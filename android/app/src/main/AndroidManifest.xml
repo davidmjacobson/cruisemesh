@@ -36,9 +36,13 @@
         android:theme="@style/Theme.CruiseMesh"
         android:supportsRtl="true">
 
+        <!-- singleTop: a message-notification tap while the app is already
+             open must land in the running activity's onNewIntent (warm-start
+             deep link into that chat) instead of relaunching it. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:theme="@style/Theme.CruiseMesh">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
