@@ -40,6 +40,9 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.cruisemesh.app.chat.ChatScreen
+import com.cruisemesh.app.chat.LocalEchoSender
+import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.friending.ContactsScreen
 import com.cruisemesh.app.friending.MyQrScreen
 import com.cruisemesh.app.friending.ScanScreen
@@ -87,6 +90,10 @@ fun CruiseMeshApp() {
         composable("myQr") { MyQrScreen(identity, onBack = { navController.popBackStack() }) }
         composable("scan") { ScanRoute(navController) }
         composable("contacts") { ContactsRoute(navController) }
+        composable("chat/{userIdHex}") { backStackEntry ->
+            val userIdHex = backStackEntry.arguments?.getString("userIdHex").orEmpty()
+            ChatRoute(identity, userIdHex, navController)
+        }
     }
 }
 
@@ -174,7 +181,38 @@ private fun ScanRoute(navController: NavHostController) {
 private fun ContactsRoute(navController: NavHostController) {
     val context = LocalContext.current
     val contacts = remember { AppStore.get(context).listContacts() }
-    ContactsScreen(contacts = contacts, onBack = { navController.popBackStack() })
+    ContactsScreen(
+        contacts = contacts,
+        onContactClick = { contact -> navController.navigate("chat/${UserIdHex.encode(contact.userId)}") },
+        onBack = { navController.popBackStack() },
+    )
+}
+
+/**
+ * Resolves the `userIdHex` route arg back into a [uniffi.cruisemesh_core.Contact] (via
+ * [AppStore]) and hosts [ChatScreen]. [LocalEchoSender] is Milestone 1's placeholder
+ * [com.cruisemesh.app.chat.MeshSender] -- see its KDoc for why the UI never depends on it directly.
+ */
+@Composable
+private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavHostController) {
+    val context = LocalContext.current
+    val store = remember { AppStore.get(context) }
+    val contact = remember(userIdHex) { store.getContact(UserIdHex.decode(userIdHex)) }
+
+    if (contact != null) {
+        val sender = remember { LocalEchoSender(store, identity.userId) }
+        ChatScreen(
+            contact = contact,
+            ownUserId = identity.userId,
+            sender = sender,
+            store = store,
+            onBack = { navController.popBackStack() },
+        )
+    } else {
+        // Unknown contact (e.g. a stale/malformed route arg) -- nothing sensible to
+        // render, so just bounce back rather than crash.
+        LaunchedEffect(Unit) { navController.popBackStack() }
+    }
 }
 
 private fun startMesh(context: Context, setStatus: (String) -> Unit) {

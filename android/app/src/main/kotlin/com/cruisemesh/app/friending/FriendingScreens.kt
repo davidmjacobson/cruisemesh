@@ -6,6 +6,7 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -152,9 +153,9 @@ fun ScanScreen(onContactAdded: (Contact) -> Unit, onBack: () -> Unit) {
     }
 }
 
-/** Lists accepted contacts (DESIGN.md §6.2). */
+/** Lists accepted contacts (DESIGN.md §6.2); tapping a row opens its 1:1 chat. */
 @Composable
-fun ContactsScreen(contacts: List<Contact>, onBack: () -> Unit) {
+fun ContactsScreen(contacts: List<Contact>, onContactClick: (Contact) -> Unit, onBack: () -> Unit) {
     Scaffold { innerPadding ->
         Column(modifier = Modifier.fillMaxSize().padding(innerPadding).padding(24.dp)) {
             Text("Contacts", style = MaterialTheme.typography.headlineSmall)
@@ -166,7 +167,13 @@ fun ContactsScreen(contacts: List<Contact>, onBack: () -> Unit) {
             } else {
                 LazyColumn(modifier = Modifier.fillMaxWidth().padding(top = 16.dp)) {
                     items(contacts) { contact ->
-                        Text(contact.name, modifier = Modifier.padding(vertical = 8.dp))
+                        Text(
+                            contact.name,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onContactClick(contact) }
+                                .padding(vertical = 8.dp),
+                        )
                     }
                 }
             }
