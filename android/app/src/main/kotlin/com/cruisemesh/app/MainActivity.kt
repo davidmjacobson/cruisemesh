@@ -1,7 +1,12 @@
 package com.cruisemesh.app
 
+import android.annotation.SuppressLint
+import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -51,8 +56,10 @@ class MainActivity : ComponentActivity() {
  * Milestone-1 proof of life: generate an identity via the Rust core (JNA/UniFFI
  * across the JNI boundary) and render its display ID + fingerprint. This
  * identity is not yet persisted — that lands with on-device secure storage.
- * The "Start mesh" button requests BLE runtime permissions and launches
- * MeshService (DESIGN.md §5.2), the Milestone 0 transport skeleton.
+ * The "Start mesh" button requests BLE runtime permissions, then (if not
+ * already exempted) the Doze/App Standby battery-optimization exemption
+ * bitchat also requests, before launching MeshService (DESIGN.md §5.2), the
+ * Milestone 0 transport skeleton.
  */
 @Composable
 fun CruiseMeshApp() {
@@ -62,12 +69,24 @@ fun CruiseMeshApp() {
     val fingerprint = remember(identity) { fingerprintWords(identity.userId) }
     var meshStatus by remember { mutableStateOf("Mesh stopped") }
 
+    val batteryOptimizationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        // Ignored either way: declining the system dialog just means less
+        // reliable backgrounded sync, not a hard failure, so mesh starts regardless.
+        startMesh(context) { meshStatus = it }
+    }
+
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { grants ->
         if (grants.values.all { it }) {
-            ContextCompat.startForegroundService(context, Intent(context, MeshService::class.java))
-            meshStatus = "Mesh starting…"
+            if (isIgnoringBatteryOptimizations(context)) {
+                startMesh(context) { meshStatus = it }
+            } else {
+                meshStatus = "Requesting background permission…"
+                batteryOptimizationLauncher.launch(batteryOptimizationIntent(context))
+            }
         } else {
             meshStatus = "BLE permissions denied"
         }
@@ -80,6 +99,20 @@ fun CruiseMeshApp() {
         onStartMesh = { permissionLauncher.launch(MeshService.requiredPermissions()) },
     )
 }
+
+private fun startMesh(context: Context, setStatus: (String) -> Unit) {
+    ContextCompat.startForegroundService(context, Intent(context, MeshService::class.java))
+    setStatus("Mesh starting…")
+}
+
+private fun isIgnoringBatteryOptimizations(context: Context): Boolean {
+    val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+    return powerManager.isIgnoringBatteryOptimizations(context.packageName)
+}
+
+@SuppressLint("BatteryLife")
+private fun batteryOptimizationIntent(context: Context): Intent =
+    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}"))
 
 @Composable
 private fun IdentityScreen(

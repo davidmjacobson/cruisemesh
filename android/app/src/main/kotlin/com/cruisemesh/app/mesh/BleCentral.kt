@@ -16,8 +16,10 @@ import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.ParcelUuid
 import android.util.Log
+import java.util.ArrayDeque
 
 private const val TAG = "BleCentral"
+private const val REQUESTED_MTU = 517
 
 /**
  * Scanner + GATT-client (central) half of the dual BLE role (DESIGN.md §5.2).
@@ -27,6 +29,12 @@ private const val TAG = "BleCentral"
  * address that just failed/disconnected (seen in practice against a peer
  * that never completes service discovery); full backoff policy is left for
  * the sync-engine milestone — this is transport plumbing only.
+ *
+ * Frames larger than one ATT write are fragmented per DESIGN.md §5.2: right
+ * after connecting we negotiate the largest MTU the peer allows, then chunk
+ * outbound frames with [FrameFraming] (queued and sent one at a time — a
+ * GATT connection allows only one in-flight write) and reassemble inbound
+ * notifications with a per-peer [FrameReassembler].
  */
 @SuppressLint("MissingPermission")
 class BleCentral(
@@ -40,6 +48,10 @@ class BleCentral(
     private var scanner: BluetoothLeScanner? = null
     private val connections = mutableMapOf<String, BluetoothGatt>()
     private val lastDisconnectAt = mutableMapOf<String, Long>()
+    private val negotiatedMtu = mutableMapOf<String, Int>()
+    private val reassemblers = mutableMapOf<String, FrameReassembler>()
+    private val writeQueues = mutableMapOf<String, ArrayDeque<ByteArray>>()
+    private val writeInFlight = mutableSetOf<String>()
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -63,15 +75,29 @@ class BleCentral(
                     // Default (balanced) connection interval is prone to
                     // status=133 on back-to-back GATT ops right after connect.
                     gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                    gatt.discoverServices()
+                    // discoverServices() is deferred to onMtuChanged: like the
+                    // descriptor-write/characteristic-write pair below, a
+                    // BluetoothGatt allows only one in-flight op at a time.
+                    gatt.requestMtu(REQUESTED_MTU)
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.i(TAG, "Peer ${gatt.device.address} disconnected (status=$status)")
                     connections.remove(gatt.device.address)
                     lastDisconnectAt[gatt.device.address] = System.currentTimeMillis()
+                    negotiatedMtu.remove(gatt.device.address)
+                    reassemblers.remove(gatt.device.address)
+                    writeQueues.remove(gatt.device.address)
+                    writeInFlight.remove(gatt.device.address)
                     gatt.close()
                 }
             }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            val effective = if (status == BluetoothGatt.GATT_SUCCESS) mtu else FrameFraming.DEFAULT_ATT_MTU
+            Log.i(TAG, "MTU negotiated for ${gatt.device.address}: $effective (status=$status)")
+            negotiatedMtu[gatt.device.address] = effective
+            gatt.discoverServices()
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -92,9 +118,9 @@ class BleCentral(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
         ) {
-            if (characteristic.uuid == MeshConstants.OUTBOUND_CHARACTERISTIC_UUID) {
-                onFrameReceived(characteristic.value)
-            }
+            if (characteristic.uuid != MeshConstants.OUTBOUND_CHARACTERISTIC_UUID) return
+            val reassembler = reassemblers.getOrPut(gatt.device.address) { FrameReassembler() }
+            reassembler.accept(characteristic.value)?.let(onFrameReceived)
         }
 
         override fun onDescriptorWrite(
@@ -115,6 +141,8 @@ class BleCentral(
             status: Int,
         ) {
             Log.i(TAG, "Characteristic write for ${gatt.device.address} status=$status")
+            writeInFlight.remove(gatt.device.address)
+            sendNextQueuedFragment(gatt)
         }
     }
 
@@ -137,25 +165,47 @@ class BleCentral(
         scanner?.stopScan(scanCallback)
         connections.values.forEach { it.close() }
         connections.clear()
+        negotiatedMtu.clear()
+        reassemblers.clear()
+        writeQueues.clear()
+        writeInFlight.clear()
     }
 
-    /** Write a frame to a specific connected peer's inbound characteristic. */
+    /**
+     * Write a frame to a specific connected peer's inbound characteristic,
+     * fragmenting per the peer's negotiated MTU if needed (DESIGN.md §5.2).
+     */
     fun sendFrame(deviceAddress: String, frame: ByteArray) {
         val gatt = connections[deviceAddress] ?: run {
             Log.w(TAG, "sendFrame: no connection tracked for $deviceAddress")
             return
         }
+        val payloadSize = (negotiatedMtu[deviceAddress] ?: FrameFraming.DEFAULT_ATT_MTU) -
+            FrameFraming.ATT_HEADER_OVERHEAD
+        val fragments = FrameFraming.fragment(frame, payloadSize)
+        writeQueues.getOrPut(deviceAddress) { ArrayDeque() }.addAll(fragments)
+        Log.i(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
+        sendNextQueuedFragment(gatt)
+    }
+
+    private fun sendNextQueuedFragment(gatt: BluetoothGatt) {
+        val address = gatt.device.address
+        if (address in writeInFlight) return
+        val fragment = writeQueues[address]?.poll() ?: return
         val service = gatt.getService(MeshConstants.SERVICE_UUID) ?: run {
-            Log.w(TAG, "sendFrame: service not found on $deviceAddress")
+            Log.w(TAG, "sendNextQueuedFragment: service not found on $address")
             return
         }
         val inbound = service.getCharacteristic(MeshConstants.INBOUND_CHARACTERISTIC_UUID) ?: run {
-            Log.w(TAG, "sendFrame: inbound characteristic not found on $deviceAddress")
+            Log.w(TAG, "sendNextQueuedFragment: inbound characteristic not found on $address")
             return
         }
-        inbound.value = frame
-        val queued = gatt.writeCharacteristic(inbound)
-        Log.i(TAG, "sendFrame: writeCharacteristic queued=$queued for $deviceAddress (${frame.size} bytes)")
+        inbound.value = fragment
+        if (gatt.writeCharacteristic(inbound)) {
+            writeInFlight += address
+        } else {
+            Log.w(TAG, "sendNextQueuedFragment: writeCharacteristic rejected for $address")
+        }
     }
 
     companion object {

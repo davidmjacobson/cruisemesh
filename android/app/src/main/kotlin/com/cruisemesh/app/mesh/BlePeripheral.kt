@@ -18,6 +18,7 @@ import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.os.ParcelUuid
 import android.util.Log
+import java.util.ArrayDeque
 
 private const val TAG = "BlePeripheral"
 
@@ -28,6 +29,11 @@ private const val TAG = "BlePeripheral"
  * frames). Frame parsing/dedupe/sync is not wired up yet — this is
  * Milestone 0 transport plumbing only; MeshService owns permission checks
  * before calling start().
+ *
+ * Frames larger than one ATT notification are fragmented per DESIGN.md
+ * §5.2, using each central's own negotiated MTU (from [onMtuChanged]) and a
+ * per-peer send queue — a GATT server also allows only one in-flight
+ * notification per connection.
  */
 @SuppressLint("MissingPermission")
 class BlePeripheral(
@@ -42,6 +48,12 @@ class BlePeripheral(
     private var advertiser: BluetoothLeAdvertiser? = null
     private var outboundCharacteristic: BluetoothGattCharacteristic? = null
 
+    private val connectedDevices = mutableMapOf<String, BluetoothDevice>()
+    private val negotiatedMtu = mutableMapOf<String, Int>()
+    private val reassemblers = mutableMapOf<String, FrameReassembler>()
+    private val notifyQueues = mutableMapOf<String, ArrayDeque<ByteArray>>()
+    private val notifyInFlight = mutableSetOf<String>()
+
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
             Log.i(TAG, "Advertising started")
@@ -55,6 +67,21 @@ class BlePeripheral(
     private val gattServerCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             Log.i(TAG, "Central ${device.address} connection state=$newState")
+            when (newState) {
+                BluetoothProfile.STATE_CONNECTED -> connectedDevices[device.address] = device
+                BluetoothProfile.STATE_DISCONNECTED -> {
+                    connectedDevices.remove(device.address)
+                    negotiatedMtu.remove(device.address)
+                    reassemblers.remove(device.address)
+                    notifyQueues.remove(device.address)
+                    notifyInFlight.remove(device.address)
+                }
+            }
+        }
+
+        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            Log.i(TAG, "MTU negotiated for ${device.address}: $mtu")
+            negotiatedMtu[device.address] = mtu
         }
 
         override fun onCharacteristicWriteRequest(
@@ -68,7 +95,8 @@ class BlePeripheral(
         ) {
             Log.i(TAG, "Write request from ${device.address} for ${characteristic.uuid} (${value.size} bytes)")
             if (characteristic.uuid == MeshConstants.INBOUND_CHARACTERISTIC_UUID) {
-                onFrameReceived(value)
+                val reassembler = reassemblers.getOrPut(device.address) { FrameReassembler() }
+                reassembler.accept(value)?.let(onFrameReceived)
             }
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
@@ -91,6 +119,11 @@ class BlePeripheral(
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
             }
+        }
+
+        override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            notifyInFlight.remove(device.address)
+            sendNextQueuedFragment(device)
         }
     }
 
@@ -121,15 +154,39 @@ class BlePeripheral(
         advertiser?.stopAdvertising(advertiseCallback)
         gattServer?.close()
         gattServer = null
+        connectedDevices.clear()
+        negotiatedMtu.clear()
+        reassemblers.clear()
+        notifyQueues.clear()
+        notifyInFlight.clear()
     }
 
-    /** Push a frame to every subscribed central via the notify characteristic. */
+    /**
+     * Push a frame to every subscribed central via the notify characteristic,
+     * fragmenting per each central's negotiated MTU if needed (DESIGN.md
+     * §5.2).
+     */
     fun notifyFrame(frame: ByteArray) {
+        connectedDevices.values.forEach { device ->
+            val payloadSize = (negotiatedMtu[device.address] ?: FrameFraming.DEFAULT_ATT_MTU) -
+                FrameFraming.ATT_HEADER_OVERHEAD
+            val fragments = FrameFraming.fragment(frame, payloadSize)
+            notifyQueues.getOrPut(device.address) { ArrayDeque() }.addAll(fragments)
+            sendNextQueuedFragment(device)
+        }
+    }
+
+    private fun sendNextQueuedFragment(device: BluetoothDevice) {
+        val address = device.address
+        if (address in notifyInFlight) return
+        val fragment = notifyQueues[address]?.poll() ?: return
         val characteristic = outboundCharacteristic ?: return
         val server = gattServer ?: return
-        characteristic.value = frame
-        bluetoothManager.getConnectedDevices(BluetoothProfile.GATT_SERVER).forEach { device ->
-            server.notifyCharacteristicChanged(device, characteristic, false)
+        characteristic.value = fragment
+        if (server.notifyCharacteristicChanged(device, characteristic, false)) {
+            notifyInFlight += address
+        } else {
+            Log.w(TAG, "sendNextQueuedFragment: notifyCharacteristicChanged rejected for $address")
         }
     }
 

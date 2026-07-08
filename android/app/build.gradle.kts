@@ -51,4 +51,5 @@ dependencies {
     implementation(libs.zxing.core)
     implementation(libs.jna) { artifact { type = "aar" } }
     debugImplementation(libs.compose.ui.tooling)
+    testImplementation(libs.junit)
 }
