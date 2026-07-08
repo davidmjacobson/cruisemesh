@@ -13,6 +13,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.AppStore
+import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.identity.IdentityStore
 import uniffi.cruisemesh_core.CoreException
@@ -273,6 +274,7 @@ class MeshService : Service() {
             ),
         )
         if (!inserted) return
+        ChatEvents.notifyChatChanged(senderUserId)
 
         val contact = store.getContact(senderUserId)
         if (contact == null) {

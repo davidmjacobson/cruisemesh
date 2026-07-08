@@ -71,6 +71,7 @@ class RealMeshSender(
                 payload = payload,
             ),
         )
+        ChatEvents.notifyChatChanged(chatId)
 
         val envelopeFrame = try {
             val body = MessageBody(

@@ -27,16 +27,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.delay
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
 
 /** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
 private const val KIND_TEXT: kotlin.UByte = 1u
-
-/** Interim refresh cadence until [com.cruisemesh.app.mesh.MeshService] can push updates directly into this screen. */
-private const val POLL_INTERVAL_MS = 1_000L
 
 /**
  * A single 1:1 chat thread (DESIGN.md §7.1: for a 1:1 chat, `chat_id` is
@@ -46,9 +42,12 @@ private const val POLL_INTERVAL_MS = 1_000L
  * against `ownUserId`, since [StoredMessage.senderUserId] is raw bytes).
  *
  * Sending goes through [sender] only -- see [MeshSender] for why the UI
- * never talks to a concrete transport directly. After a send, and on a
- * polling timer (interim until MeshService can push live updates -- the
- * next milestone), the thread is reloaded from [store].
+ * never talks to a concrete transport directly. The thread is reloaded from
+ * [store] immediately after a send (for guaranteed instant feedback on the
+ * UI thread) and whenever [ChatEvents] reports this chat changed -- which is
+ * how a message [com.cruisemesh.app.mesh.MeshService] receives on a BLE
+ * binder thread ends up on screen without a manual refresh or a polling
+ * timer.
  */
 @Composable
 fun ChatScreen(
@@ -62,14 +61,18 @@ fun ChatScreen(
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
-    // Interim polling loop: reload the thread on a timer so incoming
-    // messages (once MeshService writes them into the store) show up
-    // without a manual refresh. Replace with a push/observer once
-    // MeshService can notify the UI directly.
+    // Reload this thread whenever anything (MeshService on a BLE binder
+    // thread, a sender on the UI thread) reports its store contents changed.
+    // The collector runs on this composition's main dispatcher, so touching
+    // `messages` state here is safe; cancellation on dispose is automatic
+    // because LaunchedEffect scopes the collection to this composable.
+    // chatId is a raw ByteArray, so compare with contentEquals -- == would
+    // be referential and never match.
     LaunchedEffect(contact.userId) {
-        while (true) {
-            delay(POLL_INTERVAL_MS)
-            messages = store.messagesForChat(contact.userId)
+        ChatEvents.changes.collect { changedChatId ->
+            if (changedChatId.contentEquals(contact.userId)) {
+                messages = store.messagesForChat(contact.userId)
+            }
         }
     }
 
