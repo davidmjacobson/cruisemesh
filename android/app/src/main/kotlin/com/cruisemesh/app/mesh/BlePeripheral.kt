@@ -147,7 +147,14 @@ class BlePeripheral(
             .setIncludeDeviceName(false)
             .addServiceUuid(ParcelUuid(MeshConstants.SERVICE_UUID))
             .build()
-        advertiser?.startAdvertising(settings, data, advertiseCallback)
+        // Carried in the scan response (not the primary advertisement) to stay
+        // within the legacy 31-byte advertising budget. Lets a central
+        // recognize (and skip) its own advertisement -- see
+        // MeshConstants.LOCAL_INSTANCE_ID.
+        val scanResponse = AdvertiseData.Builder()
+            .addServiceData(ParcelUuid(MeshConstants.SERVICE_UUID), MeshConstants.LOCAL_INSTANCE_ID)
+            .build()
+        advertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
     }
 
     fun stop() {
