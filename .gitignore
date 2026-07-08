@@ -1,0 +1,23 @@
+# Rust
+/target/
+
+# Android / Gradle
+android/local.properties
+android/.gradle/
+android/.kotlin/
+android/build/
+android/*/build/
+android/.cxx/
+android/captures/
+*.iml
+.idea/
+
+# Generated from core/ via core/build-android.sh — not source, regenerate instead
+android/app/src/main/kotlin-gen/
+android/app/src/main/jniLibs/
+
+# OS
+.DS_Store
+
+# Session handoff notes — not project documentation
+/HANDOFF.md
