@@ -1,11 +1,16 @@
-//! Message store: SQLite-backed persistence for chat messages (DESIGN.md
-//! §7.1, §10). `insert_message` is idempotent on (chat_id, sender_user_id,
+//! Message + contact store: SQLite-backed persistence (DESIGN.md §7.1,
+//! §10). `insert_message` is idempotent on (chat_id, sender_user_id,
 //! lamport), so re-delivering the same envelope (expected under DTN) is
 //! safe. Per-chat lamport counters are maintained independently by each
 //! sender (DESIGN.md §7.1), so gap detection in [MessageStore::highest_contiguous_lamport]
 //! is keyed on (chat_id, sender_user_id), not chat_id alone.
+//!
+//! Contacts (DESIGN.md §6.2) live in the same store/connection rather than a
+//! separate file: they're the other half of "who can I seal a message to,"
+//! which is exactly the data a message store needs alongside messages
+//! themselves.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
 
 use crate::CoreError;
@@ -21,6 +26,19 @@ pub struct StoredMessage {
     pub timestamp: i64,
     pub kind: u8,
     pub payload: Vec<u8>,
+}
+
+/// An accepted friend (DESIGN.md §6.2): the public half of someone else's
+/// identity, imported from a scanned/pasted `FriendCard`. `user_id` is
+/// derived the same way as one's own (`friend_card_user_id`), so it's a
+/// stable primary key even though a display name can be edited later.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct Contact {
+    pub user_id: Vec<u8>,
+    pub name: String,
+    pub sign_pk: Vec<u8>,
+    pub agree_pk: Vec<u8>,
+    pub relay_url: Option<String>,
 }
 
 #[derive(uniffi::Object)]
@@ -105,6 +123,53 @@ impl MessageStore {
         }
         Ok(expected - 1)
     }
+
+    /// Add or update a contact, keyed on `user_id` -- re-scanning the same
+    /// FriendCard (e.g. after they update their display name) replaces the
+    /// row rather than erroring or duplicating.
+    pub fn upsert_contact(&self, contact: Contact) -> Result<(), CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "INSERT INTO contacts (user_id, name, sign_pk, agree_pk, relay_url)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(user_id) DO UPDATE SET
+                name = excluded.name,
+                sign_pk = excluded.sign_pk,
+                agree_pk = excluded.agree_pk,
+                relay_url = excluded.relay_url",
+            params![
+                contact.user_id,
+                contact.name,
+                contact.sign_pk,
+                contact.agree_pk,
+                contact.relay_url,
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Look up a single contact by UserID, or `None` if not a contact.
+    pub fn get_contact(&self, user_id: Vec<u8>) -> Result<Option<Contact>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT user_id, name, sign_pk, agree_pk, relay_url FROM contacts WHERE user_id = ?1",
+            params![user_id],
+            row_to_contact,
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    /// All contacts, alphabetical by name.
+    pub fn list_contacts(&self) -> Result<Vec<Contact>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn
+            .prepare("SELECT user_id, name, sign_pk, agree_pk, relay_url FROM contacts ORDER BY name ASC")
+            .map_err(store_err)?;
+        let rows = stmt.query_map([], row_to_contact).map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
 }
 
 fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
@@ -115,6 +180,16 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
         timestamp: row.get(3)?,
         kind: row.get::<_, i64>(4)? as u8,
         payload: row.get(5)?,
+    })
+}
+
+fn row_to_contact(row: &rusqlite::Row) -> rusqlite::Result<Contact> {
+    Ok(Contact {
+        user_id: row.get(0)?,
+        name: row.get(1)?,
+        sign_pk: row.get(2)?,
+        agree_pk: row.get(3)?,
+        relay_url: row.get(4)?,
     })
 }
 
@@ -134,6 +209,14 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE(chat_id, sender_user_id, lamport)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_lamport ON messages(chat_id, lamport);
+
+CREATE TABLE IF NOT EXISTS contacts (
+    user_id   BLOB PRIMARY KEY,
+    name      TEXT NOT NULL,
+    sign_pk   BLOB NOT NULL,
+    agree_pk  BLOB NOT NULL,
+    relay_url TEXT
+);
 ";
 
 #[cfg(test)]
@@ -221,5 +304,52 @@ mod tests {
             store.highest_contiguous_lamport(b"chat-a".to_vec(), b"bob".to_vec()).unwrap(),
             1
         );
+    }
+
+    fn contact(user_id: &[u8], name: &str) -> Contact {
+        Contact {
+            user_id: user_id.to_vec(),
+            name: name.to_string(),
+            sign_pk: vec![1u8; 32],
+            agree_pk: vec![2u8; 32],
+            relay_url: None,
+        }
+    }
+
+    #[test]
+    fn upsert_then_get_contact_round_trips() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+
+        let found = store.get_contact(b"alice-id".to_vec()).unwrap().expect("contact exists");
+        assert_eq!(found.name, "Alice");
+        assert_eq!(found.sign_pk, vec![1u8; 32]);
+    }
+
+    #[test]
+    fn get_contact_returns_none_when_absent() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert_eq!(store.get_contact(b"nobody".to_vec()).unwrap(), None);
+    }
+
+    #[test]
+    fn upsert_replaces_rather_than_duplicates() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice R.")).unwrap();
+
+        let contacts = store.list_contacts().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].name, "Alice R.");
+    }
+
+    #[test]
+    fn list_contacts_is_alphabetical() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"bob-id", "Bob")).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+
+        let names: Vec<String> = store.list_contacts().unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
     }
 }

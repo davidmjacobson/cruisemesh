@@ -1,8 +1,10 @@
 package com.cruisemesh.app
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.PowerManager
@@ -22,6 +24,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -33,8 +36,16 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.navigation.NavHostController
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import com.cruisemesh.app.friending.ContactsScreen
+import com.cruisemesh.app.friending.MyQrScreen
+import com.cruisemesh.app.friending.ScanScreen
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.mesh.MeshService
+import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.generateIdentity
@@ -69,6 +80,19 @@ fun CruiseMeshApp() {
     val identity = remember {
         IdentityStore.load(context) ?: generateIdentity().also { IdentityStore.save(context, it) }
     }
+    val navController = rememberNavController()
+
+    NavHost(navController = navController, startDestination = "identity") {
+        composable("identity") { IdentityRoute(identity, navController) }
+        composable("myQr") { MyQrScreen(identity, onBack = { navController.popBackStack() }) }
+        composable("scan") { ScanRoute(navController) }
+        composable("contacts") { ContactsRoute(navController) }
+    }
+}
+
+@Composable
+private fun IdentityRoute(identity: Identity, navController: NavHostController) {
+    val context = LocalContext.current
     val displayId = remember(identity) { formatUserId(identity.userId) }
     val fingerprint = remember(identity) { fingerprintWords(identity.userId) }
     var meshStatus by remember { mutableStateOf("Mesh stopped") }
@@ -101,7 +125,56 @@ fun CruiseMeshApp() {
         fingerprint = fingerprint,
         meshStatus = meshStatus,
         onStartMesh = { permissionLauncher.launch(MeshService.requiredPermissions()) },
+        onShowMyQr = { navController.navigate("myQr") },
+        onScanFriend = { navController.navigate("scan") },
+        onShowContacts = { navController.navigate("contacts") },
     )
+}
+
+/** Requests the CAMERA permission (declared in the manifest, never requested until now) before showing [ScanScreen]. */
+@Composable
+private fun ScanRoute(navController: NavHostController) {
+    val context = LocalContext.current
+    var hasCameraPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED,
+        )
+    }
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> hasCameraPermission = granted }
+
+    LaunchedEffect(Unit) {
+        if (!hasCameraPermission) permissionLauncher.launch(Manifest.permission.CAMERA)
+    }
+
+    if (hasCameraPermission) {
+        ScanScreen(
+            onContactAdded = { contact -> AppStore.get(context).upsertContact(contact) },
+            onBack = { navController.popBackStack() },
+        )
+    } else {
+        Scaffold { innerPadding ->
+            Column(
+                modifier = Modifier.fillMaxSize().padding(innerPadding).padding(24.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text("Camera permission is needed to scan a friend card.")
+                Button(onClick = { navController.popBackStack() }, modifier = Modifier.padding(top = 16.dp)) {
+                    Text("Back")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ContactsRoute(navController: NavHostController) {
+    val context = LocalContext.current
+    val contacts = remember { AppStore.get(context).listContacts() }
+    ContactsScreen(contacts = contacts, onBack = { navController.popBackStack() })
 }
 
 private fun startMesh(context: Context, setStatus: (String) -> Unit) {
@@ -124,6 +197,9 @@ private fun IdentityScreen(
     fingerprint: List<String>,
     meshStatus: String = "",
     onStartMesh: (() -> Unit)? = null,
+    onShowMyQr: (() -> Unit)? = null,
+    onScanFriend: (() -> Unit)? = null,
+    onShowContacts: (() -> Unit)? = null,
 ) {
     Scaffold { innerPadding ->
         Column(
@@ -154,6 +230,21 @@ private fun IdentityScreen(
                     Text("Start mesh")
                 }
                 Text(meshStatus, modifier = Modifier.padding(top = 8.dp))
+            }
+            if (onShowMyQr != null) {
+                Button(onClick = onShowMyQr, modifier = Modifier.padding(top = 24.dp)) {
+                    Text("Show my friend card")
+                }
+            }
+            if (onScanFriend != null) {
+                Button(onClick = onScanFriend, modifier = Modifier.padding(top = 8.dp)) {
+                    Text("Add a friend")
+                }
+            }
+            if (onShowContacts != null) {
+                Button(onClick = onShowContacts, modifier = Modifier.padding(top = 8.dp)) {
+                    Text("Contacts")
+                }
             }
         }
     }

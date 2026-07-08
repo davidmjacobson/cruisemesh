@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.cruisemesh.app"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.cruisemesh.app"
@@ -50,6 +50,10 @@ dependencies {
     implementation(libs.compose.material3)
     implementation(libs.zxing.core)
     implementation(libs.jna) { artifact { type = "aar" } }
+    implementation(libs.camerax.core)
+    implementation(libs.camerax.camera2)
+    implementation(libs.camerax.lifecycle)
+    implementation(libs.camerax.view)
     debugImplementation(libs.compose.ui.tooling)
     testImplementation(libs.junit)
 }
