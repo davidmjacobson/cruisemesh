@@ -24,6 +24,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -48,21 +49,46 @@ import com.cruisemesh.app.friending.MyQrScreen
 import com.cruisemesh.app.friending.ScanScreen
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.mesh.MeshService
+import com.cruisemesh.app.notify.ChatVisibility
+import com.cruisemesh.app.notify.MessageNotifier
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.generateIdentity
 
 class MainActivity : ComponentActivity() {
+
+    /**
+     * Chat requested by a message-notification tap ([MessageNotifier]'s
+     * PendingIntent), as the [UserIdHex]-encoded userId, or null when there is
+     * nothing pending. Covers both launch paths: cold start reads the extra
+     * off the launch intent here in [onCreate]; warm start (activity already
+     * on top, `launchMode="singleTop"` in the manifest) receives it via
+     * [onNewIntent]. Consumed (navigated to, then nulled) by a
+     * `LaunchedEffect` next to the NavHost in [CruiseMeshApp].
+     */
+    private val pendingChatUserIdHex = mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        pendingChatUserIdHex.value = intent?.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    CruiseMeshApp()
+                    CruiseMeshApp(
+                        pendingChatUserIdHex = pendingChatUserIdHex.value,
+                        onPendingChatConsumed = { pendingChatUserIdHex.value = null },
+                    )
                 }
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        intent.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)?.let {
+            pendingChatUserIdHex.value = it
         }
     }
 }
@@ -78,7 +104,10 @@ class MainActivity : ComponentActivity() {
  * MeshService (DESIGN.md §5.2), the Milestone 0 transport skeleton.
  */
 @Composable
-fun CruiseMeshApp() {
+fun CruiseMeshApp(
+    pendingChatUserIdHex: String? = null,
+    onPendingChatConsumed: () -> Unit = {},
+) {
     val context = LocalContext.current
     val identity = remember {
         IdentityStore.load(context) ?: generateIdentity().also { IdentityStore.save(context, it) }
@@ -93,6 +122,16 @@ fun CruiseMeshApp() {
         composable("chat/{userIdHex}") { backStackEntry ->
             val userIdHex = backStackEntry.arguments?.getString("userIdHex").orEmpty()
             ChatRoute(identity, userIdHex, navController)
+        }
+    }
+
+    // Notification-tap deep link (see MainActivity.pendingChatUserIdHex):
+    // navigate once the NavHost above is composed, then clear so the same
+    // tap isn't re-navigated on recomposition or a later config change.
+    LaunchedEffect(pendingChatUserIdHex) {
+        if (pendingChatUserIdHex != null) {
+            navController.navigate("chat/$pendingChatUserIdHex")
+            onPendingChatConsumed()
         }
     }
 }
@@ -200,6 +239,15 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
     val contact = remember(userIdHex) { store.getContact(UserIdHex.decode(userIdHex)) }
 
     if (contact != null) {
+        // Registers this chat as "on screen" for the whole time it is
+        // composed -- consumed by notification suppression and (soon) read
+        // receipts; see ChatVisibility's KDoc. clearVisible (not an
+        // unconditional clear) because during a chat->chat transition the
+        // incoming route's setVisible can run before this route's onDispose.
+        DisposableEffect(userIdHex) {
+            ChatVisibility.setVisible(contact.userId)
+            onDispose { ChatVisibility.clearVisible(contact.userId) }
+        }
         val sender = remember { RealMeshSender(store, identity) }
         ChatScreen(
             contact = contact,
