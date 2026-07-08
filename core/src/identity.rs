@@ -46,6 +46,10 @@ pub enum CoreError {
     InvalidKeyLength { expected: u32, actual: u32 },
     #[error("message store error: {0}")]
     Store(String),
+    #[error("crypto error: {0}")]
+    Crypto(String),
+    #[error("signature verification failed")]
+    SignatureInvalid,
 }
 
 /// Generate a fresh identity: Ed25519 signing keypair + X25519 agreement keypair.
@@ -69,7 +73,7 @@ pub fn generate_identity() -> Identity {
 }
 
 /// UserID = first 16 bytes of BLAKE2b(Ed25519 public key).
-fn derive_user_id(sign_pk: &[u8]) -> [u8; USER_ID_LEN] {
+pub(crate) fn derive_user_id(sign_pk: &[u8]) -> [u8; USER_ID_LEN] {
     let mut hasher = Blake2bVar::new(USER_ID_LEN).expect("valid blake2b output length");
     hasher.update(sign_pk);
     let mut out = [0u8; USER_ID_LEN];
