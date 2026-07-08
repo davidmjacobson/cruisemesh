@@ -34,11 +34,21 @@ private const val TAG = "BlePeripheral"
  * §5.2, using each central's own negotiated MTU (from [onMtuChanged]) and a
  * per-peer send queue — a GATT server also allows only one in-flight
  * notification per connection.
+ *
+ * Milestone 1 (DESIGN.md §5.2, §7.3): [onFrameReceived] now carries the
+ * connecting central's device address alongside the frame bytes, so callers
+ * can route replies. A peripheral can only notify a central once that
+ * central has subscribed via the CCCD (see [onDescriptorWriteRequest]) --
+ * [onCentralSubscribed] fires at exactly that point, which is when
+ * MeshService sends its half of the HELLO handshake. [onCentralDisconnected]
+ * fires so callers can drop a stale address mapping.
  */
 @SuppressLint("MissingPermission")
 class BlePeripheral(
     private val context: Context,
-    private val onFrameReceived: (ByteArray) -> Unit,
+    private val onFrameReceived: (address: String, frame: ByteArray) -> Unit,
+    private val onCentralSubscribed: (String) -> Unit = {},
+    private val onCentralDisconnected: (String) -> Unit = {},
 ) {
     private val bluetoothManager =
         context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -75,6 +85,7 @@ class BlePeripheral(
                     reassemblers.remove(device.address)
                     notifyQueues.remove(device.address)
                     notifyInFlight.remove(device.address)
+                    onCentralDisconnected(device.address)
                 }
             }
         }
@@ -96,7 +107,7 @@ class BlePeripheral(
             Log.i(TAG, "Write request from ${device.address} for ${characteristic.uuid} (${value.size} bytes)")
             if (characteristic.uuid == MeshConstants.INBOUND_CHARACTERISTIC_UUID) {
                 val reassembler = reassemblers.getOrPut(device.address) { FrameReassembler() }
-                reassembler.accept(value)?.let(onFrameReceived)
+                reassembler.accept(value)?.let { onFrameReceived(device.address, it) }
             }
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
@@ -118,6 +129,18 @@ class BlePeripheral(
             Log.i(TAG, "Descriptor write request from ${device.address} for ${descriptor.uuid}")
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
+            }
+            val isOutboundCccdEnable = descriptor.uuid == MeshConstants.CLIENT_CONFIG_DESCRIPTOR_UUID &&
+                descriptor.characteristic?.uuid == MeshConstants.OUTBOUND_CHARACTERISTIC_UUID &&
+                value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+            if (isOutboundCccdEnable) {
+                // The central has subscribed to our outbound notify
+                // characteristic: this link can carry frames from us now, so
+                // fire the peripheral-side half of the HELLO handshake
+                // (DESIGN.md §5.2). The central's half fires symmetrically
+                // from BleCentral.onDescriptorWrite once its own subscription
+                // to *our* outbound characteristic completes.
+                onCentralSubscribed(device.address)
             }
         }
 
@@ -181,6 +204,27 @@ class BlePeripheral(
             notifyQueues.getOrPut(device.address) { ArrayDeque() }.addAll(fragments)
             sendNextQueuedFragment(device)
         }
+    }
+
+    /**
+     * Push a frame to one specific subscribed central via the notify
+     * characteristic, fragmenting per that central's negotiated MTU if
+     * needed (DESIGN.md §5.2) -- mirrors [BleCentral.sendFrame]. Unlike
+     * [notifyFrame] (broadcast to everyone connected), this targets a single
+     * peer, which is what [MeshRouter] needs to address a specific contact
+     * or reply on the exact link a frame arrived on.
+     */
+    fun sendFrame(deviceAddress: String, frame: ByteArray) {
+        val device = connectedDevices[deviceAddress] ?: run {
+            Log.w(TAG, "sendFrame: no connection tracked for $deviceAddress")
+            return
+        }
+        val payloadSize = (negotiatedMtu[deviceAddress] ?: FrameFraming.DEFAULT_ATT_MTU) -
+            FrameFraming.ATT_HEADER_OVERHEAD
+        val fragments = FrameFraming.fragment(frame, payloadSize)
+        notifyQueues.getOrPut(deviceAddress) { ArrayDeque() }.addAll(fragments)
+        Log.i(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
+        sendNextQueuedFragment(device)
     }
 
     private fun sendNextQueuedFragment(device: BluetoothDevice) {

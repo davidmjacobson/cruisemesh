@@ -44,12 +44,21 @@ private const val REQUESTED_MTU = 517
  * outbound frames with [FrameFraming] (queued and sent one at a time — a
  * GATT connection allows only one in-flight write) and reassemble inbound
  * notifications with a per-peer [FrameReassembler].
+ *
+ * Milestone 1 (DESIGN.md §5.2, §7.3): callers need to know *which* peer a
+ * frame came from to route replies and receipts, so [onFrameReceived] now
+ * carries the device address alongside the frame bytes. [onPeerConnected]
+ * fires once this link can carry frames (see the existing descriptor-write
+ * comment below); [onPeerDisconnected] fires so callers (MeshRouter, via
+ * MeshService) can drop a stale address mapping instead of sending into the
+ * void.
  */
 @SuppressLint("MissingPermission")
 class BleCentral(
     private val context: Context,
-    private val onFrameReceived: (ByteArray) -> Unit,
+    private val onFrameReceived: (address: String, frame: ByteArray) -> Unit,
     private val onPeerConnected: (String) -> Unit = {},
+    private val onPeerDisconnected: (String) -> Unit = {},
 ) {
     private val bluetoothManager =
         context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -129,6 +138,7 @@ class BleCentral(
                     reassemblers.remove(address)
                     writeQueues.remove(address)
                     writeInFlight.remove(address)
+                    onPeerDisconnected(address)
                     gatt.close()
                 }
             }
@@ -160,8 +170,9 @@ class BleCentral(
             characteristic: BluetoothGattCharacteristic,
         ) {
             if (characteristic.uuid != MeshConstants.OUTBOUND_CHARACTERISTIC_UUID) return
-            val reassembler = reassemblers.getOrPut(gatt.device.address) { FrameReassembler() }
-            reassembler.accept(characteristic.value)?.let(onFrameReceived)
+            val address = gatt.device.address
+            val reassembler = reassemblers.getOrPut(address) { FrameReassembler() }
+            reassembler.accept(characteristic.value)?.let { onFrameReceived(address, it) }
         }
 
         override fun onDescriptorWrite(

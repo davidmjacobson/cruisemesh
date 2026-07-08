@@ -41,7 +41,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.cruisemesh.app.chat.ChatScreen
-import com.cruisemesh.app.chat.LocalEchoSender
+import com.cruisemesh.app.chat.RealMeshSender
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.friending.ContactsScreen
 import com.cruisemesh.app.friending.MyQrScreen
@@ -190,7 +190,7 @@ private fun ContactsRoute(navController: NavHostController) {
 
 /**
  * Resolves the `userIdHex` route arg back into a [uniffi.cruisemesh_core.Contact] (via
- * [AppStore]) and hosts [ChatScreen]. [LocalEchoSender] is Milestone 1's placeholder
+ * [AppStore]) and hosts [ChatScreen]. [RealMeshSender] is the real
  * [com.cruisemesh.app.chat.MeshSender] -- see its KDoc for why the UI never depends on it directly.
  */
 @Composable
@@ -200,7 +200,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
     val contact = remember(userIdHex) { store.getContact(UserIdHex.decode(userIdHex)) }
 
     if (contact != null) {
-        val sender = remember { LocalEchoSender(store, identity.userId) }
+        val sender = remember { RealMeshSender(store, identity) }
         ChatScreen(
             contact = contact,
             ownUserId = identity.userId,
