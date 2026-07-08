@@ -33,6 +33,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.mesh.MeshService
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
@@ -53,18 +54,21 @@ class MainActivity : ComponentActivity() {
 }
 
 /**
- * Milestone-1 proof of life: generate an identity via the Rust core (JNA/UniFFI
- * across the JNI boundary) and render its display ID + fingerprint. This
- * identity is not yet persisted — that lands with on-device secure storage.
- * The "Start mesh" button requests BLE runtime permissions, then (if not
- * already exempted) the Doze/App Standby battery-optimization exemption
- * bitchat also requests, before launching MeshService (DESIGN.md §5.2), the
- * Milestone 0 transport skeleton.
+ * Milestone-1 proof of life: load (or generate and persist) an identity via
+ * the Rust core (JNA/UniFFI across the JNI boundary) and render its display
+ * ID + fingerprint. Persistence is Android Keystore-backed (see
+ * [IdentityStore]), so the UserID stays stable across app restarts instead
+ * of regenerating every launch. The "Start mesh" button requests BLE runtime
+ * permissions, then (if not already exempted) the Doze/App Standby
+ * battery-optimization exemption bitchat also requests, before launching
+ * MeshService (DESIGN.md §5.2), the Milestone 0 transport skeleton.
  */
 @Composable
 fun CruiseMeshApp() {
     val context = LocalContext.current
-    val identity = remember { generateIdentity() }
+    val identity = remember {
+        IdentityStore.load(context) ?: generateIdentity().also { IdentityStore.save(context, it) }
+    }
     val displayId = remember(identity) { formatUserId(identity.userId) }
     val fingerprint = remember(identity) { fingerprintWords(identity.userId) }
     var meshStatus by remember { mutableStateOf("Mesh stopped") }
