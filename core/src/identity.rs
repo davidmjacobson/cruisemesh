@@ -44,6 +44,8 @@ pub enum CoreError {
     InvalidFriendCard(String),
     #[error("invalid key length: expected {expected}, got {actual}")]
     InvalidKeyLength { expected: u32, actual: u32 },
+    #[error("message store error: {0}")]
+    Store(String),
 }
 
 /// Generate a fresh identity: Ed25519 signing keypair + X25519 agreement keypair.
