@@ -50,6 +50,8 @@ pub enum CoreError {
     Crypto(String),
     #[error("signature verification failed")]
     SignatureInvalid,
+    #[error("malformed wire data: {0}")]
+    Malformed(String),
 }
 
 /// Generate a fresh identity: Ed25519 signing keypair + X25519 agreement keypair.
