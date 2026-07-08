@@ -16,8 +16,11 @@
 //!    actual C libsodium build (a much larger, autotools-based cross-compile
 //!    surface than `rusqlite`'s bundled SQLite amalgamation).
 //!
-//! The sealed envelope on the wire is `ephemeral_pubkey(32) || nonce(24) ||
-//! ciphertext+tag`. This is a from-scratch construction, not a byte-for-byte
+//! The sealed envelope on the wire is `version(1) || ephemeral_pubkey(32) ||
+//! nonce(24) || ciphertext+tag`. The leading version byte (currently 0x01)
+//! is DESIGN.md §6.3's upgrade hook: a future ratchet/PQ envelope bumps it,
+//! and old clients fail closed on envelopes they can't correctly open
+//! instead of misparsing them. This is a from-scratch construction, not a byte-for-byte
 //! reimplementation of libsodium's `crypto_box_seal` (which derives its
 //! nonce from the two public keys to save 24 bytes on the wire) -- here a
 //! nonce is generated fresh per message instead, which is simpler and
@@ -31,6 +34,7 @@ use rand_core::OsRng;
 use crate::identity::derive_user_id;
 use crate::{CoreError, Identity};
 
+const ENVELOPE_VERSION: u8 = 1;
 const PAD_BUCKET: usize = 256;
 const EPHEMERAL_PK_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
@@ -72,7 +76,8 @@ pub fn seal_message(
         .encrypt(&nonce, padded.as_slice())
         .map_err(|_| CoreError::Crypto("seal failed".to_string()))?;
 
-    let mut envelope = Vec::with_capacity(EPHEMERAL_PK_LEN + NONCE_LEN + ciphertext.len());
+    let mut envelope = Vec::with_capacity(1 + EPHEMERAL_PK_LEN + NONCE_LEN + ciphertext.len());
+    envelope.push(ENVELOPE_VERSION);
     envelope.extend_from_slice(ephemeral_pk.as_bytes());
     envelope.extend_from_slice(nonce.as_slice());
     envelope.extend_from_slice(&ciphertext);
@@ -83,10 +88,17 @@ pub fn seal_message(
 /// signature, and return the sender's UserID alongside the plaintext payload.
 #[uniffi::export]
 pub fn open_message(recipient: Identity, sealed: Vec<u8>) -> Result<OpenedMessage, CoreError> {
-    if sealed.len() < EPHEMERAL_PK_LEN + NONCE_LEN {
+    if sealed.len() < 1 + EPHEMERAL_PK_LEN + NONCE_LEN {
         return Err(CoreError::Crypto("envelope too short".to_string()));
     }
-    let (ephemeral_pk_bytes, rest) = sealed.split_at(EPHEMERAL_PK_LEN);
+    let (version, rest) = sealed.split_at(1);
+    if version[0] != ENVELOPE_VERSION {
+        return Err(CoreError::Crypto(format!(
+            "unsupported envelope version {} (this client speaks {ENVELOPE_VERSION})",
+            version[0]
+        )));
+    }
+    let (ephemeral_pk_bytes, rest) = rest.split_at(EPHEMERAL_PK_LEN);
     let (nonce_bytes, ciphertext) = rest.split_at(NONCE_LEN);
 
     let ephemeral_pk = public_key_from_bytes(ephemeral_pk_bytes)?;
@@ -200,7 +212,7 @@ mod tests {
 
         let sealed = seal_message(alice, bob.agree_pk.clone(), b"secret".to_vec()).expect("seal succeeds");
         let err = open_message(mallory, sealed).unwrap_err();
-        matches!(err, CoreError::Crypto(_));
+        assert!(matches!(err, CoreError::Crypto(_)));
     }
 
     #[test]
@@ -214,7 +226,7 @@ mod tests {
         sealed[last] ^= 0xFF;
 
         let err = open_message(bob, sealed).unwrap_err();
-        matches!(err, CoreError::Crypto(_));
+        assert!(matches!(err, CoreError::Crypto(_)));
     }
 
     #[test]
@@ -223,8 +235,8 @@ mod tests {
         let bob = generate_identity();
 
         let sealed = seal_message(alice, bob.agree_pk.clone(), b"hi".to_vec()).expect("seal succeeds");
-        // envelope = 32-byte ephemeral pk + 24-byte nonce + (256-byte padded body + 16-byte AEAD tag)
-        assert_eq!(sealed.len(), 32 + 24 + 256 + 16);
+        // envelope = version byte + 32-byte ephemeral pk + 24-byte nonce + (256-byte padded body + 16-byte AEAD tag)
+        assert_eq!(sealed.len(), 1 + 32 + 24 + 256 + 16);
     }
 
     #[test]
@@ -235,6 +247,20 @@ mod tests {
         // signed body = 32 (sender pk) + 64 (sig) + payload; push just past one 256-byte bucket.
         let payload = vec![0u8; 200];
         let sealed = seal_message(alice, bob.agree_pk.clone(), payload).expect("seal succeeds");
-        assert_eq!(sealed.len(), 32 + 24 + 512 + 16);
+        assert_eq!(sealed.len(), 1 + 32 + 24 + 512 + 16);
+    }
+
+    #[test]
+    fn unknown_envelope_version_is_rejected() {
+        let alice = generate_identity();
+        let bob = generate_identity();
+
+        let mut sealed =
+            seal_message(alice, bob.agree_pk.clone(), b"hi".to_vec()).expect("seal succeeds");
+        assert_eq!(sealed[0], ENVELOPE_VERSION);
+        sealed[0] = 0x7F; // a future version this client doesn't speak
+
+        let err = open_message(bob, sealed).unwrap_err();
+        assert!(matches!(err, CoreError::Crypto(_)));
     }
 }

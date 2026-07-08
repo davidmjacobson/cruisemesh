@@ -22,10 +22,8 @@
 //! - **version**: sealed envelopes are the thing that will eventually need a
 //!   ratchet/PQ upgrade path (DESIGN.md §6.3's "envelope has a version byte
 //!   precisely so..."); that byte belongs to the envelope format in
-//!   `crypto.rs`, not to the message body decoded from inside it. This crate
-//!   doesn't yet add that envelope version byte (`crypto.rs` predates this
-//!   module and isn't this module's responsibility to change); flagged here
-//!   so a future milestone doesn't lose track of it.
+//!   `crypto.rs` (which carries it as its leading byte), not to the message
+//!   body decoded from inside it.
 //!
 //! What's left — `kind`, `chat_id`, `lamport`, `timestamp`, `content` — is
 //! exactly [`MessageBody`]. Wire layout (all multi-byte integers big-endian):
