@@ -9,6 +9,38 @@
 //! separate file: they're the other half of "who can I seal a message to,"
 //! which is exactly the data a message store needs alongside messages
 //! themselves.
+//!
+//! ## Receipts (DESIGN.md §7.2)
+//!
+//! The `receipts` table records what *this device's peer* has acknowledged
+//! about messages *this device sent*: "the peer has delivered/read messages
+//! authored by `sender_user_id` (this device's own UserID, from the peer's
+//! point of view) in `chat_id`, through `through_lamport`." Per §7.2 a
+//! receipt is cumulative, and receipts "are tiny, idempotent, and re-sent
+//! opportunistically on every peer sync, so a lost receipt heals itself" --
+//! which means the same or a stale receipt can arrive more than once, and an
+//! older cumulative value can arrive *after* a newer one (DTN reordering).
+//! [`MessageStore::record_receipt`] is therefore a monotonic upsert: it only
+//! ever raises `through_lamport`, never lowers it.
+//!
+//! ## Sync digests (DESIGN.md §7.3)
+//!
+//! On peer connect, each side summarizes what it already has per chat so the
+//! other side can send just what's missing. §7.3 describes that summary as
+//! "(chat id, highest-contiguous lamport, recent msg_id bloom filter)".
+//! [`MessageStore::chat_digest`] implements the contiguous-lamport half of
+//! that -- one [`DigestEntry`] per sender who has posted in the chat,
+//! reusing the same gap-aware [`MessageStore::highest_contiguous_lamport`]
+//! logic already needed for per-sender ordering. The bloom filter (which
+//! would additionally let out-of-order/non-contiguous messages be
+//! discovered without waiting for the gap to fill) is **not** implemented
+//! here -- it needs a design for what counts as "recent" and how false
+//! positives are handled, and the contiguous-lamport digest is enough to
+//! drive [`MessageStore::messages_after`] for the common case. TODO: add the
+//! bloom filter once §7.3's "recent msg_id" scope is nailed down.
+//! [`MessageStore::messages_after`] answers the other half: given what a
+//! peer's digest says they already have, which of *our* messages from a
+//! given sender are they missing.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
@@ -39,6 +71,14 @@ pub struct Contact {
     pub sign_pk: Vec<u8>,
     pub agree_pk: Vec<u8>,
     pub relay_url: Option<String>,
+}
+
+/// One entry of a per-chat sync digest (DESIGN.md §7.3): "I have `sender_user_id`'s
+/// messages in this chat contiguously through `through_lamport`."
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct DigestEntry {
+    pub sender_user_id: Vec<u8>,
+    pub through_lamport: u64,
 }
 
 #[derive(uniffi::Object)]
@@ -102,26 +142,107 @@ impl MessageStore {
         sender_user_id: Vec<u8>,
     ) -> Result<u64, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
+        highest_contiguous_lamport_locked(&conn, &chat_id, &sender_user_id)
+    }
+
+    /// A sync digest for `chat_id` (DESIGN.md §7.3): one [`DigestEntry`] per
+    /// distinct sender who has ever posted in this chat, each with their
+    /// [`MessageStore::highest_contiguous_lamport`]. Ordered by
+    /// `sender_user_id` for a deterministic wire encoding. See the module
+    /// docs for why this covers only the contiguous-lamport half of §7.3's
+    /// digest (the recent-msg_id bloom filter is deferred).
+    pub fn chat_digest(&self, chat_id: Vec<u8>) -> Result<Vec<DigestEntry>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn
             .prepare(
-                "SELECT lamport FROM messages
-                 WHERE chat_id = ?1 AND sender_user_id = ?2
+                "SELECT DISTINCT sender_user_id FROM messages
+                 WHERE chat_id = ?1 ORDER BY sender_user_id ASC",
+            )
+            .map_err(store_err)?;
+        let senders = stmt
+            .query_map(params![chat_id], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(store_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(store_err)?;
+
+        let mut entries = Vec::with_capacity(senders.len());
+        for sender_user_id in senders {
+            let through_lamport = highest_contiguous_lamport_locked(&conn, &chat_id, &sender_user_id)?;
+            entries.push(DigestEntry { sender_user_id, through_lamport });
+        }
+        Ok(entries)
+    }
+
+    /// Messages from `sender_user_id` in `chat_id` with `lamport >
+    /// after_lamport`, oldest first -- what a peer whose digest reported
+    /// `after_lamport` for this sender is missing (DESIGN.md §7.3).
+    pub fn messages_after(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        after_lamport: u64,
+    ) -> Result<Vec<StoredMessage>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+                 FROM messages
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport > ?3
                  ORDER BY lamport ASC",
             )
             .map_err(store_err)?;
-        let lamports = stmt
-            .query_map(params![chat_id, sender_user_id], |row| row.get::<_, i64>(0))
+        let rows = stmt
+            .query_map(params![chat_id, sender_user_id, after_lamport as i64], row_to_message)
             .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
 
-        let mut expected: u64 = 1;
-        for lamport in lamports {
-            let lamport = lamport.map_err(store_err)? as u64;
-            if lamport != expected {
-                break;
-            }
-            expected += 1;
-        }
-        Ok(expected - 1)
+    /// Record that a peer has delivered/read messages authored by
+    /// `sender_user_id` in `chat_id` through `through_lamport` (DESIGN.md
+    /// §7.2). Monotonic: if a receipt for the same (chat_id,
+    /// sender_user_id, receipt_type) is already recorded with a
+    /// `through_lamport` at or above this one, it's left unchanged --
+    /// receipts can arrive out of order or be replayed under DTN, and a
+    /// stale/duplicate receipt must never regress what's already known.
+    pub fn record_receipt(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        receipt_type: u8,
+        through_lamport: u64,
+    ) -> Result<(), CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "INSERT INTO receipts (chat_id, sender_user_id, receipt_type, through_lamport)
+                VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat_id, sender_user_id, receipt_type) DO UPDATE SET
+                through_lamport = MAX(through_lamport, excluded.through_lamport)",
+            params![chat_id, sender_user_id, receipt_type as i64, through_lamport as i64],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// The cumulative lamport a receipt of `receipt_type` covers for
+    /// `sender_user_id`'s messages in `chat_id` (DESIGN.md §7.2). Returns 0
+    /// if no such receipt has been recorded.
+    pub fn receipt_through(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        receipt_type: u8,
+    ) -> Result<u64, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let through: Option<i64> = conn
+            .query_row(
+                "SELECT through_lamport FROM receipts
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
+                params![chat_id, sender_user_id, receipt_type as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(through.unwrap_or(0) as u64)
     }
 
     /// Add or update a contact, keyed on `user_id` -- re-scanning the same
@@ -172,6 +293,37 @@ impl MessageStore {
     }
 }
 
+/// Shared by [`MessageStore::highest_contiguous_lamport`] and
+/// [`MessageStore::chat_digest`] (which needs it once per sender, under a
+/// single lock acquisition -- `Connection`'s `Mutex` isn't reentrant, so
+/// `chat_digest` can't just call the `&self` method above for each sender).
+fn highest_contiguous_lamport_locked(
+    conn: &Connection,
+    chat_id: &[u8],
+    sender_user_id: &[u8],
+) -> Result<u64, CoreError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT lamport FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2
+             ORDER BY lamport ASC",
+        )
+        .map_err(store_err)?;
+    let lamports = stmt
+        .query_map(params![chat_id, sender_user_id], |row| row.get::<_, i64>(0))
+        .map_err(store_err)?;
+
+    let mut expected: u64 = 1;
+    for lamport in lamports {
+        let lamport = lamport.map_err(store_err)? as u64;
+        if lamport != expected {
+            break;
+        }
+        expected += 1;
+    }
+    Ok(expected - 1)
+}
+
 fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
     Ok(StoredMessage {
         chat_id: row.get(0)?,
@@ -216,6 +368,14 @@ CREATE TABLE IF NOT EXISTS contacts (
     sign_pk   BLOB NOT NULL,
     agree_pk  BLOB NOT NULL,
     relay_url TEXT
+);
+
+CREATE TABLE IF NOT EXISTS receipts (
+    chat_id         BLOB NOT NULL,
+    sender_user_id  BLOB NOT NULL,
+    receipt_type    INTEGER NOT NULL,
+    through_lamport INTEGER NOT NULL,
+    PRIMARY KEY(chat_id, sender_user_id, receipt_type)
 );
 ";
 
@@ -351,5 +511,196 @@ mod tests {
 
         let names: Vec<String> = store.list_contacts().unwrap().into_iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
+    // --- receipts (DESIGN.md §7.2) -----------------------------------------
+
+    #[test]
+    fn receipt_through_is_zero_when_none_recorded() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let through = store
+            .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+            .unwrap();
+        assert_eq!(through, 0);
+    }
+
+    #[test]
+    fn record_receipt_round_trips() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 5)
+            .unwrap();
+
+        let through = store
+            .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+            .unwrap();
+        assert_eq!(through, 5);
+    }
+
+    #[test]
+    fn record_receipt_is_monotonic_upward() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 5)
+            .unwrap();
+        store
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 9)
+            .unwrap();
+
+        let through = store
+            .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+            .unwrap();
+        assert_eq!(through, 9);
+    }
+
+    #[test]
+    fn record_receipt_never_regresses_on_a_lower_or_replayed_value() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 9)
+            .unwrap();
+        // A stale/replayed receipt (lower, or the same, value) must not undo progress.
+        store
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 3)
+            .unwrap();
+        store
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 9)
+            .unwrap();
+
+        let through = store
+            .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+            .unwrap();
+        assert_eq!(through, 9);
+    }
+
+    #[test]
+    fn receipt_types_are_independent() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 9)
+            .unwrap();
+        store
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_READ, 4)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            9
+        );
+        assert_eq!(
+            store
+                .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_READ)
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn receipts_are_independent_per_chat() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 9)
+            .unwrap();
+        store
+            .record_receipt(b"chat-b".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 2)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            9
+        );
+        assert_eq!(
+            store
+                .receipt_through(b"chat-b".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            2
+        );
+    }
+
+    // --- sync digests (DESIGN.md §7.3) -------------------------------------
+
+    #[test]
+    fn chat_digest_is_empty_for_unknown_chat() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert_eq!(store.chat_digest(b"chat-a".to_vec()).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn chat_digest_has_one_entry_per_sender_with_their_contiguous_lamport() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.insert_message(msg(b"chat-a", b"alice", 1, "one")).unwrap();
+        store.insert_message(msg(b"chat-a", b"alice", 2, "two")).unwrap();
+        // A gap: lamport 3 missing for alice.
+        store.insert_message(msg(b"chat-a", b"alice", 4, "four")).unwrap();
+        store.insert_message(msg(b"chat-a", b"bob", 1, "hey")).unwrap();
+
+        let digest = store.chat_digest(b"chat-a".to_vec()).unwrap();
+        assert_eq!(
+            digest,
+            vec![
+                DigestEntry { sender_user_id: b"alice".to_vec(), through_lamport: 2 },
+                DigestEntry { sender_user_id: b"bob".to_vec(), through_lamport: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn messages_after_returns_only_newer_messages_ascending() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.insert_message(msg(b"chat-a", b"alice", 1, "one")).unwrap();
+        store.insert_message(msg(b"chat-a", b"alice", 2, "two")).unwrap();
+        store.insert_message(msg(b"chat-a", b"alice", 3, "three")).unwrap();
+
+        let missing = store.messages_after(b"chat-a".to_vec(), b"alice".to_vec(), 1).unwrap();
+        let payloads: Vec<Vec<u8>> = missing.into_iter().map(|m| m.payload).collect();
+        assert_eq!(payloads, vec![b"two".to_vec(), b"three".to_vec()]);
+    }
+
+    #[test]
+    fn messages_after_zero_returns_everything() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.insert_message(msg(b"chat-a", b"alice", 1, "one")).unwrap();
+        store.insert_message(msg(b"chat-a", b"alice", 2, "two")).unwrap();
+
+        let missing = store.messages_after(b"chat-a".to_vec(), b"alice".to_vec(), 0).unwrap();
+        assert_eq!(missing.len(), 2);
+    }
+
+    /// The composition §7.3 sync relies on: A has messages B lacks; feeding
+    /// B's digest into A's `messages_after` per sender yields exactly what B
+    /// is missing, no more and no less.
+    #[test]
+    fn chat_digest_and_messages_after_compose_to_find_exactly_the_gap() {
+        let store_a = MessageStore::open(":memory:".to_string()).unwrap();
+        let store_b = MessageStore::open(":memory:".to_string()).unwrap();
+
+        for lamport in 1..=5u64 {
+            let m = msg(b"chat-a", b"alice", lamport, &format!("msg-{lamport}"));
+            store_a.insert_message(m).unwrap();
+        }
+        // B only has the first two.
+        store_b.insert_message(msg(b"chat-a", b"alice", 1, "msg-1")).unwrap();
+        store_b.insert_message(msg(b"chat-a", b"alice", 2, "msg-2")).unwrap();
+
+        let b_digest = store_b.chat_digest(b"chat-a".to_vec()).unwrap();
+        assert_eq!(b_digest, vec![DigestEntry { sender_user_id: b"alice".to_vec(), through_lamport: 2 }]);
+
+        let mut all_missing = Vec::new();
+        for entry in &b_digest {
+            let missing = store_a
+                .messages_after(b"chat-a".to_vec(), entry.sender_user_id.clone(), entry.through_lamport)
+                .unwrap();
+            all_missing.extend(missing);
+        }
+
+        let payloads: Vec<Vec<u8>> = all_missing.into_iter().map(|m| m.payload).collect();
+        assert_eq!(
+            payloads,
+            vec![b"msg-3".to_vec(), b"msg-4".to_vec(), b"msg-5".to_vec()]
+        );
     }
 }

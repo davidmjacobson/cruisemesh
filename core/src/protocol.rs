@@ -82,6 +82,7 @@
 //!
 //! - `0x01` = HELLO: an **unauthenticated** `user_id` announcement.
 //! - `0x02` = sealed envelope: an opaque sealed blob (crypto.rs's output).
+//! - `0x03` = DIGEST: a per-chat sync digest (DESIGN.md §7.3; layout below).
 //!
 //! **Why HELLO is deliberately unauthenticated:** BLE central/peripheral
 //! roles only give you a transient, unauthenticated link (a MAC-layer
@@ -100,7 +101,45 @@
 //! under normal DTN operation (§3), so it was judged not worth spending a
 //! signature (and the extra round trip / battery cost of verifying one) on
 //! every connection handshake.
+//!
+//! ## DIGEST frame (DESIGN.md §7.3)
+//!
+//! On connect, each peer sends a digest summarizing what it already has so
+//! the other side can send just the difference (via the store's
+//! `messages_after`). One digest frame covers **one** chat -- in the 1:1
+//! case the chat is named by the sender's own UserID, per the wire
+//! convention the Android `MeshService` already uses for envelopes -- and
+//! carries one entry per sender in that chat: "(sender_user_id,
+//! through_lamport)", i.e. "I have this sender's messages contiguously
+//! through this lamport" ([`crate::DigestEntry`], computed by the store's
+//! `chat_digest`). Layout (big-endian, like everything else here):
+//!
+//! ```text
+//! offset  size  field
+//! 0       1     frame type          (0x03)
+//! 1       2     chat_id_len         (u16 BE)
+//! 3       N     chat_id             (N = chat_id_len bytes)
+//! 3+N     2     entry_count         (u16 BE)
+//! then, per entry:
+//!         2     sender_user_id_len  (u16 BE)
+//!         M     sender_user_id      (M = sender_user_id_len bytes)
+//!         8     through_lamport     (u64 BE)
+//! ```
+//!
+//! Unlike HELLO/envelope bodies, the digest body is structured (it holds a
+//! list), so it carries internal length prefixes; the frame as a whole is
+//! still delimited by the BLE link layer (§5.2), and decoding rejects
+//! trailing garbage. `entry_count` may be 0 -- "I have nothing in this
+//! chat" is a valid, useful digest (it asks for everything). Like HELLO, a
+//! digest is unauthenticated link-layer chatter: lying in one can at worst
+//! cause a peer to retransmit sealed envelopes (idempotent by design,
+//! §7.3) or withhold them from a link, never to disclose or forge content.
+//! §7.3's "recent msg_id bloom filter" component of the digest is
+//! deliberately **not** part of this frame yet -- see the module docs in
+//! `store.rs` for why it's deferred; the version-less frame-type scheme
+//! leaves room for a richer digest frame type later.
 
+use crate::store::DigestEntry;
 use crate::CoreError;
 
 /// `MessageBody.kind` value for an ordinary text message (DESIGN.md §7.1).
@@ -118,6 +157,7 @@ pub const RECEIPT_TYPE_READ: u8 = 2;
 
 const FRAME_TYPE_HELLO: u8 = 0x01;
 const FRAME_TYPE_ENVELOPE: u8 = 0x02;
+const FRAME_TYPE_DIGEST: u8 = 0x03;
 
 /// The plaintext body that gets encoded, then handed as `payload` to
 /// [`crate::seal_message`] (DESIGN.md §7.1). See the module docs for the
@@ -194,12 +234,14 @@ pub fn decode_receipt_content(bytes: Vec<u8>) -> Result<ReceiptContent, CoreErro
     Ok(ReceiptContent { chat_id, sender_user_id, lamport, receipt_type })
 }
 
-/// A parsed BLE frame: either an unauthenticated HELLO (see module docs for
-/// why that's a considered choice) or an opaque sealed envelope.
+/// A parsed BLE frame: an unauthenticated HELLO (see module docs for why
+/// that's a considered choice), an opaque sealed envelope, or a per-chat
+/// sync digest (DESIGN.md §7.3).
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
 pub enum Frame {
     Hello { user_id: Vec<u8> },
     Envelope { sealed: Vec<u8> },
+    Digest { chat_id: Vec<u8>, entries: Vec<DigestEntry> },
 }
 
 /// Encode a HELLO frame: frame-type byte `0x01` followed by `user_id`
@@ -225,8 +267,33 @@ pub fn encode_envelope_frame(sealed: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// Encode a DIGEST frame for one chat (see module docs for layout and for
+/// the one-chat-per-frame convention): frame-type byte `0x03`, then
+/// `chat_id` (16-bit length prefix), then `entries` as a 16-bit count
+/// followed by each entry's `sender_user_id` (16-bit length prefix) and
+/// `through_lamport` (u64 BE). `entries` is typically the output of the
+/// store's `chat_digest`; an empty list is valid ("send me everything").
+#[uniffi::export]
+pub fn encode_digest(chat_id: Vec<u8>, entries: Vec<DigestEntry>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        1 + 2
+            + chat_id.len()
+            + 2
+            + entries.iter().map(|e| 2 + e.sender_user_id.len() + 8).sum::<usize>(),
+    );
+    out.push(FRAME_TYPE_DIGEST);
+    write_bytes16(&mut out, &chat_id);
+    out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    for entry in &entries {
+        write_bytes16(&mut out, &entry.sender_user_id);
+        out.extend_from_slice(&entry.through_lamport.to_be_bytes());
+    }
+    out
+}
+
 /// Parse a frame-type byte + body into a [`Frame`]. Rejects empty input, an
-/// unrecognized frame-type byte, and a HELLO/envelope frame with no body.
+/// unrecognized frame-type byte, a HELLO/envelope frame with no body, and a
+/// truncated or trailing-garbage DIGEST body.
 #[uniffi::export]
 pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
     let (frame_type, rest) = bytes
@@ -246,6 +313,19 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
                 ));
             }
             Ok(Frame::Envelope { sealed: rest.to_vec() })
+        }
+        FRAME_TYPE_DIGEST => {
+            let mut cursor = Cursor::new(rest);
+            let chat_id = cursor.take_bytes16()?;
+            let entry_count = cursor.take_u16()? as usize;
+            let mut entries = Vec::with_capacity(entry_count.min(rest.len()));
+            for _ in 0..entry_count {
+                let sender_user_id = cursor.take_bytes16()?;
+                let through_lamport = cursor.take_u64()?;
+                entries.push(DigestEntry { sender_user_id, through_lamport });
+            }
+            cursor.finish()?;
+            Ok(Frame::Digest { chat_id, entries })
         }
         other => Err(CoreError::Malformed(format!("unknown frame type byte: 0x{other:02x}"))),
     }
@@ -497,6 +577,106 @@ mod tests {
     #[test]
     fn parse_frame_rejects_envelope_with_no_sealed_bytes() {
         let err = parse_frame(vec![0x02]).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    fn sample_entries() -> Vec<DigestEntry> {
+        vec![
+            DigestEntry { sender_user_id: b"alice-user-id-16".to_vec(), through_lamport: 12 },
+            DigestEntry { sender_user_id: b"bob-user-id-1616".to_vec(), through_lamport: 3 },
+        ]
+    }
+
+    #[test]
+    fn digest_frame_round_trips() {
+        let chat_id = b"chat-1".to_vec();
+        let entries = sample_entries();
+        let framed = encode_digest(chat_id.clone(), entries.clone());
+        assert_eq!(framed[0], 0x03);
+        match parse_frame(framed).expect("parses") {
+            Frame::Digest { chat_id: got_chat, entries: got_entries } => {
+                assert_eq!(got_chat, chat_id);
+                assert_eq!(got_entries, entries);
+            }
+            other => panic!("expected Digest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn digest_frame_round_trips_with_no_entries() {
+        // "I have nothing in this chat" is a valid digest (asks for everything).
+        let framed = encode_digest(b"chat-1".to_vec(), Vec::new());
+        match parse_frame(framed).expect("parses") {
+            Frame::Digest { chat_id, entries } => {
+                assert_eq!(chat_id, b"chat-1".to_vec());
+                assert!(entries.is_empty());
+            }
+            other => panic!("expected Digest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn digest_frame_round_trips_with_empty_chat_id_and_max_lamport() {
+        let entries =
+            vec![DigestEntry { sender_user_id: b"alice".to_vec(), through_lamport: u64::MAX }];
+        let framed = encode_digest(Vec::new(), entries.clone());
+        match parse_frame(framed).expect("parses") {
+            Frame::Digest { chat_id, entries: got } => {
+                assert!(chat_id.is_empty());
+                assert_eq!(got, entries);
+            }
+            other => panic!("expected Digest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_frame_rejects_digest_with_empty_body() {
+        // Type byte alone: not even a chat_id length prefix.
+        let err = parse_frame(vec![0x03]).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn parse_frame_rejects_digest_with_truncated_chat_id() {
+        // chat_id_len claims 10 bytes, none follow.
+        let err = parse_frame(vec![0x03, 0x00, 0x0A]).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn parse_frame_rejects_digest_missing_entry_count() {
+        // Valid empty chat_id, then nothing where entry_count should be.
+        let err = parse_frame(vec![0x03, 0x00, 0x00]).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn parse_frame_rejects_digest_with_fewer_entries_than_claimed() {
+        // Empty chat_id, entry_count = 2, but only one (complete) entry follows.
+        let mut bytes = vec![0x03, 0x00, 0x00, 0x00, 0x02];
+        bytes.extend_from_slice(&(5u16).to_be_bytes());
+        bytes.extend_from_slice(b"alice");
+        bytes.extend_from_slice(&7u64.to_be_bytes());
+        let err = parse_frame(bytes).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn parse_frame_rejects_digest_with_truncated_lamport() {
+        // One entry whose through_lamport is cut short.
+        let mut bytes = vec![0x03, 0x00, 0x00, 0x00, 0x01];
+        bytes.extend_from_slice(&(5u16).to_be_bytes());
+        bytes.extend_from_slice(b"alice");
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00]); // 3 of 8 lamport bytes
+        let err = parse_frame(bytes).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn parse_frame_rejects_digest_with_trailing_garbage() {
+        let mut framed = encode_digest(b"chat-1".to_vec(), sample_entries());
+        framed.push(0xFF);
+        let err = parse_frame(framed).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
     }
 
