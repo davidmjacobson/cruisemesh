@@ -16,7 +16,11 @@ import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.identity.IdentityStore
+import com.cruisemesh.app.notify.ChatVisibility
+import com.cruisemesh.app.notify.MessageNotifier
+import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
+import uniffi.cruisemesh_core.DigestEntry
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageBody
@@ -25,6 +29,7 @@ import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.decodeMessageBody
 import uniffi.cruisemesh_core.decodeReceiptContent
+import uniffi.cruisemesh_core.encodeDigest
 import uniffi.cruisemesh_core.encodeEnvelopeFrame
 import uniffi.cruisemesh_core.encodeHello
 import uniffi.cruisemesh_core.encodeMessageBody
@@ -41,8 +46,9 @@ private const val NOTIFICATION_ID = 1
 private const val KIND_TEXT: UByte = 1u
 private const val KIND_RECEIPT: UByte = 2u
 
-/** `receipt_type` for a "delivered" receipt (DESIGN.md §7.2); "read" is a later milestone. */
+/** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
+private const val RECEIPT_TYPE_READ: UByte = 2u
 
 /**
  * Runs both BLE GATT roles simultaneously (DESIGN.md §5.2) so this device can
@@ -75,7 +81,12 @@ private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
  * convention applies to receipts (see [handleIncomingText]'s outgoing
  * receipt): a receipt's wire `chatId` is the *receipt sender's* own userId
  * (i.e. mine, when I'm acking someone else's message), for the identical
- * reason.
+ * reason. And it applies to DIGEST frames too (DESIGN.md §7.3, see
+ * [handleHello]'s outgoing digest and [handleDigest]'s sanity check): a
+ * digest's wire `chatId` is the *digest sender's* own userId, so "does this
+ * digest's chatId match what [MeshRouter] learned from this link's HELLO"
+ * is exactly the right check for "is this digest about the chat I think it
+ * is."
  */
 class MeshService : Service() {
 
@@ -116,6 +127,7 @@ class MeshService : Service() {
 
         MeshRouter.registerCentral(central::sendFrame)
         MeshRouter.registerPeripheral(peripheral::sendFrame)
+        ChatViewEvents.register(::handleChatViewed)
 
         peripheral.start()
         central.start()
@@ -127,6 +139,7 @@ class MeshService : Service() {
         central.stop()
         MeshRouter.unregisterCentral()
         MeshRouter.unregisterPeripheral()
+        ChatViewEvents.unregister()
         // stop() above tears down connections without per-address disconnect
         // callbacks, so clear the router's mappings wholesale.
         MeshRouter.reset()
@@ -171,27 +184,30 @@ class MeshService : Service() {
         when (parsed) {
             is Frame.Hello -> handleHello(address, parsed.userId, identity)
             is Frame.Envelope -> handleEnvelope(address, parsed.sealed, identity)
+            is Frame.Digest -> handleDigest(address, parsed.chatId, parsed.entries, identity)
         }
     }
 
     /**
      * HELLO handling (DESIGN.md §5.2 handshake). Records the address->userId
-     * mapping, then -- only for a known contact -- replays every message
-     * *we* authored into that contact's chat.
-     *
-     * This is a deliberately naive stand-in for the real digest exchange
-     * (DESIGN.md §7.3): rather than figuring out what the peer is actually
-     * missing, we just resend our entire outgoing history for that chat on
-     * every reconnect. That's safe because [MessageStore.insertMessage] is
-     * idempotent on the receiving end (it returns `false` and stores nothing
-     * for a duplicate), so replaying already-delivered messages is a wasted
-     * radio write, never a correctness problem. Milestone 2 replaces this
-     * with real per-chat digests (highest-contiguous-lamport + a msg_id
-     * bloom filter) so only the actual gap gets resent.
+     * mapping, then -- only for a known contact -- kicks off the real digest
+     * sync (DESIGN.md §7.3) for that 1:1 chat: we send our own digest for
+     * this chat on the same link, i.e. "here's what I have from myself,
+     * contiguously, through lamport N per sender." That's the wire-chatId
+     * convention from the class KDoc applied to DIGEST frames: `chatId` here
+     * is OUR OWN userId, and `entries` is [MessageStore.chatDigest] keyed by
+     * the *local* chat (the contact's userId), because locally that's how
+     * this 1:1 chat's history is stored. The peer's [handleDigest] uses the
+     * matching digest we sent it (from a prior HELLO) the same way to send
+     * us what we're missing -- see that method for the receiving half of
+     * this exchange. This replaces the earlier naive stand-in that just
+     * resent our entire outgoing history on every reconnect.
      *
      * An unrecognized userId means "not a friend (yet)" -- we keep the
      * address mapping (they may friend us later this session) but send
-     * nothing, since we have no key to seal anything to them with.
+     * nothing, since we have no key to seal anything to them with, and a
+     * digest to a stranger we can't sync with anyway would be pointless
+     * (see [handleDigest]'s KDoc for why it's also harmless).
      */
     private fun handleHello(address: String, userId: ByteArray, identity: Identity) {
         Log.i(TAG, "HELLO from $address: userId=${UserIdHex.encode(userId)}")
@@ -199,13 +215,59 @@ class MeshService : Service() {
 
         val contact = store.getContact(userId)
         if (contact == null) {
-            Log.i(TAG, "HELLO from unrecognized userId=${UserIdHex.encode(userId)}; not replaying anything")
+            Log.i(TAG, "HELLO from unrecognized userId=${UserIdHex.encode(userId)}; not syncing anything")
             return
         }
 
-        val ownMessages = store.messagesForChat(contact.userId)
-            .filter { it.kind == KIND_TEXT && it.senderUserId.contentEquals(identity.userId) }
-        for (message in ownMessages) {
+        val digestFrame = encodeDigest(identity.userId, store.chatDigest(contact.userId))
+        MeshRouter.sendToAddress(address, digestFrame)
+    }
+
+    /**
+     * DIGEST handling (DESIGN.md §7.3): the peer just told us, per-sender,
+     * what it has contiguously in this 1:1 chat. [DigestSync.isExpectedChatId]
+     * checks the wire-chatId sanity condition from the class KDoc -- the
+     * digest's `chatId` must equal the userId [MeshRouter] learned for this
+     * address via its HELLO. A mismatch, or a digest before any HELLO on
+     * this link, means the frame is out of order, so it's logged and
+     * dropped rather than acted on.
+     *
+     * We only ever act on the entry for OUR OWN userId
+     * ([DigestSync.throughLamportForSelf]) -- that's the peer reporting what
+     * of *our* authored history it's missing. Entries about other senders
+     * are foreign mule traffic and a later milestone (relay, DESIGN.md
+     * §5.3), so they're ignored here.
+     *
+     * Security note (see also this class's KDoc and the core's
+     * `protocol.rs` module docs): a DIGEST, like a HELLO, is unauthenticated
+     * plaintext link chatter -- there is no signature over it. A lying peer
+     * can therefore only ever cause us to (a) resend
+     * already-delivered messages, which is harmless because
+     * [MessageStore.insertMessage] is idempotent on their end, or (b)
+     * withhold sending on this one link if it falsely claims to already
+     * have everything, which is harmless because we still have the message
+     * locally and the next honest sync (a reconnect, or a different link to
+     * the same peer) resends it. It can never cause disclosure -- the
+     * resent content is still a sealed envelope only the real recipient can
+     * open -- or forgery, since nothing a DIGEST says is ever written to
+     * our own store.
+     */
+    private fun handleDigest(address: String, chatId: ByteArray, entries: List<DigestEntry>, identity: Identity) {
+        val peerUserId = MeshRouter.userIdFor(address)
+        if (!DigestSync.isExpectedChatId(chatId, peerUserId)) {
+            Log.w(TAG, "Dropping DIGEST from $address: chatId doesn't match this link's HELLO (or no HELLO seen yet)")
+            return
+        }
+
+        val contact = store.getContact(peerUserId!!)
+        if (contact == null) {
+            Log.i(TAG, "DIGEST from unrecognized userId=${UserIdHex.encode(peerUserId)}; nothing to sync")
+            return
+        }
+
+        val peerHasThrough = DigestSync.throughLamportForSelf(entries, identity.userId)
+        val missing = store.messagesAfter(contact.userId, identity.userId, peerHasThrough)
+        for (message in missing) {
             sendSealedEnvelope(
                 identity = identity,
                 recipientAgreePk = contact.agreePk,
@@ -243,23 +305,34 @@ class MeshService : Service() {
 
         when (body.kind) {
             KIND_TEXT -> handleIncomingText(address, opened.senderUserId, body, identity)
-            KIND_RECEIPT -> handleIncomingReceipt(address, body)
+            KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
         }
     }
 
     /**
      * Stores an incoming text message and, only if it was newly inserted,
-     * sends a delivered receipt back on the same link (DESIGN.md §7.2). A
-     * duplicate (e.g. re-sent by the peer's own HELLO replay above) is a
-     * silent no-op here -- it was already acknowledged the first time, and
-     * re-acking it wouldn't change anything, so this path can never send two
-     * receipts for one message.
+     * sends a delivered receipt back on the same link (DESIGN.md §7.2), plus
+     * -- if the chat is currently on screen ([ChatVisibility.isVisible]) -- a
+     * read receipt too. Otherwise, posts a notification
+     * ([MessageNotifier.notifyIncomingMessage]) instead, since the chat isn't
+     * visible for the user to see the message land. Those two are mutually
+     * exclusive by construction (`if (visible) read-receipt else notify`),
+     * which matches the product intent: no point notifying about a chat the
+     * user is already looking at, and no point sending a read receipt for
+     * one they aren't.
+     *
+     * A duplicate insert (e.g. re-sent by the peer's digest sync above,
+     * DESIGN.md §7.3) is a silent no-op here -- it was already acknowledged
+     * (and, if applicable, notified) the first time, and redoing either
+     * wouldn't change anything, so this path can never send two receipts or
+     * two notifications for one message.
      *
      * This never triggers another receipt (see [handleIncomingReceipt]):
      * receipts are kind=2, this branch only ever runs for kind=1, and
-     * [handleIncomingReceipt] never calls back into this method. Combined
-     * with [handleHello] only ever replaying kind=1 messages we authored,
+     * [handleIncomingReceipt] never calls [sendReceiptOnAddress] or
+     * [sendReceiptToContact] or otherwise sends anything back. Combined with
+     * [handleDigest] only ever resending kind=1 messages we authored,
      * there's no cycle where a receipt causes a receipt.
      */
     private fun handleIncomingText(address: String, senderUserId: ByteArray, body: MessageBody, identity: Identity) {
@@ -280,18 +353,120 @@ class MeshService : Service() {
         if (contact == null) {
             // We stored the message (friending can happen independently of
             // messaging order), but with no contact we have no agreePk to
-            // seal a receipt to, so skip it.
-            Log.i(TAG, "Stored a message from unrecognized userId=${UserIdHex.encode(senderUserId)}; no receipt to send")
+            // seal a receipt to, and nothing sensible to show in a
+            // notification (no display name, no key to trust it came from
+            // who it claims), so skip both.
+            Log.i(TAG, "Stored a message from unrecognized userId=${UserIdHex.encode(senderUserId)}; no receipt/notification")
             return
         }
 
         val throughLamport = store.highestContiguousLamport(senderUserId, senderUserId)
-        val receipt = ReceiptContent(
-            chatId = identity.userId, // wire convention: chatId = this envelope's sender, i.e. us -- see class KDoc
-            senderUserId = senderUserId, // whose messages are being acknowledged
-            lamport = throughLamport,
-            receiptType = RECEIPT_TYPE_DELIVERED,
+        sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
+
+        if (ChatVisibility.isVisible(senderUserId)) {
+            // The user is already looking at this chat, so it was read the
+            // instant it landed -- send the read receipt now rather than
+            // waiting for ChatViewEvents, which only fires when a chat
+            // *becomes* visible, not for messages arriving while it already is.
+            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
+        } else {
+            MessageNotifier.notifyIncomingMessage(this, contact, body.content.toString(Charsets.UTF_8))
+        }
+    }
+
+    /**
+     * Persists an incoming receipt as a delivered/read watermark on our own
+     * outgoing messages (DESIGN.md §7.2) and pings [ChatEvents] so any open
+     * chat screen redraws its ✓/✓✓ ticks.
+     *
+     * Two sanity checks before trusting it, both log-and-drop on failure:
+     * - `receipt.senderUserId` must be OUR OWN userId. A receipt only ever
+     *   acknowledges messages *we* authored in a 1:1 chat -- a peer has no
+     *   business acking someone else's messages to us, so anything else here
+     *   is either a bug or a malicious/confused peer.
+     * - The outer envelope's verified sender ([envelopeSenderUserId], from
+     *   [handleEnvelope]'s `openMessage`) must be a known contact, since
+     *   that's the local `chatId` this receipt gets recorded under (see
+     *   below) and we only track receipts for chats we actually have.
+     *
+     * `store.recordReceipt`'s `senderUserId` param is OUR OWN userId here --
+     * not [envelopeSenderUserId] -- because it names whose *messages* the
+     * receipt is about (ours), while `chatId` is [envelopeSenderUserId]
+     * because locally a 1:1 chat is keyed by the other party (see class
+     * KDoc). This never sends anything back, so it cannot loop into another
+     * receipt (see [handleIncomingText]'s KDoc for the full argument).
+     */
+    private fun handleIncomingReceipt(address: String, envelopeSenderUserId: ByteArray, body: MessageBody, identity: Identity) {
+        val receipt = try {
+            decodeReceiptContent(body.content)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping receipt from $address: failed to decode (${e.message})")
+            return
+        }
+        if (!receipt.senderUserId.contentEquals(identity.userId)) {
+            Log.w(
+                TAG,
+                "Dropping receipt from $address: acks senderUserId=${UserIdHex.encode(receipt.senderUserId)}, " +
+                    "not us -- peers can only ack messages we authored",
+            )
+            return
+        }
+        val contact = store.getContact(envelopeSenderUserId)
+        if (contact == null) {
+            Log.w(TAG, "Dropping receipt from $address: envelope sender ${UserIdHex.encode(envelopeSenderUserId)} is not a known contact")
+            return
+        }
+
+        Log.i(
+            TAG,
+            "Receipt from $address: ackedSender=${UserIdHex.encode(receipt.senderUserId)} " +
+                "throughLamport=${receipt.lamport} type=${receipt.receiptType}",
         )
+        store.recordReceipt(
+            chatId = envelopeSenderUserId, // local convention: chat keyed by the other party -- see class KDoc
+            senderUserId = identity.userId, // whose messages this receipt is about: ours
+            receiptType = receipt.receiptType,
+            throughLamport = receipt.lamport,
+        )
+        ChatEvents.notifyChatChanged(envelopeSenderUserId)
+    }
+
+    /**
+     * [ChatViewEvents] handler: the user just opened [peerUserId]'s chat.
+     * Sends a READ receipt covering everything currently stored from that
+     * peer (DESIGN.md §7.2), via [sendReceiptToContact] rather than
+     * [sendReceiptOnAddress] since there's no specific link this was
+     * triggered from -- it goes out over whatever link [MeshRouter] can
+     * currently reach the contact on, if any.
+     *
+     * Best-effort like every receipt: if the peer isn't connected right now,
+     * [sendSealedEnvelopeToContact] simply no-ops (logged at INFO) and
+     * nothing is queued to retry. The read state re-syncs the next time this
+     * chat is viewed again, or the next time a new message from this peer
+     * arrives (see [handleIncomingText]'s immediate read receipt for an
+     * already-visible chat). A read receipt lost to the peer being briefly
+     * offline therefore stays unsent until one of those triggers happens --
+     * an accepted gap for this milestone, closed once receipts ride the
+     * digest sync (DESIGN.md §7.3) directly instead of being sent
+     * standalone.
+     */
+    private fun handleChatViewed(peerUserId: ByteArray) {
+        val identity = this.identity ?: return
+        val contact = store.getContact(peerUserId) ?: return
+        val throughLamport = store.highestContiguousLamport(peerUserId, peerUserId)
+        if (throughLamport == 0uL) return // nothing received from this peer yet to ack as read
+        sendReceiptToContact(identity, contact, RECEIPT_TYPE_READ, peerUserId, throughLamport)
+    }
+
+    /** Builds a [ReceiptContent] and sends it as a sealed envelope on the exact link [address] (a reply to a frame that just arrived on it). */
+    private fun sendReceiptOnAddress(
+        identity: Identity,
+        contact: Contact,
+        address: String,
+        receiptType: UByte,
+        ackedSenderUserId: ByteArray,
+        throughLamport: ULong,
+    ) {
         sendSealedEnvelope(
             identity = identity,
             recipientAgreePk = contact.agreePk,
@@ -300,34 +475,71 @@ class MeshService : Service() {
             // Receipts are not part of a chat's lamport stream (that's for
             // messages, DESIGN.md §7.1) and are never persisted on either
             // side -- lamport=0 here is deliberate filler, not a real
-            // sequence number. The actual cumulative "delivered through N"
-            // value lives in ReceiptContent.lamport above.
+            // sequence number. The actual cumulative "delivered/read through
+            // N" value lives in ReceiptContent.lamport below.
             lamport = 0uL,
             timestamp = System.currentTimeMillis(),
-            content = encodeReceiptContent(receipt),
+            content = encodeReceiptContent(
+                ReceiptContent(
+                    chatId = identity.userId, // wire convention: chatId = this envelope's sender, i.e. us -- see class KDoc
+                    senderUserId = ackedSenderUserId, // whose messages are being acknowledged
+                    lamport = throughLamport,
+                    receiptType = receiptType,
+                ),
+            ),
         )
     }
 
-    /**
-     * Logs an incoming receipt. Receipt persistence and turning it into a
-     * chat's ✓✓ tick (DESIGN.md §7.2) is UI/store work for a later step --
-     * this only proves the wire round-trip for now.
-     */
-    private fun handleIncomingReceipt(address: String, body: MessageBody) {
-        val receipt = try {
-            decodeReceiptContent(body.content)
+    /** Builds a [ReceiptContent] and sends it to whichever live link currently reaches [contact], if any -- see [handleChatViewed]. */
+    private fun sendReceiptToContact(
+        identity: Identity,
+        contact: Contact,
+        receiptType: UByte,
+        ackedSenderUserId: ByteArray,
+        throughLamport: ULong,
+    ) {
+        sendSealedEnvelopeToContact(
+            identity = identity,
+            contact = contact,
+            kind = KIND_RECEIPT,
+            lamport = 0uL, // see sendReceiptOnAddress's comment: deliberate filler, not a sequence number
+            timestamp = System.currentTimeMillis(),
+            content = encodeReceiptContent(
+                ReceiptContent(
+                    chatId = identity.userId,
+                    senderUserId = ackedSenderUserId,
+                    lamport = throughLamport,
+                    receiptType = receiptType,
+                ),
+            ),
+        )
+    }
+
+    /** Seals one [MessageBody] into an envelope frame, or null (logged) if sealing fails. */
+    private fun sealEnvelopeFrame(
+        identity: Identity,
+        recipientAgreePk: ByteArray,
+        kind: UByte,
+        lamport: ULong,
+        timestamp: Long,
+        content: ByteArray,
+    ): ByteArray? {
+        val body = MessageBody(
+            kind = kind,
+            chatId = identity.userId,
+            lamport = lamport,
+            timestamp = timestamp,
+            content = content,
+        )
+        return try {
+            encodeEnvelopeFrame(sealMessage(identity, recipientAgreePk, encodeMessageBody(body)))
         } catch (e: CoreException) {
-            Log.w(TAG, "Dropping receipt from $address: failed to decode (${e.message})")
-            return
+            Log.w(TAG, "Failed to seal outgoing kind=$kind frame: ${e.message}")
+            null
         }
-        Log.i(
-            TAG,
-            "Receipt from $address: ackedSender=${UserIdHex.encode(receipt.senderUserId)} " +
-                "throughLamport=${receipt.lamport} type=${receipt.receiptType}",
-        )
     }
 
-    /** Builds, seals, and sends one [MessageBody] as an envelope frame on [address]. */
+    /** Builds, seals, and sends one [MessageBody] as an envelope frame on the exact link [address]. */
     private fun sendSealedEnvelope(
         identity: Identity,
         recipientAgreePk: ByteArray,
@@ -337,20 +549,29 @@ class MeshService : Service() {
         timestamp: Long,
         content: ByteArray,
     ) {
-        val body = MessageBody(
-            kind = kind,
-            chatId = identity.userId,
-            lamport = lamport,
-            timestamp = timestamp,
-            content = content,
-        )
-        val sealed = try {
-            sealMessage(identity, recipientAgreePk, encodeMessageBody(body))
-        } catch (e: CoreException) {
-            Log.w(TAG, "Failed to seal outgoing kind=$kind frame for $address: ${e.message}")
-            return
+        val frame = sealEnvelopeFrame(identity, recipientAgreePk, kind, lamport, timestamp, content) ?: return
+        MeshRouter.sendToAddress(address, frame)
+    }
+
+    /**
+     * Builds, seals, and sends one [MessageBody] as an envelope frame to
+     * whichever live link [MeshRouter] currently has for [contact], if any
+     * (unlike [sendSealedEnvelope], which targets a specific already-known
+     * address). Used where the caller has a contact but not a triggering
+     * frame/address, e.g. [handleChatViewed]'s read-on-view receipt.
+     */
+    private fun sendSealedEnvelopeToContact(
+        identity: Identity,
+        contact: Contact,
+        kind: UByte,
+        lamport: ULong,
+        timestamp: Long,
+        content: ByteArray,
+    ) {
+        val frame = sealEnvelopeFrame(identity, contact.agreePk, kind, lamport, timestamp, content) ?: return
+        if (!MeshRouter.sendToUserId(contact.userId, frame)) {
+            Log.i(TAG, "kind=$kind message to ${UserIdHex.encode(contact.userId)} stays local; not currently connected")
         }
-        MeshRouter.sendToAddress(address, encodeEnvelopeFrame(sealed))
     }
 
     private fun hasRequiredPermissions(): Boolean {

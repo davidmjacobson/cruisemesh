@@ -34,6 +34,10 @@ import uniffi.cruisemesh_core.StoredMessage
 /** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
 private const val KIND_TEXT: kotlin.UByte = 1u
 
+/** `receipt_type` values (DESIGN.md §7.2), for reading own-message tick watermarks out of the store. */
+private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
+private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
+
 /**
  * A single 1:1 chat thread (DESIGN.md §7.1: for a 1:1 chat, `chat_id` is
  * simply the peer's UserID). Renders `kind=1` (text) messages oldest-first,
@@ -42,12 +46,18 @@ private const val KIND_TEXT: kotlin.UByte = 1u
  * against `ownUserId`, since [StoredMessage.senderUserId] is raw bytes).
  *
  * Sending goes through [sender] only -- see [MeshSender] for why the UI
- * never talks to a concrete transport directly. The thread is reloaded from
+ * never talks to a concrete transport directly. The thread (and the two
+ * receipt watermarks driving own-message ticks, see below) is reloaded from
  * [store] immediately after a send (for guaranteed instant feedback on the
  * UI thread) and whenever [ChatEvents] reports this chat changed -- which is
- * how a message [com.cruisemesh.app.mesh.MeshService] receives on a BLE
- * binder thread ends up on screen without a manual refresh or a polling
- * timer.
+ * how a message or receipt [com.cruisemesh.app.mesh.MeshService] receives on
+ * a BLE binder thread ends up on screen without a manual refresh or a
+ * polling timer.
+ *
+ * Own messages render a ✓/✓✓ tick (DESIGN.md §7.2), derived per-message from
+ * two cumulative watermarks loaded alongside the message list:
+ * `receiptThrough(chatId, ownUserId, DELIVERED/READ)`. See [TickStatus] and
+ * [tickStatusFor] for the pure derivation and [MessageBubble] for rendering.
  */
 @Composable
 fun ChatScreen(
@@ -58,20 +68,37 @@ fun ChatScreen(
     onBack: () -> Unit,
 ) {
     var messages by remember(contact.userId) { mutableStateOf(store.messagesForChat(contact.userId)) }
+    var deliveredThrough by remember(contact.userId) {
+        mutableStateOf(store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_DELIVERED))
+    }
+    var readThrough by remember(contact.userId) {
+        mutableStateOf(store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_READ))
+    }
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
-    // Reload this thread whenever anything (MeshService on a BLE binder
-    // thread, a sender on the UI thread) reports its store contents changed.
+    // Reloads everything this screen renders from the store: the thread
+    // itself and the two cumulative receipt watermarks that drive each own
+    // bubble's tick (DESIGN.md §7.2). All three are cheap store reads, so
+    // there's no reason to reload them independently.
+    fun reload() {
+        messages = store.messagesForChat(contact.userId)
+        deliveredThrough = store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_DELIVERED)
+        readThrough = store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_READ)
+    }
+
+    // Reload whenever anything (MeshService on a BLE binder thread, a sender
+    // on the UI thread) reports this chat's store contents changed -- a new
+    // message OR a new receipt, both go through the same ChatEvents channel.
     // The collector runs on this composition's main dispatcher, so touching
-    // `messages` state here is safe; cancellation on dispose is automatic
-    // because LaunchedEffect scopes the collection to this composable.
-    // chatId is a raw ByteArray, so compare with contentEquals -- == would
-    // be referential and never match.
+    // state here is safe; cancellation on dispose is automatic because
+    // LaunchedEffect scopes the collection to this composable. chatId is a
+    // raw ByteArray, so compare with contentEquals -- == would be
+    // referential and never match.
     LaunchedEffect(contact.userId) {
         ChatEvents.changes.collect { changedChatId ->
             if (changedChatId.contentEquals(contact.userId)) {
-                messages = store.messagesForChat(contact.userId)
+                reload()
             }
         }
     }
@@ -102,7 +129,13 @@ fun ChatScreen(
             ) {
                 items(messages, key = { "${it.senderUserId.contentHashCode()}:${it.lamport}" }) { message ->
                     if (message.kind == KIND_TEXT) {
-                        MessageBubble(message, isOwn = message.senderUserId.contentEquals(ownUserId))
+                        val isOwn = message.senderUserId.contentEquals(ownUserId)
+                        MessageBubble(
+                            message = message,
+                            isOwn = isOwn,
+                            // Ticks only ever describe our own messages -- see TickStatus's KDoc.
+                            tick = if (isOwn) tickStatusFor(message.lamport, deliveredThrough, readThrough) else null,
+                        )
                     }
                 }
             }
@@ -123,7 +156,7 @@ fun ChatScreen(
                         if (text.isNotEmpty()) {
                             sender.sendText(contact, text)
                             draft = ""
-                            messages = store.messagesForChat(contact.userId)
+                            reload()
                         }
                     },
                     modifier = Modifier.padding(start = 8.dp),
@@ -135,22 +168,50 @@ fun ChatScreen(
     }
 }
 
-/** One chat bubble: kind=1 payload decoded as UTF-8, right-aligned for own messages, left-aligned for the contact's. */
+/**
+ * One chat bubble: kind=1 payload decoded as UTF-8, right-aligned for own
+ * messages, left-aligned for the contact's. [tick] is null for the
+ * contact's messages (they never get one) and non-null for our own,
+ * rendered as small right-aligned text next to the bubble text (DESIGN.md
+ * §7.2): "✓" for [TickStatus.SENT], "✓✓" in the bubble's subdued content
+ * color for [TickStatus.DELIVERED], "✓✓" tinted with
+ * `MaterialTheme.colorScheme.primary` for [TickStatus.READ].
+ */
 @Composable
-private fun MessageBubble(message: StoredMessage, isOwn: Boolean) {
+private fun MessageBubble(message: StoredMessage, isOwn: Boolean, tick: TickStatus?) {
     val text = remember(message) { message.payload.toString(Charsets.UTF_8) }
+    val bubbleColor = if (isOwn) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
+    val contentColor = if (isOwn) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
 
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         horizontalArrangement = if (isOwn) Arrangement.End else Arrangement.Start,
     ) {
         Surface(
-            color = if (isOwn) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
-            contentColor = if (isOwn) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+            color = bubbleColor,
+            contentColor = contentColor,
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier.widthIn(max = 280.dp),
         ) {
-            Text(text, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+            Row(
+                verticalAlignment = Alignment.Bottom,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            ) {
+                Text(text)
+                if (tick != null) {
+                    val (glyph, tint) = when (tick) {
+                        TickStatus.SENT -> "✓" to contentColor
+                        TickStatus.DELIVERED -> "✓✓" to contentColor.copy(alpha = 0.7f)
+                        TickStatus.READ -> "✓✓" to MaterialTheme.colorScheme.primary
+                    }
+                    Text(
+                        glyph,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = tint,
+                        modifier = Modifier.padding(start = 4.dp),
+                    )
+                }
+            }
         }
     }
 }

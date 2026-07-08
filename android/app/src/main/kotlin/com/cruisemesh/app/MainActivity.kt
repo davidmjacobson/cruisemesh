@@ -48,6 +48,7 @@ import com.cruisemesh.app.friending.ContactsScreen
 import com.cruisemesh.app.friending.MyQrScreen
 import com.cruisemesh.app.friending.ScanScreen
 import com.cruisemesh.app.identity.IdentityStore
+import com.cruisemesh.app.mesh.ChatViewEvents
 import com.cruisemesh.app.mesh.MeshService
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
@@ -240,12 +241,16 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
 
     if (contact != null) {
         // Registers this chat as "on screen" for the whole time it is
-        // composed -- consumed by notification suppression and (soon) read
+        // composed -- consumed by notification suppression and read
         // receipts; see ChatVisibility's KDoc. clearVisible (not an
         // unconditional clear) because during a chat->chat transition the
         // incoming route's setVisible can run before this route's onDispose.
+        // ChatViewEvents.onChatViewed fires once per composition (not on
+        // dispose) so MeshService can send a read receipt for whatever's
+        // already stored from this contact -- see ChatViewEvents' KDoc.
         DisposableEffect(userIdHex) {
             ChatVisibility.setVisible(contact.userId)
+            ChatViewEvents.onChatViewed(contact.userId)
             onDispose { ChatVisibility.clearVisible(contact.userId) }
         }
         val sender = remember { RealMeshSender(store, identity) }

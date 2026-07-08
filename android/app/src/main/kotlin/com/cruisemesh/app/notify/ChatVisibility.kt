@@ -24,9 +24,14 @@ import androidx.annotation.VisibleForTesting
  *    including older messages arriving in a burst via reconnect catch-up.
  *    That's acceptable for now; smarter batching/age cutoffs are a later
  *    refinement.
- * 2. **Read receipts (soon).** "This chat is on screen" is exactly the
- *    signal for when messages are actually *seen*, so the same registration
- *    will drive read-receipt emission (DESIGN.md §7.2).
+ * 2. **Read receipts.** "This chat is on screen" is exactly the signal for
+ *    when messages are actually *seen* -- [com.cruisemesh.app.mesh.MeshService.handleIncomingText]
+ *    checks [isVisible] to send a read (not just delivered) receipt for a
+ *    message arriving while its chat is already open, and
+ *    [com.cruisemesh.app.mesh.ChatViewEvents] (fired from the same
+ *    `DisposableEffect` that calls [setVisible]) sends a read receipt for
+ *    whatever's already stored when a chat *becomes* visible (DESIGN.md
+ *    §7.2).
  *
  * Thread-safe: composition writes happen on the main thread but mesh-side
  * reads come from BLE callback threads.

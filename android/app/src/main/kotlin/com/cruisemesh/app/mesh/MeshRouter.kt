@@ -19,8 +19,8 @@ private const val TAG = "MeshRouter"
  *    send path, which only has a [uniffi.cruisemesh_core.Contact], not an
  *    address.
  *  - [sendToAddress]: "reply on the exact link this frame arrived on" --
- *    used by [MeshService] for HELLO-triggered replay and delivery receipts
- *    (DESIGN.md §7.2, §7.3 interim), where correctness means answering the
+ *    used by [MeshService] for HELLO/DIGEST exchange and delivery/read
+ *    receipts (DESIGN.md §7.2, §7.3), where correctness means answering the
  *    same connection, not just "any" connection to that userId.
  */
 object MeshRouter {
@@ -73,8 +73,8 @@ object MeshRouter {
     /**
      * Sends [frame] to whichever live link has identified itself as [userId].
      * Returns false if no connected link currently maps to that userId --
-     * callers treat that as "stays local for now"; HELLO-triggered replay
-     * (DESIGN.md §7.3 interim) delivers it once the peer is next seen.
+     * callers treat that as "stays local for now"; the digest sync
+     * (DESIGN.md §7.3) delivers it once the peer is next seen and HELLOs in.
      */
     fun sendToUserId(userId: ByteArray, frame: ByteArray): Boolean {
         val (transport, address) = state.routeFor(userId) ?: return false

@@ -34,8 +34,8 @@ interface MeshSender {
  * used to, then -- if [MeshRouter] currently has a live link to that contact
  * -- seals it (DESIGN.md §6.3) and transmits it immediately (DESIGN.md
  * §5.2). If the contact isn't connected right now, the message simply stays
- * local; [com.cruisemesh.app.mesh.MeshService]'s HELLO-triggered replay
- * (DESIGN.md §7.3 interim) delivers it whenever that contact is next seen.
+ * local; [com.cruisemesh.app.mesh.MeshService]'s digest sync (DESIGN.md
+ * §7.3) delivers it whenever that contact is next seen and HELLOs in.
  * Because [ChatScreen] only ever depends on the [MeshSender] interface, this
  * swap-in required no UI changes.
  *
@@ -88,7 +88,7 @@ class RealMeshSender(
         }
 
         if (envelopeFrame != null && !MeshRouter.sendToUserId(contact.userId, envelopeFrame)) {
-            Log.i(TAG, "sendText: ${contact.name} not currently connected; message stays local until HELLO replay")
+            Log.i(TAG, "sendText: ${contact.name} not currently connected; message stays local until next digest sync")
         }
     }
 }
