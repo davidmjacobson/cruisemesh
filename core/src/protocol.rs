@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn message_body_decode_rejects_empty_input() {
         let err = decode_message_body(Vec::new()).unwrap_err();
-        matches!(err, CoreError::Malformed(_));
+        assert!(matches!(err, CoreError::Malformed(_)));
     }
 
     #[test]
@@ -396,7 +396,7 @@ mod tests {
         // kind byte + chat_id_len claiming 10 bytes, but none follow.
         let bytes = vec![KIND_TEXT, 0x00, 0x0A];
         let err = decode_message_body(bytes).unwrap_err();
-        matches!(err, CoreError::Malformed(_));
+        assert!(matches!(err, CoreError::Malformed(_)));
     }
 
     #[test]
@@ -405,7 +405,7 @@ mod tests {
         bytes.extend_from_slice(&1u64.to_be_bytes()); // full lamport
         bytes.push(0); // only 1 of 8 timestamp bytes
         let err = decode_message_body(bytes).unwrap_err();
-        matches!(err, CoreError::Malformed(_));
+        assert!(matches!(err, CoreError::Malformed(_)));
     }
 
     #[test]
@@ -413,7 +413,7 @@ mod tests {
         let mut encoded = encode_message_body(sample_body());
         encoded.push(0xFF);
         let err = decode_message_body(encoded).unwrap_err();
-        matches!(err, CoreError::Malformed(_));
+        assert!(matches!(err, CoreError::Malformed(_)));
     }
 
     fn sample_receipt() -> ReceiptContent {
@@ -447,13 +447,13 @@ mod tests {
         let mut encoded = encode_receipt_content(sample_receipt());
         encoded.truncate(encoded.len() - 1); // drop the receipt_type byte
         let err = decode_receipt_content(encoded).unwrap_err();
-        matches!(err, CoreError::Malformed(_));
+        assert!(matches!(err, CoreError::Malformed(_)));
     }
 
     #[test]
     fn receipt_content_decode_rejects_garbage() {
         let err = decode_receipt_content(vec![0xFF, 0xFF, 0xFF]).unwrap_err();
-        matches!(err, CoreError::Malformed(_));
+        assert!(matches!(err, CoreError::Malformed(_)));
     }
 
     #[test]
@@ -481,25 +481,25 @@ mod tests {
     #[test]
     fn parse_frame_rejects_empty_input() {
         let err = parse_frame(Vec::new()).unwrap_err();
-        matches!(err, CoreError::Malformed(_));
+        assert!(matches!(err, CoreError::Malformed(_)));
     }
 
     #[test]
     fn parse_frame_rejects_unknown_type_byte() {
         let err = parse_frame(vec![0x99, 0x01, 0x02]).unwrap_err();
-        matches!(err, CoreError::Malformed(_));
+        assert!(matches!(err, CoreError::Malformed(_)));
     }
 
     #[test]
     fn parse_frame_rejects_hello_with_no_user_id() {
         let err = parse_frame(vec![0x01]).unwrap_err();
-        matches!(err, CoreError::Malformed(_));
+        assert!(matches!(err, CoreError::Malformed(_)));
     }
 
     #[test]
     fn parse_frame_rejects_envelope_with_no_sealed_bytes() {
         let err = parse_frame(vec![0x02]).unwrap_err();
-        matches!(err, CoreError::Malformed(_));
+        assert!(matches!(err, CoreError::Malformed(_)));
     }
 
     #[test]
