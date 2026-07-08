@@ -47,6 +47,17 @@ object MeshRouter {
         peripheralSend = null
     }
 
+    /**
+     * Drops all address mappings. [MeshService] calls this on stop: its BLE
+     * roles' stop() paths tear down connections without firing per-address
+     * disconnect callbacks, so without this a stop/start of the mesh within
+     * one process would leave stale addresses that [sendToAddress] would
+     * happily (and uselessly) target.
+     */
+    fun reset() {
+        state.clear()
+    }
+
     /** A link to [address] over [transport] just became usable; see [MeshRouterState]. */
     fun onConnected(address: String, transport: MeshRouterState.Transport) = state.onConnected(address, transport)
 

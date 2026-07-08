@@ -126,6 +126,9 @@ class MeshService : Service() {
         central.stop()
         MeshRouter.unregisterCentral()
         MeshRouter.unregisterPeripheral()
+        // stop() above tears down connections without per-address disconnect
+        // callbacks, so clear the router's mappings wholesale.
+        MeshRouter.reset()
         super.onDestroy()
     }
 

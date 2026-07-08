@@ -21,6 +21,10 @@ package com.cruisemesh.app.mesh
  * link reaches the same peer, so picking the first match found is correct.
  * When one of the two links drops, [onDisconnected] removes only that
  * entry; the peer stays reachable over the other.
+ *
+ * Thread-safety: mutators arrive on BLE binder threads while [routeFor] is
+ * called from the UI thread's send path, so every method synchronizes on the
+ * map. The operations are all tiny (no I/O under the lock).
  */
 class MeshRouterState {
     /** Which local BLE role a given remote address is talking to. */
@@ -32,34 +36,51 @@ class MeshRouterState {
 
     /** A link to [address] over [transport] just became usable (able to send/receive frames). */
     fun onConnected(address: String, transport: Transport) {
-        peersByAddress[address] = Peer(transport, userId = null)
+        synchronized(peersByAddress) {
+            peersByAddress[address] = Peer(transport, userId = null)
+        }
     }
 
     /** [address] is no longer connected; forget it so sends never target a dead link. */
     fun onDisconnected(address: String) {
-        peersByAddress.remove(address)
+        synchronized(peersByAddress) {
+            peersByAddress.remove(address)
+        }
     }
 
     /** Record that the still-connected [address] identified itself as [userId] via a HELLO frame. */
     fun onHello(address: String, userId: ByteArray) {
-        peersByAddress[address]?.userId = userId
+        synchronized(peersByAddress) {
+            peersByAddress[address]?.userId = userId
+        }
     }
 
     /** The userId [address] identified as, if it has sent a HELLO and is still connected. */
-    fun userIdFor(address: String): ByteArray? = peersByAddress[address]?.userId
+    fun userIdFor(address: String): ByteArray? =
+        synchronized(peersByAddress) { peersByAddress[address]?.userId }
 
     /** Which local role [address] is connected under, or null if it isn't currently connected. */
-    fun transportFor(address: String): Transport? = peersByAddress[address]?.transport
+    fun transportFor(address: String): Transport? =
+        synchronized(peersByAddress) { peersByAddress[address]?.transport }
 
     /**
      * The transport + address currently usable to reach [userId], or null if
      * no connected link has identified itself as that user yet.
      */
     fun routeFor(userId: ByteArray): Pair<Transport, String>? {
-        for ((address, peer) in peersByAddress) {
-            val known = peer.userId ?: continue
-            if (known.contentEquals(userId)) return peer.transport to address
+        synchronized(peersByAddress) {
+            for ((address, peer) in peersByAddress) {
+                val known = peer.userId ?: continue
+                if (known.contentEquals(userId)) return peer.transport to address
+            }
+            return null
         }
-        return null
+    }
+
+    /** Forget every connection, e.g. when the mesh service stops and all links die with it. */
+    fun clear() {
+        synchronized(peersByAddress) {
+            peersByAddress.clear()
+        }
     }
 }
