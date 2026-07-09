@@ -25,12 +25,38 @@
 //!   msg_id (e.g. a receipt envelope re-uploaded every sync with a stable
 //!   watermark-derived msg_id) is idempotent: the row is kept, hop_ttl and
 //!   expiry take the max, sealed bytes are not rewritten.
+//!
+//! ## WebSocket push (`GET /ws`)
+//!
+//! Live internet clients can open a WebSocket instead of (or in addition to)
+//! polling. Semantics:
+//!
+//! 1. **Auth** — same family bearer token as REST. Accepted via
+//!    `Authorization: Bearer <token>` **or** `?token=<token>` query param.
+//!    Query auth exists because browser `WebSocket` cannot set headers on the
+//!    handshake; native clients (our phone apps) should prefer the header so
+//!    the token is not logged in proxy access logs / browser history.
+//! 2. **Subscribe** — `hints=` is required (same comma-separated base64url
+//!    list as `GET /envelopes`). Optional `after=` is the cursor (default 0).
+//! 3. **Replay then push** — on connect the server sends every row the poll
+//!    API would return for those hints since `after` (one envelope per text
+//!    frame, JSON shape of a single REST fetch envelope object), then streams
+//!    each newly POSTed envelope whose `(family_token, recipient_hint)`
+//!    matches.
+//! 4. **Acks stay REST-only** — WS is delivery only; clients still
+//!    `POST /envelopes/ack`. The poll API is byte-for-byte unchanged.
+//! 5. **Backpressure** — a global bounded broadcast channel fans out POSTs.
+//!    Slow or dead consumers that lag past the buffer (or fail a write
+//!    deadline) are **dropped**. Reconnect with the last known cursor and
+//!    replay heals the gap — that is what the cursor is for. Bounded memory
+//!    beats trying to buffer forever for a phone that went to sea.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
@@ -47,6 +73,15 @@ const MSG_ID_LEN: usize = 16;
 const DEFAULT_FETCH_LIMIT: usize = 100;
 const MAX_FETCH_LIMIT: usize = 500;
 
+/// Capacity of the global POST→WS broadcast. Lagging subscribers that fall
+/// more than this many events behind are disconnected (`Lagged`); they
+/// reconnect and replay from their cursor.
+pub const WS_BROADCAST_CAPACITY: usize = 64;
+
+/// If a WS write cannot complete within this window the peer is treated as
+/// slow/dead and dropped (same heal path as lag: reconnect + replay).
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// DESIGN.md §9: hard upper bound on how long a row may live on the relay.
 /// Client-supplied `expiry_ms` (typically 7 days via core's
 /// `DEFAULT_EXPIRY_MS`) is honored when tighter; this caps the rest.
@@ -56,11 +91,33 @@ pub const MAX_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 pub struct AppState {
     store: RelayStore,
     auth_tokens: HashSet<String>,
+    tx: tokio::sync::broadcast::Sender<std::sync::Arc<BroadcastEnvelope>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BroadcastEnvelope {
+    pub family_token: String,
+    pub recipient_hint: String,
+    pub envelope: EnvelopeResponse,
 }
 
 impl AppState {
     pub fn new(store: RelayStore, auth_tokens: HashSet<String>) -> Self {
-        Self { store, auth_tokens }
+        Self::with_hub_capacity(store, auth_tokens, WS_BROADCAST_CAPACITY)
+    }
+
+    /// Test helper: custom broadcast capacity for slow-consumer coverage.
+    pub fn with_hub_capacity(
+        store: RelayStore,
+        auth_tokens: HashSet<String>,
+        capacity: usize,
+    ) -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(capacity.max(1));
+        Self {
+            store,
+            auth_tokens,
+            tx,
+        }
     }
 }
 
@@ -326,6 +383,7 @@ impl RelayStore {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/ws", get(ws_handler))
         .route("/envelopes", post(post_envelope).get(get_envelopes))
         .route("/envelopes/ack", post(ack_envelopes))
         .with_state(state)
@@ -388,18 +446,36 @@ async fn post_envelope(
     if sealed.is_empty() {
         return Err(ApiError::bad_request("sealed must not be empty".to_string()));
     }
+    let now = now_ms();
     let id = state
         .store
         .insert_envelope(
             &family_token,
-            msg_id,
+            msg_id.clone(),
             request.hop_ttl,
-            recipient_hint,
-            sealed,
+            recipient_hint.clone(),
+            sealed.clone(),
             request.expiry_ms,
-            now_ms(),
+            now,
         )
         .map_err(ApiError::internal)?;
+
+    let envelope = EnvelopeResponse {
+        id,
+        msg_id: encode_base64_field(&msg_id),
+        hop_ttl: request.hop_ttl,
+        recipient_hint: encode_base64_field(&recipient_hint),
+        sealed: encode_base64_field(&sealed),
+        expiry_ms: RelayStore::effective_expiry(now, request.expiry_ms),
+        created_at_ms: now,
+    };
+    // Fan-out for live WS subscribers. Lagging peers are dropped (module docs).
+    let _ = state.tx.send(std::sync::Arc::new(BroadcastEnvelope {
+        family_token,
+        recipient_hint: encode_base64_field(&recipient_hint),
+        envelope,
+    }));
+
     Ok(Json(PostEnvelopeResponse { id }))
 }
 
@@ -410,8 +486,8 @@ struct GetEnvelopesQuery {
     limit: Option<usize>,
 }
 
-#[derive(Serialize)]
-struct EnvelopeResponse {
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct EnvelopeResponse {
     id: i64,
     msg_id: String,
     hop_ttl: u8,
@@ -502,6 +578,177 @@ async fn ack_envelopes(
     Ok(Json(AckResponse { deleted }))
 }
 
+
+#[derive(Deserialize)]
+struct WsQuery {
+    hints: String,
+    after: Option<i64>,
+    token: Option<String>,
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(query): Query<WsQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Prefer Authorization header when present (native clients); fall back to
+    // ?token= for browsers that cannot set WS handshake headers.
+    let token = if let Ok(t) = bearer_token(&headers, &state.auth_tokens) {
+        t
+    } else {
+        let Some(t) = query.token.as_deref().filter(|t| !t.is_empty()) else {
+            return Err(ApiError::unauthorized(
+                "missing family token (Authorization: Bearer or ?token=)".to_string(),
+            ));
+        };
+        if !state.auth_tokens.contains(t) {
+            return Err(ApiError::unauthorized("unknown family token".to_string()));
+        }
+        t.to_string()
+    };
+    let hints = query
+        .hints
+        .split(',')
+        .filter(|h| !h.is_empty())
+        .map(|hint| decode_base64_field(hint, "hints"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if hints.is_empty() {
+        return Err(ApiError::bad_request("at least one hint is required".to_string()));
+    }
+    for hint in &hints {
+        if hint.len() != RECIPIENT_HINT_LEN {
+            return Err(ApiError::bad_request(format!(
+                "each hint must be {RECIPIENT_HINT_LEN} bytes after base64url decoding"
+            )));
+        }
+    }
+    let after = query.after.unwrap_or(0);
+    let hints_base64: HashSet<String> = query
+        .hints
+        .split(',')
+        .filter(|h| !h.is_empty())
+        .map(String::from)
+        .collect();
+
+    Ok(ws
+        .on_upgrade(move |socket| handle_ws(socket, state, token, hints, hints_base64, after))
+        .into_response())
+}
+
+async fn ws_send_text(socket: &mut WebSocket, text: String) -> bool {
+    matches!(
+        tokio::time::timeout(
+            WS_WRITE_TIMEOUT,
+            socket.send(Message::Text(text.into())),
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
+async fn handle_ws(
+    mut socket: WebSocket,
+    state: AppState,
+    family_token: String,
+    hints: Vec<Vec<u8>>,
+    hints_base64: HashSet<String>,
+    mut after: i64,
+) {
+    // Subscribe before replay so POSTs that land during replay are not lost;
+    // the live loop skips ids already covered by `after`.
+    let mut rx = state.tx.subscribe();
+
+    // --- Replay: same rows GET /envelopes would return ---
+    loop {
+        let rows = match state.store.fetch_envelopes(
+            &family_token,
+            hints.clone(),
+            after,
+            DEFAULT_FETCH_LIMIT,
+            now_ms(),
+        ) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if rows.is_empty() {
+            break;
+        }
+        let n = rows.len();
+        for row in rows {
+            let env = EnvelopeResponse {
+                id: row.id,
+                msg_id: encode_base64_field(&row.msg_id),
+                hop_ttl: row.hop_ttl,
+                recipient_hint: encode_base64_field(&row.recipient_hint),
+                sealed: encode_base64_field(&row.sealed),
+                expiry_ms: row.expiry_ms,
+                created_at_ms: row.created_at_ms,
+            };
+            after = after.max(env.id);
+            let Ok(msg) = serde_json::to_string(&env) else {
+                return;
+            };
+            if !ws_send_text(&mut socket, msg).await {
+                return;
+            }
+        }
+        if n < DEFAULT_FETCH_LIMIT {
+            break;
+        }
+    }
+
+    // --- Live push ---
+    loop {
+        tokio::select! {
+            res = rx.recv() => {
+                match res {
+                    Ok(broadcast) => {
+                        if broadcast.family_token == family_token
+                            && hints_base64.contains(&broadcast.recipient_hint)
+                            && broadcast.envelope.id > after
+                        {
+                            after = after.max(broadcast.envelope.id);
+                            let Ok(msg) = serde_json::to_string(&broadcast.envelope) else {
+                                break;
+                            };
+                            if !ws_send_text(&mut socket, msg).await {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Bound memory: drop slow/dead consumers; reconnect
+                        // + replay from cursor heals (module docs).
+                        
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if tokio::time::timeout(
+                            WS_WRITE_TIMEOUT,
+                            socket.send(Message::Pong(payload)),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // Client→server traffic ignored (acks are REST-only).
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+    }
+}
 fn decode_base64_field(value: &str, field: &str) -> Result<Vec<u8>, ApiError> {
     URL_SAFE_NO_PAD
         .decode(value)
