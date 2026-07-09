@@ -12,8 +12,10 @@
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <!-- QR-code friending (DESIGN.md §6.2) -->
+    <!-- QR-code friending (DESIGN.md §6.2) and in-chat camera photos -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- In-chat voice memos (DESIGN.md §8) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Internet relay flush (DESIGN.md §9), best-effort only -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -32,7 +34,9 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@style/Theme.CruiseMesh"
         android:supportsRtl="true">
 
@@ -54,5 +58,16 @@
             android:name=".mesh.MeshService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- Camera capture target for in-chat photos (TakePicture contract). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

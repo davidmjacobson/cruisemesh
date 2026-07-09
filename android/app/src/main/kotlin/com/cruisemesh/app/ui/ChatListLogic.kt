@@ -2,6 +2,9 @@ package com.cruisemesh.app.ui
 
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
+import com.cruisemesh.app.media.AttachmentPayload
+import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
+import com.cruisemesh.app.media.isVisibleChatKind
 import uniffi.cruisemesh_core.StoredMessage
 import java.util.Calendar
 import java.text.SimpleDateFormat
@@ -53,8 +56,22 @@ object ChatListLogic {
     }
 
     fun computeUnread(messages: List<StoredMessage>, ownUserId: ByteArray, readThrough: ULong): Int {
-        return messages.count { 
-            !it.senderUserId.contentEquals(ownUserId) && it.lamport > readThrough 
+        return messages.count {
+            isVisibleChatKind(it.kind) &&
+                !it.senderUserId.contentEquals(ownUserId) &&
+                it.lamport > readThrough
+        }
+    }
+
+    /** Last message shown in the conversation list (hides friend-request noise). */
+    fun lastVisibleMessage(messages: List<StoredMessage>): StoredMessage? =
+        messages.filter { isVisibleChatKind(it.kind) }.maxByOrNull { it.timestamp }
+
+    fun previewText(message: StoredMessage): String {
+        return when (message.kind) {
+            KIND_ATTACHMENT_MANIFEST ->
+                AttachmentPayload.previewLabel(AttachmentPayload.decode(message.payload))
+            else -> String(message.payload, Charsets.UTF_8)
         }
     }
 }

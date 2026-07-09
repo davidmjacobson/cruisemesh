@@ -185,7 +185,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             val unreadCount = ChatListLogic.computeUnread(messages, identity.userId, readThrough)
             ChatSummary(
                 contact = c,
-                lastMessage = messages.maxByOrNull { it.timestamp },
+                lastMessage = ChatListLogic.lastVisibleMessage(messages),
                 unreadCount = unreadCount,
                 ownDeliveredThrough = deliveredThrough,
                 ownReadThrough = readThrough

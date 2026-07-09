@@ -31,7 +31,8 @@
 //! ```text
 //! offset  size  field
 //! 0       1     kind            (u8; text=1, receipt=2, friend-request=3,
-//!                               group-invite=4, per DESIGN.md §7.1)
+//!                               group-invite=4, attachment-manifest=16,
+//!                               attachment-chunk=17, per DESIGN.md §7.1)
 //! 1       2     chat_id_len     (u16 BE)
 //! 3       N     chat_id         (N = chat_id_len bytes)
 //! 3+N     8     lamport         (u64 BE)
@@ -235,6 +236,14 @@ pub const KIND_FRIEND_REQUEST: u8 = 3;
 /// `MessageBody.kind` value for a pairwise-sealed group invite whose
 /// `content` is an encoded [`crate::Group`] record.
 pub const KIND_GROUP_INVITE: u8 = 4;
+/// `MessageBody.kind` value for an attachment manifest (DESIGN.md §7.1
+/// reserved, §8). Android currently embeds the media blob inline in the
+/// manifest payload for BLE/relay-friendly sizes; `KIND_ATTACHMENT_CHUNK`
+/// is reserved for a future external-chunk transfer path.
+pub const KIND_ATTACHMENT_MANIFEST: u8 = 16;
+/// Reserved for content-addressed attachment chunks (DESIGN.md §8). Not
+/// yet produced or consumed by the current client.
+pub const KIND_ATTACHMENT_CHUNK: u8 = 17;
 
 /// `ReceiptContent.receipt_type` value: recipient's device decrypted and
 /// stored the message (the ✓✓ tick, DESIGN.md §7.2).

@@ -1,6 +1,8 @@
 package com.cruisemesh.app.chat
 
 import android.util.Log
+import com.cruisemesh.app.media.AttachmentPayload
+import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import com.cruisemesh.app.mesh.MeshRouter
 import com.cruisemesh.app.mesh.RelaySyncEvents
 import com.cruisemesh.app.mesh.buildOutboundAuthoredEnvelope
@@ -16,14 +18,20 @@ private const val TAG = "MeshSender"
 private const val KIND_TEXT: kotlin.UByte = 1u
 
 /**
- * Sends an outgoing text message into a contact's 1:1 chat (DESIGN.md §7.1).
- * [ChatScreen] depends only on this interface -- never on a concrete
- * implementation -- so the transport can be swapped from a local-only stub
- * to real mesh delivery without any UI changes.
+ * Sends an outgoing text or media message into a contact's 1:1 chat
+ * (DESIGN.md §7.1 / §8). [ChatScreen] depends only on this interface -- never
+ * on a concrete implementation -- so the transport can be swapped from a
+ * local-only stub to real mesh delivery without any UI changes.
  */
 interface MeshSender {
     /** Sends `text` as a `kind=1` message to `contact`'s chat. */
     fun sendText(contact: Contact, text: String)
+
+    /**
+     * Sends an inline attachment as a `kind=16` chat-stream message
+     * (attachment manifest with embedded blob; DESIGN.md §8).
+     */
+    fun sendAttachment(contact: Contact, attachment: AttachmentPayload)
 }
 
 /**
@@ -53,17 +61,43 @@ class RealMeshSender(
     private val identity: Identity,
 ) : MeshSender {
     override fun sendText(contact: Contact, text: String) {
+        enqueueAuthored(
+            contact = contact,
+            kind = KIND_TEXT,
+            payload = text.toByteArray(Charsets.UTF_8),
+            logLabel = "sendText",
+        )
+    }
+
+    override fun sendAttachment(contact: Contact, attachment: AttachmentPayload) {
+        if (attachment.blob.size > AttachmentPayload.MAX_BLOB_BYTES) {
+            Log.w(TAG, "Refusing attachment larger than ${AttachmentPayload.MAX_BLOB_BYTES} bytes")
+            return
+        }
+        enqueueAuthored(
+            contact = contact,
+            kind = KIND_ATTACHMENT_MANIFEST,
+            payload = attachment.encode(),
+            logLabel = "sendAttachment",
+        )
+    }
+
+    private fun enqueueAuthored(
+        contact: Contact,
+        kind: UByte,
+        payload: ByteArray,
+        logLabel: String,
+    ) {
         val chatId = contact.userId
         val lamport = store.highestContiguousLamport(chatId, identity.userId) + 1UL
         val timestamp = System.currentTimeMillis()
-        val payload = text.toByteArray(Charsets.UTF_8)
 
         val message = StoredMessage(
             chatId = chatId,
             senderUserId = identity.userId,
             lamport = lamport,
             timestamp = timestamp,
-            kind = KIND_TEXT,
+            kind = kind,
             payload = payload,
         )
         val outbound = buildOutboundAuthoredEnvelope(identity, contact, message) ?: return
@@ -72,7 +106,7 @@ class RealMeshSender(
         RelaySyncEvents.requestSync()
 
         if (!MeshRouter.sendToUserId(contact.userId, encodeOutboundEnvelopeFrame(outbound))) {
-            Log.i(TAG, "sendText: ${contact.name} not currently connected; message stays local until next digest sync")
+            Log.i(TAG, "$logLabel: ${contact.name} not currently connected; message stays local until next digest sync")
         }
     }
 }

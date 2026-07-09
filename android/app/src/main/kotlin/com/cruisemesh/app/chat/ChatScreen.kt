@@ -1,6 +1,16 @@
 package com.cruisemesh.app.chat
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.BitmapFactory
+import android.media.MediaPlayer
+import android.net.Uri
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -10,7 +20,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -18,9 +30,14 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -32,23 +49,34 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import com.cruisemesh.app.media.AttachmentPayload
+import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
+import com.cruisemesh.app.media.MediaCompressor
+import com.cruisemesh.app.media.VoiceRecorder
+import com.cruisemesh.app.media.isVisibleChatKind
 import com.cruisemesh.app.ui.AvatarBadge
 import com.cruisemesh.app.ui.BubbleGrouping
 import com.cruisemesh.app.ui.ChatListLogic
@@ -63,6 +91,8 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
+import java.io.File
+import kotlinx.coroutines.delay
 
 /** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
 private const val KIND_TEXT: kotlin.UByte = 1u
@@ -71,12 +101,15 @@ private const val KIND_TEXT: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
 
+private const val MAX_VOICE_MS = 60_000
+
 /**
  * A single 1:1 chat thread (DESIGN.md §7.1: for a 1:1 chat, `chat_id` is
- * simply the peer's UserID). Renders `kind=1` (text) messages oldest-first,
- * auto-scrolled to the newest, with the local user's bubbles right-aligned
- * and the contact's left-aligned (compared via [ByteArray.contentEquals]
- * against `ownUserId`, since [StoredMessage.senderUserId] is raw bytes).
+ * simply the peer's UserID). Renders visible chat kinds (text + attachment
+ * manifests) oldest-first, auto-scrolled to the newest, with the local user's
+ * bubbles right-aligned and the contact's left-aligned (compared via
+ * [ByteArray.contentEquals] against `ownUserId`, since
+ * [StoredMessage.senderUserId] is raw bytes).
  *
  * Sending goes through [sender] only -- see [MeshSender] for why the UI
  * never talks to a concrete transport directly. The thread (and the two
@@ -101,6 +134,7 @@ fun ChatScreen(
     onBack: () -> Unit,
     onDeleteContact: () -> Unit,
 ) {
+    val context = LocalContext.current
     var messages by remember(contact.userId) { mutableStateOf(store.messagesForChat(contact.userId)) }
     var deliveredThrough by remember(contact.userId) {
         mutableStateOf(store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_DELIVERED))
@@ -109,11 +143,104 @@ fun ChatScreen(
         mutableStateOf(store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_READ))
     }
     var draft by remember { mutableStateOf("") }
+    var attachMenuOpen by remember { mutableStateOf(false) }
+    var showVoiceDialog by remember { mutableStateOf(false) }
+    var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
+    val voiceRecorder = remember { VoiceRecorder(context) }
 
     fun reload() {
         messages = store.messagesForChat(contact.userId)
         deliveredThrough = store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_DELIVERED)
         readThrough = store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_READ)
+    }
+
+    fun sendImageBytes(jpeg: ByteArray?) {
+        if (jpeg == null) {
+            Toast.makeText(context, "Could not prepare photo (too large or unreadable)", Toast.LENGTH_SHORT).show()
+            return
+        }
+        sender.sendAttachment(
+            contact,
+            AttachmentPayload(
+                mediaType = AttachmentPayload.MediaType.IMAGE,
+                mimeType = "image/jpeg",
+                durationMs = 0,
+                blob = jpeg,
+            ),
+        )
+        reload()
+    }
+
+    fun sendVoiceFile(file: File, durationMs: Int) {
+        val bytes = try {
+            file.readBytes()
+        } catch (_: Exception) {
+            null
+        }
+        file.delete()
+        if (bytes == null || bytes.isEmpty()) {
+            Toast.makeText(context, "Could not save voice memo", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (bytes.size > AttachmentPayload.MAX_BLOB_BYTES) {
+            Toast.makeText(context, "Voice memo is too large to send over the mesh", Toast.LENGTH_SHORT).show()
+            return
+        }
+        sender.sendAttachment(
+            contact,
+            AttachmentPayload(
+                mediaType = AttachmentPayload.MediaType.AUDIO,
+                mimeType = "audio/mp4",
+                durationMs = durationMs.coerceAtMost(MAX_VOICE_MS),
+                blob = bytes,
+            ),
+        )
+        reload()
+    }
+
+    val galleryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri ->
+        if (uri != null) {
+            sendImageBytes(MediaCompressor.compressImageUri(context, uri))
+        }
+    }
+
+    val cameraLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicture(),
+    ) { success ->
+        val uri = pendingCameraUri
+        pendingCameraUri = null
+        if (success && uri != null) {
+            sendImageBytes(MediaCompressor.compressImageUri(context, uri))
+        }
+    }
+
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            launchCamera(context) { uri ->
+                pendingCameraUri = uri
+                cameraLauncher.launch(uri)
+            }
+        } else {
+            Toast.makeText(context, "Camera permission is required to take photos", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            showVoiceDialog = true
+        } else {
+            Toast.makeText(context, "Microphone permission is required for voice memos", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { voiceRecorder.cancel() }
     }
 
     LaunchedEffect(contact.userId) {
@@ -140,9 +267,59 @@ fun ChatScreen(
                 reload()
             }
         },
+        attachMenuOpen = attachMenuOpen,
+        onAttachMenuChange = { attachMenuOpen = it },
+        onPickGallery = {
+            attachMenuOpen = false
+            galleryLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        },
+        onPickCamera = {
+            attachMenuOpen = false
+            val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                launchCamera(context) { uri ->
+                    pendingCameraUri = uri
+                    cameraLauncher.launch(uri)
+                }
+            } else {
+                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            }
+        },
+        onPickVoice = {
+            attachMenuOpen = false
+            val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                showVoiceDialog = true
+            } else {
+                micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
+        },
         onBack = onBack,
         onDeleteContact = onDeleteContact,
     )
+
+    if (showVoiceDialog) {
+        VoiceMemoDialog(
+            recorder = voiceRecorder,
+            onDismiss = {
+                voiceRecorder.cancel()
+                showVoiceDialog = false
+            },
+            onSend = { file, durationMs ->
+                showVoiceDialog = false
+                sendVoiceFile(file, durationMs)
+            },
+        )
+    }
+}
+
+private fun launchCamera(context: android.content.Context, onReady: (Uri) -> Unit) {
+    val dir = File(context.cacheDir, "camera").apply { mkdirs() }
+    val file = File(dir, "capture-${System.currentTimeMillis()}.jpg")
+    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+    onReady(uri)
 }
 
 @Composable
@@ -155,6 +332,11 @@ private fun ConversationScreen(
     draft: String,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
+    attachMenuOpen: Boolean = false,
+    onAttachMenuChange: (Boolean) -> Unit = {},
+    onPickGallery: () -> Unit = {},
+    onPickCamera: () -> Unit = {},
+    onPickVoice: () -> Unit = {},
     onBack: () -> Unit,
     onDeleteContact: () -> Unit,
 ) {
@@ -166,11 +348,11 @@ private fun ConversationScreen(
     val (contactColor, _) = remember(contact, displayId) {
         ChatListLogic.avatarHueAndInitials(contact.userId, contact.name, displayId)
     }
-    val textMessages = remember(messages) { messages.filter { it.kind == KIND_TEXT } }
-    val gaps = remember(textMessages) {
+    val visibleMessages = remember(messages) { messages.filter { isVisibleChatKind(it.kind) } }
+    val gaps = remember(visibleMessages) {
         val result = mutableSetOf<Int>()
         val lastLamport = mutableMapOf<String, ULong>()
-        textMessages.forEachIndexed { index, msg ->
+        visibleMessages.forEachIndexed { index, msg ->
             val senderHex = formatUserId(msg.senderUserId)
             val previous = lastLamport[senderHex]
             if (previous != null && msg.lamport > previous + 1uL) {
@@ -180,16 +362,16 @@ private fun ConversationScreen(
         }
         result
     }
-    val grouping = remember(textMessages) {
-        val meta = textMessages.map { ConversationMessageMeta(formatUserId(it.senderUserId), it.timestamp) }
+    val grouping = remember(visibleMessages) {
+        val meta = visibleMessages.map { ConversationMessageMeta(formatUserId(it.senderUserId), it.timestamp) }
         meta.indices.map { bubbleGroupingFor(meta, it) }
     }
     var showContactDetails by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
 
-    LaunchedEffect(textMessages.size) {
-        if (textMessages.isNotEmpty()) {
-            listState.animateScrollToItem(textMessages.size - 1)
+    LaunchedEffect(visibleMessages.size) {
+        if (visibleMessages.isNotEmpty()) {
+            listState.animateScrollToItem(visibleMessages.size - 1)
         }
     }
 
@@ -218,12 +400,12 @@ private fun ConversationScreen(
                     .padding(vertical = 8.dp),
             ) {
                 itemsIndexed(
-                    textMessages,
+                    visibleMessages,
                     key = { _, message -> "${message.senderUserId.contentHashCode()}:${message.lamport}" },
                 ) { index, message ->
                     val isOwn = message.senderUserId.contentEquals(ownUserId)
 
-                    if (isNewDay(textMessages, index)) {
+                    if (isNewDay(visibleMessages, index)) {
                         DaySeparator(message.timestamp)
                     }
 
@@ -247,6 +429,33 @@ private fun ConversationScreen(
                     .fillMaxWidth()
                     .padding(bottom = 16.dp),
             ) {
+                Box {
+                    IconButton(
+                        onClick = { onAttachMenuChange(true) },
+                        modifier = Modifier.semantics {
+                            contentDescription = "Attach photo or voice memo"
+                        },
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null)
+                    }
+                    DropdownMenu(
+                        expanded = attachMenuOpen,
+                        onDismissRequest = { onAttachMenuChange(false) },
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Photo library") },
+                            onClick = onPickGallery,
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Take photo") },
+                            onClick = onPickCamera,
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Voice memo") },
+                            onClick = onPickVoice,
+                        )
+                    }
+                }
                 OutlinedTextField(
                     value = draft,
                     onValueChange = onDraftChange,
@@ -298,6 +507,97 @@ private fun ConversationScreen(
             },
         )
     }
+}
+
+@Composable
+private fun VoiceMemoDialog(
+    recorder: VoiceRecorder,
+    onDismiss: () -> Unit,
+    onSend: (File, Int) -> Unit,
+) {
+    var recording by remember { mutableStateOf(false) }
+    var elapsedMs by remember { mutableLongStateOf(0L) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(recording) {
+        if (!recording) return@LaunchedEffect
+        val start = System.currentTimeMillis()
+        while (recording) {
+            elapsedMs = System.currentTimeMillis() - start
+            if (elapsedMs >= MAX_VOICE_MS) {
+                val result = recorder.stop()
+                recording = false
+                if (result != null) {
+                    onSend(result.first, result.second)
+                } else {
+                    error = "Recording failed"
+                }
+                return@LaunchedEffect
+            }
+            delay(200)
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = {
+            recorder.cancel()
+            onDismiss()
+        },
+        title = { Text("Voice memo") },
+        text = {
+            Column {
+                Text(
+                    if (recording) {
+                        "Recording… ${formatDurationMs(elapsedMs.toInt())} / ${formatDurationMs(MAX_VOICE_MS)}"
+                    } else {
+                        "Tap Start, then Send when you're done (max 60s)."
+                    },
+                )
+                if (error != null) {
+                    Text(
+                        text = error!!,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            if (recording) {
+                TextButton(
+                    onClick = {
+                        val result = recorder.stop()
+                        recording = false
+                        if (result != null) {
+                            onSend(result.first, result.second)
+                        } else {
+                            error = "Recording failed"
+                        }
+                    },
+                ) { Text("Send") }
+            } else {
+                TextButton(
+                    onClick = {
+                        error = null
+                        if (recorder.start()) {
+                            recording = true
+                            elapsedMs = 0L
+                        } else {
+                            error = "Could not access microphone"
+                        }
+                    },
+                ) { Text("Start") }
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = {
+                    recorder.cancel()
+                    onDismiss()
+                },
+            ) { Text("Cancel") }
+        },
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -397,7 +697,6 @@ private fun MessageBubble(
     contactColor: Color?,
     grouping: BubbleGrouping,
 ) {
-    val text = remember(message) { message.payload.toString(Charsets.UTF_8) }
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
     } else {
@@ -431,23 +730,41 @@ private fun MessageBubble(
                 shape = shape,
                 modifier = Modifier.clickable(enabled = tick != null) { showLegend = true },
             ) {
-                Row(
-                    verticalAlignment = Alignment.Bottom,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                ) {
-                    Text(text)
-                    if (tick != null) {
-                        val tint = when (tick) {
-                            TickStatus.SENT -> tickBaseColor.copy(alpha = 0.88f)
-                            TickStatus.DELIVERED -> tickBaseColor.copy(alpha = 0.74f)
-                            TickStatus.READ -> tickBaseColor
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                    when (message.kind) {
+                        KIND_ATTACHMENT_MANIFEST -> {
+                            val attachment = remember(message.payload) {
+                                AttachmentPayload.decode(message.payload)
+                            }
+                            if (attachment == null) {
+                                Text("Unsupported attachment")
+                            } else {
+                                AttachmentBubbleContent(attachment = attachment, contentColor = contentColor)
+                            }
                         }
-                        SignalTick(
-                            status = tick,
-                            tint = tint,
-                            bubbleColor = bubbleColor,
-                            modifier = Modifier.padding(start = 8.dp, bottom = 2.dp),
-                        )
+                        else -> {
+                            Text(message.payload.toString(Charsets.UTF_8))
+                        }
+                    }
+                    if (tick != null) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 4.dp),
+                            horizontalArrangement = Arrangement.End,
+                        ) {
+                            val tint = when (tick) {
+                                TickStatus.SENT -> tickBaseColor.copy(alpha = 0.88f)
+                                TickStatus.DELIVERED -> tickBaseColor.copy(alpha = 0.74f)
+                                TickStatus.READ -> tickBaseColor
+                            }
+                            SignalTick(
+                                status = tick,
+                                tint = tint,
+                                bubbleColor = bubbleColor,
+                                modifier = Modifier.padding(start = 8.dp, bottom = 2.dp),
+                            )
+                        }
                     }
                 }
             }
@@ -475,6 +792,122 @@ private fun MessageBubble(
             }
         )
     }
+}
+
+@Composable
+private fun AttachmentBubbleContent(
+    attachment: AttachmentPayload,
+    contentColor: Color,
+) {
+    when (attachment.mediaType) {
+        AttachmentPayload.MediaType.IMAGE -> {
+            val bitmap = remember(attachment.blob) {
+                BitmapFactory.decodeByteArray(attachment.blob, 0, attachment.blob.size)?.asImageBitmap()
+            }
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap,
+                    contentDescription = "Photo",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 240.dp),
+                )
+            } else {
+                Text("Photo (could not display)")
+            }
+            if (attachment.caption.isNotBlank()) {
+                Text(
+                    text = attachment.caption,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+        }
+        AttachmentPayload.MediaType.AUDIO -> {
+            VoiceMemoPlayer(
+                blob = attachment.blob,
+                durationMs = attachment.durationMs,
+                contentColor = contentColor,
+            )
+            if (attachment.caption.isNotBlank()) {
+                Text(
+                    text = attachment.caption,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun VoiceMemoPlayer(
+    blob: ByteArray,
+    durationMs: Int,
+    contentColor: Color,
+) {
+    val context = LocalContext.current
+    var playing by remember { mutableStateOf(false) }
+    var player by remember { mutableStateOf<MediaPlayer?>(null) }
+
+    DisposableEffect(blob) {
+        onDispose {
+            player?.release()
+            player = null
+            playing = false
+        }
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        IconButton(
+            onClick = {
+                if (playing) {
+                    player?.stop()
+                    player?.release()
+                    player = null
+                    playing = false
+                } else {
+                    try {
+                        val temp = File(context.cacheDir, "play-${System.currentTimeMillis()}.m4a")
+                        temp.writeBytes(blob)
+                        val mp = MediaPlayer().apply {
+                            setDataSource(temp.absolutePath)
+                            setOnCompletionListener {
+                                playing = false
+                                release()
+                                player = null
+                                temp.delete()
+                            }
+                            prepare()
+                            start()
+                        }
+                        player = mp
+                        playing = true
+                    } catch (_: Exception) {
+                        playing = false
+                        Toast.makeText(context, "Could not play voice memo", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            },
+            modifier = Modifier.size(40.dp),
+        ) {
+            Icon(
+                imageVector = if (playing) Icons.Default.Close else Icons.Default.PlayArrow,
+                contentDescription = if (playing) "Stop" else "Play voice memo",
+                tint = contentColor,
+            )
+        }
+        Text(
+            text = "Voice memo · ${formatDurationMs(durationMs)}",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+    }
+}
+
+private fun formatDurationMs(ms: Int): String {
+    val totalSec = ((ms + 500) / 1000).coerceAtLeast(0)
+    val min = totalSec / 60
+    val sec = totalSec % 60
+    return "%d:%02d".format(min, sec)
 }
 
 private fun isNewDay(messages: List<StoredMessage>, index: Int): Boolean {

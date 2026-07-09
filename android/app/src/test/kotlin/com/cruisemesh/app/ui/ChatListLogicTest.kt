@@ -49,9 +49,23 @@ class ChatListLogicTest {
             StoredMessage(peerId, peerId, 1uL, 1000L, 1u.toUByte(), byteArrayOf()), // read
             StoredMessage(ownId, ownId, 2uL, 2000L, 1u.toUByte(), byteArrayOf()), // own message
             StoredMessage(peerId, peerId, 3uL, 3000L, 1u.toUByte(), byteArrayOf()), // unread
-            StoredMessage(peerId, peerId, 4uL, 4000L, 1u.toUByte(), byteArrayOf())  // unread
+            StoredMessage(peerId, peerId, 4uL, 4000L, 1u.toUByte(), byteArrayOf()), // unread
+            // Hidden friend-request stream noise must not inflate the badge.
+            StoredMessage(peerId, peerId, 5uL, 5000L, 3u.toUByte(), byteArrayOf()),
         )
         val unread = ChatListLogic.computeUnread(messages, ownId, readThrough = 1uL)
         assertEquals(2, unread)
+    }
+
+    @Test
+    fun lastVisibleMessageSkipsFriendRequests() {
+        val peerId = byteArrayOf(2)
+        val messages = listOf(
+            StoredMessage(peerId, peerId, 1uL, 1000L, 1u.toUByte(), "hello".toByteArray()),
+            StoredMessage(peerId, peerId, 2uL, 2000L, 3u.toUByte(), "{}".toByteArray()),
+        )
+        val last = ChatListLogic.lastVisibleMessage(messages)
+        assertEquals(1uL, last!!.lamport)
+        assertEquals("hello", ChatListLogic.previewText(last))
     }
 }

@@ -230,7 +230,7 @@ fun ChatRow(
                 if (summary.lastMessage != null) {
                     val isOwn = summary.lastMessage.senderUserId.contentEquals(ownUserId)
                     val prefix = if (isOwn) "You: " else ""
-                    val content = String(summary.lastMessage.payload, Charsets.UTF_8)
+                    val content = ChatListLogic.previewText(summary.lastMessage)
                     
                     if (isOwn) {
                         val tick = tickStatusFor(

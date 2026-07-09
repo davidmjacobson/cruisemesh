@@ -27,6 +27,8 @@ import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.identity.IdentityStore
+import com.cruisemesh.app.media.AttachmentPayload
+import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
 import com.cruisemesh.app.relay.RelayClient
@@ -1024,7 +1026,14 @@ class MeshService : Service() {
         }
 
         when (body.kind) {
-            KIND_TEXT -> handleIncomingText(address, opened.senderUserId, body, identity)
+            KIND_TEXT -> handleIncomingChatMessage(address, opened.senderUserId, body, identity, KIND_TEXT)
+            KIND_ATTACHMENT_MANIFEST -> handleIncomingChatMessage(
+                address,
+                opened.senderUserId,
+                body,
+                identity,
+                KIND_ATTACHMENT_MANIFEST,
+            )
             KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
             KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, opened.senderUserId, body, identity)
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
@@ -1126,34 +1135,40 @@ class MeshService : Service() {
      * two notifications for one message.
      *
      * This never triggers another receipt (see [handleIncomingReceipt]):
-     * receipts are kind=2, this branch only ever runs for kind=1, and
-     * [handleIncomingReceipt] never calls [sendReceiptOnAddress] or
-     * [sendReceiptToContact] or otherwise sends anything back. Combined with
-     * authored resend only ever replaying kinds that *we* originated (text
-     * and friend-request, never a receipt), there's no cycle where a receipt
-     * causes a receipt.
+     * receipts are kind=2, this branch only ever runs for chat-stream kinds
+     * (text / attachment-manifest), and [handleIncomingReceipt] never calls
+     * [sendReceiptOnAddress] or [sendReceiptToContact] or otherwise sends
+     * anything back. Combined with authored resend only ever replaying kinds
+     * that *we* originated (text, attachment, friend-request — never a
+     * receipt), there's no cycle where a receipt causes a receipt.
      */
-    private fun handleIncomingText(address: String, senderUserId: ByteArray, body: MessageBody, identity: Identity) {
+    private fun handleIncomingChatMessage(
+        address: String,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+        kind: UByte,
+    ) {
         val inserted = store.insertMessage(
             StoredMessage(
                 chatId = senderUserId,
                 senderUserId = senderUserId,
                 lamport = body.lamport,
                 timestamp = body.timestamp,
-                kind = KIND_TEXT,
+                kind = kind,
                 payload = body.content,
             ),
         )
         if (!inserted) {
             Log.i(
                 TAG,
-                "Ignoring duplicate text from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
+                "Ignoring duplicate kind=$kind from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
             )
             return
         }
         Log.i(
             TAG,
-            "Stored text from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
+            "Stored kind=$kind from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
         )
         ChatEvents.notifyChatChanged(senderUserId)
 
@@ -1205,7 +1220,12 @@ class MeshService : Service() {
             // *becomes* visible, not for messages arriving while it already is.
             sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
         } else {
-            MessageNotifier.notifyIncomingMessage(this, contact, body.content.toString(Charsets.UTF_8))
+            val preview = when (kind) {
+                KIND_ATTACHMENT_MANIFEST ->
+                    AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))
+                else -> body.content.toString(Charsets.UTF_8)
+            }
+            MessageNotifier.notifyIncomingMessage(this, contact, preview)
         }
     }
 

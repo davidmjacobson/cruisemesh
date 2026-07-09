@@ -1,6 +1,7 @@
 package com.cruisemesh.app.mesh
 
 import android.util.Log
+import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.Identity
@@ -23,6 +24,9 @@ private const val KIND_FRIEND_REQUEST: UByte = 3u
 /** Mirrors core's `DEFAULT_HOP_TTL` for freshly authored outbound messages. */
 private const val DEFAULT_HOP_TTL: UByte = 7u
 
+private fun isAuthoredChatKind(kind: UByte): Boolean =
+    kind == KIND_TEXT || kind == KIND_FRIEND_REQUEST || kind == KIND_ATTACHMENT_MANIFEST
+
 /**
  * Seals one locally authored chat-stream message into the persistent outbound
  * queue shape used by BLE retry and relay upload. The message's own authoring
@@ -35,7 +39,7 @@ fun buildOutboundAuthoredEnvelope(
     contact: Contact,
     message: StoredMessage,
 ): OutboundEnvelope? {
-    if (message.kind != KIND_TEXT && message.kind != KIND_FRIEND_REQUEST) {
+    if (!isAuthoredChatKind(message.kind)) {
         Log.w(TAG, "Refusing to queue unsupported authored message kind=${message.kind}")
         return null
     }
