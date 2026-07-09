@@ -270,6 +270,35 @@ impl MessageStore {
         Ok(())
     }
 
+    /// Delete a contact and, with it, the entire 1:1 chat: the contact row,
+    /// every message whose `chat_id` is their UserID (DESIGN.md §7.1: a 1:1
+    /// chat's id *is* the peer's UserID), and that chat's receipt rows.
+    ///
+    /// Messages are deleted rather than retained, deliberately: the driving
+    /// use case is pruning a dead contact whose identity changed (e.g. a
+    /// reinstall regenerated their keys), where the old chat can never
+    /// receive again -- and this app's privacy posture (DESIGN.md §6.4
+    /// hides even receipt metadata from the wire) argues against quietly
+    /// hoarding plaintext history for a peer the user chose to remove.
+    /// Group messages from this sender are untouched (they live under the
+    /// group's chat_id and belong to the group, not the contact).
+    ///
+    /// Atomic (single transaction) and idempotent: deleting an unknown
+    /// contact is a no-op. Returns `true` if a contact row was removed.
+    pub fn delete_contact(&self, user_id: Vec<u8>) -> Result<bool, CoreError> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
+        let removed = tx
+            .execute("DELETE FROM contacts WHERE user_id = ?1", params![user_id])
+            .map_err(store_err)?;
+        tx.execute("DELETE FROM messages WHERE chat_id = ?1", params![user_id])
+            .map_err(store_err)?;
+        tx.execute("DELETE FROM receipts WHERE chat_id = ?1", params![user_id])
+            .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(removed > 0)
+    }
+
     /// Look up a single contact by UserID, or `None` if not a contact.
     pub fn get_contact(&self, user_id: Vec<u8>) -> Result<Option<Contact>, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
@@ -511,6 +540,67 @@ mod tests {
 
         let names: Vec<String> = store.list_contacts().unwrap().into_iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
+    #[test]
+    fn delete_contact_removes_the_contact() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+
+        assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
+        assert_eq!(store.get_contact(b"alice-id".to_vec()).unwrap(), None);
+        assert!(store.list_contacts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_contact_is_a_noop_for_unknown_contact() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(!store.delete_contact(b"nobody".to_vec()).unwrap());
+        // Deleting twice is idempotent, not an error.
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
+        assert!(!store.delete_contact(b"alice-id".to_vec()).unwrap());
+    }
+
+    #[test]
+    fn delete_contact_deletes_the_1to1_chat_messages_and_receipts() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        // 1:1 chat_id = the peer's UserID (DESIGN.md §7.1): both directions live under it.
+        store.insert_message(msg(b"alice-id", b"alice-id", 1, "from alice")).unwrap();
+        store.insert_message(msg(b"alice-id", b"me", 1, "from me")).unwrap();
+        store
+            .record_receipt(b"alice-id".to_vec(), b"me".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 1)
+            .unwrap();
+
+        assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
+
+        assert!(store.messages_for_chat(b"alice-id".to_vec()).unwrap().is_empty());
+        assert_eq!(
+            store
+                .receipt_through(b"alice-id".to_vec(), b"me".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn delete_contact_leaves_other_contacts_and_chats_alone() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        store.upsert_contact(contact(b"bob-id", "Bob")).unwrap();
+        store.insert_message(msg(b"alice-id", b"alice-id", 1, "hi")).unwrap();
+        store.insert_message(msg(b"bob-id", b"bob-id", 1, "yo")).unwrap();
+        // A group chat where alice posted: her group messages belong to the
+        // group's chat_id, not to her contact, and must survive.
+        store.insert_message(msg(b"group-1", b"alice-id", 1, "group msg")).unwrap();
+
+        assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
+
+        assert_eq!(store.list_contacts().unwrap().len(), 1);
+        assert_eq!(store.messages_for_chat(b"bob-id".to_vec()).unwrap().len(), 1);
+        assert_eq!(store.messages_for_chat(b"group-1".to_vec()).unwrap().len(), 1);
+        assert!(store.messages_for_chat(b"alice-id".to_vec()).unwrap().is_empty());
     }
 
     // --- receipts (DESIGN.md §7.2) -----------------------------------------
