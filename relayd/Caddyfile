@@ -1,6 +1,11 @@
 # TLS termination for cruisemesh-relayd.
 # RELAY_DOMAIN is injected by docker compose (e.g. relay.example.com).
 # Caddy obtains and renews Let's Encrypt certificates automatically.
+#
+# WebSocket: Caddy's reverse_proxy upgrades Connection: Upgrade by default
+# (no extra directive). GET /ws on the backend is reachable as
+# wss://{$RELAY_DOMAIN}/ws?... — do not put a long response timeout that
+# would kill idle push sockets; the defaults are fine for family-scale load.
 
 {$RELAY_DOMAIN} {
 	encode gzip

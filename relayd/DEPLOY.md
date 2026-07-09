@@ -64,7 +64,9 @@ On each phone, the friend card / contact fields should be:
 | relay token | the same family token from step 1 |
 
 The Android client uploads queued envelopes and polls
-`GET /envelopes?hints=...` with that bearer token.
+`GET /envelopes?hints=...` with that bearer token. With a live network path
+it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
+(see §6).
 
 ## 5. Environment reference
 
@@ -110,8 +112,29 @@ named volume so this cannot silently drift.
   can re-poll after a crash without losing mail.
 - **Content-agnostic**: sealed blobs only. Text and receipt envelopes share the
   same routes; the server never inspects `kind`.
+- **WebSocket push** (`GET /ws`): see §7. Acks remain `POST /envelopes/ack`;
+  poll stays available and unchanged for offline/reconnect catch-up.
 
-## 7. Local (non-Docker) run
+## 7. WebSocket push (`GET /ws`)
+
+Phones with a live internet path can subscribe instead of only polling:
+
+```
+wss://relay.example.com/ws?hints=<base64url,...>&after=<cursor>
+```
+
+| Concern | Behavior |
+|---|---|
+| Auth | Same family bearer token as REST. Prefer `Authorization: Bearer <token>` on the handshake (native clients). `?token=` is also accepted because browser `WebSocket` cannot set headers — avoid query tokens in shared logs when you can. |
+| `hints=` / `after=` | Same meaning as `GET /envelopes`. |
+| On connect | Server **replays** every row poll would return for those hints since `after` (JSON pages shaped like the REST fetch body: `{ envelopes, next_cursor }`), then **streams** matching new POSTs the same way. |
+| Ack | Still REST-only (`POST /envelopes/ack`). WS never deletes rows. |
+| Slow clients | Bounded broadcast; lagging or stuck writers are **disconnected**. Reconnect with the last cursor and replay — that is what the cursor is for. |
+
+Caddy already proxies WebSocket upgrades on the compose stack (see `Caddyfile`
+comments). No extra port is required.
+
+## 8. Local (non-Docker) run
 
 Useful for development on the same machine as the phones' host:
 
@@ -127,7 +150,7 @@ For a quick public URL during bring-up only, a tunnel (localtunnel, cloudflared,
 etc.) can still sit in front of that bind address — production should use the
 compose + Caddy path above instead.
 
-## 8. Backup
+## 9. Backup
 
 The SQLite file is the entire mailbox state:
 
@@ -141,8 +164,8 @@ docker run --rm -v relayd_relay-data:/data -v "${PWD}:/backup" alpine \
 Volume name may be prefixed with the compose project name (`relayd_relay-data`
 if started from this directory).
 
-## 9. Not in this deploy yet
+## 10. Not in this deploy yet
 
-- **WebSocket push** (DESIGN.md §9) — phones still poll when internet appears.
-  Stretch work for a later pass.
 - Multi-region / federation — single VPS is the intended family-scale deploy.
+- Android/iOS clients still primarily poll today; wiring the phone apps to
+  `GET /ws` is a client change, not a server gap.
