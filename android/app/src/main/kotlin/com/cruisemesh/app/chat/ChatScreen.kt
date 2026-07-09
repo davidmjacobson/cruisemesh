@@ -152,6 +152,9 @@ fun ChatScreen(
     }
     var draft by remember { mutableStateOf("") }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
+    // A photo picked but not yet sent: shown as a preview card above the composer
+    // so a caption can ride along with it in a single attachment (see [onSend]).
+    var pendingPhoto by remember { mutableStateOf<ByteArray?>(null) }
     val voiceRecorder = remember { VoiceRecorder(context) }
 
     fun reload() {
@@ -160,21 +163,12 @@ fun ChatScreen(
         readThrough = store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_READ)
     }
 
-    fun sendImageBytes(jpeg: ByteArray?) {
+    fun stagePhoto(jpeg: ByteArray?) {
         if (jpeg == null) {
             Toast.makeText(context, "Could not prepare photo (too large or unreadable)", Toast.LENGTH_SHORT).show()
             return
         }
-        sender.sendAttachment(
-            contact,
-            AttachmentPayload(
-                mediaType = AttachmentPayload.MediaType.IMAGE,
-                mimeType = "image/jpeg",
-                durationMs = 0,
-                blob = jpeg,
-            ),
-        )
-        reload()
+        pendingPhoto = jpeg
     }
 
     fun sendVoiceFile(file: File, durationMs: Int) {
@@ -208,7 +202,7 @@ fun ChatScreen(
         ActivityResultContracts.PickVisualMedia(),
     ) { uri ->
         if (uri != null) {
-            sendImageBytes(MediaCompressor.compressImageUri(context, uri))
+            stagePhoto(MediaCompressor.compressImageUri(context, uri))
         }
     }
 
@@ -218,7 +212,7 @@ fun ChatScreen(
         val uri = pendingCameraUri
         pendingCameraUri = null
         if (success && uri != null) {
-            sendImageBytes(MediaCompressor.compressImageUri(context, uri))
+            stagePhoto(MediaCompressor.compressImageUri(context, uri))
         }
     }
 
@@ -265,9 +259,26 @@ fun ChatScreen(
         readThrough = readThrough,
         draft = draft,
         onDraftChange = { draft = it },
+        pendingPhoto = pendingPhoto,
+        onClearPendingPhoto = { pendingPhoto = null },
         onSend = {
             val text = draft.trim()
-            if (text.isNotEmpty()) {
+            val photo = pendingPhoto
+            if (photo != null) {
+                sender.sendAttachment(
+                    contact,
+                    AttachmentPayload(
+                        mediaType = AttachmentPayload.MediaType.IMAGE,
+                        mimeType = "image/jpeg",
+                        durationMs = 0,
+                        blob = photo,
+                        caption = text,
+                    ),
+                )
+                pendingPhoto = null
+                draft = ""
+                reload()
+            } else if (text.isNotEmpty()) {
                 sender.sendText(contact, text)
                 draft = ""
                 reload()
@@ -329,6 +340,8 @@ private fun ConversationScreen(
     draft: String,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
+    pendingPhoto: ByteArray? = null,
+    onClearPendingPhoto: () -> Unit = {},
     onPickGallery: () -> Unit = {},
     onPickCamera: () -> Unit = {},
     onStartVoice: () -> Boolean = { false },
@@ -420,10 +433,15 @@ private fun ConversationScreen(
                 }
             }
 
+            if (pendingPhoto != null) {
+                PendingPhotoCard(bytes = pendingPhoto, onRemove = onClearPendingPhoto)
+            }
+
             MessageComposer(
                 draft = draft,
                 onDraftChange = onDraftChange,
                 onSend = onSend,
+                hasPendingAttachment = pendingPhoto != null,
                 ownBubbleColor = MaterialTheme.colorScheme.primary,
                 onPickGallery = onPickGallery,
                 onPickCamera = onPickCamera,
@@ -470,6 +488,61 @@ private fun ConversationScreen(
 }
 
 /**
+ * Preview card for a photo that's been picked but not yet sent. Shown just
+ * above the composer with a remove button, so the user can type a caption that
+ * rides along with the image in a single attachment.
+ */
+@Composable
+private fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
+    val bitmap = remember(bytes) {
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 8.dp),
+    ) {
+        Box {
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap,
+                    contentDescription = "Photo to send",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(72.dp)
+                        .clip(RoundedCornerShape(12.dp)),
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(4.dp)
+                    .size(22.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .clickable(onClick = onRemove)
+                    .semantics { contentDescription = "Remove photo" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Default.Close,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(
+            text = "Photo ready — add a caption or send",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/**
  * Signal-style message composer: a circular "+" (in the user's own-bubble
  * color) that opens the photo library, a rounded input pill with a camera
  * icon inside on the right, and a trailing action that is a hold-to-record
@@ -485,6 +558,7 @@ private fun MessageComposer(
     draft: String,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
+    hasPendingAttachment: Boolean,
     ownBubbleColor: Color,
     onPickGallery: () -> Unit,
     onPickCamera: () -> Unit,
@@ -496,7 +570,10 @@ private fun MessageComposer(
     val onBubbleColor = MaterialTheme.colorScheme.onPrimary
     var recording by remember { mutableStateOf(false) }
     var elapsedMs by remember { mutableLongStateOf(0L) }
-    val hasText = draft.isNotBlank()
+    // A staged photo can be sent on its own, so the send button shows whenever
+    // there's text *or* a pending attachment; the mic only takes over when the
+    // composer is otherwise empty.
+    val canSend = draft.isNotBlank() || hasPendingAttachment
 
     LaunchedEffect(recording) {
         if (!recording) return@LaunchedEffect
@@ -560,7 +637,7 @@ private fun MessageComposer(
             TextField(
                 value = draft,
                 onValueChange = onDraftChange,
-                placeholder = { Text("Message") },
+                placeholder = { Text(if (hasPendingAttachment) "Add a caption…" else "Message") },
                 trailingIcon = {
                     IconButton(onClick = onPickCamera) {
                         Icon(ComposerCameraIcon, contentDescription = "Take photo")
@@ -581,7 +658,7 @@ private fun MessageComposer(
 
         Spacer(modifier = Modifier.width(8.dp))
 
-        if (hasText && !recording) {
+        if (canSend && !recording) {
             Box(
                 modifier = Modifier
                     .size(48.dp)
