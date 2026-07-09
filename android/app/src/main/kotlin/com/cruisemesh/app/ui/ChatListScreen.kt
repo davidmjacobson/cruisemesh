@@ -1,29 +1,47 @@
 package com.cruisemesh.app.ui
 
+import android.content.res.Configuration
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material3.*
+import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.cruisemesh.app.chat.TickStatus
 import com.cruisemesh.app.chat.tickStatusFor
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.StoredMessage
@@ -41,6 +59,7 @@ data class ChatSummary(
 @Composable
 fun ChatListScreen(
     ownUserId: ByteArray,
+    ownDisplayName: String,
     onChatClick: (Contact) -> Unit,
     onDeleteContact: (Contact) -> Unit,
     onNewChatClick: () -> Unit,
@@ -55,19 +74,12 @@ fun ChatListScreen(
                 title = { Text("CruiseMesh") },
                 navigationIcon = {
                     IconButton(onClick = onProfileClick) {
-                        Box(
-                            modifier = Modifier
-                                .size(32.dp)
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.primaryContainer),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = "ME",
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                style = MaterialTheme.typography.labelMedium
-                            )
-                        }
+                        AvatarBadge(
+                            userId = ownUserId,
+                            name = ownDisplayName,
+                            displayId = formatUserId(ownUserId),
+                            size = 32.dp,
+                        )
                     }
                 },
                 actions = {
@@ -97,22 +109,11 @@ fun ChatListScreen(
         }
     ) { innerPadding ->
         Column(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable(onClick = onMeshStatusClick)
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                shape = CircleShape,
-                color = MaterialTheme.colorScheme.secondaryContainer
-            ) {
-                Text(
-                    text = meshStatusText,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                    textAlign = TextAlign.Center
-                )
-            }
+            MeshStatusPill(
+                text = meshStatusText,
+                onClick = onMeshStatusClick,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
 
             if (summaries.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -173,12 +174,11 @@ fun ChatRow(
     onLongClick: () -> Unit
 ) {
     val displayId = remember(summary.contact.userId) { formatUserId(summary.contact.userId) }
-    val (avatarColor, initials) = remember(summary.contact) {
-        ChatListLogic.avatarHueAndInitials(summary.contact.userId, summary.contact.name, displayId)
+    val displayName = remember(summary.contact.name, displayId) {
+        ChatListLogic.displayNameOrId(summary.contact.name, displayId)
     }
-    
     val isUnread = summary.unreadCount > 0
-    
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -189,22 +189,14 @@ fun ChatRow(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Box(
-            modifier = Modifier
-                .size(48.dp)
-                .clip(CircleShape)
-                .background(avatarColor),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                text = initials,
-                color = Color.White,
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
-            )
-        }
-        
+        AvatarBadge(
+            userId = summary.contact.userId,
+            name = summary.contact.name,
+            displayId = displayId,
+        )
+
         Spacer(modifier = Modifier.width(16.dp))
-        
+
         Column(modifier = Modifier.weight(1f)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -212,7 +204,7 @@ fun ChatRow(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = if (summary.contact.name.isNotBlank() && summary.contact.name != "Unknown") summary.contact.name else displayId,
+                    text = displayName,
                     style = MaterialTheme.typography.bodyLarge.copy(
                         fontWeight = if (isUnread) FontWeight.Bold else FontWeight.Normal
                     ),
@@ -246,20 +238,19 @@ fun ChatRow(
                             summary.ownDeliveredThrough,
                             summary.ownReadThrough
                         )
-                        val glyph = when(tick) {
-                            TickStatus.SENT -> "✓"
-                            TickStatus.DELIVERED -> "✓✓"
-                            TickStatus.READ -> "✓✓"
+                        val tint = if (summary.ownReadThrough >= summary.lastMessage.lamport) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
                         }
-                        val tint = if (tick == TickStatus.READ) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                        Text(
-                            text = glyph,
-                            color = tint,
-                            style = MaterialTheme.typography.labelSmall,
+                        SignalTick(
+                            status = tick,
+                            tint = tint,
+                            bubbleColor = MaterialTheme.colorScheme.surface,
                             modifier = Modifier.padding(end = 4.dp)
                         )
                     }
-                    
+
                     Text(
                         text = prefix + content,
                         style = MaterialTheme.typography.bodyMedium.copy(
@@ -295,10 +286,11 @@ fun ChatRow(
 
 @Preview(showBackground = true)
 @Composable
-fun ChatListScreenPreview() {
-    MaterialTheme {
+private fun ChatListScreenEmptyPreview() {
+    CruiseMeshTheme {
         ChatListScreen(
-            ownUserId = byteArrayOf(),
+            ownUserId = byteArrayOf(0x44, 0x11),
+            ownDisplayName = "Captain",
             onChatClick = {},
             onDeleteContact = {},
             onNewChatClick = {},
@@ -306,6 +298,75 @@ fun ChatListScreenPreview() {
             onMeshStatusClick = {},
             meshStatusText = "Mesh off",
             summaries = emptyList()
+        )
+    }
+}
+
+@Preview(showBackground = true, name = "Chat List")
+@Preview(
+    showBackground = true,
+    name = "Chat List Dark",
+    uiMode = Configuration.UI_MODE_NIGHT_YES,
+)
+@Composable
+private fun ChatListScreenPreview() {
+    val ownUserId = byteArrayOf(0x44, 0x11)
+    val mayaId = byteArrayOf(0x01, 0x02)
+    val julesId = byteArrayOf(0x03, 0x04)
+    CruiseMeshTheme {
+        ChatListScreen(
+            ownUserId = ownUserId,
+            ownDisplayName = "Captain",
+            onChatClick = {},
+            onDeleteContact = {},
+            onNewChatClick = {},
+            onProfileClick = {},
+            onMeshStatusClick = {},
+            meshStatusText = "Meshing · 2 nearby",
+            summaries = listOf(
+                ChatSummary(
+                    contact = Contact(
+                        userId = mayaId,
+                        name = "Maya",
+                        signPk = ByteArray(32),
+                        agreePk = ByteArray(32),
+                        relayUrl = null,
+                        relayToken = null,
+                    ),
+                    lastMessage = StoredMessage(
+                        senderUserId = mayaId,
+                        chatId = mayaId,
+                        lamport = 8uL,
+                        timestamp = 1_783_614_000_000L,
+                        kind = 1u.toUByte(),
+                        payload = "Meet us by the aft elevators".toByteArray(),
+                    ),
+                    unreadCount = 2,
+                    ownDeliveredThrough = 0uL,
+                    ownReadThrough = 0uL,
+                ),
+                ChatSummary(
+                    contact = Contact(
+                        userId = julesId,
+                        name = "Jules",
+                        signPk = ByteArray(32),
+                        agreePk = ByteArray(32),
+                        relayUrl = null,
+                        relayToken = null,
+                    ),
+                    lastMessage = StoredMessage(
+                        senderUserId = ownUserId,
+                        chatId = julesId,
+                        lamport = 4uL,
+                        timestamp = 1_783_610_400_000L,
+                        kind = 1u.toUByte(),
+                        payload = "We grabbed coffee already".toByteArray(),
+                    ),
+                    unreadCount = 0,
+                    ownDeliveredThrough = 4uL,
+                    ownReadThrough = 4uL,
+                ),
+            ),
         )
     }
 }

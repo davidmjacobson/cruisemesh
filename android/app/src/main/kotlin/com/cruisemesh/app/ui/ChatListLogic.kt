@@ -1,6 +1,7 @@
 package com.cruisemesh.app.ui
 
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import uniffi.cruisemesh_core.StoredMessage
 import java.util.Calendar
 import java.text.SimpleDateFormat
@@ -8,10 +9,13 @@ import java.util.Locale
 
 object ChatListLogic {
 
+    fun displayNameOrId(name: String, displayId: String): String =
+        if (name.isNotBlank() && name != "Unknown") name else displayId
+
     fun avatarHueAndInitials(userId: ByteArray, name: String, displayId: String): Pair<Color, String> {
         val hue = (userId.fold(0) { acc, byte -> acc + byte.toInt() } and 0xFF) / 255f
         val color = Color.hsv(hue * 360f, 0.5f, 0.7f)
-        
+
         val initials = if (name.isNotBlank() && name != "Unknown") {
             name.take(2).uppercase()
         } else {
@@ -21,6 +25,12 @@ object ChatListLogic {
         }
         return color to initials
     }
+
+    fun avatarTextColor(background: Color): Color =
+        if (background.luminance() > 0.58f) Color.Black else Color.White
+
+    fun avatarContentDescription(name: String, displayId: String): String =
+        "Avatar for ${displayNameOrId(name, displayId)}"
 
     fun formatRelativeTime(timestampMs: Long, nowMs: Long = System.currentTimeMillis()): String {
         val now = Calendar.getInstance().apply { timeInMillis = nowMs }

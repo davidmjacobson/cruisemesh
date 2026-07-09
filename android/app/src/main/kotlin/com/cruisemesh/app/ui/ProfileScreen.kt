@@ -1,5 +1,6 @@
 package com.cruisemesh.app.ui
 
+import android.content.res.Configuration
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -100,9 +101,14 @@ fun ProfileScreen(
 }
 
 @Preview(showBackground = true)
+@Preview(
+    showBackground = true,
+    name = "Profile Dark",
+    uiMode = Configuration.UI_MODE_NIGHT_YES,
+)
 @Composable
 fun ProfileScreenPreview() {
-    MaterialTheme {
+    CruiseMeshTheme {
         ProfileScreen(
             displayId = "CM-K7QX-9M2P-3F8J-QRTZ-AB",
             fingerprint = listOf("anchor", "beacon", "coral", "dock"),

@@ -19,7 +19,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -34,10 +33,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.navigation.NavController
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -50,12 +48,14 @@ import com.cruisemesh.app.friending.FriendRequestSender
 import com.cruisemesh.app.friending.MyQrScreen
 import com.cruisemesh.app.friending.ScanScreen
 import com.cruisemesh.app.identity.IdentityStore
+import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.mesh.ChatViewEvents
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
 import com.cruisemesh.app.mesh.MeshService
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
+import com.cruisemesh.app.ui.CruiseMeshTheme
 import com.cruisemesh.app.ui.ChatListScreen
 import com.cruisemesh.app.ui.ChatSummary
 import com.cruisemesh.app.ui.ProfileScreen
@@ -77,7 +77,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         pendingChatUserIdHex.value = intent?.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)
         setContent {
-            MaterialTheme {
+            CruiseMeshTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     CruiseMeshApp(
                         pendingChatUserIdHex = pendingChatUserIdHex.value,
@@ -133,6 +133,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val store = remember { AppStore.get(context) }
     val runtimeStatus by MeshRuntimeStatus.state.collectAsState()
     var transientMeshStatus by remember { mutableStateOf<String?>(null) }
+    var ownDisplayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     
     val hasPermissions = remember(context) {
         MeshService.requiredPermissions().all {
@@ -200,14 +201,20 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     }
 
     // Refresh when navigating back to home
-    navController.addOnDestinationChangedListener { _, dest, _ ->
-        if (dest.route == "home") {
-            reloadSummaries()
+    DisposableEffect(navController) {
+        val listener = NavController.OnDestinationChangedListener { _, dest, _ ->
+            if (dest.route == "home") {
+                ownDisplayName = ProfileStore.loadDisplayName(context)
+                reloadSummaries()
+            }
         }
+        navController.addOnDestinationChangedListener(listener)
+        onDispose { navController.removeOnDestinationChangedListener(listener) }
     }
 
     ChatListScreen(
         ownUserId = identity.userId,
+        ownDisplayName = ownDisplayName,
         onChatClick = { contact -> navController.navigate("chat/${UserIdHex.encode(contact.userId)}") },
         onDeleteContact = { contact ->
             store.deleteContact(contact.userId)
@@ -323,10 +330,14 @@ private fun ContactsRoute(navController: NavHostController) {
     var contacts by remember { mutableStateOf(store.listContacts()) }
     
     // Refresh list when resuming screen
-    navController.addOnDestinationChangedListener { _, dest, _ ->
-        if (dest.route == "contacts") {
-            contacts = store.listContacts()
+    DisposableEffect(navController) {
+        val listener = NavController.OnDestinationChangedListener { _, dest, _ ->
+            if (dest.route == "contacts") {
+                contacts = store.listContacts()
+            }
         }
+        navController.addOnDestinationChangedListener(listener)
+        onDispose { navController.removeOnDestinationChangedListener(listener) }
     }
 
     ContactsScreen(
@@ -361,6 +372,10 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             sender = sender,
             store = store,
             onBack = { navController.popBackStack() },
+            onDeleteContact = {
+                store.deleteContact(contact.userId)
+                navController.popBackStack()
+            },
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }

@@ -36,8 +36,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
@@ -50,11 +48,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.relay.RelayConfigStore
+import com.cruisemesh.app.ui.AvatarBadge
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.friendCardUserId
@@ -303,9 +303,7 @@ fun ContactsScreen(
                         )
                     }
                     items(contacts) { contact ->
-                        val (avatarColor, initials) = com.cruisemesh.app.ui.ChatListLogic.avatarHueAndInitials(
-                            contact.userId, contact.name, uniffi.cruisemesh_core.formatUserId(contact.userId)
-                        )
+                        val displayId = uniffi.cruisemesh_core.formatUserId(contact.userId)
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -316,19 +314,11 @@ fun ContactsScreen(
                                 .padding(16.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(48.dp)
-                                    .clip(CircleShape)
-                                    .background(avatarColor),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = initials,
-                                    color = Color.White,
-                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
-                                )
-                            }
+                            AvatarBadge(
+                                userId = contact.userId,
+                                name = contact.name,
+                                displayId = displayId,
+                            )
                             Spacer(modifier = Modifier.width(16.dp))
                             Text(
                                 contact.name,
