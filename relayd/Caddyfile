@@ -1,0 +1,8 @@
+# TLS termination for cruisemesh-relayd.
+# RELAY_DOMAIN is injected by docker compose (e.g. relay.example.com).
+# Caddy obtains and renews Let's Encrypt certificates automatically.
+
+{$RELAY_DOMAIN} {
+	encode gzip
+	reverse_proxy relayd:8080
+}

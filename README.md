@@ -8,13 +8,14 @@ full design and milestone plan.
 - `core/` — Rust core (identity, crypto, sync engine) exposed to native shells via
   [UniFFI](https://mozilla.github.io/uniffi-rs/).
 - `android/` — Android app (Kotlin, Jetpack Compose), currently Milestone 0/1 scaffold.
+- `relayd/` — Axum + SQLite relay mailbox server for Milestone 3.
 
 ## Building
 
-**Core (host, for tests):**
+**Workspace tests:**
 
 ```sh
-cargo test -p cruisemesh-core
+cargo test --workspace
 ```
 
 **Core for Android + Kotlin bindings** (requires `rustup target add
@@ -34,3 +35,29 @@ Run this after changing anything in `core/`; it regenerates
 cd android
 ./gradlew assembleDebug
 ```
+
+**Relay server** (local dev):
+
+```sh
+# PowerShell — use an *absolute* DB path (relative defaults resolve against CWD
+# and are easy to mis-watch; see relayd/DEPLOY.md).
+$env:CRUISEMESH_RELAY_TOKENS="family-token"
+$env:CRUISEMESH_RELAY_DB="$PWD\tmp\relayd-dev.sqlite"
+cargo run -p cruisemesh-relayd
+```
+
+The relay API stores the full public envelope header shape
+(`msg_id`, `hop_ttl`, `recipient_hint`, `sealed`, `expiry_ms`) with
+msg_id-based dedupe per family token, fetch-by-hint + cursor, delete-on-ack,
+per-envelope expiry pruning, and a 30-day server retention ceiling. It is
+content-agnostic (sealed blobs only — text and receipt envelopes share one path).
+
+Optional env vars:
+
+- `CRUISEMESH_RELAY_BIND` — listen address, default `0.0.0.0:8080`
+- `CRUISEMESH_RELAY_DB` — SQLite path, default `cruisemesh-relayd.sqlite` (**prefer absolute**)
+- `CRUISEMESH_RELAY_TOKENS` — required comma-separated family bearer tokens
+
+**Production deploy** (Docker + Caddy TLS, family-token provisioning, DB-path
+gotcha): see [`relayd/DEPLOY.md`](relayd/DEPLOY.md) and
+[`relayd/docker-compose.yml`](relayd/docker-compose.yml).
