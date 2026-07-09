@@ -220,10 +220,17 @@ private fun ScanRoute(navController: NavHostController) {
 @Composable
 private fun ContactsRoute(navController: NavHostController) {
     val context = LocalContext.current
-    val contacts = remember { AppStore.get(context).listContacts() }
+    val store = remember { AppStore.get(context) }
+    // Mutable so a deletion is reflected immediately; reloaded from the store
+    // rather than filtered locally so the list always mirrors what persisted.
+    var contacts by remember { mutableStateOf(store.listContacts()) }
     ContactsScreen(
         contacts = contacts,
         onContactClick = { contact -> navController.navigate("chat/${UserIdHex.encode(contact.userId)}") },
+        onContactDelete = { contact ->
+            store.deleteContact(contact.userId)
+            contacts = store.listContacts()
+        },
         onBack = { navController.popBackStack() },
     )
 }
