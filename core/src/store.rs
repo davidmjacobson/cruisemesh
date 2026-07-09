@@ -81,6 +81,24 @@ pub struct DigestEntry {
     pub through_lamport: u64,
 }
 
+/// A sealed envelope this node is muling for someone else (DESIGN.md §5.3
+/// carry queue): a foreign envelope we couldn't open (so it isn't for us) but
+/// hold on to, to hand to its recipient when we next meet them. These are the
+/// §6.4 public-header fields plus the opaque sealed blob -- everything needed
+/// to reconstruct the exact `0x02` frame for onward delivery (see
+/// [`crate::encode_envelope_frame`]). The internal eviction bookkeeping
+/// (is-family, received-at, size) is deliberately *not* on this record: it's
+/// an implementation detail of the store's budget enforcement, not something
+/// the transport layer needs when it pulls an envelope back out to send.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct CarriedEnvelope {
+    pub msg_id: Vec<u8>,
+    pub hop_ttl: u8,
+    pub expiry: i64,
+    pub recipient_hint: Vec<u8>,
+    pub sealed: Vec<u8>,
+}
+
 #[derive(uniffi::Object)]
 pub struct MessageStore {
     conn: Mutex<Connection>,
@@ -320,6 +338,156 @@ impl MessageStore {
         let rows = stmt.query_map([], row_to_contact).map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
+
+    // --- carry queue (DESIGN.md §5.3) --------------------------------------
+
+    /// Store a foreign envelope for later store-and-forward delivery
+    /// (DESIGN.md §5.3 carry queue). Keyed on `msg_id`, so re-enqueuing an
+    /// envelope we're already carrying is a no-op (returns `false`); a fresh
+    /// insert returns `true`.
+    ///
+    /// `is_family` marks whether this envelope is addressed to someone this
+    /// node knows (its `recipient_hint` matched a contact -- the caller
+    /// decides, since it holds the contacts and the hint derivation). Family
+    /// envelopes are kept until they expire and **never** evicted for space;
+    /// only foreign envelopes count against `foreign_budget_bytes` (DESIGN.md
+    /// §5.3: "Family messages always win eviction fights"). When inserting a
+    /// new foreign envelope pushes the foreign total over budget, the oldest
+    /// foreign envelopes (by `received_at_ms`) are evicted until it fits --
+    /// possibly including this one, if a single envelope exceeds the whole
+    /// budget. All of this happens in one transaction.
+    pub fn enqueue_carried_envelope(
+        &self,
+        envelope: CarriedEnvelope,
+        is_family: bool,
+        received_at_ms: i64,
+        foreign_budget_bytes: i64,
+    ) -> Result<bool, CoreError> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
+        let size = envelope.sealed.len() as i64;
+        let changed = tx
+            .execute(
+                "INSERT OR IGNORE INTO carried_envelopes
+                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family, received_at, size_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    envelope.msg_id,
+                    envelope.hop_ttl as i64,
+                    envelope.expiry,
+                    envelope.recipient_hint,
+                    envelope.sealed,
+                    is_family as i64,
+                    received_at_ms,
+                    size,
+                ],
+            )
+            .map_err(store_err)?;
+
+        if changed == 0 {
+            // Already carrying this msg_id: nothing inserted, so the budget
+            // can't have grown -- skip eviction.
+            tx.commit().map_err(store_err)?;
+            return Ok(false);
+        }
+
+        // Family envelopes are evict-proof; enforce the budget over foreign
+        // ones only, dropping oldest-first until back within it.
+        let mut foreign_total: i64 = tx
+            .query_row(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM carried_envelopes WHERE is_family = 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(store_err)?;
+        while foreign_total > foreign_budget_bytes {
+            let oldest: Option<(Vec<u8>, i64)> = tx
+                .query_row(
+                    "SELECT msg_id, size_bytes FROM carried_envelopes
+                     WHERE is_family = 0 ORDER BY received_at ASC, msg_id ASC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(store_err)?;
+            match oldest {
+                Some((msg_id, sz)) => {
+                    tx.execute("DELETE FROM carried_envelopes WHERE msg_id = ?1", params![msg_id])
+                        .map_err(store_err)?;
+                    foreign_total -= sz;
+                }
+                None => break,
+            }
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(true)
+    }
+
+    /// Carried envelopes whose `recipient_hint` matches any of `hints` and
+    /// that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
+    /// The caller passes the set of hints a just-met peer could match --
+    /// `recipient_hint` rotates daily (§6.4), so that's the peer's UserID
+    /// hashed against each recent day. A match means "this envelope is for
+    /// that peer," so the caller can hand it over and then
+    /// [`MessageStore::remove_carried_envelope`] it.
+    pub fn carried_envelopes_for_hints(
+        &self,
+        hints: Vec<Vec<u8>>,
+        now_ms: i64,
+    ) -> Result<Vec<CarriedEnvelope>, CoreError> {
+        if hints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let placeholders = std::iter::repeat("?").take(hints.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
+             FROM carried_envelopes
+             WHERE expiry > ?1 AND recipient_hint IN ({placeholders})
+             ORDER BY received_at ASC, msg_id ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let mut bindings: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(hints.len() + 1);
+        bindings.push(&now_ms);
+        for hint in &hints {
+            bindings.push(hint);
+        }
+        let rows = stmt
+            .query_map(bindings.as_slice(), row_to_carried)
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Drop a carried envelope by `msg_id` -- called once it's been handed to
+    /// its recipient (DESIGN.md §5.3: a mule's job is done on delivery).
+    /// Returns `true` if a row was removed.
+    pub fn remove_carried_envelope(&self, msg_id: Vec<u8>) -> Result<bool, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let removed = conn
+            .execute("DELETE FROM carried_envelopes WHERE msg_id = ?1", params![msg_id])
+            .map_err(store_err)?;
+        Ok(removed > 0)
+    }
+
+    /// Delete every carried envelope whose `expiry` is at or before `now_ms`
+    /// (DESIGN.md §5.3: "carriers drop the envelope past this time"). Returns
+    /// how many were pruned.
+    pub fn prune_expired_carried(&self, now_ms: i64) -> Result<u64, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let pruned = conn
+            .execute("DELETE FROM carried_envelopes WHERE expiry <= ?1", params![now_ms])
+            .map_err(store_err)?;
+        Ok(pruned as u64)
+    }
+
+    /// Number of envelopes currently in the carry queue (diagnostics/tests).
+    pub fn carried_len(&self) -> Result<u64, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM carried_envelopes", [], |row| row.get(0))
+            .map_err(store_err)?;
+        Ok(count as u64)
+    }
 }
 
 /// Shared by [`MessageStore::highest_contiguous_lamport`] and
@@ -361,6 +529,16 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
         timestamp: row.get(3)?,
         kind: row.get::<_, i64>(4)? as u8,
         payload: row.get(5)?,
+    })
+}
+
+fn row_to_carried(row: &rusqlite::Row) -> rusqlite::Result<CarriedEnvelope> {
+    Ok(CarriedEnvelope {
+        msg_id: row.get(0)?,
+        hop_ttl: row.get::<_, i64>(1)? as u8,
+        expiry: row.get(2)?,
+        recipient_hint: row.get(3)?,
+        sealed: row.get(4)?,
     })
 }
 
@@ -406,6 +584,19 @@ CREATE TABLE IF NOT EXISTS receipts (
     through_lamport INTEGER NOT NULL,
     PRIMARY KEY(chat_id, sender_user_id, receipt_type)
 );
+
+CREATE TABLE IF NOT EXISTS carried_envelopes (
+    msg_id         BLOB PRIMARY KEY,
+    hop_ttl        INTEGER NOT NULL,
+    expiry         INTEGER NOT NULL,
+    recipient_hint BLOB NOT NULL,
+    sealed         BLOB NOT NULL,
+    is_family      INTEGER NOT NULL,
+    received_at    INTEGER NOT NULL,
+    size_bytes     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_carried_hint ON carried_envelopes(recipient_hint);
+CREATE INDEX IF NOT EXISTS idx_carried_expiry ON carried_envelopes(expiry);
 ";
 
 #[cfg(test)]
@@ -792,5 +983,125 @@ mod tests {
             payloads,
             vec![b"msg-3".to_vec(), b"msg-4".to_vec(), b"msg-5".to_vec()]
         );
+    }
+
+    // --- carry queue (DESIGN.md §5.3) --------------------------------------
+
+    const BIG_BUDGET: i64 = 5 * 1024 * 1024;
+
+    fn carried(msg_id: &[u8], hint: &[u8], expiry: i64, sealed_len: usize) -> CarriedEnvelope {
+        CarriedEnvelope {
+            msg_id: msg_id.to_vec(),
+            hop_ttl: 7,
+            expiry,
+            recipient_hint: hint.to_vec(),
+            sealed: vec![0xAB; sealed_len],
+        }
+    }
+
+    #[test]
+    fn enqueue_then_fetch_by_hint_round_trips() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let env = carried(b"m1", b"hint-a", 2_000, 100);
+        assert!(store.enqueue_carried_envelope(env.clone(), false, 1_000, BIG_BUDGET).unwrap());
+
+        let found = store.carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 1_500).unwrap();
+        assert_eq!(found, vec![env]);
+    }
+
+    #[test]
+    fn enqueue_is_idempotent_on_msg_id() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(store.enqueue_carried_envelope(carried(b"m1", b"h", 2_000, 100), false, 1_000, BIG_BUDGET).unwrap());
+        // Same msg_id, re-received under DTN: no-op, not a duplicate row.
+        assert!(!store.enqueue_carried_envelope(carried(b"m1", b"h", 2_000, 100), false, 1_050, BIG_BUDGET).unwrap());
+        assert_eq!(store.carried_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn fetch_by_hint_ignores_nonmatching_and_expired() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.enqueue_carried_envelope(carried(b"m1", b"hint-a", 2_000, 10), false, 1_000, BIG_BUDGET).unwrap();
+        store.enqueue_carried_envelope(carried(b"m2", b"hint-b", 2_000, 10), false, 1_000, BIG_BUDGET).unwrap();
+        store.enqueue_carried_envelope(carried(b"m3", b"hint-a", 1_200, 10), false, 1_000, BIG_BUDGET).unwrap();
+
+        // now_ms = 1_500: m3 (expiry 1_200) is expired; m2 has the wrong hint.
+        let found = store.carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 1_500).unwrap();
+        let ids: Vec<Vec<u8>> = found.into_iter().map(|e| e.msg_id).collect();
+        assert_eq!(ids, vec![b"m1".to_vec()]);
+    }
+
+    #[test]
+    fn fetch_matches_any_of_several_hints() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.enqueue_carried_envelope(carried(b"m1", b"day-a", 9_000, 10), false, 1_000, BIG_BUDGET).unwrap();
+        store.enqueue_carried_envelope(carried(b"m2", b"day-b", 9_000, 10), false, 1_100, BIG_BUDGET).unwrap();
+        store.enqueue_carried_envelope(carried(b"m3", b"day-c", 9_000, 10), false, 1_200, BIG_BUDGET).unwrap();
+
+        // A peer's recent-day hints cover day-a and day-c but not day-b.
+        let found = store
+            .carried_envelopes_for_hints(vec![b"day-a".to_vec(), b"day-c".to_vec()], 5_000)
+            .unwrap();
+        let ids: Vec<Vec<u8>> = found.into_iter().map(|e| e.msg_id).collect();
+        assert_eq!(ids, vec![b"m1".to_vec(), b"m3".to_vec()]); // oldest received_at first
+    }
+
+    #[test]
+    fn remove_carried_deletes_it() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.enqueue_carried_envelope(carried(b"m1", b"h", 2_000, 10), false, 1_000, BIG_BUDGET).unwrap();
+        assert!(store.remove_carried_envelope(b"m1".to_vec()).unwrap());
+        assert!(!store.remove_carried_envelope(b"m1".to_vec()).unwrap()); // gone, idempotent
+        assert_eq!(store.carried_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_expired_carried_drops_only_the_expired() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.enqueue_carried_envelope(carried(b"live", b"h", 5_000, 10), false, 1_000, BIG_BUDGET).unwrap();
+        store.enqueue_carried_envelope(carried(b"dead", b"h", 1_500, 10), false, 1_000, BIG_BUDGET).unwrap();
+
+        assert_eq!(store.prune_expired_carried(2_000).unwrap(), 1);
+        assert_eq!(store.carried_len().unwrap(), 1);
+        let found = store.carried_envelopes_for_hints(vec![b"h".to_vec()], 2_000).unwrap();
+        assert_eq!(found[0].msg_id, b"live");
+    }
+
+    #[test]
+    fn foreign_budget_evicts_oldest_foreign_first() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // Budget of 250 bytes; three 100-byte foreign envelopes can't all fit.
+        store.enqueue_carried_envelope(carried(b"f1", b"h", 9_000, 100), false, 1_000, 250).unwrap();
+        store.enqueue_carried_envelope(carried(b"f2", b"h", 9_000, 100), false, 2_000, 250).unwrap();
+        // Third insert pushes total to 300 > 250, evicting the oldest (f1).
+        store.enqueue_carried_envelope(carried(b"f3", b"h", 9_000, 100), false, 3_000, 250).unwrap();
+
+        let ids: Vec<Vec<u8>> = store
+            .carried_envelopes_for_hints(vec![b"h".to_vec()], 5_000)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.msg_id)
+            .collect();
+        assert_eq!(ids, vec![b"f2".to_vec(), b"f3".to_vec()]);
+    }
+
+    #[test]
+    fn family_envelopes_are_never_evicted_for_budget() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // A family envelope (is_family = true) far exceeding the budget stays.
+        store.enqueue_carried_envelope(carried(b"fam", b"h", 9_000, 400), true, 1_000, 250).unwrap();
+        // Foreign envelopes still get budget-capped independently...
+        store.enqueue_carried_envelope(carried(b"f1", b"h", 9_000, 100), false, 2_000, 250).unwrap();
+        store.enqueue_carried_envelope(carried(b"f2", b"h", 9_000, 100), false, 3_000, 250).unwrap();
+        store.enqueue_carried_envelope(carried(b"f3", b"h", 9_000, 100), false, 4_000, 250).unwrap();
+
+        let ids: Vec<Vec<u8>> = store
+            .carried_envelopes_for_hints(vec![b"h".to_vec()], 5_000)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.msg_id)
+            .collect();
+        // fam survives despite being 400 bytes (> budget); foreign kept to f2,f3.
+        assert_eq!(ids, vec![b"fam".to_vec(), b"f2".to_vec(), b"f3".to_vec()]);
     }
 }

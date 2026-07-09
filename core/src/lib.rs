@@ -22,4 +22,4 @@ pub use protocol::{
     DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL, KIND_RECEIPT, KIND_TEXT, RECEIPT_TYPE_DELIVERED,
     RECEIPT_TYPE_READ,
 };
-pub use store::{Contact, DigestEntry, MessageStore, StoredMessage};
+pub use store::{CarriedEnvelope, Contact, DigestEntry, MessageStore, StoredMessage};

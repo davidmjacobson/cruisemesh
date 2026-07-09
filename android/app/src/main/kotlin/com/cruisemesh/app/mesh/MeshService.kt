@@ -18,6 +18,7 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
+import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.DigestEntry
@@ -56,6 +57,23 @@ private const val RECEIPT_TYPE_READ: UByte = 2u
 
 /** DESIGN.md §5.3: hop budget a freshly authored envelope's §6.4 header starts with. Mirrors core's `DEFAULT_HOP_TTL`. */
 private const val DEFAULT_HOP_TTL: UByte = 7u
+
+private const val MS_PER_DAY: Long = 24L * 60 * 60 * 1000
+
+/**
+ * How many recent day-numbers to hash a peer's UserID against when matching
+ * carried envelopes (DESIGN.md §5.3 carry queue, §6.4 `recipient_hint`). A
+ * `recipient_hint` is `BLAKE2b-8(UserID || day-number)` where the day-number
+ * is the envelope's *creation* day; since envelopes live `DEFAULT_EXPIRY_MS`
+ * (7 days) and an unexpired one was created at most 7 days ago, hashing a
+ * peer's UserID against today back through 7 days ago covers every day-salt a
+ * still-carried envelope for them could have used. Mirrors core's
+ * `DEFAULT_EXPIRY_MS` / `MS_PER_DAY`.
+ */
+private const val CARRY_HINT_DAY_WINDOW: Long = 7
+
+/** DESIGN.md §5.3: the bounded budget (~5 MB) of *foreign* muled envelopes; family (known-recipient) traffic is exempt. */
+private const val FOREIGN_CARRY_BUDGET_BYTES: Long = 5L * 1024 * 1024
 
 /**
  * Runs both BLE GATT roles simultaneously (DESIGN.md §5.2) so this device can
@@ -241,6 +259,12 @@ class MeshService : Service() {
         MeshRouter.onHello(address, userId)
         Log.i(TAG, "HELLO from $address: userId=${UserIdHex.encode(userId)}")
 
+        // Hand off anything we're muling for this peer (DESIGN.md §5.3 carry
+        // queue) before the digest sync. This runs for *any* peer, contact or
+        // not: we carry foreign envelopes for strangers too, and a stranger to
+        // us may still be the intended recipient of something we picked up.
+        drainCarriedEnvelopesTo(address, userId)
+
         val contact = store.getContact(userId)
         if (contact == null) {
             Log.i(TAG, "HELLO from unrecognized userId=${UserIdHex.encode(userId)}; not syncing anything")
@@ -353,12 +377,102 @@ class MeshService : Service() {
         val opened = try {
             openMessage(identity, envelope.sealed)
         } catch (e: CoreException) {
-            // Not for us (or unopenable) -> foreign traffic to relay onward.
+            // Not for us (or unopenable) -> foreign traffic. Two jobs, both
+            // best-effort (DESIGN.md §5.3): flood it to whoever's connected
+            // right now, and carry it so we can hand it to its recipient the
+            // next time we meet them, even if that's hours from now.
             relayForeignEnvelope(address, envelope)
+            carryForeignEnvelope(envelope)
             return
         }
         deliverOpenedEnvelope(address, opened, identity)
     }
+
+    /**
+     * Adds a foreign envelope to the persistent carry queue (DESIGN.md §5.3
+     * store-and-forward). Classifies it as "family" -- addressed to someone we
+     * know -- when its `recipient_hint` matches a contact ([hintMatchesAnyContact]);
+     * family envelopes are kept until expiry and never evicted for space,
+     * while foreign ones share a bounded [FOREIGN_CARRY_BUDGET_BYTES] budget.
+     * Idempotent on `msg_id`, so re-seeing an envelope we already carry is a
+     * no-op. Reached only after [handleEnvelope]'s dedupe + expiry gates, so
+     * we never carry a stale duplicate or an already-expired envelope.
+     */
+    private fun carryForeignEnvelope(envelope: Frame.Envelope) {
+        val now = System.currentTimeMillis()
+        try {
+            val isFamily = hintMatchesAnyContact(envelope.recipientHint, now)
+            val stored = store.enqueueCarriedEnvelope(
+                CarriedEnvelope(
+                    msgId = envelope.msgId,
+                    hopTtl = envelope.hopTtl,
+                    expiry = envelope.expiry,
+                    recipientHint = envelope.recipientHint,
+                    sealed = envelope.sealed,
+                ),
+                isFamily,
+                now,
+                FOREIGN_CARRY_BUDGET_BYTES,
+            )
+            if (stored) {
+                Log.i(TAG, "Carrying foreign envelope (family=$isFamily) for later delivery")
+            }
+        } catch (e: CoreException) {
+            Log.w(TAG, "Failed to enqueue carried envelope: ${e.message}")
+        }
+    }
+
+    /**
+     * Hands over every carried envelope destined for the peer that just
+     * HELLO'd on [address] (DESIGN.md §5.3): we compute the peer's recent-day
+     * `recipient_hint`s ([recentHintsFor]) and pull matching envelopes from
+     * the store, send each on this link, and drop it once sent (a mule's job
+     * ends on delivery). Expired entries are pruned first. If the peer already
+     * saw an envelope via an earlier flood, their own seen-ID set drops the
+     * duplicate harmlessly; if they didn't (the whole point -- they were out
+     * of range when it flooded), this is how it reaches them.
+     */
+    private fun drainCarriedEnvelopesTo(address: String, peerUserId: ByteArray) {
+        val now = System.currentTimeMillis()
+        try {
+            store.pruneExpiredCarried(now)
+            val hints = recentHintsFor(peerUserId, now)
+            val toDeliver = store.carriedEnvelopesForHints(hints, now)
+            if (toDeliver.isEmpty()) return
+            var delivered = 0
+            for (env in toDeliver) {
+                val frame = encodeEnvelopeFrame(env.msgId, env.hopTtl, env.expiry, env.recipientHint, env.sealed)
+                if (MeshRouter.sendToAddress(address, frame)) {
+                    store.removeCarriedEnvelope(env.msgId)
+                    delivered++
+                }
+            }
+            Log.i(TAG, "Drained $delivered carried envelope(s) to $address")
+        } catch (e: CoreException) {
+            Log.w(TAG, "Failed to drain carried envelopes to $address: ${e.message}")
+        }
+    }
+
+    /** True if [hint] matches any known contact's `recipient_hint` for a recent day (see [recentHintsFor]). */
+    private fun hintMatchesAnyContact(hint: ByteArray, now: Long): Boolean {
+        for (contact in store.listContacts()) {
+            if (recentHintsFor(contact.userId, now).any { it.contentEquals(hint) }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * The `recipient_hint`s [userId] could match for a still-carriable
+     * envelope: their UserID hashed against each day-number from today back
+     * through [CARRY_HINT_DAY_WINDOW] days (DESIGN.md §6.4's daily-rotating
+     * hint over the §5.3 expiry window).
+     */
+    private fun recentHintsFor(userId: ByteArray, now: Long): List<ByteArray> =
+        (0..CARRY_HINT_DAY_WINDOW).map { daysAgo ->
+            computeRecipientHint(userId, now - daysAgo * MS_PER_DAY)
+        }
 
     /**
      * Floods a foreign (not-for-us) envelope onward per DESIGN.md §5.3, if it
