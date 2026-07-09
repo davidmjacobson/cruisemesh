@@ -1,0 +1,4 @@
+module cruisemesh_coreFFI {
+    header "cruisemesh_coreFFI.h"
+    export *
+}

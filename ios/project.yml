@@ -1,0 +1,96 @@
+name: CruiseMesh
+options:
+  bundleIdPrefix: com.cruisemesh
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    ENABLE_BITCODE: NO
+    CLANG_ENABLE_MODULES: YES
+    SWIFT_OBJC_BRIDGING_HEADER: ""
+    OTHER_LDFLAGS: ["-lc++"]
+    HEADER_SEARCH_PATHS: ["$(SRCROOT)/CruiseMesh/Generated"]
+    SWIFT_INCLUDE_PATHS: ["$(SRCROOT)/CruiseMesh/Generated"]
+    LIBRARY_SEARCH_PATHS: ["$(SRCROOT)/CruiseMesh/Frameworks"]
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  CruiseMesh:
+    type: application
+    platform: iOS
+    sources:
+      - path: CruiseMesh
+        excludes:
+          - "Frameworks/**"
+          - "Generated/cruisemesh_coreFFI.h"
+          - "Generated/*.modulemap"
+    dependencies:
+      - framework: CruiseMesh/Frameworks/cruisemesh_core.xcframework
+        embed: false
+      - sdk: CoreBluetooth.framework
+      - sdk: AVFoundation.framework
+      - sdk: UserNotifications.framework
+      - sdk: PhotosUI.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cruisemesh.app
+        INFOPLIST_FILE: CruiseMesh/Info.plist
+        CODE_SIGN_ENTITLEMENTS: CruiseMesh/CruiseMesh.entitlements
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_STYLE: Automatic
+        OTHER_LDFLAGS: ["$(inherited)", "-lc++"]
+        SWIFT_OBJC_INTEROP_MODE: objcxx
+        DEFINES_MODULE: YES
+      configs:
+        Debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+    info:
+      path: CruiseMesh/Info.plist
+      properties:
+        CFBundleDisplayName: CruiseMesh
+        UILaunchScreen: {}
+        UIBackgroundModes:
+          - bluetooth-central
+          - bluetooth-peripheral
+          - fetch
+          - processing
+        NSBluetoothAlwaysUsageDescription: CruiseMesh uses Bluetooth to message nearby friends without internet.
+        NSBluetoothPeripheralUsageDescription: CruiseMesh advertises so friends can find you on the mesh.
+        NSCameraUsageDescription: Take a photo to send in chat, or scan a friend QR code.
+        NSMicrophoneUsageDescription: Record a short voice memo to send in chat.
+        NSPhotoLibraryUsageDescription: Choose a photo from your library to send in chat.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+
+  CruiseMeshTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: CruiseMeshTests
+    dependencies:
+      - target: CruiseMesh
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cruisemesh.app.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/CruiseMesh.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/CruiseMesh"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
+schemes:
+  CruiseMesh:
+    build:
+      targets:
+        CruiseMesh: all
+        CruiseMeshTests: [test]
+    test:
+      targets:
+        - CruiseMeshTests
+    run:
+      config: Debug

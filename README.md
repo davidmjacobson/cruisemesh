@@ -7,7 +7,8 @@ full design and milestone plan.
 
 - `core/` — Rust core (identity, crypto, sync engine) exposed to native shells via
   [UniFFI](https://mozilla.github.io/uniffi-rs/).
-- `android/` — Android app (Kotlin, Jetpack Compose), currently Milestone 0/1 scaffold.
+- `android/` — Android app (Kotlin, Jetpack Compose).
+- `ios/` — iOS app (SwiftUI + CoreBluetooth), feature-parity shell; see [`ios/README.md`](ios/README.md).
 - `relayd/` — Axum + SQLite relay mailbox server for Milestone 3.
 
 ## Building
@@ -28,6 +29,15 @@ core/build-android.sh
 
 Run this after changing anything in `core/`; it regenerates
 `android/app/src/main/kotlin-gen` and `android/app/src/main/jniLibs`.
+
+**Core for iOS + Swift bindings** (macOS + Xcode required):
+
+```sh
+core/build-ios.sh
+cd ios && xcodegen generate && open CruiseMesh.xcodeproj
+```
+
+See [`ios/README.md`](ios/README.md) for details.
 
 **Android app:**
 
