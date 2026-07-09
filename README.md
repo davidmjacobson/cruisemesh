@@ -51,6 +51,10 @@ The relay API stores the full public envelope header shape
 msg_id-based dedupe per family token, fetch-by-hint + cursor, delete-on-ack,
 per-envelope expiry pruning, and a 30-day server retention ceiling. It is
 content-agnostic (sealed blobs only — text and receipt envelopes share one path).
+`GET /ws` adds WebSocket push: same family bearer (header or `?token=`), same
+`hints=`/`after=` as poll, replay-then-stream of matching envelopes as JSON
+pages identical to the REST fetch body; acks stay on `POST /envelopes/ack`, and
+slow subscribers are dropped so reconnect+replay can heal (bounded memory).
 
 Optional env vars:
 
