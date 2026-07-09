@@ -7,10 +7,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.clickable
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -26,6 +30,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.MessageStore
@@ -77,24 +84,32 @@ fun ChatScreen(
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
-    // Reloads everything this screen renders from the store: the thread
-    // itself and the two cumulative receipt watermarks that drive each own
-    // bubble's tick (DESIGN.md §7.2). All three are cheap store reads, so
-    // there's no reason to reload them independently.
+    val (contactColor, _) = remember(contact) {
+        com.cruisemesh.app.ui.ChatListLogic.avatarHueAndInitials(contact.userId, contact.name, uniffi.cruisemesh_core.formatUserId(contact.userId))
+    }
+
+    val gaps = remember(messages) {
+        val result = mutableSetOf<Int>()
+        val lastLamport = mutableMapOf<String, ULong>()
+        messages.forEachIndexed { i, msg ->
+            if (msg.kind == KIND_TEXT) {
+                val senderHex = uniffi.cruisemesh_core.formatUserId(msg.senderUserId)
+                val prev = lastLamport[senderHex]
+                if (prev != null && msg.lamport > prev + 1uL) {
+                    result.add(i)
+                }
+                lastLamport[senderHex] = maxOf(prev ?: 0uL, msg.lamport)
+            }
+        }
+        result
+    }
+
     fun reload() {
         messages = store.messagesForChat(contact.userId)
         deliveredThrough = store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_DELIVERED)
         readThrough = store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_READ)
     }
 
-    // Reload whenever anything (MeshService on a BLE binder thread, a sender
-    // on the UI thread) reports this chat's store contents changed -- a new
-    // message OR a new receipt, both go through the same ChatEvents channel.
-    // The collector runs on this composition's main dispatcher, so touching
-    // state here is safe; cancellation on dispose is automatic because
-    // LaunchedEffect scopes the collection to this composable. chatId is a
-    // raw ByteArray, so compare with contentEquals -- == would be
-    // referential and never match.
     LaunchedEffect(contact.userId) {
         ChatEvents.changes.collect { changedChatId ->
             if (changedChatId.contentEquals(contact.userId)) {
@@ -127,14 +142,40 @@ fun ChatScreen(
                 state = listState,
                 modifier = Modifier.fillMaxWidth().weight(1f).padding(vertical = 8.dp),
             ) {
-                items(messages, key = { "${it.senderUserId.contentHashCode()}:${it.lamport}" }) { message ->
+                itemsIndexed(messages, key = { _, it -> "${it.senderUserId.contentHashCode()}:${it.lamport}" }) { i, message ->
                     if (message.kind == KIND_TEXT) {
                         val isOwn = message.senderUserId.contentEquals(ownUserId)
+
+                        val cal = remember(message.timestamp) { java.util.Calendar.getInstance().apply { timeInMillis = message.timestamp } }
+                        val prevCal = if (i > 0) java.util.Calendar.getInstance().apply { timeInMillis = messages[i-1].timestamp } else null
+                        val isNewDay = prevCal == null || 
+                            cal.get(java.util.Calendar.DAY_OF_YEAR) != prevCal.get(java.util.Calendar.DAY_OF_YEAR) || 
+                            cal.get(java.util.Calendar.YEAR) != prevCal.get(java.util.Calendar.YEAR)
+
+                        if (isNewDay) {
+                            val dateString = java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US).format(cal.time)
+                            Text(
+                                dateString,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).wrapContentWidth(Alignment.CenterHorizontally)
+                            )
+                        }
+
+                        if (gaps.contains(i)) {
+                            Text(
+                                "some messages may still be in transit",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp).wrapContentWidth(Alignment.CenterHorizontally)
+                            )
+                        }
+
                         MessageBubble(
                             message = message,
                             isOwn = isOwn,
-                            // Ticks only ever describe our own messages -- see TickStatus's KDoc.
                             tick = if (isOwn) tickStatusFor(message.lamport, deliveredThrough, readThrough) else null,
+                            contactColor = if (isOwn) null else contactColor
                         )
                     }
                 }
@@ -168,20 +209,15 @@ fun ChatScreen(
     }
 }
 
-/**
- * One chat bubble: kind=1 payload decoded as UTF-8, right-aligned for own
- * messages, left-aligned for the contact's. [tick] is null for the
- * contact's messages (they never get one) and non-null for our own,
- * rendered as small right-aligned text next to the bubble text (DESIGN.md
- * §7.2): "✓" for [TickStatus.SENT], "✓✓" in the bubble's subdued content
- * color for [TickStatus.DELIVERED], "✓✓" tinted with
- * `MaterialTheme.colorScheme.primary` for [TickStatus.READ].
- */
 @Composable
-private fun MessageBubble(message: StoredMessage, isOwn: Boolean, tick: TickStatus?) {
+private fun MessageBubble(message: StoredMessage, isOwn: Boolean, tick: TickStatus?, contactColor: Color?) {
     val text = remember(message) { message.payload.toString(Charsets.UTF_8) }
-    val bubbleColor = if (isOwn) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
-    val contentColor = if (isOwn) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+    val bubbleColor = if (isOwn) MaterialTheme.colorScheme.primary else (contactColor?.copy(alpha = 0.2f) ?: MaterialTheme.colorScheme.surfaceVariant)
+    val contentColor = if (isOwn) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+    val tickBaseColor = if (bubbleColor.luminance() > 0.5f) Color.Black else Color.White
+    val tickChipColor =
+        if (tickBaseColor == Color.White) Color.Black.copy(alpha = 0.28f) else Color.White.copy(alpha = 0.34f)
+    var showLegend by remember { mutableStateOf(false) }
 
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -191,7 +227,7 @@ private fun MessageBubble(message: StoredMessage, isOwn: Boolean, tick: TickStat
             color = bubbleColor,
             contentColor = contentColor,
             shape = RoundedCornerShape(12.dp),
-            modifier = Modifier.widthIn(max = 280.dp),
+            modifier = Modifier.widthIn(max = 280.dp).clickable { if (isOwn) showLegend = true },
         ) {
             Row(
                 verticalAlignment = Alignment.Bottom,
@@ -200,18 +236,42 @@ private fun MessageBubble(message: StoredMessage, isOwn: Boolean, tick: TickStat
                 Text(text)
                 if (tick != null) {
                     val (glyph, tint) = when (tick) {
-                        TickStatus.SENT -> "✓" to contentColor
-                        TickStatus.DELIVERED -> "✓✓" to contentColor.copy(alpha = 0.7f)
-                        TickStatus.READ -> "✓✓" to MaterialTheme.colorScheme.primary
+                        TickStatus.SENT -> "✓" to tickBaseColor.copy(alpha = 0.85f)
+                        TickStatus.DELIVERED -> "✓✓" to tickBaseColor.copy(alpha = 0.7f)
+                        TickStatus.READ -> "✓✓" to tickBaseColor
                     }
-                    Text(
-                        glyph,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = tint,
-                        modifier = Modifier.padding(start = 4.dp),
-                    )
+                    Surface(
+                        color = tickChipColor,
+                        shape = CircleShape,
+                        modifier = Modifier.padding(start = 6.dp),
+                    ) {
+                        Text(
+                            glyph,
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = tint,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                        )
+                    }
                 }
             }
         }
+    }
+
+    if (showLegend && tick != null) {
+        AlertDialog(
+            onDismissRequest = { showLegend = false },
+            title = { Text("Message Status") },
+            text = { 
+                val statusText = when(tick) {
+                    TickStatus.SENT -> "✓ Sent: queued for delivery."
+                    TickStatus.DELIVERED -> "✓✓ Delivered: received by the contact's device."
+                    TickStatus.READ -> "✓✓ Read: viewed by the contact."
+                }
+                Text(statusText)
+            },
+            confirmButton = {
+                TextButton(onClick = { showLegend = false }) { Text("OK") }
+            }
+        )
     }
 }
