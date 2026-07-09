@@ -25,6 +25,7 @@ import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
+import uniffi.cruisemesh_core.OpenedMessage
 import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
@@ -203,7 +204,7 @@ class MeshService : Service() {
         }
         when (parsed) {
             is Frame.Hello -> handleHello(address, parsed.userId, identity)
-            is Frame.Envelope -> handleEnvelope(address, parsed.sealed, identity)
+            is Frame.Envelope -> handleEnvelope(address, parsed, identity)
             is Frame.Digest -> handleDigest(address, parsed.chatId, parsed.entries, identity)
         }
     }
@@ -309,17 +310,94 @@ class MeshService : Service() {
     }
 
     /**
-     * Envelope handling (DESIGN.md §6.3 open/verify, §7.1 body layout). See
-     * this class's KDoc for why `body.chatId == opened.senderUserId` is the
-     * correct sanity check here.
+     * Envelope handling with §5.3 gossip in front of §6.3 delivery.
+     *
+     * Every inbound `0x02` frame carries the §6.4 public header, so before
+     * touching crypto we run the flooding logic DESIGN.md §5.3 calls for:
+     *
+     * 1. **Dedupe** on `msg_id` via the shared [GossipState.seenIds]. A
+     *    `msg_id` we've already handled (on this or any other link, including
+     *    one we ourselves authored -- see [sealEnvelopeFrame]) is dropped
+     *    outright: it was already delivered-or-relayed the first time, and the
+     *    mesh's redundant links guarantee we'll see popular frames more than
+     *    once. This is the single most important line for not melting the
+     *    network with a flood.
+     * 2. **Expiry**: a carrier drops an envelope past its `expiry`
+     *    (DESIGN.md §5.3) rather than delivering or forwarding it. For
+     *    freshly authored direct traffic expiry is a week out so this never
+     *    fires; it matters for the old muled traffic a future carry queue
+     *    (§5.3) will hold.
+     * 3. **Open vs relay**: we try to [openMessage]. A sealed box is anonymous
+     *    and addressed to exactly one X25519 key (§6.3), so *opening it means
+     *    we are the intended recipient* -- deliver locally and do NOT re-flood
+     *    (it's home). Failure means it's foreign traffic just passing through,
+     *    so [relayForeignEnvelope] floods it onward with a decremented
+     *    `hop_ttl`. (A failure could also be a corrupt/garbage envelope; we
+     *    can't tell those apart from "not for us" without the key, and relaying
+     *    a few bad frames is cheap and TTL-bounded, so we treat both the same.)
+     *
+     * Delivery itself (decode body, the `chatId == verified sender` sanity
+     * check explained in this class's KDoc, kind dispatch) is unchanged --
+     * see [deliverOpenedEnvelope].
      */
-    private fun handleEnvelope(address: String, sealed: ByteArray, identity: Identity) {
-        val opened = try {
-            openMessage(identity, sealed)
-        } catch (e: CoreException) {
-            Log.w(TAG, "Dropping envelope from $address: failed to open (${e.message})")
+    private fun handleEnvelope(address: String, envelope: Frame.Envelope, identity: Identity) {
+        if (!GossipState.seenIds.checkAndRecord(envelope.msgId)) {
+            // Already handled this msg_id; a redundant copy from the flood.
             return
         }
+        if (envelope.expiry <= System.currentTimeMillis()) {
+            Log.i(TAG, "Dropping expired envelope from $address (expiry=${envelope.expiry})")
+            return
+        }
+
+        val opened = try {
+            openMessage(identity, envelope.sealed)
+        } catch (e: CoreException) {
+            // Not for us (or unopenable) -> foreign traffic to relay onward.
+            relayForeignEnvelope(address, envelope)
+            return
+        }
+        deliverOpenedEnvelope(address, opened, identity)
+    }
+
+    /**
+     * Floods a foreign (not-for-us) envelope onward per DESIGN.md §5.3, if it
+     * still has hop budget. `hop_ttl` is the remaining number of hops; we
+     * decrement it and forward only while at least one hop would remain
+     * (`hop_ttl > 1`), so a frame arriving with `hop_ttl == 1` is the last
+     * carrier's copy and stops here. The `msg_id`, `expiry`, `recipient_hint`,
+     * and sealed bytes are all preserved verbatim -- only `hop_ttl` changes --
+     * so every carrier along the way computes the same dedupe key. The
+     * arriving link is excluded from the flood to avoid the trivial echo; the
+     * seen-ID set (already updated by [handleEnvelope]) stops longer loops.
+     */
+    private fun relayForeignEnvelope(address: String, envelope: Frame.Envelope) {
+        val remainingHops = envelope.hopTtl.toInt()
+        if (remainingHops <= 1) {
+            // Hop budget exhausted; this node is the final carrier for it.
+            return
+        }
+        val relayed = encodeEnvelopeFrame(
+            envelope.msgId,
+            (remainingHops - 1).toUByte(),
+            envelope.expiry,
+            envelope.recipientHint,
+            envelope.sealed,
+        )
+        val fanout = MeshRouter.relayToAllExcept(address, relayed)
+        if (fanout > 0) {
+            Log.i(TAG, "Relayed foreign envelope from $address to $fanout link(s), hop_ttl ${remainingHops}->${remainingHops - 1}")
+        }
+    }
+
+    /**
+     * Delivers an envelope we successfully opened (DESIGN.md §6.3 open/verify,
+     * §7.1 body layout). See this class's KDoc for why
+     * `body.chatId == opened.senderUserId` is the correct sanity check here.
+     * Reached only for envelopes addressed to us; foreign traffic never gets
+     * here (see [handleEnvelope]).
+     */
+    private fun deliverOpenedEnvelope(address: String, opened: OpenedMessage, identity: Identity) {
         val body = try {
             decodeMessageBody(opened.payload)
         } catch (e: CoreException) {
@@ -571,8 +649,13 @@ class MeshService : Service() {
         )
         return try {
             val now = System.currentTimeMillis()
+            val msgId = generateMsgId()
+            // Remember our own msg_id so that if a relay floods this envelope
+            // back to us we recognise it as a duplicate rather than "foreign"
+            // (we can't open our own sealed box) and re-relay it (DESIGN.md §5.3).
+            GossipState.seenIds.record(msgId)
             encodeEnvelopeFrame(
-                generateMsgId(),
+                msgId,
                 DEFAULT_HOP_TTL,
                 defaultExpiry(now),
                 computeRecipientHint(recipientUserId, now),

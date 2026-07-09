@@ -4,11 +4,13 @@
 uniffi::setup_scaffolding!("cruisemesh_core");
 
 mod crypto;
+mod gossip;
 mod identity;
 mod protocol;
 mod store;
 
 pub use crypto::{open_message, seal_message, OpenedMessage};
+pub use gossip::SeenIds;
 pub use identity::{
     fingerprint_words, generate_identity, make_friend_card, parse_friend_card, Identity,
     FriendCard, CoreError,

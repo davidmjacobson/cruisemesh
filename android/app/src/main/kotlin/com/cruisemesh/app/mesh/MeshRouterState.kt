@@ -64,6 +64,20 @@ class MeshRouterState {
         synchronized(peersByAddress) { peersByAddress[address]?.transport }
 
     /**
+     * A snapshot of every currently connected link as (transport, address)
+     * pairs, regardless of whether its userId is known yet. Used by the
+     * gossip flood path (DESIGN.md §5.3): a foreign envelope is relayed to
+     * every link *except* the one it arrived on, and relaying doesn't need to
+     * know who's on the far end -- an unopenable envelope is forwarded blindly
+     * and the true recipient (or the next relay) sorts it out. Returns a copy
+     * so the caller can iterate without holding the lock.
+     */
+    fun connectedRoutes(): List<Pair<Transport, String>> =
+        synchronized(peersByAddress) {
+            peersByAddress.map { (address, peer) -> peer.transport to address }
+        }
+
+    /**
      * The transport + address currently usable to reach [userId], or null if
      * no connected link has identified itself as that user yet.
      */

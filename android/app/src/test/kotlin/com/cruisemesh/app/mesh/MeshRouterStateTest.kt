@@ -89,4 +89,34 @@ class MeshRouterStateTest {
         assertEquals(MeshRouterState.Transport.CENTRAL, state.transportFor("AA:BB"))
         assertNull(state.transportFor("NEVER-CONNECTED"))
     }
+
+    @Test
+    fun `connectedRoutes lists every live link including ones with no HELLO yet`() {
+        val state = MeshRouterState()
+        state.onConnected("AA:BB", MeshRouterState.Transport.CENTRAL)
+        state.onHello("AA:BB", userId(1))
+        state.onConnected("CC:DD", MeshRouterState.Transport.PERIPHERAL) // no HELLO yet
+
+        val routes = state.connectedRoutes().toSet()
+        assertEquals(
+            setOf(
+                MeshRouterState.Transport.CENTRAL to "AA:BB",
+                MeshRouterState.Transport.PERIPHERAL to "CC:DD",
+            ),
+            routes,
+        )
+    }
+
+    @Test
+    fun `connectedRoutes drops a link once it disconnects`() {
+        val state = MeshRouterState()
+        state.onConnected("AA:BB", MeshRouterState.Transport.CENTRAL)
+        state.onConnected("CC:DD", MeshRouterState.Transport.PERIPHERAL)
+        state.onDisconnected("AA:BB")
+
+        assertEquals(
+            listOf(MeshRouterState.Transport.PERIPHERAL to "CC:DD"),
+            state.connectedRoutes(),
+        )
+    }
 }

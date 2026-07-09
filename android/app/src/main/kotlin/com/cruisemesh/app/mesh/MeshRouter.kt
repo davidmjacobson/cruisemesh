@@ -94,6 +94,24 @@ object MeshRouter {
         return dispatch(transport, address, frame)
     }
 
+    /**
+     * Floods [frame] to every currently connected link except [exceptAddress]
+     * (the one it arrived on) -- the epidemic-relay send primitive for
+     * DESIGN.md §5.3 gossip. Returns the number of links it was dispatched to.
+     * Callers are responsible for dedupe (see [com.cruisemesh.app.mesh.GossipState])
+     * and hop-budget checks before relaying; this method just sprays the frame
+     * outward. Excluding the arriving link avoids the trivial immediate
+     * echo-back; the seen-ID set and `hop_ttl` bound the rest of the flood.
+     */
+    fun relayToAllExcept(exceptAddress: String, frame: ByteArray): Int {
+        var sent = 0
+        for ((transport, address) in state.connectedRoutes()) {
+            if (address == exceptAddress) continue
+            if (dispatch(transport, address, frame)) sent++
+        }
+        return sent
+    }
+
     private fun dispatch(transport: MeshRouterState.Transport, address: String, frame: ByteArray): Boolean {
         val send = when (transport) {
             MeshRouterState.Transport.CENTRAL -> centralSend

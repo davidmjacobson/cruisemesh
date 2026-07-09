@@ -1,6 +1,7 @@
 package com.cruisemesh.app.chat
 
 import android.util.Log
+import com.cruisemesh.app.mesh.GossipState
 import com.cruisemesh.app.mesh.MeshRouter
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
@@ -87,8 +88,13 @@ class RealMeshSender(
                 timestamp = timestamp,
                 content = payload,
             )
+            val msgId = generateMsgId()
+            // Record our own msg_id as seen so a relay flooding this message
+            // back to us isn't mistaken for foreign traffic and re-relayed
+            // (DESIGN.md §5.3; a sealed box can't be opened by its sender).
+            GossipState.seenIds.record(msgId)
             encodeEnvelopeFrame(
-                generateMsgId(),
+                msgId,
                 DEFAULT_HOP_TTL,
                 defaultExpiry(timestamp),
                 computeRecipientHint(contact.userId, timestamp),
