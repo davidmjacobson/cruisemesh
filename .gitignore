@@ -21,3 +21,6 @@ android/app/src/main/jniLibs/
 
 # Session handoff notes — not project documentation
 /HANDOFF.md
+
+# Editor swap files
+*.swp
