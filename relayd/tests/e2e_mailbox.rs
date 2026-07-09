@@ -396,3 +396,48 @@ async fn expiry_pruning_drops_stale_sealed_envelopes() {
     let body = decode_message_body(opened.payload).unwrap();
     assert_eq!(body.content, b"still good");
 }
+
+
+async fn spawn_app_with_router(tokens: &[&str]) -> (NamedTempFile, Router, String) {
+    let db = NamedTempFile::new().unwrap();
+    let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
+    let auth: HashSet<String> = tokens.iter().map(|t| (*t).to_string()).collect();
+    let app = app(AppState::new(store, auth));
+    
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app_clone).await.unwrap();
+    });
+    
+    (db, app, format!("ws://{}", addr))
+}
+
+use futures_util::StreamExt;
+
+#[tokio::test]
+async fn ws_live_push_after_connect() {
+    let alice = generate_identity();
+    let bob = generate_identity();
+    let (_db, app, ws_url) = spawn_app_with_router(&["family-a"]).await;
+    
+    let env1 = author_text(&alice, &bob, "hello 1", 1);
+    let url = format!("{ws_url}/ws?hints={}&token=family-a&after=0", b64(&env1.recipient_hint));
+    println!("TEST: connecting to {}", url);
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    println!("TEST: connected");
+
+    // Post while connected
+    println!("TEST: posting envelope");
+    post_envelope(&app, "family-a", &env1).await;
+    println!("TEST: envelope posted");
+
+    println!("TEST: waiting for socket.next");
+    let msg1_opt = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next()).await;
+    println!("TEST: received {:?}", msg1_opt);
+    let msg1 = msg1_opt.unwrap().unwrap().unwrap();
+    assert!(msg1.is_text());
+    let txt = msg1.to_text().unwrap();
+    assert!(txt.contains(&b64(&env1.msg_id)));
+}
