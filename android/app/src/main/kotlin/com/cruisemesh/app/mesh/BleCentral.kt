@@ -126,8 +126,15 @@ class BleCentral(
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    // Default (balanced) connection interval is prone to
-                    // status=133 on back-to-back GATT ops right after connect.
+                    // HIGH (minimum ~7.5 ms connection interval) *only* for the
+                    // connect/MTU/discover/CCCD setup burst, which is prone to
+                    // status=133 on back-to-back GATT ops at the balanced
+                    // interval. It is relaxed back to BALANCED in
+                    // onDescriptorWrite once the link is fully set up -- holding
+                    // 7.5 ms at rest pegs the shared 2.4 GHz radio and starves
+                    // the phone's own Bluetooth (A2DP) audio (HANDOFF: BLE
+                    // coexistence blocker). The mesh only ships occasional small
+                    // text frames, so it does not need a fast link at rest.
                     gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                     // discoverServices() is deferred to onMtuChanged: like the
                     // descriptor-write/characteristic-write pair below, a
@@ -199,6 +206,13 @@ class BleCentral(
         ) {
             Log.i(TAG, "Descriptor write for ${gatt.device.address} status=$status")
             if (status == BluetoothGatt.GATT_SUCCESS) {
+                // Setup burst is done -- drop the connection interval back from
+                // HIGH (~7.5 ms) to BALANCED so an idle mesh link stops hogging
+                // the shared radio and killing Bluetooth audio (HANDOFF: BLE
+                // coexistence blocker). Frames still flow fine at the balanced
+                // interval; this only trades a little added latency on the
+                // occasional text frame for the phone's audio staying usable.
+                gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
                 // Fully connected: clear this address's failure history so a
                 // peer that connects reliably never accumulates backoff.
                 backoff.recordSuccess(gatt.device.address)
@@ -236,7 +250,14 @@ class BleCentral(
             .setServiceUuid(ParcelUuid(MeshConstants.SERVICE_UUID))
             .build()
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
+            // LOW_POWER (was BALANCED): a much smaller scan duty cycle so
+            // continuous discovery stops monopolizing the shared 2.4 GHz radio
+            // and starving Bluetooth audio (HANDOFF: BLE coexistence blocker).
+            // Discovery is a little slower to notice a new peer; acceptable for
+            // a mesh that stays connected once peers are found. (Result
+            // batching via setReportDelay would help further but routes results
+            // to onBatchScanResults, which this callback doesn't implement.)
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
             .build()
         scanner?.startScan(listOf(filter), settings, scanCallback)
     }

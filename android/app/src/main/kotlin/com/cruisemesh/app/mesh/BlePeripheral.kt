@@ -173,7 +173,12 @@ class BlePeripheral(
 
         advertiser = btAdapter.bluetoothLeAdvertiser
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
+            // LOW_POWER (was BALANCED): a longer advertising interval so we
+            // broadcast less often and leave more radio airtime for Bluetooth
+            // audio (HANDOFF: BLE coexistence blocker). TX power stays MEDIUM --
+            // that governs range, which matters for ship-scale mesh, and it's
+            // the advertising *interval* (the mode) that drives coexistence.
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
             .setConnectable(true)
             .build()
