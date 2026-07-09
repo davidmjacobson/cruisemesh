@@ -21,6 +21,8 @@ import kotlin.io.path.isRegularFile
 class ReceiptRelayRoundTripTest {
 
     companion object {
+        private const val HOST_CORE_LIBRARY_PROPERTY = "cruisemesh.test.hostCoreLibrary"
+
         init {
             configureJnaBootLibrary()
             System.setProperty(
@@ -41,20 +43,37 @@ class ReceiptRelayRoundTripTest {
         }
 
         private fun hostCoreLibrary(): Path {
+            System.getProperty(HOST_CORE_LIBRARY_PROPERTY)?.let { override ->
+                val overridePath = Path.of(override).normalize()
+                if (overridePath.isRegularFile()) {
+                    return overridePath
+                }
+                error("Host core library override not found at $overridePath")
+            }
+
             val userDir = Path.of(System.getProperty("user.dir"))
+            val searchRoots = linkedSetOf<Path>()
             var cursor: Path? = userDir
             while (cursor != null) {
+                searchRoots.add(cursor)
+                cursor.parent?.resolve("CruiseMesh")?.normalize()?.let { siblingMain ->
+                    searchRoots.add(siblingMain)
+                }
+                cursor = cursor.parent
+            }
+
+            searchRoots.forEach { root ->
                 val candidates = listOf(
-                    cursor.resolve("target/debug/cruisemesh_core.dll"),
-                    cursor.resolve("target/debug/libcruisemesh_core.so"),
+                    root.resolve("target/debug/cruisemesh_core.dll"),
+                    root.resolve("target/debug/libcruisemesh_core.so"),
                 ).map { it.normalize() }
                 val found = candidates.firstOrNull { it.isRegularFile() }
                 if (found != null) {
                     return found
                 }
-                cursor = cursor.parent
             }
-            error("Host cruisemesh_core library not found above ${userDir.toAbsolutePath()}")
+
+            error("Host cruisemesh_core library not found above ${userDir.toAbsolutePath()} or in a sibling CruiseMesh checkout")
         }
 
         private fun jnaJar(): Path {

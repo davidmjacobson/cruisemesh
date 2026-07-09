@@ -13,6 +13,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -50,6 +51,8 @@ import com.cruisemesh.app.friending.FriendRequestSender
 import com.cruisemesh.app.friending.MyQrScreen
 import com.cruisemesh.app.friending.ScanScreen
 import com.cruisemesh.app.identity.IdentityStore
+import com.cruisemesh.app.identity.OnboardingStore
+import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.mesh.ChatViewEvents
 import com.cruisemesh.app.mesh.MeshRuntimeState
@@ -57,12 +60,13 @@ import com.cruisemesh.app.mesh.MeshRuntimeStatus
 import com.cruisemesh.app.mesh.MeshService
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
-import com.cruisemesh.app.ui.CruiseMeshTheme
+import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ChatListScreen
 import com.cruisemesh.app.ui.ChatSummary
+import com.cruisemesh.app.ui.CruiseMeshTheme
 import com.cruisemesh.app.ui.NewGroupScreen
+import com.cruisemesh.app.ui.OnboardingScreen
 import com.cruisemesh.app.ui.ProfileScreen
-import com.cruisemesh.app.ui.ChatListLogic
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
@@ -118,8 +122,20 @@ fun CruiseMeshApp(
         IdentityStore.load(context) ?: generateIdentity().also { IdentityStore.save(context, it) }
     }
     val navController = rememberNavController()
+    var onboardingCompleted by remember { mutableStateOf(OnboardingStore.isCompleted(context)) }
 
-    NavHost(navController = navController, startDestination = "home") {
+    NavHost(
+        navController = navController,
+        startDestination = if (onboardingCompleted) "home" else "onboarding",
+    ) {
+        composable("onboarding") {
+            OnboardingRoute(identity) {
+                onboardingCompleted = true
+                navController.navigate("home") {
+                    popUpTo("onboarding") { inclusive = true }
+                }
+            }
+        }
         composable("home") { HomeRoute(identity, navController) }
         composable("profile") { ProfileRoute(identity, navController) }
         composable("myQr") { MyQrScreen(identity, onBack = { navController.popBackStack() }) }
@@ -136,15 +152,95 @@ fun CruiseMeshApp(
         }
     }
 
-    LaunchedEffect(pendingDeepLink) {
+    LaunchedEffect(pendingDeepLink, onboardingCompleted) {
         val link = pendingDeepLink ?: return@LaunchedEffect
-        if (link.isGroup) {
-            navController.navigate("group/${link.idHex}")
-        } else {
-            navController.navigate("chat/${link.idHex}")
+        if (!onboardingCompleted) return@LaunchedEffect
+        val route = if (link.isGroup) "group/${link.idHex}" else "chat/${link.idHex}"
+        navController.navigate(route) {
+            launchSingleTop = true
         }
         onPendingDeepLinkConsumed()
     }
+}
+
+@Composable
+private fun OnboardingRoute(identity: Identity, onComplete: () -> Unit) {
+    val context = LocalContext.current
+    val displayId = remember(identity) { formatUserId(identity.userId) }
+    var displayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
+    var avatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
+    var permissionRefreshToken by remember { mutableStateOf(0) }
+    val meshPermissionsGranted = remember(context, permissionRefreshToken) {
+        hasMeshPermissions(context)
+    }
+    val batteryExemptionGranted = remember(context, permissionRefreshToken) {
+        isIgnoringBatteryOptimizations(context)
+    }
+    val meshPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) {
+        permissionRefreshToken += 1
+    }
+    val batteryOptimizationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        permissionRefreshToken += 1
+    }
+    val pickPhotoLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri ->
+        if (uri != null) {
+            avatarPath = ProfilePhotoStore.saveFromUri(context, uri) ?: avatarPath
+        }
+    }
+    val takePhotoLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicturePreview(),
+    ) { bitmap ->
+        if (bitmap != null) {
+            avatarPath = ProfilePhotoStore.saveFromBitmap(context, bitmap) ?: avatarPath
+        }
+    }
+
+    OnboardingScreen(
+        userId = identity.userId,
+        displayId = displayId,
+        displayName = displayName,
+        avatarPath = avatarPath,
+        meshPermissionsGranted = meshPermissionsGranted,
+        batteryExemptionGranted = batteryExemptionGranted,
+        onDisplayNameChange = {
+            displayName = it
+            ProfileStore.saveDisplayName(context, it)
+        },
+        onTakePhoto = { takePhotoLauncher.launch(null) },
+        onChoosePhoto = {
+            pickPhotoLauncher.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+            )
+        },
+        onRemovePhoto = {
+            ProfilePhotoStore.clear(context)
+            avatarPath = null
+        },
+        onRequestMeshPermissions = {
+            if (!meshPermissionsGranted) {
+                meshPermissionLauncher.launch(MeshService.requiredPermissions())
+            }
+        },
+        onRequestBatteryExemption = {
+            if (!batteryExemptionGranted) {
+                batteryOptimizationLauncher.launch(batteryOptimizationIntent(context))
+            }
+        },
+        onComplete = {
+            if (displayName.isBlank()) {
+                displayName = ProfileStore.defaultDisplayName()
+                ProfileStore.saveDisplayName(context, displayName)
+            }
+            OnboardingStore.markCompleted(context)
+            onComplete()
+        },
+    )
 }
 
 @Composable
@@ -154,11 +250,10 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val runtimeStatus by MeshRuntimeStatus.state.collectAsState()
     var transientMeshStatus by remember { mutableStateOf<String?>(null) }
     var ownDisplayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
+    var ownAvatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
     
     val hasPermissions = remember(context) {
-        MeshService.requiredPermissions().all {
-            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
-        }
+        hasMeshPermissions(context)
     }
     
     val batteryOptimizationLauncher = rememberLauncherForActivityResult(
@@ -247,6 +342,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         val listener = NavController.OnDestinationChangedListener { _, dest, _ ->
             if (dest.route == "home") {
                 ownDisplayName = ProfileStore.loadDisplayName(context)
+                ownAvatarPath = ProfilePhotoStore.loadAvatarPath(context)
                 reloadSummaries()
             }
         }
@@ -257,6 +353,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     ChatListScreen(
         ownUserId = identity.userId,
         ownDisplayName = ownDisplayName,
+        ownAvatarPath = ownAvatarPath,
         onChatClick = { summary ->
             if (summary.isGroup) {
                 navController.navigate("group/${UserIdHex.encode(summary.chatId)}")
@@ -322,6 +419,7 @@ private fun ProfileRoute(identity: Identity, navController: NavHostController) {
     }
 
     ProfileScreen(
+        profileUserId = identity.userId,
         displayId = displayId,
         fingerprint = fingerprint,
         meshStatus = transientMeshStatus ?: runtimeStatus.label,
@@ -505,6 +603,11 @@ private fun startMesh(context: Context) {
         MeshRuntimeStatus.markStopped()
     }
 }
+
+private fun hasMeshPermissions(context: Context): Boolean =
+    MeshService.requiredPermissions().all {
+        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+    }
 
 private fun isIgnoringBatteryOptimizations(context: Context): Boolean {
     val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
