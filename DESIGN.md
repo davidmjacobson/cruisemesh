@@ -3,7 +3,7 @@
 *Offline-first family messaging for cruise ships. Delay-tolerant BLE mesh with an
 optional internet relay, end-to-end encrypted.*
 
-Status: draft v0.1 (2026-07-08)
+Status: draft v0.1 (2026-07-09)
 
 ---
 
@@ -175,7 +175,7 @@ and the design must remain boring enough to describe in one page.
 - **UserID** = first 16 bytes of BLAKE2b(Ed25519 public key). Displayed/base32 for
   out-of-band sharing (`CM-K7QX-9M2P-...`).
 - **Friending**: QR code (or pasted string) containing `{name, both public keys,
-  optional relay URL}`. Scanning imports the contact and queues a signed
+  optional relay URL, optional relay token}`. Scanning imports the contact and queues a signed
   friend-request envelope back; friendship is mutual once both sides hold each
   other's keys. Contact card shows a short fingerprint phrase (4 words) for verbal
   verification, Signal-safety-number style.
@@ -202,8 +202,10 @@ ratchet/PQ upgrade can ship later without a flag day.
 
 The public envelope header contains only: `version, msg_id, hop_ttl, expiry,
 recipient_hint, ciphertext`. `recipient_hint` = 8-byte BLAKE2b(recipient UserID ‖
-day-salt), enough for relays/mules to route and recipients to cheaply test "for
-me?", without a stable global identifier on the wire. Sender identity is **inside**
+day-salt), where `day-salt` = the UTC day number
+`timestamp_ms.div_euclid(86_400_000)` encoded as 8 big-endian bytes. That is
+enough for relays/mules to route and recipients to cheaply test "for me?",
+without a stable global identifier on the wire. Sender identity is **inside**
 the ciphertext. Relay servers store sealed envelopes and hints, nothing else.
 
 ### 6.5 Groups
@@ -293,10 +295,12 @@ Nothing else about media gets designed today.
 A deliberately dumb mailbox:
 
 - Single Go or Rust binary + SQLite, Docker image, runs on a $4/mo VPS.
-- API (HTTPS + WebSocket): `POST /envelopes` (store sealed envelopes),
-  `GET /envelopes?hints=...` (fetch by recipient_hint since cursor), delete-on-ack,
-  30-day retention, per-family auth token (baked into the QR friend card / group
-  config) so randoms can't use your mailbox.
+- API (HTTPS + WebSocket): `POST /envelopes` and `GET /envelopes?hints=...`
+  move the full **public** envelope header shape (`msg_id`, `hop_ttl`, `expiry`,
+  `recipient_hint`, `sealed`) rather than plaintext message metadata; relay-side
+  dedupe is by `(family_token, msg_id)`, fetch is by `recipient_hint` since cursor,
+  delete-on-ack, 30-day retention, per-family auth token (baked into the QR friend
+  card / group config) so randoms can't use your mailbox.
 - Sees only sealed envelopes and hints (§6.4). A compromised relay learns traffic
   timing and approximate social graph size — not contents, senders, or read state.
 - Phones poll it whenever internet appears and also push all queued outbound —
@@ -369,6 +373,87 @@ Milestone 0 is the go/no-go gate: it de-risks the only thing we can't design aro
 - Message history sync for a group member who joins late.
 - Ratchet / post-quantum upgrade timing (envelope `version` byte reserves the path).
 - Passworded broadcast channels; relay federation.
+
+---
+
+## 14. UI / UX plan (Android v1)
+
+The current home screen is a Milestone-1 debug artifact — an identity card with
+stacked buttons. This section is the target UI. The model is **Signal**: the home
+screen is the conversation list, because opening a conversation is the only thing a
+user launches this app to do. Identity, friending, and mesh plumbing all move behind
+it. Material 3 components, Signal's information architecture.
+
+### 14.1 Navigation map
+
+```
+Home (conversation list)
+ ├─ tap row ───────────────── Chat
+ ├─ FAB ✏ (compose) ───────── New chat = friends list
+ │                              ├─ tap friend → Chat
+ │                              ├─ "Add a friend" → QR scan
+ │                              └─ "My friend card" → QR display
+ ├─ avatar (top-left) ─────── Profile & settings
+ └─ mesh status pill ──────── start mesh / explain current state
+```
+
+Friends do **not** get a home-screen tab. At family scale (4–10 contacts) a
+dedicated Friends tab is dead weight you'd visit twice a cruise. Signal's own
+pattern — contacts live one tap away behind the compose FAB, with friend management
+(add / my card) at the top of that list — is the right shape here. A duplicate
+"Friends" entry in the top-bar overflow menu covers discoverability.
+
+### 14.2 Home: conversation list
+
+One row per chat (1:1 now; groups and broadcast slot in later, §14.6), sorted by
+last activity, newest first.
+
+- **Avatar bubble**: colored circle, hue derived deterministically from the
+  contact's UserID bytes, initials from their display name (fallback: first two
+  characters of the base32 ID). No photos in v1 — media isn't on the wire yet (§8).
+- **Row content**: display name (bold when unread), one-line ellipsized snippet of
+  the last message (`You: ` prefix for own), relative timestamp Signal-style
+  (time-of-day today, weekday within 7 days, date otherwise), unread-count badge,
+  and the ✓/✓✓/read tick when the last message is our own.
+- **Unread count** is computable client-side without schema changes: our own read
+  watermark for a chat is the outgoing READ receipt's through-lamport
+  (`outgoing_receipt_through`); unread = peer messages with lamport above it.
+- **Empty state**: friendly copy + a prominent "Add a friend" button — this is the
+  first-run experience.
+- **Long-press row** → delete conversation (the existing contact-deletion flow).
+
+### 14.3 Mesh status — the one element Signal doesn't have
+
+Where Signal shows "Connecting…" under the title, we show a persistent status pill
+below the top bar: `Mesh off` / `Starting…` / `Meshing · N nearby` /
+`Paused — Bluetooth audio` / `Syncing via relay`. Tapping it starts the mesh
+(running the existing permission + battery-exemption flow) or explains the current
+state in a sheet. The mesh **auto-starts on app open** once permissions have been
+granted before — the giant "Start mesh" button dies. Honest copy matters here
+(§12.1): the pill is where "open the app when you sit down" expectations get set.
+
+### 14.4 Profile & settings (top-left avatar, like Signal)
+
+Absorbs the old identity screen: editable display name (ProfileStore), my QR friend
+card, UserID + fingerprint words (with the "read these aloud to verify" hint), mesh
+on/off, relay configuration status. Nothing here is daily-use, which is exactly why
+it lives behind the avatar.
+
+### 14.5 Chat screen (already mostly built — polish only)
+
+Keep the current push-based screen. Polish list: day separators, the §7.1
+lamport-gap indicator ("some messages may still be in transit" — subtle, not an
+error), tick-state legend on tap, bubble palette coherent with the avatar hue.
+
+### 14.6 Later, designed for now
+
+- **Groups (M4)**: "New group" action alongside the friends list under the FAB;
+  group rows use the same bubble with a group glyph; per-member receipt detail on
+  tap in-chat (§7.2).
+- **Broadcast (M4)**: a clearly labeled "Ship broadcast" row pinned at the bottom of
+  home, visually distinct (public-to-anyone framing per §6.6), collapsed by default.
+
+Both slot into the §14.2 list without re-architecting the home screen.
 
 ---
 
