@@ -4,6 +4,8 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import android.util.Log
+import java.security.GeneralSecurityException
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -38,9 +40,20 @@ object IdentityStore {
         val ciphertext = prefs.getString(PREF_CIPHERTEXT, null)?.let { decodeBase64(it) } ?: return null
         val iv = prefs.getString(PREF_IV, null)?.let { decodeBase64(it) } ?: return null
 
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv))
-        return decodeIdentity(cipher.doFinal(ciphertext))
+        return try {
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv))
+            decodeIdentity(cipher.doFinal(ciphertext))
+        } catch (e: GeneralSecurityException) {
+            // The stored blob can't be decrypted with the current Keystore key
+            // (e.g. AEADBadTagException / KeyPermanentlyInvalidatedException after
+            // the key was regenerated or invalidated). Nothing can recover the old
+            // identity, so drop the stale blob and let the caller mint a fresh one
+            // instead of crash-looping on every launch.
+            Log.w("IdentityStore", "Discarding undecryptable stored identity; regenerating", e)
+            prefs.edit().remove(PREF_CIPHERTEXT).remove(PREF_IV).apply()
+            null
+        }
     }
 
     fun save(context: Context, identity: Identity) {
