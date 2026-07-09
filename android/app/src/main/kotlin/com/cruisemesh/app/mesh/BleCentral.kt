@@ -206,6 +206,14 @@ class BleCentral(
             Log.w(TAG, "No Bluetooth adapter; cannot start central role")
             return
         }
+        if (scanner != null) {
+            // Idempotent for the same reason as BlePeripheral.start(): a
+            // second start must not disturb live connections (the duplicate
+            // startScan alone just fails with SCAN_FAILED_ALREADY_STARTED,
+            // but keeping the guard symmetric makes the contract obvious).
+            Log.i(TAG, "start: central role already running; ignoring")
+            return
+        }
         scanner = btAdapter.bluetoothLeScanner
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(MeshConstants.SERVICE_UUID))
@@ -218,6 +226,7 @@ class BleCentral(
 
     fun stop() {
         scanner?.stopScan(scanCallback)
+        scanner = null
         connections.values.forEach { it.close() }
         connections.clear()
         negotiatedMtu.clear()

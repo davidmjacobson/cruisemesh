@@ -92,6 +92,7 @@ class MeshService : Service() {
 
     private var identity: Identity? = null
     private lateinit var store: MessageStore
+    private var running = false
 
     private val peripheral by lazy {
         BlePeripheral(this, ::onFrameReceived, ::onPeripheralCentralSubscribed, ::onPeripheralCentralDisconnected)
@@ -104,6 +105,17 @@ class MeshService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
+
+        if (running) {
+            // Second "Start mesh" tap (or any repeat start) while already
+            // running: everything below is live -- re-running it would at
+            // best duplicate registrations and at worst disturb the BLE
+            // roles (see BlePeripheral.start's idempotence note; this guard
+            // makes that one redundant in the normal path but both stay, as
+            // defense-in-depth).
+            Log.i(TAG, "onStartCommand: mesh already running; ignoring")
+            return START_STICKY
+        }
 
         if (!hasRequiredPermissions()) {
             Log.w(TAG, "Missing BLE permissions; stopping")
@@ -131,10 +143,12 @@ class MeshService : Service() {
 
         peripheral.start()
         central.start()
+        running = true
         return START_STICKY
     }
 
     override fun onDestroy() {
+        running = false
         peripheral.stop()
         central.stop()
         MeshRouter.unregisterCentral()

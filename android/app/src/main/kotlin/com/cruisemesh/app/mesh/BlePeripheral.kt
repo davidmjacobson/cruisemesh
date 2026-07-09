@@ -155,6 +155,17 @@ class BlePeripheral(
             Log.w(TAG, "No Bluetooth adapter; cannot start peripheral role")
             return
         }
+        if (gattServer != null) {
+            // Idempotence matters here: re-opening a GATT server orphans the
+            // live one -- existing centrals' CCCD subscriptions live on the
+            // old server object, so notifications sent via the new one never
+            // reach them, and sendResponse() for requests delivered to the
+            // old server goes to the wrong instance (the central then hangs
+            // on its descriptor write until a ~30s supervision timeout).
+            // Observed live 2026-07-08 when "Start mesh" was tapped twice.
+            Log.i(TAG, "start: peripheral role already running; ignoring")
+            return
+        }
 
         gattServer = bluetoothManager.openGattServer(context, gattServerCallback)?.also { server ->
             server.addService(buildGattService())
