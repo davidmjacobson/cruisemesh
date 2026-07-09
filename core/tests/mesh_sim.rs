@@ -15,8 +15,10 @@
 //!     opening means we're the recipient (deliver, don't re-flood), else it's
 //!     foreign traffic to relay (flood with `hop_ttl - 1`, if hops remain) and
 //!     carry (enqueue for later).
-//!   * meeting (HELLO): drain carried envelopes whose `recipient_hint` matches
-//!     the peer, handing each over and dropping it once delivered.
+//!   * meeting (HELLO): first drain carried envelopes whose `recipient_hint`
+//!     matches the peer, handing each over and dropping it once delivered;
+//!     then spray the remaining carried envelopes onward to a non-recipient
+//!     mule, excluding any `msg_id`s that mule's digest says it already knows.
 //!
 //! Because that orchestration currently lives in Kotlin, this file
 //! re-implements it in `SimNode::receive` / `Network::meet`. That validates
@@ -37,6 +39,7 @@ use cruisemesh_core::{
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 const BASE_NOW: i64 = 1_700_000_000_000;
 const FOREIGN_BUDGET: i64 = 5 * 1024 * 1024;
+const DIGEST_CARRIED_MSG_IDS_LIMIT: u64 = 512;
 
 /// One mesh participant: identity + crypto, its persistent carry queue, its
 /// flood-dedupe set, and an inbox of payloads it successfully opened.
@@ -216,10 +219,11 @@ impl Network {
         }
     }
 
-    /// Every in-contact pair exchanges carried envelopes destined for the other
-    /// (the HELLO carry-drain). Mirrors `MeshService.drainCarriedEnvelopesTo`,
-    /// run in both directions for each edge. A handed-over envelope the peer can
-    /// open lands in their inbox; the mule drops it once sent.
+    /// Every in-contact pair does the HELLO sync: first targeted carried
+    /// delivery to the true recipient, then spray-on-connect to a non-recipient
+    /// mule excluding any `msg_id`s the peer already knows. Mirrors
+    /// `MeshService.drainCarriedEnvelopesTo` plus `sprayCarriedEnvelopesTo`,
+    /// run in both directions for each edge.
     fn meet(&mut self, now: i64) {
         let n = self.nodes.len();
         for a in 0..n {
@@ -246,6 +250,30 @@ impl Network {
                     // The peer opens it if it's theirs; if not (only on a hint
                     // collision, vanishingly rare) they'd re-carry -- ignore the
                     // relay return here, meetings don't cascade floods.
+                    let _ = self.nodes[b].receive(&frame, now);
+                }
+
+                let peer_known_msg_ids = self.nodes[b]
+                    .store
+                    .carried_msg_ids(DIGEST_CARRIED_MSG_IDS_LIMIT)
+                    .expect("peer carried msg ids");
+                let spray = self.nodes[a]
+                    .store
+                    .carried_envelopes_for_peer_sync(
+                        recent_hints(&self.nodes[b].user_id(), now),
+                        peer_known_msg_ids,
+                        now,
+                    )
+                    .expect("query spray candidates");
+                for env in spray {
+                    let frame = encode_envelope_frame(
+                        env.msg_id,
+                        env.hop_ttl,
+                        env.expiry,
+                        env.recipient_hint,
+                        env.sealed,
+                    );
+                    self.transmissions += 1;
                     let _ = self.nodes[b].receive(&frame, now);
                 }
             }
@@ -374,15 +402,11 @@ fn fifty_node_dense_flood_delivers_once_and_dedupe_bounds_the_cost() {
 }
 
 #[test]
-fn multi_mule_carry_chain_is_not_yet_delivered() {
-    // Documents a known limitation (HANDOFF: carry queue has no
-    // spray-on-connect). 0 sends to 3. A chain of mules meets pairwise over
-    // time -- 0&1, then 1&2, then 2&3 -- but 0 and 3 never share a mule that
-    // also meets the other. Because a mule only hands a carried envelope to the
-    // *recipient* (hint match), not to another mule, it never crosses 1->2->3.
-    //
-    // When spray-on-connect lands (paired with the §7.3 msg_id digest), flip
-    // this assertion: the message SHOULD then reach node 3.
+fn multi_mule_carry_chain_delivers_once_spray_on_connect_exists() {
+    // 0 sends to 3. A chain of mules meets pairwise over time -- 0&1, then
+    // 1&2, then 2&3 -- but 0 and 3 never share a mule that also meets the
+    // other. With spray-on-connect paired to the digest's exact carried
+    // `msg_id` set, the envelope should now cross 1->2 and then reach 3.
     let mut net = Network::new(4);
     let msg = b"lost in the relay chain";
 
@@ -392,13 +416,28 @@ fn multi_mule_carry_chain_is_not_yet_delivered() {
 
     net.set_edges(&[(1, 2)]);
     net.meet(BASE_NOW + 10_000);
-    assert_eq!(net.nodes[2].store.carried_len().unwrap(), 0, "mule 1 does NOT hand off to mule 2");
+    assert_eq!(net.nodes[2].store.carried_len().unwrap(), 1, "mule 1 sprays it onward to mule 2");
 
     net.set_edges(&[(2, 3)]);
     net.meet(BASE_NOW + 20_000);
 
-    assert!(
-        net.openers_of(msg).is_empty(),
-        "multi-mule carry chains aren't delivered until spray-on-connect exists",
-    );
+    assert_eq!(net.openers_of(msg), vec![3], "multi-mule carry chain reaches the recipient");
+}
+
+#[test]
+fn repeated_mule_meetings_do_not_resend_known_carried_envelopes() {
+    let mut net = Network::new(4);
+    let msg = b"don't keep re-spraying me";
+
+    net.set_edges(&[(0, 1)]);
+    net.author_and_flood(0, 3, msg, DEFAULT_HOP_TTL, BASE_NOW);
+
+    net.set_edges(&[(1, 2)]);
+    net.meet(BASE_NOW + 10_000);
+    let after_first_meet = net.transmissions;
+
+    // Same two mules meet again before the recipient leg. Mule 2 already
+    // carries this msg_id, so the exact digest set should suppress a resend.
+    net.meet(BASE_NOW + 20_000);
+    assert_eq!(net.transmissions, after_first_meet, "second meeting was fully suppressed");
 }

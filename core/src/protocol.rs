@@ -30,7 +30,8 @@
 //!
 //! ```text
 //! offset  size  field
-//! 0       1     kind            (u8; text=1, receipt=2, per DESIGN.md §7.1)
+//! 0       1     kind            (u8; text=1, receipt=2, friend-request=3,
+//!                               per DESIGN.md §7.1)
 //! 1       2     chat_id_len     (u16 BE)
 //! 3       N     chat_id         (N = chat_id_len bytes)
 //! 3+N     8     lamport         (u64 BE)
@@ -165,6 +166,10 @@
 //!         2     sender_user_id_len  (u16 BE)
 //!         M     sender_user_id      (M = sender_user_id_len bytes)
 //!         8     through_lamport     (u64 BE)
+//! then:
+//!         2     recent_msg_id_count (u16 BE)
+//! then, per recent msg id:
+//!         16    msg_id              (the exact msg_id bytes)
 //! ```
 //!
 //! Unlike HELLO/envelope bodies, the digest body is structured (it holds a
@@ -175,10 +180,13 @@
 //! digest is unauthenticated link-layer chatter: lying in one can at worst
 //! cause a peer to retransmit sealed envelopes (idempotent by design,
 //! §7.3) or withhold them from a link, never to disclose or forge content.
-//! §7.3's "recent msg_id bloom filter" component of the digest is
-//! deliberately **not** part of this frame yet -- see the module docs in
-//! `store.rs` for why it's deferred; the version-less frame-type scheme
-//! leaves room for a richer digest frame type later.
+//! §7.3's "recent msg_id bloom filter" component ships here as an **exact**
+//! list of recent msg_ids instead of a bloom filter for now. At family scale
+//! the exact list is small enough, false positives would be worse than a few
+//! extra bytes, and this is enough to unlock mule spray-on-connect without
+//! blindly resending a whole carry queue every reconnect. A true bloom filter
+//! can replace this field later without revisiting the higher-level sync
+//! algorithm.
 
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
@@ -192,6 +200,9 @@ pub const KIND_TEXT: u8 = 1;
 /// `MessageBody.kind` value for a receipt (DESIGN.md §7.1, §7.2); `content`
 /// is an encoded [`ReceiptContent`].
 pub const KIND_RECEIPT: u8 = 2;
+/// `MessageBody.kind` value for a signed friend-request envelope (DESIGN.md
+/// §6.2, §7.1). The payload is application-defined contact-import content.
+pub const KIND_FRIEND_REQUEST: u8 = 3;
 
 /// `ReceiptContent.receipt_type` value: recipient's device decrypted and
 /// stored the message (the ✓✓ tick, DESIGN.md §7.2).
@@ -296,7 +307,7 @@ pub fn decode_receipt_content(bytes: Vec<u8>) -> Result<ReceiptContent, CoreErro
 pub enum Frame {
     Hello { user_id: Vec<u8> },
     Envelope { msg_id: Vec<u8>, hop_ttl: u8, expiry: i64, recipient_hint: Vec<u8>, sealed: Vec<u8> },
-    Digest { chat_id: Vec<u8>, entries: Vec<DigestEntry> },
+    Digest { chat_id: Vec<u8>, entries: Vec<DigestEntry>, recent_msg_ids: Vec<Vec<u8>> },
 }
 
 /// Encode a HELLO frame: frame-type byte `0x01` followed by `user_id`
@@ -380,15 +391,18 @@ pub fn default_expiry(timestamp_ms: i64) -> i64 {
 /// the one-chat-per-frame convention): frame-type byte `0x03`, then
 /// `chat_id` (16-bit length prefix), then `entries` as a 16-bit count
 /// followed by each entry's `sender_user_id` (16-bit length prefix) and
-/// `through_lamport` (u64 BE). `entries` is typically the output of the
-/// store's `chat_digest`; an empty list is valid ("send me everything").
+/// `through_lamport` (u64 BE), then `recent_msg_ids` as a 16-bit count plus
+/// each fixed-width 16-byte `msg_id`. `entries` is typically the output of
+/// the store's `chat_digest`; an empty list is valid ("send me everything").
 #[uniffi::export]
-pub fn encode_digest(chat_id: Vec<u8>, entries: Vec<DigestEntry>) -> Vec<u8> {
+pub fn encode_digest(chat_id: Vec<u8>, entries: Vec<DigestEntry>, recent_msg_ids: Vec<Vec<u8>>) -> Vec<u8> {
     let mut out = Vec::with_capacity(
         1 + 2
             + chat_id.len()
             + 2
-            + entries.iter().map(|e| 2 + e.sender_user_id.len() + 8).sum::<usize>(),
+            + entries.iter().map(|e| 2 + e.sender_user_id.len() + 8).sum::<usize>()
+            + 2
+            + recent_msg_ids.len() * MSG_ID_LEN,
     );
     out.push(FRAME_TYPE_DIGEST);
     write_bytes16(&mut out, &chat_id);
@@ -396,6 +410,11 @@ pub fn encode_digest(chat_id: Vec<u8>, entries: Vec<DigestEntry>) -> Vec<u8> {
     for entry in &entries {
         write_bytes16(&mut out, &entry.sender_user_id);
         out.extend_from_slice(&entry.through_lamport.to_be_bytes());
+    }
+    out.extend_from_slice(&(recent_msg_ids.len() as u16).to_be_bytes());
+    for msg_id in &recent_msg_ids {
+        assert_eq!(msg_id.len(), MSG_ID_LEN, "digest msg_id must be exactly {} bytes", MSG_ID_LEN);
+        out.extend_from_slice(msg_id);
     }
     out
 }
@@ -439,8 +458,13 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
                 let through_lamport = cursor.take_u64()?;
                 entries.push(DigestEntry { sender_user_id, through_lamport });
             }
+            let recent_msg_id_count = cursor.take_u16()? as usize;
+            let mut recent_msg_ids = Vec::with_capacity(recent_msg_id_count.min(rest.len() / MSG_ID_LEN));
+            for _ in 0..recent_msg_id_count {
+                recent_msg_ids.push(cursor.take(MSG_ID_LEN)?.to_vec());
+            }
             cursor.finish()?;
-            Ok(Frame::Digest { chat_id, entries })
+            Ok(Frame::Digest { chat_id, entries, recent_msg_ids })
         }
         other => Err(CoreError::Malformed(format!("unknown frame type byte: 0x{other:02x}"))),
     }
@@ -783,16 +807,22 @@ mod tests {
         ]
     }
 
+    fn sample_recent_msg_ids() -> Vec<Vec<u8>> {
+        vec![vec![0x11; MSG_ID_LEN], vec![0x22; MSG_ID_LEN]]
+    }
+
     #[test]
     fn digest_frame_round_trips() {
         let chat_id = b"chat-1".to_vec();
         let entries = sample_entries();
-        let framed = encode_digest(chat_id.clone(), entries.clone());
+        let recent_msg_ids = sample_recent_msg_ids();
+        let framed = encode_digest(chat_id.clone(), entries.clone(), recent_msg_ids.clone());
         assert_eq!(framed[0], 0x03);
         match parse_frame(framed).expect("parses") {
-            Frame::Digest { chat_id: got_chat, entries: got_entries } => {
+            Frame::Digest { chat_id: got_chat, entries: got_entries, recent_msg_ids: got_recent } => {
                 assert_eq!(got_chat, chat_id);
                 assert_eq!(got_entries, entries);
+                assert_eq!(got_recent, recent_msg_ids);
             }
             other => panic!("expected Digest, got {other:?}"),
         }
@@ -801,11 +831,12 @@ mod tests {
     #[test]
     fn digest_frame_round_trips_with_no_entries() {
         // "I have nothing in this chat" is a valid digest (asks for everything).
-        let framed = encode_digest(b"chat-1".to_vec(), Vec::new());
+        let framed = encode_digest(b"chat-1".to_vec(), Vec::new(), Vec::new());
         match parse_frame(framed).expect("parses") {
-            Frame::Digest { chat_id, entries } => {
+            Frame::Digest { chat_id, entries, recent_msg_ids } => {
                 assert_eq!(chat_id, b"chat-1".to_vec());
                 assert!(entries.is_empty());
+                assert!(recent_msg_ids.is_empty());
             }
             other => panic!("expected Digest, got {other:?}"),
         }
@@ -815,11 +846,12 @@ mod tests {
     fn digest_frame_round_trips_with_empty_chat_id_and_max_lamport() {
         let entries =
             vec![DigestEntry { sender_user_id: b"alice".to_vec(), through_lamport: u64::MAX }];
-        let framed = encode_digest(Vec::new(), entries.clone());
+        let framed = encode_digest(Vec::new(), entries.clone(), sample_recent_msg_ids());
         match parse_frame(framed).expect("parses") {
-            Frame::Digest { chat_id, entries: got } => {
+            Frame::Digest { chat_id, entries: got, recent_msg_ids } => {
                 assert!(chat_id.is_empty());
                 assert_eq!(got, entries);
+                assert_eq!(recent_msg_ids, sample_recent_msg_ids());
             }
             other => panic!("expected Digest, got {other:?}"),
         }
@@ -869,8 +901,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_frame_rejects_digest_missing_recent_msg_id_count() {
+        let mut bytes = vec![0x03, 0x00, 0x00, 0x00, 0x01];
+        bytes.extend_from_slice(&(5u16).to_be_bytes());
+        bytes.extend_from_slice(b"alice");
+        bytes.extend_from_slice(&7u64.to_be_bytes());
+        let err = parse_frame(bytes).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn parse_frame_rejects_digest_with_truncated_recent_msg_id() {
+        let mut bytes = encode_digest(b"chat-1".to_vec(), sample_entries(), Vec::new());
+        bytes.extend_from_slice(&(1u16).to_be_bytes());
+        bytes.extend_from_slice(&[0xAA; MSG_ID_LEN - 1]);
+        let err = parse_frame(bytes).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
     fn parse_frame_rejects_digest_with_trailing_garbage() {
-        let mut framed = encode_digest(b"chat-1".to_vec(), sample_entries());
+        let mut framed = encode_digest(b"chat-1".to_vec(), sample_entries(), sample_recent_msg_ids());
         framed.push(0xFF);
         let err = parse_frame(framed).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));

@@ -36,6 +36,7 @@ pub struct FriendCard {
     pub sign_pk: Vec<u8>,
     pub agree_pk: Vec<u8>,
     pub relay_url: Option<String>,
+    pub relay_token: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -118,12 +119,18 @@ pub fn friend_card_user_id(card: FriendCard) -> Vec<u8> {
 
 /// Build the JSON payload shared via QR code / pasted text when friending.
 #[uniffi::export]
-pub fn make_friend_card(name: String, identity: Identity, relay_url: Option<String>) -> String {
+pub fn make_friend_card(
+    name: String,
+    identity: Identity,
+    relay_url: Option<String>,
+    relay_token: Option<String>,
+) -> String {
     let card = FriendCard {
         name,
         sign_pk: identity.sign_pk,
         agree_pk: identity.agree_pk,
         relay_url,
+        relay_token,
     };
     // Construction is infallible: every field is already valid UTF-8 / bytes.
     serde_json::to_string(&card).expect("FriendCard always serializes")
@@ -178,11 +185,18 @@ mod tests {
     #[test]
     fn friend_card_round_trips() {
         let id = generate_identity();
-        let json = make_friend_card("Dave".to_string(), id.clone(), None);
+        let json = make_friend_card(
+            "Dave".to_string(),
+            id.clone(),
+            Some("https://relay.example".to_string()),
+            Some("family-token".to_string()),
+        );
         let card = parse_friend_card(json).expect("valid card");
         assert_eq!(card.name, "Dave");
         assert_eq!(card.sign_pk, id.sign_pk);
         assert_eq!(card.agree_pk, id.agree_pk);
+        assert_eq!(card.relay_url, Some("https://relay.example".to_string()));
+        assert_eq!(card.relay_token, Some("family-token".to_string()));
         assert_eq!(friend_card_user_id(card), id.user_id);
     }
 
