@@ -8,14 +8,20 @@ import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.computeRecipientHint
+import uniffi.cruisemesh_core.defaultExpiry
 import uniffi.cruisemesh_core.encodeEnvelopeFrame
 import uniffi.cruisemesh_core.encodeMessageBody
+import uniffi.cruisemesh_core.generateMsgId
 import uniffi.cruisemesh_core.sealMessage
 
 private const val TAG = "MeshSender"
 
 /** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
 private const val KIND_TEXT: kotlin.UByte = 1u
+
+/** DESIGN.md §5.3: hop budget a freshly authored envelope's §6.4 header starts with. Mirrors core's `DEFAULT_HOP_TTL`. */
+private const val DEFAULT_HOP_TTL: kotlin.UByte = 7u
 
 /**
  * Sends an outgoing text message into a contact's 1:1 chat (DESIGN.md §7.1).
@@ -81,7 +87,13 @@ class RealMeshSender(
                 timestamp = timestamp,
                 content = payload,
             )
-            encodeEnvelopeFrame(sealMessage(identity, contact.agreePk, encodeMessageBody(body)))
+            encodeEnvelopeFrame(
+                generateMsgId(),
+                DEFAULT_HOP_TTL,
+                defaultExpiry(timestamp),
+                computeRecipientHint(contact.userId, timestamp),
+                sealMessage(identity, contact.agreePk, encodeMessageBody(body)),
+            )
         } catch (e: CoreException) {
             Log.w(TAG, "sendText: failed to seal message for ${contact.name}: ${e.message}")
             null

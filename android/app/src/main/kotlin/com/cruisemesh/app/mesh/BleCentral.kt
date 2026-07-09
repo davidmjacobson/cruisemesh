@@ -72,22 +72,39 @@ class BleCentral(
     private val writeInFlight = mutableSetOf<String>()
     private val scanDiagnostics = mutableMapOf<String, ScanDiagnostics>()
 
-    /** Advertised service UUIDs + device name captured at discovery time, for logging. */
-    private data class ScanDiagnostics(val serviceUuids: List<String>, val deviceName: String?) {
-        override fun toString() = "serviceUuids=$serviceUuids name=${deviceName ?: "?"}"
+    /**
+     * Advertised service UUIDs + device name + whether our service *data*
+     * (the scan-response payload the self-connection guard reads, distinct
+     * from the advertised UUID list) was present, captured at discovery
+     * time for logging. `hasServiceData` exists specifically to settle the
+     * open question in known-issue #2 of HANDOFF.md's churn notes: is a
+     * churning address missing scan-response service data (a guard blind
+     * spot) or is it a genuinely stale rotated peer address? If churn logs
+     * ever show `hasServiceData=false` for a churning peer that still
+     * advertises our service UUID, that's the guard blind spot; if it's
+     * always `true`, the guard is seeing the data and rejecting for some
+     * other reason, and rotated stale addresses are the more likely cause.
+     */
+    private data class ScanDiagnostics(
+        val serviceUuids: List<String>,
+        val deviceName: String?,
+        val hasServiceData: Boolean,
+    ) {
+        override fun toString() = "serviceUuids=$serviceUuids name=${deviceName ?: "?"} hasServiceData=$hasServiceData"
     }
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
             val record = result.scanRecord
+            val ownInstanceData = record?.getServiceData(ParcelUuid(MeshConstants.SERVICE_UUID))
             val diagnostics = ScanDiagnostics(
                 serviceUuids = record?.serviceUuids?.map { it.toString() } ?: emptyList(),
                 deviceName = record?.deviceName,
+                hasServiceData = ownInstanceData != null,
             )
             scanDiagnostics[device.address] = diagnostics
 
-            val ownInstanceData = record?.getServiceData(ParcelUuid(MeshConstants.SERVICE_UUID))
             if (ownInstanceData != null && ownInstanceData.contentEquals(MeshConstants.LOCAL_INSTANCE_ID)) {
                 Log.i(TAG, "Ignoring own advertisement from ${device.address} ($diagnostics)")
                 return

@@ -27,13 +27,16 @@ import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.decodeMessageBody
 import uniffi.cruisemesh_core.decodeReceiptContent
+import uniffi.cruisemesh_core.defaultExpiry
 import uniffi.cruisemesh_core.encodeDigest
 import uniffi.cruisemesh_core.encodeEnvelopeFrame
 import uniffi.cruisemesh_core.encodeHello
 import uniffi.cruisemesh_core.encodeMessageBody
 import uniffi.cruisemesh_core.encodeReceiptContent
+import uniffi.cruisemesh_core.generateMsgId
 import uniffi.cruisemesh_core.openMessage
 import uniffi.cruisemesh_core.parseFrame
 import uniffi.cruisemesh_core.sealMessage
@@ -49,6 +52,9 @@ private const val KIND_RECEIPT: UByte = 2u
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
 private const val RECEIPT_TYPE_READ: UByte = 2u
+
+/** DESIGN.md §5.3: hop budget a freshly authored envelope's §6.4 header starts with. Mirrors core's `DEFAULT_HOP_TTL`. */
+private const val DEFAULT_HOP_TTL: UByte = 7u
 
 /**
  * Runs both BLE GATT roles simultaneously (DESIGN.md §5.2) so this device can
@@ -224,8 +230,15 @@ class MeshService : Service() {
      * (see [handleDigest]'s KDoc for why it's also harmless).
      */
     private fun handleHello(address: String, userId: ByteArray, identity: Identity) {
-        Log.i(TAG, "HELLO from $address: userId=${UserIdHex.encode(userId)}")
+        // Register the address->userId mapping before anything else --
+        // including the log line below -- to shrink the window for the
+        // benign digest-before-HELLO race (see class KDoc / HANDOFF known
+        // issue #1): a DIGEST for this same link, delivered on a different
+        // binder thread, can otherwise reach handleDigest's
+        // MeshRouter.userIdFor(address) lookup before this registration is
+        // visible.
         MeshRouter.onHello(address, userId)
+        Log.i(TAG, "HELLO from $address: userId=${UserIdHex.encode(userId)}")
 
         val contact = store.getContact(userId)
         if (contact == null) {
@@ -284,6 +297,7 @@ class MeshService : Service() {
         for (message in missing) {
             sendSealedEnvelope(
                 identity = identity,
+                recipientUserId = contact.userId,
                 recipientAgreePk = contact.agreePk,
                 address = address,
                 kind = KIND_TEXT,
@@ -483,6 +497,7 @@ class MeshService : Service() {
     ) {
         sendSealedEnvelope(
             identity = identity,
+            recipientUserId = contact.userId,
             recipientAgreePk = contact.agreePk,
             address = address,
             kind = KIND_RECEIPT,
@@ -529,9 +544,18 @@ class MeshService : Service() {
         )
     }
 
-    /** Seals one [MessageBody] into an envelope frame, or null (logged) if sealing fails. */
+    /**
+     * Seals one [MessageBody] into an envelope frame, or null (logged) if
+     * sealing fails. Wraps the sealed bytes in the §6.4 public header: a
+     * fresh random `msgId`, `DEFAULT_HOP_TTL`, an expiry `DEFAULT_EXPIRY_MS`
+     * out from now, and a `recipientHint` for [recipientUserId] as of now.
+     * Every field but the sealed bytes themselves is inert on receive today
+     * (direct-link delivery only, no relay/mule engine yet) -- see
+     * `protocol.rs`'s envelope-header module docs.
+     */
     private fun sealEnvelopeFrame(
         identity: Identity,
+        recipientUserId: ByteArray,
         recipientAgreePk: ByteArray,
         kind: UByte,
         lamport: ULong,
@@ -546,7 +570,14 @@ class MeshService : Service() {
             content = content,
         )
         return try {
-            encodeEnvelopeFrame(sealMessage(identity, recipientAgreePk, encodeMessageBody(body)))
+            val now = System.currentTimeMillis()
+            encodeEnvelopeFrame(
+                generateMsgId(),
+                DEFAULT_HOP_TTL,
+                defaultExpiry(now),
+                computeRecipientHint(recipientUserId, now),
+                sealMessage(identity, recipientAgreePk, encodeMessageBody(body)),
+            )
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to seal outgoing kind=$kind frame: ${e.message}")
             null
@@ -556,6 +587,7 @@ class MeshService : Service() {
     /** Builds, seals, and sends one [MessageBody] as an envelope frame on the exact link [address]. */
     private fun sendSealedEnvelope(
         identity: Identity,
+        recipientUserId: ByteArray,
         recipientAgreePk: ByteArray,
         address: String,
         kind: UByte,
@@ -563,7 +595,7 @@ class MeshService : Service() {
         timestamp: Long,
         content: ByteArray,
     ) {
-        val frame = sealEnvelopeFrame(identity, recipientAgreePk, kind, lamport, timestamp, content) ?: return
+        val frame = sealEnvelopeFrame(identity, recipientUserId, recipientAgreePk, kind, lamport, timestamp, content) ?: return
         MeshRouter.sendToAddress(address, frame)
     }
 
@@ -582,7 +614,7 @@ class MeshService : Service() {
         timestamp: Long,
         content: ByteArray,
     ) {
-        val frame = sealEnvelopeFrame(identity, contact.agreePk, kind, lamport, timestamp, content) ?: return
+        val frame = sealEnvelopeFrame(identity, contact.userId, contact.agreePk, kind, lamport, timestamp, content) ?: return
         if (!MeshRouter.sendToUserId(contact.userId, frame)) {
             Log.i(TAG, "kind=$kind message to ${UserIdHex.encode(contact.userId)} stays local; not currently connected")
         }

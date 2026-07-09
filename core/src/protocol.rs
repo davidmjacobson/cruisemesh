@@ -81,7 +81,8 @@
 //! prefix of their own -- "everything after the type byte" is the body.
 //!
 //! - `0x01` = HELLO: an **unauthenticated** `user_id` announcement.
-//! - `0x02` = sealed envelope: an opaque sealed blob (crypto.rs's output).
+//! - `0x02` = sealed envelope: crypto.rs's sealed blob, now wrapped in the
+//!   §6.4 public header described below.
 //! - `0x03` = DIGEST: a per-chat sync digest (DESIGN.md §7.3; layout below).
 //!
 //! **Why HELLO is deliberately unauthenticated:** BLE central/peripheral
@@ -101,6 +102,46 @@
 //! under normal DTN operation (§3), so it was judged not worth spending a
 //! signature (and the extra round trip / battery cost of verifying one) on
 //! every connection handshake.
+//!
+//! ## Envelope frame header (DESIGN.md §6.4, §5.3)
+//!
+//! A `0x02` frame's body is no longer just the opaque sealed blob -- it's
+//! prefixed with the public header DESIGN.md §6.4 says observers (including
+//! future relays/mules, §5.3, §9) are allowed to see: enough to route and
+//! dedupe an envelope without decrypting it. Layout (big-endian, fixed-width
+//! fields with no length prefixes -- their sizes are part of the wire format,
+//! not self-describing):
+//!
+//! ```text
+//! offset  size  field
+//! 0       16    msg_id           (random per-envelope id; the seen-ID
+//!                                 dedupe key future gossip, §5.3, will use)
+//! 16      1     hop_ttl          (u8; DEFAULT_HOP_TTL = 7 when freshly
+//!                                 authored; decremented per relay hop --
+//!                                 not yet done, since relaying isn't wired
+//!                                 up yet)
+//! 17      8     expiry           (i64 BE; ms since Unix epoch; carriers
+//!                                 drop the envelope past this time)
+//! 25      8     recipient_hint   (BLAKE2b-8(recipient UserID || day
+//!                                 number); lets a relay/mule cheaply test
+//!                                 "could this be for someone I carry for"
+//!                                 without decrypting; rotates daily so it
+//!                                 isn't a stable tracking identifier)
+//! 33      M     sealed           (the rest of the frame; crypto.rs's
+//!                                 seal_message output, opaque to everyone
+//!                                 but the true recipient)
+//! ```
+//!
+//! `sender_user_id` is deliberately absent from this header (unlike
+//! `recipient_hint`, which names the *recipient*): the whole point of
+//! sign-then-seal (§6.3) is that sender identity only comes out on
+//! successful decryption, so a header-level sender field would undermine
+//! that. Today (direct-link delivery only, no gossip/mule engine yet) every
+//! header field except `sealed` is inert on receive -- `parse_frame` decodes
+//! them so the type exists for §5.3's relay/carry-queue work to consume
+//! later, but `MeshService` doesn't act on `hop_ttl`/`expiry`/
+//! `recipient_hint` yet. [`generate_msg_id`], [`compute_recipient_hint`], and
+//! [`default_expiry`] are the canonical ways to produce these fields.
 //!
 //! ## DIGEST frame (DESIGN.md §7.3)
 //!
@@ -139,6 +180,10 @@
 //! `store.rs` for why it's deferred; the version-less frame-type scheme
 //! leaves room for a richer digest frame type later.
 
+use blake2::digest::{Update, VariableOutput};
+use blake2::Blake2bVar;
+use rand_core::{OsRng, RngCore};
+
 use crate::store::DigestEntry;
 use crate::CoreError;
 
@@ -155,9 +200,19 @@ pub const RECEIPT_TYPE_DELIVERED: u8 = 1;
 /// filled ✓✓ tick, DESIGN.md §7.2).
 pub const RECEIPT_TYPE_READ: u8 = 2;
 
+/// DESIGN.md §5.3: hop budget a freshly authored envelope starts with.
+pub const DEFAULT_HOP_TTL: u8 = 7;
+/// DESIGN.md §5.3: how long (in ms) a freshly authored envelope lives before
+/// carriers should drop it. See [`default_expiry`].
+pub const DEFAULT_EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
 const FRAME_TYPE_HELLO: u8 = 0x01;
 const FRAME_TYPE_ENVELOPE: u8 = 0x02;
 const FRAME_TYPE_DIGEST: u8 = 0x03;
+
+const MSG_ID_LEN: usize = 16;
+const RECIPIENT_HINT_LEN: usize = 8;
+const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
 /// The plaintext body that gets encoded, then handed as `payload` to
 /// [`crate::seal_message`] (DESIGN.md §7.1). See the module docs for the
@@ -240,7 +295,7 @@ pub fn decode_receipt_content(bytes: Vec<u8>) -> Result<ReceiptContent, CoreErro
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
 pub enum Frame {
     Hello { user_id: Vec<u8> },
-    Envelope { sealed: Vec<u8> },
+    Envelope { msg_id: Vec<u8>, hop_ttl: u8, expiry: i64, recipient_hint: Vec<u8>, sealed: Vec<u8> },
     Digest { chat_id: Vec<u8>, entries: Vec<DigestEntry> },
 }
 
@@ -257,14 +312,68 @@ pub fn encode_hello(user_id: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// Encode a sealed-envelope frame: frame-type byte `0x02` followed by the
-/// sealed bytes verbatim (the output of [`crate::seal_message`]).
+/// Encode a sealed-envelope frame: frame-type byte `0x02`, then the §6.4
+/// public header (`msg_id`, `hop_ttl`, `expiry`, `recipient_hint` -- see
+/// module docs for exact byte layout), then the sealed bytes verbatim (the
+/// output of [`crate::seal_message`]). Use [`generate_msg_id`],
+/// [`DEFAULT_HOP_TTL`], [`default_expiry`], and [`compute_recipient_hint`] to
+/// produce the header fields for a freshly authored envelope.
 #[uniffi::export]
-pub fn encode_envelope_frame(sealed: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + sealed.len());
+pub fn encode_envelope_frame(
+    msg_id: Vec<u8>,
+    hop_ttl: u8,
+    expiry: i64,
+    recipient_hint: Vec<u8>,
+    sealed: Vec<u8>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        1 + msg_id.len() + 1 + 8 + recipient_hint.len() + sealed.len(),
+    );
     out.push(FRAME_TYPE_ENVELOPE);
+    out.extend_from_slice(&msg_id);
+    out.push(hop_ttl);
+    out.extend_from_slice(&expiry.to_be_bytes());
+    out.extend_from_slice(&recipient_hint);
     out.extend_from_slice(&sealed);
     out
+}
+
+/// Generate a fresh, random 16-byte `msg_id` for an envelope's §6.4 header
+/// (the seen-ID dedupe key future gossip, §5.3, will use).
+#[uniffi::export]
+pub fn generate_msg_id() -> Vec<u8> {
+    let mut id = vec![0u8; MSG_ID_LEN];
+    OsRng.fill_bytes(&mut id);
+    id
+}
+
+/// `recipient_hint` for an envelope's §6.4 header: `BLAKE2b-8(recipient
+/// UserID || day number)`, where the day number is `timestamp_ms` divided
+/// into whole days since the Unix epoch. Deterministic given the same
+/// `(recipient_user_id, timestamp_ms)` pair, so both the sender (authoring
+/// the envelope "today") and the true recipient (recomputing this with their
+/// own UserID and current time) land on the same hint without coordination
+/// -- while an observer who doesn't hold `recipient_user_id` gets no
+/// stable, long-lived identifier to track, since the hint rotates daily.
+#[uniffi::export]
+pub fn compute_recipient_hint(recipient_user_id: Vec<u8>, timestamp_ms: i64) -> Vec<u8> {
+    let day_number = timestamp_ms.div_euclid(MS_PER_DAY);
+    let mut hasher = Blake2bVar::new(RECIPIENT_HINT_LEN).expect("valid blake2b output length");
+    hasher.update(&recipient_user_id);
+    hasher.update(&day_number.to_be_bytes());
+    let mut out = vec![0u8; RECIPIENT_HINT_LEN];
+    hasher
+        .finalize_variable(&mut out)
+        .expect("output buffer matches configured length");
+    out
+}
+
+/// `expiry` for a freshly authored envelope's §6.4 header:
+/// `timestamp_ms + DEFAULT_EXPIRY_MS` (7 days, DESIGN.md §5.3), saturating
+/// rather than overflowing for pathological inputs.
+#[uniffi::export]
+pub fn default_expiry(timestamp_ms: i64) -> i64 {
+    timestamp_ms.saturating_add(DEFAULT_EXPIRY_MS)
 }
 
 /// Encode a DIGEST frame for one chat (see module docs for layout and for
@@ -307,12 +416,18 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
             Ok(Frame::Hello { user_id: rest.to_vec() })
         }
         FRAME_TYPE_ENVELOPE => {
-            if rest.is_empty() {
+            let mut cursor = Cursor::new(rest);
+            let msg_id = cursor.take(MSG_ID_LEN)?.to_vec();
+            let hop_ttl = cursor.take_u8()?;
+            let expiry = cursor.take_i64()?;
+            let recipient_hint = cursor.take(RECIPIENT_HINT_LEN)?.to_vec();
+            let sealed = cursor.take_remaining();
+            if sealed.is_empty() {
                 return Err(CoreError::Malformed(
                     "envelope frame missing sealed payload".to_string(),
                 ));
             }
-            Ok(Frame::Envelope { sealed: rest.to_vec() })
+            Ok(Frame::Envelope { msg_id, hop_ttl, expiry, recipient_hint, sealed: sealed.to_vec() })
         }
         FRAME_TYPE_DIGEST => {
             let mut cursor = Cursor::new(rest);
@@ -400,6 +515,15 @@ impl<'a> Cursor<'a> {
     fn take_bytes32(&mut self) -> Result<Vec<u8>, CoreError> {
         let len = self.take_u32()? as usize;
         Ok(self.take(len)?.to_vec())
+    }
+
+    /// Consumes and returns every remaining byte (no length prefix -- used
+    /// where, like the envelope frame's `sealed` tail, the field's length is
+    /// implicitly "whatever's left").
+    fn take_remaining(&mut self) -> &'a [u8] {
+        let rest = &self.data[self.pos..];
+        self.pos = self.data.len();
+        rest
     }
 
     /// Consumes the cursor, erroring if any bytes remain unread.
@@ -545,15 +669,77 @@ mod tests {
         }
     }
 
+    fn sample_envelope_header() -> (Vec<u8>, u8, i64, Vec<u8>) {
+        (vec![0xCD; MSG_ID_LEN], DEFAULT_HOP_TTL, 1_700_000_600_000, vec![0xEF; RECIPIENT_HINT_LEN])
+    }
+
     #[test]
     fn envelope_frame_round_trips() {
+        let (msg_id, hop_ttl, expiry, recipient_hint) = sample_envelope_header();
         let sealed = vec![0x11, 0x22, 0x33, 0x44];
-        let framed = encode_envelope_frame(sealed.clone());
+        let framed = encode_envelope_frame(
+            msg_id.clone(),
+            hop_ttl,
+            expiry,
+            recipient_hint.clone(),
+            sealed.clone(),
+        );
         assert_eq!(framed[0], 0x02);
         match parse_frame(framed).expect("parses") {
-            Frame::Envelope { sealed: got } => assert_eq!(got, sealed),
+            Frame::Envelope {
+                msg_id: got_msg_id,
+                hop_ttl: got_hop_ttl,
+                expiry: got_expiry,
+                recipient_hint: got_hint,
+                sealed: got_sealed,
+            } => {
+                assert_eq!(got_msg_id, msg_id);
+                assert_eq!(got_hop_ttl, hop_ttl);
+                assert_eq!(got_expiry, expiry);
+                assert_eq!(got_hint, recipient_hint);
+                assert_eq!(got_sealed, sealed);
+            }
             other => panic!("expected Envelope, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn generate_msg_id_produces_distinct_16_byte_ids() {
+        let a = generate_msg_id();
+        let b = generate_msg_id();
+        assert_eq!(a.len(), MSG_ID_LEN);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn compute_recipient_hint_is_deterministic_and_8_bytes() {
+        let user_id = vec![0x42; 16];
+        let a = compute_recipient_hint(user_id.clone(), 1_700_000_000_000);
+        let b = compute_recipient_hint(user_id, 1_700_000_000_000);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), RECIPIENT_HINT_LEN);
+    }
+
+    #[test]
+    fn compute_recipient_hint_rotates_across_day_boundary_but_not_within_a_day() {
+        let user_id = vec![0x42; 16];
+        let morning = compute_recipient_hint(user_id.clone(), 0);
+        let evening = compute_recipient_hint(user_id.clone(), MS_PER_DAY - 1);
+        let next_day = compute_recipient_hint(user_id, MS_PER_DAY);
+        assert_eq!(morning, evening);
+        assert_ne!(morning, next_day);
+    }
+
+    #[test]
+    fn compute_recipient_hint_differs_per_recipient() {
+        let a = compute_recipient_hint(vec![0x01; 16], 1_700_000_000_000);
+        let b = compute_recipient_hint(vec![0x02; 16], 1_700_000_000_000);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn default_expiry_adds_the_default_window() {
+        assert_eq!(default_expiry(1_000), 1_000 + DEFAULT_EXPIRY_MS);
     }
 
     #[test]
@@ -575,8 +761,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_frame_rejects_envelope_with_no_sealed_bytes() {
+    fn parse_frame_rejects_envelope_with_truncated_header() {
+        // Type byte alone: not even a full msg_id follows.
         let err = parse_frame(vec![0x02]).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn parse_frame_rejects_envelope_with_no_sealed_bytes() {
+        // A complete header but nothing after it.
+        let (msg_id, hop_ttl, expiry, recipient_hint) = sample_envelope_header();
+        let framed = encode_envelope_frame(msg_id, hop_ttl, expiry, recipient_hint, Vec::new());
+        let err = parse_frame(framed).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
     }
 
