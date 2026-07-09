@@ -70,4 +70,15 @@ class DigestSyncTest {
         )
         assertEquals(0uL, DigestSync.throughLamportForSelf(entries, ownUserId))
     }
+
+    @Test
+    fun `the peer authored entry can be looked up directly for receipt sync`() {
+        val peerUserId = userId(2)
+        val entries = listOf(
+            DigestEntry(senderUserId = userId(1), throughLamport = 7uL),
+            DigestEntry(senderUserId = peerUserId, throughLamport = 11uL),
+        )
+
+        assertEquals(11uL, DigestSync.throughLamportForSender(entries, peerUserId))
+    }
 }

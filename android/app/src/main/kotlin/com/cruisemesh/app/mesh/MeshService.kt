@@ -5,10 +5,21 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.bluetooth.BluetoothA2dp
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -18,6 +29,9 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
+import com.cruisemesh.app.relay.RelayClient
+import com.cruisemesh.app.relay.RelayConfig
+import com.cruisemesh.app.relay.RelayConfigStore
 import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
@@ -27,6 +41,7 @@ import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OpenedMessage
+import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
@@ -38,7 +53,9 @@ import uniffi.cruisemesh_core.encodeEnvelopeFrame
 import uniffi.cruisemesh_core.encodeHello
 import uniffi.cruisemesh_core.encodeMessageBody
 import uniffi.cruisemesh_core.encodeReceiptContent
+import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.generateMsgId
+import uniffi.cruisemesh_core.parseFriendCard
 import uniffi.cruisemesh_core.openMessage
 import uniffi.cruisemesh_core.parseFrame
 import uniffi.cruisemesh_core.sealMessage
@@ -50,6 +67,7 @@ private const val NOTIFICATION_ID = 1
 /** `kind` bytes from DESIGN.md §7.1. */
 private const val KIND_TEXT: UByte = 1u
 private const val KIND_RECEIPT: UByte = 2u
+private const val KIND_FRIEND_REQUEST: UByte = 3u
 
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
@@ -74,6 +92,16 @@ private const val CARRY_HINT_DAY_WINDOW: Long = 7
 
 /** DESIGN.md §5.3: the bounded budget (~5 MB) of *foreign* muled envelopes; family (known-recipient) traffic is exempt. */
 private const val FOREIGN_CARRY_BUDGET_BYTES: Long = 5L * 1024 * 1024
+private const val RELAY_BATCH_LIMIT: ULong = 128uL
+private const val RELAY_POLL_INTERVAL_MS = 60_000L
+
+/**
+ * Exact carried-`msg_id` count advertised in the interim digest. This is the
+ * stand-in for §7.3's deferred bloom filter: large enough to suppress blind
+ * resend of a typical family-scale carry queue, still small enough to fit in
+ * one HELLO sync over fragmented BLE.
+ */
+private const val DIGEST_CARRIED_MSG_IDS_LIMIT: ULong = 512uL
 
 /**
  * Runs both BLE GATT roles simultaneously (DESIGN.md §5.2) so this device can
@@ -118,6 +146,21 @@ class MeshService : Service() {
     private var identity: Identity? = null
     private lateinit var store: MessageStore
     private var running = false
+    private var meshRolesRunning = false
+    private var pausedForBluetoothAudio = false
+    private var bluetoothAudioReceiverRegistered = false
+    private var relayNetworkCallbackRegistered = false
+    @Volatile private var relaySyncInFlight = false
+    @Volatile private var relaySyncPending = false
+    private val relaySyncLock = Any()
+    private val relayMainHandler by lazy { Handler(Looper.getMainLooper()) }
+    private val bluetoothManager by lazy {
+        getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+    }
+    private val connectivityManager by lazy {
+        getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    }
+    private val a2dpAudioBackoff = A2dpAudioBackoff()
 
     private val peripheral by lazy {
         BlePeripheral(this, ::onFrameReceived, ::onPeripheralCentralSubscribed, ::onPeripheralCentralDisconnected)
@@ -125,11 +168,36 @@ class MeshService : Service() {
     private val central by lazy {
         BleCentral(this, ::onFrameReceived, ::onCentralPeerConnected, ::onCentralPeerDisconnected)
     }
+    private val bluetoothAudioReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val action = intent?.action ?: return
+            val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)
+            refreshBluetoothAudioBackoff("$action state=$state")
+        }
+    }
+    private val relayNetworkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            requestRelaySync("network available")
+        }
+
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            if (networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                requestRelaySync("network validated")
+            }
+        }
+    }
+    private val relayPollRunnable = object : Runnable {
+        override fun run() {
+            requestRelaySync("poll interval")
+            relayMainHandler.postDelayed(this, RELAY_POLL_INTERVAL_MS)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
+        MeshRuntimeStatus.markStarting()
 
         if (running) {
             // Second "Start mesh" tap (or any repeat start) while already
@@ -138,11 +206,17 @@ class MeshService : Service() {
             // roles (see BlePeripheral.start's idempotence note; this guard
             // makes that one redundant in the normal path but both stay, as
             // defense-in-depth).
+            if (pausedForBluetoothAudio) {
+                MeshRuntimeStatus.markPausedForBluetoothAudio()
+            } else {
+                MeshRuntimeStatus.markActive()
+            }
             Log.i(TAG, "onStartCommand: mesh already running; ignoring")
             return START_STICKY
         }
 
         if (!hasRequiredPermissions()) {
+            MeshRuntimeStatus.markStopped()
             Log.w(TAG, "Missing BLE permissions; stopping")
             stopSelf()
             return START_NOT_STICKY
@@ -155,6 +229,7 @@ class MeshService : Service() {
             // can be started (DESIGN.md §6.2) -- but sealing/opening
             // requires one, so there's nothing useful this service can do
             // without it.
+            MeshRuntimeStatus.markStopped()
             Log.e(TAG, "No identity persisted; stopping mesh service")
             stopSelf()
             return START_NOT_STICKY
@@ -165,17 +240,25 @@ class MeshService : Service() {
         MeshRouter.registerCentral(central::sendFrame)
         MeshRouter.registerPeripheral(peripheral::sendFrame)
         ChatViewEvents.register(::handleChatViewed)
+        RelaySyncEvents.register { requestRelaySync("queue changed") }
 
-        peripheral.start()
-        central.start()
         running = true
+        registerBluetoothAudioReceiver()
+        registerRelayNetworkCallback()
+        scheduleRelayPolling()
+        refreshBluetoothAudioBackoff("service start")
+        requestRelaySync("service start")
         return START_STICKY
     }
 
     override fun onDestroy() {
         running = false
-        peripheral.stop()
-        central.stop()
+        MeshRuntimeStatus.markStopped()
+        unregisterBluetoothAudioReceiver()
+        unregisterRelayNetworkCallback()
+        cancelRelayPolling()
+        RelaySyncEvents.unregister()
+        stopMeshRoles()
         MeshRouter.unregisterCentral()
         MeshRouter.unregisterPeripheral()
         ChatViewEvents.unregister()
@@ -183,6 +266,316 @@ class MeshService : Service() {
         // callbacks, so clear the router's mappings wholesale.
         MeshRouter.reset()
         super.onDestroy()
+    }
+
+    private fun startMeshRoles() {
+        if (meshRolesRunning) return
+        peripheral.start()
+        central.start()
+        meshRolesRunning = true
+        refreshForegroundNotification()
+    }
+
+    private fun stopMeshRoles() {
+        if (!meshRolesRunning) return
+        peripheral.stop()
+        central.stop()
+        meshRolesRunning = false
+        // stop() tears links down without per-address disconnect callbacks.
+        MeshRouter.reset()
+        refreshForegroundNotification()
+    }
+
+    private fun registerBluetoothAudioReceiver() {
+        if (bluetoothAudioReceiverRegistered) return
+        val filter = IntentFilter(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(bluetoothAudioReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(bluetoothAudioReceiver, filter)
+        }
+        bluetoothAudioReceiverRegistered = true
+    }
+
+    private fun unregisterBluetoothAudioReceiver() {
+        if (!bluetoothAudioReceiverRegistered) return
+        unregisterReceiver(bluetoothAudioReceiver)
+        bluetoothAudioReceiverRegistered = false
+    }
+
+    private fun registerRelayNetworkCallback() {
+        if (relayNetworkCallbackRegistered) return
+        connectivityManager.registerDefaultNetworkCallback(relayNetworkCallback)
+        relayNetworkCallbackRegistered = true
+    }
+
+    private fun unregisterRelayNetworkCallback() {
+        if (!relayNetworkCallbackRegistered) return
+        connectivityManager.unregisterNetworkCallback(relayNetworkCallback)
+        relayNetworkCallbackRegistered = false
+    }
+
+    private fun scheduleRelayPolling() {
+        relayMainHandler.removeCallbacks(relayPollRunnable)
+        relayMainHandler.postDelayed(relayPollRunnable, RELAY_POLL_INTERVAL_MS)
+    }
+
+    private fun cancelRelayPolling() {
+        relayMainHandler.removeCallbacks(relayPollRunnable)
+    }
+
+    private fun hasValidatedInternet(): Boolean {
+        val active = connectivityManager.activeNetwork ?: return false
+        val capabilities = connectivityManager.getNetworkCapabilities(active) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    private fun requestRelaySync(reason: String) {
+        if (!running || identity == null || !hasValidatedInternet()) return
+        synchronized(relaySyncLock) {
+            if (relaySyncInFlight) {
+                relaySyncPending = true
+                return
+            }
+            relaySyncInFlight = true
+        }
+        Thread {
+            while (true) {
+                try {
+                    performRelaySyncPass(reason)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Relay sync failed ($reason): ${e.message}")
+                }
+                val rerun = synchronized(relaySyncLock) {
+                    if (relaySyncPending && running && hasValidatedInternet()) {
+                        relaySyncPending = false
+                        true
+                    } else {
+                        relaySyncInFlight = false
+                        false
+                    }
+                }
+                if (!rerun) break
+            }
+        }.start()
+    }
+
+    private fun performRelaySyncPass(reason: String) {
+        val identity = this.identity ?: return
+        val now = System.currentTimeMillis()
+        store.pruneExpiredOutboundEnvelopes(now)
+        store.pruneExpiredOutgoingReceiptEnvelopes(now)
+        store.pruneExpiredCarried(now)
+        val contacts = store.listContacts()
+        val fallbackConfig = RelayConfigStore.load(this)
+        backfillRelayOutgoingReceiptEnvelopes(identity, contacts, now)
+        uploadPendingOutgoingReceiptEnvelopes(contacts, fallbackConfig, now)
+        uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now)
+        uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now)
+
+        val configs = distinctRelayConfigs(contacts, fallbackConfig)
+        if (configs.isEmpty()) return
+        for (config in configs) {
+            pollRelayMailbox(config, identity, contacts, fallbackConfig, now)
+        }
+        Log.i(TAG, "Relay sync complete: configs=${configs.size} reason=$reason")
+    }
+
+    private fun backfillRelayOutgoingReceiptEnvelopes(
+        identity: Identity,
+        contacts: List<Contact>,
+        now: Long,
+    ) {
+        for (contact in contacts) {
+            queueOutgoingReceiptForRelay(
+                identity = identity,
+                contact = contact,
+                receiptType = RECEIPT_TYPE_DELIVERED,
+                ackedSenderUserId = contact.userId,
+                throughLamport = store.outgoingReceiptThrough(
+                    contact.userId,
+                    contact.userId,
+                    RECEIPT_TYPE_DELIVERED,
+                ),
+                timestamp = now,
+            )
+            queueOutgoingReceiptForRelay(
+                identity = identity,
+                contact = contact,
+                receiptType = RECEIPT_TYPE_READ,
+                ackedSenderUserId = contact.userId,
+                throughLamport = store.outgoingReceiptThrough(
+                    contact.userId,
+                    contact.userId,
+                    RECEIPT_TYPE_READ,
+                ),
+                timestamp = now,
+            )
+        }
+    }
+
+    private fun uploadPendingOutgoingReceiptEnvelopes(
+        contacts: List<Contact>,
+        fallbackConfig: RelayConfig?,
+        now: Long,
+    ) {
+        val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
+        for (envelope in store.pendingRelayOutgoingReceiptEnvelopes(RELAY_BATCH_LIMIT, now)) {
+            val contact = contactsByUserId[UserIdHex.encode(envelope.recipientUserId)] ?: continue
+            val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
+            try {
+                val relayId = RelayClient.postReceiptEnvelope(config, envelope)
+                store.markOutgoingReceiptEnvelopeRelayPosted(envelope.msgId, now)
+                Log.i(
+                    TAG,
+                    "Uploaded receipt envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to upload receipt envelope to relay ${config.relayUrl}: ${e.message}")
+            }
+        }
+    }
+
+    private fun uploadPendingOutboundEnvelopes(
+        contacts: List<Contact>,
+        fallbackConfig: RelayConfig?,
+        now: Long,
+    ) {
+        val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
+        for (envelope in store.pendingRelayOutboundEnvelopes(RELAY_BATCH_LIMIT, now)) {
+            val contact = contactsByUserId[UserIdHex.encode(envelope.recipientUserId)] ?: continue
+            val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
+            try {
+                val relayId = RelayClient.postOutboundEnvelope(config, envelope)
+                store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
+                Log.i(
+                    TAG,
+                    "Uploaded outbound envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to upload outbound envelope to relay ${config.relayUrl}: ${e.message}")
+            }
+        }
+    }
+
+    private fun uploadFamilyCarriedEnvelopes(
+        contacts: List<Contact>,
+        fallbackConfig: RelayConfig?,
+        now: Long,
+    ) {
+        for (envelope in store.familyCarriedEnvelopes(RELAY_BATCH_LIMIT, now)) {
+            val contact = contactMatchingHint(contacts, envelope.recipientHint, now) ?: continue
+            val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
+            try {
+                val relayId = RelayClient.postCarriedEnvelope(config, envelope)
+                Log.i(
+                    TAG,
+                    "Uploaded carried envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to upload carried envelope to relay ${config.relayUrl}: ${e.message}")
+            }
+        }
+    }
+
+    private fun pollRelayMailbox(
+        config: RelayConfig,
+        identity: Identity,
+        contacts: List<Contact>,
+        fallbackConfig: RelayConfig?,
+        now: Long,
+    ) {
+        val hints = relayHintsForConfig(identity.userId, contacts, config, fallbackConfig, now)
+        if (hints.isEmpty()) return
+        var after = 0L
+        while (running && hasValidatedInternet()) {
+            val page = RelayClient.fetchEnvelopes(config, hints, after, RELAY_BATCH_LIMIT.toInt())
+            Log.i(
+                TAG,
+                "Fetched ${page.envelopes.size} relay envelope(s) from ${config.relayUrl} after=$after next=${page.nextCursor}",
+            )
+            if (page.envelopes.isEmpty()) return
+            val ackIds = ArrayList<Long>(page.envelopes.size)
+            for (envelope in page.envelopes) {
+                handleRelayEnvelope(envelope, identity)
+                ackIds += envelope.id
+            }
+            Log.i(TAG, "Acking ${ackIds.size} relay envelope(s) on ${config.relayUrl}: $ackIds")
+            RelayClient.ackEnvelopes(config, ackIds)
+            after = page.nextCursor
+            if (page.envelopes.size < RELAY_BATCH_LIMIT.toInt()) return
+        }
+    }
+
+    private fun relayHintsForConfig(
+        ownUserId: ByteArray,
+        contacts: List<Contact>,
+        config: RelayConfig,
+        fallbackConfig: RelayConfig?,
+        now: Long,
+    ): List<ByteArray> {
+        val hints = mutableListOf<ByteArray>()
+        hints += recentHintsFor(ownUserId, now)
+        for (contact in contacts) {
+            if (resolvedRelayConfig(contact, fallbackConfig) == config) {
+                hints += recentHintsFor(contact.userId, now)
+            }
+        }
+        return hints
+    }
+
+    private fun distinctRelayConfigs(contacts: List<Contact>, fallbackConfig: RelayConfig?): List<RelayConfig> =
+        buildList {
+            fallbackConfig?.let { add(it) }
+            for (contact in contacts) {
+                val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
+                if (!contains(config)) add(config)
+            }
+        }
+
+    private fun resolvedRelayConfig(contact: Contact, fallbackConfig: RelayConfig?): RelayConfig? {
+        val relayUrl = contact.relayUrl?.trim().orEmpty()
+        val relayToken = contact.relayToken?.trim().orEmpty()
+        if (relayUrl.isNotEmpty() && relayToken.isNotEmpty()) {
+            return RelayConfig(relayUrl, relayToken)
+        }
+        return fallbackConfig
+    }
+
+    private fun contactMatchingHint(contacts: List<Contact>, hint: ByteArray, now: Long): Contact? =
+        contacts.firstOrNull { contact ->
+            recentHintsFor(contact.userId, now).any { it.contentEquals(hint) }
+        }
+
+    private fun refreshBluetoothAudioBackoff(reason: String) {
+        when (a2dpAudioBackoff.update(isA2dpConnected())) {
+            A2dpAudioBackoff.Mode.ACTIVE -> {
+                pausedForBluetoothAudio = false
+                MeshRuntimeStatus.markActive()
+                Log.i(TAG, "Bluetooth audio clear; resuming BLE mesh ($reason)")
+                startMeshRoles()
+            }
+            A2dpAudioBackoff.Mode.PAUSED_FOR_A2DP -> {
+                pausedForBluetoothAudio = true
+                MeshRuntimeStatus.markPausedForBluetoothAudio()
+                Log.i(TAG, "Bluetooth A2DP connected; pausing BLE mesh to protect audio ($reason)")
+                stopMeshRoles()
+                refreshForegroundNotification()
+            }
+            null -> Unit
+        }
+    }
+
+    private fun isA2dpConnected(): Boolean {
+        val adapter = bluetoothManager.adapter ?: return false
+        return try {
+            adapter.getProfileConnectionState(BluetoothProfile.A2DP) == BluetoothProfile.STATE_CONNECTED
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Cannot query A2DP connection state; assuming disconnected (${e.message})")
+            false
+        }
     }
 
     private fun onCentralPeerConnected(address: String) {
@@ -223,30 +616,32 @@ class MeshService : Service() {
         when (parsed) {
             is Frame.Hello -> handleHello(address, parsed.userId, identity)
             is Frame.Envelope -> handleEnvelope(address, parsed, identity)
-            is Frame.Digest -> handleDigest(address, parsed.chatId, parsed.entries, identity)
+            is Frame.Digest -> handleDigest(address, parsed.chatId, parsed.entries, parsed.recentMsgIds, identity)
         }
     }
 
     /**
      * HELLO handling (DESIGN.md §5.2 handshake). Records the address->userId
-     * mapping, then -- only for a known contact -- kicks off the real digest
-     * sync (DESIGN.md §7.3) for that 1:1 chat: we send our own digest for
-     * this chat on the same link, i.e. "here's what I have from myself,
-     * contiguously, through lamport N per sender." That's the wire-chatId
-     * convention from the class KDoc applied to DIGEST frames: `chatId` here
-     * is OUR OWN userId, and `entries` is [MessageStore.chatDigest] keyed by
-     * the *local* chat (the contact's userId), because locally that's how
-     * this 1:1 chat's history is stored. The peer's [handleDigest] uses the
-     * matching digest we sent it (from a prior HELLO) the same way to send
-     * us what we're missing -- see that method for the receiving half of
-     * this exchange. This replaces the earlier naive stand-in that just
-     * resent our entire outgoing history on every reconnect.
+     * mapping, then kicks off the real digest sync (DESIGN.md §7.3). Every
+     * peer, contact or stranger, gets a digest now because the carried
+     * `msg_id` set is useful to both: it suppresses blind re-spray of foreign
+     * mule traffic on reconnect. A known contact additionally gets the
+     * per-sender lamport digest for the 1:1 chat, i.e. "here's what I have
+     * from myself, contiguously, through lamport N per sender." That's the
+     * wire-chatId convention from the class KDoc applied to DIGEST frames:
+     * `chatId` here is OUR OWN userId, and `entries` is
+     * [MessageStore.chatDigest] keyed by the *local* chat (the contact's
+     * userId), because locally that's how this 1:1 chat's history is stored.
+     * The peer's [handleDigest] uses the matching digest we sent it (from a
+     * prior HELLO) the same way to send us what we're missing -- see that
+     * method for the receiving half of this exchange. This replaces the
+     * earlier naive stand-in that just resent our entire outgoing history on
+     * every reconnect.
      *
-     * An unrecognized userId means "not a friend (yet)" -- we keep the
-     * address mapping (they may friend us later this session) but send
-     * nothing, since we have no key to seal anything to them with, and a
-     * digest to a stranger we can't sync with anyway would be pointless
-     * (see [handleDigest]'s KDoc for why it's also harmless).
+     * An unrecognized userId still means "not a friend (yet)" for sealed 1:1
+     * chat: `entries` is empty, because we have no local chat history keyed to
+     * a stranger. But the digest is still worth sending for the carried
+     * `msg_id` suppression above.
      */
     private fun handleHello(address: String, userId: ByteArray, identity: Identity) {
         // Register the address->userId mapping before anything else --
@@ -266,29 +661,39 @@ class MeshService : Service() {
         drainCarriedEnvelopesTo(address, userId)
 
         val contact = store.getContact(userId)
+        val digestEntries = contact?.let { store.chatDigest(it.userId) } ?: emptyList()
         if (contact == null) {
-            Log.i(TAG, "HELLO from unrecognized userId=${UserIdHex.encode(userId)}; not syncing anything")
-            return
+            Log.i(TAG, "HELLO from unrecognized userId=${UserIdHex.encode(userId)}; sending carry-suppression digest only")
         }
-
-        val digestFrame = encodeDigest(identity.userId, store.chatDigest(contact.userId))
+        val digestFrame = encodeDigest(identity.userId, digestEntries, store.carriedMsgIds(DIGEST_CARRIED_MSG_IDS_LIMIT))
         MeshRouter.sendToAddress(address, digestFrame)
     }
 
     /**
-     * DIGEST handling (DESIGN.md §7.3): the peer just told us, per-sender,
-     * what it has contiguously in this 1:1 chat. [DigestSync.isExpectedChatId]
+     * DIGEST handling (DESIGN.md §7.3): the peer just told us both
+     * (a) per-sender contiguous lamports for the 1:1 chat, and
+     * (b) the exact carried `msg_id`s it already knows, so a mule doesn't
+     * blindly resend them on every reconnect. [DigestSync.isExpectedChatId]
      * checks the wire-chatId sanity condition from the class KDoc -- the
      * digest's `chatId` must equal the userId [MeshRouter] learned for this
      * address via its HELLO. A mismatch, or a digest before any HELLO on
-     * this link, means the frame is out of order, so it's logged and
-     * dropped rather than acted on.
+     * this link, means the frame is out of order, so it's logged and dropped
+     * rather than acted on.
      *
-     * We only ever act on the entry for OUR OWN userId
-     * ([DigestSync.throughLamportForSelf]) -- that's the peer reporting what
-     * of *our* authored history it's missing. Entries about other senders
-     * are foreign mule traffic and a later milestone (relay, DESIGN.md
-     * §5.3), so they're ignored here.
+     * We act on two digest entries, in §7.3's order:
+     *
+     * 1. The entry for the PEER'S own userId tells us how far their authored
+     *    stream exists contiguously from their point of view, which is the
+     *    upper bound for the delivered/read receipts we owe them. Those
+     *    receipts are re-sent first from the store's persisted outgoing
+     *    receipt watermarks, which closes the standalone-receipt retry gap.
+     * 2. The entry for OUR OWN userId ([DigestSync.throughLamportForSelf]) is
+     *    the peer reporting what of *our* authored history it's missing, so
+     *    we resend those messages oldest-first after the receipts.
+     *
+     * Entries about any other senders are still ignored here -- that is
+     * future group traffic rather than this 1:1 chat's retry path. Mule
+     * traffic is instead keyed by the digest's exact carried `msg_id` set.
      *
      * Security note (see also this class's KDoc and the core's
      * `protocol.rs` module docs): a DIGEST, like a HELLO, is unauthenticated
@@ -304,32 +709,105 @@ class MeshService : Service() {
      * open -- or forgery, since nothing a DIGEST says is ever written to
      * our own store.
      */
-    private fun handleDigest(address: String, chatId: ByteArray, entries: List<DigestEntry>, identity: Identity) {
+    private fun handleDigest(
+        address: String,
+        chatId: ByteArray,
+        entries: List<DigestEntry>,
+        recentMsgIds: List<ByteArray>,
+        identity: Identity,
+    ) {
         val peerUserId = MeshRouter.userIdFor(address)
         if (!DigestSync.isExpectedChatId(chatId, peerUserId)) {
             Log.w(TAG, "Dropping DIGEST from $address: chatId doesn't match this link's HELLO (or no HELLO seen yet)")
             return
         }
 
-        val contact = store.getContact(peerUserId!!)
+        val resolvedPeerUserId = peerUserId!!
+        val contact = store.getContact(resolvedPeerUserId)
+        if (contact != null) {
+            syncReceiptsFirst(identity, contact, address, entries)
+            val peerHasThrough = DigestSync.throughLamportForSelf(entries, identity.userId)
+            val queuedByLamport = store
+                .outboundEnvelopesAfter(contact.userId, identity.userId, peerHasThrough)
+                .associateBy { it.lamport }
+            val missing = store.messagesAfter(contact.userId, identity.userId, peerHasThrough)
+            for (message in missing) {
+                val outbound = queuedByLamport[message.lamport] ?: backfillOutboundAuthoredEnvelope(identity, contact, message)
+                if (outbound != null) {
+                    sendStoredOutboundEnvelope(address, outbound)
+                }
+            }
+        }
+        sprayCarriedEnvelopesTo(address, resolvedPeerUserId, recentMsgIds)
         if (contact == null) {
-            Log.i(TAG, "DIGEST from unrecognized userId=${UserIdHex.encode(peerUserId)}; nothing to sync")
-            return
+            Log.i(TAG, "DIGEST from unrecognized userId=${UserIdHex.encode(resolvedPeerUserId)}; sprayed carry queue only")
+        }
+    }
+
+    /**
+     * DESIGN.md §7.3: receipts go first on peer sync because they're the
+     * smallest frames and unblock the most UI. The store persists the latest
+     * cumulative delivered/read watermarks we owe [contact], so a receipt that
+     * couldn't be sent when it was first observed heals on this reconnect.
+     *
+     * The digest entry for [contact.userId] is "how far the peer says its own
+     * authored stream exists contiguously"; receipts acknowledging beyond that
+     * point are capped away as nonsensical. In the ordinary case the cap is a
+     * no-op, but it makes the foreign digest entry actively meaningful rather
+     * than ignored.
+     */
+    private fun syncReceiptsFirst(
+        identity: Identity,
+        contact: Contact,
+        address: String,
+        entries: List<DigestEntry>,
+    ) {
+        val peerAuthoredThrough = DigestSync.throughLamportForSender(entries, contact.userId)
+        if (peerAuthoredThrough == 0uL) return
+
+        val deliveredThrough = minOf(
+            store.outgoingReceiptThrough(contact.userId, contact.userId, RECEIPT_TYPE_DELIVERED),
+            peerAuthoredThrough,
+        )
+        if (deliveredThrough > 0uL) {
+            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, contact.userId, deliveredThrough)
         }
 
-        val peerHasThrough = DigestSync.throughLamportForSelf(entries, identity.userId)
-        val missing = store.messagesAfter(contact.userId, identity.userId, peerHasThrough)
-        for (message in missing) {
-            sendSealedEnvelope(
-                identity = identity,
-                recipientUserId = contact.userId,
-                recipientAgreePk = contact.agreePk,
-                address = address,
-                kind = KIND_TEXT,
-                lamport = message.lamport,
-                timestamp = message.timestamp,
-                content = message.payload,
-            )
+        val readThrough = minOf(
+            store.outgoingReceiptThrough(contact.userId, contact.userId, RECEIPT_TYPE_READ),
+            peerAuthoredThrough,
+        )
+        if (readThrough > 0uL) {
+            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, contact.userId, readThrough)
+        }
+    }
+
+    /**
+     * DESIGN.md §5.3 carry follow-up: spray carried foreign envelopes onward
+     * to a non-recipient mule on reconnect, excluding anything actually
+     * destined for that peer (the targeted drain already handled those) and
+     * anything the peer's digest says it already knows by `msg_id`.
+     *
+     * Unlike [drainCarriedEnvelopesTo], this keeps the local copy: a mule
+     * stays a mule until the true recipient eventually opens it.
+     */
+    private fun sprayCarriedEnvelopesTo(address: String, peerUserId: ByteArray, peerKnownMsgIds: List<ByteArray>) {
+        val now = System.currentTimeMillis()
+        try {
+            store.pruneExpiredCarried(now)
+            val peerHints = recentHintsFor(peerUserId, now)
+            val toSpray = store.carriedEnvelopesForPeerSync(peerHints, peerKnownMsgIds, now)
+            if (toSpray.isEmpty()) return
+            var sprayed = 0
+            for (env in toSpray) {
+                val frame = encodeEnvelopeFrame(env.msgId, env.hopTtl, env.expiry, env.recipientHint, env.sealed)
+                if (MeshRouter.sendToAddress(address, frame)) {
+                    sprayed++
+                }
+            }
+            Log.i(TAG, "Sprayed $sprayed carried envelope(s) to mule $address")
+        } catch (e: CoreException) {
+            Log.w(TAG, "Failed to spray carried envelopes to $address: ${e.message}")
         }
     }
 
@@ -365,12 +843,35 @@ class MeshService : Service() {
      * see [deliverOpenedEnvelope].
      */
     private fun handleEnvelope(address: String, envelope: Frame.Envelope, identity: Identity) {
+        processInboundEnvelope(address, envelope, identity)
+    }
+
+    private fun handleRelayEnvelope(envelope: com.cruisemesh.app.relay.RelayFetchedEnvelope, identity: Identity) {
+        Log.i(
+            TAG,
+            "Handling relay envelope id=${envelope.id} msgId=${UserIdHex.encode(envelope.msgId)} hopTtl=${envelope.hopTtl}",
+        )
+        processInboundEnvelope(
+            sourceAddress = null,
+            envelope = Frame.Envelope(
+                msgId = envelope.msgId,
+                hopTtl = envelope.hopTtl,
+                expiry = envelope.expiryMs,
+                recipientHint = envelope.recipientHint,
+                sealed = envelope.sealed,
+            ),
+            identity = identity,
+        )
+    }
+
+    private fun processInboundEnvelope(sourceAddress: String?, envelope: Frame.Envelope, identity: Identity) {
+        val sourceLabel = sourceAddress ?: "relay"
         if (!GossipState.seenIds.checkAndRecord(envelope.msgId)) {
             // Already handled this msg_id; a redundant copy from the flood.
             return
         }
         if (envelope.expiry <= System.currentTimeMillis()) {
-            Log.i(TAG, "Dropping expired envelope from $address (expiry=${envelope.expiry})")
+            Log.i(TAG, "Dropping expired envelope from $sourceLabel (expiry=${envelope.expiry})")
             return
         }
 
@@ -381,11 +882,11 @@ class MeshService : Service() {
             // best-effort (DESIGN.md §5.3): flood it to whoever's connected
             // right now, and carry it so we can hand it to its recipient the
             // next time we meet them, even if that's hours from now.
-            relayForeignEnvelope(address, envelope)
+            relayForeignEnvelope(sourceAddress, envelope)
             carryForeignEnvelope(envelope)
             return
         }
-        deliverOpenedEnvelope(address, opened, identity)
+        deliverOpenedEnvelope(sourceLabel, opened, identity)
     }
 
     /**
@@ -416,6 +917,9 @@ class MeshService : Service() {
             )
             if (stored) {
                 Log.i(TAG, "Carrying foreign envelope (family=$isFamily) for later delivery")
+                if (isFamily) {
+                    requestRelaySync("family carry queued")
+                }
             }
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to enqueue carried envelope: ${e.message}")
@@ -485,7 +989,7 @@ class MeshService : Service() {
      * arriving link is excluded from the flood to avoid the trivial echo; the
      * seen-ID set (already updated by [handleEnvelope]) stops longer loops.
      */
-    private fun relayForeignEnvelope(address: String, envelope: Frame.Envelope) {
+    private fun relayForeignEnvelope(address: String?, envelope: Frame.Envelope) {
         val remainingHops = envelope.hopTtl.toInt()
         if (remainingHops <= 1) {
             // Hop budget exhausted; this node is the final carrier for it.
@@ -498,9 +1002,17 @@ class MeshService : Service() {
             envelope.recipientHint,
             envelope.sealed,
         )
-        val fanout = MeshRouter.relayToAllExcept(address, relayed)
+        val fanout = if (address == null) {
+            MeshRouter.relayToAll(relayed)
+        } else {
+            MeshRouter.relayToAllExcept(address, relayed)
+        }
         if (fanout > 0) {
-            Log.i(TAG, "Relayed foreign envelope from $address to $fanout link(s), hop_ttl ${remainingHops}->${remainingHops - 1}")
+            Log.i(
+                TAG,
+                "Relayed foreign envelope from ${address ?: "relay"} to $fanout link(s), " +
+                    "hop_ttl ${remainingHops}->${remainingHops - 1}",
+            )
         }
     }
 
@@ -526,8 +1038,85 @@ class MeshService : Service() {
         when (body.kind) {
             KIND_TEXT -> handleIncomingText(address, opened.senderUserId, body, identity)
             KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
+            KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, opened.senderUserId, body, identity)
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
         }
+    }
+
+    /**
+     * Stores a signed `kind=3` friend request in the hidden lamport stream and
+     * imports/updates the sender as a contact from the authenticated payload.
+     * The payload is a FriendCard JSON string, but unlike a QR scan we can
+     * verify it matches the envelope sender's signing key before trusting it.
+     */
+    private fun handleIncomingFriendRequest(
+        address: String,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+    ) {
+        val card = try {
+            parseFriendCard(body.content.toString(Charsets.UTF_8))
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping friend request from $address: failed to parse FriendCard (${e.message})")
+            return
+        }
+        if (!friendCardUserId(card).contentEquals(senderUserId)) {
+            Log.w(TAG, "Dropping friend request from $address: payload identity doesn't match verified sender")
+            return
+        }
+
+        val contact = Contact(
+            userId = senderUserId,
+            name = card.name,
+            signPk = card.signPk,
+            agreePk = card.agreePk,
+            relayUrl = card.relayUrl,
+            relayToken = card.relayToken,
+        )
+        store.upsertContact(contact)
+        val inserted = store.insertMessage(
+            StoredMessage(
+                chatId = senderUserId,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_FRIEND_REQUEST,
+                payload = body.content,
+            ),
+        )
+        if (!inserted) return
+        ChatEvents.notifyChatChanged(senderUserId)
+
+        val throughLamport = store.highestContiguousLamport(senderUserId, senderUserId)
+        store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
+        var relayQueueChanged = queueOutgoingReceiptForRelay(
+            identity = identity,
+            contact = contact,
+            receiptType = RECEIPT_TYPE_DELIVERED,
+            ackedSenderUserId = senderUserId,
+            throughLamport = throughLamport,
+        )
+        val isVisible = ChatVisibility.isVisible(senderUserId)
+        if (isVisible) {
+            store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_READ, throughLamport)
+            relayQueueChanged = queueOutgoingReceiptForRelay(
+                identity = identity,
+                contact = contact,
+                receiptType = RECEIPT_TYPE_READ,
+                ackedSenderUserId = senderUserId,
+                throughLamport = throughLamport,
+            ) || relayQueueChanged
+        }
+        if (relayQueueChanged) {
+            RelaySyncEvents.requestSync()
+        }
+
+        sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
+        if (isVisible) {
+            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
+        }
+        Log.i(TAG, "Imported contact ${contact.name} from friend request on $address")
     }
 
     /**
@@ -552,8 +1141,9 @@ class MeshService : Service() {
      * receipts are kind=2, this branch only ever runs for kind=1, and
      * [handleIncomingReceipt] never calls [sendReceiptOnAddress] or
      * [sendReceiptToContact] or otherwise sends anything back. Combined with
-     * [handleDigest] only ever resending kind=1 messages we authored,
-     * there's no cycle where a receipt causes a receipt.
+     * authored resend only ever replaying kinds that *we* originated (text
+     * and friend-request, never a receipt), there's no cycle where a receipt
+     * causes a receipt.
      */
     private fun handleIncomingText(address: String, senderUserId: ByteArray, body: MessageBody, identity: Identity) {
         val inserted = store.insertMessage(
@@ -566,8 +1156,26 @@ class MeshService : Service() {
                 payload = body.content,
             ),
         )
-        if (!inserted) return
+        if (!inserted) {
+            Log.i(
+                TAG,
+                "Ignoring duplicate text from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
+            )
+            return
+        }
+        Log.i(
+            TAG,
+            "Stored text from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
+        )
         ChatEvents.notifyChatChanged(senderUserId)
+
+        val throughLamport = store.highestContiguousLamport(senderUserId, senderUserId)
+        store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
+        var relayQueueChanged = false
+        val isVisible = ChatVisibility.isVisible(senderUserId)
+        if (isVisible) {
+            store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_READ, throughLamport)
+        }
 
         val contact = store.getContact(senderUserId)
         if (contact == null) {
@@ -580,10 +1188,29 @@ class MeshService : Service() {
             return
         }
 
-        val throughLamport = store.highestContiguousLamport(senderUserId, senderUserId)
+        relayQueueChanged = queueOutgoingReceiptForRelay(
+            identity = identity,
+            contact = contact,
+            receiptType = RECEIPT_TYPE_DELIVERED,
+            ackedSenderUserId = senderUserId,
+            throughLamport = throughLamport,
+        )
+        if (isVisible) {
+            relayQueueChanged = queueOutgoingReceiptForRelay(
+                identity = identity,
+                contact = contact,
+                receiptType = RECEIPT_TYPE_READ,
+                ackedSenderUserId = senderUserId,
+                throughLamport = throughLamport,
+            ) || relayQueueChanged
+        }
+        if (relayQueueChanged) {
+            RelaySyncEvents.requestSync()
+        }
+
         sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
 
-        if (ChatVisibility.isVisible(senderUserId)) {
+        if (isVisible) {
             // The user is already looking at this chat, so it was read the
             // instant it landed -- send the read receipt now rather than
             // waiting for ChatViewEvents, which only fires when a chat
@@ -652,6 +1279,36 @@ class MeshService : Service() {
     }
 
     /**
+     * Persist the latest relay-uploadable sealed receipt envelope for one
+     * cumulative outgoing watermark. Same watermark is a no-op so the stored
+     * `msg_id` stays stable; higher watermark replaces it with a newly sealed
+     * envelope and clears the relay-posted marker in core.
+     */
+    private fun queueOutgoingReceiptForRelay(
+        identity: Identity,
+        contact: Contact,
+        receiptType: UByte,
+        ackedSenderUserId: ByteArray,
+        throughLamport: ULong,
+        timestamp: Long = System.currentTimeMillis(),
+    ): Boolean {
+        if (throughLamport == 0uL) return false
+        val existing = store.outgoingReceiptEnvelope(contact.userId, ackedSenderUserId, receiptType)
+        if (existing != null && existing.throughLamport >= throughLamport) {
+            return false
+        }
+        val envelope = buildOutgoingReceiptEnvelope(
+            identity = identity,
+            contact = contact,
+            receiptType = receiptType,
+            ackedSenderUserId = ackedSenderUserId,
+            throughLamport = throughLamport,
+            timestamp = timestamp,
+        ) ?: return false
+        return store.upsertOutgoingReceiptEnvelope(envelope, timestamp)
+    }
+
+    /**
      * [ChatViewEvents] handler: the user just opened [peerUserId]'s chat.
      * Sends a READ receipt covering everything currently stored from that
      * peer (DESIGN.md §7.2), via [sendReceiptToContact] rather than
@@ -659,22 +1316,29 @@ class MeshService : Service() {
      * triggered from -- it goes out over whatever link [MeshRouter] can
      * currently reach the contact on, if any.
      *
-     * Best-effort like every receipt: if the peer isn't connected right now,
-     * [sendSealedEnvelopeToContact] simply no-ops (logged at INFO) and
-     * nothing is queued to retry. The read state re-syncs the next time this
-     * chat is viewed again, or the next time a new message from this peer
-     * arrives (see [handleIncomingText]'s immediate read receipt for an
-     * already-visible chat). A read receipt lost to the peer being briefly
-     * offline therefore stays unsent until one of those triggers happens --
-     * an accepted gap for this milestone, closed once receipts ride the
-     * digest sync (DESIGN.md §7.3) directly instead of being sent
-     * standalone.
+     * Best-effort immediately like every receipt: if the peer isn't connected
+     * right now, [sendSealedEnvelopeToContact] simply no-ops (logged at INFO).
+     * The difference from the earlier milestone is that the cumulative read
+     * watermark is first persisted via `recordOutgoingReceipt`, so the next
+     * digest sync re-sends it receipts-first and closes the old retry gap.
      */
     private fun handleChatViewed(peerUserId: ByteArray) {
         val identity = this.identity ?: return
         val contact = store.getContact(peerUserId) ?: return
         val throughLamport = store.highestContiguousLamport(peerUserId, peerUserId)
         if (throughLamport == 0uL) return // nothing received from this peer yet to ack as read
+        store.recordOutgoingReceipt(peerUserId, peerUserId, RECEIPT_TYPE_READ, throughLamport)
+        if (
+            queueOutgoingReceiptForRelay(
+                identity = identity,
+                contact = contact,
+                receiptType = RECEIPT_TYPE_READ,
+                ackedSenderUserId = peerUserId,
+                throughLamport = throughLamport,
+            )
+        ) {
+            RelaySyncEvents.requestSync()
+        }
         sendReceiptToContact(identity, contact, RECEIPT_TYPE_READ, peerUserId, throughLamport)
     }
 
@@ -737,13 +1401,33 @@ class MeshService : Service() {
     }
 
     /**
+     * Re-queues an older locally authored chat-stream message that predates
+     * the new outbound-envelope table, so reconnect retry and relay upload can
+     * use the same persisted-envelope path as newly authored traffic.
+     */
+    private fun backfillOutboundAuthoredEnvelope(
+        identity: Identity,
+        contact: Contact,
+        message: StoredMessage,
+    ): OutboundEnvelope? {
+        val outbound = buildOutboundAuthoredEnvelope(identity, contact, message) ?: return null
+        store.insertOutgoingMessage(message, outbound, message.timestamp)
+        return outbound
+    }
+
+    /** Sends one previously persisted outbound envelope on the exact link [address]. */
+    private fun sendStoredOutboundEnvelope(address: String, envelope: OutboundEnvelope) {
+        MeshRouter.sendToAddress(address, encodeOutboundEnvelopeFrame(envelope))
+    }
+
+    /**
      * Seals one [MessageBody] into an envelope frame, or null (logged) if
      * sealing fails. Wraps the sealed bytes in the §6.4 public header: a
      * fresh random `msgId`, `DEFAULT_HOP_TTL`, an expiry `DEFAULT_EXPIRY_MS`
      * out from now, and a `recipientHint` for [recipientUserId] as of now.
-     * Every field but the sealed bytes themselves is inert on receive today
-     * (direct-link delivery only, no relay/mule engine yet) -- see
-     * `protocol.rs`'s envelope-header module docs.
+     * This helper remains for auto-generated receipts; authored text now uses
+     * the persistent outbound-envelope queue instead so reconnect retries and
+     * relay upload preserve one stable `msg_id` and ciphertext per message.
      */
     private fun sealEnvelopeFrame(
         identity: Identity,
@@ -843,10 +1527,20 @@ class MeshService : Service() {
         }
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("CruiseMesh")
-            .setContentText("Relaying messages nearby")
+            .setContentText(
+                if (pausedForBluetoothAudio) {
+                    "Paused while Bluetooth audio is connected"
+                } else {
+                    "Relaying messages nearby"
+                },
+            )
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setOngoing(true)
             .build()
+    }
+
+    private fun refreshForegroundNotification() {
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification())
     }
 
     companion object {

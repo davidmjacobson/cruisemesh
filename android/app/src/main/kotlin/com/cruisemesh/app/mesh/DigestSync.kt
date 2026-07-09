@@ -25,15 +25,20 @@ object DigestSync {
 
     /**
      * The lamport a peer's digest [entries] reports having contiguously for
-     * messages authored by [ownUserId] -- i.e. "the peer is missing
-     * everything from us after this." An [entries] list with no matching
-     * [DigestEntry] means the peer has never acknowledged any of our
-     * messages in this chat (e.g. first sync ever), which is exactly what
-     * `0` means to [uniffi.cruisemesh_core.MessageStore.messagesAfter]:
-     * "send everything." Entries about senders other than [ownUserId] are
-     * foreign mule traffic and deliberately ignored -- relaying other
-     * people's messages is a later milestone (DESIGN.md §5.3).
+     * messages authored by [senderUserId]. An [entries] list with no matching
+     * [DigestEntry] means the peer has nothing contiguous for that sender in
+     * this chat, which is exactly what `0` means to both the retry logic and
+     * [uniffi.cruisemesh_core.MessageStore.messagesAfter]: "send everything
+     * after zero." Senders absent from the digest stay absent -- nothing is
+     * inferred or summed across entries.
+     */
+    fun throughLamportForSender(entries: List<DigestEntry>, senderUserId: ByteArray): ULong =
+        entries.firstOrNull { it.senderUserId.contentEquals(senderUserId) }?.throughLamport ?: 0uL
+
+    /**
+     * Convenience wrapper for the common "what does the peer already have of
+     * our own authored stream?" lookup used by outgoing message resend.
      */
     fun throughLamportForSelf(entries: List<DigestEntry>, ownUserId: ByteArray): ULong =
-        entries.firstOrNull { it.senderUserId.contentEquals(ownUserId) }?.throughLamport ?: 0uL
+        throughLamportForSender(entries, ownUserId)
 }

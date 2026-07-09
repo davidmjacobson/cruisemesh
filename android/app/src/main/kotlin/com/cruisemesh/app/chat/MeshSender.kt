@@ -1,28 +1,19 @@
 package com.cruisemesh.app.chat
 
 import android.util.Log
-import com.cruisemesh.app.mesh.GossipState
 import com.cruisemesh.app.mesh.MeshRouter
+import com.cruisemesh.app.mesh.RelaySyncEvents
+import com.cruisemesh.app.mesh.buildOutboundAuthoredEnvelope
+import com.cruisemesh.app.mesh.encodeOutboundEnvelopeFrame
 import uniffi.cruisemesh_core.Contact
-import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.Identity
-import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
-import uniffi.cruisemesh_core.computeRecipientHint
-import uniffi.cruisemesh_core.defaultExpiry
-import uniffi.cruisemesh_core.encodeEnvelopeFrame
-import uniffi.cruisemesh_core.encodeMessageBody
-import uniffi.cruisemesh_core.generateMsgId
-import uniffi.cruisemesh_core.sealMessage
 
 private const val TAG = "MeshSender"
 
 /** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
 private const val KIND_TEXT: kotlin.UByte = 1u
-
-/** DESIGN.md §5.3: hop budget a freshly authored envelope's §6.4 header starts with. Mirrors core's `DEFAULT_HOP_TTL`. */
-private const val DEFAULT_HOP_TTL: kotlin.UByte = 7u
 
 /**
  * Sends an outgoing text message into a contact's 1:1 chat (DESIGN.md §7.1).
@@ -36,15 +27,14 @@ interface MeshSender {
 }
 
 /**
- * Real [MeshSender]: persists the outgoing message into the local
- * [MessageStore] exactly as the Milestone-1 placeholder (`LocalEchoSender`)
- * used to, then -- if [MeshRouter] currently has a live link to that contact
- * -- seals it (DESIGN.md §6.3) and transmits it immediately (DESIGN.md
- * §5.2). If the contact isn't connected right now, the message simply stays
- * local; [com.cruisemesh.app.mesh.MeshService]'s digest sync (DESIGN.md
- * §7.3) delivers it whenever that contact is next seen and HELLOs in.
- * Because [ChatScreen] only ever depends on the [MeshSender] interface, this
- * swap-in required no UI changes.
+ * Real [MeshSender]: seals the message once into a persistent outbound
+ * envelope (DESIGN.md §4, §9), stores both the plaintext row and that exact
+ * sealed retry copy atomically in [MessageStore], then transmits it
+ * immediately if [MeshRouter] currently has a live link to the contact. If
+ * the contact isn't connected right now, the same queued envelope stays local
+ * for [com.cruisemesh.app.mesh.MeshService]'s digest sync (and later relay
+ * upload) to retry. Because [ChatScreen] only ever depends on the
+ * [MeshSender] interface, this swap-in required no UI changes.
  *
  * 1:1 chats use the peer's UserID as the *local* `chat_id` (DESIGN.md §7.1),
  * so the outgoing message is stored under `contact.userId` even though
@@ -68,44 +58,20 @@ class RealMeshSender(
         val timestamp = System.currentTimeMillis()
         val payload = text.toByteArray(Charsets.UTF_8)
 
-        store.insertMessage(
-            StoredMessage(
-                chatId = chatId,
-                senderUserId = identity.userId,
-                lamport = lamport,
-                timestamp = timestamp,
-                kind = KIND_TEXT,
-                payload = payload,
-            ),
+        val message = StoredMessage(
+            chatId = chatId,
+            senderUserId = identity.userId,
+            lamport = lamport,
+            timestamp = timestamp,
+            kind = KIND_TEXT,
+            payload = payload,
         )
+        val outbound = buildOutboundAuthoredEnvelope(identity, contact, message) ?: return
+        store.insertOutgoingMessage(message, outbound, timestamp)
         ChatEvents.notifyChatChanged(chatId)
+        RelaySyncEvents.requestSync()
 
-        val envelopeFrame = try {
-            val body = MessageBody(
-                kind = KIND_TEXT,
-                chatId = identity.userId, // wire convention: sender's own userId -- see MeshService KDoc
-                lamport = lamport,
-                timestamp = timestamp,
-                content = payload,
-            )
-            val msgId = generateMsgId()
-            // Record our own msg_id as seen so a relay flooding this message
-            // back to us isn't mistaken for foreign traffic and re-relayed
-            // (DESIGN.md §5.3; a sealed box can't be opened by its sender).
-            GossipState.seenIds.record(msgId)
-            encodeEnvelopeFrame(
-                msgId,
-                DEFAULT_HOP_TTL,
-                defaultExpiry(timestamp),
-                computeRecipientHint(contact.userId, timestamp),
-                sealMessage(identity, contact.agreePk, encodeMessageBody(body)),
-            )
-        } catch (e: CoreException) {
-            Log.w(TAG, "sendText: failed to seal message for ${contact.name}: ${e.message}")
-            null
-        }
-
-        if (envelopeFrame != null && !MeshRouter.sendToUserId(contact.userId, envelopeFrame)) {
+        if (!MeshRouter.sendToUserId(contact.userId, encodeOutboundEnvelopeFrame(outbound))) {
             Log.i(TAG, "sendText: ${contact.name} not currently connected; message stays local until next digest sync")
         }
     }

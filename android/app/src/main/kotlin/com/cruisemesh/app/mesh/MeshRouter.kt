@@ -112,6 +112,15 @@ object MeshRouter {
         return sent
     }
 
+    /** Floods [frame] to every currently connected link. */
+    fun relayToAll(frame: ByteArray): Int {
+        var sent = 0
+        for ((transport, address) in state.connectedRoutes()) {
+            if (dispatch(transport, address, frame)) sent++
+        }
+        return sent
+    }
+
     private fun dispatch(transport: MeshRouterState.Transport, address: String, frame: ByteArray): Boolean {
         val send = when (transport) {
             MeshRouterState.Transport.CENTRAL -> centralSend
