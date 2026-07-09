@@ -487,7 +487,7 @@ class MeshService : Service() {
         fallbackConfig: RelayConfig?,
         now: Long,
     ) {
-        val hints = relayHintsForConfig(identity.userId, contacts, config, fallbackConfig, now)
+        val hints = relayHintsForConfig(identity.userId, now)
         if (hints.isEmpty()) return
         var after = 0L
         while (running && hasValidatedInternet()) {
@@ -511,20 +511,8 @@ class MeshService : Service() {
 
     private fun relayHintsForConfig(
         ownUserId: ByteArray,
-        contacts: List<Contact>,
-        config: RelayConfig,
-        fallbackConfig: RelayConfig?,
         now: Long,
-    ): List<ByteArray> {
-        val hints = mutableListOf<ByteArray>()
-        hints += recentHintsFor(ownUserId, now)
-        for (contact in contacts) {
-            if (resolvedRelayConfig(contact, fallbackConfig) == config) {
-                hints += recentHintsFor(contact.userId, now)
-            }
-        }
-        return hints
-    }
+    ): List<ByteArray> = recentHintsFor(ownUserId, now)
 
     private fun distinctRelayConfigs(contacts: List<Contact>, fallbackConfig: RelayConfig?): List<RelayConfig> =
         buildList {
