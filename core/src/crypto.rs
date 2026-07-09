@@ -35,11 +35,11 @@ use crate::identity::derive_user_id;
 use crate::{CoreError, Identity};
 
 const ENVELOPE_VERSION: u8 = 1;
-const PAD_BUCKET: usize = 256;
 const EPHEMERAL_PK_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
-const SIGN_PK_LEN: usize = 32;
-const SIGNATURE_LEN: usize = 64;
+pub(crate) const PAD_BUCKET: usize = 256;
+pub(crate) const SIGN_PK_LEN: usize = 32;
+pub(crate) const SIGNATURE_LEN: usize = 64;
 
 /// A payload recovered from a sealed envelope, with the sender identified
 /// and their signature already verified.
@@ -57,15 +57,7 @@ pub fn seal_message(
     recipient_agree_pk: Vec<u8>,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, CoreError> {
-    let signing_key = signing_key_from_bytes(&sender.sign_sk)?;
-    let signature = signing_key.sign(&payload);
-
-    let mut signed_body = Vec::with_capacity(SIGN_PK_LEN + SIGNATURE_LEN + payload.len());
-    signed_body.extend_from_slice(&sender.sign_pk);
-    signed_body.extend_from_slice(&signature.to_bytes());
-    signed_body.extend_from_slice(&payload);
-
-    let padded = pad_to_bucket(&signed_body);
+    let padded = sign_and_pad(&sender, &payload)?;
 
     let recipient_pk = public_key_from_bytes(&recipient_agree_pk)?;
     let ephemeral_sk = SecretKey::generate(&mut OsRng);
@@ -110,8 +102,22 @@ pub fn open_message(recipient: Identity, sealed: Vec<u8>) -> Result<OpenedMessag
     let padded = opening_box
         .decrypt(&nonce, ciphertext)
         .map_err(|_| CoreError::Crypto("open failed".to_string()))?;
+    open_signed_payload(&padded)
+}
 
-    let signed_body = unpad(&padded)?;
+pub(crate) fn sign_and_pad(sender: &Identity, payload: &[u8]) -> Result<Vec<u8>, CoreError> {
+    let signing_key = signing_key_from_bytes(&sender.sign_sk)?;
+    let signature = signing_key.sign(payload);
+
+    let mut signed_body = Vec::with_capacity(SIGN_PK_LEN + SIGNATURE_LEN + payload.len());
+    signed_body.extend_from_slice(&sender.sign_pk);
+    signed_body.extend_from_slice(&signature.to_bytes());
+    signed_body.extend_from_slice(payload);
+    Ok(pad_to_bucket(&signed_body))
+}
+
+pub(crate) fn open_signed_payload(padded: &[u8]) -> Result<OpenedMessage, CoreError> {
+    let signed_body = unpad(padded)?;
     if signed_body.len() < SIGN_PK_LEN + SIGNATURE_LEN {
         return Err(CoreError::Crypto("signed body too short".to_string()));
     }
@@ -134,7 +140,7 @@ pub fn open_message(recipient: Identity, sealed: Vec<u8>) -> Result<OpenedMessag
     })
 }
 
-fn pad_to_bucket(data: &[u8]) -> Vec<u8> {
+pub(crate) fn pad_to_bucket(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + data.len());
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     out.extend_from_slice(data);
@@ -143,7 +149,7 @@ fn pad_to_bucket(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn unpad(data: &[u8]) -> Result<Vec<u8>, CoreError> {
+pub(crate) fn unpad(data: &[u8]) -> Result<Vec<u8>, CoreError> {
     if data.len() < 4 {
         return Err(CoreError::Crypto("padded body too short".to_string()));
     }
@@ -154,36 +160,32 @@ fn unpad(data: &[u8]) -> Result<Vec<u8>, CoreError> {
     Ok(data[4..4 + len].to_vec())
 }
 
-fn signing_key_from_bytes(bytes: &[u8]) -> Result<SigningKey, CoreError> {
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| key_len_err(32, bytes.len()))?;
+pub(crate) fn signing_key_from_bytes(bytes: &[u8]) -> Result<SigningKey, CoreError> {
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| key_len_err(32, bytes.len()))?;
     Ok(SigningKey::from_bytes(&arr))
 }
 
-fn verifying_key_from_bytes(bytes: &[u8]) -> Result<VerifyingKey, CoreError> {
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| key_len_err(32, bytes.len()))?;
-    VerifyingKey::from_bytes(&arr).map_err(|_| CoreError::Crypto("invalid Ed25519 public key".to_string()))
+pub(crate) fn verifying_key_from_bytes(bytes: &[u8]) -> Result<VerifyingKey, CoreError> {
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| key_len_err(32, bytes.len()))?;
+    VerifyingKey::from_bytes(&arr)
+        .map_err(|_| CoreError::Crypto("invalid Ed25519 public key".to_string()))
 }
 
 fn public_key_from_bytes(bytes: &[u8]) -> Result<PublicKey, CoreError> {
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| key_len_err(32, bytes.len()))?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| key_len_err(32, bytes.len()))?;
     Ok(PublicKey::from(arr))
 }
 
 fn secret_key_from_bytes(bytes: &[u8]) -> Result<SecretKey, CoreError> {
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| key_len_err(32, bytes.len()))?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| key_len_err(32, bytes.len()))?;
     Ok(SecretKey::from(arr))
 }
 
-fn key_len_err(expected: u32, actual: usize) -> CoreError {
-    CoreError::InvalidKeyLength { expected, actual: actual as u32 }
+pub(crate) fn key_len_err(expected: u32, actual: usize) -> CoreError {
+    CoreError::InvalidKeyLength {
+        expected,
+        actual: actual as u32,
+    }
 }
 
 #[cfg(test)]
@@ -196,8 +198,12 @@ mod tests {
         let alice = generate_identity();
         let bob = generate_identity();
 
-        let sealed = seal_message(alice.clone(), bob.agree_pk.clone(), b"meet at the buffet at 6".to_vec())
-            .expect("seal succeeds");
+        let sealed = seal_message(
+            alice.clone(),
+            bob.agree_pk.clone(),
+            b"meet at the buffet at 6".to_vec(),
+        )
+        .expect("seal succeeds");
         let opened = open_message(bob, sealed).expect("open succeeds");
 
         assert_eq!(opened.payload, b"meet at the buffet at 6");
@@ -210,7 +216,8 @@ mod tests {
         let bob = generate_identity();
         let mallory = generate_identity();
 
-        let sealed = seal_message(alice, bob.agree_pk.clone(), b"secret".to_vec()).expect("seal succeeds");
+        let sealed =
+            seal_message(alice, bob.agree_pk.clone(), b"secret".to_vec()).expect("seal succeeds");
         let err = open_message(mallory, sealed).unwrap_err();
         assert!(matches!(err, CoreError::Crypto(_)));
     }
@@ -220,8 +227,8 @@ mod tests {
         let alice = generate_identity();
         let bob = generate_identity();
 
-        let mut sealed =
-            seal_message(alice, bob.agree_pk.clone(), b"meet at the buffet".to_vec()).expect("seal succeeds");
+        let mut sealed = seal_message(alice, bob.agree_pk.clone(), b"meet at the buffet".to_vec())
+            .expect("seal succeeds");
         let last = sealed.len() - 1;
         sealed[last] ^= 0xFF;
 
@@ -234,7 +241,8 @@ mod tests {
         let alice = generate_identity();
         let bob = generate_identity();
 
-        let sealed = seal_message(alice, bob.agree_pk.clone(), b"hi".to_vec()).expect("seal succeeds");
+        let sealed =
+            seal_message(alice, bob.agree_pk.clone(), b"hi".to_vec()).expect("seal succeeds");
         // envelope = version byte + 32-byte ephemeral pk + 24-byte nonce + (256-byte padded body + 16-byte AEAD tag)
         assert_eq!(sealed.len(), 1 + 32 + 24 + 256 + 16);
     }

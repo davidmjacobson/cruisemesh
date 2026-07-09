@@ -31,7 +31,7 @@
 //! ```text
 //! offset  size  field
 //! 0       1     kind            (u8; text=1, receipt=2, friend-request=3,
-//!                               per DESIGN.md §7.1)
+//!                               group-invite=4, per DESIGN.md §7.1)
 //! 1       2     chat_id_len     (u16 BE)
 //! 3       N     chat_id         (N = chat_id_len bytes)
 //! 3+N     8     lamport         (u64 BE)
@@ -71,6 +71,28 @@
 //! 4+N+M   8     lamport             (u64 BE; cumulative through this value)
 //! 12+N+M  1     receipt_type        (u8; delivered=1, read=2)
 //! ```
+//!
+//! ## Group invites (DESIGN.md §6.5, §7.1)
+//!
+//! A group invite is an ordinary [`MessageBody`] with `kind =
+//! KIND_GROUP_INVITE`, whose `content` is the encoded
+//! [`crate::Group`] record:
+//!
+//! ```text
+//! offset  size  field
+//! 0       16    group_id            (random 16-byte group id)
+//! 16      32    key                 (XChaCha20-Poly1305 group key)
+//! 48      2     name_len            (u16 BE)
+//! 50      N     name_utf8           (N = name_len bytes)
+//! 50+N    2     member_count        (u16 BE)
+//! then, per member:
+//!         2     member_user_id_len  (u16 BE)
+//!         M     member_user_id      (M = that length)
+//! ```
+//!
+//! Invites are sent pairwise through the existing 1:1 sign-then-seal path
+//! (`crypto.rs::seal_message`). Importing one means decoding this payload and
+//! storing the resulting group config locally.
 //!
 //! ## BLE frame discriminator (DESIGN.md §5.2, §7.3)
 //!
@@ -128,9 +150,11 @@
 //!                                 "could this be for someone I carry for"
 //!                                 without decrypting; rotates daily so it
 //!                                 isn't a stable tracking identifier)
-//! 33      M     sealed           (the rest of the frame; crypto.rs's
-//!                                 seal_message output, opaque to everyone
-//!                                 but the true recipient)
+//! 33      M     sealed           (the rest of the frame; either
+//!                                 `crypto.rs::seal_message` for pairwise
+//!                                 traffic, including `kind=4` invites, or
+//!                                 `groups.rs::seal_group_message` for
+//!                                 group-authored traffic)
 //! ```
 //!
 //! `sender_user_id` is deliberately absent from this header (unlike
@@ -143,6 +167,11 @@
 //! later, but `MeshService` doesn't act on `hop_ttl`/`expiry`/
 //! `recipient_hint` yet. [`generate_msg_id`], [`compute_recipient_hint`], and
 //! [`default_expiry`] are the canonical ways to produce these fields.
+//! Group messages use the same header unchanged; the only difference is that
+//! `recipient_hint` is derived from the group id instead of a user id, and
+//! the sealed tail's private format is `version(1) | nonce(24) |
+//! ciphertext+tag`, where the ciphertext opens to the same signed+padded
+//! inner body shape 1:1 messages use.
 //!
 //! ## DIGEST frame (DESIGN.md §7.3)
 //!
@@ -203,6 +232,9 @@ pub const KIND_RECEIPT: u8 = 2;
 /// `MessageBody.kind` value for a signed friend-request envelope (DESIGN.md
 /// §6.2, §7.1). The payload is application-defined contact-import content.
 pub const KIND_FRIEND_REQUEST: u8 = 3;
+/// `MessageBody.kind` value for a pairwise-sealed group invite whose
+/// `content` is an encoded [`crate::Group`] record.
+pub const KIND_GROUP_INVITE: u8 = 4;
 
 /// `ReceiptContent.receipt_type` value: recipient's device decrypted and
 /// stored the message (the ✓✓ tick, DESIGN.md §7.2).
@@ -260,7 +292,13 @@ pub fn decode_message_body(bytes: Vec<u8>) -> Result<MessageBody, CoreError> {
     let timestamp = cursor.take_i64()?;
     let content = cursor.take_bytes32()?;
     cursor.finish()?;
-    Ok(MessageBody { kind, chat_id, lamport, timestamp, content })
+    Ok(MessageBody {
+        kind,
+        chat_id,
+        lamport,
+        timestamp,
+        content,
+    })
 }
 
 /// The decoded form of a receipt's `content` (a `MessageBody` with
@@ -277,9 +315,8 @@ pub struct ReceiptContent {
 /// Encode a [`ReceiptContent`] to its wire form (see module docs for layout).
 #[uniffi::export]
 pub fn encode_receipt_content(content: ReceiptContent) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        2 + content.chat_id.len() + 2 + content.sender_user_id.len() + 8 + 1,
-    );
+    let mut out =
+        Vec::with_capacity(2 + content.chat_id.len() + 2 + content.sender_user_id.len() + 8 + 1);
     write_bytes16(&mut out, &content.chat_id);
     write_bytes16(&mut out, &content.sender_user_id);
     out.extend_from_slice(&content.lamport.to_be_bytes());
@@ -297,7 +334,12 @@ pub fn decode_receipt_content(bytes: Vec<u8>) -> Result<ReceiptContent, CoreErro
     let lamport = cursor.take_u64()?;
     let receipt_type = cursor.take_u8()?;
     cursor.finish()?;
-    Ok(ReceiptContent { chat_id, sender_user_id, lamport, receipt_type })
+    Ok(ReceiptContent {
+        chat_id,
+        sender_user_id,
+        lamport,
+        receipt_type,
+    })
 }
 
 /// A parsed BLE frame: an unauthenticated HELLO (see module docs for why
@@ -305,9 +347,21 @@ pub fn decode_receipt_content(bytes: Vec<u8>) -> Result<ReceiptContent, CoreErro
 /// sync digest (DESIGN.md §7.3).
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
 pub enum Frame {
-    Hello { user_id: Vec<u8> },
-    Envelope { msg_id: Vec<u8>, hop_ttl: u8, expiry: i64, recipient_hint: Vec<u8>, sealed: Vec<u8> },
-    Digest { chat_id: Vec<u8>, entries: Vec<DigestEntry>, recent_msg_ids: Vec<Vec<u8>> },
+    Hello {
+        user_id: Vec<u8>,
+    },
+    Envelope {
+        msg_id: Vec<u8>,
+        hop_ttl: u8,
+        expiry: i64,
+        recipient_hint: Vec<u8>,
+        sealed: Vec<u8>,
+    },
+    Digest {
+        chat_id: Vec<u8>,
+        entries: Vec<DigestEntry>,
+        recent_msg_ids: Vec<Vec<u8>>,
+    },
 }
 
 /// Encode a HELLO frame: frame-type byte `0x01` followed by `user_id`
@@ -337,9 +391,8 @@ pub fn encode_envelope_frame(
     recipient_hint: Vec<u8>,
     sealed: Vec<u8>,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        1 + msg_id.len() + 1 + 8 + recipient_hint.len() + sealed.len(),
-    );
+    let mut out =
+        Vec::with_capacity(1 + msg_id.len() + 1 + 8 + recipient_hint.len() + sealed.len());
     out.push(FRAME_TYPE_ENVELOPE);
     out.extend_from_slice(&msg_id);
     out.push(hop_ttl);
@@ -395,12 +448,19 @@ pub fn default_expiry(timestamp_ms: i64) -> i64 {
 /// each fixed-width 16-byte `msg_id`. `entries` is typically the output of
 /// the store's `chat_digest`; an empty list is valid ("send me everything").
 #[uniffi::export]
-pub fn encode_digest(chat_id: Vec<u8>, entries: Vec<DigestEntry>, recent_msg_ids: Vec<Vec<u8>>) -> Vec<u8> {
+pub fn encode_digest(
+    chat_id: Vec<u8>,
+    entries: Vec<DigestEntry>,
+    recent_msg_ids: Vec<Vec<u8>>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(
         1 + 2
             + chat_id.len()
             + 2
-            + entries.iter().map(|e| 2 + e.sender_user_id.len() + 8).sum::<usize>()
+            + entries
+                .iter()
+                .map(|e| 2 + e.sender_user_id.len() + 8)
+                .sum::<usize>()
             + 2
             + recent_msg_ids.len() * MSG_ID_LEN,
     );
@@ -413,7 +473,12 @@ pub fn encode_digest(chat_id: Vec<u8>, entries: Vec<DigestEntry>, recent_msg_ids
     }
     out.extend_from_slice(&(recent_msg_ids.len() as u16).to_be_bytes());
     for msg_id in &recent_msg_ids {
-        assert_eq!(msg_id.len(), MSG_ID_LEN, "digest msg_id must be exactly {} bytes", MSG_ID_LEN);
+        assert_eq!(
+            msg_id.len(),
+            MSG_ID_LEN,
+            "digest msg_id must be exactly {} bytes",
+            MSG_ID_LEN
+        );
         out.extend_from_slice(msg_id);
     }
     out
@@ -430,9 +495,13 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
     match *frame_type {
         FRAME_TYPE_HELLO => {
             if rest.is_empty() {
-                return Err(CoreError::Malformed("HELLO frame missing user_id".to_string()));
+                return Err(CoreError::Malformed(
+                    "HELLO frame missing user_id".to_string(),
+                ));
             }
-            Ok(Frame::Hello { user_id: rest.to_vec() })
+            Ok(Frame::Hello {
+                user_id: rest.to_vec(),
+            })
         }
         FRAME_TYPE_ENVELOPE => {
             let mut cursor = Cursor::new(rest);
@@ -446,7 +515,13 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
                     "envelope frame missing sealed payload".to_string(),
                 ));
             }
-            Ok(Frame::Envelope { msg_id, hop_ttl, expiry, recipient_hint, sealed: sealed.to_vec() })
+            Ok(Frame::Envelope {
+                msg_id,
+                hop_ttl,
+                expiry,
+                recipient_hint,
+                sealed: sealed.to_vec(),
+            })
         }
         FRAME_TYPE_DIGEST => {
             let mut cursor = Cursor::new(rest);
@@ -456,17 +531,27 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
             for _ in 0..entry_count {
                 let sender_user_id = cursor.take_bytes16()?;
                 let through_lamport = cursor.take_u64()?;
-                entries.push(DigestEntry { sender_user_id, through_lamport });
+                entries.push(DigestEntry {
+                    sender_user_id,
+                    through_lamport,
+                });
             }
             let recent_msg_id_count = cursor.take_u16()? as usize;
-            let mut recent_msg_ids = Vec::with_capacity(recent_msg_id_count.min(rest.len() / MSG_ID_LEN));
+            let mut recent_msg_ids =
+                Vec::with_capacity(recent_msg_id_count.min(rest.len() / MSG_ID_LEN));
             for _ in 0..recent_msg_id_count {
                 recent_msg_ids.push(cursor.take(MSG_ID_LEN)?.to_vec());
             }
             cursor.finish()?;
-            Ok(Frame::Digest { chat_id, entries, recent_msg_ids })
+            Ok(Frame::Digest {
+                chat_id,
+                entries,
+                recent_msg_ids,
+            })
         }
-        other => Err(CoreError::Malformed(format!("unknown frame type byte: 0x{other:02x}"))),
+        other => Err(CoreError::Malformed(format!(
+            "unknown frame type byte: 0x{other:02x}"
+        ))),
     }
 }
 
@@ -496,7 +581,10 @@ impl<'a> Cursor<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], CoreError> {
-        let end = self.pos.checked_add(n).filter(|&end| end <= self.data.len());
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.data.len());
         match end {
             Some(end) => {
                 let slice = &self.data[self.pos..end];
@@ -516,19 +604,27 @@ impl<'a> Cursor<'a> {
     }
 
     fn take_u16(&mut self) -> Result<u16, CoreError> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().expect("exactly 2 bytes")))
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().expect("exactly 2 bytes"),
+        ))
     }
 
     fn take_u32(&mut self) -> Result<u32, CoreError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().expect("exactly 4 bytes")))
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("exactly 4 bytes"),
+        ))
     }
 
     fn take_u64(&mut self) -> Result<u64, CoreError> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().expect("exactly 8 bytes")))
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("exactly 8 bytes"),
+        ))
     }
 
     fn take_i64(&mut self) -> Result<i64, CoreError> {
-        Ok(i64::from_be_bytes(self.take(8)?.try_into().expect("exactly 8 bytes")))
+        Ok(i64::from_be_bytes(
+            self.take(8)?.try_into().expect("exactly 8 bytes"),
+        ))
     }
 
     fn take_bytes16(&mut self) -> Result<Vec<u8>, CoreError> {
@@ -694,7 +790,12 @@ mod tests {
     }
 
     fn sample_envelope_header() -> (Vec<u8>, u8, i64, Vec<u8>) {
-        (vec![0xCD; MSG_ID_LEN], DEFAULT_HOP_TTL, 1_700_000_600_000, vec![0xEF; RECIPIENT_HINT_LEN])
+        (
+            vec![0xCD; MSG_ID_LEN],
+            DEFAULT_HOP_TTL,
+            1_700_000_600_000,
+            vec![0xEF; RECIPIENT_HINT_LEN],
+        )
     }
 
     #[test]
@@ -802,8 +903,14 @@ mod tests {
 
     fn sample_entries() -> Vec<DigestEntry> {
         vec![
-            DigestEntry { sender_user_id: b"alice-user-id-16".to_vec(), through_lamport: 12 },
-            DigestEntry { sender_user_id: b"bob-user-id-1616".to_vec(), through_lamport: 3 },
+            DigestEntry {
+                sender_user_id: b"alice-user-id-16".to_vec(),
+                through_lamport: 12,
+            },
+            DigestEntry {
+                sender_user_id: b"bob-user-id-1616".to_vec(),
+                through_lamport: 3,
+            },
         ]
     }
 
@@ -819,7 +926,11 @@ mod tests {
         let framed = encode_digest(chat_id.clone(), entries.clone(), recent_msg_ids.clone());
         assert_eq!(framed[0], 0x03);
         match parse_frame(framed).expect("parses") {
-            Frame::Digest { chat_id: got_chat, entries: got_entries, recent_msg_ids: got_recent } => {
+            Frame::Digest {
+                chat_id: got_chat,
+                entries: got_entries,
+                recent_msg_ids: got_recent,
+            } => {
                 assert_eq!(got_chat, chat_id);
                 assert_eq!(got_entries, entries);
                 assert_eq!(got_recent, recent_msg_ids);
@@ -833,7 +944,11 @@ mod tests {
         // "I have nothing in this chat" is a valid digest (asks for everything).
         let framed = encode_digest(b"chat-1".to_vec(), Vec::new(), Vec::new());
         match parse_frame(framed).expect("parses") {
-            Frame::Digest { chat_id, entries, recent_msg_ids } => {
+            Frame::Digest {
+                chat_id,
+                entries,
+                recent_msg_ids,
+            } => {
                 assert_eq!(chat_id, b"chat-1".to_vec());
                 assert!(entries.is_empty());
                 assert!(recent_msg_ids.is_empty());
@@ -844,11 +959,17 @@ mod tests {
 
     #[test]
     fn digest_frame_round_trips_with_empty_chat_id_and_max_lamport() {
-        let entries =
-            vec![DigestEntry { sender_user_id: b"alice".to_vec(), through_lamport: u64::MAX }];
+        let entries = vec![DigestEntry {
+            sender_user_id: b"alice".to_vec(),
+            through_lamport: u64::MAX,
+        }];
         let framed = encode_digest(Vec::new(), entries.clone(), sample_recent_msg_ids());
         match parse_frame(framed).expect("parses") {
-            Frame::Digest { chat_id, entries: got, recent_msg_ids } => {
+            Frame::Digest {
+                chat_id,
+                entries: got,
+                recent_msg_ids,
+            } => {
                 assert!(chat_id.is_empty());
                 assert_eq!(got, entries);
                 assert_eq!(recent_msg_ids, sample_recent_msg_ids());
@@ -921,7 +1042,11 @@ mod tests {
 
     #[test]
     fn parse_frame_rejects_digest_with_trailing_garbage() {
-        let mut framed = encode_digest(b"chat-1".to_vec(), sample_entries(), sample_recent_msg_ids());
+        let mut framed = encode_digest(
+            b"chat-1".to_vec(),
+            sample_entries(),
+            sample_recent_msg_ids(),
+        );
         framed.push(0xFF);
         let err = parse_frame(framed).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
@@ -935,7 +1060,8 @@ mod tests {
         let body = sample_body();
         let payload = encode_message_body(body.clone());
 
-        let sealed = seal_message(alice.clone(), bob.agree_pk.clone(), payload).expect("seal succeeds");
+        let sealed =
+            seal_message(alice.clone(), bob.agree_pk.clone(), payload).expect("seal succeeds");
         let opened = open_message(bob, sealed).expect("open succeeds");
         assert_eq!(opened.sender_user_id, alice.user_id);
 
@@ -958,7 +1084,8 @@ mod tests {
         };
         let payload = encode_message_body(body.clone());
 
-        let sealed = seal_message(alice.clone(), bob.agree_pk.clone(), payload).expect("seal succeeds");
+        let sealed =
+            seal_message(alice.clone(), bob.agree_pk.clone(), payload).expect("seal succeeds");
         let opened = open_message(bob, sealed).expect("open succeeds");
 
         let decoded_body = decode_message_body(opened.payload).expect("decodes body");

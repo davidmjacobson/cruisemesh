@@ -10,6 +10,12 @@
 //! which is exactly the data a message store needs alongside messages
 //! themselves.
 //!
+//! Groups (DESIGN.md §6.5) live here too: one `groups` row for the stable
+//! id/name/key tuple, plus `group_members` rows for the current membership.
+//! Group chat history reuses the existing `messages` table with `chat_id =
+//! group_id`; the existing `(chat_id, sender_user_id, lamport)` streams were
+//! already designed for multi-sender chats.
+//!
 //! ## Receipts (DESIGN.md §7.2)
 //!
 //! The `receipts` table records what *this device's peer* has acknowledged
@@ -29,11 +35,14 @@
 //! to whatever transports are up. The `outbound_envelopes` table is that
 //! transport-agnostic queue for authored chat messages: it stores the exact
 //! §6.4 public header plus sealed bytes, keyed by the logical message
-//! identity `(chat_id, sender_user_id, kind, lamport)` so reconnect retries
-//! reuse the same `msg_id` and ciphertext instead of re-sealing a fresh
-//! envelope every time. `insert_outgoing_message` writes the plaintext
-//! message row and its queued envelope in one transaction so local history
-//! and sync state never diverge on a crash boundary.
+//! identity `(chat_id, sender_user_id, kind, lamport, recipient_user_id)` so
+//! reconnect retries reuse the same `msg_id` and ciphertext instead of
+//! re-sealing a fresh envelope every time. The recipient now participates in
+//! the dedupe key because `kind=4` group invites are one logical chat event
+//! fanned out as several pairwise-sealed envelopes, one per member.
+//! `insert_outgoing_message` writes the plaintext message row and one queued
+//! envelope in one transaction so local history and sync state never diverge
+//! on a crash boundary.
 //!
 //! ## Outgoing receipts (DESIGN.md §7.2, §7.3)
 //!
@@ -83,7 +92,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use crate::CoreError;
+use crate::groups::{canonicalize_members, validate_group};
+use crate::{CoreError, Group};
 
 /// One stored message body (DESIGN.md §7.1). `timestamp` is milliseconds
 /// since the Unix epoch; `kind` matches the DESIGN.md §7.1 `kind` byte
@@ -191,7 +201,9 @@ impl MessageStore {
         let conn = Connection::open(&path).map_err(store_err)?;
         conn.execute_batch(SCHEMA).map_err(store_err)?;
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Insert a message. Returns `true` if a new row was inserted, `false`
@@ -212,7 +224,7 @@ impl MessageStore {
                     message.payload,
                 ],
             )
-        .map_err(store_err)?;
+            .map_err(store_err)?;
         Ok(changed > 0)
     }
 
@@ -256,6 +268,7 @@ impl MessageStore {
                         &envelope.sender_user_id,
                         envelope.kind,
                         envelope.lamport,
+                        &envelope.recipient_user_id,
                     ),
                     envelope.msg_id,
                     envelope.recipient_user_id,
@@ -293,7 +306,9 @@ impl MessageStore {
                  FROM messages WHERE chat_id = ?1 ORDER BY timestamp ASC, id ASC",
             )
             .map_err(store_err)?;
-        let rows = stmt.query_map(params![chat_id], row_to_message).map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![chat_id], row_to_message)
+            .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
 
@@ -332,8 +347,12 @@ impl MessageStore {
 
         let mut entries = Vec::with_capacity(senders.len());
         for sender_user_id in senders {
-            let through_lamport = highest_contiguous_lamport_locked(&conn, &chat_id, &sender_user_id)?;
-            entries.push(DigestEntry { sender_user_id, through_lamport });
+            let through_lamport =
+                highest_contiguous_lamport_locked(&conn, &chat_id, &sender_user_id)?;
+            entries.push(DigestEntry {
+                sender_user_id,
+                through_lamport,
+            });
         }
         Ok(entries)
     }
@@ -357,7 +376,10 @@ impl MessageStore {
             )
             .map_err(store_err)?;
         let rows = stmt
-            .query_map(params![chat_id, sender_user_id, after_lamport as i64], row_to_message)
+            .query_map(
+                params![chat_id, sender_user_id, after_lamport as i64],
+                row_to_message,
+            )
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
@@ -385,7 +407,10 @@ impl MessageStore {
             )
             .map_err(store_err)?;
         let rows = stmt
-            .query_map(params![chat_id, sender_user_id, after_lamport as i64], row_to_outbound)
+            .query_map(
+                params![chat_id, sender_user_id, after_lamport as i64],
+                row_to_outbound,
+            )
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
@@ -437,7 +462,10 @@ impl MessageStore {
     pub fn prune_expired_outbound_envelopes(&self, now_ms: i64) -> Result<u64, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let pruned = conn
-            .execute("DELETE FROM outbound_envelopes WHERE expiry <= ?1", params![now_ms])
+            .execute(
+                "DELETE FROM outbound_envelopes WHERE expiry <= ?1",
+                params![now_ms],
+            )
             .map_err(store_err)?;
         Ok(pruned as u64)
     }
@@ -626,7 +654,12 @@ impl MessageStore {
                 VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(chat_id, sender_user_id, receipt_type) DO UPDATE SET
                 through_lamport = MAX(through_lamport, excluded.through_lamport)",
-            params![chat_id, sender_user_id, receipt_type as i64, through_lamport as i64],
+            params![
+                chat_id,
+                sender_user_id,
+                receipt_type as i64,
+                through_lamport as i64
+            ],
         )
         .map_err(store_err)?;
         Ok(())
@@ -673,7 +706,12 @@ impl MessageStore {
                 VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(chat_id, sender_user_id, receipt_type) DO UPDATE SET
                 through_lamport = MAX(through_lamport, excluded.through_lamport)",
-            params![chat_id, sender_user_id, receipt_type as i64, through_lamport as i64],
+            params![
+                chat_id,
+                sender_user_id,
+                receipt_type as i64,
+                through_lamport as i64
+            ],
         )
         .map_err(store_err)?;
         Ok(())
@@ -755,8 +793,11 @@ impl MessageStore {
             .map_err(store_err)?;
         tx.execute("DELETE FROM receipts WHERE chat_id = ?1", params![user_id])
             .map_err(store_err)?;
-        tx.execute("DELETE FROM outgoing_receipts WHERE chat_id = ?1", params![user_id])
-            .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM outgoing_receipts WHERE chat_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
         tx.execute(
             "DELETE FROM outgoing_receipt_envelopes WHERE chat_id = ?1",
             params![user_id],
@@ -786,6 +827,111 @@ impl MessageStore {
             .map_err(store_err)?;
         let rows = stmt.query_map([], row_to_contact).map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Add or replace a group definition and its full membership. Updating an
+    /// existing group id replaces the stored key/member list atomically,
+    /// which is the v1 rotation path for membership changes.
+    pub fn upsert_group(&self, group: Group) -> Result<(), CoreError> {
+        validate_group(&group)?;
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
+            "INSERT INTO groups (group_id, name, group_key)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(group_id) DO UPDATE SET
+                name = excluded.name,
+                group_key = excluded.group_key",
+            params![&group.id, &group.name, &group.key],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM group_members WHERE group_id = ?1",
+            params![&group.id],
+        )
+        .map_err(store_err)?;
+        for member_user_id in canonicalize_members(group.member_user_ids) {
+            tx.execute(
+                "INSERT INTO group_members (group_id, user_id) VALUES (?1, ?2)",
+                params![&group.id, member_user_id],
+            )
+            .map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Look up one imported group by id, including its current member list.
+    pub fn get_group(&self, group_id: Vec<u8>) -> Result<Option<Group>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<GroupRow> = conn
+            .query_row(
+                "SELECT group_id, name, group_key FROM groups WHERE group_id = ?1",
+                params![&group_id],
+                row_to_group_row,
+            )
+            .optional()
+            .map_err(store_err)?;
+        row.map(|row| hydrate_group(&conn, row)).transpose()
+    }
+
+    /// All imported groups, alphabetical by name then id for stable ordering.
+    pub fn list_groups(&self) -> Result<Vec<Group>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let raw = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT group_id, name, group_key FROM groups ORDER BY name ASC, group_id ASC",
+                )
+                .map_err(store_err)?;
+            let rows = stmt.query_map([], row_to_group_row).map_err(store_err)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(store_err)?
+        };
+        raw.into_iter()
+            .map(|row| hydrate_group(&conn, row))
+            .collect()
+    }
+
+    /// Delete a group definition, its membership rows, and the local chat
+    /// history / retry state keyed by that group id. Atomic and idempotent.
+    pub fn delete_group(&self, group_id: Vec<u8>) -> Result<bool, CoreError> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM group_members WHERE group_id = ?1",
+            params![&group_id],
+        )
+        .map_err(store_err)?;
+        let removed = tx
+            .execute("DELETE FROM groups WHERE group_id = ?1", params![&group_id])
+            .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM messages WHERE chat_id = ?1",
+            params![&group_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM receipts WHERE chat_id = ?1",
+            params![&group_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM outgoing_receipts WHERE chat_id = ?1",
+            params![&group_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM outgoing_receipt_envelopes WHERE chat_id = ?1",
+            params![&group_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM outbound_envelopes WHERE chat_id = ?1",
+            params![&group_id],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(removed > 0)
     }
 
     // --- carry queue (DESIGN.md §5.3) --------------------------------------
@@ -861,8 +1007,11 @@ impl MessageStore {
                 .map_err(store_err)?;
             match oldest {
                 Some((msg_id, sz)) => {
-                    tx.execute("DELETE FROM carried_envelopes WHERE msg_id = ?1", params![msg_id])
-                        .map_err(store_err)?;
+                    tx.execute(
+                        "DELETE FROM carried_envelopes WHERE msg_id = ?1",
+                        params![msg_id],
+                    )
+                    .map_err(store_err)?;
                     foreign_total -= sz;
                 }
                 None => break,
@@ -888,7 +1037,10 @@ impl MessageStore {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().expect("store mutex poisoned");
-        let placeholders = std::iter::repeat("?").take(hints.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat("?")
+            .take(hints.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
              FROM carried_envelopes
@@ -965,7 +1117,10 @@ impl MessageStore {
     pub fn remove_carried_envelope(&self, msg_id: Vec<u8>) -> Result<bool, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let removed = conn
-            .execute("DELETE FROM carried_envelopes WHERE msg_id = ?1", params![msg_id])
+            .execute(
+                "DELETE FROM carried_envelopes WHERE msg_id = ?1",
+                params![msg_id],
+            )
             .map_err(store_err)?;
         Ok(removed > 0)
     }
@@ -976,7 +1131,10 @@ impl MessageStore {
     pub fn prune_expired_carried(&self, now_ms: i64) -> Result<u64, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let pruned = conn
-            .execute("DELETE FROM carried_envelopes WHERE expiry <= ?1", params![now_ms])
+            .execute(
+                "DELETE FROM carried_envelopes WHERE expiry <= ?1",
+                params![now_ms],
+            )
             .map_err(store_err)?;
         Ok(pruned as u64)
     }
@@ -985,7 +1143,9 @@ impl MessageStore {
     pub fn carried_len(&self) -> Result<u64, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM carried_envelopes", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM carried_envelopes", [], |row| {
+                row.get(0)
+            })
             .map_err(store_err)?;
         Ok(count as u64)
     }
@@ -1110,6 +1270,39 @@ fn row_to_contact(row: &rusqlite::Row) -> rusqlite::Result<Contact> {
     })
 }
 
+struct GroupRow {
+    id: Vec<u8>,
+    name: String,
+    key: Vec<u8>,
+}
+
+fn row_to_group_row(row: &rusqlite::Row) -> rusqlite::Result<GroupRow> {
+    Ok(GroupRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        key: row.get(2)?,
+    })
+}
+
+fn hydrate_group(conn: &Connection, row: GroupRow) -> Result<Group, CoreError> {
+    Ok(Group {
+        member_user_ids: load_group_members(conn, &row.id)?,
+        id: row.id,
+        name: row.name,
+        key: row.key,
+    })
+}
+
+fn load_group_members(conn: &Connection, group_id: &[u8]) -> Result<Vec<Vec<u8>>, CoreError> {
+    let mut stmt = conn
+        .prepare("SELECT user_id FROM group_members WHERE group_id = ?1 ORDER BY user_id ASC")
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map(params![group_id], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(store_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+}
+
 fn store_err(e: rusqlite::Error) -> CoreError {
     CoreError::Store(e.to_string())
 }
@@ -1119,13 +1312,17 @@ fn outbound_message_dedupe_key(
     sender_user_id: &[u8],
     kind: u8,
     lamport: u64,
+    recipient_user_id: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 2 + chat_id.len() + 2 + sender_user_id.len() + 1 + 8);
+    let mut out = Vec::with_capacity(
+        1 + 2 + chat_id.len() + 2 + sender_user_id.len() + 1 + 8 + 2 + recipient_user_id.len(),
+    );
     out.push(1);
     write_bytes16_local(&mut out, chat_id);
     write_bytes16_local(&mut out, sender_user_id);
     out.push(kind);
     out.extend_from_slice(&lamport.to_be_bytes());
+    write_bytes16_local(&mut out, recipient_user_id);
     out
 }
 
@@ -1135,7 +1332,9 @@ fn write_bytes16_local(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 fn ensure_contact_column(conn: &Connection, name: &str, column_def: &str) -> Result<(), CoreError> {
-    let mut stmt = conn.prepare("PRAGMA table_info(contacts)").map_err(store_err)?;
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(contacts)")
+        .map_err(store_err)?;
     let names = stmt
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(store_err)?
@@ -1144,8 +1343,11 @@ fn ensure_contact_column(conn: &Connection, name: &str, column_def: &str) -> Res
     if names.iter().any(|existing| existing == name) {
         return Ok(());
     }
-    conn.execute(&format!("ALTER TABLE contacts ADD COLUMN {name} {column_def}"), [])
-        .map_err(store_err)?;
+    conn.execute(
+        &format!("ALTER TABLE contacts ADD COLUMN {name} {column_def}"),
+        [],
+    )
+    .map_err(store_err)?;
     Ok(())
 }
 
@@ -1171,6 +1373,19 @@ CREATE TABLE IF NOT EXISTS contacts (
     relay_url TEXT,
     relay_token TEXT
 );
+
+CREATE TABLE IF NOT EXISTS groups (
+    group_id   BLOB PRIMARY KEY,
+    name       TEXT NOT NULL,
+    group_key  BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id BLOB NOT NULL,
+    user_id  BLOB NOT NULL,
+    PRIMARY KEY(group_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_group_members_user_id ON group_members(user_id);
 
 CREATE TABLE IF NOT EXISTS receipts (
     chat_id         BLOB NOT NULL,
@@ -1248,6 +1463,7 @@ CREATE INDEX IF NOT EXISTS idx_carried_expiry ON carried_envelopes(expiry);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Group, KIND_GROUP_INVITE, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1264,7 +1480,11 @@ mod tests {
         }
     }
 
-    fn outbound_for(message: &StoredMessage, recipient_user_id: &[u8], msg_id: &[u8]) -> OutboundEnvelope {
+    fn outbound_for(
+        message: &StoredMessage,
+        recipient_user_id: &[u8],
+        msg_id: &[u8],
+    ) -> OutboundEnvelope {
         OutboundEnvelope {
             msg_id: msg_id.to_vec(),
             recipient_user_id: recipient_user_id.to_vec(),
@@ -1303,11 +1523,24 @@ mod tests {
         }
     }
 
+    fn group(id_byte: u8, name: &str, key_byte: u8, members: &[&[u8]]) -> Group {
+        Group {
+            id: vec![id_byte; 16],
+            name: name.to_string(),
+            member_user_ids: members.iter().map(|member| member.to_vec()).collect(),
+            key: vec![key_byte; 32],
+        }
+    }
+
     #[test]
     fn insert_then_fetch_round_trips() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 1, "hi")).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 2, "there")).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "hi"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 2, "there"))
+            .unwrap();
 
         let messages = store.messages_for_chat(b"chat-a".to_vec()).unwrap();
         assert_eq!(messages.len(), 2);
@@ -1351,20 +1584,37 @@ mod tests {
     #[test]
     fn insert_is_idempotent_on_dedupe_key() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        assert!(store.insert_message(msg(b"chat-a", b"alice", 1, "hi")).unwrap());
+        assert!(store
+            .insert_message(msg(b"chat-a", b"alice", 1, "hi"))
+            .unwrap());
         // Re-delivery of the same envelope (expected under DTN): no-op, not an error.
-        assert!(!store.insert_message(msg(b"chat-a", b"alice", 1, "hi")).unwrap());
-        assert_eq!(store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(), 1);
+        assert!(!store
+            .insert_message(msg(b"chat-a", b"alice", 1, "hi"))
+            .unwrap());
+        assert_eq!(
+            store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(),
+            1
+        );
     }
 
     #[test]
     fn messages_are_isolated_per_chat() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 1, "hi")).unwrap();
-        store.insert_message(msg(b"chat-b", b"alice", 1, "yo")).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "hi"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-b", b"alice", 1, "yo"))
+            .unwrap();
 
-        assert_eq!(store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(), 1);
-        assert_eq!(store.messages_for_chat(b"chat-b".to_vec()).unwrap().len(), 1);
+        assert_eq!(
+            store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.messages_for_chat(b"chat-b".to_vec()).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -1379,10 +1629,16 @@ mod tests {
     #[test]
     fn highest_contiguous_lamport_stops_at_a_gap() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 1, "one")).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 2, "two")).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "one"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 2, "two"))
+            .unwrap();
         // lamport 3 is missing -- message 4 arrived out of order (DTN reality).
-        store.insert_message(msg(b"chat-a", b"alice", 4, "four")).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 4, "four"))
+            .unwrap();
 
         let n = store
             .highest_contiguous_lamport(b"chat-a".to_vec(), b"alice".to_vec())
@@ -1393,17 +1649,27 @@ mod tests {
     #[test]
     fn highest_contiguous_lamport_is_per_sender_not_per_chat() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 1, "hi")).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 2, "there")).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "hi"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 2, "there"))
+            .unwrap();
         // Bob's own counter in the same chat starts independently at 1.
-        store.insert_message(msg(b"chat-a", b"bob", 1, "hey")).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"bob", 1, "hey"))
+            .unwrap();
 
         assert_eq!(
-            store.highest_contiguous_lamport(b"chat-a".to_vec(), b"alice".to_vec()).unwrap(),
+            store
+                .highest_contiguous_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+                .unwrap(),
             2
         );
         assert_eq!(
-            store.highest_contiguous_lamport(b"chat-a".to_vec(), b"bob".to_vec()).unwrap(),
+            store
+                .highest_contiguous_lamport(b"chat-a".to_vec(), b"bob".to_vec())
+                .unwrap(),
             1
         );
     }
@@ -1418,7 +1684,10 @@ mod tests {
             .insert_outgoing_message(message.clone(), outbound.clone(), 1_700_000_000_100)
             .unwrap());
 
-        assert_eq!(store.messages_for_chat(b"chat-a".to_vec()).unwrap(), vec![message]);
+        assert_eq!(
+            store.messages_for_chat(b"chat-a".to_vec()).unwrap(),
+            vec![message]
+        );
         assert_eq!(
             store
                 .outbound_envelopes_after(b"chat-a".to_vec(), b"alice".to_vec(), 0)
@@ -1462,7 +1731,10 @@ mod tests {
                 1_700_000_000_100,
             )
             .unwrap());
-        assert_eq!(store.messages_for_chat(b"chat-a".to_vec()).unwrap(), vec![message]);
+        assert_eq!(
+            store.messages_for_chat(b"chat-a".to_vec()).unwrap(),
+            vec![message]
+        );
         assert_eq!(
             store
                 .outbound_envelopes_after(b"chat-a".to_vec(), b"alice".to_vec(), 0)
@@ -1492,6 +1764,35 @@ mod tests {
     }
 
     #[test]
+    fn group_invites_can_queue_one_pairwise_envelope_per_recipient() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut invite = msg(&vec![0x11; 16], b"alice", 7, "group invite");
+        invite.kind = KIND_GROUP_INVITE;
+        let first = outbound_for(&invite, b"bob", b"msg-000000000011");
+        let second = outbound_for(&invite, b"carol", b"msg-000000000012");
+
+        assert!(store
+            .insert_outgoing_message(invite.clone(), first.clone(), 1_700_000_000_100)
+            .unwrap());
+        assert!(store
+            .insert_outgoing_message(invite.clone(), second.clone(), 1_700_000_000_200)
+            .unwrap());
+
+        assert_eq!(
+            store.messages_for_chat(invite.chat_id.clone()).unwrap(),
+            vec![invite]
+        );
+        let mut recipients: Vec<Vec<u8>> = store
+            .outbound_envelopes_after(vec![0x11; 16], b"alice".to_vec(), 0)
+            .unwrap()
+            .into_iter()
+            .map(|envelope| envelope.recipient_user_id)
+            .collect();
+        recipients.sort();
+        assert_eq!(recipients, vec![b"bob".to_vec(), b"carol".to_vec()]);
+    }
+
+    #[test]
     fn pending_relay_outbound_envelopes_skip_posted_and_expired_rows() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let live = msg(b"chat-a", b"alice", 1, "live");
@@ -1505,9 +1806,15 @@ mod tests {
         let mut posted_env = outbound_for(&posted, b"bob", b"msg-000000000003");
         posted_env.expiry = 10_000;
 
-        store.insert_outgoing_message(live, live_env.clone(), 1_000).unwrap();
-        store.insert_outgoing_message(stale, stale_env, 1_100).unwrap();
-        store.insert_outgoing_message(posted, posted_env.clone(), 1_200).unwrap();
+        store
+            .insert_outgoing_message(live, live_env.clone(), 1_000)
+            .unwrap();
+        store
+            .insert_outgoing_message(stale, stale_env, 1_100)
+            .unwrap();
+        store
+            .insert_outgoing_message(posted, posted_env.clone(), 1_200)
+            .unwrap();
         assert!(store
             .mark_outbound_envelope_relay_posted(posted_env.msg_id.clone(), 1_500)
             .unwrap());
@@ -1614,7 +1921,9 @@ mod tests {
             .unwrap());
 
         assert_eq!(
-            store.pending_relay_outgoing_receipt_envelopes(10, 3_000).unwrap(),
+            store
+                .pending_relay_outgoing_receipt_envelopes(10, 3_000)
+                .unwrap(),
             vec![second.clone()],
         );
         assert_eq!(
@@ -1672,7 +1981,9 @@ mod tests {
             .unwrap());
 
         assert_eq!(
-            store.pending_relay_outgoing_receipt_envelopes(10, 2_000).unwrap(),
+            store
+                .pending_relay_outgoing_receipt_envelopes(10, 2_000)
+                .unwrap(),
             vec![live],
         );
     }
@@ -1680,9 +1991,25 @@ mod tests {
     #[test]
     fn family_carried_envelopes_return_only_unexpired_family_rows() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.enqueue_carried_envelope(carried(b"fam", b"h1", 9_000, 10), true, 1_000, BIG_BUDGET).unwrap();
-        store.enqueue_carried_envelope(carried(b"foreign", b"h2", 9_000, 10), false, 2_000, BIG_BUDGET).unwrap();
-        store.enqueue_carried_envelope(carried(b"expired", b"h3", 1_500, 10), true, 3_000, BIG_BUDGET).unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"fam", b"h1", 9_000, 10), true, 1_000, BIG_BUDGET)
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"foreign", b"h2", 9_000, 10),
+                false,
+                2_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"expired", b"h3", 1_500, 10),
+                true,
+                3_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
 
         let rows = store.family_carried_envelopes(10, 2_000).unwrap();
         assert_eq!(rows.len(), 1);
@@ -1702,7 +2029,10 @@ mod tests {
 
     #[test]
     fn open_migrates_an_old_contacts_table_to_add_relay_token() {
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!("cruisemesh-store-migration-{unique}.sqlite"));
         let path_str = path.to_string_lossy().to_string();
         let conn = Connection::open(&path_str).unwrap();
@@ -1721,20 +2051,32 @@ mod tests {
         conn.execute(
             "INSERT INTO contacts (user_id, name, sign_pk, agree_pk, relay_url)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![b"alice-id".to_vec(), "Alice", vec![1u8; 32], vec![2u8; 32], "https://relay.example"],
+            params![
+                b"alice-id".to_vec(),
+                "Alice",
+                vec![1u8; 32],
+                vec![2u8; 32],
+                "https://relay.example"
+            ],
         )
         .unwrap();
         drop(conn);
 
         let store = MessageStore::open(path_str.clone()).unwrap();
         let migrated = store.get_contact(b"alice-id".to_vec()).unwrap().unwrap();
-        assert_eq!(migrated.relay_url, Some("https://relay.example".to_string()));
+        assert_eq!(
+            migrated.relay_url,
+            Some("https://relay.example".to_string())
+        );
         assert_eq!(migrated.relay_token, None);
 
         let mut updated = migrated.clone();
         updated.relay_token = Some("family-token".to_string());
         store.upsert_contact(updated.clone()).unwrap();
-        assert_eq!(store.get_contact(b"alice-id".to_vec()).unwrap(), Some(updated));
+        assert_eq!(
+            store.get_contact(b"alice-id".to_vec()).unwrap(),
+            Some(updated)
+        );
 
         drop(store);
         fs::remove_file(path).unwrap();
@@ -1745,7 +2087,10 @@ mod tests {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
 
-        let found = store.get_contact(b"alice-id".to_vec()).unwrap().expect("contact exists");
+        let found = store
+            .get_contact(b"alice-id".to_vec())
+            .unwrap()
+            .expect("contact exists");
         assert_eq!(found.name, "Alice");
         assert_eq!(found.sign_pk, vec![1u8; 32]);
     }
@@ -1760,7 +2105,9 @@ mod tests {
     fn upsert_replaces_rather_than_duplicates() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
-        store.upsert_contact(contact(b"alice-id", "Alice R.")).unwrap();
+        store
+            .upsert_contact(contact(b"alice-id", "Alice R."))
+            .unwrap();
 
         let contacts = store.list_contacts().unwrap();
         assert_eq!(contacts.len(), 1);
@@ -1773,7 +2120,12 @@ mod tests {
         store.upsert_contact(contact(b"bob-id", "Bob")).unwrap();
         store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
 
-        let names: Vec<String> = store.list_contacts().unwrap().into_iter().map(|c| c.name).collect();
+        let names: Vec<String> = store
+            .list_contacts()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
         assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
     }
 
@@ -1802,10 +2154,19 @@ mod tests {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
         // 1:1 chat_id = the peer's UserID (DESIGN.md §7.1): both directions live under it.
-        store.insert_message(msg(b"alice-id", b"alice-id", 1, "from alice")).unwrap();
-        store.insert_message(msg(b"alice-id", b"me", 1, "from me")).unwrap();
         store
-            .record_receipt(b"alice-id".to_vec(), b"me".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 1)
+            .insert_message(msg(b"alice-id", b"alice-id", 1, "from alice"))
+            .unwrap();
+        store
+            .insert_message(msg(b"alice-id", b"me", 1, "from me"))
+            .unwrap();
+        store
+            .record_receipt(
+                b"alice-id".to_vec(),
+                b"me".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                1,
+            )
             .unwrap();
         store
             .record_outgoing_receipt(
@@ -1818,10 +2179,17 @@ mod tests {
 
         assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
 
-        assert!(store.messages_for_chat(b"alice-id".to_vec()).unwrap().is_empty());
+        assert!(store
+            .messages_for_chat(b"alice-id".to_vec())
+            .unwrap()
+            .is_empty());
         assert_eq!(
             store
-                .receipt_through(b"alice-id".to_vec(), b"me".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+                .receipt_through(
+                    b"alice-id".to_vec(),
+                    b"me".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
                 .unwrap(),
             0
         );
@@ -1842,18 +2210,131 @@ mod tests {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
         store.upsert_contact(contact(b"bob-id", "Bob")).unwrap();
-        store.insert_message(msg(b"alice-id", b"alice-id", 1, "hi")).unwrap();
-        store.insert_message(msg(b"bob-id", b"bob-id", 1, "yo")).unwrap();
+        store
+            .insert_message(msg(b"alice-id", b"alice-id", 1, "hi"))
+            .unwrap();
+        store
+            .insert_message(msg(b"bob-id", b"bob-id", 1, "yo"))
+            .unwrap();
         // A group chat where alice posted: her group messages belong to the
         // group's chat_id, not to her contact, and must survive.
-        store.insert_message(msg(b"group-1", b"alice-id", 1, "group msg")).unwrap();
+        store
+            .insert_message(msg(b"group-1", b"alice-id", 1, "group msg"))
+            .unwrap();
 
         assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
 
         assert_eq!(store.list_contacts().unwrap().len(), 1);
-        assert_eq!(store.messages_for_chat(b"bob-id".to_vec()).unwrap().len(), 1);
-        assert_eq!(store.messages_for_chat(b"group-1".to_vec()).unwrap().len(), 1);
-        assert!(store.messages_for_chat(b"alice-id".to_vec()).unwrap().is_empty());
+        assert_eq!(
+            store.messages_for_chat(b"bob-id".to_vec()).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.messages_for_chat(b"group-1".to_vec()).unwrap().len(),
+            1
+        );
+        assert!(store
+            .messages_for_chat(b"alice-id".to_vec())
+            .unwrap()
+            .is_empty());
+    }
+
+    // --- groups (DESIGN.md §6.5) ------------------------------------------
+
+    #[test]
+    fn upsert_then_get_group_round_trips() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let group = group(0x11, "Family", 0x22, &[b"carol", b"alice", b"alice"]);
+        store.upsert_group(group.clone()).unwrap();
+
+        assert_eq!(
+            store.get_group(group.id.clone()).unwrap(),
+            Some(Group {
+                id: group.id,
+                name: "Family".to_string(),
+                member_user_ids: vec![b"alice".to_vec(), b"carol".to_vec()],
+                key: vec![0x22; 32],
+            })
+        );
+    }
+
+    #[test]
+    fn upsert_group_replaces_key_and_members_for_rotation() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut rotated = group(0x11, "Bridge", 0x22, &[b"alice", b"bob"]);
+        store.upsert_group(rotated.clone()).unwrap();
+        rotated.key = vec![0x33; 32];
+        rotated.member_user_ids = vec![b"alice".to_vec(), b"dave".to_vec()];
+
+        store.upsert_group(rotated.clone()).unwrap();
+
+        assert_eq!(store.get_group(rotated.id.clone()).unwrap(), Some(rotated));
+    }
+
+    #[test]
+    fn list_groups_orders_by_name() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .upsert_group(group(0x22, "Zulu", 0x33, &[b"alice"]))
+            .unwrap();
+        store
+            .upsert_group(group(0x11, "Alpha", 0x22, &[b"bob"]))
+            .unwrap();
+
+        let names: Vec<String> = store
+            .list_groups()
+            .unwrap()
+            .into_iter()
+            .map(|group| group.name)
+            .collect();
+        assert_eq!(names, vec!["Alpha".to_string(), "Zulu".to_string()]);
+    }
+
+    #[test]
+    fn delete_group_removes_group_and_group_chat_state() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let group = group(0x11, "Family", 0x22, &[b"alice", b"bob"]);
+        store.upsert_group(group.clone()).unwrap();
+        store
+            .insert_message(StoredMessage {
+                chat_id: group.id.clone(),
+                sender_user_id: b"alice".to_vec(),
+                lamport: 1,
+                timestamp: 1_700_000_000_000,
+                kind: 1,
+                payload: b"group hi".to_vec(),
+            })
+            .unwrap();
+        store
+            .record_receipt(
+                group.id.clone(),
+                b"alice".to_vec(),
+                RECEIPT_TYPE_DELIVERED,
+                1,
+            )
+            .unwrap();
+        store
+            .record_outgoing_receipt(group.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ, 1)
+            .unwrap();
+
+        assert!(store.delete_group(group.id.clone()).unwrap());
+        assert_eq!(store.get_group(group.id.clone()).unwrap(), None);
+        assert!(store
+            .messages_for_chat(group.id.clone())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .receipt_through(group.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(group.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            0
+        );
     }
 
     // --- receipts (DESIGN.md §7.2) -----------------------------------------
@@ -1862,7 +2343,11 @@ mod tests {
     fn receipt_through_is_zero_when_none_recorded() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let through = store
-            .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+            .receipt_through(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+            )
             .unwrap();
         assert_eq!(through, 0);
     }
@@ -1871,11 +2356,20 @@ mod tests {
     fn record_receipt_round_trips() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store
-            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 5)
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                5,
+            )
             .unwrap();
 
         let through = store
-            .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+            .receipt_through(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+            )
             .unwrap();
         assert_eq!(through, 5);
     }
@@ -1884,14 +2378,28 @@ mod tests {
     fn record_receipt_is_monotonic_upward() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store
-            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 5)
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                5,
+            )
             .unwrap();
         store
-            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 9)
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9,
+            )
             .unwrap();
 
         let through = store
-            .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+            .receipt_through(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+            )
             .unwrap();
         assert_eq!(through, 9);
     }
@@ -1900,18 +2408,37 @@ mod tests {
     fn record_receipt_never_regresses_on_a_lower_or_replayed_value() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store
-            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 9)
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9,
+            )
             .unwrap();
         // A stale/replayed receipt (lower, or the same, value) must not undo progress.
         store
-            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 3)
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                3,
+            )
             .unwrap();
         store
-            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 9)
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9,
+            )
             .unwrap();
 
         let through = store
-            .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+            .receipt_through(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+            )
             .unwrap();
         assert_eq!(through, 9);
     }
@@ -1920,21 +2447,39 @@ mod tests {
     fn receipt_types_are_independent() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store
-            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 9)
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9,
+            )
             .unwrap();
         store
-            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_READ, 4)
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_READ,
+                4,
+            )
             .unwrap();
 
         assert_eq!(
             store
-                .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+                .receipt_through(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
                 .unwrap(),
             9
         );
         assert_eq!(
             store
-                .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_READ)
+                .receipt_through(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_READ
+                )
                 .unwrap(),
             4
         );
@@ -1944,21 +2489,39 @@ mod tests {
     fn receipts_are_independent_per_chat() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store
-            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 9)
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9,
+            )
             .unwrap();
         store
-            .record_receipt(b"chat-b".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED, 2)
+            .record_receipt(
+                b"chat-b".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                2,
+            )
             .unwrap();
 
         assert_eq!(
             store
-                .receipt_through(b"chat-a".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+                .receipt_through(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
                 .unwrap(),
             9
         );
         assert_eq!(
             store
-                .receipt_through(b"chat-b".to_vec(), b"alice".to_vec(), crate::RECEIPT_TYPE_DELIVERED)
+                .receipt_through(
+                    b"chat-b".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
                 .unwrap(),
             2
         );
@@ -2062,18 +2625,32 @@ mod tests {
     #[test]
     fn chat_digest_has_one_entry_per_sender_with_their_contiguous_lamport() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 1, "one")).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 2, "two")).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "one"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 2, "two"))
+            .unwrap();
         // A gap: lamport 3 missing for alice.
-        store.insert_message(msg(b"chat-a", b"alice", 4, "four")).unwrap();
-        store.insert_message(msg(b"chat-a", b"bob", 1, "hey")).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 4, "four"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"bob", 1, "hey"))
+            .unwrap();
 
         let digest = store.chat_digest(b"chat-a".to_vec()).unwrap();
         assert_eq!(
             digest,
             vec![
-                DigestEntry { sender_user_id: b"alice".to_vec(), through_lamport: 2 },
-                DigestEntry { sender_user_id: b"bob".to_vec(), through_lamport: 1 },
+                DigestEntry {
+                    sender_user_id: b"alice".to_vec(),
+                    through_lamport: 2
+                },
+                DigestEntry {
+                    sender_user_id: b"bob".to_vec(),
+                    through_lamport: 1
+                },
             ]
         );
     }
@@ -2081,11 +2658,19 @@ mod tests {
     #[test]
     fn messages_after_returns_only_newer_messages_ascending() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 1, "one")).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 2, "two")).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 3, "three")).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "one"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 2, "two"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 3, "three"))
+            .unwrap();
 
-        let missing = store.messages_after(b"chat-a".to_vec(), b"alice".to_vec(), 1).unwrap();
+        let missing = store
+            .messages_after(b"chat-a".to_vec(), b"alice".to_vec(), 1)
+            .unwrap();
         let payloads: Vec<Vec<u8>> = missing.into_iter().map(|m| m.payload).collect();
         assert_eq!(payloads, vec![b"two".to_vec(), b"three".to_vec()]);
     }
@@ -2093,10 +2678,16 @@ mod tests {
     #[test]
     fn messages_after_zero_returns_everything() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 1, "one")).unwrap();
-        store.insert_message(msg(b"chat-a", b"alice", 2, "two")).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "one"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 2, "two"))
+            .unwrap();
 
-        let missing = store.messages_after(b"chat-a".to_vec(), b"alice".to_vec(), 0).unwrap();
+        let missing = store
+            .messages_after(b"chat-a".to_vec(), b"alice".to_vec(), 0)
+            .unwrap();
         assert_eq!(missing.len(), 2);
     }
 
@@ -2113,16 +2704,30 @@ mod tests {
             store_a.insert_message(m).unwrap();
         }
         // B only has the first two.
-        store_b.insert_message(msg(b"chat-a", b"alice", 1, "msg-1")).unwrap();
-        store_b.insert_message(msg(b"chat-a", b"alice", 2, "msg-2")).unwrap();
+        store_b
+            .insert_message(msg(b"chat-a", b"alice", 1, "msg-1"))
+            .unwrap();
+        store_b
+            .insert_message(msg(b"chat-a", b"alice", 2, "msg-2"))
+            .unwrap();
 
         let b_digest = store_b.chat_digest(b"chat-a".to_vec()).unwrap();
-        assert_eq!(b_digest, vec![DigestEntry { sender_user_id: b"alice".to_vec(), through_lamport: 2 }]);
+        assert_eq!(
+            b_digest,
+            vec![DigestEntry {
+                sender_user_id: b"alice".to_vec(),
+                through_lamport: 2
+            }]
+        );
 
         let mut all_missing = Vec::new();
         for entry in &b_digest {
             let missing = store_a
-                .messages_after(b"chat-a".to_vec(), entry.sender_user_id.clone(), entry.through_lamport)
+                .messages_after(
+                    b"chat-a".to_vec(),
+                    entry.sender_user_id.clone(),
+                    entry.through_lamport,
+                )
                 .unwrap();
             all_missing.extend(missing);
         }
@@ -2152,30 +2757,61 @@ mod tests {
     fn enqueue_then_fetch_by_hint_round_trips() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let env = carried(b"m1", b"hint-a", 2_000, 100);
-        assert!(store.enqueue_carried_envelope(env.clone(), false, 1_000, BIG_BUDGET).unwrap());
+        assert!(store
+            .enqueue_carried_envelope(env.clone(), false, 1_000, BIG_BUDGET)
+            .unwrap());
 
-        let found = store.carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 1_500).unwrap();
+        let found = store
+            .carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 1_500)
+            .unwrap();
         assert_eq!(found, vec![env]);
     }
 
     #[test]
     fn enqueue_is_idempotent_on_msg_id() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        assert!(store.enqueue_carried_envelope(carried(b"m1", b"h", 2_000, 100), false, 1_000, BIG_BUDGET).unwrap());
+        assert!(store
+            .enqueue_carried_envelope(carried(b"m1", b"h", 2_000, 100), false, 1_000, BIG_BUDGET)
+            .unwrap());
         // Same msg_id, re-received under DTN: no-op, not a duplicate row.
-        assert!(!store.enqueue_carried_envelope(carried(b"m1", b"h", 2_000, 100), false, 1_050, BIG_BUDGET).unwrap());
+        assert!(!store
+            .enqueue_carried_envelope(carried(b"m1", b"h", 2_000, 100), false, 1_050, BIG_BUDGET)
+            .unwrap());
         assert_eq!(store.carried_len().unwrap(), 1);
     }
 
     #[test]
     fn fetch_by_hint_ignores_nonmatching_and_expired() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.enqueue_carried_envelope(carried(b"m1", b"hint-a", 2_000, 10), false, 1_000, BIG_BUDGET).unwrap();
-        store.enqueue_carried_envelope(carried(b"m2", b"hint-b", 2_000, 10), false, 1_000, BIG_BUDGET).unwrap();
-        store.enqueue_carried_envelope(carried(b"m3", b"hint-a", 1_200, 10), false, 1_000, BIG_BUDGET).unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"m1", b"hint-a", 2_000, 10),
+                false,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"m2", b"hint-b", 2_000, 10),
+                false,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"m3", b"hint-a", 1_200, 10),
+                false,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
 
         // now_ms = 1_500: m3 (expiry 1_200) is expired; m2 has the wrong hint.
-        let found = store.carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 1_500).unwrap();
+        let found = store
+            .carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 1_500)
+            .unwrap();
         let ids: Vec<Vec<u8>> = found.into_iter().map(|e| e.msg_id).collect();
         assert_eq!(ids, vec![b"m1".to_vec()]);
     }
@@ -2183,9 +2819,30 @@ mod tests {
     #[test]
     fn fetch_matches_any_of_several_hints() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.enqueue_carried_envelope(carried(b"m1", b"day-a", 9_000, 10), false, 1_000, BIG_BUDGET).unwrap();
-        store.enqueue_carried_envelope(carried(b"m2", b"day-b", 9_000, 10), false, 1_100, BIG_BUDGET).unwrap();
-        store.enqueue_carried_envelope(carried(b"m3", b"day-c", 9_000, 10), false, 1_200, BIG_BUDGET).unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"m1", b"day-a", 9_000, 10),
+                false,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"m2", b"day-b", 9_000, 10),
+                false,
+                1_100,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"m3", b"day-c", 9_000, 10),
+                false,
+                1_200,
+                BIG_BUDGET,
+            )
+            .unwrap();
 
         // A peer's recent-day hints cover day-a and day-c but not day-b.
         let found = store
@@ -2198,9 +2855,15 @@ mod tests {
     #[test]
     fn carried_msg_ids_are_returned_oldest_first_and_limited() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.enqueue_carried_envelope(carried(b"m1", b"h", 9_000, 10), false, 1_000, BIG_BUDGET).unwrap();
-        store.enqueue_carried_envelope(carried(b"m2", b"h", 9_000, 10), false, 2_000, BIG_BUDGET).unwrap();
-        store.enqueue_carried_envelope(carried(b"m3", b"h", 9_000, 10), false, 3_000, BIG_BUDGET).unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"m1", b"h", 9_000, 10), false, 1_000, BIG_BUDGET)
+            .unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"m2", b"h", 9_000, 10), false, 2_000, BIG_BUDGET)
+            .unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"m3", b"h", 9_000, 10), false, 3_000, BIG_BUDGET)
+            .unwrap();
 
         let ids = store.carried_msg_ids(2).unwrap();
         assert_eq!(ids, vec![b"m1".to_vec(), b"m2".to_vec()]);
@@ -2209,9 +2872,30 @@ mod tests {
     #[test]
     fn peer_sync_candidates_exclude_the_peers_known_ids_and_targeted_delivery() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.enqueue_carried_envelope(carried(b"known", b"day-a", 9_000, 10), false, 1_000, BIG_BUDGET).unwrap();
-        store.enqueue_carried_envelope(carried(b"for-peer", b"day-b", 9_000, 10), false, 2_000, BIG_BUDGET).unwrap();
-        store.enqueue_carried_envelope(carried(b"spray", b"day-c", 9_000, 10), false, 3_000, BIG_BUDGET).unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"known", b"day-a", 9_000, 10),
+                false,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"for-peer", b"day-b", 9_000, 10),
+                false,
+                2_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"spray", b"day-c", 9_000, 10),
+                false,
+                3_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
 
         let found = store
             .carried_envelopes_for_peer_sync(
@@ -2227,7 +2911,9 @@ mod tests {
     #[test]
     fn remove_carried_deletes_it() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.enqueue_carried_envelope(carried(b"m1", b"h", 2_000, 10), false, 1_000, BIG_BUDGET).unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"m1", b"h", 2_000, 10), false, 1_000, BIG_BUDGET)
+            .unwrap();
         assert!(store.remove_carried_envelope(b"m1".to_vec()).unwrap());
         assert!(!store.remove_carried_envelope(b"m1".to_vec()).unwrap()); // gone, idempotent
         assert_eq!(store.carried_len().unwrap(), 0);
@@ -2236,12 +2922,18 @@ mod tests {
     #[test]
     fn prune_expired_carried_drops_only_the_expired() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.enqueue_carried_envelope(carried(b"live", b"h", 5_000, 10), false, 1_000, BIG_BUDGET).unwrap();
-        store.enqueue_carried_envelope(carried(b"dead", b"h", 1_500, 10), false, 1_000, BIG_BUDGET).unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"live", b"h", 5_000, 10), false, 1_000, BIG_BUDGET)
+            .unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"dead", b"h", 1_500, 10), false, 1_000, BIG_BUDGET)
+            .unwrap();
 
         assert_eq!(store.prune_expired_carried(2_000).unwrap(), 1);
         assert_eq!(store.carried_len().unwrap(), 1);
-        let found = store.carried_envelopes_for_hints(vec![b"h".to_vec()], 2_000).unwrap();
+        let found = store
+            .carried_envelopes_for_hints(vec![b"h".to_vec()], 2_000)
+            .unwrap();
         assert_eq!(found[0].msg_id, b"live");
     }
 
@@ -2249,10 +2941,16 @@ mod tests {
     fn foreign_budget_evicts_oldest_foreign_first() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         // Budget of 250 bytes; three 100-byte foreign envelopes can't all fit.
-        store.enqueue_carried_envelope(carried(b"f1", b"h", 9_000, 100), false, 1_000, 250).unwrap();
-        store.enqueue_carried_envelope(carried(b"f2", b"h", 9_000, 100), false, 2_000, 250).unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"f1", b"h", 9_000, 100), false, 1_000, 250)
+            .unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"f2", b"h", 9_000, 100), false, 2_000, 250)
+            .unwrap();
         // Third insert pushes total to 300 > 250, evicting the oldest (f1).
-        store.enqueue_carried_envelope(carried(b"f3", b"h", 9_000, 100), false, 3_000, 250).unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"f3", b"h", 9_000, 100), false, 3_000, 250)
+            .unwrap();
 
         let ids: Vec<Vec<u8>> = store
             .carried_envelopes_for_hints(vec![b"h".to_vec()], 5_000)
@@ -2267,11 +2965,19 @@ mod tests {
     fn family_envelopes_are_never_evicted_for_budget() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         // A family envelope (is_family = true) far exceeding the budget stays.
-        store.enqueue_carried_envelope(carried(b"fam", b"h", 9_000, 400), true, 1_000, 250).unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"fam", b"h", 9_000, 400), true, 1_000, 250)
+            .unwrap();
         // Foreign envelopes still get budget-capped independently...
-        store.enqueue_carried_envelope(carried(b"f1", b"h", 9_000, 100), false, 2_000, 250).unwrap();
-        store.enqueue_carried_envelope(carried(b"f2", b"h", 9_000, 100), false, 3_000, 250).unwrap();
-        store.enqueue_carried_envelope(carried(b"f3", b"h", 9_000, 100), false, 4_000, 250).unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"f1", b"h", 9_000, 100), false, 2_000, 250)
+            .unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"f2", b"h", 9_000, 100), false, 3_000, 250)
+            .unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"f3", b"h", 9_000, 100), false, 4_000, 250)
+            .unwrap();
 
         let ids: Vec<Vec<u8>> = store
             .carried_envelopes_for_hints(vec![b"h".to_vec()], 5_000)
