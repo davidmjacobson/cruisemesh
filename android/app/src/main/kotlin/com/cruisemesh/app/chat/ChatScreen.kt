@@ -11,7 +11,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,7 +21,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -28,6 +29,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -35,18 +37,16 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -58,9 +58,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
@@ -80,6 +82,9 @@ import com.cruisemesh.app.media.isVisibleChatKind
 import com.cruisemesh.app.ui.AvatarBadge
 import com.cruisemesh.app.ui.BubbleGrouping
 import com.cruisemesh.app.ui.ChatListLogic
+import com.cruisemesh.app.ui.ComposerCameraIcon
+import com.cruisemesh.app.ui.ComposerMicIcon
+import com.cruisemesh.app.ui.ComposerSendIcon
 import com.cruisemesh.app.ui.ContactDetailsSheet
 import com.cruisemesh.app.ui.ConversationMessageMeta
 import com.cruisemesh.app.ui.CruiseMeshTheme
@@ -102,6 +107,9 @@ private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
 
 private const val MAX_VOICE_MS = 60_000
+
+/** Below this hold duration a mic press is treated as an accidental tap, not a memo. */
+private const val MIN_VOICE_MS = 500L
 
 /**
  * A single 1:1 chat thread (DESIGN.md §7.1: for a 1:1 chat, `chat_id` is
@@ -143,8 +151,6 @@ fun ChatScreen(
         mutableStateOf(store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_READ))
     }
     var draft by remember { mutableStateOf("") }
-    var attachMenuOpen by remember { mutableStateOf(false) }
-    var showVoiceDialog by remember { mutableStateOf(false) }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
     val voiceRecorder = remember { VoiceRecorder(context) }
 
@@ -233,7 +239,7 @@ fun ChatScreen(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
         if (granted) {
-            showVoiceDialog = true
+            Toast.makeText(context, "Microphone ready — hold the mic to record", Toast.LENGTH_SHORT).show()
         } else {
             Toast.makeText(context, "Microphone permission is required for voice memos", Toast.LENGTH_SHORT).show()
         }
@@ -267,14 +273,10 @@ fun ChatScreen(
                 reload()
             }
         },
-        attachMenuOpen = attachMenuOpen,
-        onAttachMenuChange = { attachMenuOpen = it },
         onPickGallery = {
-            attachMenuOpen = false
             galleryLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
         },
         onPickCamera = {
-            attachMenuOpen = false
             val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
                 PackageManager.PERMISSION_GRANTED
             if (granted) {
@@ -286,33 +288,28 @@ fun ChatScreen(
                 cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
             }
         },
-        onPickVoice = {
-            attachMenuOpen = false
+        onStartVoice = {
             val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
                 PackageManager.PERMISSION_GRANTED
             if (granted) {
-                showVoiceDialog = true
+                voiceRecorder.start()
             } else {
                 micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                false
             }
         },
+        onStopVoice = {
+            val result = voiceRecorder.stop()
+            if (result != null) {
+                sendVoiceFile(result.first, result.second)
+            } else {
+                Toast.makeText(context, "Recording failed", Toast.LENGTH_SHORT).show()
+            }
+        },
+        onCancelVoice = { voiceRecorder.cancel() },
         onBack = onBack,
         onDeleteContact = onDeleteContact,
     )
-
-    if (showVoiceDialog) {
-        VoiceMemoDialog(
-            recorder = voiceRecorder,
-            onDismiss = {
-                voiceRecorder.cancel()
-                showVoiceDialog = false
-            },
-            onSend = { file, durationMs ->
-                showVoiceDialog = false
-                sendVoiceFile(file, durationMs)
-            },
-        )
-    }
 }
 
 private fun launchCamera(context: android.content.Context, onReady: (Uri) -> Unit) {
@@ -332,11 +329,11 @@ private fun ConversationScreen(
     draft: String,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
-    attachMenuOpen: Boolean = false,
-    onAttachMenuChange: (Boolean) -> Unit = {},
     onPickGallery: () -> Unit = {},
     onPickCamera: () -> Unit = {},
-    onPickVoice: () -> Unit = {},
+    onStartVoice: () -> Boolean = { false },
+    onStopVoice: () -> Unit = {},
+    onCancelVoice: () -> Unit = {},
     onBack: () -> Unit,
     onDeleteContact: () -> Unit,
 ) {
@@ -423,54 +420,17 @@ private fun ConversationScreen(
                 }
             }
 
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 16.dp),
-            ) {
-                Box {
-                    IconButton(
-                        onClick = { onAttachMenuChange(true) },
-                        modifier = Modifier.semantics {
-                            contentDescription = "Attach photo or voice memo"
-                        },
-                    ) {
-                        Icon(Icons.Default.Add, contentDescription = null)
-                    }
-                    DropdownMenu(
-                        expanded = attachMenuOpen,
-                        onDismissRequest = { onAttachMenuChange(false) },
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Photo library") },
-                            onClick = onPickGallery,
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Take photo") },
-                            onClick = onPickCamera,
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Voice memo") },
-                            onClick = onPickVoice,
-                        )
-                    }
-                }
-                OutlinedTextField(
-                    value = draft,
-                    onValueChange = onDraftChange,
-                    placeholder = { Text("Message") },
-                    modifier = Modifier.weight(1f),
-                )
-                Button(
-                    onClick = onSend,
-                    modifier = Modifier
-                        .padding(start = 8.dp)
-                        .height(56.dp),
-                ) {
-                    Text("Send")
-                }
-            }
+            MessageComposer(
+                draft = draft,
+                onDraftChange = onDraftChange,
+                onSend = onSend,
+                ownBubbleColor = MaterialTheme.colorScheme.primary,
+                onPickGallery = onPickGallery,
+                onPickCamera = onPickCamera,
+                onStartVoice = onStartVoice,
+                onStopVoice = onStopVoice,
+                onCancelVoice = onCancelVoice,
+            )
         }
     }
 
@@ -509,15 +469,34 @@ private fun ConversationScreen(
     }
 }
 
+/**
+ * Signal-style message composer: a circular "+" (in the user's own-bubble
+ * color) that opens the photo library, a rounded input pill with a camera
+ * icon inside on the right, and a trailing action that is a hold-to-record
+ * microphone when the draft is empty and a send button once there's text.
+ *
+ * Voice memos record while the mic is held and send on release (a press
+ * shorter than [MIN_VOICE_MS] is treated as an accidental tap and discarded).
+ * The recorder itself is owned by [ChatScreen]; this composable only drives it
+ * through [onStartVoice] / [onStopVoice] / [onCancelVoice].
+ */
 @Composable
-private fun VoiceMemoDialog(
-    recorder: VoiceRecorder,
-    onDismiss: () -> Unit,
-    onSend: (File, Int) -> Unit,
+private fun MessageComposer(
+    draft: String,
+    onDraftChange: (String) -> Unit,
+    onSend: () -> Unit,
+    ownBubbleColor: Color,
+    onPickGallery: () -> Unit,
+    onPickCamera: () -> Unit,
+    onStartVoice: () -> Boolean,
+    onStopVoice: () -> Unit,
+    onCancelVoice: () -> Unit,
 ) {
+    val context = LocalContext.current
+    val onBubbleColor = MaterialTheme.colorScheme.onPrimary
     var recording by remember { mutableStateOf(false) }
     var elapsedMs by remember { mutableLongStateOf(0L) }
-    var error by remember { mutableStateOf<String?>(null) }
+    val hasText = draft.isNotBlank()
 
     LaunchedEffect(recording) {
         if (!recording) return@LaunchedEffect
@@ -525,79 +504,141 @@ private fun VoiceMemoDialog(
         while (recording) {
             elapsedMs = System.currentTimeMillis() - start
             if (elapsedMs >= MAX_VOICE_MS) {
-                val result = recorder.stop()
                 recording = false
-                if (result != null) {
-                    onSend(result.first, result.second)
-                } else {
-                    error = "Recording failed"
-                }
+                onStopVoice()
                 return@LaunchedEffect
             }
-            delay(200)
+            delay(100)
         }
     }
 
-    AlertDialog(
-        onDismissRequest = {
-            recorder.cancel()
-            onDismiss()
-        },
-        title = { Text("Voice memo") },
-        text = {
-            Column {
-                Text(
-                    if (recording) {
-                        "Recording… ${formatDurationMs(elapsedMs.toInt())} / ${formatDurationMs(MAX_VOICE_MS)}"
-                    } else {
-                        "Tap Start, then Send when you're done (max 60s)."
-                    },
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 16.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .clip(CircleShape)
+                .background(ownBubbleColor)
+                .clickable(onClick = onPickGallery)
+                .semantics { contentDescription = "Attach photo from library" },
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(Icons.Default.Add, contentDescription = null, tint = onBubbleColor)
+        }
+
+        Spacer(modifier = Modifier.width(8.dp))
+
+        if (recording) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFFE53935)),
                 )
-                if (error != null) {
-                    Text(
-                        text = error!!,
-                        color = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.padding(top = 8.dp),
-                    )
-                }
+                Spacer(modifier = Modifier.width(10.dp))
+                Text("Recording… ${formatDurationMs(elapsedMs.toInt())}")
+                Spacer(modifier = Modifier.weight(1f))
+                Text(
+                    text = "release to send",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
-        },
-        confirmButton = {
-            if (recording) {
-                TextButton(
-                    onClick = {
-                        val result = recorder.stop()
-                        recording = false
-                        if (result != null) {
-                            onSend(result.first, result.second)
-                        } else {
-                            error = "Recording failed"
-                        }
-                    },
-                ) { Text("Send") }
-            } else {
-                TextButton(
-                    onClick = {
-                        error = null
-                        if (recorder.start()) {
-                            recording = true
-                            elapsedMs = 0L
-                        } else {
-                            error = "Could not access microphone"
-                        }
-                    },
-                ) { Text("Start") }
-            }
-        },
-        dismissButton = {
-            TextButton(
-                onClick = {
-                    recorder.cancel()
-                    onDismiss()
+        } else {
+            TextField(
+                value = draft,
+                onValueChange = onDraftChange,
+                placeholder = { Text("Message") },
+                trailingIcon = {
+                    IconButton(onClick = onPickCamera) {
+                        Icon(ComposerCameraIcon, contentDescription = "Take photo")
+                    }
                 },
-            ) { Text("Cancel") }
-        },
-    )
+                shape = RoundedCornerShape(24.dp),
+                maxLines = 5,
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    focusedIndicatorColor = Color.Transparent,
+                    unfocusedIndicatorColor = Color.Transparent,
+                    disabledIndicatorColor = Color.Transparent,
+                ),
+                modifier = Modifier.weight(1f),
+            )
+        }
+
+        Spacer(modifier = Modifier.width(8.dp))
+
+        if (hasText && !recording) {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(ownBubbleColor)
+                    .clickable(onClick = onSend)
+                    .semantics { contentDescription = "Send" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(ComposerSendIcon, contentDescription = null, tint = onBubbleColor)
+            }
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(if (recording) ownBubbleColor else Color.Transparent)
+                    .pointerInput(Unit) {
+                        detectTapGestures(
+                            onPress = {
+                                val started = onStartVoice()
+                                if (!started) {
+                                    tryAwaitRelease()
+                                    return@detectTapGestures
+                                }
+                                recording = true
+                                elapsedMs = 0L
+                                val pressStart = System.currentTimeMillis()
+                                tryAwaitRelease()
+                                val held = System.currentTimeMillis() - pressStart
+                                if (recording) {
+                                    recording = false
+                                    if (held < MIN_VOICE_MS) {
+                                        onCancelVoice()
+                                        Toast.makeText(
+                                            context,
+                                            "Hold the mic to record a voice memo",
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    } else {
+                                        onStopVoice()
+                                    }
+                                }
+                            },
+                        )
+                    }
+                    .semantics { contentDescription = "Hold to record a voice memo" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    ComposerMicIcon,
+                    contentDescription = null,
+                    tint = if (recording) onBubbleColor else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

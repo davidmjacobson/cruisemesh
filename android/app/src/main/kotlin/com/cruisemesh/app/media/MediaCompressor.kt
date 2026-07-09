@@ -21,14 +21,19 @@ object MediaCompressor {
 
     fun compressImageUri(context: Context, uri: Uri): ByteArray? {
         return try {
+            // A bounds-only pass (inJustDecodeBounds) always returns a null Bitmap
+            // by design -- it only fills in outWidth/outHeight. So guard the *stream*
+            // itself, and ignore the (expected) null decode result; otherwise the
+            // elvis below would misfire on every image and nothing would ever send.
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            context.contentResolver.openInputStream(uri)?.use {
+            (context.contentResolver.openInputStream(uri) ?: return null).use {
                 BitmapFactory.decodeStream(it, null, bounds)
-            } ?: return null
+            }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
             val sample = sampleSizeFor(bounds.outWidth, bounds.outHeight, MAX_EDGE_PX)
             val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-            val decoded = context.contentResolver.openInputStream(uri)?.use {
+            val decoded = (context.contentResolver.openInputStream(uri) ?: return null).use {
                 BitmapFactory.decodeStream(it, null, opts)
             } ?: return null
 
