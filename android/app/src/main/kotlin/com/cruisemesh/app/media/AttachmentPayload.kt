@@ -147,6 +147,9 @@ const val KIND_ATTACHMENT_MANIFEST: UByte = 16u
 /** DESIGN.md §7.1 reserved: attachment-chunk (not used for inline v1). */
 const val KIND_ATTACHMENT_CHUNK: UByte = 17u
 
+/** DESIGN.md §7.1: pairwise-sealed group invite (shown as a system line). */
+const val KIND_GROUP_INVITE: UByte = 4u
+
 /** Kinds rendered in the conversation timeline. */
 fun isVisibleChatKind(kind: UByte): Boolean =
-    kind == 1u.toUByte() || kind == KIND_ATTACHMENT_MANIFEST
+    kind == 1u.toUByte() || kind == KIND_ATTACHMENT_MANIFEST || kind == KIND_GROUP_INVITE

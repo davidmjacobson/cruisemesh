@@ -14,6 +14,7 @@ import androidx.core.content.ContextCompat
 import com.cruisemesh.app.MainActivity
 import com.cruisemesh.app.chat.UserIdHex
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.Group
 
 private const val TAG = "MessageNotifier"
 
@@ -50,9 +51,15 @@ object MessageNotifier {
 
     /**
      * Intent extra on [MainActivity] carrying the [UserIdHex]-encoded userId
-     * of the chat a notification tap should open.
+     * (or group id) of the chat a notification tap should open.
      */
     const val EXTRA_CHAT_USER_ID_HEX = "com.cruisemesh.app.extra.CHAT_USER_ID_HEX"
+
+    /**
+     * When true, [EXTRA_CHAT_USER_ID_HEX] is a group id and the app should open
+     * the group chat route rather than a 1:1 contact chat.
+     */
+    const val EXTRA_CHAT_IS_GROUP = "com.cruisemesh.app.extra.CHAT_IS_GROUP"
 
     /**
      * Posts (or updates -- one notification per chat, keyed by a stable id
@@ -63,6 +70,46 @@ object MessageNotifier {
      * INFO and returns without posting.
      */
     fun notifyIncomingMessage(context: Context, contact: Contact, text: String) {
+        postChatNotification(
+            context = context,
+            chatId = contact.userId,
+            title = contact.name,
+            text = text,
+            deepLinkHex = UserIdHex.encode(contact.userId),
+            isGroup = false,
+        )
+    }
+
+    /**
+     * Posts (or updates) a notification for an incoming group message. Tapping
+     * opens the group chat via [EXTRA_CHAT_IS_GROUP] + [EXTRA_CHAT_USER_ID_HEX]
+     * (the hex is the group id).
+     */
+    fun notifyIncomingGroupMessage(
+        context: Context,
+        group: Group,
+        senderName: String,
+        text: String,
+    ) {
+        val body = if (text.startsWith("Added you to ")) text else "$senderName: $text"
+        postChatNotification(
+            context = context,
+            chatId = group.id,
+            title = group.name,
+            text = body,
+            deepLinkHex = UserIdHex.encode(group.id),
+            isGroup = true,
+        )
+    }
+
+    private fun postChatNotification(
+        context: Context,
+        chatId: ByteArray,
+        title: String,
+        text: String,
+        deepLinkHex: String,
+        isGroup: Boolean,
+    ) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
@@ -79,10 +126,11 @@ object MessageNotifier {
         // PendingIntent request code so intents for different chats never
         // collide (same request code + FLAG_UPDATE_CURRENT would otherwise
         // silently rewrite another chat's tap target).
-        val notificationId = contact.userId.contentHashCode()
+        val notificationId = chatId.contentHashCode()
 
         val tapIntent = Intent(context, MainActivity::class.java).apply {
-            putExtra(EXTRA_CHAT_USER_ID_HEX, UserIdHex.encode(contact.userId))
+            putExtra(EXTRA_CHAT_USER_ID_HEX, deepLinkHex)
+            putExtra(EXTRA_CHAT_IS_GROUP, isGroup)
             // Resume the existing task if the app is already running
             // (launchMode="singleTop" routes this through onNewIntent).
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -96,7 +144,7 @@ object MessageNotifier {
 
         val notification = NotificationCompat.Builder(context, MESSAGE_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
-            .setContentTitle(contact.name)
+            .setContentTitle(title)
             .setContentText(text)
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)

@@ -44,24 +44,47 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.cruisemesh.app.chat.tickStatusFor
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
 
+/**
+ * One row on the home conversation list — either a 1:1 contact chat or a
+ * group (DESIGN.md §14.2 / §14.6).
+ */
 data class ChatSummary(
-    val contact: Contact,
+    val chatId: ByteArray,
+    val title: String,
+    val isGroup: Boolean,
+    val contact: Contact? = null,
+    val group: Group? = null,
     val lastMessage: StoredMessage?,
     val unreadCount: Int,
     val ownDeliveredThrough: ULong,
-    val ownReadThrough: ULong
-)
+    val ownReadThrough: ULong,
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ChatSummary) return false
+        return chatId.contentEquals(other.chatId) &&
+            title == other.title &&
+            isGroup == other.isGroup &&
+            lastMessage == other.lastMessage &&
+            unreadCount == other.unreadCount &&
+            ownDeliveredThrough == other.ownDeliveredThrough &&
+            ownReadThrough == other.ownReadThrough
+    }
+
+    override fun hashCode(): Int = chatId.contentHashCode()
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatListScreen(
     ownUserId: ByteArray,
     ownDisplayName: String,
-    onChatClick: (Contact) -> Unit,
-    onDeleteContact: (Contact) -> Unit,
+    onChatClick: (ChatSummary) -> Unit,
+    onDeleteSummary: (ChatSummary) -> Unit,
     onNewChatClick: () -> Unit,
     onProfileClick: () -> Unit,
     onMeshStatusClick: () -> Unit,
@@ -132,18 +155,28 @@ fun ChatListScreen(
                 }
             } else {
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(summaries, key = { it.contact.userId.contentHashCode() }) { summary ->
+                    items(summaries, key = { it.chatId.contentHashCode() }) { summary ->
                         var showDeleteDialog by remember { mutableStateOf(false) }
 
                         if (showDeleteDialog) {
                             AlertDialog(
                                 onDismissRequest = { showDeleteDialog = false },
-                                title = { Text("Delete Contact") },
-                                text = { Text("Delete contact and all message history?") },
+                                title = {
+                                    Text(if (summary.isGroup) "Delete group" else "Delete Contact")
+                                },
+                                text = {
+                                    Text(
+                                        if (summary.isGroup) {
+                                            "Delete this group and its message history from this device?"
+                                        } else {
+                                            "Delete contact and all message history?"
+                                        },
+                                    )
+                                },
                                 confirmButton = {
                                     TextButton(onClick = {
                                         showDeleteDialog = false
-                                        onDeleteContact(summary.contact)
+                                        onDeleteSummary(summary)
                                     }) { Text("Delete") }
                                 },
                                 dismissButton = {
@@ -155,7 +188,7 @@ fun ChatListScreen(
                         ChatRow(
                             summary = summary,
                             ownUserId = ownUserId,
-                            onClick = { onChatClick(summary.contact) },
+                            onClick = { onChatClick(summary) },
                             onLongClick = { showDeleteDialog = true }
                         )
                     }
@@ -173,9 +206,11 @@ fun ChatRow(
     onClick: () -> Unit,
     onLongClick: () -> Unit
 ) {
-    val displayId = remember(summary.contact.userId) { formatUserId(summary.contact.userId) }
-    val displayName = remember(summary.contact.name, displayId) {
-        ChatListLogic.displayNameOrId(summary.contact.name, displayId)
+    val displayId = remember(summary.chatId, summary.isGroup) {
+        if (summary.isGroup) summary.title else formatUserId(summary.chatId)
+    }
+    val displayName = remember(summary.title, displayId) {
+        ChatListLogic.displayNameOrId(summary.title, displayId)
     }
     val isUnread = summary.unreadCount > 0
 
@@ -190,8 +225,8 @@ fun ChatRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         AvatarBadge(
-            userId = summary.contact.userId,
-            name = summary.contact.name,
+            userId = summary.chatId,
+            name = summary.title,
             displayId = displayId,
         )
 
@@ -204,7 +239,7 @@ fun ChatRow(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = displayName,
+                    text = if (summary.isGroup) "👥 $displayName" else displayName,
                     style = MaterialTheme.typography.bodyLarge.copy(
                         fontWeight = if (isUnread) FontWeight.Bold else FontWeight.Normal
                     ),
@@ -230,9 +265,12 @@ fun ChatRow(
                 if (summary.lastMessage != null) {
                     val isOwn = summary.lastMessage.senderUserId.contentEquals(ownUserId)
                     val prefix = if (isOwn) "You: " else ""
-                    val content = ChatListLogic.previewText(summary.lastMessage)
+                    val content = ChatListLogic.previewText(
+                        summary.lastMessage,
+                        groupName = if (summary.isGroup) summary.title else null,
+                    )
                     
-                    if (isOwn) {
+                    if (isOwn && !summary.isGroup) {
                         val tick = tickStatusFor(
                             summary.lastMessage.lamport,
                             summary.ownDeliveredThrough,
@@ -292,7 +330,7 @@ private fun ChatListScreenEmptyPreview() {
             ownUserId = byteArrayOf(0x44, 0x11),
             ownDisplayName = "Captain",
             onChatClick = {},
-            onDeleteContact = {},
+            onDeleteSummary = {},
             onNewChatClick = {},
             onProfileClick = {},
             onMeshStatusClick = {},
@@ -312,19 +350,22 @@ private fun ChatListScreenEmptyPreview() {
 private fun ChatListScreenPreview() {
     val ownUserId = byteArrayOf(0x44, 0x11)
     val mayaId = byteArrayOf(0x01, 0x02)
-    val julesId = byteArrayOf(0x03, 0x04)
+    val groupId = ByteArray(16) { 0x11 }
     CruiseMeshTheme {
         ChatListScreen(
             ownUserId = ownUserId,
             ownDisplayName = "Captain",
             onChatClick = {},
-            onDeleteContact = {},
+            onDeleteSummary = {},
             onNewChatClick = {},
             onProfileClick = {},
             onMeshStatusClick = {},
             meshStatusText = "Meshing · 2 nearby",
             summaries = listOf(
                 ChatSummary(
+                    chatId = mayaId,
+                    title = "Maya",
+                    isGroup = false,
                     contact = Contact(
                         userId = mayaId,
                         name = "Maya",
@@ -346,27 +387,28 @@ private fun ChatListScreenPreview() {
                     ownReadThrough = 0uL,
                 ),
                 ChatSummary(
-                    contact = Contact(
-                        userId = julesId,
-                        name = "Jules",
-                        signPk = ByteArray(32),
-                        agreePk = ByteArray(32),
-                        relayUrl = null,
-                        relayToken = null,
+                    chatId = groupId,
+                    title = "Bridge Crew",
+                    isGroup = true,
+                    group = Group(
+                        id = groupId,
+                        name = "Bridge Crew",
+                        memberUserIds = listOf(ownUserId, mayaId),
+                        key = ByteArray(32) { 0x22 },
                     ),
                     lastMessage = StoredMessage(
                         senderUserId = ownUserId,
-                        chatId = julesId,
-                        lamport = 4uL,
-                        timestamp = 1_783_610_400_000L,
+                        chatId = groupId,
+                        lamport = 2uL,
+                        timestamp = 1_783_615_000_000L,
                         kind = 1u.toUByte(),
-                        payload = "We grabbed coffee already".toByteArray(),
+                        payload = "Dinner at 7?".toByteArray(),
                     ),
                     unreadCount = 0,
-                    ownDeliveredThrough = 4uL,
-                    ownReadThrough = 4uL,
+                    ownDeliveredThrough = 0uL,
+                    ownReadThrough = 0uL,
                 ),
-            ),
+            )
         )
     }
 }

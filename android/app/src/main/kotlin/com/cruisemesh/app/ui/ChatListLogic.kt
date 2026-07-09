@@ -4,6 +4,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import com.cruisemesh.app.media.AttachmentPayload
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
+import com.cruisemesh.app.media.KIND_GROUP_INVITE
 import com.cruisemesh.app.media.isVisibleChatKind
 import uniffi.cruisemesh_core.StoredMessage
 import java.util.Calendar
@@ -63,14 +64,33 @@ object ChatListLogic {
         }
     }
 
+    /**
+     * Group unread across multi-sender streams: for each other sender, count
+     * messages above our local READ watermark for that sender (stored in
+     * outgoing_receipts; group wire receipts are deferred).
+     */
+    fun computeGroupUnread(
+        messages: List<StoredMessage>,
+        ownUserId: ByteArray,
+        readThroughForSender: (ByteArray) -> ULong,
+    ): Int {
+        return messages.count { msg ->
+            isVisibleChatKind(msg.kind) &&
+                !msg.senderUserId.contentEquals(ownUserId) &&
+                msg.lamport > readThroughForSender(msg.senderUserId)
+        }
+    }
+
     /** Last message shown in the conversation list (hides friend-request noise). */
     fun lastVisibleMessage(messages: List<StoredMessage>): StoredMessage? =
         messages.filter { isVisibleChatKind(it.kind) }.maxByOrNull { it.timestamp }
 
-    fun previewText(message: StoredMessage): String {
+    fun previewText(message: StoredMessage, groupName: String? = null): String {
         return when (message.kind) {
             KIND_ATTACHMENT_MANIFEST ->
                 AttachmentPayload.previewLabel(AttachmentPayload.decode(message.payload))
+            KIND_GROUP_INVITE ->
+                if (groupName != null) "Group created: $groupName" else "Group invite"
             else -> String(message.payload, Charsets.UTF_8)
         }
     }

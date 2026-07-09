@@ -20,12 +20,16 @@ private const val TAG = "OutgoingEnvelope"
 /** The `kind` bytes for authored chat-stream messages (DESIGN.md §7.1). */
 private const val KIND_TEXT: UByte = 1u
 private const val KIND_FRIEND_REQUEST: UByte = 3u
+private const val KIND_GROUP_INVITE: UByte = 4u
 
 /** Mirrors core's `DEFAULT_HOP_TTL` for freshly authored outbound messages. */
 private const val DEFAULT_HOP_TTL: UByte = 7u
 
 private fun isAuthoredChatKind(kind: UByte): Boolean =
-    kind == KIND_TEXT || kind == KIND_FRIEND_REQUEST || kind == KIND_ATTACHMENT_MANIFEST
+    kind == KIND_TEXT ||
+        kind == KIND_FRIEND_REQUEST ||
+        kind == KIND_GROUP_INVITE ||
+        kind == KIND_ATTACHMENT_MANIFEST
 
 /**
  * Seals one locally authored chat-stream message into the persistent outbound

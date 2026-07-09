@@ -68,4 +68,36 @@ class ChatListLogicTest {
         assertEquals(1uL, last!!.lamport)
         assertEquals("hello", ChatListLogic.previewText(last))
     }
+
+    @Test
+    fun groupInviteIsVisibleWithSystemPreview() {
+        val groupId = ByteArray(16) { 0x11 }
+        val msg = StoredMessage(groupId, byteArrayOf(1), 1uL, 1000L, 4u.toUByte(), byteArrayOf())
+        assertEquals(msg, ChatListLogic.lastVisibleMessage(listOf(msg)))
+        assertEquals("Group created: Bridge", ChatListLogic.previewText(msg, "Bridge"))
+        assertEquals("Group invite", ChatListLogic.previewText(msg))
+    }
+
+    @Test
+    fun computeGroupUnreadCountsPerSenderStreams() {
+        val ownId = byteArrayOf(1)
+        val alice = byteArrayOf(2)
+        val bob = byteArrayOf(3)
+        val groupId = ByteArray(16) { 0x22 }
+        val messages = listOf(
+            StoredMessage(groupId, alice, 1uL, 1000L, 1u.toUByte(), "a1".toByteArray()),
+            StoredMessage(groupId, alice, 2uL, 2000L, 1u.toUByte(), "a2".toByteArray()),
+            StoredMessage(groupId, bob, 1uL, 3000L, 1u.toUByte(), "b1".toByteArray()),
+            StoredMessage(groupId, ownId, 1uL, 4000L, 1u.toUByte(), "me".toByteArray()),
+        )
+        val readThrough = mapOf(
+            alice.contentHashCode() to 1uL,
+            bob.contentHashCode() to 0uL,
+        )
+        val unread = ChatListLogic.computeGroupUnread(messages, ownId) { sender ->
+            readThrough[sender.contentHashCode()] ?: 0uL
+        }
+        // alice's lamport 2 + bob's lamport 1
+        assertEquals(2, unread)
+    }
 }

@@ -225,6 +225,7 @@ fun ContactsScreen(
     onContactDelete: (Contact) -> Unit,
     onAddFriendClick: () -> Unit,
     onMyCardClick: () -> Unit,
+    onNewGroupClick: () -> Unit = {},
     onBack: () -> Unit,
 ) {
     var pendingDelete by remember { mutableStateOf<Contact?>(null) }
@@ -263,6 +264,30 @@ fun ContactsScreen(
                         Spacer(modifier = Modifier.width(16.dp))
                         Text(
                             text = "Add a friend",
+                            style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium)
+                        )
+                    }
+                }
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(onClick = onNewGroupClick)
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.surfaceVariant),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("👥", style = MaterialTheme.typography.titleMedium)
+                        }
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Text(
+                            text = "New group",
                             style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium)
                         )
                     }

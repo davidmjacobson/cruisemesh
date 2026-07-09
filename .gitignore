@@ -21,6 +21,16 @@ android/app/src/main/jniLibs/
 
 # Session handoff notes — not project documentation
 /HANDOFF.md
+/LANEA.md
+/LANEB.md
+/LANEC.md
+
+# Local debug output: device logs and pulled sqlite dumps
+/logs/
+/tmp/
+
+# Icon source assets (rendered launcher icons live in android res/)
+/art/
 
 # Editor swap files
 *.swp

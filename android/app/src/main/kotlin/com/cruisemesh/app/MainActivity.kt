@@ -41,6 +41,8 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.cruisemesh.app.chat.ChatScreen
+import com.cruisemesh.app.chat.GroupChatScreen
+import com.cruisemesh.app.chat.GroupSender
 import com.cruisemesh.app.chat.RealMeshSender
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.friending.ContactsScreen
@@ -58,6 +60,7 @@ import com.cruisemesh.app.notify.MessageNotifier
 import com.cruisemesh.app.ui.CruiseMeshTheme
 import com.cruisemesh.app.ui.ChatListScreen
 import com.cruisemesh.app.ui.ChatSummary
+import com.cruisemesh.app.ui.NewGroupScreen
 import com.cruisemesh.app.ui.ProfileScreen
 import com.cruisemesh.app.ui.ChatListLogic
 import uniffi.cruisemesh_core.Identity
@@ -68,20 +71,25 @@ import uniffi.cruisemesh_core.generateIdentity
 private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
 
+data class PendingDeepLink(
+    val idHex: String,
+    val isGroup: Boolean,
+)
+
 class MainActivity : ComponentActivity() {
 
-    private val pendingChatUserIdHex = mutableStateOf<String?>(null)
+    private val pendingDeepLink = mutableStateOf<PendingDeepLink?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        pendingChatUserIdHex.value = intent?.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)
+        pendingDeepLink.value = deepLinkFromIntent(intent)
         setContent {
             CruiseMeshTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     CruiseMeshApp(
-                        pendingChatUserIdHex = pendingChatUserIdHex.value,
-                        onPendingChatConsumed = { pendingChatUserIdHex.value = null },
+                        pendingDeepLink = pendingDeepLink.value,
+                        onPendingDeepLinkConsumed = { pendingDeepLink.value = null },
                     )
                 }
             }
@@ -90,16 +98,20 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        intent.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)?.let {
-            pendingChatUserIdHex.value = it
-        }
+        pendingDeepLink.value = deepLinkFromIntent(intent)
+    }
+
+    private fun deepLinkFromIntent(intent: Intent?): PendingDeepLink? {
+        val hex = intent?.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX) ?: return null
+        val isGroup = intent.getBooleanExtra(MessageNotifier.EXTRA_CHAT_IS_GROUP, false)
+        return PendingDeepLink(hex, isGroup)
     }
 }
 
 @Composable
 fun CruiseMeshApp(
-    pendingChatUserIdHex: String? = null,
-    onPendingChatConsumed: () -> Unit = {},
+    pendingDeepLink: PendingDeepLink? = null,
+    onPendingDeepLinkConsumed: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val identity = remember {
@@ -113,17 +125,25 @@ fun CruiseMeshApp(
         composable("myQr") { MyQrScreen(identity, onBack = { navController.popBackStack() }) }
         composable("scan") { ScanRoute(identity, navController) }
         composable("contacts") { ContactsRoute(navController) }
+        composable("newGroup") { NewGroupRoute(identity, navController) }
         composable("chat/{userIdHex}") { backStackEntry ->
             val userIdHex = backStackEntry.arguments?.getString("userIdHex").orEmpty()
             ChatRoute(identity, userIdHex, navController)
         }
+        composable("group/{groupIdHex}") { backStackEntry ->
+            val groupIdHex = backStackEntry.arguments?.getString("groupIdHex").orEmpty()
+            GroupChatRoute(identity, groupIdHex, navController)
+        }
     }
 
-    LaunchedEffect(pendingChatUserIdHex) {
-        if (pendingChatUserIdHex != null) {
-            navController.navigate("chat/$pendingChatUserIdHex")
-            onPendingChatConsumed()
+    LaunchedEffect(pendingDeepLink) {
+        val link = pendingDeepLink ?: return@LaunchedEffect
+        if (link.isGroup) {
+            navController.navigate("group/${link.idHex}")
+        } else {
+            navController.navigate("chat/${link.idHex}")
         }
+        onPendingDeepLinkConsumed()
     }
 }
 
@@ -178,19 +198,41 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     
     fun reloadSummaries() {
         val contacts = store.listContacts()
-        summaries = contacts.map { c ->
+        val direct = contacts.map { c ->
             val messages = store.messagesForChat(c.userId)
             val readThrough = store.receiptThrough(c.userId, identity.userId, RECEIPT_TYPE_READ)
             val deliveredThrough = store.receiptThrough(c.userId, identity.userId, RECEIPT_TYPE_DELIVERED)
-            val unreadCount = ChatListLogic.computeUnread(messages, identity.userId, readThrough)
+            // Unread uses our local read watermark of the peer's stream.
+            val localReadThrough = store.outgoingReceiptThrough(c.userId, c.userId, RECEIPT_TYPE_READ)
+            val unreadCount = ChatListLogic.computeUnread(messages, identity.userId, localReadThrough)
             ChatSummary(
+                chatId = c.userId,
+                title = c.name,
+                isGroup = false,
                 contact = c,
                 lastMessage = ChatListLogic.lastVisibleMessage(messages),
                 unreadCount = unreadCount,
                 ownDeliveredThrough = deliveredThrough,
-                ownReadThrough = readThrough
+                ownReadThrough = readThrough,
             )
-        }.sortedByDescending { it.lastMessage?.timestamp ?: 0L }
+        }
+        val groups = store.listGroups().map { g ->
+            val messages = store.messagesForChat(g.id)
+            val unreadCount = ChatListLogic.computeGroupUnread(messages, identity.userId) { senderId ->
+                store.outgoingReceiptThrough(g.id, senderId, RECEIPT_TYPE_READ)
+            }
+            ChatSummary(
+                chatId = g.id,
+                title = g.name,
+                isGroup = true,
+                group = g,
+                lastMessage = ChatListLogic.lastVisibleMessage(messages),
+                unreadCount = unreadCount,
+                ownDeliveredThrough = 0uL,
+                ownReadThrough = 0uL,
+            )
+        }
+        summaries = (direct + groups).sortedByDescending { it.lastMessage?.timestamp ?: 0L }
     }
 
     LaunchedEffect(Unit) {
@@ -215,9 +257,19 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     ChatListScreen(
         ownUserId = identity.userId,
         ownDisplayName = ownDisplayName,
-        onChatClick = { contact -> navController.navigate("chat/${UserIdHex.encode(contact.userId)}") },
-        onDeleteContact = { contact ->
-            store.deleteContact(contact.userId)
+        onChatClick = { summary ->
+            if (summary.isGroup) {
+                navController.navigate("group/${UserIdHex.encode(summary.chatId)}")
+            } else {
+                navController.navigate("chat/${UserIdHex.encode(summary.chatId)}")
+            }
+        },
+        onDeleteSummary = { summary ->
+            if (summary.isGroup) {
+                store.deleteGroup(summary.chatId)
+            } else {
+                store.deleteContact(summary.chatId)
+            }
             reloadSummaries()
         },
         onNewChatClick = { navController.navigate("contacts") },
@@ -349,6 +401,28 @@ private fun ContactsRoute(navController: NavHostController) {
         },
         onAddFriendClick = { navController.navigate("scan") },
         onMyCardClick = { navController.navigate("myQr") },
+        onNewGroupClick = { navController.navigate("newGroup") },
+        onBack = { navController.popBackStack() },
+    )
+}
+
+@Composable
+private fun NewGroupRoute(identity: Identity, navController: NavHostController) {
+    val context = LocalContext.current
+    val store = remember { AppStore.get(context) }
+    val contacts = remember { store.listContacts() }
+    val groupSender = remember { GroupSender(store, identity) }
+
+    NewGroupScreen(
+        contacts = contacts,
+        onCreate = { name, members ->
+            val group = groupSender.createAndInvite(name, members)
+            if (group != null) {
+                navController.navigate("group/${UserIdHex.encode(group.id)}") {
+                    popUpTo("contacts") { inclusive = false }
+                }
+            }
+        },
         onBack = { navController.popBackStack() },
     )
 }
@@ -374,6 +448,47 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             onBack = { navController.popBackStack() },
             onDeleteContact = {
                 store.deleteContact(contact.userId)
+                navController.popBackStack()
+            },
+        )
+    } else {
+        LaunchedEffect(Unit) { navController.popBackStack() }
+    }
+}
+
+@Composable
+private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController: NavHostController) {
+    val context = LocalContext.current
+    val store = remember { AppStore.get(context) }
+    val groupId = remember(groupIdHex) { UserIdHex.decode(groupIdHex) }
+    val group = remember(groupIdHex) { store.getGroup(groupId) }
+    val contactsByUserId = remember {
+        store.listContacts().associateBy { UserIdHex.encode(it.userId) }
+    }
+
+    if (group != null) {
+        DisposableEffect(groupIdHex) {
+            ChatVisibility.setVisible(group.id)
+            // Local read watermarks for every other member (no wire receipts yet).
+            for (memberId in group.memberUserIds) {
+                if (memberId.contentEquals(identity.userId)) continue
+                val through = store.highestContiguousLamport(group.id, memberId)
+                if (through > 0uL) {
+                    store.recordOutgoingReceipt(group.id, memberId, RECEIPT_TYPE_READ, through)
+                }
+            }
+            onDispose { ChatVisibility.clearVisible(group.id) }
+        }
+        val sender = remember { GroupSender(store, identity) }
+        GroupChatScreen(
+            group = group,
+            ownUserId = identity.userId,
+            contactsByUserId = contactsByUserId,
+            sender = sender,
+            store = store,
+            onBack = { navController.popBackStack() },
+            onDeleteGroup = {
+                store.deleteGroup(group.id)
                 navController.popBackStack()
             },
         )

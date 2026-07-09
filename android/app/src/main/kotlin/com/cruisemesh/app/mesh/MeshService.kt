@@ -39,6 +39,7 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.DigestEntry
 import uniffi.cruisemesh_core.Frame
+import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
@@ -47,6 +48,7 @@ import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
+import uniffi.cruisemesh_core.decodeGroupInviteContent
 import uniffi.cruisemesh_core.decodeMessageBody
 import uniffi.cruisemesh_core.decodeReceiptContent
 import uniffi.cruisemesh_core.defaultExpiry
@@ -57,6 +59,7 @@ import uniffi.cruisemesh_core.encodeMessageBody
 import uniffi.cruisemesh_core.encodeReceiptContent
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.generateMsgId
+import uniffi.cruisemesh_core.openGroupMessage
 import uniffi.cruisemesh_core.parseFriendCard
 import uniffi.cruisemesh_core.openMessage
 import uniffi.cruisemesh_core.parseFrame
@@ -70,6 +73,7 @@ private const val NOTIFICATION_ID = 1
 private const val KIND_TEXT: UByte = 1u
 private const val KIND_RECEIPT: UByte = 2u
 private const val KIND_FRIEND_REQUEST: UByte = 3u
+private const val KIND_GROUP_INVITE: UByte = 4u
 
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
@@ -447,8 +451,15 @@ class MeshService : Service() {
     ) {
         val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
         for (envelope in store.pendingRelayOutboundEnvelopes(RELAY_BATCH_LIMIT, now)) {
-            val contact = contactsByUserId[UserIdHex.encode(envelope.recipientUserId)] ?: continue
-            val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
+            // 1:1 / invite envelopes are addressed to a contact userId; group
+            // text uses recipientUserId = group.id and rides the family's
+            // fallback (or any member's) relay config.
+            val contact = contactsByUserId[UserIdHex.encode(envelope.recipientUserId)]
+            val config = if (contact != null) {
+                resolvedRelayConfig(contact, fallbackConfig)
+            } else {
+                relayConfigForGroupRecipient(envelope.recipientUserId, contacts, fallbackConfig)
+            } ?: continue
             try {
                 val relayId = RelayClient.postOutboundEnvelope(config, envelope)
                 store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
@@ -460,6 +471,20 @@ class MeshService : Service() {
                 Log.w(TAG, "Failed to upload outbound envelope to relay ${config.relayUrl}: ${e.message}")
             }
         }
+    }
+
+    private fun relayConfigForGroupRecipient(
+        groupId: ByteArray,
+        contacts: List<Contact>,
+        fallbackConfig: RelayConfig?,
+    ): RelayConfig? {
+        val group = store.getGroup(groupId) ?: return fallbackConfig
+        for (memberId in group.memberUserIds) {
+            val contact = contacts.firstOrNull { it.userId.contentEquals(memberId) } ?: continue
+            val config = resolvedRelayConfig(contact, fallbackConfig)
+            if (config != null) return config
+        }
+        return fallbackConfig
     }
 
     private fun uploadFamilyCarriedEnvelopes(
@@ -514,7 +539,16 @@ class MeshService : Service() {
     private fun relayHintsForConfig(
         ownUserId: ByteArray,
         now: Long,
-    ): List<ByteArray> = recentHintsFor(ownUserId, now)
+    ): List<ByteArray> {
+        val hints = recentHintsFor(ownUserId, now).toMutableList()
+        // Pull group-addressed mail for every group we belong to (DESIGN.md §6.5).
+        for (group in store.listGroups()) {
+            if (group.memberUserIds.any { it.contentEquals(ownUserId) }) {
+                hints += recentHintsFor(group.id, now)
+            }
+        }
+        return hints
+    }
 
     private fun distinctRelayConfigs(contacts: List<Contact>, fallbackConfig: RelayConfig?): List<RelayConfig> =
         buildList {
@@ -534,10 +568,20 @@ class MeshService : Service() {
         return fallbackConfig
     }
 
-    private fun contactMatchingHint(contacts: List<Contact>, hint: ByteArray, now: Long): Contact? =
+    private fun contactMatchingHint(contacts: List<Contact>, hint: ByteArray, now: Long): Contact? {
         contacts.firstOrNull { contact ->
             recentHintsFor(contact.userId, now).any { it.contentEquals(hint) }
+        }?.let { return it }
+        // Group-addressed carries: upload via any member's relay config.
+        for (group in store.listGroups()) {
+            if (!recentHintsFor(group.id, now).any { it.contentEquals(hint) }) continue
+            for (memberId in group.memberUserIds) {
+                val contact = contacts.firstOrNull { it.userId.contentEquals(memberId) }
+                if (contact != null) return contact
+            }
         }
+        return null
+    }
 
     private fun refreshBluetoothAudioBackoff(reason: String) {
         when (a2dpAudioBackoff.update(isA2dpConnected())) {
@@ -727,10 +771,38 @@ class MeshService : Service() {
                     sendStoredOutboundEnvelope(address, outbound)
                 }
             }
+            // Group digests are not on the wire yet (1:1 digest only). At family
+            // scale, re-offer every outbound group envelope we authored for
+            // groups this peer is in; their insert is idempotent.
+            resendGroupOutboundToPeer(address, resolvedPeerUserId, identity)
         }
         sprayCarriedEnvelopesTo(address, resolvedPeerUserId, recentMsgIds)
         if (contact == null) {
             Log.i(TAG, "DIGEST from unrecognized userId=${UserIdHex.encode(resolvedPeerUserId)}; sprayed carry queue only")
+        }
+    }
+
+    /**
+     * Best-effort group catch-up on reconnect: send our sealed group traffic
+     * (and any queued pairwise invites addressed to this peer) for groups the
+     * peer belongs to. Without per-group digests we resend from lamport 0;
+     * duplicates are safe on the receiver.
+     */
+    private fun resendGroupOutboundToPeer(address: String, peerUserId: ByteArray, identity: Identity) {
+        for (group in store.listGroups()) {
+            if (!group.memberUserIds.any { it.contentEquals(peerUserId) }) continue
+            if (!group.memberUserIds.any { it.contentEquals(identity.userId) }) continue
+            val envelopes = store.outboundEnvelopesAfter(group.id, identity.userId, 0uL)
+            for (envelope in envelopes) {
+                // Pairwise invites are only useful to their intended recipient;
+                // group-sealed text has recipientUserId = group.id.
+                if (envelope.kind == KIND_GROUP_INVITE &&
+                    !envelope.recipientUserId.contentEquals(peerUserId)
+                ) {
+                    continue
+                }
+                sendStoredOutboundEnvelope(address, envelope)
+            }
         }
     }
 
@@ -868,6 +940,18 @@ class MeshService : Service() {
         val opened = try {
             openMessage(identity, envelope.sealed)
         } catch (e: CoreException) {
+            // Pairwise open failed: either foreign 1:1 traffic, or a group
+            // envelope sealed with a shared key (DESIGN.md §6.5). Try groups
+            // whose recipient_hint matches before treating it as pure mule
+            // traffic. Group members keep relaying/carrying so absent members
+            // still get a copy (mesh_sim group scenario).
+            val groupOpened = tryOpenGroupMessage(envelope.recipientHint, envelope.sealed)
+            if (groupOpened != null) {
+                deliverOpenedGroupEnvelope(sourceLabel, groupOpened.first, groupOpened.second, identity)
+                relayForeignEnvelope(sourceAddress, envelope)
+                carryForeignEnvelope(envelope, forceFamily = true)
+                return
+            }
             // Not for us (or unopenable) -> foreign traffic. Two jobs, both
             // best-effort (DESIGN.md §5.3): flood it to whoever's connected
             // right now, and carry it so we can hand it to its recipient the
@@ -880,6 +964,28 @@ class MeshService : Service() {
     }
 
     /**
+     * Opens [sealed] with any imported group whose recent-day `recipient_hint`
+     * matches [recipientHint]. Returns the matching [Group] and opened
+     * payload, or null. [openGroupMessage] does not check membership of the
+     * signer; callers must enforce that before trusting the body.
+     */
+    private fun tryOpenGroupMessage(
+        recipientHint: ByteArray,
+        sealed: ByteArray,
+    ): Pair<Group, OpenedMessage>? {
+        val now = System.currentTimeMillis()
+        for (group in store.listGroups()) {
+            if (!recentHintsFor(group.id, now).any { it.contentEquals(recipientHint) }) continue
+            try {
+                return group to openGroupMessage(group, sealed)
+            } catch (_: CoreException) {
+                // Wrong key / corrupt — try the next matching group (rare).
+            }
+        }
+        return null
+    }
+
+    /**
      * Adds a foreign envelope to the persistent carry queue (DESIGN.md §5.3
      * store-and-forward). Classifies it as "family" -- addressed to someone we
      * know -- when its `recipient_hint` matches a contact ([hintMatchesAnyContact]);
@@ -889,10 +995,10 @@ class MeshService : Service() {
      * no-op. Reached only after [handleEnvelope]'s dedupe + expiry gates, so
      * we never carry a stale duplicate or an already-expired envelope.
      */
-    private fun carryForeignEnvelope(envelope: Frame.Envelope) {
+    private fun carryForeignEnvelope(envelope: Frame.Envelope, forceFamily: Boolean = false) {
         val now = System.currentTimeMillis()
         try {
-            val isFamily = hintMatchesAnyContact(envelope.recipientHint, now)
+            val isFamily = forceFamily || hintMatchesKnownTarget(envelope.recipientHint, now)
             val stored = store.enqueueCarriedEnvelope(
                 CarriedEnvelope(
                     msgId = envelope.msgId,
@@ -930,14 +1036,20 @@ class MeshService : Service() {
         val now = System.currentTimeMillis()
         try {
             store.pruneExpiredCarried(now)
-            val hints = recentHintsFor(peerUserId, now)
+            // Peer userId hints plus every group that peer is a member of
+            // (DESIGN.md §6.5: members mule for the whole group).
+            val hints = deliveryHintsForPeer(peerUserId, now)
             val toDeliver = store.carriedEnvelopesForHints(hints, now)
             if (toDeliver.isEmpty()) return
             var delivered = 0
             for (env in toDeliver) {
                 val frame = encodeEnvelopeFrame(env.msgId, env.hopTtl, env.expiry, env.recipientHint, env.sealed)
                 if (MeshRouter.sendToAddress(address, frame)) {
-                    store.removeCarriedEnvelope(env.msgId)
+                    // Keep group carries so we can still mule to other members;
+                    // only drop true 1:1-targeted envelopes once handed over.
+                    if (!recognizesGroupHint(env.recipientHint, now)) {
+                        store.removeCarriedEnvelope(env.msgId)
+                    }
                     delivered++
                 }
             }
@@ -947,10 +1059,33 @@ class MeshService : Service() {
         }
     }
 
-    /** True if [hint] matches any known contact's `recipient_hint` for a recent day (see [recentHintsFor]). */
-    private fun hintMatchesAnyContact(hint: ByteArray, now: Long): Boolean {
+    /**
+     * `recipient_hint`s the peer can open: their own userId over recent days,
+     * plus every imported group they belong to.
+     */
+    private fun deliveryHintsForPeer(peerUserId: ByteArray, now: Long): List<ByteArray> {
+        val hints = recentHintsFor(peerUserId, now).toMutableList()
+        for (group in store.listGroups()) {
+            if (group.memberUserIds.any { it.contentEquals(peerUserId) }) {
+                hints += recentHintsFor(group.id, now)
+            }
+        }
+        return hints
+    }
+
+    /** True if [hint] matches a known contact or imported group (family traffic). */
+    private fun hintMatchesKnownTarget(hint: ByteArray, now: Long): Boolean {
         for (contact in store.listContacts()) {
             if (recentHintsFor(contact.userId, now).any { it.contentEquals(hint) }) {
+                return true
+            }
+        }
+        return recognizesGroupHint(hint, now)
+    }
+
+    private fun recognizesGroupHint(hint: ByteArray, now: Long): Boolean {
+        for (group in store.listGroups()) {
+            if (recentHintsFor(group.id, now).any { it.contentEquals(hint) }) {
                 return true
             }
         }
@@ -1036,7 +1171,157 @@ class MeshService : Service() {
             )
             KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
             KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, opened.senderUserId, body, identity)
+            KIND_GROUP_INVITE -> handleIncomingGroupInvite(address, opened.senderUserId, body, identity)
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
+        }
+    }
+
+    /**
+     * Delivers a group-sealed envelope we opened with an imported group key
+     * (DESIGN.md §6.5). Wire [MessageBody.chatId] is the group id; the
+     * verified signer must be a current member (core does not check this).
+     * Group receipts are deferred — we only store + notify.
+     */
+    private fun deliverOpenedGroupEnvelope(
+        address: String,
+        group: Group,
+        opened: OpenedMessage,
+        identity: Identity,
+    ) {
+        if (!group.memberUserIds.any { it.contentEquals(opened.senderUserId) }) {
+            Log.w(
+                TAG,
+                "Dropping group envelope from $address: signer ${UserIdHex.encode(opened.senderUserId)} " +
+                    "is not a member of group ${group.name}",
+            )
+            return
+        }
+        if (!group.memberUserIds.any { it.contentEquals(identity.userId) }) {
+            Log.w(TAG, "Dropping group envelope from $address: we are not a member of ${group.name}")
+            return
+        }
+
+        val body = try {
+            decodeMessageBody(opened.payload)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping group envelope from $address: failed to decode body (${e.message})")
+            return
+        }
+        if (!body.chatId.contentEquals(group.id)) {
+            Log.w(TAG, "Dropping group envelope from $address: body.chatId does not match group id")
+            return
+        }
+        when (body.kind) {
+            KIND_TEXT -> handleIncomingGroupChatMessage(address, group, opened.senderUserId, body)
+            else -> Log.i(TAG, "Dropping group envelope from $address: unhandled kind=${body.kind}")
+        }
+    }
+
+    private fun handleIncomingGroupChatMessage(
+        address: String,
+        group: Group,
+        senderUserId: ByteArray,
+        body: MessageBody,
+    ) {
+        val inserted = store.insertMessage(
+            StoredMessage(
+                chatId = group.id,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = body.kind,
+                payload = body.content,
+            ),
+        )
+        if (!inserted) {
+            Log.i(
+                TAG,
+                "Ignoring duplicate group kind=${body.kind} from $address " +
+                    "sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
+            )
+            return
+        }
+        Log.i(
+            TAG,
+            "Stored group kind=${body.kind} in ${group.name} from $address " +
+                "sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
+        )
+        ChatEvents.notifyChatChanged(group.id)
+
+        // Local read watermark only (group wire receipts are deferred).
+        val throughLamport = store.highestContiguousLamport(group.id, senderUserId)
+        store.recordOutgoingReceipt(group.id, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
+        val isVisible = ChatVisibility.isVisible(group.id)
+        if (isVisible) {
+            store.recordOutgoingReceipt(group.id, senderUserId, RECEIPT_TYPE_READ, throughLamport)
+        } else {
+            val senderName = store.getContact(senderUserId)?.name
+                ?: UserIdHex.encode(senderUserId).take(8)
+            val preview = body.content.toString(Charsets.UTF_8)
+            MessageNotifier.notifyIncomingGroupMessage(this, group, senderName, preview)
+        }
+    }
+
+    /**
+     * Imports a pairwise-sealed `kind=4` group invite (DESIGN.md §6.5). Wire
+     * `chatId` is the invite sender's userId (1:1 pairwise convention); the
+     * group id/key/members live in the invite content. Local history is stored
+     * under `chat_id = group.id`.
+     */
+    private fun handleIncomingGroupInvite(
+        address: String,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+    ) {
+        val group = try {
+            decodeGroupInviteContent(body.content)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping group invite from $address: failed to decode (${e.message})")
+            return
+        }
+        if (!group.memberUserIds.any { it.contentEquals(identity.userId) }) {
+            Log.w(TAG, "Dropping group invite from $address: we are not listed as a member")
+            return
+        }
+        if (!group.memberUserIds.any { it.contentEquals(senderUserId) }) {
+            Log.w(TAG, "Dropping group invite from $address: sender is not listed as a member")
+            return
+        }
+
+        store.upsertGroup(group)
+        val inserted = store.insertMessage(
+            StoredMessage(
+                chatId = group.id,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_GROUP_INVITE,
+                payload = body.content,
+            ),
+        )
+        if (!inserted) {
+            Log.i(TAG, "Ignoring duplicate group invite for ${group.name} from $address")
+            return
+        }
+        ChatEvents.notifyChatChanged(group.id)
+        Log.i(TAG, "Imported group ${group.name} from invite on $address")
+
+        val contact = store.getContact(senderUserId)
+        if (contact != null) {
+            // 1:1 delivered/read receipts still apply to the pairwise invite
+            // envelope's sender stream — but the invite row lives under the
+            // group chat, so we only ack if we also store something under the
+            // 1:1 chat. Skip wire receipts for invites; the group is what matters.
+        }
+        if (!ChatVisibility.isVisible(group.id)) {
+            val senderName = contact?.name ?: UserIdHex.encode(senderUserId).take(8)
+            MessageNotifier.notifyIncomingGroupMessage(
+                this,
+                group,
+                senderName,
+                "Added you to ${group.name}",
+            )
         }
     }
 
