@@ -19,6 +19,9 @@ enum RelayClient {
     private static let connectTimeout: TimeInterval = 10
     private static let userAgent = "CruiseMeshRelayClient-iOS/0.1"
 
+    /// Overridable for unit tests (URLProtocol / mock sessions).
+    static var urlSession: URLSession = .shared
+
     static func postOutboundEnvelope(config: RelayConfig, envelope: OutboundEnvelope) throws -> Int64 {
         try postEnvelope(
             config: config,
@@ -134,7 +137,7 @@ enum RelayClient {
     private static func syncRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
         let sem = DispatchSemaphore(value: 0)
         var result: Result<(Data, URLResponse), Error>!
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        urlSession.dataTask(with: request) { data, response, error in
             if let error {
                 result = .failure(error)
             } else if let data, let response {

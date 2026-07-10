@@ -13,8 +13,25 @@ SwiftUI + CoreBluetooth shell with **feature parity** to the Android app:
 | Digest sync, receipts, carry queue | ✓ |
 | Internet relay poll/upload | ✓ |
 | Profile, mesh status pill, notifications | ✓ |
+| Contact details (fingerprint / delete) | ✓ |
+| Bluetooth-audio coexistence pause | ✓ (AVAudioSession route; see note) |
 
 Protocol, crypto, and storage live in the shared Rust core (`../core`) via UniFFI.
+
+### Secondary parity notes
+
+- **Contact details** live in `UI/ContactDetailsSheet.swift` (opened from the
+  chat top bar): avatar, safety words for out-of-band verify, delete contact.
+- **Bluetooth audio coexistence:** Android pauses BLE when a Classic A2DP
+  device is *connected* (`A2dpAudioBackoff`). iOS has no public A2DP profile
+  API, so `BluetoothAudioBackoff` + `MeshController` pause BLE roles when
+  `AVAudioSession` reports an active Bluetooth audio route
+  (`.bluetoothA2DP` / `.bluetoothHFP` / `.bluetoothLE`). Relay keeps running.
+  This is intentional platform mapping, not a missing feature.
+- **Unit tests** under `CruiseMeshTests/` mirror Android's pure-logic suite
+  (digest sync, mesh router state, reconnect backoff, chat list, visibility,
+  user-id hex, relay client, Bluetooth-audio backoff, framing, attachments,
+  ticks).
 
 ## Requirements
 
@@ -64,8 +81,9 @@ ios/
     Relay/                    # HTTPS client for relayd
     Notify/                   # local notifications + chat visibility
     UI/                       # SwiftUI screens
-  CruiseMeshTests/            # pure logic unit tests
+  CruiseMeshTests/            # pure-logic unit tests (Android parity suite)
 ```
+
 
 ## Wire conventions (same as Android)
 
