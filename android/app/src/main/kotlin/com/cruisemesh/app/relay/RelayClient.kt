@@ -1,5 +1,6 @@
 package com.cruisemesh.app.relay
 
+import android.net.Network
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import uniffi.cruisemesh_core.CarriedEnvelope
@@ -39,7 +40,7 @@ data class RelayFetchPage(
 object RelayClient {
     private val gson = Gson()
 
-    fun postOutboundEnvelope(config: RelayConfig, envelope: OutboundEnvelope): Long =
+    fun postOutboundEnvelope(config: RelayConfig, envelope: OutboundEnvelope, network: Network? = null): Long =
         postEnvelope(
             config,
             msgId = envelope.msgId,
@@ -47,9 +48,10 @@ object RelayClient {
             recipientHint = envelope.recipientHint,
             sealed = envelope.sealed,
             expiryMs = envelope.expiry,
+            network = network,
         )
 
-    fun postCarriedEnvelope(config: RelayConfig, envelope: CarriedEnvelope): Long =
+    fun postCarriedEnvelope(config: RelayConfig, envelope: CarriedEnvelope, network: Network? = null): Long =
         postEnvelope(
             config,
             msgId = envelope.msgId,
@@ -57,9 +59,10 @@ object RelayClient {
             recipientHint = envelope.recipientHint,
             sealed = envelope.sealed,
             expiryMs = envelope.expiry,
+            network = network,
         )
 
-    fun postReceiptEnvelope(config: RelayConfig, envelope: OutgoingReceiptEnvelope): Long =
+    fun postReceiptEnvelope(config: RelayConfig, envelope: OutgoingReceiptEnvelope, network: Network? = null): Long =
         postEnvelope(
             config,
             msgId = envelope.msgId,
@@ -67,6 +70,7 @@ object RelayClient {
             recipientHint = envelope.recipientHint,
             sealed = envelope.sealed,
             expiryMs = envelope.expiry,
+            network = network,
         )
 
     fun fetchEnvelopes(
@@ -74,10 +78,11 @@ object RelayClient {
         hints: List<ByteArray>,
         afterId: Long,
         limit: Int,
+        network: Network? = null,
     ): RelayFetchPage {
         val encodedHints = hints.joinToString(",") { urlEncode(base64Url(it)) }
         val url = buildUrl(config.relayUrl, "/envelopes?hints=$encodedHints&after=$afterId&limit=$limit")
-        val connection = openConnection(url, "GET", config)
+        val connection = openConnection(url, "GET", config, network)
         return connection.useJsonResponse { body ->
             val response = gson.fromJson(body, GetEnvelopesResponse::class.java)
             RelayFetchPage(
@@ -96,10 +101,10 @@ object RelayClient {
         }
     }
 
-    fun ackEnvelopes(config: RelayConfig, ids: List<Long>) {
+    fun ackEnvelopes(config: RelayConfig, ids: List<Long>, network: Network? = null) {
         if (ids.isEmpty()) return
         val body = gson.toJson(AckRequest(ids))
-        val connection = openConnection(buildUrl(config.relayUrl, "/envelopes/ack"), "POST", config)
+        val connection = openConnection(buildUrl(config.relayUrl, "/envelopes/ack"), "POST", config, network)
         connection.writeJson(body)
         connection.useJsonResponse { }
     }
@@ -111,6 +116,7 @@ object RelayClient {
         recipientHint: ByteArray,
         sealed: ByteArray,
         expiryMs: Long,
+        network: Network?,
     ): Long {
         val body = gson.toJson(
             PostEnvelopeRequest(
@@ -121,13 +127,21 @@ object RelayClient {
                 expiryMs = expiryMs,
             ),
         )
-        val connection = openConnection(buildUrl(config.relayUrl, "/envelopes"), "POST", config)
+        val connection = openConnection(buildUrl(config.relayUrl, "/envelopes"), "POST", config, network)
         connection.writeJson(body)
         return connection.useJsonResponse { gson.fromJson(it, PostEnvelopeResponse::class.java).id }
     }
 
-    private fun openConnection(url: String, method: String, config: RelayConfig): HttpURLConnection {
-        val connection = URL(url).openConnection() as HttpURLConnection
+    /**
+     * Opens an [HttpURLConnection] to the relay. When [network] is non-null the
+     * connection is pinned to that specific [Network] via
+     * [Network.openConnection] instead of the process default. This is what lets
+     * relay sync ride a validated network (e.g. cellular) even while Android
+     * still lists an associated-but-dead Wi‑Fi as the system default network.
+     */
+    private fun openConnection(url: String, method: String, config: RelayConfig, network: Network?): HttpURLConnection {
+        val parsed = URL(url)
+        val connection = (network?.openConnection(parsed) ?: parsed.openConnection()) as HttpURLConnection
         connection.requestMethod = method
         connection.connectTimeout = CONNECT_TIMEOUT_MS
         connection.readTimeout = READ_TIMEOUT_MS

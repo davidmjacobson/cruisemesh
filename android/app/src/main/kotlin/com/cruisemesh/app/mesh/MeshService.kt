@@ -16,6 +16,7 @@ import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -156,6 +157,16 @@ class MeshService : Service() {
     private var bluetoothAudioConnected = false
     private var bluetoothAudioReceiverRegistered = false
     private var relayNetworkCallbackRegistered = false
+    /**
+     * The network relay traffic is pinned to: the best network with validated
+     * internet, as granted by [ConnectivityManager.requestNetwork]. The system
+     * prefers Wi‑Fi when it is validated and hands us cellular the moment Wi‑Fi
+     * stops validating — so this keeps flowing over cellular even while Android
+     * still lists an associated-but-dead Wi‑Fi as the system default network.
+     * `requestNetwork` (not a passive callback) is required so we are actually
+     * permitted to bind sockets to it.
+     */
+    @Volatile private var relayBindNetwork: Network? = null
     @Volatile private var relaySyncInFlight = false
     @Volatile private var relaySyncPending = false
     private val relaySyncLock = Any()
@@ -181,15 +192,23 @@ class MeshService : Service() {
             refreshBluetoothAudioStatus("$action state=$state")
         }
     }
+    // Backs an INTERNET requestNetwork() (VALIDATED is not requestable, only
+    // observable — so we request INTERNET and gate on validation here). The
+    // request grants permission to bind to whatever network it assigns, which
+    // the framework reassigns from a Wi‑Fi that stops validating to cellular.
+    // We only pin traffic to it once it actually reports validated internet.
     private val relayNetworkCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) {
-            requestRelaySync("network available")
+        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+            if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                relayBindNetwork = network
+                requestRelaySync("network validated")
+            } else if (relayBindNetwork == network) {
+                relayBindNetwork = null
+            }
         }
 
-        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-            if (networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
-                requestRelaySync("network validated")
-            }
+        override fun onLost(network: Network) {
+            if (relayBindNetwork == network) relayBindNetwork = null
         }
     }
     private val relayPollRunnable = object : Runnable {
@@ -317,7 +336,15 @@ class MeshService : Service() {
 
     private fun registerRelayNetworkCallback() {
         if (relayNetworkCallbackRegistered) return
-        connectivityManager.registerDefaultNetworkCallback(relayNetworkCallback)
+        // Ask for an internet-capable network rather than watching only the
+        // default. Leaving Wi‑Fi range, Android keeps the dead Wi‑Fi as the
+        // default for a while; requestNetwork instead reassigns us to cellular
+        // once Wi‑Fi stops validating (and grants permission to bind to it).
+        // VALIDATED can't be part of the request, so the callback gates on it.
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        connectivityManager.requestNetwork(request, relayNetworkCallback)
         relayNetworkCallbackRegistered = true
     }
 
@@ -325,6 +352,57 @@ class MeshService : Service() {
         if (!relayNetworkCallbackRegistered) return
         connectivityManager.unregisterNetworkCallback(relayNetworkCallback)
         relayNetworkCallbackRegistered = false
+        relayBindNetwork = null
+    }
+
+    /**
+     * The network to bind relay sockets to, or null to use the process default.
+     *
+     * - Default already validated (normal Wi‑Fi/cellular, or an up VPN tunnel):
+     *   null — the default works, and binding to a network under a VPN is
+     *   forbidden (EPERM) and would bypass the tunnel anyway.
+     * - Default missing/unvalidated with no VPN (associated-but-dead Wi‑Fi):
+     *   the validated network our [requestNetwork] grant found (cellular), so
+     *   relay sync rides it instead of the dead default. This is the fix for
+     *   messages not relaying the moment you leave Wi‑Fi.
+     * - Default is a VPN that is not (yet) validated: null — respect the
+     *   tunnel; we must not bypass it.
+     */
+    private fun relayBindTarget(): Network? {
+        if (isDefaultValidated() || isDefaultVpn()) return null
+        return relayBindNetwork
+    }
+
+    /** True when a usable validated internet path exists for relay traffic. */
+    private fun hasValidatedInternet(): Boolean =
+        isDefaultValidated() || (!isDefaultVpn() && relayBindNetwork != null)
+
+    private fun defaultCaps(): NetworkCapabilities? =
+        connectivityManager.activeNetwork?.let { connectivityManager.getNetworkCapabilities(it) }
+
+    private fun isDefaultValidated(): Boolean {
+        val caps = defaultCaps() ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    /** A VPN owns the app's default route (so we must not bind past it). */
+    private fun isDefaultVpn(): Boolean {
+        val caps = defaultCaps() ?: return false
+        return !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+    }
+
+    /** Short transport label for a network, for relay-sync diagnostics. */
+    private fun networkLabel(network: Network?): String {
+        if (network == null) return "none"
+        val caps = connectivityManager.getNetworkCapabilities(network) ?: return "unknown"
+        return when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+            else -> "other"
+        }
     }
 
     private fun scheduleRelayPolling() {
@@ -334,13 +412,6 @@ class MeshService : Service() {
 
     private fun cancelRelayPolling() {
         relayMainHandler.removeCallbacks(relayPollRunnable)
-    }
-
-    private fun hasValidatedInternet(): Boolean {
-        val active = connectivityManager.activeNetwork ?: return false
-        val capabilities = connectivityManager.getNetworkCapabilities(active) ?: return false
-        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
     private fun requestRelaySync(reason: String) {
@@ -381,17 +452,22 @@ class MeshService : Service() {
         store.pruneExpiredCarried(now)
         val contacts = store.listContacts()
         val fallbackConfig = RelayConfigStore.load(this)
+        // Bind this whole pass to a validated network when the default can't be
+        // trusted (associated-but-dead Wi‑Fi, no VPN); otherwise null = use the
+        // default (normal networks and VPN tunnels route themselves).
+        val network = relayBindTarget()
         backfillRelayOutgoingReceiptEnvelopes(identity, contacts, now)
-        uploadPendingOutgoingReceiptEnvelopes(contacts, fallbackConfig, now)
-        uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now)
-        uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now)
+        uploadPendingOutgoingReceiptEnvelopes(contacts, fallbackConfig, now, network)
+        uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now, network)
+        uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now, network)
 
         val configs = distinctRelayConfigs(contacts, fallbackConfig)
         if (configs.isEmpty()) return
         for (config in configs) {
-            pollRelayMailbox(config, identity, contacts, fallbackConfig, now)
+            pollRelayMailbox(config, identity, contacts, fallbackConfig, now, network)
         }
-        Log.i(TAG, "Relay sync complete: configs=${configs.size} reason=$reason")
+        val netDesc = if (network != null) "${networkLabel(network)}(pinned)" else "${networkLabel(connectivityManager.activeNetwork)}(default)"
+        Log.i(TAG, "Relay sync complete: configs=${configs.size} net=$netDesc reason=$reason")
     }
 
     private fun backfillRelayOutgoingReceiptEnvelopes(
@@ -431,13 +507,14 @@ class MeshService : Service() {
         contacts: List<Contact>,
         fallbackConfig: RelayConfig?,
         now: Long,
+        network: Network?,
     ) {
         val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
         for (envelope in store.pendingRelayOutgoingReceiptEnvelopes(RELAY_BATCH_LIMIT, now)) {
             val contact = contactsByUserId[UserIdHex.encode(envelope.recipientUserId)] ?: continue
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
-                val relayId = RelayClient.postReceiptEnvelope(config, envelope)
+                val relayId = RelayClient.postReceiptEnvelope(config, envelope, network)
                 store.markOutgoingReceiptEnvelopeRelayPosted(envelope.msgId, now)
                 Log.i(
                     TAG,
@@ -453,6 +530,7 @@ class MeshService : Service() {
         contacts: List<Contact>,
         fallbackConfig: RelayConfig?,
         now: Long,
+        network: Network?,
     ) {
         val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
         for (envelope in store.pendingRelayOutboundEnvelopes(RELAY_BATCH_LIMIT, now)) {
@@ -466,7 +544,7 @@ class MeshService : Service() {
                 relayConfigForGroupRecipient(envelope.recipientUserId, contacts, fallbackConfig)
             } ?: continue
             try {
-                val relayId = RelayClient.postOutboundEnvelope(config, envelope)
+                val relayId = RelayClient.postOutboundEnvelope(config, envelope, network)
                 store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
                 Log.i(
                     TAG,
@@ -496,12 +574,13 @@ class MeshService : Service() {
         contacts: List<Contact>,
         fallbackConfig: RelayConfig?,
         now: Long,
+        network: Network?,
     ) {
         for (envelope in store.familyCarriedEnvelopes(RELAY_BATCH_LIMIT, now)) {
             val contact = contactMatchingHint(contacts, envelope.recipientHint, now) ?: continue
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
-                val relayId = RelayClient.postCarriedEnvelope(config, envelope)
+                val relayId = RelayClient.postCarriedEnvelope(config, envelope, network)
                 Log.i(
                     TAG,
                     "Uploaded carried envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
@@ -518,12 +597,13 @@ class MeshService : Service() {
         contacts: List<Contact>,
         fallbackConfig: RelayConfig?,
         now: Long,
+        network: Network?,
     ) {
         val hints = relayHintsForConfig(identity.userId, now)
         if (hints.isEmpty()) return
         var after = 0L
         while (running && hasValidatedInternet()) {
-            val page = RelayClient.fetchEnvelopes(config, hints, after, RELAY_BATCH_LIMIT.toInt())
+            val page = RelayClient.fetchEnvelopes(config, hints, after, RELAY_BATCH_LIMIT.toInt(), network)
             Log.i(
                 TAG,
                 "Fetched ${page.envelopes.size} relay envelope(s) from ${config.relayUrl} after=$after next=${page.nextCursor}",
@@ -535,7 +615,7 @@ class MeshService : Service() {
                 ackIds += envelope.id
             }
             Log.i(TAG, "Acking ${ackIds.size} relay envelope(s) on ${config.relayUrl}: $ackIds")
-            RelayClient.ackEnvelopes(config, ackIds)
+            RelayClient.ackEnvelopes(config, ackIds, network)
             after = page.nextCursor
             if (page.envelopes.size < RELAY_BATCH_LIMIT.toInt()) return
         }

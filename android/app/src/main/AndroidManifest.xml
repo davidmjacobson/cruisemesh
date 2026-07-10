@@ -19,6 +19,9 @@
     <!-- Internet relay flush (DESIGN.md §9), best-effort only -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Lets relay sync request and bind to a validated network (e.g. cellular)
+         instead of the system default, so it keeps working when leaving Wi-Fi. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <!-- Keeps mesh sync alive while backgrounded -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
