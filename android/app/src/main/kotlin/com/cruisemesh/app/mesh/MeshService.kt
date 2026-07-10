@@ -153,7 +153,7 @@ class MeshService : Service() {
     private lateinit var store: MessageStore
     private var running = false
     private var meshRolesRunning = false
-    private var pausedForBluetoothAudio = false
+    private var bluetoothAudioConnected = false
     private var bluetoothAudioReceiverRegistered = false
     private var relayNetworkCallbackRegistered = false
     @Volatile private var relaySyncInFlight = false
@@ -178,7 +178,7 @@ class MeshService : Service() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val action = intent?.action ?: return
             val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)
-            refreshBluetoothAudioBackoff("$action state=$state")
+            refreshBluetoothAudioStatus("$action state=$state")
         }
     }
     private val relayNetworkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -212,11 +212,7 @@ class MeshService : Service() {
             // roles (see BlePeripheral.start's idempotence note; this guard
             // makes that one redundant in the normal path but both stay, as
             // defense-in-depth).
-            if (pausedForBluetoothAudio) {
-                MeshRuntimeStatus.markPausedForBluetoothAudio()
-            } else {
-                MeshRuntimeStatus.markActive()
-            }
+            MeshRuntimeStatus.markActive()
             Log.i(TAG, "onStartCommand: mesh already running; ignoring")
             return START_STICKY
         }
@@ -252,7 +248,16 @@ class MeshService : Service() {
         registerBluetoothAudioReceiver()
         registerRelayNetworkCallback()
         scheduleRelayPolling()
-        refreshBluetoothAudioBackoff("service start")
+        // The mesh runs regardless of Bluetooth audio now (see
+        // refreshBluetoothAudioStatus); start the roles unconditionally rather
+        // than gating them on an audio-clear check.
+        startMeshRoles()
+        // Mesh is up. The old A2DP-gated path used to flip STARTING->ACTIVE from
+        // inside the backoff's ACTIVE branch; now that roles start
+        // unconditionally, mark it active here or the status pill sticks on
+        // "Mesh starting…" forever.
+        MeshRuntimeStatus.markActive()
+        refreshBluetoothAudioStatus("service start")
         requestRelaySync("service start")
         return START_STICKY
     }
@@ -583,23 +588,37 @@ class MeshService : Service() {
         return null
     }
 
-    private fun refreshBluetoothAudioBackoff(reason: String) {
-        when (a2dpAudioBackoff.update(isA2dpConnected())) {
-            A2dpAudioBackoff.Mode.ACTIVE -> {
-                pausedForBluetoothAudio = false
-                MeshRuntimeStatus.markActive()
-                Log.i(TAG, "Bluetooth audio clear; resuming BLE mesh ($reason)")
-                startMeshRoles()
-            }
-            A2dpAudioBackoff.Mode.PAUSED_FOR_A2DP -> {
-                pausedForBluetoothAudio = true
-                MeshRuntimeStatus.markPausedForBluetoothAudio()
-                Log.i(TAG, "Bluetooth A2DP connected; pausing BLE mesh to protect audio ($reason)")
-                stopMeshRoles()
-                refreshForegroundNotification()
-            }
-            null -> Unit
+    /**
+     * Reacts to Bluetooth (A2DP) audio connect/disconnect. Policy as of
+     * 2026-07-09 (was: pause both BLE roles entirely while audio is connected):
+     * the mesh now stays up regardless, because pausing it silently killed all
+     * messaging whenever earbuds were connected -- an unacceptable trade for a
+     * messaging app -- and the relaxed low-power scan/advertise interval plus
+     * the BALANCED connection priority (see BleCentral/BlePeripheral) are the
+     * actual coexistence mitigation for audio stutter. A2DP state now only
+     * drives an informational indicator (foreground notification + in-app
+     * banner) so a user knows audio and the mesh are sharing the radio.
+     *
+     * [A2dpAudioBackoff] is reused purely as a connect/disconnect transition
+     * detector here; its Mode names predate this policy change.
+     */
+    private fun refreshBluetoothAudioStatus(reason: String) {
+        val connected = when (a2dpAudioBackoff.update(isA2dpConnected())) {
+            A2dpAudioBackoff.Mode.ACTIVE -> false
+            A2dpAudioBackoff.Mode.PAUSED_FOR_A2DP -> true
+            null -> return
         }
+        bluetoothAudioConnected = connected
+        MeshRuntimeStatus.setBluetoothAudioConnected(connected)
+        Log.i(
+            TAG,
+            if (connected) {
+                "Bluetooth audio connected; keeping mesh running ($reason)"
+            } else {
+                "Bluetooth audio disconnected ($reason)"
+            },
+        )
+        refreshForegroundNotification()
     }
 
     private fun isA2dpConnected(): Boolean {
@@ -1821,8 +1840,8 @@ class MeshService : Service() {
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("CruiseMesh")
             .setContentText(
-                if (pausedForBluetoothAudio) {
-                    "Paused while Bluetooth audio is connected"
+                if (bluetoothAudioConnected) {
+                    "Relaying messages nearby (Bluetooth audio also connected)"
                 } else {
                     "Relaying messages nearby"
                 },

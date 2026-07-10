@@ -173,12 +173,14 @@ class BlePeripheral(
 
         advertiser = btAdapter.bluetoothLeAdvertiser
         val settings = AdvertiseSettings.Builder()
-            // LOW_POWER (was BALANCED): a longer advertising interval so we
-            // broadcast less often and leave more radio airtime for Bluetooth
-            // audio (HANDOFF: BLE coexistence blocker). TX power stays MEDIUM --
-            // that governs range, which matters for ship-scale mesh, and it's
+            // BALANCED (restored from LOW_POWER 2026-07-10): the longer LOW_POWER
+            // advertising interval made this peer hard for a central to catch for
+            // a direct connect (status=133 churn / slow first connect). The mesh
+            // no longer pauses for Bluetooth audio, so favor a faster, more
+            // catchable advertisement -- re-verify earbud audio doesn't stutter.
+            // TX power stays MEDIUM -- that governs range (ship-scale mesh); it's
             // the advertising *interval* (the mode) that drives coexistence.
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
             .setConnectable(true)
             .build()
@@ -216,7 +218,10 @@ class BlePeripheral(
         connectedDevices.values.forEach { device ->
             val payloadSize = (negotiatedMtu[device.address] ?: FrameFraming.DEFAULT_ATT_MTU) -
                 FrameFraming.ATT_HEADER_OVERHEAD
-            val fragments = FrameFraming.fragment(frame, payloadSize)
+            val fragments = FrameFraming.fragmentOrNull(frame, payloadSize) ?: run {
+                Log.w(TAG, "notifyFrame: dropping ${frame.size}-byte frame for ${device.address} -- too large to fragment")
+                return@forEach
+            }
             notifyQueues.getOrPut(device.address) { ArrayDeque() }.addAll(fragments)
             sendNextQueuedFragment(device)
         }
@@ -237,7 +242,10 @@ class BlePeripheral(
         }
         val payloadSize = (negotiatedMtu[deviceAddress] ?: FrameFraming.DEFAULT_ATT_MTU) -
             FrameFraming.ATT_HEADER_OVERHEAD
-        val fragments = FrameFraming.fragment(frame, payloadSize)
+        val fragments = FrameFraming.fragmentOrNull(frame, payloadSize) ?: run {
+            Log.w(TAG, "sendFrame: dropping ${frame.size}-byte frame for $deviceAddress -- too large to fragment")
+            return
+        }
         notifyQueues.getOrPut(deviceAddress) { ArrayDeque() }.addAll(fragments)
         Log.i(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
         sendNextQueuedFragment(device)
@@ -250,7 +258,18 @@ class BlePeripheral(
         val characteristic = outboundCharacteristic ?: return
         val server = gattServer ?: return
         characteristic.value = fragment
-        if (server.notifyCharacteristicChanged(device, characteristic, false)) {
+        // notifyCharacteristicChanged throws IllegalArgumentException on an
+        // oversized value; letting that unwind here would abandon the GATT
+        // callback it runs on (e.g. a central never gets its write response and
+        // the link times out). FrameFraming keeps fragments within the ATT cap,
+        // so this guard is belt-and-suspenders against any future bad fragment.
+        val notified = try {
+            server.notifyCharacteristicChanged(device, characteristic, false)
+        } catch (e: Exception) {
+            Log.w(TAG, "sendNextQueuedFragment: notify threw for $address (${e.message}); dropping fragment")
+            false
+        }
+        if (notified) {
             notifyInFlight += address
         } else {
             Log.w(TAG, "sendNextQueuedFragment: notifyCharacteristicChanged rejected for $address")

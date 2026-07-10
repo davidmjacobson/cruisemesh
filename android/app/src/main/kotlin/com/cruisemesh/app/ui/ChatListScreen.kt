@@ -90,6 +90,8 @@ fun ChatListScreen(
     onProfileClick: () -> Unit,
     onMeshStatusClick: () -> Unit,
     meshStatusText: String,
+    connectivityWarning: String? = null,
+    onConnectivityWarningClick: () -> Unit = {},
     summaries: List<ChatSummary>
 ) {
     Scaffold(
@@ -134,6 +136,13 @@ fun ChatListScreen(
         }
     ) { innerPadding ->
         Column(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
+            if (connectivityWarning != null) {
+                ConnectivityWarningBanner(
+                    text = connectivityWarning,
+                    onClick = onConnectivityWarningClick,
+                )
+            }
+
             MeshStatusPill(
                 text = meshStatusText,
                 onClick = onMeshStatusClick,

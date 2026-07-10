@@ -54,6 +54,7 @@ import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.OnboardingStore
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
+import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.mesh.ChatViewEvents
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
@@ -193,11 +194,23 @@ private fun OnboardingRoute(identity: Identity, onComplete: () -> Unit) {
             avatarPath = ProfilePhotoStore.saveFromUri(context, uri) ?: avatarPath
         }
     }
+    var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
     val takePhotoLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.TakePicturePreview(),
-    ) { bitmap ->
-        if (bitmap != null) {
-            avatarPath = ProfilePhotoStore.saveFromBitmap(context, bitmap) ?: avatarPath
+        ActivityResultContracts.TakePicture(),
+    ) { success ->
+        val uri = pendingCameraUri
+        pendingCameraUri = null
+        if (success && uri != null) {
+            avatarPath = ProfilePhotoStore.saveFromUri(context, uri) ?: avatarPath
+        }
+    }
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            val uri = createCameraCaptureUri(context)
+            pendingCameraUri = uri
+            takePhotoLauncher.launch(uri)
         }
     }
 
@@ -212,7 +225,17 @@ private fun OnboardingRoute(identity: Identity, onComplete: () -> Unit) {
             displayName = it
             ProfileStore.saveDisplayName(context, it)
         },
-        onTakePhoto = { takePhotoLauncher.launch(null) },
+        onTakePhoto = {
+            val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                val uri = createCameraCaptureUri(context)
+                pendingCameraUri = uri
+                takePhotoLauncher.launch(uri)
+            } else {
+                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            }
+        },
         onChoosePhoto = {
             pickPhotoLauncher.launch(
                 PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
@@ -248,14 +271,30 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val context = LocalContext.current
     val store = remember { AppStore.get(context) }
     val runtimeStatus by MeshRuntimeStatus.state.collectAsState()
+    val bluetoothAudioConnected by MeshRuntimeStatus.bluetoothAudioConnected.collectAsState()
     var transientMeshStatus by remember { mutableStateOf<String?>(null) }
     var ownDisplayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     var ownAvatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
-    
-    val hasPermissions = remember(context) {
+
+    var permissionRefreshToken by remember { mutableStateOf(0) }
+    val hasPermissions = remember(context, permissionRefreshToken) {
         hasMeshPermissions(context)
     }
-    
+    var bluetoothEnabled by remember { mutableStateOf(isBluetoothRadioEnabled(context)) }
+
+    DisposableEffect(context) {
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(receiverContext: Context, intent: Intent) {
+                bluetoothEnabled = isBluetoothRadioEnabled(context)
+            }
+        }
+        context.registerReceiver(
+            receiver,
+            android.content.IntentFilter(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED),
+        )
+        onDispose { context.unregisterReceiver(receiver) }
+    }
+
     val batteryOptimizationLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) {
@@ -265,6 +304,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { grants ->
+        permissionRefreshToken += 1
         if (grants.values.all { it }) {
             if (isIgnoringBatteryOptimizations(context)) {
                 startMesh(context)
@@ -343,6 +383,8 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             if (dest.route == "home") {
                 ownDisplayName = ProfileStore.loadDisplayName(context)
                 ownAvatarPath = ProfilePhotoStore.loadAvatarPath(context)
+                permissionRefreshToken += 1
+                bluetoothEnabled = isBluetoothRadioEnabled(context)
                 reloadSummaries()
             }
         }
@@ -379,6 +421,19 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             }
         },
         meshStatusText = transientMeshStatus ?: runtimeStatus.label,
+        connectivityWarning = when {
+            !hasPermissions -> "Nearby permissions needed — tap to enable sending and receiving"
+            !bluetoothEnabled -> "Bluetooth is off. It's needed to send and receive messages nearby."
+            bluetoothAudioConnected -> "Bluetooth audio connected — mesh still running, watch for audio glitches"
+            else -> null
+        },
+        onConnectivityWarningClick = {
+            if (!hasPermissions) {
+                permissionLauncher.launch(MeshService.requiredPermissions())
+            } else if (!bluetoothEnabled) {
+                context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+            }
+        },
         summaries = summaries
     )
 }
@@ -608,6 +663,17 @@ private fun hasMeshPermissions(context: Context): Boolean =
     MeshService.requiredPermissions().all {
         ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
     }
+
+private fun isBluetoothRadioEnabled(context: Context): Boolean {
+    val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
+    val adapter = manager?.adapter ?: return false
+    return try {
+        adapter.isEnabled
+    } catch (_: SecurityException) {
+        // BLUETOOTH_CONNECT isn't granted yet; the permissions banner already covers this case.
+        true
+    }
+}
 
 private fun isIgnoringBatteryOptimizations(context: Context): Boolean {
     val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
