@@ -90,7 +90,7 @@ fun ChatListScreen(
     onProfileClick: () -> Unit,
     onMeshStatusClick: () -> Unit,
     meshStatusText: String,
-    connectivityWarning: String? = null,
+    connectivityWarning: ConnectivityWarning? = null,
     onConnectivityWarningClick: () -> Unit = {},
     summaries: List<ChatSummary>
 ) {
@@ -138,7 +138,7 @@ fun ChatListScreen(
         Column(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
             if (connectivityWarning != null) {
                 ConnectivityWarningBanner(
-                    text = connectivityWarning,
+                    warning = connectivityWarning,
                     onClick = onConnectivityWarningClick,
                 )
             }
@@ -347,6 +347,11 @@ private fun ChatListScreenEmptyPreview() {
             onProfileClick = {},
             onMeshStatusClick = {},
             meshStatusText = "Mesh off",
+            connectivityWarning = ConnectivityWarning(
+                title = "Permissions required — mesh is off",
+                body = "Without Nearby devices access, CruiseMesh cannot send or receive messages.",
+                actionLabel = "Enable permissions",
+            ),
             summaries = emptyList()
         )
     }

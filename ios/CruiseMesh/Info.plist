@@ -23,15 +23,17 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>CruiseMesh uses Bluetooth to message nearby friends without internet.</string>
+	<string>CruiseMesh needs Bluetooth to scan, connect, send, and receive messages nearby. Without it, the mesh cannot work as designed.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
-	<string>CruiseMesh advertises so friends can find you on the mesh.</string>
+	<string>CruiseMesh needs Bluetooth advertising so friends can find you on the mesh. Without it, the mesh cannot work as designed.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Take a photo to send in chat, or scan a friend QR code.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Record a short voice memo to send in chat.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Choose a photo from your library to send in chat.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Save a photo from a chat message to your photo library.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>

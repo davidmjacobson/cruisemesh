@@ -48,6 +48,10 @@ import com.cruisemesh.app.chat.RealMeshSender
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.friending.ContactsScreen
 import com.cruisemesh.app.friending.FriendRequestSender
+import com.cruisemesh.app.ui.ConnectivityWarning
+import com.cruisemesh.app.ui.ConnectivityWarningSeverity
+import android.widget.Toast
+import androidx.core.app.ActivityCompat
 import com.cruisemesh.app.friending.MyQrScreen
 import com.cruisemesh.app.friending.ScanScreen
 import com.cruisemesh.app.identity.IdentityStore
@@ -180,8 +184,29 @@ private fun OnboardingRoute(identity: Identity, onComplete: () -> Unit) {
     }
     val meshPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
-    ) {
+    ) { grants ->
         permissionRefreshToken += 1
+        if (!grants.values.all { it }) {
+            val activity = context as? ComponentActivity
+            val permanentlyDenied = activity != null && MeshService.requiredPermissions().any { perm ->
+                grants[perm] == false &&
+                    !ActivityCompat.shouldShowRequestPermissionRationale(activity, perm)
+            }
+            if (permanentlyDenied) {
+                Toast.makeText(
+                    context,
+                    "Enable Nearby devices (and notifications) in App permissions — without them the mesh cannot run",
+                    Toast.LENGTH_LONG,
+                ).show()
+                openAppPermissionSettings(context)
+            } else {
+                Toast.makeText(
+                    context,
+                    "Nearby permissions are required for CruiseMesh to send and receive messages",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
     }
     val batteryOptimizationLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -283,6 +308,20 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     }
     var bluetoothEnabled by remember { mutableStateOf(isBluetoothRadioEnabled(context)) }
 
+    // Re-check after App info / system dialogs so the blocking banner clears
+    // as soon as the user grants access without restarting the app.
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                permissionRefreshToken += 1
+                bluetoothEnabled = isBluetoothRadioEnabled(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     DisposableEffect(context) {
         val receiver = object : android.content.BroadcastReceiver() {
             override fun onReceive(receiverContext: Context, intent: Intent) {
@@ -302,6 +341,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         startMesh(context)
     }
 
+    val activity = context as? ComponentActivity
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { grants ->
@@ -314,7 +354,21 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 batteryOptimizationLauncher.launch(batteryOptimizationIntent(context))
             }
         } else {
-            transientMeshStatus = "BLE permissions denied"
+            transientMeshStatus = "Permissions denied — mesh cannot run"
+            // If the system will not show the dialog again, send the user to
+            // App info so they can flip Nearby / Notifications manually.
+            val permanentlyDenied = activity != null && MeshService.requiredPermissions().any { perm ->
+                grants[perm] == false &&
+                    !ActivityCompat.shouldShowRequestPermissionRationale(activity, perm)
+            }
+            if (permanentlyDenied) {
+                Toast.makeText(
+                    context,
+                    "Enable Nearby devices (and notifications) in App permissions",
+                    Toast.LENGTH_LONG,
+                ).show()
+                openAppPermissionSettings(context)
+            }
         }
     }
 
@@ -423,16 +477,32 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         },
         meshStatusText = transientMeshStatus ?: runtimeStatus.label,
         connectivityWarning = when {
-            !hasPermissions -> "Nearby permissions needed — tap to enable sending and receiving"
-            !bluetoothEnabled -> "Bluetooth is off. It's needed to send and receive messages nearby."
-            bluetoothAudioConnected -> "Bluetooth audio connected — mesh still running, watch for audio glitches"
+            !hasPermissions -> ConnectivityWarning(
+                title = "Permissions required — mesh is off",
+                body = "Without Nearby devices (and notification) access, CruiseMesh cannot scan, connect, send, or receive messages. The app will not work as designed until you grant them.",
+                actionLabel = "Enable permissions",
+                severity = ConnectivityWarningSeverity.Blocking,
+            )
+            !bluetoothEnabled -> ConnectivityWarning(
+                title = "Bluetooth is off",
+                body = "CruiseMesh needs Bluetooth on to find nearby phones and deliver messages. Turn it on to use the mesh.",
+                actionLabel = "Open Bluetooth settings",
+                severity = ConnectivityWarningSeverity.Blocking,
+            )
+            bluetoothAudioConnected -> ConnectivityWarning(
+                title = "Bluetooth audio connected",
+                body = "The mesh is still running, but wireless earbuds/speakers can slow nearby delivery. Watch for glitches.",
+                actionLabel = "Got it",
+                severity = ConnectivityWarningSeverity.Caution,
+            )
             else -> null
         },
         onConnectivityWarningClick = {
-            if (!hasPermissions) {
-                permissionLauncher.launch(MeshService.requiredPermissions())
-            } else if (!bluetoothEnabled) {
-                context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+            when {
+                !hasPermissions -> permissionLauncher.launch(MeshService.requiredPermissions())
+                !bluetoothEnabled -> context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                // Caution banners are dismiss-by-action only (no state to clear);
+                // tapping still re-reads nothing harmful.
             }
         },
         summaries = summaries
@@ -470,7 +540,20 @@ private fun ProfileRoute(identity: Identity, navController: NavHostController) {
                 batteryOptimizationLauncher.launch(batteryOptimizationIntent(context))
             }
         } else {
-            transientMeshStatus = "BLE permissions denied"
+            transientMeshStatus = "Permissions denied — mesh cannot run"
+            val activity = context as? ComponentActivity
+            val permanentlyDenied = activity != null && MeshService.requiredPermissions().any { perm ->
+                grants[perm] == false &&
+                    !ActivityCompat.shouldShowRequestPermissionRationale(activity, perm)
+            }
+            if (permanentlyDenied) {
+                Toast.makeText(
+                    context,
+                    "Enable Nearby devices (and notifications) in App permissions",
+                    Toast.LENGTH_LONG,
+                ).show()
+                openAppPermissionSettings(context)
+            }
         }
     }
 
@@ -665,6 +748,14 @@ private fun hasMeshPermissions(context: Context): Boolean =
     MeshService.requiredPermissions().all {
         ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
     }
+
+private fun openAppPermissionSettings(context: Context) {
+    val intent = Intent(
+        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+        Uri.fromParts("package", context.packageName, null),
+    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    context.startActivity(intent)
+}
 
 private fun isBluetoothRadioEnabled(context: Context): Boolean {
     val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager

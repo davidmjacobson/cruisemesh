@@ -32,41 +32,50 @@ struct ChatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(visible.enumerated()), id: \.offset) { index, message in
-                            if isNewDay(index) {
-                                Text(dayLabel(message.timestamp))
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 6)
+            // Bottom-anchor the thread so a new/short chat keeps the latest
+            // bubble just above the composer (and keyboard), matching Android.
+            GeometryReader { geo in
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(visible.enumerated()), id: \.offset) { index, message in
+                                if isNewDay(index) {
+                                    Text(dayLabel(message.timestamp))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 6)
+                                }
+                                MessageBubbleView(
+                                    message: message,
+                                    isOwn: message.senderUserId == identity.userId,
+                                    tick: message.senderUserId == identity.userId
+                                        ? tickStatusFor(
+                                            lamport: message.lamport,
+                                            deliveredThrough: deliveredThrough,
+                                            readThrough: readThrough
+                                        )
+                                        : nil,
+                                    contactColor: ChatListLogic.avatarHueAndInitials(
+                                        userId: contact.userId,
+                                        name: contact.name,
+                                        displayId: formatUserId(userId: contact.userId)
+                                    ).0,
+                                    onStatus: { statusMessage = $0 }
+                                )
+                                .id(message.lamport)
                             }
-                            MessageBubbleView(
-                                message: message,
-                                isOwn: message.senderUserId == identity.userId,
-                                tick: message.senderUserId == identity.userId
-                                    ? tickStatusFor(
-                                        lamport: message.lamport,
-                                        deliveredThrough: deliveredThrough,
-                                        readThrough: readThrough
-                                    )
-                                    : nil,
-                                contactColor: ChatListLogic.avatarHueAndInitials(
-                                    userId: contact.userId,
-                                    name: contact.name,
-                                    displayId: formatUserId(userId: contact.userId)
-                                ).0
-                            )
-                            .id(message.lamport)
                         }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .frame(minHeight: geo.size.height, alignment: .bottom)
                     }
-                    .padding(.horizontal, 12)
-                }
-                .onChange(of: visible.count) { _ in
-                    if let last = visible.last {
-                        withAnimation { proxy.scrollTo(last.lamport, anchor: .bottom) }
+                    .scrollDismissesKeyboard(.interactively)
+                    .onChange(of: visible.count) { _ in
+                        scrollToLatest(proxy: proxy)
+                    }
+                    .onAppear {
+                        scrollToLatest(proxy: proxy, animated: false)
                     }
                 }
             }
@@ -101,6 +110,7 @@ struct ChatView: View {
                 .buttonStyle(.borderedProminent)
             }
             .padding(12)
+            .background(.bar)
         }
         .navigationTitle(ChatListLogic.displayNameOrId(
             name: contact.name,
@@ -301,6 +311,15 @@ struct ChatView: View {
         f.locale = Locale(identifier: "en_US")
         return f.string(from: Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000))
     }
+
+    private func scrollToLatest(proxy: ScrollViewProxy, animated: Bool = true) {
+        guard let last = visible.last else { return }
+        if animated {
+            withAnimation { proxy.scrollTo(last.lamport, anchor: .bottom) }
+        } else {
+            proxy.scrollTo(last.lamport, anchor: .bottom)
+        }
+    }
 }
 
 private struct MessageBubbleView: View {
@@ -308,6 +327,7 @@ private struct MessageBubbleView: View {
     let isOwn: Bool
     let tick: TickStatus?
     let contactColor: Color
+    var onStatus: (String) -> Void = { _ in }
     @State private var showLegend = false
 
     var body: some View {
@@ -353,15 +373,7 @@ private struct MessageBubbleView: View {
             if let attachment = AttachmentPayload.decode(message.payload) {
                 switch attachment.mediaType {
                 case .image:
-                    if let ui = UIImage(data: attachment.blob) {
-                        Image(uiImage: ui)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(maxHeight: 240)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                    } else {
-                        Text("Photo (could not display)")
-                    }
+                    ChatImageView(jpeg: attachment.blob, onStatus: onStatus)
                 case .audio:
                     VoiceMemoPlayerView(blob: attachment.blob, durationMs: attachment.durationMs)
                 }
@@ -381,6 +393,41 @@ private struct MessageBubbleView: View {
         f.dateFormat = "h:mm a"
         f.locale = Locale(identifier: "en_US")
         return f.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000))
+    }
+}
+
+/// Chat photo: keeps native aspect ratio and offers Save via long-press.
+private struct ChatImageView: View {
+    let jpeg: Data
+    var onStatus: (String) -> Void = { _ in }
+
+    var body: some View {
+        if let ui = UIImage(data: jpeg) {
+            Image(uiImage: ui)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: 280, maxHeight: 360)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .contextMenu {
+                    Button {
+                        ImageGallery.saveJpeg(jpeg) { result in
+                            switch result {
+                            case .saved:
+                                onStatus("Saved to Photos")
+                            case .denied:
+                                onStatus("Photo Library access is required to save images. Enable it in Settings.")
+                            case .failed(let message):
+                                onStatus(message)
+                            }
+                        }
+                    } label: {
+                        Label("Save image", systemImage: "square.and.arrow.down")
+                    }
+                }
+                .accessibilityHint("Long-press for save options")
+        } else {
+            Text("Photo (could not display)")
+        }
     }
 }
 

@@ -16,6 +16,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -37,6 +38,8 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -65,6 +68,7 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -74,6 +78,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.media.AttachmentPayload
+import com.cruisemesh.app.media.ImageGallery
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import com.cruisemesh.app.media.MediaCompressor
 import com.cruisemesh.app.media.VoiceRecorder
@@ -114,7 +119,8 @@ private const val MIN_VOICE_MS = 500L
 /**
  * A single 1:1 chat thread (DESIGN.md §7.1: for a 1:1 chat, `chat_id` is
  * simply the peer's UserID). Renders visible chat kinds (text + attachment
- * manifests) oldest-first, auto-scrolled to the newest, with the local user's
+ * manifests) in a bottom-anchored list (newest just above the composer /
+ * keyboard via [LazyColumn] `reverseLayout`), with the local user's
  * bubbles right-aligned and the contact's left-aligned (compared via
  * [ByteArray.contentEquals] against `ownUserId`, since
  * [StoredMessage.senderUserId] is raw bytes).
@@ -375,10 +381,14 @@ private fun ConversationScreen(
     }
     var showContactDetails by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    // Newest-first for reverseLayout LazyColumn: index 0 sits at the bottom
+    // edge (just above the composer / keyboard), empty space stays above.
+    val displayMessages = remember(visibleMessages) { visibleMessages.asReversed() }
 
     LaunchedEffect(visibleMessages.size) {
         if (visibleMessages.isNotEmpty()) {
-            listState.animateScrollToItem(visibleMessages.size - 1)
+            // reverseLayout start is the bottom; pin the newest message there.
+            listState.scrollToItem(0)
         }
     }
 
@@ -404,15 +414,18 @@ private fun ConversationScreen(
         ) {
             LazyColumn(
                 state = listState,
+                reverseLayout = true,
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
                     .padding(vertical = 8.dp),
             ) {
                 itemsIndexed(
-                    visibleMessages,
+                    displayMessages,
                     key = { _, message -> "${message.senderUserId.contentHashCode()}:${message.lamport}" },
-                ) { index, message ->
+                ) { revIndex, message ->
+                    // Map back to oldest-first index for gap / day / grouping logic.
+                    val index = visibleMessages.lastIndex - revIndex
                     val isOwn = message.senderUserId.contentEquals(ownUserId)
 
                     if (isNewDay(visibleMessages, index)) {
@@ -919,21 +932,7 @@ private fun AttachmentBubbleContent(
 ) {
     when (attachment.mediaType) {
         AttachmentPayload.MediaType.IMAGE -> {
-            val bitmap = remember(attachment.blob) {
-                BitmapFactory.decodeByteArray(attachment.blob, 0, attachment.blob.size)?.asImageBitmap()
-            }
-            if (bitmap != null) {
-                Image(
-                    bitmap = bitmap,
-                    contentDescription = "Photo",
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 240.dp),
-                )
-            } else {
-                Text("Photo (could not display)")
-            }
+            ChatImageAttachment(jpeg = attachment.blob)
             if (attachment.caption.isNotBlank()) {
                 Text(
                     text = attachment.caption,
@@ -951,6 +950,70 @@ private fun AttachmentBubbleContent(
                 Text(
                     text = attachment.caption,
                     modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Renders a chat photo at its native aspect ratio (no center-crop), capped to
+ * the bubble width and a reasonable max height. Tap opens a small menu so the
+ * user can save the JPEG into Pictures/CruiseMesh.
+ */
+@Composable
+private fun ChatImageAttachment(jpeg: ByteArray) {
+    val context = LocalContext.current
+    val decoded = remember(jpeg) {
+        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+    }
+    val imageBitmap = remember(decoded) { decoded?.asImageBitmap() }
+    var menuOpen by remember { mutableStateOf(false) }
+
+    if (decoded == null || imageBitmap == null) {
+        Text("Photo (could not display)")
+        return
+    }
+
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        val density = LocalDensity.current
+        val maxWidthPx = with(density) { maxWidth.toPx() }
+        val maxHeightPx = with(density) { 360.dp.toPx() }
+        val (widthPx, heightPx) = remember(decoded.width, decoded.height, maxWidthPx, maxHeightPx) {
+            ImageGallery.fitSize(decoded.width, decoded.height, maxWidthPx, maxHeightPx)
+        }
+        val widthDp = with(density) { widthPx.toDp() }
+        val heightDp = with(density) { heightPx.toDp() }
+
+        Box {
+            Image(
+                bitmap = imageBitmap,
+                contentDescription = "Photo — tap for options",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .size(widthDp, heightDp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { menuOpen = true },
+            )
+            DropdownMenu(
+                expanded = menuOpen,
+                onDismissRequest = { menuOpen = false },
+            ) {
+                DropdownMenuItem(
+                    text = { Text("Save image") },
+                    onClick = {
+                        menuOpen = false
+                        val uri = ImageGallery.saveJpeg(context, jpeg)
+                        Toast.makeText(
+                            context,
+                            if (uri != null) {
+                                "Saved to Pictures/CruiseMesh"
+                            } else {
+                                "Could not save image"
+                            },
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    },
                 )
             }
         }

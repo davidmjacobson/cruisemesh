@@ -23,12 +23,41 @@ enum ChatRoute: Hashable {
 struct ChatListView: View {
     let identity: Identity
     @ObservedObject var appModel: AppModel
+    @ObservedObject private var bluetooth = BluetoothAccess.shared
     @State private var summaries: [ChatSummary] = []
     @State private var showFriends = false
     @State private var showProfile = false
     @State private var showNewGroup = false
     @State private var showMeshHelp = false
     @State private var cancellable: AnyCancellable?
+
+    private var connectivityWarning: ConnectivityWarning? {
+        if bluetooth.isAuthorizationBlocked {
+            return ConnectivityWarning(
+                title: "Bluetooth permission required — mesh is off",
+                body: "Without Bluetooth access, CruiseMesh cannot scan, connect, send, or receive messages. The app will not work as designed until you allow Bluetooth in Settings.",
+                actionLabel: "Open Settings",
+                severity: .blocking
+            )
+        }
+        if bluetooth.isRadioOff {
+            return ConnectivityWarning(
+                title: "Bluetooth is off",
+                body: "CruiseMesh needs Bluetooth on to find nearby phones and deliver messages. Turn it on to use the mesh.",
+                actionLabel: "Open Settings",
+                severity: .blocking
+            )
+        }
+        if case .pausedForBluetoothAudio = MeshRuntimeStatus.shared.state {
+            return ConnectivityWarning(
+                title: "Bluetooth audio connected",
+                body: "The mesh may pause or slow while wireless audio is active. Watch for delayed delivery.",
+                actionLabel: "Got it",
+                severity: .caution
+            )
+        }
+        return nil
+    }
 
     var body: some View {
         NavigationStack {
@@ -93,14 +122,26 @@ struct ChatListView: View {
                 }
             }
             .safeAreaInset(edge: .top) {
-                MeshStatusPill {
-                    if case .stopped = MeshRuntimeStatus.shared.state {
-                        appModel.startMesh()
-                    } else {
-                        showMeshHelp = true
+                VStack(spacing: 0) {
+                    if let warning = connectivityWarning {
+                        ConnectivityWarningBanner(warning: warning) {
+                            if warning.severity == .blocking {
+                                bluetooth.openSystemSettings()
+                            }
+                        }
                     }
+                    MeshStatusPill {
+                        if bluetooth.isAuthorizationBlocked || bluetooth.isRadioOff {
+                            bluetooth.openSystemSettings()
+                        } else if case .stopped = MeshRuntimeStatus.shared.state {
+                            appModel.startMesh()
+                        } else {
+                            showMeshHelp = true
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
                 }
-                .padding(.bottom, 4)
             }
             .overlay(alignment: .bottomTrailing) {
                 Menu {
