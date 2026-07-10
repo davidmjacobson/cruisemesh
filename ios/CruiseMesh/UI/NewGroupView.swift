@@ -1,24 +1,26 @@
 import SwiftUI
 
+/// Create a group: name + multi-select friends (DESIGN.md §14.6 / §6.5).
 struct NewGroupView: View {
     let identity: Identity
-    let contacts: [Contact]
-    let onCreated: (Group) -> Void
+    let onDone: () -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
-    @State private var selectedIds = Set<Data>()
-    @State private var error: String?
+    @State private var selected: Set<Data> = []
+    @State private var contacts: [Contact] = []
+
+    private let store = AppStore.get()
 
     private var canCreate: Bool {
-        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !selectedIds.isEmpty
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !selected.isEmpty
     }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Group") {
-                    TextField("Group name", text: $name)
+                Section("Group name") {
+                    TextField("Name", text: $name)
                 }
                 Section("Members") {
                     if contacts.isEmpty {
@@ -29,18 +31,18 @@ struct NewGroupView: View {
                             Button {
                                 toggle(contact.userId)
                             } label: {
-                                HStack {
-                                    AvatarView(userId: contact.userId, name: contact.name, size: 40)
+                                HStack(spacing: 12) {
+                                    Image(systemName: selected.contains(contact.userId)
+                                        ? "checkmark.circle.fill"
+                                        : "circle")
+                                        .foregroundStyle(selected.contains(contact.userId) ? Color.accentColor : .secondary)
+                                    AvatarView(userId: contact.userId, name: contact.name, size: 36)
                                     Text(ChatListLogic.displayNameOrId(
                                         name: contact.name,
                                         displayId: formatUserId(userId: contact.userId)
                                     ))
                                     .foregroundStyle(.primary)
                                     Spacer()
-                                    if selectedIds.contains(contact.userId) {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(Color.accentColor)
-                                    }
                                 }
                             }
                         }
@@ -48,42 +50,35 @@ struct NewGroupView: View {
                 }
             }
             .navigationTitle("New group")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Create") { createGroupChat() }
+                    Button("Create") { create() }
                         .disabled(!canCreate)
                 }
             }
-            .alert("Could not create group", isPresented: Binding(
-                get: { error != nil },
-                set: { if !$0 { error = nil } }
-            )) {
-                Button("OK", role: .cancel) { error = nil }
-            } message: {
-                Text(error ?? "")
+            .onAppear {
+                contacts = (try? store.listContacts()) ?? []
             }
         }
     }
 
     private func toggle(_ userId: Data) {
-        if selectedIds.contains(userId) {
-            selectedIds.remove(userId)
+        if selected.contains(userId) {
+            selected.remove(userId)
         } else {
-            selectedIds.insert(userId)
+            selected.insert(userId)
         }
     }
 
-    private func createGroupChat() {
-        let members = contacts.filter { selectedIds.contains($0.userId) }
-        let sender = GroupSender(store: AppStore.get(), identity: identity)
-        guard let group = sender.createAndInvite(name: name, members: members) else {
-            error = "Check the group name and selected members, then try again."
-            return
-        }
-        onCreated(group)
+    private func create() {
+        let members = contacts.filter { selected.contains($0.userId) }
+        let sender = GroupSender(store: store, identity: identity)
+        _ = sender.createAndInvite(name: name, members: members)
         dismiss()
+        onDone()
     }
 }

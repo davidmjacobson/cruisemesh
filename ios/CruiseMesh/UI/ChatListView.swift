@@ -5,16 +5,19 @@ struct ChatSummary: Identifiable {
     var id: Data { chatId }
     let chatId: Data
     let title: String
+    let isGroup: Bool
+    let contact: Contact?
     let group: Group?
     let lastMessage: StoredMessage?
     let unreadCount: Int
     let ownDeliveredThrough: UInt64
     let ownReadThrough: UInt64
+}
 
-    var isGroup: Bool { group != nil }
-    var navigationValue: String {
-        "\(isGroup ? "group" : "contact"):\(UserIdHex.encode(chatId))"
-    }
+/// Navigation target for the chat list — a 1:1 contact chat or a group chat.
+enum ChatRoute: Hashable {
+    case contact(Data)
+    case group(Data)
 }
 
 struct ChatListView: View {
@@ -43,19 +46,15 @@ struct ChatListView: View {
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, 32)
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     List(summaries) { summary in
-                        NavigationLink(value: summary.navigationValue) {
+                        NavigationLink(value: route(for: summary)) {
                             ChatRowView(summary: summary, ownUserId: identity.userId)
                         }
                         .swipeActions {
                             Button(role: .destructive) {
-                                if summary.isGroup {
-                                    try? AppStore.get().deleteGroup(groupId: summary.chatId)
-                                } else {
-                                    try? AppStore.get().deleteContact(userId: summary.chatId)
-                                }
-                                reload()
+                                delete(summary)
                             } label: {
                                 Label("Delete", systemImage: "trash")
                             }
@@ -65,15 +64,15 @@ struct ChatListView: View {
                 }
             }
             .navigationTitle("CruiseMesh")
-            .navigationDestination(for: String.self) { hex in
-                let pieces = hex.split(separator: ":", maxSplits: 1).map(String.init)
-                if pieces.count == 2, let chatId = try? UserIdHex.decode(pieces[1]) {
-                    if pieces[0] == "group",
-                       let group = try? AppStore.get().getGroup(groupId: chatId) {
-                        GroupChatView(group: group, identity: identity)
-                    } else if pieces[0] == "contact",
-                              let contact = try? AppStore.get().getContact(userId: chatId) {
+            .navigationDestination(for: ChatRoute.self) { route in
+                switch route {
+                case .contact(let userId):
+                    if let contact = try? AppStore.get().getContact(userId: userId) {
                         ChatView(contact: contact, identity: identity)
+                    }
+                case .group(let groupId):
+                    if let group = try? AppStore.get().getGroup(groupId: groupId) {
+                        GroupChatView(group: group, identity: identity)
                     }
                 }
             }
@@ -85,8 +84,8 @@ struct ChatListView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
-                        Button("Friends") { showFriends = true }
                         Button("New group") { showNewGroup = true }
+                        Button("Friends") { showFriends = true }
                         Button("Mesh status") { showMeshHelp = true }
                     } label: {
                         Image(systemName: "ellipsis.circle")
@@ -124,16 +123,14 @@ struct ChatListView: View {
                     reload()
                 }
             }
-            .sheet(isPresented: $showProfile) {
-                ProfileView(identity: identity, appModel: appModel)
-            }
             .sheet(isPresented: $showNewGroup) {
-                NewGroupView(
-                    identity: identity,
-                    contacts: (try? AppStore.get().listContacts()) ?? []
-                ) { _ in
+                NewGroupView(identity: identity) {
+                    showNewGroup = false
                     reload()
                 }
+            }
+            .sheet(isPresented: $showProfile) {
+                ProfileView(identity: identity, appModel: appModel)
             }
             .alert("Mesh", isPresented: $showMeshHelp) {
                 Button("Start mesh") { appModel.startMesh() }
@@ -150,19 +147,27 @@ struct ChatListView: View {
         }
     }
 
+    private func route(for summary: ChatSummary) -> ChatRoute {
+        summary.isGroup ? .group(summary.chatId) : .contact(summary.chatId)
+    }
+
+    private func delete(_ summary: ChatSummary) {
+        if summary.isGroup {
+            _ = try? AppStore.get().deleteGroup(groupId: summary.chatId)
+        } else {
+            try? AppStore.get().deleteContact(userId: summary.chatId)
+        }
+        reload()
+    }
+
     private func reload() {
         let store = AppStore.get()
         let contacts = (try? store.listContacts()) ?? []
-        let directSummaries = contacts.map { c in
+        let direct: [ChatSummary] = contacts.map { c in
             let messages = (try? store.messagesForChat(chatId: c.userId)) ?? []
             let readThrough = (try? store.receiptThrough(
                 chatId: c.userId,
                 senderUserId: identity.userId,
-                receiptType: ReceiptType.read
-            )) ?? 0
-            let localReadThrough = (try? store.outgoingReceiptThrough(
-                chatId: c.userId,
-                senderUserId: c.userId,
                 receiptType: ReceiptType.read
             )) ?? 0
             let deliveredThrough = (try? store.receiptThrough(
@@ -170,12 +175,17 @@ struct ChatListView: View {
                 senderUserId: identity.userId,
                 receiptType: ReceiptType.delivered
             )) ?? 0
+            // Unread uses our local read watermark of the peer's stream.
+            let localReadThrough = (try? store.outgoingReceiptThrough(
+                chatId: c.userId,
+                senderUserId: c.userId,
+                receiptType: ReceiptType.read
+            )) ?? 0
             return ChatSummary(
                 chatId: c.userId,
-                title: ChatListLogic.displayNameOrId(
-                    name: c.name,
-                    displayId: formatUserId(userId: c.userId)
-                ),
+                title: c.name,
+                isGroup: false,
+                contact: c,
                 group: nil,
                 lastMessage: ChatListLogic.lastVisibleMessage(messages),
                 unreadCount: ChatListLogic.computeUnread(
@@ -188,30 +198,32 @@ struct ChatListView: View {
             )
         }
         let groups = (try? store.listGroups()) ?? []
-        let groupSummaries = groups.map { group in
-            let messages = (try? store.messagesForChat(chatId: group.id)) ?? []
+        let groupSummaries: [ChatSummary] = groups.map { g in
+            let messages = (try? store.messagesForChat(chatId: g.id)) ?? []
             let unread = ChatListLogic.computeGroupUnread(
                 messages: messages,
                 ownUserId: identity.userId
-            ) { senderUserId in
+            ) { senderId in
                 (try? store.outgoingReceiptThrough(
-                    chatId: group.id,
-                    senderUserId: senderUserId,
+                    chatId: g.id,
+                    senderUserId: senderId,
                     receiptType: ReceiptType.read
                 )) ?? 0
             }
             return ChatSummary(
-                chatId: group.id,
-                title: group.name,
-                group: group,
+                chatId: g.id,
+                title: g.name,
+                isGroup: true,
+                contact: nil,
+                group: g,
                 lastMessage: ChatListLogic.lastVisibleMessage(messages),
                 unreadCount: unread,
                 ownDeliveredThrough: 0,
                 ownReadThrough: 0
             )
         }
-        summaries = (directSummaries + groupSummaries)
-        .sorted { ($0.lastMessage?.timestamp ?? 0) > ($1.lastMessage?.timestamp ?? 0) }
+        summaries = (direct + groupSummaries)
+            .sorted { ($0.lastMessage?.timestamp ?? 0) > ($1.lastMessage?.timestamp ?? 0) }
     }
 }
 
@@ -219,14 +231,20 @@ private struct ChatRowView: View {
     let summary: ChatSummary
     let ownUserId: Data
 
+    private var displayName: String {
+        summary.isGroup
+            ? summary.title
+            : ChatListLogic.displayNameOrId(name: summary.title, displayId: formatUserId(userId: summary.chatId))
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             AvatarView(userId: summary.chatId, name: summary.title, size: 48)
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(summary.title)
-                    .font(.headline)
-                    .fontWeight(summary.unreadCount > 0 ? .bold : .semibold)
+                    Text(summary.isGroup ? "👥 \(displayName)" : displayName)
+                        .font(.headline)
+                        .fontWeight(summary.unreadCount > 0 ? .bold : .semibold)
                     Spacer()
                     if let last = summary.lastMessage {
                         Text(ChatListLogic.formatRelativeTime(timestampMs: last.timestamp))
@@ -244,10 +262,7 @@ private struct ChatRowView: View {
                                 readThrough: summary.ownReadThrough
                             ))
                         }
-                        Text((isOwn ? "You: " : "") + ChatListLogic.previewText(
-                            last,
-                            groupName: summary.group?.name
-                        ))
+                        Text((isOwn ? "You: " : "") + ChatListLogic.previewText(last, groupName: summary.isGroup ? summary.title : nil))
                             .font(.subheadline)
                             .foregroundStyle(summary.unreadCount > 0 ? .primary : .secondary)
                             .lineLimit(1)
