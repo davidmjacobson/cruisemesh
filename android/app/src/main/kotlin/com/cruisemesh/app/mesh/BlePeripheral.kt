@@ -199,8 +199,15 @@ class BlePeripheral(
     }
 
     fun stop() {
-        advertiser?.stopAdvertising(advertiseCallback)
-        gattServer?.close()
+        // stopAdvertising throws if the adapter is already off -- the case when
+        // stop() runs because Bluetooth was turned off. Swallow it; advertising
+        // is gone either way.
+        try {
+            advertiser?.stopAdvertising(advertiseCallback)
+        } catch (e: Exception) {
+            Log.w(TAG, "stopAdvertising during stop() failed (adapter likely off): ${e.message}")
+        }
+        runCatching { gattServer?.close() }
         gattServer = null
         connectedDevices.clear()
         negotiatedMtu.clear()
