@@ -39,7 +39,7 @@ struct GroupChatView: View {
                                     displayId: formatUserId(userId: message.senderUserId)
                                 ).0
                             )
-                            .id(message.lamport)
+                            .id(messageId(message))
                         }
                     }
                     .padding(.horizontal, 12)
@@ -47,7 +47,7 @@ struct GroupChatView: View {
                 }
                 .onChange(of: visible.count) { _ in
                     if let last = visible.last {
-                        withAnimation { proxy.scrollTo(last.lamport, anchor: .bottom) }
+                        withAnimation { proxy.scrollTo(messageId(last), anchor: .bottom) }
                     }
                 }
             }
@@ -98,6 +98,7 @@ struct GroupChatView: View {
         }
         .onDisappear {
             ChatVisibility.clearVisible(group.id)
+            ChatEvents.notifyChatChanged(group.id)
         }
         .sheet(isPresented: $showDetails) {
             GroupDetailsSheet(
@@ -125,6 +126,10 @@ struct GroupChatView: View {
             return contact.name
         }
         return formatUserId(userId: userId)
+    }
+
+    private func messageId(_ message: StoredMessage) -> String {
+        "\(UserIdHex.encode(message.senderUserId))-\(message.lamport)-\(message.kind)"
     }
 
     /// Show a sender label above a non-own message when it starts a new run

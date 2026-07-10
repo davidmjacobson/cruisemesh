@@ -13,7 +13,6 @@ struct ChatView: View {
     @State private var deliveredThrough: UInt64 = 0
     @State private var readThrough: UInt64 = 0
     @State private var draft = ""
-    @State private var showAttach = false
     @State private var showVoice = false
     @State private var showDetails = false
     @State private var confirmDelete = false
@@ -23,7 +22,6 @@ struct ChatView: View {
     @State private var cancellable: AnyCancellable?
     @State private var voiceRecorder = VoiceRecorder()
     @State private var voiceRecording = false
-    @State private var voiceElapsed: Int = 0
 
     private let store = AppStore.get()
     private var sender: RealMeshSender { RealMeshSender(store: store, identity: identity) }
@@ -180,6 +178,53 @@ struct ChatView: View {
                 }
             }
         }
+        .sheet(isPresented: $showVoice, onDismiss: {
+            voiceRecorder.cancel()
+            voiceRecording = false
+        }) {
+            NavigationStack {
+                VStack(spacing: 24) {
+                    Image(systemName: voiceRecording ? "waveform.circle.fill" : "mic.circle")
+                        .font(.system(size: 72))
+                        .foregroundStyle(voiceRecording ? Color.red : Color.accentColor)
+                    Text(voiceRecording ? "Recording…" : "Voice memo")
+                        .font(.title2.weight(.semibold))
+                    Text("Voice memos stop automatically after \(Int(VoiceRecorder.maxDurationSeconds)) seconds.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    if voiceRecording {
+                        Button("Stop and send") {
+                            if let (url, duration) = voiceRecorder.stop() {
+                                sendVoice(url: url, durationMs: duration)
+                            }
+                            voiceRecording = false
+                            showVoice = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                    } else {
+                        Button("Start recording") {
+                            if voiceRecorder.start() {
+                                voiceRecording = true
+                            } else {
+                                statusMessage = "Microphone unavailable"
+                                showVoice = false
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                    Spacer()
+                }
+                .padding(24)
+                .navigationTitle("Voice memo")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { showVoice = false }
+                    }
+                }
+            }
+        }
         .sheet(isPresented: $showDetails) {
             ContactDetailsSheet(contact: contact) {
                 showDetails = false
@@ -194,31 +239,6 @@ struct ChatView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Removes the contact and chat history.")
-        }
-        .alert("Voice memo", isPresented: $showVoice) {
-            if voiceRecording {
-                Button("Send") {
-                    if let (url, duration) = voiceRecorder.stop() {
-                        sendVoice(url: url, durationMs: duration)
-                    }
-                    voiceRecording = false
-                    showVoice = false
-                }
-            } else {
-                Button("Start") {
-                    if voiceRecorder.start() {
-                        voiceRecording = true
-                    } else {
-                        statusMessage = "Microphone unavailable"
-                    }
-                }
-            }
-            Button("Cancel", role: .cancel) {
-                voiceRecorder.cancel()
-                voiceRecording = false
-            }
-        } message: {
-            Text(voiceRecording ? "Recording… tap Send when done (max 60s)." : "Tap Start, then Send.")
         }
         .alert("Notice", isPresented: Binding(
             get: { statusMessage != nil },
@@ -378,13 +398,16 @@ private struct VoiceMemoPlayerView: View {
                     playing = false
                 } else {
                     do {
-                        let url = FileManager.default.temporaryDirectory
-                            .appendingPathComponent("play-\(UUID().uuidString).m4a")
-                        try blob.write(to: url)
-                        let p = try AVAudioPlayer(contentsOf: url)
+                        let p = try AVAudioPlayer(data: blob)
                         p.play()
                         player = p
                         playing = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + p.duration) {
+                            if player === p {
+                                player = nil
+                                playing = false
+                            }
+                        }
                     } catch {
                         playing = false
                     }

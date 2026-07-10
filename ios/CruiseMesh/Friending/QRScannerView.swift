@@ -21,6 +21,7 @@ final class ScannerViewController: UIViewController, AVCaptureMetadataOutputObje
     var onCode: ((String) -> Void)?
     var onCancel: (() -> Void)?
     private let session = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(label: "com.cruisemesh.qr-scanner", qos: .userInitiated)
     private var handled = false
 
     override func viewDidLoad() {
@@ -57,12 +58,12 @@ final class ScannerViewController: UIViewController, AVCaptureMetadataOutputObje
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        DispatchQueue.global(qos: .userInitiated).async { self.session.startRunning() }
+        sessionQueue.async { [weak self] in self?.session.startRunning() }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        session.stopRunning()
+        sessionQueue.async { [weak self] in self?.session.stopRunning() }
     }
 
     @objc private func cancelTapped() {
@@ -79,7 +80,7 @@ final class ScannerViewController: UIViewController, AVCaptureMetadataOutputObje
               object.type == .qr,
               let value = object.stringValue else { return }
         handled = true
-        session.stopRunning()
+        sessionQueue.async { [weak self] in self?.session.stopRunning() }
         onCode?(value)
     }
 }

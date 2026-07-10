@@ -5,6 +5,7 @@ enum MediaCompressor {
     private static let maxEdge: CGFloat = 1280
     private static let startQuality: CGFloat = 0.82
     private static let minQuality: CGFloat = 0.40
+    private static let maxCompressedImageBytes = 120 * 1024
 
     static func compressImage(data: Data) -> Data? {
         guard let image = UIImage(data: data) else { return nil }
@@ -17,16 +18,19 @@ enum MediaCompressor {
     }
 
     static func compress(image: UIImage) -> Data? {
-        let scaled = scaleToMaxEdge(image, maxEdge: maxEdge)
-        var quality = startQuality
-        var bytes: Data?
-        repeat {
-            bytes = scaled.jpegData(compressionQuality: quality)
-            if let bytes, bytes.count <= AttachmentPayload.maxBlobBytes {
-                return bytes
-            }
-            quality -= 0.08
-        } while quality >= minQuality
+        var targetEdge = maxEdge
+        while targetEdge >= 480 {
+            let scaled = scaleToMaxEdge(image, maxEdge: targetEdge)
+            var quality = startQuality
+            repeat {
+                if let bytes = scaled.jpegData(compressionQuality: quality),
+                   bytes.count <= maxCompressedImageBytes {
+                    return bytes
+                }
+                quality -= 0.08
+            } while quality >= minQuality
+            targetEdge *= 0.8
+        }
         return nil
     }
 

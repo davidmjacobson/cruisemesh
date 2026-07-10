@@ -44,6 +44,12 @@ final class ReconnectBackoffTracker {
         state[address]?.consecutiveFailures ?? 0
     }
 
+    func retryDelayMs(address: String, nowMs: Int64) -> Int64? {
+        guard let state = state[address],
+              state.consecutiveFailures < maxConsecutiveFailures else { return nil }
+        return max(0, state.nextEligibleAtMs - nowMs)
+    }
+
     @discardableResult
     func recordFailure(address: String, nowMs: Int64) -> Int {
         let previous = state[address]?.consecutiveFailures ?? 0
@@ -56,5 +62,9 @@ final class ReconnectBackoffTracker {
 
     func recordSuccess(address: String) {
         state.removeValue(forKey: address)
+    }
+
+    func clear() {
+        state.removeAll()
     }
 }

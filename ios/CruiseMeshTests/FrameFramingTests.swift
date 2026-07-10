@@ -13,4 +13,24 @@ final class FrameFramingTests: XCTestCase {
         }
         XCTAssertEqual(result, frame)
     }
+
+    func testCapsFragmentsAtMaximumAttributeValueLength() {
+        let fragments = FrameFraming.fragment(frame: Data(repeating: 1, count: 1_500), mtuPayloadSize: 1_000)
+        XCTAssertFalse(fragments.isEmpty)
+        XCTAssertTrue(fragments.allSatisfy { $0.count <= FrameFraming.maxAttValueLength })
+    }
+
+    func testOversizedFrameFailsWithoutCrashing() {
+        let maximumFrameSize = (FrameFraming.maxAttValueLength - 2) * 255
+        let fragments = FrameFraming.fragment(
+            frame: Data(repeating: 1, count: maximumFrameSize + 1),
+            mtuPayloadSize: FrameFraming.maxAttValueLength
+        )
+        XCTAssertTrue(fragments.isEmpty)
+    }
+
+    func testRejectsInvalidZeroFragmentCount() {
+        let reassembler = FrameReassembler()
+        XCTAssertNil(reassembler.accept(Data([0, 0, 1, 2, 3])))
+    }
 }

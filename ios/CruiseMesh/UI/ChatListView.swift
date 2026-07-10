@@ -103,7 +103,10 @@ struct ChatListView: View {
                 .padding(.bottom, 4)
             }
             .overlay(alignment: .bottomTrailing) {
-                Button { showFriends = true } label: {
+                Menu {
+                    Button("New message") { showFriends = true }
+                    Button("New group") { showNewGroup = true }
+                } label: {
                     Image(systemName: "square.and.pencil")
                         .font(.title2.weight(.semibold))
                         .foregroundStyle(.white)
@@ -131,7 +134,7 @@ struct ChatListView: View {
             }
             .alert("Mesh", isPresented: $showMeshHelp) {
                 Button("Start mesh") { appModel.startMesh() }
-                Button("Stop mesh", role: .destructive) { MeshController.shared.stop() }
+                Button("Stop mesh", role: .destructive) { appModel.stopMesh() }
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(MeshRuntimeStatus.shared.pillText + "\n\nOpen the app when you sit down with family so phones can sync over Bluetooth.")
@@ -139,7 +142,7 @@ struct ChatListView: View {
             .onAppear {
                 reload()
                 cancellable = ChatEvents.subject.sink { _ in reload() }
-                appModel.startMesh()
+                appModel.startMeshIfEnabled()
             }
         }
     }

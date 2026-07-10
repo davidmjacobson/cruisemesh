@@ -38,12 +38,12 @@ final class GroupSender {
         let group: Group
         do {
             group = try createGroup(name: trimmed, memberUserIds: memberIds)
+            try store.upsertGroup(group: group)
         } catch {
-            log.warning("createGroup failed: \(error.localizedDescription, privacy: .public)")
+            log.warning("Failed to create or persist group: \(error.localizedDescription, privacy: .public)")
             return nil
         }
 
-        try? store.upsertGroup(group: group)
         queueInvites(group: group, members: members)
         ChatEvents.notifyChatChanged(group.id)
         RelaySyncEvents.requestSync()
@@ -52,8 +52,9 @@ final class GroupSender {
 
     /// Sends `text` into `group`'s chat stream, sealed with the group key.
     func sendText(group: Group, text: String) {
-        let payload = Data(text.utf8)
-        guard !payload.isEmpty else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let payload = Data(trimmed.utf8)
+        guard !payload.isEmpty, group.memberUserIds.contains(identity.userId) else { return }
 
         let chatId = group.id
         let lamport = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0

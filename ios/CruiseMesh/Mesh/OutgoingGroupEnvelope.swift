@@ -24,6 +24,10 @@ func buildOutboundGroupEnvelope(
         groupLog.warning("Refusing group envelope whose chatId does not match group.id")
         return nil
     }
+    guard group.memberUserIds.contains(identity.userId) else {
+        groupLog.warning("Refusing group envelope from a non-member identity")
+        return nil
+    }
 
     let body = MessageBody(
         kind: message.kind,
