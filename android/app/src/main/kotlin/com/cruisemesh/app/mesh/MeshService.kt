@@ -6,6 +6,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.bluetooth.BluetoothA2dp
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.BroadcastReceiver
@@ -157,6 +158,7 @@ class MeshService : Service() {
     private var meshRolesRunning = false
     private var bluetoothAudioConnected = false
     private var bluetoothAudioReceiverRegistered = false
+    private var bluetoothStateReceiverRegistered = false
     private var relayNetworkCallbackRegistered = false
     /**
      * The network relay traffic is pinned to: the best network with validated
@@ -191,6 +193,33 @@ class MeshService : Service() {
             val action = intent?.action ?: return
             val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)
             refreshBluetoothAudioStatus("$action state=$state")
+        }
+    }
+    /**
+     * Restarts (or tears down) the BLE roles when the Bluetooth adapter is
+     * toggled off and back on. Without this, turning Bluetooth off invalidates
+     * the OS-side scanner/advertiser/GATT server, and because [startMeshRoles]
+     * is guarded on [meshRolesRunning] the app never rebuilds them when
+     * Bluetooth returns -- the device silently stops participating in the mesh
+     * until the whole app is restarted (observed live 2026-07-10: a phone whose
+     * Bluetooth was toggled received nothing over BLE even though the service
+     * still reported "Mesh running").
+     */
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_ON -> {
+                    Log.i(TAG, "Bluetooth turned on; restarting mesh roles")
+                    if (running) restartMeshRoles()
+                }
+                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
+                    Log.i(TAG, "Bluetooth turning off; stopping mesh roles")
+                    stopMeshRoles()
+                }
+            }
+            refreshRuntimeState()
+            refreshForegroundNotification()
         }
     }
     // Backs an INTERNET requestNetwork() (VALIDATED is not requestable, only
@@ -266,17 +295,19 @@ class MeshService : Service() {
 
         running = true
         registerBluetoothAudioReceiver()
+        registerBluetoothStateReceiver()
         registerRelayNetworkCallback()
         scheduleRelayPolling()
         // The mesh runs regardless of Bluetooth audio now (see
         // refreshBluetoothAudioStatus); start the roles unconditionally rather
-        // than gating them on an audio-clear check.
+        // than gating them on an audio-clear check. (startMeshRoles is a no-op
+        // at the BLE layer if Bluetooth is off; the state receiver restarts the
+        // roles for real once Bluetooth is turned on.)
         startMeshRoles()
-        // Mesh is up. The old A2DP-gated path used to flip STARTING->ACTIVE from
-        // inside the backoff's ACTIVE branch; now that roles start
-        // unconditionally, mark it active here or the status pill sticks on
-        // "Mesh starting…" forever.
-        MeshRuntimeStatus.markActive()
+        // Mesh is up. Publish the real state (ACTIVE, or NO_BLUETOOTH if
+        // Bluetooth is currently off) rather than an unconditional "running", so
+        // the status pill can't claim the mesh is live while it's actually deaf.
+        refreshRuntimeState()
         refreshBluetoothAudioStatus("service start")
         requestRelaySync("service start")
         return START_STICKY
@@ -286,6 +317,7 @@ class MeshService : Service() {
         running = false
         MeshRuntimeStatus.markStopped()
         unregisterBluetoothAudioReceiver()
+        unregisterBluetoothStateReceiver()
         unregisterRelayNetworkCallback()
         cancelRelayPolling()
         RelaySyncEvents.unregister()
@@ -304,6 +336,7 @@ class MeshService : Service() {
         peripheral.start()
         central.start()
         meshRolesRunning = true
+        refreshRuntimeState()
         refreshForegroundNotification()
     }
 
@@ -314,7 +347,40 @@ class MeshService : Service() {
         meshRolesRunning = false
         // stop() tears links down without per-address disconnect callbacks.
         MeshRouter.reset()
+        refreshRuntimeState()
         refreshForegroundNotification()
+    }
+
+    /**
+     * Tears the BLE roles down and stands them back up. Used when Bluetooth is
+     * toggled back on: the stale scanner/advertiser/GATT-server handles from
+     * before the toggle are dead, and [BlePeripheral.start]/[BleCentral.start]
+     * are idempotent on their own handles, so a plain [startMeshRoles] would
+     * see them as "already running" and never rebuild. The [stopMeshRoles] here
+     * nulls those handles first so the following start creates fresh ones.
+     */
+    private fun restartMeshRoles() {
+        stopMeshRoles()
+        startMeshRoles()
+    }
+
+    /** Whether the Bluetooth adapter is present and on (BLE can actually run). */
+    private fun isBluetoothOn(): Boolean = bluetoothManager.adapter?.isEnabled == true
+
+    /**
+     * Publishes the honest runtime state to [MeshRuntimeStatus]: STOPPED when
+     * the service isn't running, NO_BLUETOOTH when it is but the adapter is off
+     * (BLE roles can't carry anything), ACTIVE when the roles are up, else
+     * STARTING. Called wherever [running], [meshRolesRunning], or the adapter
+     * state changes.
+     */
+    private fun refreshRuntimeState() {
+        when {
+            !running -> MeshRuntimeStatus.markStopped()
+            !isBluetoothOn() -> MeshRuntimeStatus.markNoBluetooth()
+            meshRolesRunning -> MeshRuntimeStatus.markActive()
+            else -> MeshRuntimeStatus.markStarting()
+        }
     }
 
     private fun registerBluetoothAudioReceiver() {
@@ -333,6 +399,24 @@ class MeshService : Service() {
         if (!bluetoothAudioReceiverRegistered) return
         unregisterReceiver(bluetoothAudioReceiver)
         bluetoothAudioReceiverRegistered = false
+    }
+
+    private fun registerBluetoothStateReceiver() {
+        if (bluetoothStateReceiverRegistered) return
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(bluetoothStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(bluetoothStateReceiver, filter)
+        }
+        bluetoothStateReceiverRegistered = true
+    }
+
+    private fun unregisterBluetoothStateReceiver() {
+        if (!bluetoothStateReceiverRegistered) return
+        unregisterReceiver(bluetoothStateReceiver)
+        bluetoothStateReceiverRegistered = false
     }
 
     private fun registerRelayNetworkCallback() {
@@ -1925,10 +2009,10 @@ class MeshService : Service() {
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("CruiseMesh")
             .setContentText(
-                if (bluetoothAudioConnected) {
-                    "Relaying messages nearby (Bluetooth audio also connected)"
-                } else {
-                    "Relaying messages nearby"
+                when {
+                    !isBluetoothOn() -> "Paused — turn on Bluetooth to sync nearby"
+                    bluetoothAudioConnected -> "Relaying messages nearby (Bluetooth audio also connected)"
+                    else -> "Relaying messages nearby"
                 },
             )
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)

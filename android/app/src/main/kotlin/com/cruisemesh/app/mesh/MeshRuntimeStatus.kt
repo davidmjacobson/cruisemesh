@@ -8,6 +8,16 @@ enum class MeshRuntimeState(val label: String) {
     STOPPED("Mesh stopped"),
     STARTING("Mesh starting…"),
     ACTIVE("Mesh running"),
+
+    /**
+     * The service is up and *wants* to run, but Bluetooth is off so its BLE
+     * roles (scan/advertise/GATT) can't actually carry anything. Previously the
+     * status stayed [ACTIVE] in this case, so the pill said "Mesh running" while
+     * the device was in fact deaf to the mesh -- exactly the state a user lands
+     * in after toggling Bluetooth off and back on. Reporting it honestly lets
+     * the UI say "paused" and prompt turning Bluetooth back on.
+     */
+    NO_BLUETOOTH("Mesh paused — Bluetooth off"),
 }
 
 /**
@@ -40,6 +50,10 @@ object MeshRuntimeStatus {
 
     fun markActive() {
         _state.value = MeshRuntimeState.ACTIVE
+    }
+
+    fun markNoBluetooth() {
+        _state.value = MeshRuntimeState.NO_BLUETOOTH
     }
 
     fun markStopped() {

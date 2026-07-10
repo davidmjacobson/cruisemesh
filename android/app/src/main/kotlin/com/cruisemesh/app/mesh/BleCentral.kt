@@ -264,9 +264,16 @@ class BleCentral(
     }
 
     fun stop() {
-        scanner?.stopScan(scanCallback)
+        // stopScan throws IllegalStateException if the adapter is already off --
+        // which is exactly the case when stop() runs in response to Bluetooth
+        // being turned off. Swallow it; the scan is gone either way.
+        try {
+            scanner?.stopScan(scanCallback)
+        } catch (e: Exception) {
+            Log.w(TAG, "stopScan during stop() failed (adapter likely off): ${e.message}")
+        }
         scanner = null
-        connections.values.forEach { it.close() }
+        connections.values.forEach { runCatching { it.close() } }
         connections.clear()
         negotiatedMtu.clear()
         reassemblers.clear()
