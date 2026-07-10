@@ -26,11 +26,14 @@ enum MeshDefaults {
 }
 
 func isVisibleChatKind(_ kind: UInt8) -> Bool {
-    kind == ProtocolKind.text || kind == ProtocolKind.attachmentManifest
+    kind == ProtocolKind.text
+        || kind == ProtocolKind.attachmentManifest
+        || kind == ProtocolKind.groupInvite
 }
 
 func isAuthoredChatKind(_ kind: UInt8) -> Bool {
     kind == ProtocolKind.text
         || kind == ProtocolKind.friendRequest
+        || kind == ProtocolKind.groupInvite
         || kind == ProtocolKind.attachmentManifest
 }

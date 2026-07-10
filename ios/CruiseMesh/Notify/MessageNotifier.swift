@@ -19,4 +19,16 @@ enum MessageNotifier {
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
+
+    static func notifyIncomingGroupMessage(group: Group, senderName: String, preview: String) {
+        let content = UNMutableNotificationContent()
+        content.title = group.name
+        content.body = "\(senderName): \(preview)"
+        content.sound = .default
+        content.userInfo = [chatUserIdKey: UserIdHex.encode(group.id)]
+
+        let id = UserIdHex.encode(group.id)
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+    }
 }

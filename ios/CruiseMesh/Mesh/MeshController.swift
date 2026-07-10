@@ -225,6 +225,36 @@ final class MeshController: ObservableObject {
             let opened = try openMessage(recipient: identity, sealed: sealed)
             deliverOpened(sourceLabel: sourceLabel, sourceAddress: sourceAddress, opened: opened, identity: identity)
         } catch {
+            // Pairwise open failed: either foreign 1:1 traffic, or a group
+            // envelope sealed with a shared key (DESIGN.md §6.5). Try groups
+            // whose recipient_hint matches before treating it as pure mule
+            // traffic. Group members keep relaying/carrying so absent members
+            // still get a copy.
+            if let (group, opened) = tryOpenGroupMessage(recipientHint: recipientHint, sealed: sealed, now: now) {
+                deliverOpenedGroupEnvelope(
+                    sourceLabel: sourceLabel,
+                    group: group,
+                    opened: opened,
+                    identity: identity
+                )
+                relayForeign(
+                    sourceAddress: sourceAddress,
+                    msgId: msgId,
+                    hopTtl: hopTtl,
+                    expiry: expiry,
+                    recipientHint: recipientHint,
+                    sealed: sealed
+                )
+                carryForeign(
+                    msgId: msgId,
+                    hopTtl: hopTtl,
+                    expiry: expiry,
+                    recipientHint: recipientHint,
+                    sealed: sealed,
+                    forceFamily: true
+                )
+                return
+            }
             relayForeign(
                 sourceAddress: sourceAddress,
                 msgId: msgId,
@@ -235,6 +265,21 @@ final class MeshController: ObservableObject {
             )
             carryForeign(msgId: msgId, hopTtl: hopTtl, expiry: expiry, recipientHint: recipientHint, sealed: sealed)
         }
+    }
+
+    /// Opens `sealed` with any imported group whose recent-day `recipient_hint`
+    /// matches `recipientHint`. Returns the matching group and opened payload,
+    /// or nil. `openGroupMessage` does not check membership of the signer;
+    /// callers must enforce that before trusting the body.
+    private func tryOpenGroupMessage(recipientHint: Data, sealed: Data, now: Int64) -> (Group, OpenedMessage)? {
+        let groups = (try? store.listGroups()) ?? []
+        for group in groups {
+            guard recentHintsFor(userId: group.id, now: now).contains(where: { $0 == recipientHint }) else { continue }
+            if let opened = try? openGroupMessage(group: group, sealed: sealed) {
+                return (group, opened)
+            }
+        }
+        return nil
     }
 
     private func deliverOpened(
@@ -274,8 +319,136 @@ final class MeshController: ObservableObject {
                 body: body,
                 identity: identity
             )
+        case ProtocolKind.groupInvite:
+            handleIncomingGroupInvite(
+                sourceLabel: sourceLabel,
+                senderUserId: opened.senderUserId,
+                body: body,
+                identity: identity
+            )
         default:
             log.info("Unhandled kind=\(body.kind) from \(sourceLabel, privacy: .public)")
+        }
+    }
+
+    /// Delivers a group-sealed envelope we opened with an imported group key
+    /// (DESIGN.md §6.5). Wire `MessageBody.chatId` is the group id; the
+    /// verified signer must be a current member (core does not check this).
+    /// Group receipts are deferred — we only store + notify.
+    private func deliverOpenedGroupEnvelope(
+        sourceLabel: String,
+        group: Group,
+        opened: OpenedMessage,
+        identity: Identity
+    ) {
+        guard group.memberUserIds.contains(opened.senderUserId) else {
+            log.warning("Dropping group envelope from \(sourceLabel, privacy: .public): signer is not a member of \(group.name, privacy: .public)")
+            return
+        }
+        guard group.memberUserIds.contains(identity.userId) else {
+            log.warning("Dropping group envelope from \(sourceLabel, privacy: .public): we are not a member of \(group.name, privacy: .public)")
+            return
+        }
+        let body: MessageBody
+        do {
+            body = try decodeMessageBody(bytes: opened.payload)
+        } catch {
+            return
+        }
+        guard body.chatId == group.id else {
+            log.warning("Dropping group envelope from \(sourceLabel, privacy: .public): body.chatId does not match group id")
+            return
+        }
+        switch body.kind {
+        case ProtocolKind.text:
+            handleIncomingGroupChatMessage(group: group, senderUserId: opened.senderUserId, body: body)
+        default:
+            log.info("Dropping group envelope from \(sourceLabel, privacy: .public): unhandled kind=\(body.kind)")
+        }
+    }
+
+    private func handleIncomingGroupChatMessage(group: Group, senderUserId: Data, body: MessageBody) {
+        let inserted = (try? store.insertMessage(message: StoredMessage(
+            chatId: group.id,
+            senderUserId: senderUserId,
+            lamport: body.lamport,
+            timestamp: body.timestamp,
+            kind: body.kind,
+            payload: body.content
+        ))) ?? false
+        guard inserted else { return }
+        ChatEvents.notifyChatChanged(group.id)
+
+        // Local read watermark only (group wire receipts are deferred).
+        let throughLamport = (try? store.highestContiguousLamport(chatId: group.id, senderUserId: senderUserId)) ?? 0
+        try? store.recordOutgoingReceipt(
+            chatId: group.id,
+            senderUserId: senderUserId,
+            receiptType: ReceiptType.delivered,
+            throughLamport: throughLamport
+        )
+        if ChatVisibility.isVisible(group.id) {
+            try? store.recordOutgoingReceipt(
+                chatId: group.id,
+                senderUserId: senderUserId,
+                receiptType: ReceiptType.read,
+                throughLamport: throughLamport
+            )
+        } else {
+            let senderName = (try? store.getContact(userId: senderUserId))?.name
+                ?? String(UserIdHex.encode(senderUserId).prefix(8))
+            let preview = String(data: body.content, encoding: .utf8) ?? ""
+            MessageNotifier.notifyIncomingGroupMessage(group: group, senderName: senderName, preview: preview)
+        }
+    }
+
+    /// Imports a pairwise-sealed `kind=4` group invite (DESIGN.md §6.5). Wire
+    /// `chatId` is the invite sender's userId (1:1 pairwise convention); the
+    /// group id/key/members live in the invite content. Local history is stored
+    /// under `chat_id = group.id`.
+    private func handleIncomingGroupInvite(
+        sourceLabel: String,
+        senderUserId: Data,
+        body: MessageBody,
+        identity: Identity
+    ) {
+        let group: Group
+        do {
+            group = try decodeGroupInviteContent(bytes: body.content)
+        } catch {
+            log.warning("Dropping group invite from \(sourceLabel, privacy: .public): failed to decode")
+            return
+        }
+        guard group.memberUserIds.contains(identity.userId) else {
+            log.warning("Dropping group invite from \(sourceLabel, privacy: .public): we are not listed as a member")
+            return
+        }
+        guard group.memberUserIds.contains(senderUserId) else {
+            log.warning("Dropping group invite from \(sourceLabel, privacy: .public): sender is not listed as a member")
+            return
+        }
+
+        try? store.upsertGroup(group: group)
+        let inserted = (try? store.insertMessage(message: StoredMessage(
+            chatId: group.id,
+            senderUserId: senderUserId,
+            lamport: body.lamport,
+            timestamp: body.timestamp,
+            kind: ProtocolKind.groupInvite,
+            payload: body.content
+        ))) ?? false
+        guard inserted else { return }
+        ChatEvents.notifyChatChanged(group.id)
+        log.info("Imported group \(group.name, privacy: .public) from invite on \(sourceLabel, privacy: .public)")
+
+        if !ChatVisibility.isVisible(group.id) {
+            let senderName = (try? store.getContact(userId: senderUserId))?.name
+                ?? String(UserIdHex.encode(senderUserId).prefix(8))
+            MessageNotifier.notifyIncomingGroupMessage(
+                group: group,
+                senderName: senderName,
+                preview: "Added you to \(group.name)"
+            )
         }
     }
 
@@ -626,9 +799,16 @@ final class MeshController: ObservableObject {
         return outbound
     }
 
-    private func carryForeign(msgId: Data, hopTtl: UInt8, expiry: Int64, recipientHint: Data, sealed: Data) {
+    private func carryForeign(
+        msgId: Data,
+        hopTtl: UInt8,
+        expiry: Int64,
+        recipientHint: Data,
+        sealed: Data,
+        forceFamily: Bool = false
+    ) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let isFamily = hintMatchesAnyContact(hint: recipientHint, now: now)
+        let isFamily = forceFamily || hintMatchesAnyContact(hint: recipientHint, now: now)
         _ = try? store.enqueueCarriedEnvelope(
             envelope: CarriedEnvelope(
                 msgId: msgId,

@@ -52,14 +52,30 @@ enum ChatListLogic {
         }.count
     }
 
+    static func computeGroupUnread(
+        messages: [StoredMessage],
+        ownUserId: Data,
+        readThroughForSender: (Data) -> UInt64
+    ) -> Int {
+        messages.filter {
+            isVisibleChatKind($0.kind)
+                && $0.senderUserId != ownUserId
+                && $0.lamport > readThroughForSender($0.senderUserId)
+        }.count
+    }
+
     static func lastVisibleMessage(_ messages: [StoredMessage]) -> StoredMessage? {
         messages.filter { isVisibleChatKind($0.kind) }.max(by: { $0.timestamp < $1.timestamp })
     }
 
-    static func previewText(_ message: StoredMessage) -> String {
-        if message.kind == ProtocolKind.attachmentManifest {
+    static func previewText(_ message: StoredMessage, groupName: String? = nil) -> String {
+        switch message.kind {
+        case ProtocolKind.attachmentManifest:
             return AttachmentPayload.previewLabel(AttachmentPayload.decode(message.payload))
+        case ProtocolKind.groupInvite:
+            return groupName != nil ? "Group created: \(groupName!)" : "Group invite"
+        default:
+            return String(data: message.payload, encoding: .utf8) ?? ""
         }
-        return String(data: message.payload, encoding: .utf8) ?? ""
     }
 }
