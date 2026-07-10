@@ -1,3 +1,4 @@
+import AVFoundation
 import Combine
 import Foundation
 import Network
@@ -11,12 +12,16 @@ final class MeshController: ObservableObject {
     private let log = Logger(subsystem: "com.cruisemesh", category: "MeshController")
     private let transport = BleTransport()
     private let store = AppStore.get()
+    private let bluetoothAudioBackoff = BluetoothAudioBackoff()
     private var identity: Identity!
     private var relayCursor: Int64 = 0
     private var relayTimer: Timer?
     private var pathMonitor: NWPathMonitor?
     private var isRunning = false
+    private var meshRolesRunning = false
+    private var pausedForBluetoothAudio = false
     private var relayCancellable: AnyCancellable?
+    private var audioRouteObserver: NSObjectProtocol?
 
     private init() {}
 
@@ -25,7 +30,15 @@ final class MeshController: ObservableObject {
     }
 
     func start() {
-        guard !isRunning else { return }
+        if isRunning {
+            // Repeat start while already running: refresh status only.
+            if pausedForBluetoothAudio {
+                MeshRuntimeStatus.shared.markPausedForBluetoothAudio()
+            } else {
+                MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
+            }
+            return
+        }
         isRunning = true
         MeshRuntimeStatus.shared.markStarting()
 
@@ -62,16 +75,19 @@ final class MeshController: ObservableObject {
             Task { @MainActor in MeshController.shared.refreshNearby() }
         }
 
-        transport.start()
+        registerBluetoothAudioObserver()
         startRelayLoop()
-        MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
+        refreshBluetoothAudioBackoff(reason: "mesh start")
         log.info("Mesh started")
     }
 
     func stop() {
         guard isRunning else { return }
         isRunning = false
-        transport.stop()
+        pausedForBluetoothAudio = false
+        bluetoothAudioBackoff.reset()
+        unregisterBluetoothAudioObserver()
+        stopMeshRoles()
         MeshRouter.unregisterCentral()
         MeshRouter.unregisterPeripheral()
         MeshRouter.reset()
@@ -79,8 +95,76 @@ final class MeshController: ObservableObject {
         relayTimer = nil
         pathMonitor?.cancel()
         pathMonitor = nil
+        relayCancellable?.cancel()
+        relayCancellable = nil
         MeshRuntimeStatus.shared.markStopped()
         log.info("Mesh stopped")
+    }
+
+    // MARK: - Bluetooth audio coexistence
+
+    private func registerBluetoothAudioObserver() {
+        guard audioRouteObserver == nil else { return }
+        audioRouteObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshBluetoothAudioBackoff(reason: "route change")
+            }
+        }
+    }
+
+    private func unregisterBluetoothAudioObserver() {
+        if let audioRouteObserver {
+            NotificationCenter.default.removeObserver(audioRouteObserver)
+            self.audioRouteObserver = nil
+        }
+    }
+
+    private func refreshBluetoothAudioBackoff(reason: String) {
+        guard isRunning else { return }
+        switch bluetoothAudioBackoff.update(bluetoothAudioActive: isBluetoothAudioActive()) {
+        case .active:
+            pausedForBluetoothAudio = false
+            log.info("Bluetooth audio clear; resuming BLE mesh (\(reason, privacy: .public))")
+            startMeshRoles()
+            MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
+        case .pausedForBluetoothAudio:
+            pausedForBluetoothAudio = true
+            log.info("Bluetooth audio active; pausing BLE mesh to protect audio (\(reason, privacy: .public))")
+            stopMeshRoles()
+            MeshRuntimeStatus.shared.markPausedForBluetoothAudio()
+        case nil:
+            break
+        }
+    }
+
+    /// Active Bluetooth audio route (A2DP / HFP / LE audio). See `BluetoothAudioBackoff`.
+    private func isBluetoothAudioActive() -> Bool {
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        return outputs.contains { port in
+            switch port.portType {
+            case .bluetoothA2DP, .bluetoothHFP, .bluetoothLE:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    private func startMeshRoles() {
+        guard !meshRolesRunning else { return }
+        transport.start()
+        meshRolesRunning = true
+    }
+
+    private func stopMeshRoles() {
+        guard meshRolesRunning else { return }
+        transport.stop()
+        meshRolesRunning = false
+        MeshRouter.reset()
     }
 
     func notifyChatViewed(chatId: Data) {
@@ -926,7 +1010,9 @@ final class MeshController: ObservableObject {
 
     private func runRelaySync() {
         guard let identity, let config = RelayConfigStore.load() else { return }
-        MeshRuntimeStatus.shared.markSyncingViaRelay()
+        if !pausedForBluetoothAudio {
+            MeshRuntimeStatus.shared.markSyncingViaRelay()
+        }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.relaySyncBlocking(identity: identity, config: config)
             Task { @MainActor in
@@ -1002,7 +1088,10 @@ final class MeshController: ObservableObject {
     }
 
     private func refreshNearby() {
-        if isRunning {
+        guard isRunning else { return }
+        if pausedForBluetoothAudio {
+            MeshRuntimeStatus.shared.markPausedForBluetoothAudio()
+        } else {
             MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
         }
     }

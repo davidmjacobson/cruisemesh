@@ -52,15 +52,19 @@ enum ChatListLogic {
         }.count
     }
 
+    /**
+     Group unread across multi-sender streams: for each other sender, count
+     messages above our local READ watermark for that sender.
+     */
     static func computeGroupUnread(
         messages: [StoredMessage],
         ownUserId: Data,
         readThroughForSender: (Data) -> UInt64
     ) -> Int {
-        messages.filter {
-            isVisibleChatKind($0.kind)
-                && $0.senderUserId != ownUserId
-                && $0.lamport > readThroughForSender($0.senderUserId)
+        messages.filter { msg in
+            isVisibleChatKind(msg.kind)
+                && msg.senderUserId != ownUserId
+                && msg.lamport > readThroughForSender(msg.senderUserId)
         }.count
     }
 
@@ -73,7 +77,8 @@ enum ChatListLogic {
         case ProtocolKind.attachmentManifest:
             return AttachmentPayload.previewLabel(AttachmentPayload.decode(message.payload))
         case ProtocolKind.groupInvite:
-            return groupName != nil ? "Group created: \(groupName!)" : "Group invite"
+            if let groupName { return "Group created: \(groupName)" }
+            return "Group invite"
         default:
             return String(data: message.payload, encoding: .utf8) ?? ""
         }

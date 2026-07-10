@@ -30,7 +30,9 @@ text each other "meet at the buffet at 6" and know whether the message got throu
 
 **Explicit non-goals (v1)**
 
-- Media (photos, audio memos) — but the wire format and storage must leave room. §8.
+- General media attachments (photos, audio memos) — but the wire format and
+  storage must leave room. Contact profile photos are a separate, tiny metadata
+  path. §6.2.1 and §8.
 - Anonymity / censorship resistance (Briar's threat model). Our adversary is "no
   internet," not a nation-state. We still encrypt end-to-end because relays and
   strangers' phones carry our ciphertext.
@@ -180,6 +182,35 @@ and the design must remain boring enough to describe in one page.
   other's keys. Contact card shows a short fingerprint phrase (4 words) for verbal
   verification, Signal-safety-number style.
 
+### 6.2.1 Contact profile photos
+
+Profile photos are **not** general chat media. They are durable contact metadata:
+"this is what I look like in your conversation list and friend card."
+
+- Canonical form: square-cropped JPEG or WebP, max **256 x 256**, target
+  **<= 24 KiB**. The app also derives a tiny thumbnail (**64 x 64**, target
+  **<= 4 KiB**) for list views and friending previews.
+- Storage: content-addressed by BLAKE2b hash, with a monotonic `avatar_epoch`
+  timestamp so updates are replaceable and idempotent. Newest epoch wins.
+- **QR friend cards do not embed image bytes.** They may carry
+  `{avatar_hash?, avatar_epoch?}` so a newly scanned contact can tell whether
+  an avatar exists, but the QR payload stays text-sized.
+- **Friending exchanges full photos on the spot.** Friending is in-person, so
+  a direct BLE link to the new friend is the normal case. When that link is
+  live, each side's sealed `profile-sync` envelope carries the **full-size**
+  avatar immediately — a 24 KiB transfer takes seconds, and both people walk
+  away from the handshake with each other's actual photos.
+- Fallbacks, for when the peers separate before the transfer completes (or a
+  photo changes mid-cruise): the signed `friend-request` follow-up envelope may
+  piggyback the thumbnail if it fits comfortably, and the queued `profile-sync`
+  retries over direct BLE on the next encounter or over the internet relay.
+- Full-size avatar bytes move only over **direct BLE** or the **internet
+  relay**. They are small enough to transfer opportunistically, but they are
+  **not** treated like foreign mule traffic and are never flood-gossiped to
+  uninvolved strangers' phones.
+- UI fallback remains the deterministic color + initials bubble when no shared
+  photo is present, decoding fails, or the user intentionally keeps no photo.
+
 ### 6.3 Message encryption (1:1)
 
 Per-message **sign-then-seal**:
@@ -236,7 +267,8 @@ Optional passworded channels later (Argon2id password → channel key, as bitcha
 version | sender UserID | chat id (peer or group) | lamport counter |
 timestamp | kind | payload
 kinds: text=1, receipt=2, friend-request=3, group-invite=4,
-       [reserved: attachment-manifest=16, attachment-chunk=17]
+       profile-sync=5, [reserved: attachment-manifest=16,
+       attachment-chunk=17]
 ```
 
 The per-chat **lamport counter** orders messages when clocks drift and lets a
@@ -271,6 +303,10 @@ interrupt mid-transfer — reconnection just re-runs the digest exchange.
 ---
 
 ## 8. Media readiness (photos & audio memos, later)
+
+Profile photos are the one intentional exception to "no media in v1": they are
+small, durable contact metadata (§6.2.1), not chat attachments. Everything
+larger than that still follows the rules below.
 
 Decisions taken **now** so media doesn't force a redesign:
 
@@ -408,9 +444,11 @@ pattern — contacts live one tap away behind the compose FAB, with friend manag
 One row per chat (1:1 now; groups and broadcast slot in later, §14.6), sorted by
 last activity, newest first.
 
-- **Avatar bubble**: colored circle, hue derived deterministically from the
-  contact's UserID bytes, initials from their display name (fallback: first two
-  characters of the base32 ID). No photos in v1 — media isn't on the wire yet (§8).
+- **Avatar bubble**: shared contact photo when present; otherwise a colored
+  circle whose hue is derived deterministically from the contact's UserID bytes,
+  with initials from their display name (fallback: first two characters of the
+  base32 ID). Shared avatars follow the tiny-metadata rules in §6.2.1, not the
+  general media rules in §8.
 - **Row content**: display name (bold when unread), one-line ellipsized snippet of
   the last message (`You: ` prefix for own), relative timestamp Signal-style
   (time-of-day today, weekday within 7 days, date otherwise), unread-count badge,
@@ -434,10 +472,10 @@ granted before — the giant "Start mesh" button dies. Honest copy matters here
 
 ### 14.4 Profile & settings (top-left avatar, like Signal)
 
-Absorbs the old identity screen: editable display name (ProfileStore), my QR friend
-card, UserID + fingerprint words (with the "read these aloud to verify" hint), mesh
-on/off, relay configuration status. Nothing here is daily-use, which is exactly why
-it lives behind the avatar.
+Absorbs the old identity screen: editable display name, local/shared profile
+photo picker, my QR friend card, UserID + fingerprint words (with the "read
+these aloud to verify" hint), mesh on/off, relay configuration status. Nothing
+here is daily-use, which is exactly why it lives behind the avatar.
 
 ### 14.5 Chat screen (already mostly built — polish only)
 

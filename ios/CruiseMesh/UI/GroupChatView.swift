@@ -97,7 +97,7 @@ struct GroupChatView: View {
             }
         }
         .onDisappear {
-            ChatVisibility.setVisible(nil)
+            ChatVisibility.clearVisible(group.id)
         }
         .sheet(isPresented: $showDetails) {
             GroupDetailsSheet(

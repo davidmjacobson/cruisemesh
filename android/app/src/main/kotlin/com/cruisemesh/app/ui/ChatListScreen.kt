@@ -83,6 +83,7 @@ data class ChatSummary(
 fun ChatListScreen(
     ownUserId: ByteArray,
     ownDisplayName: String,
+    ownAvatarPath: String?,
     onChatClick: (ChatSummary) -> Unit,
     onDeleteSummary: (ChatSummary) -> Unit,
     onNewChatClick: () -> Unit,
@@ -102,6 +103,7 @@ fun ChatListScreen(
                             name = ownDisplayName,
                             displayId = formatUserId(ownUserId),
                             size = 32.dp,
+                            photoPath = ownAvatarPath,
                         )
                     }
                 },
@@ -329,6 +331,7 @@ private fun ChatListScreenEmptyPreview() {
         ChatListScreen(
             ownUserId = byteArrayOf(0x44, 0x11),
             ownDisplayName = "Captain",
+            ownAvatarPath = null,
             onChatClick = {},
             onDeleteSummary = {},
             onNewChatClick = {},
@@ -355,6 +358,7 @@ private fun ChatListScreenPreview() {
         ChatListScreen(
             ownUserId = ownUserId,
             ownDisplayName = "Captain",
+            ownAvatarPath = null,
             onChatClick = {},
             onDeleteSummary = {},
             onNewChatClick = {},

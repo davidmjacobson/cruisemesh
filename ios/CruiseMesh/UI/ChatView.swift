@@ -138,7 +138,7 @@ struct ChatView: View {
             }
         }
         .onDisappear {
-            ChatVisibility.setVisible(nil)
+            ChatVisibility.clearVisible(contact.userId)
             voiceRecorder.cancel()
         }
         .onChange(of: photoItem) { item in
@@ -434,32 +434,4 @@ private struct CameraPicker: UIViewControllerRepresentable {
     }
 }
 
-private struct ContactDetailsSheet: View {
-    let contact: Contact
-    let onDelete: () -> Void
-    @Environment(\.dismiss) private var dismiss
 
-    var body: some View {
-        NavigationStack {
-            List {
-                Section("Contact") {
-                    LabeledContent("Name", value: contact.name)
-                    LabeledContent("ID", value: formatUserId(userId: contact.userId))
-                    LabeledContent(
-                        "Fingerprint",
-                        value: fingerprintWords(userId: contact.userId).joined(separator: " ")
-                    )
-                }
-                Section {
-                    Button("Delete contact", role: .destructive, action: onDelete)
-                }
-            }
-            .navigationTitle("Details")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
-    }
-}
