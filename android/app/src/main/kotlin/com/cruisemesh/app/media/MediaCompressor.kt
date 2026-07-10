@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
 import android.util.Log
+import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayOutputStream
 
 private const val TAG = "MediaCompressor"
@@ -47,9 +48,17 @@ object MediaCompressor {
                 BitmapFactory.decodeStream(it, null, opts)
             } ?: return null
 
-            val scaled = scaleToMaxEdge(decoded, MAX_EDGE_PX)
-            if (scaled !== decoded) decoded.recycle()
-            compressJpeg(scaled).also { scaled.recycle() }
+            // Camera photos record their rotation only in EXIF; re-compressing to
+            // JPEG below drops that tag, so bake the orientation into the pixels.
+            val orientation = context.contentResolver.openInputStream(uri)?.use {
+                ExifInterface(it).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL,
+                )
+            } ?: ExifInterface.ORIENTATION_NORMAL
+
+            val transformed = transform(decoded, MAX_EDGE_PX, orientation)
+            if (transformed !== decoded) decoded.recycle()
+            compressJpeg(transformed).also { transformed.recycle() }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to compress image from $uri: ${e.message}")
             null
@@ -63,9 +72,12 @@ object MediaCompressor {
             val sample = sampleSizeFor(bounds.outWidth, bounds.outHeight, MAX_EDGE_PX)
             val opts = BitmapFactory.Options().apply { inSampleSize = sample }
             val decoded = BitmapFactory.decodeFile(path, opts) ?: return null
-            val scaled = scaleToMaxEdge(decoded, MAX_EDGE_PX)
-            if (scaled !== decoded) decoded.recycle()
-            compressJpeg(scaled).also { scaled.recycle() }
+            val orientation = ExifInterface(path).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL,
+            )
+            val transformed = transform(decoded, MAX_EDGE_PX, orientation)
+            if (transformed !== decoded) decoded.recycle()
+            compressJpeg(transformed).also { transformed.recycle() }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to compress image file $path: ${e.message}")
             null
@@ -84,12 +96,39 @@ object MediaCompressor {
         return sample.coerceAtLeast(1)
     }
 
-    private fun scaleToMaxEdge(source: Bitmap, maxEdge: Int): Bitmap {
+    /**
+     * Downscales to [maxEdge] and applies the source's EXIF [orientation] in a
+     * single matrix pass. Returns [source] unchanged when neither is needed.
+     */
+    private fun transform(source: Bitmap, maxEdge: Int, orientation: Int): Bitmap {
         val longest = maxOf(source.width, source.height)
-        if (longest <= maxEdge) return source
-        val scale = maxEdge.toFloat() / longest.toFloat()
-        val matrix = Matrix().apply { setScale(scale, scale) }
+        val scale = if (longest > maxEdge) maxEdge.toFloat() / longest.toFloat() else 1f
+        val matrix = orientationMatrix(orientation) ?: Matrix()
+        if (scale != 1f) matrix.postScale(scale, scale)
+        if (matrix.isIdentity) return source
         return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+    }
+
+    /** Rotation/flip for an EXIF orientation tag, or null if none is required. */
+    private fun orientationMatrix(orientation: Int): Matrix? {
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> {
+                matrix.postRotate(90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_TRANSVERSE -> {
+                matrix.postRotate(270f)
+                matrix.postScale(-1f, 1f)
+            }
+            else -> return null
+        }
+        return matrix
     }
 
     private fun compressJpeg(bitmap: Bitmap): ByteArray? {
