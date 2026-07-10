@@ -44,6 +44,7 @@ private data class PermissionItem(
     val title: String,
     val detail: String,
     val enabled: Boolean,
+    val required: Boolean = false,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -247,35 +248,54 @@ private fun PermissionsSlide(
     onRequestBatteryExemption: () -> Unit,
 ) {
     SlideScaffold(
-        eyebrow = "Recommended setup",
-        title = "Turn on the permissions that help the mesh",
-        body = "CruiseMesh works best when Android lets it use nearby devices, show delivery notifications, and keep running in the background.",
+        eyebrow = "Required for messaging",
+        title = "CruiseMesh needs these permissions to work",
+        body = "Without Nearby devices access, this app cannot scan, connect, send, or receive messages. It will not work as designed until you grant them.",
     ) {
+        if (!meshPermissionsGranted) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = MaterialTheme.colorScheme.errorContainer,
+                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 4.dp),
+            ) {
+                Text(
+                    text = "Nearby permissions are required. Skipping them means the mesh stays off.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(16.dp),
+                )
+            }
+        }
+
         val items = listOf(
             PermissionItem(
                 title = "Nearby devices and notifications",
-                detail = "Lets CruiseMesh scan, advertise, connect, and tell you when messages arrive.",
+                detail = "Required so CruiseMesh can scan, advertise, connect over Bluetooth, and notify you when messages arrive.",
                 enabled = meshPermissionsGranted,
+                required = true,
             ),
             PermissionItem(
                 title = "Background activity",
-                detail = "Helps the mesh keep syncing while your phone is in your pocket.",
+                detail = "Strongly recommended so the mesh can keep syncing while your phone is in your pocket.",
                 enabled = batteryExemptionGranted,
+                required = false,
             ),
         )
         items.forEach { item -> PermissionStatusCard(item) }
 
-        OutlinedButton(
+        Button(
             onClick = onRequestMeshPermissions,
             enabled = !meshPermissionsGranted,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 18.dp),
         ) {
-            Text(if (meshPermissionsGranted) "Nearby access enabled" else "Enable nearby access")
+            Text(if (meshPermissionsGranted) "Nearby access enabled" else "Enable nearby access (required)")
         }
 
-        Button(
+        OutlinedButton(
             onClick = onRequestBatteryExemption,
             enabled = !batteryExemptionGranted,
             modifier = Modifier
@@ -286,9 +306,17 @@ private fun PermissionsSlide(
         }
 
         Text(
-            text = "You can continue without these, but message delivery will be less reliable while the app is backgrounded.",
+            text = if (meshPermissionsGranted) {
+                "Nearby access is on. Background exemption is optional but makes delivery more reliable when the app is not open."
+            } else {
+                "You can finish setup without granting access, but the home screen will keep warning you — and no messages will move over the mesh until you do."
+            },
             style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = if (meshPermissionsGranted) {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            } else {
+                MaterialTheme.colorScheme.error
+            },
             modifier = Modifier.padding(top = 14.dp),
         )
     }
@@ -384,15 +412,16 @@ private fun HighlightCard(title: String, detail: String) {
 
 @Composable
 private fun PermissionStatusCard(item: PermissionItem) {
+    val missingRequired = item.required && !item.enabled
     Surface(
         modifier = Modifier
             .fillMaxWidth()
             .padding(top = 12.dp),
         shape = RoundedCornerShape(20.dp),
-        color = if (item.enabled) {
-            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.75f)
-        } else {
-            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
+        color = when {
+            item.enabled -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.75f)
+            missingRequired -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.85f)
+            else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
         },
     ) {
         Column(modifier = Modifier.padding(18.dp)) {
@@ -407,12 +436,16 @@ private fun PermissionStatusCard(item: PermissionItem) {
                 modifier = Modifier.padding(top = 6.dp),
             )
             Text(
-                text = if (item.enabled) "Enabled" else "Recommended",
+                text = when {
+                    item.enabled -> "Enabled"
+                    item.required -> "Required — mesh off without this"
+                    else -> "Recommended"
+                },
                 style = MaterialTheme.typography.labelLarge,
-                color = if (item.enabled) {
-                    MaterialTheme.colorScheme.primary
-                } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
+                color = when {
+                    item.enabled -> MaterialTheme.colorScheme.primary
+                    item.required -> MaterialTheme.colorScheme.error
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
                 },
                 modifier = Modifier.padding(top = 10.dp),
             )

@@ -36,6 +36,7 @@ targets:
       - sdk: AVFoundation.framework
       - sdk: UserNotifications.framework
       - sdk: PhotosUI.framework
+      - sdk: Photos.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cruisemesh.app
@@ -56,11 +57,12 @@ targets:
         UIBackgroundModes:
           - bluetooth-central
           - bluetooth-peripheral
-        NSBluetoothAlwaysUsageDescription: CruiseMesh uses Bluetooth to message nearby friends without internet.
-        NSBluetoothPeripheralUsageDescription: CruiseMesh advertises so friends can find you on the mesh.
+        NSBluetoothAlwaysUsageDescription: CruiseMesh needs Bluetooth to scan, connect, send, and receive messages nearby. Without it, the mesh cannot work as designed.
+        NSBluetoothPeripheralUsageDescription: CruiseMesh needs Bluetooth advertising so friends can find you on the mesh. Without it, the mesh cannot work as designed.
         NSCameraUsageDescription: Take a photo to send in chat, or scan a friend QR code.
         NSMicrophoneUsageDescription: Record a short voice memo to send in chat.
         NSPhotoLibraryUsageDescription: Choose a photo from your library to send in chat.
+        NSPhotoLibraryAddUsageDescription: Save a photo from a chat message to your photo library.
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

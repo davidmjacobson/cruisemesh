@@ -97,10 +97,14 @@ fun GroupChatScreen(
         val meta = visibleMessages.map { ConversationMessageMeta(formatUserId(it.senderUserId), it.timestamp) }
         meta.indices.map { bubbleGroupingFor(meta, it) }
     }
+    // Newest-first for reverseLayout LazyColumn: index 0 sits at the bottom
+    // edge (just above the composer / keyboard), empty space stays above.
+    val displayMessages = remember(visibleMessages) { visibleMessages.asReversed() }
 
     LaunchedEffect(visibleMessages.size) {
         if (visibleMessages.isNotEmpty()) {
-            listState.animateScrollToItem(visibleMessages.size - 1)
+            // reverseLayout start is the bottom; pin the newest message there.
+            listState.scrollToItem(0)
         }
     }
 
@@ -124,15 +128,17 @@ fun GroupChatScreen(
         ) {
             LazyColumn(
                 state = listState,
+                reverseLayout = true,
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
                     .padding(vertical = 8.dp),
             ) {
                 itemsIndexed(
-                    visibleMessages,
+                    displayMessages,
                     key = { _, message -> "${message.senderUserId.contentHashCode()}:${message.lamport}" },
-                ) { index, message ->
+                ) { revIndex, message ->
+                    val index = visibleMessages.lastIndex - revIndex
                     val isOwn = message.senderUserId.contentEquals(ownUserId)
                     GroupMessageBubble(
                         message = message,

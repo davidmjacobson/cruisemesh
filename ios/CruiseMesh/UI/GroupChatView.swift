@@ -24,30 +24,35 @@ struct GroupChatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(visible.enumerated()), id: \.offset) { index, message in
-                            GroupMessageRow(
-                                message: message,
-                                isOwn: message.senderUserId == identity.userId,
-                                groupName: group.name,
-                                senderLabel: senderLabel(at: index),
-                                contactColor: ChatListLogic.avatarHueAndInitials(
-                                    userId: message.senderUserId,
-                                    name: senderName(message.senderUserId),
-                                    displayId: formatUserId(userId: message.senderUserId)
-                                ).0
-                            )
-                            .id(messageId(message))
+            GeometryReader { geo in
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(visible.enumerated()), id: \.offset) { index, message in
+                                GroupMessageRow(
+                                    message: message,
+                                    isOwn: message.senderUserId == identity.userId,
+                                    groupName: group.name,
+                                    senderLabel: senderLabel(at: index),
+                                    contactColor: ChatListLogic.avatarHueAndInitials(
+                                        userId: message.senderUserId,
+                                        name: senderName(message.senderUserId),
+                                        displayId: formatUserId(userId: message.senderUserId)
+                                    ).0
+                                )
+                                .id(messageId(message))
+                            }
                         }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .frame(minHeight: geo.size.height, alignment: .bottom)
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                }
-                .onChange(of: visible.count) { _ in
-                    if let last = visible.last {
-                        withAnimation { proxy.scrollTo(messageId(last), anchor: .bottom) }
+                    .scrollDismissesKeyboard(.interactively)
+                    .onChange(of: visible.count) { _ in
+                        scrollToLatest(proxy: proxy)
+                    }
+                    .onAppear {
+                        scrollToLatest(proxy: proxy, animated: false)
                     }
                 }
             }
@@ -67,6 +72,7 @@ struct GroupChatView: View {
                 .buttonStyle(.borderedProminent)
             }
             .padding(12)
+            .background(.bar)
         }
         .navigationTitle(group.name)
         .navigationBarTitleDisplayMode(.inline)
@@ -130,6 +136,16 @@ struct GroupChatView: View {
 
     private func messageId(_ message: StoredMessage) -> String {
         "\(UserIdHex.encode(message.senderUserId))-\(message.lamport)-\(message.kind)"
+    }
+
+    private func scrollToLatest(proxy: ScrollViewProxy, animated: Bool = true) {
+        guard let last = visible.last else { return }
+        let id = messageId(last)
+        if animated {
+            withAnimation { proxy.scrollTo(id, anchor: .bottom) }
+        } else {
+            proxy.scrollTo(id, anchor: .bottom)
+        }
     }
 
     /// Show a sender label above a non-own message when it starts a new run
