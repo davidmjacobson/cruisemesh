@@ -35,6 +35,7 @@ struct ChatListView: View {
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, 32)
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     List(summaries) { summary in
                         NavigationLink(value: UserIdHex.encode(summary.contact.userId)) {
