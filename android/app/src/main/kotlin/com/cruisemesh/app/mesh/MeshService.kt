@@ -35,6 +35,7 @@ import com.cruisemesh.app.notify.MessageNotifier
 import com.cruisemesh.app.relay.RelayClient
 import com.cruisemesh.app.relay.RelayConfig
 import com.cruisemesh.app.relay.RelayConfigStore
+import com.cruisemesh.app.relay.RelayImport
 import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
@@ -1447,13 +1448,17 @@ class MeshService : Service() {
             return
         }
 
-        val contact = Contact(
-            userId = senderUserId,
-            name = card.name,
-            signPk = card.signPk,
-            agreePk = card.agreePk,
-            relayUrl = card.relayUrl,
-            relayToken = card.relayToken,
+        val contact = RelayImport.reconcileOnImport(
+            this,
+            store,
+            Contact(
+                userId = senderUserId,
+                name = card.name,
+                signPk = card.signPk,
+                agreePk = card.agreePk,
+                relayUrl = card.relayUrl,
+                relayToken = card.relayToken,
+            ),
         )
         store.upsertContact(contact)
         val inserted = store.insertMessage(
