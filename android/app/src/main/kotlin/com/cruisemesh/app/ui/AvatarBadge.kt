@@ -21,6 +21,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import java.io.File
 
 @Composable
 fun AvatarBadge(
@@ -38,7 +39,10 @@ fun AvatarBadge(
     val contentDescription = remember(name, displayId) {
         ChatListLogic.avatarContentDescription(name, displayId)
     }
-    val avatarBitmap = remember(photoPath) {
+    // The saved avatar always lives at the same path, so a replaced photo
+    // needs the file's mtime in the key too or this keeps showing the stale
+    // decoded bitmap from before the replacement.
+    val avatarBitmap = remember(photoPath, photoPath?.let { File(it).lastModified() }) {
         photoPath?.let { path -> BitmapFactory.decodeFile(path)?.asImageBitmap() }
     }
 

@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -73,11 +74,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import com.cruisemesh.app.media.AttachmentPayload
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import com.cruisemesh.app.media.MediaCompressor
 import com.cruisemesh.app.media.VoiceRecorder
+import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.media.isVisibleChatKind
 import com.cruisemesh.app.ui.AvatarBadge
 import com.cruisemesh.app.ui.BubbleGrouping
@@ -324,10 +325,7 @@ fun ChatScreen(
 }
 
 private fun launchCamera(context: android.content.Context, onReady: (Uri) -> Unit) {
-    val dir = File(context.cacheDir, "camera").apply { mkdirs() }
-    val file = File(dir, "capture-${System.currentTimeMillis()}.jpg")
-    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-    onReady(uri)
+    onReady(createCameraCaptureUri(context))
 }
 
 @Composable
@@ -400,6 +398,7 @@ private fun ConversationScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
+                .imePadding()
                 .padding(horizontal = 16.dp)
         ) {
             LazyColumn(

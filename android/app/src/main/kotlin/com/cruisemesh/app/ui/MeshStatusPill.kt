@@ -18,6 +18,40 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
+/**
+ * Sits above [MeshStatusPill] whenever the mesh flatly can't send or receive
+ * (Bluetooth permissions not granted, or the radio itself is off) rather
+ * than just being between hops -- distinct enough that it doesn't blend in
+ * with routine "Mesh stopped" status text.
+ */
+@Composable
+fun ConnectivityWarningBanner(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .semantics {
+                role = Role.Button
+                contentDescription = text
+            }
+            .clickable(onClick = onClick),
+        color = MaterialTheme.colorScheme.primary,
+        contentColor = MaterialTheme.colorScheme.onPrimary,
+    ) {
+        Text(
+            text = text,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            style = MaterialTheme.typography.labelLarge,
+            textAlign = TextAlign.Center,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
 @Composable
 fun MeshStatusPill(
     text: String,

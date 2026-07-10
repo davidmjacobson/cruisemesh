@@ -250,7 +250,18 @@ class BlePeripheral(
         val characteristic = outboundCharacteristic ?: return
         val server = gattServer ?: return
         characteristic.value = fragment
-        if (server.notifyCharacteristicChanged(device, characteristic, false)) {
+        // notifyCharacteristicChanged throws IllegalArgumentException on an
+        // oversized value; letting that unwind here would abandon the GATT
+        // callback it runs on (e.g. a central never gets its write response and
+        // the link times out). FrameFraming keeps fragments within the ATT cap,
+        // so this guard is belt-and-suspenders against any future bad fragment.
+        val notified = try {
+            server.notifyCharacteristicChanged(device, characteristic, false)
+        } catch (e: Exception) {
+            Log.w(TAG, "sendNextQueuedFragment: notify threw for $address (${e.message}); dropping fragment")
+            false
+        }
+        if (notified) {
             notifyInFlight += address
         } else {
             Log.w(TAG, "sendNextQueuedFragment: notifyCharacteristicChanged rejected for $address")

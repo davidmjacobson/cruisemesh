@@ -304,7 +304,16 @@ class BleCentral(
             return
         }
         inbound.value = fragment
-        if (gatt.writeCharacteristic(inbound)) {
+        // writeCharacteristic can throw on an oversized value; keep it from
+        // unwinding this GATT callback (mirrors BlePeripheral). FrameFraming
+        // already caps fragments at the ATT limit, so this is a safety net.
+        val written = try {
+            gatt.writeCharacteristic(inbound)
+        } catch (e: Exception) {
+            Log.w(TAG, "sendNextQueuedFragment: write threw for $address (${e.message}); dropping fragment")
+            false
+        }
+        if (written) {
             writeInFlight += address
         } else {
             Log.w(TAG, "sendNextQueuedFragment: writeCharacteristic rejected for $address")

@@ -1,6 +1,9 @@
 package com.cruisemesh.app.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,8 +36,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
+import com.cruisemesh.app.media.createCameraCaptureUri
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -57,11 +62,23 @@ fun ProfileScreen(
             avatarPath = ProfilePhotoStore.saveFromUri(context, uri) ?: avatarPath
         }
     }
+    var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
     val takePhotoLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.TakePicturePreview(),
-    ) { bitmap ->
-        if (bitmap != null) {
-            avatarPath = ProfilePhotoStore.saveFromBitmap(context, bitmap) ?: avatarPath
+        ActivityResultContracts.TakePicture(),
+    ) { success ->
+        val uri = pendingCameraUri
+        pendingCameraUri = null
+        if (success && uri != null) {
+            avatarPath = ProfilePhotoStore.saveFromUri(context, uri) ?: avatarPath
+        }
+    }
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            val uri = createCameraCaptureUri(context)
+            pendingCameraUri = uri
+            takePhotoLauncher.launch(uri)
         }
     }
 
@@ -94,7 +111,17 @@ fun ProfileScreen(
                     displayName = it
                     ProfileStore.saveDisplayName(context, it)
                 },
-                onTakePhoto = { takePhotoLauncher.launch(null) },
+                onTakePhoto = {
+                    val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                        PackageManager.PERMISSION_GRANTED
+                    if (granted) {
+                        val uri = createCameraCaptureUri(context)
+                        pendingCameraUri = uri
+                        takePhotoLauncher.launch(uri)
+                    } else {
+                        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                    }
+                },
                 onChoosePhoto = {
                     pickPhotoLauncher.launch(
                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),

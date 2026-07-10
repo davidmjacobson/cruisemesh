@@ -22,9 +22,6 @@ object ProfilePhotoStore {
         avatarFile(context).delete()
     }
 
-    fun saveFromBitmap(context: Context, bitmap: Bitmap): String? =
-        saveBitmap(context, bitmap)
-
     fun saveFromUri(context: Context, uri: Uri): String? {
         val bitmap = decodeSampledBitmap(context, uri) ?: return null
         return saveBitmap(context, bitmap)

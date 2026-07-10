@@ -15,12 +15,28 @@ object FrameFraming {
     /** Usable payload at the default (un-negotiated) ATT MTU of 23 bytes. */
     const val DEFAULT_ATT_MTU = 23
 
+    /**
+     * The GATT spec caps a single attribute value (and therefore one
+     * write/notification payload) at 512 bytes, independent of the negotiated
+     * MTU. Modern phones negotiate MTU 517, so `mtu - ATT_HEADER_OVERHEAD` is
+     * 514 -- two over this limit -- and `notifyCharacteristicChanged` /
+     * `writeCharacteristic` throw `IllegalArgumentException: Notification
+     * should not be longer than max length of an attribute value` on any
+     * fragment that fills the chunk. That uncaught throw also unwinds the GATT
+     * callback it fires in, stalling the link. So every emitted fragment must
+     * fit here regardless of how large the MTU is.
+     */
+    const val MAX_ATT_VALUE_LEN = 512
+
     private const val HEADER_SIZE = 2
     private const val MAX_FRAGMENTS = 255
 
     /** Split [frame] into BLE-sized fragments, each prefixed with [index, total]. */
     fun fragment(frame: ByteArray, mtuPayloadSize: Int): List<ByteArray> {
-        val chunkSize = (mtuPayloadSize - HEADER_SIZE).coerceAtLeast(1)
+        // A fragment is HEADER_SIZE + chunkSize bytes, so cap the whole
+        // fragment at MAX_ATT_VALUE_LEN, never just the MTU-derived size.
+        val cappedPayload = mtuPayloadSize.coerceAtMost(MAX_ATT_VALUE_LEN)
+        val chunkSize = (cappedPayload - HEADER_SIZE).coerceAtLeast(1)
         val total = maxOf(1, (frame.size + chunkSize - 1) / chunkSize)
         require(total <= MAX_FRAGMENTS) {
             "frame too large to fragment: ${frame.size} bytes needs $total fragments (max $MAX_FRAGMENTS)"
