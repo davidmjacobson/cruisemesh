@@ -3,6 +3,9 @@
 
 # Android / Gradle
 android/local.properties
+android/app/keystore.properties
+android/app/*.jks
+android/app/*.keystore
 android/.gradle/
 android/.kotlin/
 android/build/
