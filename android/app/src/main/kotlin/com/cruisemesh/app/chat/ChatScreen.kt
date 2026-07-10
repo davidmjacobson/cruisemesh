@@ -22,7 +22,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -394,11 +393,13 @@ private fun ConversationScreen(
             )
         }
     ) { innerPadding ->
+        // Scaffold's contentWindowInsets (safeDrawing) already include IME, so
+        // do not also call imePadding() here — that double-counts keyboard height
+        // and leaves a large blank gap above the soft keyboard.
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .imePadding()
                 .padding(horizontal = 16.dp)
         ) {
             LazyColumn(

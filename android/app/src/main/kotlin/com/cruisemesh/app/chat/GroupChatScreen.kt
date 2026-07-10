@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -115,11 +114,12 @@ fun GroupChatScreen(
             )
         },
     ) { innerPadding ->
+        // Scaffold already applies safeDrawing (incl. IME) via innerPadding.
+        // Extra imePadding() double-counts keyboard height above the soft keyboard.
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .imePadding()
                 .padding(horizontal = 16.dp),
         ) {
             LazyColumn(
