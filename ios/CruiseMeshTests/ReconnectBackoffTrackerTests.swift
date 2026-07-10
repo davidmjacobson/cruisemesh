@@ -79,4 +79,21 @@ final class ReconnectBackoffTrackerTests: XCTestCase {
         XCTAssertTrue(tracker.canAttempt(address: "FRESH", nowMs: 0))
         XCTAssertFalse(tracker.isGivenUp(address: "FRESH"))
     }
+
+    func testRetryDelayTracksNextEligibleAttempt() {
+        let tracker = ReconnectBackoffTracker(initialBackoffMs: 1_000, maxBackoffMs: 10_000)
+        tracker.recordFailure(address: "AA:BB", nowMs: 500)
+
+        XCTAssertEqual(tracker.retryDelayMs(address: "AA:BB", nowMs: 750), 750)
+        XCTAssertEqual(tracker.retryDelayMs(address: "AA:BB", nowMs: 1_500), 0)
+    }
+
+    func testClearForgetsAllAddresses() {
+        let tracker = ReconnectBackoffTracker(initialBackoffMs: 1_000, maxBackoffMs: 10_000)
+        tracker.recordFailure(address: "AA:BB", nowMs: 0)
+        tracker.clear()
+
+        XCTAssertTrue(tracker.canAttempt(address: "AA:BB", nowMs: 0))
+        XCTAssertNil(tracker.retryDelayMs(address: "AA:BB", nowMs: 0))
+    }
 }

@@ -38,6 +38,10 @@ final class AttachmentPayloadTests: XCTestCase {
         XCTAssertNil(AttachmentPayload.decode(bytes))
     }
 
+    func testRejectsTruncatedNumericFields() {
+        XCTAssertNil(AttachmentPayload.decode(Data([1, 1, 0, 0, 0, 0, 0])))
+    }
+
     func testPreviewLabels() {
         let photo = AttachmentPayload(mediaType: .image, mimeType: "image/jpeg", durationMs: 0, blob: Data([1]))
         XCTAssertEqual(AttachmentPayload.previewLabel(photo), "📷 Photo")

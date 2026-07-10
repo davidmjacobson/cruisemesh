@@ -34,5 +34,6 @@ func isVisibleChatKind(_ kind: UInt8) -> Bool {
 func isAuthoredChatKind(_ kind: UInt8) -> Bool {
     kind == ProtocolKind.text
         || kind == ProtocolKind.friendRequest
+        || kind == ProtocolKind.groupInvite
         || kind == ProtocolKind.attachmentManifest
 }

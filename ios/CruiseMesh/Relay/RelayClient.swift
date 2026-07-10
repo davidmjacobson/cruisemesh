@@ -65,16 +65,27 @@ enum RelayClient {
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        let items = json["envelopes"] as? [[String: Any]] ?? []
-        let nextCursor = (json["next_cursor"] as? NSNumber)?.int64Value ?? afterId
+        guard let items = json["envelopes"] as? [[String: Any]],
+              let nextCursor = (json["next_cursor"] as? NSNumber)?.int64Value else {
+            throw malformedResponse("missing relay page fields")
+        }
         let envelopes: [RelayFetchedEnvelope] = try items.map { item in
-            RelayFetchedEnvelope(
-                id: (item["id"] as? NSNumber)?.int64Value ?? 0,
-                msgId: try base64UrlDecode(item["msg_id"] as? String ?? ""),
-                hopTtl: UInt8((item["hop_ttl"] as? NSNumber)?.intValue ?? 0),
-                recipientHint: try base64UrlDecode(item["recipient_hint"] as? String ?? ""),
-                sealed: try base64UrlDecode(item["sealed"] as? String ?? ""),
-                expiryMs: (item["expiry_ms"] as? NSNumber)?.int64Value ?? 0
+            guard let id = (item["id"] as? NSNumber)?.int64Value,
+                  let msgId = item["msg_id"] as? String,
+                  let hopTtlValue = (item["hop_ttl"] as? NSNumber)?.intValue,
+                  let hopTtl = UInt8(exactly: hopTtlValue),
+                  let recipientHint = item["recipient_hint"] as? String,
+                  let sealed = item["sealed"] as? String,
+                  let expiryMs = (item["expiry_ms"] as? NSNumber)?.int64Value else {
+                throw malformedResponse("invalid relay envelope")
+            }
+            return RelayFetchedEnvelope(
+                id: id,
+                msgId: try base64UrlDecode(msgId),
+                hopTtl: hopTtl,
+                recipientHint: try base64UrlDecode(recipientHint),
+                sealed: try base64UrlDecode(sealed),
+                expiryMs: expiryMs
             )
         }
         return RelayFetchPage(envelopes: envelopes, nextCursor: nextCursor)
@@ -117,7 +128,10 @@ enum RelayClient {
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        return (json["id"] as? NSNumber)?.int64Value ?? 0
+        guard let id = (json["id"] as? NSNumber)?.int64Value else {
+            throw malformedResponse("missing posted envelope id")
+        }
+        return id
     }
 
     private static func applyAuth(_ request: inout URLRequest, config: RelayConfig) {
@@ -136,8 +150,8 @@ enum RelayClient {
 
     private static func syncRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
         let sem = DispatchSemaphore(value: 0)
-        var result: Result<(Data, URLResponse), Error>!
-        urlSession.dataTask(with: request) { data, response, error in
+        var result: Result<(Data, URLResponse), Error>?
+        let task = urlSession.dataTask(with: request) { data, response, error in
             if let error {
                 result = .failure(error)
             } else if let data, let response {
@@ -146,13 +160,22 @@ enum RelayClient {
                 result = .failure(NSError(domain: "RelayClient", code: 2, userInfo: [NSLocalizedDescriptionKey: "empty response"]))
             }
             sem.signal()
-        }.resume()
-        _ = sem.wait(timeout: .now() + connectTimeout + 5)
+        }
+        task.resume()
+        guard sem.wait(timeout: .now() + connectTimeout + 5) == .success else {
+            task.cancel()
+            throw URLError(.timedOut)
+        }
+        guard let result else {
+            throw malformedResponse("request completed without a result")
+        }
         return try result.get()
     }
 
     private static func ensureOK(_ response: URLResponse, data: Data) throws {
-        guard let http = response as? HTTPURLResponse else { return }
+        guard let http = response as? HTTPURLResponse else {
+            throw malformedResponse("non-HTTP relay response")
+        }
         guard (200..<300).contains(http.statusCode) else {
             let body = String(data: data, encoding: .utf8) ?? ""
             throw NSError(
@@ -178,5 +201,13 @@ enum RelayClient {
             throw NSError(domain: "RelayClient", code: 3, userInfo: [NSLocalizedDescriptionKey: "bad base64"])
         }
         return data
+    }
+
+    private static func malformedResponse(_ message: String) -> NSError {
+        NSError(
+            domain: "RelayClient",
+            code: 4,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
     }
 }

@@ -2,9 +2,10 @@ import AVFoundation
 import Foundation
 
 final class VoiceRecorder: NSObject {
+    static let maxDurationSeconds: TimeInterval = 30
+
     private var recorder: AVAudioRecorder?
     private var outputURL: URL?
-    private var startedAt: Date?
 
     var isRecording: Bool { recorder?.isRecording == true }
 
@@ -15,6 +16,7 @@ final class VoiceRecorder: NSObject {
             try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
             try session.setActive(true)
         } catch {
+            deactivateAudioSession()
             return false
         }
 
@@ -30,27 +32,30 @@ final class VoiceRecorder: NSObject {
         do {
             let rec = try AVAudioRecorder(url: url, settings: settings)
             rec.prepareToRecord()
-            guard rec.record() else { return false }
+            guard rec.record(forDuration: Self.maxDurationSeconds) else {
+                deactivateAudioSession()
+                return false
+            }
             recorder = rec
             outputURL = url
-            startedAt = Date()
             return true
         } catch {
+            deactivateAudioSession()
             return false
         }
     }
 
     /// Stops and returns (file URL, duration ms), or nil.
     func stop() -> (URL, Int32)? {
-        guard let recorder, let url = outputURL, let startedAt else {
+        guard let recorder, let url = outputURL else {
             cancel()
             return nil
         }
+        let duration = Int32(min(recorder.currentTime * 1_000, Double(Int32.max)))
         recorder.stop()
+        deactivateAudioSession()
         self.recorder = nil
         self.outputURL = nil
-        let duration = Int32(Date().timeIntervalSince(startedAt) * 1000)
-        self.startedAt = nil
         guard FileManager.default.fileExists(atPath: url.path),
               (try? Data(contentsOf: url))?.isEmpty == false else {
             try? FileManager.default.removeItem(at: url)
@@ -60,12 +65,19 @@ final class VoiceRecorder: NSObject {
     }
 
     func cancel() {
+        let hadActiveRecording = recorder != nil || outputURL != nil
         recorder?.stop()
+        if hadActiveRecording {
+            deactivateAudioSession()
+        }
         recorder = nil
         if let url = outputURL {
             try? FileManager.default.removeItem(at: url)
         }
         outputURL = nil
-        startedAt = nil
+    }
+
+    private func deactivateAudioSession() {
+        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
     }
 }

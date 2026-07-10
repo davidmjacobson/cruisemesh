@@ -14,7 +14,6 @@ final class MeshController: ObservableObject {
     private let store = AppStore.get()
     private let bluetoothAudioBackoff = BluetoothAudioBackoff()
     private var identity: Identity!
-    private var relayCursor: Int64 = 0
     private var relayTimer: Timer?
     private var pathMonitor: NWPathMonitor?
     private var isRunning = false
@@ -22,6 +21,8 @@ final class MeshController: ObservableObject {
     private var pausedForBluetoothAudio = false
     private var relayCancellable: AnyCancellable?
     private var audioRouteObserver: NSObjectProtocol?
+    private var relaySyncInFlight = false
+    private var relaySyncPending = false
 
     private init() {}
 
@@ -97,6 +98,7 @@ final class MeshController: ObservableObject {
         pathMonitor = nil
         relayCancellable?.cancel()
         relayCancellable = nil
+        relaySyncPending = false
         MeshRuntimeStatus.shared.markStopped()
         log.info("Mesh stopped")
     }
@@ -195,6 +197,25 @@ final class MeshController: ObservableObject {
         RelaySyncEvents.requestSync()
     }
 
+    func notifyGroupViewed(groupId: Data) {
+        guard let identity,
+              let group = try? store.getGroup(groupId: groupId),
+              group.memberUserIds.contains(identity.userId) else { return }
+        for senderUserId in group.memberUserIds where senderUserId != identity.userId {
+            let through = (try? store.highestContiguousLamport(
+                chatId: groupId,
+                senderUserId: senderUserId
+            )) ?? 0
+            guard through > 0 else { continue }
+            try? store.recordOutgoingReceipt(
+                chatId: groupId,
+                senderUserId: senderUserId,
+                receiptType: ReceiptType.read,
+                throughLamport: through
+            )
+        }
+    }
+
     // MARK: - Frames
 
     private func sendHello(address: String) {
@@ -286,6 +307,7 @@ final class MeshController: ObservableObject {
                 }
             }
         }
+        resendGroupOutboundToPeer(address: address, peerUserId: peerUserId, identity: identity)
         sprayCarriedEnvelopesTo(address: address, peerUserId: peerUserId, peerKnownIds: Set(recentMsgIds))
     }
 
@@ -309,6 +331,30 @@ final class MeshController: ObservableObject {
             let opened = try openMessage(recipient: identity, sealed: sealed)
             deliverOpened(sourceLabel: sourceLabel, sourceAddress: sourceAddress, opened: opened, identity: identity)
         } catch {
+            if let (group, opened) = tryOpenGroupMessage(recipientHint: recipientHint, sealed: sealed) {
+                deliverOpenedGroup(
+                    sourceLabel: sourceLabel,
+                    group: group,
+                    opened: opened,
+                    identity: identity
+                )
+                relayForeign(
+                    sourceAddress: sourceAddress,
+                    msgId: msgId,
+                    hopTtl: hopTtl,
+                    expiry: expiry,
+                    recipientHint: recipientHint,
+                    sealed: sealed
+                )
+                carryForeign(
+                    msgId: msgId,
+                    hopTtl: hopTtl,
+                    expiry: expiry,
+                    recipientHint: recipientHint,
+                    sealed: sealed
+                )
+                return
+            }
             relayForeign(
                 sourceAddress: sourceAddress,
                 msgId: msgId,
@@ -354,6 +400,12 @@ final class MeshController: ObservableObject {
         case ProtocolKind.friendRequest:
             handleIncomingFriendRequest(
                 sourceAddress: sourceAddress,
+                senderUserId: opened.senderUserId,
+                body: body,
+                identity: identity
+            )
+        case ProtocolKind.groupInvite:
+            handleIncomingGroupInvite(
                 senderUserId: opened.senderUserId,
                 body: body,
                 identity: identity
@@ -527,6 +579,148 @@ final class MeshController: ObservableObject {
             )
         }
         log.info("Imported contact \(contact.name, privacy: .public) from friend request")
+    }
+
+    private func handleIncomingGroupInvite(
+        senderUserId: Data,
+        body: MessageBody,
+        identity: Identity
+    ) {
+        guard let group = try? decodeGroupInviteContent(bytes: body.content),
+              group.memberUserIds.contains(identity.userId),
+              group.memberUserIds.contains(senderUserId) else { return }
+        do {
+            try store.upsertGroup(group: group)
+            let inserted = try store.insertMessage(message: StoredMessage(
+                chatId: group.id,
+                senderUserId: senderUserId,
+                lamport: body.lamport,
+                timestamp: body.timestamp,
+                kind: ProtocolKind.groupInvite,
+                payload: body.content
+            ))
+            guard inserted else { return }
+            ChatEvents.notifyChatChanged(group.id)
+            deliverCarriedMessagesForImportedGroup(group: group, identity: identity)
+            if !ChatVisibility.isVisible(group.id) {
+                let senderName = (try? store.getContact(userId: senderUserId))?.name
+                    ?? String(UserIdHex.encode(senderUserId).prefix(8))
+                MessageNotifier.notifyIncomingGroup(
+                    group: group,
+                    senderName: senderName,
+                    preview: "Added you to \(group.name)"
+                )
+            }
+        } catch {
+            log.warning("Failed to import group invite: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func deliverCarriedMessagesForImportedGroup(group: Group, identity: Identity) {
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        let hints = recentHintsFor(userId: group.id, now: now)
+        let carried = (try? store.carriedEnvelopesForHints(hints: hints, nowMs: now)) ?? []
+        for envelope in carried {
+            guard let opened = try? openGroupMessage(group: group, sealed: envelope.sealed) else { continue }
+            deliverOpenedGroup(
+                sourceLabel: "carry queue",
+                group: group,
+                opened: opened,
+                identity: identity
+            )
+        }
+    }
+
+    private func tryOpenGroupMessage(recipientHint: Data, sealed: Data) -> (Group, OpenedMessage)? {
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        let groups = (try? store.listGroups()) ?? []
+        for group in groups {
+            guard recentHintsFor(userId: group.id, now: now).contains(recipientHint) else { continue }
+            if let opened = try? openGroupMessage(group: group, sealed: sealed) {
+                return (group, opened)
+            }
+        }
+        return nil
+    }
+
+    private func deliverOpenedGroup(
+        sourceLabel: String,
+        group: Group,
+        opened: OpenedMessage,
+        identity: Identity
+    ) {
+        guard group.memberUserIds.contains(identity.userId),
+              group.memberUserIds.contains(opened.senderUserId),
+              let body = try? decodeMessageBody(bytes: opened.payload),
+              body.chatId == group.id,
+              body.kind == ProtocolKind.text else {
+            log.warning("Dropping invalid group envelope from \(sourceLabel, privacy: .public)")
+            return
+        }
+
+        let inserted = (try? store.insertMessage(message: StoredMessage(
+            chatId: group.id,
+            senderUserId: opened.senderUserId,
+            lamport: body.lamport,
+            timestamp: body.timestamp,
+            kind: body.kind,
+            payload: body.content
+        ))) ?? false
+        guard inserted else { return }
+
+        ChatEvents.notifyChatChanged(group.id)
+        let through = (try? store.highestContiguousLamport(
+            chatId: group.id,
+            senderUserId: opened.senderUserId
+        )) ?? 0
+        try? store.recordOutgoingReceipt(
+            chatId: group.id,
+            senderUserId: opened.senderUserId,
+            receiptType: ReceiptType.delivered,
+            throughLamport: through
+        )
+        if ChatVisibility.isVisible(group.id) {
+            try? store.recordOutgoingReceipt(
+                chatId: group.id,
+                senderUserId: opened.senderUserId,
+                receiptType: ReceiptType.read,
+                throughLamport: through
+            )
+        } else {
+            let senderName = (try? store.getContact(userId: opened.senderUserId))?.name
+                ?? String(UserIdHex.encode(opened.senderUserId).prefix(8))
+            MessageNotifier.notifyIncomingGroup(
+                group: group,
+                senderName: senderName,
+                preview: String(data: body.content, encoding: .utf8) ?? "New message"
+            )
+        }
+    }
+
+    private func resendGroupOutboundToPeer(
+        address: String,
+        peerUserId: Data,
+        identity: Identity
+    ) {
+        let groups = (try? store.listGroups()) ?? []
+        for group in groups where group.memberUserIds.contains(peerUserId)
+            && group.memberUserIds.contains(identity.userId) {
+            let envelopes = (try? store.outboundEnvelopesAfter(
+                chatId: group.id,
+                senderUserId: identity.userId,
+                afterLamport: 0
+            )) ?? []
+            for envelope in envelopes {
+                if envelope.kind == ProtocolKind.groupInvite,
+                   envelope.recipientUserId != peerUserId {
+                    continue
+                }
+                _ = MeshRouter.sendToAddress(
+                    address: address,
+                    frame: encodeOutboundEnvelopeFrame(envelope)
+                )
+            }
+        }
     }
 
     // MARK: - Receipts / carry / relay
@@ -755,7 +949,7 @@ final class MeshController: ObservableObject {
     private func drainCarriedEnvelopesTo(address: String, peerUserId: Data) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         try? store.pruneExpiredCarried(nowMs: now)
-        let hints = recentHintsFor(userId: peerUserId, now: now)
+        let hints = deliveryHintsForPeer(peerUserId: peerUserId, now: now)
         let toDeliver = (try? store.carriedEnvelopesForHints(hints: hints, nowMs: now)) ?? []
         for env in toDeliver {
             let frame = encodeEnvelopeFrame(
@@ -766,7 +960,9 @@ final class MeshController: ObservableObject {
                 sealed: env.sealed
             )
             if MeshRouter.sendToAddress(address: address, frame: frame) {
-                try? store.removeCarriedEnvelope(msgId: env.msgId)
+                if !recognizesGroupHint(env.recipientHint, now: now) {
+                    try? store.removeCarriedEnvelope(msgId: env.msgId)
+                }
             }
         }
     }
@@ -798,7 +994,23 @@ final class MeshController: ObservableObject {
                 return true
             }
         }
-        return false
+        return recognizesGroupHint(hint, now: now)
+    }
+
+    private func deliveryHintsForPeer(peerUserId: Data, now: Int64) -> [Data] {
+        var hints = recentHintsFor(userId: peerUserId, now: now)
+        let groups = (try? store.listGroups()) ?? []
+        for group in groups where group.memberUserIds.contains(peerUserId) {
+            hints.append(contentsOf: recentHintsFor(userId: group.id, now: now))
+        }
+        return hints
+    }
+
+    private func recognizesGroupHint(_ hint: Data, now: Int64) -> Bool {
+        let groups = (try? store.listGroups()) ?? []
+        return groups.contains { group in
+            recentHintsFor(userId: group.id, now: now).contains(hint)
+        }
     }
 
     private func recentHintsFor(userId: Data, now: Int64) -> [Data] {
@@ -829,23 +1041,63 @@ final class MeshController: ObservableObject {
     }
 
     private func runRelaySync() {
-        guard let identity, let config = RelayConfigStore.load() else { return }
+        guard isRunning, let identity, let config = RelayConfigStore.load() else { return }
+        if relaySyncInFlight {
+            relaySyncPending = true
+            return
+        }
+        relaySyncInFlight = true
+        backfillRelayReceipts(identity: identity)
         if !pausedForBluetoothAudio {
             MeshRuntimeStatus.shared.markSyncingViaRelay()
         }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.relaySyncBlocking(identity: identity, config: config)
-            Task { @MainActor in
-                self?.refreshNearby()
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            await self.relaySyncBlocking(identity: identity, config: config)
+            await self.finishRelaySync()
+        }
+    }
+
+    private func finishRelaySync() {
+        relaySyncInFlight = false
+        if relaySyncPending, isRunning {
+            relaySyncPending = false
+            runRelaySync()
+        } else {
+            relaySyncPending = false
+            refreshNearby()
+        }
+    }
+
+    private func backfillRelayReceipts(identity: Identity) {
+        let contacts = (try? store.listContacts()) ?? []
+        for contact in contacts {
+            for receiptType in [ReceiptType.delivered, ReceiptType.read] {
+                let through = (try? store.outgoingReceiptThrough(
+                    chatId: contact.userId,
+                    senderUserId: contact.userId,
+                    receiptType: receiptType
+                )) ?? 0
+                guard through > 0 else { continue }
+                _ = queueOutgoingReceiptForRelay(
+                    identity: identity,
+                    contact: contact,
+                    receiptType: receiptType,
+                    ackedSenderUserId: contact.userId,
+                    throughLamport: through
+                )
             }
         }
     }
 
-    private nonisolated func relaySyncBlocking(identity: Identity, config: RelayConfig) {
+    private nonisolated func relaySyncBlocking(identity: Identity, config: RelayConfig) async {
         let store = AppStore.get()
         do {
             // Upload receipts first, then authored, then family carry.
             let now = Int64(Date().timeIntervalSince1970 * 1000)
+            _ = try store.pruneExpiredOutgoingReceiptEnvelopes(nowMs: now)
+            _ = try store.pruneExpiredOutboundEnvelopes(nowMs: now)
+            _ = try store.pruneExpiredCarried(nowMs: now)
             let receipts = try store.pendingRelayOutgoingReceiptEnvelopes(
                 limit: MeshDefaults.relayBatchLimit,
                 nowMs: now
@@ -880,30 +1132,48 @@ final class MeshController: ObservableObject {
                     timestampMs: Int64(Date().timeIntervalSince1970 * 1000) - day * MeshDefaults.msPerDay
                 ))
             }
-            let page = try RelayClient.fetchEnvelopes(
-                config: config,
-                hints: hints,
-                afterId: 0,
-                limit: Int(MeshDefaults.relayBatchLimit)
-            )
-            var acks: [Int64] = []
-            for env in page.envelopes {
-                Task { @MainActor in
-                    MeshController.shared.processInboundEnvelope(
-                        sourceAddress: nil,
-                        msgId: env.msgId,
-                        hopTtl: env.hopTtl,
-                        expiry: env.expiryMs,
-                        recipientHint: env.recipientHint,
-                        sealed: env.sealed,
-                        identity: identity
+            let groups = try store.listGroups()
+            for group in groups where group.memberUserIds.contains(identity.userId) {
+                hints.append(contentsOf: (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
+                    computeRecipientHint(
+                        recipientUserId: group.id,
+                        timestampMs: now - daysAgo * MeshDefaults.msPerDay
                     )
-                }
-                acks.append(env.id)
+                })
             }
-            try RelayClient.ackEnvelopes(config: config, ids: acks)
+            var afterId: Int64 = 0
+            while true {
+                let page = try RelayClient.fetchEnvelopes(
+                    config: config,
+                    hints: hints,
+                    afterId: afterId,
+                    limit: Int(MeshDefaults.relayBatchLimit)
+                )
+                guard !page.envelopes.isEmpty else { break }
+                var acks: [Int64] = []
+                for env in page.envelopes {
+                    await MainActor.run {
+                        MeshController.shared.processInboundEnvelope(
+                            sourceAddress: nil,
+                            msgId: env.msgId,
+                            hopTtl: env.hopTtl,
+                            expiry: env.expiryMs,
+                            recipientHint: env.recipientHint,
+                            sealed: env.sealed,
+                            identity: identity
+                        )
+                    }
+                    acks.append(env.id)
+                }
+                try RelayClient.ackEnvelopes(config: config, ids: acks)
+                afterId = page.nextCursor
+                if page.envelopes.count < Int(MeshDefaults.relayBatchLimit) { break }
+            }
         } catch {
-            // Best-effort; next poll retries.
+            let message = error.localizedDescription
+            await MainActor.run {
+                log.warning("Relay sync failed: \(message, privacy: .public)")
+            }
         }
     }
 

@@ -4,7 +4,6 @@ import UserNotifications
 @main
 struct CruiseMeshApp: App {
     @StateObject private var appModel = AppModel()
-    @State private var deepLinkChatHex: String?
 
     var body: some Scene {
         WindowGroup {

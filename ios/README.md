@@ -1,12 +1,13 @@
 # CruiseMesh iOS
 
-SwiftUI + CoreBluetooth shell with **feature parity** to the Android app:
+SwiftUI + CoreBluetooth shell covering the current 1:1 messaging feature set:
 
 | Feature | iOS |
 |---|---|
 | Identity (Ed25519+X25519) in Keychain | ✓ |
 | Conversation list + Signal-style ticks | ✓ |
 | 1:1 text messaging | ✓ |
+| Group creation, invites, text, unread state | ✓ |
 | Photos (library + camera) + voice memos | ✓ |
 | QR friending + mutual `kind=3` friend request | ✓ |
 | BLE dual-role mesh (central + peripheral) | ✓ |
@@ -15,6 +16,16 @@ SwiftUI + CoreBluetooth shell with **feature parity** to the Android app:
 | Profile, mesh status pill, notifications | ✓ |
 | Contact details (fingerprint / delete) | ✓ |
 | Bluetooth-audio coexistence pause | ✓ (AVAudioSession route; see note) |
+
+### Current limitations
+
+- Inline attachment envelopes use the shared 2-byte BLE fragment header, which
+  supports at most 255 fragments. Large attachments that exceed a link's
+  negotiated capacity remain persisted instead of crashing. A configured relay
+  can still deliver them; reliable BLE-only delivery needs the planned `kind=17`
+  chunk transfer.
+- Background BLE behavior, battery impact, and two-device iOS interoperability
+  still require physical-device testing. Simulator coverage is not sufficient.
 
 Protocol, crypto, and storage live in the shared Rust core (`../core`) via UniFFI.
 
@@ -32,6 +43,10 @@ Protocol, crypto, and storage live in the shared Rust core (`../core`) via UniFF
   (digest sync, mesh router state, reconnect backoff, chat list, visibility,
   user-id hex, relay client, Bluetooth-audio backoff, framing, attachments,
   ticks).
+- **Groups:** creation fans out pairwise `kind=4` invites, while group text is
+  sealed once with the shared group key and flooded/carried for all members.
+  Group receipts remain local-only; wire delivery/read ticks are deferred on
+  both platforms.
 
 ## Requirements
 
@@ -89,5 +104,5 @@ ios/
 
 - Local 1:1 `chat_id` = peer's UserID
 - Wire `MessageBody.chatId` = **sender's** UserID
-- Kinds: text=1, receipt=2, friend-request=3, attachment-manifest=16
+- Kinds: text=1, receipt=2, friend-request=3, group-invite=4, attachment-manifest=16
 - BLE service/characteristic UUIDs match Android `MeshConstants`

@@ -48,13 +48,11 @@ struct AttachmentPayload: Equatable {
         guard need(1), let mediaType = MediaType(rawValue: bytes[offset]) else { return nil }
         offset += 1
         guard let mime = readUtf16(bytes, &offset) else { return nil }
-        guard need(4) else { return nil }
-        let duration = Int32(bigEndian: bytes.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) })
-        offset += 4
+        guard let durationBits = readUInt32(bytes, &offset) else { return nil }
+        let duration = Int32(bitPattern: durationBits)
         guard duration >= 0 else { return nil }
-        guard need(4) else { return nil }
-        let blobLen = Int(UInt32(bigEndian: bytes.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }))
-        offset += 4
+        guard let blobLengthBits = readUInt32(bytes, &offset) else { return nil }
+        let blobLen = Int(blobLengthBits)
         guard blobLen >= 0, blobLen <= maxBlobBytes * 2, need(blobLen) else { return nil }
         let blob = bytes.subdata(in: offset..<offset+blobLen)
         offset += blobLen
@@ -88,12 +86,28 @@ struct AttachmentPayload: Equatable {
     }
 
     private static func readUtf16(_ bytes: Data, _ offset: inout Int) -> String? {
-        guard offset + 2 <= bytes.count else { return nil }
-        let len = Int(UInt16(bigEndian: bytes.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self) }))
-        offset += 2
+        guard let length = readUInt16(bytes, &offset) else { return nil }
+        let len = Int(length)
         guard offset + len <= bytes.count else { return nil }
         let slice = bytes.subdata(in: offset..<offset+len)
         offset += len
         return String(data: slice, encoding: .utf8)
+    }
+
+    private static func readUInt16(_ bytes: Data, _ offset: inout Int) -> UInt16? {
+        guard offset + 2 <= bytes.count else { return nil }
+        let value = (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
+        offset += 2
+        return value
+    }
+
+    private static func readUInt32(_ bytes: Data, _ offset: inout Int) -> UInt32? {
+        guard offset + 4 <= bytes.count else { return nil }
+        let value = (UInt32(bytes[offset]) << 24)
+            | (UInt32(bytes[offset + 1]) << 16)
+            | (UInt32(bytes[offset + 2]) << 8)
+            | UInt32(bytes[offset + 3])
+        offset += 4
+        return value
     }
 }

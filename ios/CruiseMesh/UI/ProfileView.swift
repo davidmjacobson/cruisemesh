@@ -3,6 +3,7 @@ import SwiftUI
 struct ProfileView: View {
     let identity: Identity
     @ObservedObject var appModel: AppModel
+    @ObservedObject private var runtime = MeshRuntimeStatus.shared
     @Environment(\.dismiss) private var dismiss
 
     @State private var displayName: String = ""
@@ -36,9 +37,9 @@ struct ProfileView: View {
                 Section("Mesh") {
                     Toggle("Mesh running", isOn: $meshOn)
                         .onChange(of: meshOn) { on in
-                            if on { appModel.startMesh() } else { MeshController.shared.stop() }
+                            if on { appModel.startMesh() } else { appModel.stopMesh() }
                         }
-                    LabeledContent("Status", value: MeshRuntimeStatus.shared.pillText)
+                    LabeledContent("Status", value: runtime.pillText)
                 }
             }
             .navigationTitle("Profile")
@@ -48,8 +49,9 @@ struct ProfileView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
-                        ProfileStore.saveDisplayName(displayName)
-                        appModel.displayName = displayName
+                        let trimmedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                        ProfileStore.saveDisplayName(trimmedName)
+                        appModel.displayName = trimmedName
                         RelayConfigStore.save(relayUrl: relayUrl, relayToken: relayToken)
                         dismiss()
                     }
@@ -61,9 +63,7 @@ struct ProfileView: View {
                     relayUrl = cfg.relayUrl
                     relayToken = cfg.relayToken
                 }
-                if case .stopped = MeshRuntimeStatus.shared.state {
-                    meshOn = false
-                }
+                meshOn = appModel.meshEnabled
             }
         }
     }

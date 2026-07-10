@@ -152,6 +152,28 @@ final class RelayClientTests: XCTestCase {
         XCTAssertEqual((ids[0] as? NSNumber)?.int64Value, 9)
     }
 
+    func testFetchRejectsOutOfRangeHopTtlInsteadOfCrashing() {
+        RelayMockURLProtocol.responses = [
+            .init(
+                statusCode: 200,
+                body: Data(#"{"envelopes":[{"id":1,"msg_id":"AA","hop_ttl":999,"recipient_hint":"AA","sealed":"AA","expiry_ms":1700000000000}],"next_cursor":1}"#.utf8),
+                headers: [:]
+            ),
+        ]
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+
+        XCTAssertThrowsError(try RelayClient.fetchEnvelopes(config: config, hints: [], afterId: 0, limit: 50))
+    }
+
+    func testPostRejectsMissingEnvelopeId() {
+        RelayMockURLProtocol.responses = [
+            .init(statusCode: 200, body: Data(#"{}"#.utf8), headers: [:]),
+        ]
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+
+        XCTAssertThrowsError(try RelayClient.postOutboundEnvelope(config: config, envelope: sampleOutboundEnvelope()))
+    }
+
     private func sampleOutboundEnvelope() -> OutboundEnvelope {
         OutboundEnvelope(
             msgId: Data(repeating: 1, count: 16),

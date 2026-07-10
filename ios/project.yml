@@ -56,8 +56,6 @@ targets:
         UIBackgroundModes:
           - bluetooth-central
           - bluetooth-peripheral
-          - fetch
-          - processing
         NSBluetoothAlwaysUsageDescription: CruiseMesh uses Bluetooth to message nearby friends without internet.
         NSBluetoothPeripheralUsageDescription: CruiseMesh advertises so friends can find you on the mesh.
         NSCameraUsageDescription: Take a photo to send in chat, or scan a friend QR code.
