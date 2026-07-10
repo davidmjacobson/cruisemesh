@@ -250,14 +250,15 @@ class BleCentral(
             .setServiceUuid(ParcelUuid(MeshConstants.SERVICE_UUID))
             .build()
         val settings = ScanSettings.Builder()
-            // LOW_POWER (was BALANCED): a much smaller scan duty cycle so
-            // continuous discovery stops monopolizing the shared 2.4 GHz radio
-            // and starving Bluetooth audio (HANDOFF: BLE coexistence blocker).
-            // Discovery is a little slower to notice a new peer; acceptable for
-            // a mesh that stays connected once peers are found. (Result
+            // BALANCED (restored from LOW_POWER 2026-07-10): the LOW_POWER scan
+            // duty cycle was too small for the central to catch a peer's
+            // advertising window, so direct connects churned with status=133 and
+            // the initial connect was flaky/slow. Since the mesh no longer pauses
+            // for Bluetooth audio, connection reliability wins here -- re-verify
+            // earbud audio doesn't stutter at this higher scan duty. (Result
             // batching via setReportDelay would help further but routes results
             // to onBatchScanResults, which this callback doesn't implement.)
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
             .build()
         scanner?.startScan(listOf(filter), settings, scanCallback)
     }
@@ -285,7 +286,10 @@ class BleCentral(
         }
         val payloadSize = (negotiatedMtu[deviceAddress] ?: FrameFraming.DEFAULT_ATT_MTU) -
             FrameFraming.ATT_HEADER_OVERHEAD
-        val fragments = FrameFraming.fragment(frame, payloadSize)
+        val fragments = FrameFraming.fragmentOrNull(frame, payloadSize) ?: run {
+            Log.w(TAG, "sendFrame: dropping ${frame.size}-byte frame for $deviceAddress -- too large to fragment")
+            return
+        }
         writeQueues.getOrPut(deviceAddress) { ArrayDeque() }.addAll(fragments)
         Log.i(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
         sendNextQueuedFragment(gatt)

@@ -252,6 +252,11 @@ class MeshService : Service() {
         // refreshBluetoothAudioStatus); start the roles unconditionally rather
         // than gating them on an audio-clear check.
         startMeshRoles()
+        // Mesh is up. The old A2DP-gated path used to flip STARTING->ACTIVE from
+        // inside the backoff's ACTIVE branch; now that roles start
+        // unconditionally, mark it active here or the status pill sticks on
+        // "Mesh starting…" forever.
+        MeshRuntimeStatus.markActive()
         refreshBluetoothAudioStatus("service start")
         requestRelaySync("service start")
         return START_STICKY

@@ -15,9 +15,19 @@ private const val TAG = "MediaCompressor"
  * inline attachment budget ([AttachmentPayload.MAX_BLOB_BYTES]).
  */
 object MediaCompressor {
-    private const val MAX_EDGE_PX = 1280
+    private const val MAX_EDGE_PX = 1024
     private const val MIN_QUALITY = 40
-    private const val START_QUALITY = 82
+    private const val START_QUALITY = 75
+
+    /**
+     * Compression aims for this, well under [AttachmentPayload.MAX_BLOB_BYTES].
+     * The hard cap (180 KB) is a terrible transfer target: at ~510 bytes/BLE
+     * fragment that's ~360 fragments, each a ~150 ms write-with-response, so a
+     * photo took ~1 min to send. ~48 KB is ~95 fragments (~15 s) and still
+     * looks fine at 1024 px on a phone screen. MAX_BLOB_BYTES stays only as a
+     * last-resort ceiling for an unusually detailed image.
+     */
+    private const val TARGET_BLOB_BYTES = 48 * 1024
 
     fun compressImageUri(context: Context, uri: Uri): ByteArray? {
         return try {
@@ -84,20 +94,28 @@ object MediaCompressor {
 
     private fun compressJpeg(bitmap: Bitmap): ByteArray? {
         var quality = START_QUALITY
-        var bytes: ByteArray
+        var smallest: ByteArray? = null
         do {
             val stream = ByteArrayOutputStream()
             if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)) {
-                return null
+                break
             }
-            bytes = stream.toByteArray()
-            if (bytes.size <= AttachmentPayload.MAX_BLOB_BYTES) {
+            val bytes = stream.toByteArray()
+            if (smallest == null || bytes.size < smallest.size) smallest = bytes
+            // Small enough for a fast BLE transfer -- good enough, stop shrinking.
+            if (bytes.size <= TARGET_BLOB_BYTES) {
                 return bytes
             }
             quality -= 8
         } while (quality >= MIN_QUALITY)
 
-        Log.w(TAG, "Image still ${bytes.size} bytes after min quality; refusing")
-        return null
+        // Couldn't reach the target even at MIN_QUALITY. Still send the smallest
+        // we produced as long as it fits the hard blob cap; a very detailed photo
+        // just costs more fragments. Only refuse if it can't fit at all.
+        return smallest?.takeIf { it.size <= AttachmentPayload.MAX_BLOB_BYTES }
+            ?: run {
+                Log.w(TAG, "Image still ${smallest?.size} bytes after min quality; refusing")
+                null
+            }
     }
 }
