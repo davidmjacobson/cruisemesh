@@ -21,13 +21,20 @@ struct ChatListView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
+            SwiftUI.Group {
                 if summaries.isEmpty {
-                    ContentUnavailableView(
-                        "No chats yet",
-                        systemImage: "bubble.left.and.bubble.right",
-                        description: Text("Add a friend with a QR code to start messaging on the mesh.")
-                    )
+                    VStack(spacing: 12) {
+                        Image(systemName: "bubble.left.and.bubble.right")
+                            .font(.system(size: 44))
+                            .foregroundStyle(.secondary)
+                        Text("No chats yet")
+                            .font(.title2.weight(.semibold))
+                        Text("Add a friend with a QR code to start messaging on the mesh.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 32)
+                    }
                 } else {
                     List(summaries) { summary in
                         NavigationLink(value: UserIdHex.encode(summary.contact.userId)) {

@@ -35,7 +35,7 @@ struct ProfileView: View {
                 }
                 Section("Mesh") {
                     Toggle("Mesh running", isOn: $meshOn)
-                        .onChange(of: meshOn) { _, on in
+                        .onChange(of: meshOn) { on in
                             if on { appModel.startMesh() } else { MeshController.shared.stop() }
                         }
                     LabeledContent("Status", value: MeshRuntimeStatus.shared.pillText)

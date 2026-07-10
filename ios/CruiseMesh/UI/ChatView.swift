@@ -66,7 +66,7 @@ struct ChatView: View {
                     }
                     .padding(.horizontal, 12)
                 }
-                .onChange(of: visible.count) { _, _ in
+                .onChange(of: visible.count) { _ in
                     if let last = visible.last {
                         withAnimation { proxy.scrollTo(last.lamport, anchor: .bottom) }
                     }
@@ -141,7 +141,7 @@ struct ChatView: View {
             ChatVisibility.setVisible(nil)
             voiceRecorder.cancel()
         }
-        .onChange(of: photoItem) { _, item in
+        .onChange(of: photoItem) { item in
             guard let item else { return }
             Task {
                 if let data = try? await item.loadTransferable(type: Data.self),
