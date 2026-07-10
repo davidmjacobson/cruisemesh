@@ -61,6 +61,7 @@ import com.cruisemesh.app.mesh.MeshRuntimeStatus
 import com.cruisemesh.app.mesh.MeshService
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
+import com.cruisemesh.app.relay.RelayImport
 import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ChatListScreen
 import com.cruisemesh.app.ui.ChatSummary
@@ -506,7 +507,8 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
 
     if (hasCameraPermission) {
         ScanScreen(
-            onContactAdded = { contact ->
+            onContactAdded = { scanned ->
+                val contact = RelayImport.reconcileOnImport(context, store, scanned)
                 store.upsertContact(contact)
                 FriendRequestSender.queueForScannedContact(context, store, identity, contact)
             },
