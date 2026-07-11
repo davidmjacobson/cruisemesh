@@ -81,6 +81,15 @@ android {
         // ../../core/build-android.sh. Regenerate after changing the Rust API.
         getByName("main").kotlin.srcDirs("src/main/kotlin-gen")
     }
+    testOptions {
+        unitTests {
+            // Production code logs routinely (android.util.Log) on paths unit
+            // tests exercise directly (no Robolectric here); without this the
+            // unmocked framework stub throws instead of no-op'ing, which has
+            // nothing to do with what the test is actually asserting.
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
