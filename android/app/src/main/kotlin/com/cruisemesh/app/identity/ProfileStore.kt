@@ -5,6 +5,7 @@ import android.os.Build
 
 private const val PREFS_NAME = "cruisemesh_profile"
 private const val PREF_DISPLAY_NAME = "display_name"
+private const val PREF_OWN_AVATAR_EPOCH = "own_avatar_epoch"
 
 /** Persists the local display name used in our QR friend card and friend requests. */
 object ProfileStore {
@@ -23,6 +24,20 @@ object ProfileStore {
             return
         }
         edit.putString(PREF_DISPLAY_NAME, normalized).apply()
+    }
+
+    fun loadOwnAvatarEpoch(context: Context): Long {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getLong(PREF_OWN_AVATAR_EPOCH, 0L)
+    }
+
+    fun bumpOwnAvatarEpoch(context: Context): Long {
+        val epoch = System.currentTimeMillis()
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putLong(PREF_OWN_AVATAR_EPOCH, epoch)
+            .apply()
+        return epoch
     }
 
     fun defaultDisplayName(): String =

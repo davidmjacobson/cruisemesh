@@ -17,15 +17,16 @@ pub use groups::{
     rotate_group, seal_group_message, Group,
 };
 pub use identity::{
-    fingerprint_words, generate_identity, make_friend_card, parse_friend_card, CoreError,
-    FriendCard, Identity,
+    fingerprint_words, generate_identity, make_friend_card, make_friend_link, parse_friend_card,
+    parse_friend_text, CoreError, FriendCard, Identity,
 };
 pub use protocol::{
-    compute_recipient_hint, decode_message_body, decode_receipt_content, default_expiry,
-    encode_digest, encode_envelope_frame, encode_hello, encode_message_body,
-    encode_receipt_content, generate_msg_id, parse_frame, Frame, MessageBody, ReceiptContent,
-    DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL, KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST,
-    KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_REACTION, KIND_RECEIPT, KIND_TEXT,
+    compute_recipient_hint, decode_message_body, decode_profile_sync_content,
+    decode_receipt_content, default_expiry, encode_digest, encode_envelope_frame, encode_hello,
+    encode_message_body, encode_profile_sync_content, encode_receipt_content, generate_msg_id,
+    parse_frame, Frame, MessageBody, ProfileSyncContent, ReceiptContent, DEFAULT_EXPIRY_MS,
+    DEFAULT_HOP_TTL, KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_REQUEST,
+    KIND_GROUP_INVITE, KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_TEXT,
     RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 pub use store::{

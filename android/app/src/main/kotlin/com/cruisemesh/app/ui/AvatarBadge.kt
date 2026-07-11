@@ -36,6 +36,7 @@ fun AvatarBadge(
     modifier: Modifier = Modifier,
     size: Dp = 48.dp,
     photoPath: String? = null,
+    photoBytes: ByteArray? = null,
     reachability: ReachabilityLevel? = null,
 ) {
     val (avatarColor, initials) = remember(userId, name, displayId) {
@@ -52,6 +53,10 @@ fun AvatarBadge(
     // decoded bitmap from before the replacement.
     val avatarBitmap = remember(photoPath, photoPath?.let { File(it).lastModified() }) {
         photoPath?.let { path -> BitmapFactory.decodeFile(path)?.asImageBitmap() }
+    } ?: remember(photoBytes?.contentHashCode()) {
+        photoBytes?.let { bytes ->
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+        }
     }
 
     Box(modifier = modifier.size(size)) {

@@ -159,12 +159,14 @@ fun ChatScreen(
     reachabilityStatusText: String = ContactReachability.chatHeaderCopy(ReachabilityLevel.OFFLINE, null, 0L),
 ) {
     val context = LocalContext.current
-    var messages by remember(contact.userId) { mutableStateOf(store.messagesForChat(contact.userId)) }
+    var currentContact by remember(contact.userId) { mutableStateOf(contact) }
+    var messages by remember(contact.userId) { mutableStateOf(store.messagesForChat(currentContact.userId)) }
+    var contactAvatar by remember(contact.userId) { mutableStateOf(store.contactAvatar(currentContact.userId)) }
     var deliveredThrough by remember(contact.userId) {
-        mutableStateOf(store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_DELIVERED))
+        mutableStateOf(store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_DELIVERED))
     }
     var readThrough by remember(contact.userId) {
-        mutableStateOf(store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_READ))
+        mutableStateOf(store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_READ))
     }
     var draft by remember { mutableStateOf("") }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
@@ -174,9 +176,11 @@ fun ChatScreen(
     val voiceRecorder = remember { VoiceRecorder(context) }
 
     fun reload() {
-        messages = store.messagesForChat(contact.userId)
-        deliveredThrough = store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_DELIVERED)
-        readThrough = store.receiptThrough(contact.userId, ownUserId, RECEIPT_TYPE_READ)
+        currentContact = store.getContact(contact.userId) ?: currentContact
+        messages = store.messagesForChat(currentContact.userId)
+        contactAvatar = store.contactAvatar(currentContact.userId)
+        deliveredThrough = store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_DELIVERED)
+        readThrough = store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_READ)
     }
 
     fun stagePhoto(jpeg: ByteArray?) {
@@ -203,7 +207,7 @@ fun ChatScreen(
             return
         }
         sender.sendAttachment(
-            contact,
+            currentContact,
             AttachmentPayload(
                 mediaType = AttachmentPayload.MediaType.AUDIO,
                 mimeType = "audio/mp4",
@@ -261,16 +265,17 @@ fun ChatScreen(
 
     LaunchedEffect(contact.userId) {
         ChatEvents.changes.collect { changedChatId ->
-            if (changedChatId.contentEquals(contact.userId)) {
+            if (changedChatId.contentEquals(currentContact.userId)) {
                 reload()
             }
         }
     }
 
     ConversationScreen(
-        contact = contact,
+        contact = currentContact,
         ownUserId = ownUserId,
         messages = messages,
+        contactAvatar = contactAvatar,
         deliveredThrough = deliveredThrough,
         readThrough = readThrough,
         draft = draft,
@@ -282,7 +287,7 @@ fun ChatScreen(
             val photo = pendingPhoto
             if (photo != null) {
                 sender.sendAttachment(
-                    contact,
+                    currentContact,
                     AttachmentPayload(
                         mediaType = AttachmentPayload.MediaType.IMAGE,
                         mimeType = "image/jpeg",
@@ -295,13 +300,13 @@ fun ChatScreen(
                 draft = ""
                 reload()
             } else if (text.isNotEmpty()) {
-                sender.sendText(contact, text)
+                sender.sendText(currentContact, text)
                 draft = ""
                 reload()
             }
         },
         onReact = { target, emoji ->
-            sender.sendReaction(contact, target, emoji)
+            sender.sendReaction(currentContact, target, emoji)
             reload()
         },
         onPickGallery = {
@@ -354,6 +359,7 @@ private fun ConversationScreen(
     contact: Contact,
     ownUserId: ByteArray,
     messages: List<StoredMessage>,
+    contactAvatar: ByteArray? = null,
     deliveredThrough: ULong,
     readThrough: ULong,
     draft: String,
@@ -408,6 +414,7 @@ private fun ConversationScreen(
                 displayName = displayName,
                 statusText = reachabilityStatusText,
                 reachability = reachability,
+                avatarBytes = contactAvatar,
                 onBack = onBack,
                 onOpenDetails = { showContactDetails = true },
             )
@@ -489,6 +496,7 @@ private fun ConversationScreen(
         ContactDetailsSheet(
             contact = contact,
             connectivityText = reachabilityStatusText,
+            avatarBytes = contactAvatar,
             onDeleteContact = {
                 showContactDetails = false
                 confirmDelete = true
@@ -760,6 +768,7 @@ private fun ConversationTopBar(
     displayName: String,
     statusText: String,
     reachability: ReachabilityLevel,
+    avatarBytes: ByteArray?,
     onBack: () -> Unit,
     onOpenDetails: () -> Unit,
 ) {
@@ -789,6 +798,7 @@ private fun ConversationTopBar(
                     displayId = displayId,
                     size = 36.dp,
                     reachability = reachability,
+                    photoBytes = avatarBytes,
                 )
                 Spacer(modifier = Modifier.width(12.dp))
                 Column {

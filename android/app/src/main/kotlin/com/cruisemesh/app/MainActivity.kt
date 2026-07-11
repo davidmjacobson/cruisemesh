@@ -49,12 +49,16 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.friending.ContactsScreen
 import com.cruisemesh.app.friending.FriendRequestSender
+import com.cruisemesh.app.friending.AddFriendScreen
+import com.cruisemesh.app.friending.ImportFriendResult
 import com.cruisemesh.app.ui.ConnectivityWarning
 import com.cruisemesh.app.ui.ConnectivityWarningSeverity
 import android.widget.Toast
 import androidx.core.app.ActivityCompat
 import com.cruisemesh.app.friending.MyQrScreen
+import com.cruisemesh.app.friending.ProfileSyncSender
 import com.cruisemesh.app.friending.ScanScreen
+import com.cruisemesh.app.friending.extractFriendToken
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.OnboardingStore
 import com.cruisemesh.app.identity.ProfilePhotoStore
@@ -71,6 +75,7 @@ import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
 import com.cruisemesh.app.relay.RelayImport
+import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ChatListScreen
 import com.cruisemesh.app.ui.ChatSummary
@@ -86,6 +91,9 @@ import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.generateIdentity
+import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.friendCardUserId
+import uniffi.cruisemesh_core.parseFriendText
 
 private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
@@ -157,6 +165,7 @@ fun CruiseMeshApp(
         composable("home") { HomeRoute(identity, navController) }
         composable("profile") { ProfileRoute(identity, navController) }
         composable("myQr") { MyQrScreen(identity, onBack = { navController.popBackStack() }) }
+        composable("addFriend") { AddFriendRoute(identity, navController) }
         composable("scan") { ScanRoute(identity, navController) }
         composable("contacts") { ContactsRoute(navController) }
         composable("newGroup") { NewGroupRoute(identity, navController) }
@@ -229,7 +238,11 @@ private fun OnboardingRoute(identity: Identity, onComplete: () -> Unit) {
         ActivityResultContracts.PickVisualMedia(),
     ) { uri ->
         if (uri != null) {
-            avatarPath = ProfilePhotoStore.saveFromUri(context, uri) ?: avatarPath
+            val saved = ProfilePhotoStore.saveFromUri(context, uri)
+            if (saved != null) {
+                avatarPath = saved
+                ProfileStore.bumpOwnAvatarEpoch(context)
+            }
         }
     }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
@@ -239,7 +252,11 @@ private fun OnboardingRoute(identity: Identity, onComplete: () -> Unit) {
         val uri = pendingCameraUri
         pendingCameraUri = null
         if (success && uri != null) {
-            avatarPath = ProfilePhotoStore.saveFromUri(context, uri) ?: avatarPath
+            val saved = ProfilePhotoStore.saveFromUri(context, uri)
+            if (saved != null) {
+                avatarPath = saved
+                ProfileStore.bumpOwnAvatarEpoch(context)
+            }
         }
     }
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
@@ -282,6 +299,7 @@ private fun OnboardingRoute(identity: Identity, onComplete: () -> Unit) {
         onRemovePhoto = {
             ProfilePhotoStore.clear(context)
             avatarPath = null
+            ProfileStore.bumpOwnAvatarEpoch(context)
         },
         onRequestMeshPermissions = {
             if (!meshPermissionsGranted) {
@@ -297,6 +315,9 @@ private fun OnboardingRoute(identity: Identity, onComplete: () -> Unit) {
             if (displayName.isBlank()) {
                 displayName = ProfileStore.defaultDisplayName()
                 ProfileStore.saveDisplayName(context, displayName)
+            }
+            if (ProfileStore.loadOwnAvatarEpoch(context) == 0L) {
+                ProfileStore.bumpOwnAvatarEpoch(context)
             }
             OnboardingStore.markCompleted(context)
             onComplete()
@@ -528,6 +549,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 unreadCount = unreadCount,
                 ownDeliveredThrough = deliveredThrough,
                 ownReadThrough = readThrough,
+                avatarBytes = store.contactAvatar(c.userId),
             )
         }
         val groups = store.listGroups().map { g ->
@@ -656,6 +678,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
 @Composable
 private fun ProfileRoute(identity: Identity, navController: NavHostController) {
     val context = LocalContext.current
+    val store = remember { AppStore.get(context) }
     val displayId = remember(identity) { formatUserId(identity.userId) }
     val fingerprint = remember(identity) { fingerprintWords(identity.userId) }
     val runtimeStatus by MeshRuntimeStatus.state.collectAsState()
@@ -710,6 +733,9 @@ private fun ProfileRoute(identity: Identity, navController: NavHostController) {
             { permissionLauncher.launch(MeshService.requiredPermissions()) }
         } else null,
         onShowMyQr = { navController.navigate("myQr") },
+        onProfileChanged = { epoch ->
+            ProfileSyncSender.queueToAllContacts(context, store, identity, epoch)
+        },
         onBack = { navController.popBackStack() }
     )
 }
@@ -734,10 +760,18 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
 
     if (hasCameraPermission) {
         ScanScreen(
+            ownUserId = identity.userId,
             onContactAdded = { scanned ->
                 val contact = RelayImport.reconcileOnImport(context, store, scanned)
                 store.upsertContact(contact)
                 FriendRequestSender.queueForScannedContact(context, store, identity, contact)
+                ProfileSyncSender.queueToContact(
+                    context,
+                    store,
+                    identity,
+                    contact,
+                    ProfileStore.loadOwnAvatarEpoch(context),
+                )
             },
             onBack = { navController.popBackStack() },
         )
@@ -758,16 +792,79 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
 }
 
 @Composable
+private fun AddFriendRoute(identity: Identity, navController: NavHostController) {
+    val context = LocalContext.current
+    val store = remember { AppStore.get(context) }
+
+    AddFriendScreen(
+        onScanClick = { navController.navigate("scan") },
+        onImportText = { text ->
+            try {
+                val card = parseFriendText(extractFriendToken(text))
+                val userId = friendCardUserId(card)
+                if (userId.contentEquals(identity.userId)) {
+                    ImportFriendResult.Error("That's your own card")
+                } else {
+                    val contact = RelayImport.reconcileOnImport(
+                        context,
+                        store,
+                        Contact(
+                            userId = userId,
+                            name = card.name,
+                            signPk = card.signPk,
+                            agreePk = card.agreePk,
+                            relayUrl = card.relayUrl,
+                            relayToken = card.relayToken,
+                        ),
+                    )
+                    store.upsertContact(contact)
+                    FriendRequestSender.queueForScannedContact(context, store, identity, contact)
+                    ProfileSyncSender.queueToContact(
+                        context,
+                        store,
+                        identity,
+                        contact,
+                        ProfileStore.loadOwnAvatarEpoch(context),
+                    )
+                    val notice = if (RelayConfigStore.load(context) == null) {
+                        "Added ${contact.name}. You don't have a relay set up, so messages will wait until your phones are near each other."
+                    } else {
+                        null
+                    }
+                    if (notice != null) {
+                        Toast.makeText(context, notice, Toast.LENGTH_LONG).show()
+                    }
+                    navController.navigate("chat/${UserIdHex.encode(contact.userId)}")
+                    ImportFriendResult.Success(notice)
+                }
+            } catch (_: Exception) {
+                ImportFriendResult.Error("Not a CruiseMesh friend card")
+            }
+        },
+        onBack = { navController.popBackStack() },
+    )
+}
+
+@Composable
 private fun ContactsRoute(navController: NavHostController) {
     val context = LocalContext.current
     val store = remember { AppStore.get(context) }
     var contacts by remember { mutableStateOf(store.listContacts()) }
+    var avatars by remember {
+        mutableStateOf(contacts.associate { formatUserId(it.userId) to store.contactAvatar(it.userId) }.filterValues { it != null }.mapValues { it.value!! })
+    }
+    fun reloadContacts() {
+        contacts = store.listContacts()
+        avatars = contacts.associate { formatUserId(it.userId) to store.contactAvatar(it.userId) }
+            .filterValues { it != null }
+            .mapValues { it.value!! }
+    }
     
     // Refresh list when resuming screen
     DisposableEffect(navController) {
         val listener = NavController.OnDestinationChangedListener { _, dest, _ ->
             if (dest.route == "contacts") {
-                contacts = store.listContacts()
+                reloadContacts()
             }
         }
         navController.addOnDestinationChangedListener(listener)
@@ -776,12 +873,13 @@ private fun ContactsRoute(navController: NavHostController) {
 
     ContactsScreen(
         contacts = contacts,
+        avatarBytesByUserId = avatars,
         onContactClick = { contact -> navController.navigate("chat/${UserIdHex.encode(contact.userId)}") },
         onContactDelete = { contact ->
             store.deleteContact(contact.userId)
-            contacts = store.listContacts()
+            reloadContacts()
         },
-        onAddFriendClick = { navController.navigate("scan") },
+        onAddFriendClick = { navController.navigate("addFriend") },
         onMyCardClick = { navController.navigate("myQr") },
         onNewGroupClick = { navController.navigate("newGroup") },
         onBack = { navController.popBackStack() },
@@ -793,10 +891,16 @@ private fun NewGroupRoute(identity: Identity, navController: NavHostController) 
     val context = LocalContext.current
     val store = remember { AppStore.get(context) }
     val contacts = remember { store.listContacts() }
+    val avatars = remember(contacts) {
+        contacts.associate { formatUserId(it.userId) to store.contactAvatar(it.userId) }
+            .filterValues { it != null }
+            .mapValues { it.value!! }
+    }
     val groupSender = remember { GroupSender(store, identity) }
 
     NewGroupScreen(
         contacts = contacts,
+        avatarBytesByUserId = avatars,
         onCreate = { name, members ->
             val group = groupSender.createAndInvite(name, members)
             if (group != null) {

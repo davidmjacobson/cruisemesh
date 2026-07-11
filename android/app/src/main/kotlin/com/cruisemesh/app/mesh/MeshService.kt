@@ -29,7 +29,9 @@ import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
+import com.cruisemesh.app.friending.ProfileSyncSender
 import com.cruisemesh.app.identity.IdentityStore
+import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.AttachmentPayload
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import com.cruisemesh.app.media.KIND_REACTION
@@ -56,6 +58,7 @@ import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.decodeGroupInviteContent
 import uniffi.cruisemesh_core.decodeMessageBody
+import uniffi.cruisemesh_core.decodeProfileSyncContent
 import uniffi.cruisemesh_core.decodeReceiptContent
 import uniffi.cruisemesh_core.defaultExpiry
 import uniffi.cruisemesh_core.encodeDigest
@@ -80,6 +83,7 @@ private const val KIND_TEXT: UByte = 1u
 private const val KIND_RECEIPT: UByte = 2u
 private const val KIND_FRIEND_REQUEST: UByte = 3u
 private const val KIND_GROUP_INVITE: UByte = 4u
+private const val KIND_PROFILE_SYNC: UByte = 5u
 
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
@@ -1628,6 +1632,7 @@ class MeshService : Service() {
             KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
             KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, opened.senderUserId, body, identity)
             KIND_GROUP_INVITE -> handleIncomingGroupInvite(address, opened.senderUserId, body, identity)
+            KIND_PROFILE_SYNC -> handleIncomingProfileSync(address, opened.senderUserId, body, identity)
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
         }
     }
@@ -1822,6 +1827,13 @@ class MeshService : Service() {
             ),
         )
         store.upsertContact(contact)
+        ProfileSyncSender.queueToContact(
+            this,
+            store,
+            identity,
+            contact,
+            ProfileStore.loadOwnAvatarEpoch(this),
+        )
         val inserted = store.insertMessage(
             StoredMessage(
                 chatId = senderUserId,
@@ -1868,6 +1880,76 @@ class MeshService : Service() {
             sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
         }
         Log.i(TAG, "Imported contact ${contact.name} from friend request on $address")
+    }
+
+    private fun handleIncomingProfileSync(
+        address: String,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+    ) {
+        val existing = store.getContact(senderUserId)
+        if (existing == null) {
+            Log.i(TAG, "Dropping profile sync from $address: sender is not a contact")
+            return
+        }
+        val content = try {
+            decodeProfileSyncContent(body.content)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping profile sync from $address: failed to decode (${e.message})")
+            return
+        }
+        val inserted = store.insertMessage(
+            StoredMessage(
+                chatId = senderUserId,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_PROFILE_SYNC,
+                payload = body.content,
+            ),
+        )
+        if (!inserted) return
+
+        val applied = store.setContactAvatar(
+            senderUserId,
+            content.avatar.takeIf { it.isNotEmpty() },
+            content.avatarEpoch,
+        )
+        if (applied && content.name != existing.name) {
+            store.upsertContact(existing.copy(name = content.name))
+        }
+        ChatEvents.notifyChatChanged(senderUserId)
+
+        val contact = store.getContact(senderUserId) ?: existing
+        val throughLamport = store.highestLamport(senderUserId, senderUserId)
+        store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
+        var relayQueueChanged = queueOutgoingReceiptForRelay(
+            identity = identity,
+            contact = contact,
+            receiptType = RECEIPT_TYPE_DELIVERED,
+            ackedSenderUserId = senderUserId,
+            throughLamport = throughLamport,
+        )
+        val isVisible = ChatVisibility.isVisible(senderUserId)
+        if (isVisible) {
+            store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_READ, throughLamport)
+            relayQueueChanged = queueOutgoingReceiptForRelay(
+                identity = identity,
+                contact = contact,
+                receiptType = RECEIPT_TYPE_READ,
+                ackedSenderUserId = senderUserId,
+                throughLamport = throughLamport,
+            ) || relayQueueChanged
+        }
+        if (relayQueueChanged) {
+            RelaySyncEvents.requestSync()
+        }
+
+        sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
+        if (isVisible) {
+            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
+        }
     }
 
     /**

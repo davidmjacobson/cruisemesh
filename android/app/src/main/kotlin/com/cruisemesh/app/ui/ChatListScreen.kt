@@ -64,6 +64,7 @@ data class ChatSummary(
     val ownDeliveredThrough: ULong,
     val ownReadThrough: ULong,
     val reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
+    val avatarBytes: ByteArray? = null,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -75,7 +76,9 @@ data class ChatSummary(
             unreadCount == other.unreadCount &&
             ownDeliveredThrough == other.ownDeliveredThrough &&
             ownReadThrough == other.ownReadThrough &&
-            reachability == other.reachability
+            reachability == other.reachability &&
+            ((avatarBytes == null && other.avatarBytes == null) ||
+                (avatarBytes != null && other.avatarBytes != null && avatarBytes.contentEquals(other.avatarBytes)))
     }
 
     override fun hashCode(): Int = chatId.contentHashCode()
@@ -245,6 +248,7 @@ fun ChatRow(
             name = summary.title,
             displayId = displayId,
             reachability = summary.reachability,
+            photoBytes = if (summary.isGroup) null else summary.avatarBytes,
         )
 
         Spacer(modifier = Modifier.width(16.dp))

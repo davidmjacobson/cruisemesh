@@ -32,6 +32,7 @@ import uniffi.cruisemesh_core.formatUserId
 @Composable
 fun ContactDetailsSheet(
     contact: Contact,
+    avatarBytes: ByteArray? = null,
     onDeleteContact: () -> Unit,
     onDismiss: () -> Unit,
     connectivityText: String? = null,
@@ -39,6 +40,7 @@ fun ContactDetailsSheet(
     ModalBottomSheet(onDismissRequest = onDismiss) {
         ContactDetailsSheetContent(
             contact = contact,
+            avatarBytes = avatarBytes,
             onDeleteContact = onDeleteContact,
             connectivityText = connectivityText,
             modifier = Modifier.padding(bottom = 24.dp),
@@ -49,6 +51,7 @@ fun ContactDetailsSheet(
 @Composable
 fun ContactDetailsSheetContent(
     contact: Contact,
+    avatarBytes: ByteArray? = null,
     onDeleteContact: () -> Unit,
     modifier: Modifier = Modifier,
     connectivityText: String? = null,
@@ -68,6 +71,7 @@ fun ContactDetailsSheetContent(
             name = contact.name,
             displayId = displayId,
             size = 72.dp,
+            photoBytes = avatarBytes,
         )
         Text(
             text = displayName,

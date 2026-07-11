@@ -1,5 +1,10 @@
 package com.cruisemesh.app.friending
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.widget.Toast
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -59,7 +64,8 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.makeFriendCard
-import uniffi.cruisemesh_core.parseFriendCard
+import uniffi.cruisemesh_core.makeFriendLink
+import uniffi.cruisemesh_core.parseFriendText
 
 /** Shows this device's own FriendCard (DESIGN.md §6.2) as a QR code to be scanned by a peer. */
 @Composable
@@ -69,15 +75,17 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
     var name by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     var relayUrl by remember { mutableStateOf(savedRelay?.relayUrl.orEmpty()) }
     var relayToken by remember { mutableStateOf(savedRelay?.relayToken.orEmpty()) }
-    val cardJson = remember(name, relayUrl, relayToken, identity) {
+    val friendLink = remember(name, relayUrl, relayToken, identity) {
+        val cardJson =
         makeFriendCard(
             name.trim().ifEmpty { ProfileStore.defaultDisplayName() },
             identity,
             relayUrl.trim().ifEmpty { null },
             relayToken.trim().ifEmpty { null },
         )
+        makeFriendLink(cardJson)
     }
-    val qrBitmap = remember(cardJson) { encodeQrBitmap(cardJson) }
+    val qrBitmap = remember(friendLink) { encodeQrBitmap(friendLink) }
 
     Scaffold { innerPadding ->
         Column(
@@ -121,6 +129,31 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
                 contentDescription = "Friend card QR code",
                 modifier = Modifier.padding(top = 24.dp),
             )
+            Row(
+                modifier = Modifier.padding(top = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Button(
+                    onClick = {
+                        val text = "Add me on CruiseMesh — copy this whole message and paste it in the app:\n$friendLink"
+                        val intent = Intent(Intent.ACTION_SEND)
+                            .setType("text/plain")
+                            .putExtra(Intent.EXTRA_TEXT, text)
+                        context.startActivity(Intent.createChooser(intent, "Share friend card"))
+                    },
+                ) {
+                    Text("Share card as text")
+                }
+                Button(
+                    onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("CruiseMesh friend card", friendLink))
+                        Toast.makeText(context, "Copied friend card link", Toast.LENGTH_SHORT).show()
+                    },
+                ) {
+                    Text("Copy")
+                }
+            }
             Button(onClick = onBack, modifier = Modifier.padding(top = 24.dp)) {
                 Text("Back")
             }
@@ -130,7 +163,11 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
 
 /** Scans a peer's FriendCard QR code and imports them as a contact (DESIGN.md §6.2). */
 @Composable
-fun ScanScreen(onContactAdded: (Contact) -> Unit, onBack: () -> Unit) {
+fun ScanScreen(
+    ownUserId: ByteArray,
+    onContactAdded: (Contact) -> Unit,
+    onBack: () -> Unit,
+) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var status by remember { mutableStateOf("Point the camera at a CruiseMesh friend card") }
@@ -156,9 +193,14 @@ fun ScanScreen(onContactAdded: (Contact) -> Unit, onBack: () -> Unit) {
                             QrAnalyzer { decoded ->
                                 if (added != null) return@QrAnalyzer
                                 try {
-                                    val card = parseFriendCard(decoded)
+                                    val card = parseFriendText(decoded)
+                                    val userId = friendCardUserId(card)
+                                    if (userId.contentEquals(ownUserId)) {
+                                        status = "That's your own card"
+                                        return@QrAnalyzer
+                                    }
                                     val contact = Contact(
-                                        userId = friendCardUserId(card),
+                                        userId = userId,
                                         name = card.name,
                                         signPk = card.signPk,
                                         agreePk = card.agreePk,
@@ -209,6 +251,77 @@ fun ScanScreen(onContactAdded: (Contact) -> Unit, onBack: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AddFriendScreen(
+    onScanClick: () -> Unit,
+    onImportText: (String) -> ImportFriendResult,
+    onBack: () -> Unit,
+) {
+    var pasted by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var notice by remember { mutableStateOf<String?>(null) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Add a friend") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                    }
+                },
+            )
+        },
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier.fillMaxSize().padding(innerPadding).padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            Button(onClick = onScanClick, modifier = Modifier.fillMaxWidth()) {
+                Text("Scan QR code")
+            }
+            OutlinedTextField(
+                value = pasted,
+                onValueChange = {
+                    pasted = it
+                    error = null
+                    notice = null
+                },
+                label = { Text("Paste friend card") },
+                minLines = 4,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = {
+                    when (val result = onImportText(pasted)) {
+                        is ImportFriendResult.Success -> {
+                            error = null
+                            notice = result.notice
+                        }
+                        is ImportFriendResult.Error -> error = result.message
+                    }
+                },
+                enabled = pasted.isNotBlank(),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Import")
+            }
+            error?.let {
+                Text(it, color = MaterialTheme.colorScheme.error)
+            }
+            notice?.let {
+                Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+sealed interface ImportFriendResult {
+    data class Success(val notice: String?) : ImportFriendResult
+    data class Error(val message: String) : ImportFriendResult
+}
+
 /**
  * Lists accepted contacts (DESIGN.md §6.2); tapping a row opens its 1:1 chat,
  * long-pressing offers deletion behind a confirmation dialog. Deleting exists
@@ -221,6 +334,7 @@ fun ScanScreen(onContactAdded: (Contact) -> Unit, onBack: () -> Unit) {
 @Composable
 fun ContactsScreen(
     contacts: List<Contact>,
+    avatarBytesByUserId: Map<String, ByteArray> = emptyMap(),
     onContactClick: (Contact) -> Unit,
     onContactDelete: (Contact) -> Unit,
     onAddFriendClick: () -> Unit,
@@ -343,6 +457,7 @@ fun ContactsScreen(
                                 userId = contact.userId,
                                 name = contact.name,
                                 displayId = displayId,
+                                photoBytes = avatarBytesByUserId[displayId],
                             )
                             Spacer(modifier = Modifier.width(16.dp))
                             Text(

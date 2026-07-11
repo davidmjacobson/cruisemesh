@@ -205,6 +205,8 @@ impl MessageStore {
         let conn = Connection::open(&path).map_err(store_err)?;
         conn.execute_batch(SCHEMA).map_err(store_err)?;
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
+        ensure_contact_column(&conn, "avatar", "BLOB")?;
+        ensure_contact_column(&conn, "avatar_epoch", "INTEGER NOT NULL DEFAULT 0")?;
         // Relay proxy-polling (see enqueue_relay_carried_envelope): marks a
         // carried envelope as one we pulled FROM the relay rather than one we
         // received over BLE, so the relay-upload query can skip re-uploading
@@ -282,7 +284,11 @@ impl MessageStore {
             .query_row(
                 "SELECT timestamp, kind, payload FROM messages
                  WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
-                params![message.chat_id, message.sender_user_id, message.lamport as i64],
+                params![
+                    message.chat_id,
+                    message.sender_user_id,
+                    message.lamport as i64
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -313,7 +319,11 @@ impl MessageStore {
         // beyond this message under the new numbering too)...
         tx.execute(
             "DELETE FROM messages WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport >= ?3",
-            params![message.chat_id, message.sender_user_id, message.lamport as i64],
+            params![
+                message.chat_id,
+                message.sender_user_id,
+                message.lamport as i64
+            ],
         )
         .map_err(store_err)?;
         // ...and the watermarks we'd computed against that abandoned tail,
@@ -936,6 +946,55 @@ impl MessageStore {
         )
         .map_err(store_err)?;
         Ok(())
+    }
+
+    /// Apply a contact avatar update only if `epoch` is newer than the stored
+    /// avatar epoch. `None` or an empty blob clears the avatar but still
+    /// records the newer epoch.
+    pub fn set_contact_avatar(
+        &self,
+        user_id: Vec<u8>,
+        avatar: Option<Vec<u8>>,
+        epoch: i64,
+    ) -> Result<bool, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let avatar = avatar.filter(|bytes| !bytes.is_empty());
+        let changed = conn
+            .execute(
+                "UPDATE contacts
+                 SET avatar = ?2, avatar_epoch = ?3
+                 WHERE user_id = ?1 AND ?3 > avatar_epoch",
+                params![user_id, avatar, epoch],
+            )
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
+    /// The canonical JPEG avatar bytes for a contact, if one has been synced.
+    pub fn contact_avatar(&self, user_id: Vec<u8>) -> Result<Option<Vec<u8>>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT avatar FROM contacts WHERE user_id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(store_err)
+        .map(|row| row.flatten())
+    }
+
+    /// The newest avatar/display-name profile-sync epoch applied for a contact.
+    pub fn contact_avatar_epoch(&self, user_id: Vec<u8>) -> Result<i64, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let epoch: Option<i64> = conn
+            .query_row(
+                "SELECT avatar_epoch FROM contacts WHERE user_id = ?1",
+                params![user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(epoch.unwrap_or(0))
     }
 
     /// Delete a contact and, with it, the entire 1:1 chat: the contact row,
@@ -1644,7 +1703,9 @@ CREATE TABLE IF NOT EXISTS contacts (
     sign_pk   BLOB NOT NULL,
     agree_pk  BLOB NOT NULL,
     relay_url TEXT,
-    relay_token TEXT
+    relay_token TEXT,
+    avatar BLOB,
+    avatar_epoch INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS groups (
@@ -1984,7 +2045,11 @@ mod tests {
 
         assert_eq!(
             store
-                .receipt_through(b"chat-a".to_vec(), b"self".to_vec(), crate::RECEIPT_TYPE_READ)
+                .receipt_through(
+                    b"chat-a".to_vec(),
+                    b"self".to_vec(),
+                    crate::RECEIPT_TYPE_READ
+                )
                 .unwrap(),
             2
         );
@@ -2555,6 +2620,59 @@ mod tests {
     }
 
     #[test]
+    fn open_migrates_contacts_table_to_add_avatar_columns() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cruisemesh-store-avatar-migration-{unique}.sqlite"));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE contacts (
+                user_id   BLOB PRIMARY KEY,
+                name      TEXT NOT NULL,
+                sign_pk   BLOB NOT NULL,
+                agree_pk  BLOB NOT NULL,
+                relay_url TEXT,
+                relay_token TEXT
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO contacts (user_id, name, sign_pk, agree_pk, relay_url, relay_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                b"alice-id".to_vec(),
+                "Alice",
+                vec![1u8; 32],
+                vec![2u8; 32],
+                "https://relay.example",
+                "token"
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        assert_eq!(store.contact_avatar(b"alice-id".to_vec()).unwrap(), None);
+        assert_eq!(store.contact_avatar_epoch(b"alice-id".to_vec()).unwrap(), 0);
+        assert!(store
+            .set_contact_avatar(b"alice-id".to_vec(), Some(vec![1, 2, 3]), 10)
+            .unwrap());
+        assert_eq!(
+            store.contact_avatar(b"alice-id".to_vec()).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn upsert_then_get_contact_round_trips() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
@@ -2584,6 +2702,71 @@ mod tests {
         let contacts = store.list_contacts().unwrap();
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].name, "Alice R.");
+    }
+
+    #[test]
+    fn upsert_contact_preserves_avatar_and_epoch() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        assert!(store
+            .set_contact_avatar(b"alice-id".to_vec(), Some(vec![9, 8, 7]), 123)
+            .unwrap());
+
+        let mut updated = contact(b"alice-id", "Alice R.");
+        updated.relay_url = Some("https://relay.example".to_string());
+        store.upsert_contact(updated).unwrap();
+
+        assert_eq!(
+            store.contact_avatar(b"alice-id".to_vec()).unwrap(),
+            Some(vec![9, 8, 7])
+        );
+        assert_eq!(
+            store.contact_avatar_epoch(b"alice-id".to_vec()).unwrap(),
+            123
+        );
+    }
+
+    #[test]
+    fn set_contact_avatar_applies_only_newer_epochs() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+
+        assert!(store
+            .set_contact_avatar(b"alice-id".to_vec(), Some(vec![1]), 100)
+            .unwrap());
+        assert!(!store
+            .set_contact_avatar(b"alice-id".to_vec(), Some(vec![2]), 99)
+            .unwrap());
+        assert!(!store
+            .set_contact_avatar(b"alice-id".to_vec(), Some(vec![3]), 100)
+            .unwrap());
+        assert_eq!(
+            store.contact_avatar(b"alice-id".to_vec()).unwrap(),
+            Some(vec![1])
+        );
+        assert_eq!(
+            store.contact_avatar_epoch(b"alice-id".to_vec()).unwrap(),
+            100
+        );
+
+        assert!(store
+            .set_contact_avatar(b"alice-id".to_vec(), Some(Vec::new()), 101)
+            .unwrap());
+        assert_eq!(store.contact_avatar(b"alice-id".to_vec()).unwrap(), None);
+        assert_eq!(
+            store.contact_avatar_epoch(b"alice-id".to_vec()).unwrap(),
+            101
+        );
+    }
+
+    #[test]
+    fn set_contact_avatar_unknown_contact_is_noop() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(!store
+            .set_contact_avatar(b"nobody".to_vec(), Some(vec![1]), 1)
+            .unwrap());
+        assert_eq!(store.contact_avatar_epoch(b"nobody".to_vec()).unwrap(), 0);
+        assert_eq!(store.contact_avatar(b"nobody".to_vec()).unwrap(), None);
     }
 
     #[test]
@@ -2740,7 +2923,12 @@ mod tests {
             )
             .unwrap();
         store
-            .record_outgoing_receipt(b"alice-id".to_vec(), b"alice-id".to_vec(), RECEIPT_TYPE_READ, 1)
+            .record_outgoing_receipt(
+                b"alice-id".to_vec(),
+                b"alice-id".to_vec(),
+                RECEIPT_TYPE_READ,
+                1,
+            )
             .unwrap();
         store
             .upsert_outgoing_receipt_envelope(
@@ -2769,7 +2957,12 @@ mod tests {
             .insert_message(msg(b"bob-id", b"bob-id", 1, "hi from bob"))
             .unwrap();
         store
-            .record_receipt(b"bob-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED, 1)
+            .record_receipt(
+                b"bob-id".to_vec(),
+                b"me".to_vec(),
+                RECEIPT_TYPE_DELIVERED,
+                1,
+            )
             .unwrap();
         store
             .record_outgoing_receipt(b"bob-id".to_vec(), b"bob-id".to_vec(), RECEIPT_TYPE_READ, 1)
@@ -2790,7 +2983,11 @@ mod tests {
         let bob_outgoing = msg(b"bob-id", b"me", 1, "reply to bob");
         let bob_outbound = outbound_for(&bob_outgoing, b"bob-id", b"msg-bob-out-1");
         store
-            .insert_outgoing_message(bob_outgoing.clone(), bob_outbound.clone(), 1_700_000_000_200)
+            .insert_outgoing_message(
+                bob_outgoing.clone(),
+                bob_outbound.clone(),
+                1_700_000_000_200,
+            )
             .unwrap();
 
         assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
@@ -2808,13 +3005,21 @@ mod tests {
         );
         assert_eq!(
             store
-                .outgoing_receipt_through(b"alice-id".to_vec(), b"alice-id".to_vec(), RECEIPT_TYPE_READ)
+                .outgoing_receipt_through(
+                    b"alice-id".to_vec(),
+                    b"alice-id".to_vec(),
+                    RECEIPT_TYPE_READ
+                )
                 .unwrap(),
             0
         );
         assert_eq!(
             store
-                .outgoing_receipt_envelope(b"alice-id".to_vec(), b"alice-id".to_vec(), RECEIPT_TYPE_READ)
+                .outgoing_receipt_envelope(
+                    b"alice-id".to_vec(),
+                    b"alice-id".to_vec(),
+                    RECEIPT_TYPE_READ
+                )
                 .unwrap(),
             None
         );
@@ -2826,10 +3031,7 @@ mod tests {
         // Bob's chat is untouched in every one of the same five tables
         // (2 messages: bob's incoming one plus our outgoing reply).
         assert_eq!(
-            store
-                .messages_for_chat(b"bob-id".to_vec())
-                .unwrap()
-                .len(),
+            store.messages_for_chat(b"bob-id".to_vec()).unwrap().len(),
             2
         );
         assert_eq!(
@@ -2969,7 +3171,12 @@ mod tests {
             .insert_message(msg(&group_a.id, b"alice", 1, "hi group a"))
             .unwrap();
         store
-            .record_receipt(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_DELIVERED, 1)
+            .record_receipt(
+                group_a.id.clone(),
+                b"alice".to_vec(),
+                RECEIPT_TYPE_DELIVERED,
+                1,
+            )
             .unwrap();
         store
             .record_outgoing_receipt(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ, 1)
@@ -3000,7 +3207,12 @@ mod tests {
             .insert_message(msg(&group_b.id, b"carol", 1, "hi group b"))
             .unwrap();
         store
-            .record_receipt(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_DELIVERED, 1)
+            .record_receipt(
+                group_b.id.clone(),
+                b"carol".to_vec(),
+                RECEIPT_TYPE_DELIVERED,
+                1,
+            )
             .unwrap();
         store
             .record_outgoing_receipt(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_READ, 1)
@@ -3033,7 +3245,11 @@ mod tests {
             .is_empty());
         assert_eq!(
             store
-                .receipt_through(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .receipt_through(
+                    group_a.id.clone(),
+                    b"alice".to_vec(),
+                    RECEIPT_TYPE_DELIVERED
+                )
                 .unwrap(),
             0
         );
@@ -3062,7 +3278,11 @@ mod tests {
         );
         assert_eq!(
             store
-                .receipt_through(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .receipt_through(
+                    group_b.id.clone(),
+                    b"carol".to_vec(),
+                    RECEIPT_TYPE_DELIVERED
+                )
                 .unwrap(),
             1
         );
@@ -3777,8 +3997,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("cruisemesh-store-migration-carried-{unique}.sqlite"));
+        let path = std::env::temp_dir().join(format!(
+            "cruisemesh-store-migration-carried-{unique}.sqlite"
+        ));
         let path_str = path.to_string_lossy().to_string();
         let conn = Connection::open(&path_str).unwrap();
         conn.execute_batch(
