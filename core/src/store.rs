@@ -880,8 +880,9 @@ impl MessageStore {
 
     /// Delete a contact and, with it, the entire 1:1 chat: the contact row,
     /// every message whose `chat_id` is their UserID (DESIGN.md §7.1: a 1:1
-    /// chat's id *is* the peer's UserID), and that chat's incoming/outgoing
-    /// receipt rows.
+    /// chat's id *is* the peer's UserID), that chat's incoming/outgoing
+    /// receipt rows, and every queued retry artifact keyed to this chat
+    /// (`outgoing_receipt_envelopes`, `outbound_envelopes`).
     ///
     /// Messages are deleted rather than retained, deliberately: the driving
     /// use case is pruning a dead contact whose identity changed (e.g. a
@@ -891,6 +892,20 @@ impl MessageStore {
     /// hoarding plaintext history for a peer the user chose to remove.
     /// Group messages from this sender are untouched (they live under the
     /// group's chat_id and belong to the group, not the contact).
+    ///
+    /// The two queued-envelope tables matter as much as `messages` here: a
+    /// deleted chat that left `outbound_envelopes` behind re-arms the
+    /// reset-stream trap fixed in fc6b9f9 (recover-from-forked-stream) --
+    /// stale queued envelopes can resend frames from the deleted history to
+    /// a peer whose lamport stream has since moved on, which is exactly the
+    /// shape of bug that recovery exists to catch, not reintroduce via a
+    /// leftover queue. And a leftover `receipts` row is exactly the
+    /// overstated ratchet that painted false read-ticks before that fix: a
+    /// delete must yield a genuinely blank slate, not a chat that looks
+    /// empty locally but still remembers watermarks against history the
+    /// user asked to erase. If the contact is re-added, the peer's replayed
+    /// receipts plus fork recovery re-establish consistency from scratch --
+    /// nothing here needs to survive a delete to make that work.
     ///
     /// Atomic (single transaction) and idempotent: deleting an unknown
     /// contact is a no-op. Returns `true` if a contact row was removed.
@@ -911,6 +926,11 @@ impl MessageStore {
         .map_err(store_err)?;
         tx.execute(
             "DELETE FROM outgoing_receipt_envelopes WHERE chat_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM outbound_envelopes WHERE chat_id = ?1",
             params![user_id],
         )
         .map_err(store_err)?;
@@ -1003,8 +1023,14 @@ impl MessageStore {
             .collect()
     }
 
-    /// Delete a group definition, its membership rows, and the local chat
-    /// history / retry state keyed by that group id. Atomic and idempotent.
+    /// Delete a group definition, its membership rows, and every row of
+    /// local chat history / retry state keyed by that group id: `messages`,
+    /// `receipts`, `outgoing_receipts`, `outgoing_receipt_envelopes`, and
+    /// `outbound_envelopes` -- the same "genuinely blank slate" purge as
+    /// [`MessageStore::delete_contact`] (see that method's doc comment for
+    /// why leftover queued envelopes or receipt watermarks are a bug, not
+    /// just clutter: they re-arm the reset-stream trap fixed in fc6b9f9 and
+    /// paint false read-ticks). Atomic and idempotent.
     pub fn delete_group(&self, group_id: Vec<u8>) -> Result<bool, CoreError> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
@@ -2469,6 +2495,151 @@ mod tests {
             .is_empty());
     }
 
+    #[test]
+    fn delete_contact_purges_all_per_chat_state_and_leaves_other_chat_alone() {
+        // Regression test for the silent-blackhole-adjacent bug: a delete
+        // that only cleared `messages`/`receipts`/`outgoing_receipts` left
+        // `outgoing_receipt_envelopes` and `outbound_envelopes` behind,
+        // re-arming the reset-stream trap fixed in fc6b9f9 and leaving a
+        // "deleted" chat that could still resend frames from its erased
+        // history. Seed every one of the five per-chat tables for two
+        // contacts, delete one, and verify a genuinely blank slate for it
+        // while the other contact's chat is untouched.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        store.upsert_contact(contact(b"bob-id", "Bob")).unwrap();
+
+        // Alice's chat: one message from her, a receipt she gave us, an
+        // outgoing receipt watermark, its queued envelope, and one queued
+        // outbound message envelope.
+        store
+            .insert_message(msg(b"alice-id", b"alice-id", 1, "hi from alice"))
+            .unwrap();
+        store
+            .record_receipt(
+                b"alice-id".to_vec(),
+                b"me".to_vec(),
+                RECEIPT_TYPE_DELIVERED,
+                1,
+            )
+            .unwrap();
+        store
+            .record_outgoing_receipt(b"alice-id".to_vec(), b"alice-id".to_vec(), RECEIPT_TYPE_READ, 1)
+            .unwrap();
+        store
+            .upsert_outgoing_receipt_envelope(
+                outgoing_receipt_for(
+                    b"alice-id",
+                    b"alice-id",
+                    b"alice-id",
+                    RECEIPT_TYPE_READ,
+                    1,
+                    b"rcpt-alice-1",
+                ),
+                1_700_000_000_100,
+            )
+            .unwrap();
+        let alice_outgoing = msg(b"alice-id", b"me", 1, "reply to alice");
+        store
+            .insert_outgoing_message(
+                alice_outgoing.clone(),
+                outbound_for(&alice_outgoing, b"alice-id", b"msg-alice-out-1"),
+                1_700_000_000_200,
+            )
+            .unwrap();
+
+        // Bob's chat: the identical shape of state, to prove it survives.
+        store
+            .insert_message(msg(b"bob-id", b"bob-id", 1, "hi from bob"))
+            .unwrap();
+        store
+            .record_receipt(b"bob-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED, 1)
+            .unwrap();
+        store
+            .record_outgoing_receipt(b"bob-id".to_vec(), b"bob-id".to_vec(), RECEIPT_TYPE_READ, 1)
+            .unwrap();
+        store
+            .upsert_outgoing_receipt_envelope(
+                outgoing_receipt_for(
+                    b"bob-id",
+                    b"bob-id",
+                    b"bob-id",
+                    RECEIPT_TYPE_READ,
+                    1,
+                    b"rcpt-bob-1",
+                ),
+                1_700_000_000_100,
+            )
+            .unwrap();
+        let bob_outgoing = msg(b"bob-id", b"me", 1, "reply to bob");
+        let bob_outbound = outbound_for(&bob_outgoing, b"bob-id", b"msg-bob-out-1");
+        store
+            .insert_outgoing_message(bob_outgoing.clone(), bob_outbound.clone(), 1_700_000_000_200)
+            .unwrap();
+
+        assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
+
+        // All five per-chat tables are empty for alice's chat_id.
+        assert!(store
+            .messages_for_chat(b"alice-id".to_vec())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .receipt_through(b"alice-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(b"alice-id".to_vec(), b"alice-id".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_envelope(b"alice-id".to_vec(), b"alice-id".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            None
+        );
+        assert!(store
+            .outbound_envelopes_after(b"alice-id".to_vec(), b"me".to_vec(), 0)
+            .unwrap()
+            .is_empty());
+
+        // Bob's chat is untouched in every one of the same five tables
+        // (2 messages: bob's incoming one plus our outgoing reply).
+        assert_eq!(
+            store
+                .messages_for_chat(b"bob-id".to_vec())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .receipt_through(b"bob-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(b"bob-id".to_vec(), b"bob-id".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            1
+        );
+        assert!(store
+            .outgoing_receipt_envelope(b"bob-id".to_vec(), b"bob-id".to_vec(), RECEIPT_TYPE_READ)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .outbound_envelopes_after(b"bob-id".to_vec(), b"me".to_vec(), 0)
+                .unwrap(),
+            vec![bob_outbound],
+        );
+    }
+
     // --- groups (DESIGN.md §6.5) ------------------------------------------
 
     #[test]
@@ -2564,6 +2735,136 @@ mod tests {
                 .outgoing_receipt_through(group.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ)
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn delete_group_purges_all_per_chat_state_and_leaves_other_group_alone() {
+        // Mirrors delete_contact_purges_all_per_chat_state_and_leaves_other_chat_alone:
+        // seed all five per-chat tables for two groups, delete one, verify a
+        // blank slate for it and the other group's state untouched.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let group_a = group(0x11, "Family", 0x22, &[b"alice", b"bob"]);
+        let group_b = group(0x33, "Crew", 0x44, &[b"carol", b"dave"]);
+        store.upsert_group(group_a.clone()).unwrap();
+        store.upsert_group(group_b.clone()).unwrap();
+
+        store
+            .insert_message(msg(&group_a.id, b"alice", 1, "hi group a"))
+            .unwrap();
+        store
+            .record_receipt(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_DELIVERED, 1)
+            .unwrap();
+        store
+            .record_outgoing_receipt(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ, 1)
+            .unwrap();
+        store
+            .upsert_outgoing_receipt_envelope(
+                outgoing_receipt_for(
+                    &group_a.id,
+                    b"alice",
+                    b"alice",
+                    RECEIPT_TYPE_READ,
+                    1,
+                    b"rcpt-a-1",
+                ),
+                1_700_000_000_100,
+            )
+            .unwrap();
+        let a_outgoing = msg(&group_a.id, b"me", 1, "reply in group a");
+        store
+            .insert_outgoing_message(
+                a_outgoing.clone(),
+                outbound_for(&a_outgoing, b"alice", b"msg-a-out-1"),
+                1_700_000_000_200,
+            )
+            .unwrap();
+
+        store
+            .insert_message(msg(&group_b.id, b"carol", 1, "hi group b"))
+            .unwrap();
+        store
+            .record_receipt(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_DELIVERED, 1)
+            .unwrap();
+        store
+            .record_outgoing_receipt(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_READ, 1)
+            .unwrap();
+        store
+            .upsert_outgoing_receipt_envelope(
+                outgoing_receipt_for(
+                    &group_b.id,
+                    b"carol",
+                    b"carol",
+                    RECEIPT_TYPE_READ,
+                    1,
+                    b"rcpt-b-1",
+                ),
+                1_700_000_000_100,
+            )
+            .unwrap();
+        let b_outgoing = msg(&group_b.id, b"me", 1, "reply in group b");
+        let b_outbound = outbound_for(&b_outgoing, b"carol", b"msg-b-out-1");
+        store
+            .insert_outgoing_message(b_outgoing.clone(), b_outbound.clone(), 1_700_000_000_200)
+            .unwrap();
+
+        assert!(store.delete_group(group_a.id.clone()).unwrap());
+
+        // All five per-chat tables are empty for group_a's chat_id.
+        assert!(store
+            .messages_for_chat(group_a.id.clone())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .receipt_through(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_envelope(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            None
+        );
+        assert!(store
+            .outbound_envelopes_after(group_a.id.clone(), b"me".to_vec(), 0)
+            .unwrap()
+            .is_empty());
+
+        // group_b's state is untouched in every one of the same five tables
+        // (2 messages: carol's incoming one plus our outgoing reply).
+        assert_eq!(
+            store.messages_for_chat(group_b.id.clone()).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            store
+                .receipt_through(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            1
+        );
+        assert!(store
+            .outgoing_receipt_envelope(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_READ)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .outbound_envelopes_after(group_b.id.clone(), b"me".to_vec(), 0)
+                .unwrap(),
+            vec![b_outbound],
         );
     }
 
