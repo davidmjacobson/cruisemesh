@@ -116,6 +116,15 @@ private const val RELAY_POLL_INTERVAL_MS = 60_000L
 private const val DIGEST_CARRIED_MSG_IDS_LIMIT: ULong = 512uL
 
 /**
+ * BLE_1TO1_MULING.md Hook B: bounded per-digest-exchange budget (sealed-byte
+ * size) for spraying our own still-undelivered 1:1 outbound envelopes to a
+ * non-recipient mule. Same order of magnitude as [FOREIGN_CARRY_BUDGET_BYTES]
+ * is generous for storage, but this budget bounds one GATT exchange's worth
+ * of traffic, not total storage, so it's much smaller.
+ */
+private const val OWN_OUTBOUND_SPRAY_BUDGET_BYTES: Long = 256L * 1024
+
+/**
  * Runs both BLE GATT roles simultaneously (DESIGN.md §5.2) so this device can
  * be discovered by, and discover, any other CruiseMesh phone in range.
  *
@@ -294,6 +303,7 @@ class MeshService : Service() {
         }
         identity = loadedIdentity
         store = AppStore.get(this)
+        seedSeenIdsFromOwnHistory(loadedIdentity)
 
         MeshRouter.registerCentral(central::sendFrame)
         MeshRouter.registerPeripheral(peripheral::sendFrame)
@@ -336,6 +346,39 @@ class MeshService : Service() {
         // callbacks, so clear the router's mappings wholesale.
         MeshRouter.reset()
         super.onDestroy()
+    }
+
+    /**
+     * BLE_1TO1_MULING.md §5 restart hardening: [GossipState.seenIds] is an
+     * in-memory dedupe set that does not survive a process restart (see its
+     * KDoc), while [store] is durable. Without this, a cold app start forgets
+     * every `msg_id` we ever authored, so a mule handing one of our own
+     * envelopes back to us (Hook A/B just made that routine) would fail to
+     * open it -- sealed to the recipient, not us -- and get misclassified as
+     * foreign traffic worth carrying. Harmless (the relay and this store both
+     * dedupe by `msg_id` too) but wasteful, so every persisted `msg_id` we
+     * authored -- our own outbound queue across every 1:1 chat and group,
+     * plus whatever we're currently muling for others -- is re-seeded here
+     * before the mesh roles come up.
+     */
+    private fun seedSeenIdsFromOwnHistory(identity: Identity) {
+        try {
+            for (contact in store.listContacts()) {
+                for (envelope in store.outboundEnvelopesAfter(contact.userId, identity.userId, 0uL)) {
+                    GossipState.seenIds.record(envelope.msgId)
+                }
+            }
+            for (group in store.listGroups()) {
+                for (envelope in store.outboundEnvelopesAfter(group.id, identity.userId, 0uL)) {
+                    GossipState.seenIds.record(envelope.msgId)
+                }
+            }
+            for (msgId in store.carriedMsgIds(DIGEST_CARRIED_MSG_IDS_LIMIT)) {
+                GossipState.seenIds.record(msgId)
+            }
+        } catch (e: CoreException) {
+            Log.w(TAG, "Failed to seed seenIds from own history: ${e.message}")
+        }
     }
 
     private fun startMeshRoles() {
@@ -1056,8 +1099,57 @@ class MeshService : Service() {
             resendGroupOutboundToPeer(address, resolvedPeerUserId, identity)
         }
         sprayCarriedEnvelopesTo(address, resolvedPeerUserId, recentMsgIds)
+        sprayOwnPendingOutboundTo(address, resolvedPeerUserId, recentMsgIds, identity)
         if (contact == null) {
             Log.i(TAG, "DIGEST from unrecognized userId=${UserIdHex.encode(resolvedPeerUserId)}; sprayed carry queue only")
+        }
+    }
+
+    /**
+     * BLE_1TO1_MULING.md Hook B: offers this digest peer -- whether or not
+     * they're a contact -- our own still-undelivered 1:1 outbound envelopes
+     * addressed to OTHER contacts, so a message authored while nobody was
+     * around still leaves this phone the next time any peer reconnects, not
+     * just the message's own recipient. [handleDigest]'s own-chat resend
+     * above already covers [peerUserId]'s own chat via the direct digest
+     * watermark, so it's excluded here to avoid a redundant second pass over
+     * the same envelopes. Group-addressed outbound envelopes are excluded
+     * too: [resendGroupOutboundToPeer] already floods those at send time and
+     * on every reconnect.
+     */
+    private fun sprayOwnPendingOutboundTo(
+        address: String,
+        peerUserId: ByteArray,
+        peerKnownMsgIds: List<ByteArray>,
+        identity: Identity,
+    ) {
+        val now = System.currentTimeMillis()
+        try {
+            val peerKnownHex = peerKnownMsgIds.mapTo(mutableSetOf()) { UserIdHex.encode(it) }
+            val pendingByContact = store.listContacts()
+                .filter { !it.userId.contentEquals(peerUserId) }
+                .map { contact ->
+                    val deliveredThrough = store.receiptThrough(contact.userId, identity.userId, RECEIPT_TYPE_DELIVERED)
+                    store.outboundEnvelopesAfter(contact.userId, identity.userId, deliveredThrough)
+                }
+            val toSpray = OwnOutboundSpraySelector.select(
+                pendingByContact,
+                peerKnownHex,
+                now,
+                OWN_OUTBOUND_SPRAY_BUDGET_BYTES,
+            )
+            if (toSpray.isEmpty()) return
+            var sprayed = 0
+            for (envelope in toSpray) {
+                if (MeshRouter.sendToAddress(address, encodeOutboundEnvelopeFrame(envelope))) {
+                    sprayed++
+                }
+            }
+            if (sprayed > 0) {
+                Log.i(TAG, "Sprayed $sprayed own pending outbound envelope(s) to mule $address")
+            }
+        } catch (e: CoreException) {
+            Log.w(TAG, "Failed to spray own pending outbound to $address: ${e.message}")
         }
     }
 

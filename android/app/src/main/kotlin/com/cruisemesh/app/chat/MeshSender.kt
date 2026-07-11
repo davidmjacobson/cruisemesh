@@ -154,8 +154,20 @@ class RealMeshSender(
         ChatEvents.notifyChatChanged(chatId)
         RelaySyncEvents.requestSync()
 
-        if (!MeshRouter.sendToUserId(contact.userId, encodeOutboundEnvelopeFrame(outbound))) {
-            Log.i(TAG, "$logLabel: ${contact.name} not currently connected; message stays local until next digest sync")
+        val frame = encodeOutboundEnvelopeFrame(outbound)
+        if (!MeshRouter.sendToUserId(contact.userId, frame)) {
+            // No direct link to the recipient right now -- give the sealed
+            // envelope to whoever IS connected so it can mule to the
+            // recipient later (BLE_1TO1_MULING.md Hook A). Muling peers can't
+            // open it (sealed to the recipient), so they carry/flood it via
+            // the existing foreign-envelope path; skipped entirely when the
+            // direct send above already succeeded, since that path plus
+            // receipts/digest resend already covers delivery.
+            val muled = MeshRouter.relayToAll(frame)
+            Log.i(
+                TAG,
+                "$logLabel: ${contact.name} not currently connected; sprayed to $muled mule link(s), message stays queued",
+            )
         }
     }
 }
