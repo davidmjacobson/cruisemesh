@@ -58,6 +58,34 @@ class ChatListLogicTest {
     }
 
     @Test
+    fun computeUnreadClearsOnMaxWatermarkButStallsOnContiguousWatermark() {
+        // Regression shape for the highestContiguousLamport -> highestLamport
+        // fix (MeshService.handleChatViewed etc.): a peer's stream can
+        // legitimately start above lamport 1 after the lamport ratchet
+        // rebases it post chat-history-wipe, so a receiver who holds only
+        // {3, 4} from that peer has everything the peer ever sent, but there
+        // is no lamport 1 or 2 to be "contiguous" with.
+        val ownId = byteArrayOf(1)
+        val peerId = byteArrayOf(2)
+        val messages = listOf(
+            StoredMessage(peerId, peerId, 3uL, 3000L, 1u.toUByte(), byteArrayOf()),
+            StoredMessage(peerId, peerId, 4uL, 4000L, 1u.toUByte(), byteArrayOf()),
+        )
+
+        // The fix: a real store's highestLamport(peerId, peerId) would
+        // return 4 here (plain MAX of {3, 4}), and feeding that through as
+        // readThrough clears the badge, exactly as opening the chat should.
+        assertEquals(0, ChatListLogic.computeUnread(messages, ownId, readThrough = 4uL))
+
+        // The bug: the old highestContiguousLamport(peerId, peerId) would
+        // return 0 here (nothing contiguous from 1, since 1 and 2 never
+        // existed), so `computeUnread`'s raw `lamport > readThrough`
+        // comparison never clears -- both messages stay counted as unread no
+        // matter how many times the chat is opened.
+        assertEquals(2, ChatListLogic.computeUnread(messages, ownId, readThrough = 0uL))
+    }
+
+    @Test
     fun lastVisibleMessageSkipsFriendRequests() {
         val peerId = byteArrayOf(2)
         val messages = listOf(

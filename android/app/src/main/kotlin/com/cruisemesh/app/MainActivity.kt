@@ -46,6 +46,7 @@ import com.cruisemesh.app.chat.GroupChatScreen
 import com.cruisemesh.app.chat.GroupSender
 import com.cruisemesh.app.chat.RealMeshSender
 import com.cruisemesh.app.chat.UserIdHex
+import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.friending.ContactsScreen
 import com.cruisemesh.app.friending.FriendRequestSender
 import com.cruisemesh.app.ui.ConnectivityWarning
@@ -93,6 +94,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Debug builds: start capturing this process's log to a file so it can
+        // be shared without adb (no-op in release). Idempotent with MeshService.
+        DebugFileLog.start(this)
         pendingDeepLink.value = deepLinkFromIntent(intent)
         setContent {
             CruiseMeshTheme {
@@ -672,10 +676,32 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
     val contact = remember(userIdHex) { store.getContact(UserIdHex.decode(userIdHex)) }
 
     if (contact != null) {
-        DisposableEffect(userIdHex) {
-            ChatVisibility.setVisible(contact.userId)
-            ChatViewEvents.onChatViewed(contact.userId)
-            onDispose { ChatVisibility.clearVisible(contact.userId) }
+        val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+        DisposableEffect(userIdHex, lifecycleOwner) {
+            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                when (event) {
+                    androidx.lifecycle.Lifecycle.Event.ON_START -> {
+                        // Chat is actually on screen (this destination is
+                        // resumed AND the app is foregrounded). Mark visible,
+                        // clear any notification posted while backgrounded, and
+                        // re-run read-on-view so returning to an already-open
+                        // chat still advances read state.
+                        ChatVisibility.setVisible(contact.userId)
+                        MessageNotifier.cancel(context, contact.userId)
+                        ChatViewEvents.onChatViewed(contact.userId)
+                    }
+                    androidx.lifecycle.Lifecycle.Event.ON_STOP ->
+                        // Navigated away OR app backgrounded: no longer on
+                        // screen, so incoming messages for it should notify.
+                        ChatVisibility.clearVisible(contact.userId)
+                    else -> {}
+                }
+            }
+            lifecycleOwner.lifecycle.addObserver(observer)
+            onDispose {
+                lifecycleOwner.lifecycle.removeObserver(observer)
+                ChatVisibility.clearVisible(contact.userId)
+            }
         }
         val sender = remember { RealMeshSender(store, identity) }
         ChatScreen(
@@ -705,17 +731,37 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
     }
 
     if (group != null) {
-        DisposableEffect(groupIdHex) {
-            ChatVisibility.setVisible(group.id)
-            // Local read watermarks for every other member (no wire receipts yet).
-            for (memberId in group.memberUserIds) {
-                if (memberId.contentEquals(identity.userId)) continue
-                val through = store.highestContiguousLamport(group.id, memberId)
-                if (through > 0uL) {
-                    store.recordOutgoingReceipt(group.id, memberId, RECEIPT_TYPE_READ, through)
+        val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+        DisposableEffect(groupIdHex, lifecycleOwner) {
+            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                when (event) {
+                    androidx.lifecycle.Lifecycle.Event.ON_START -> {
+                        ChatVisibility.setVisible(group.id)
+                        MessageNotifier.cancel(context, group.id)
+                        // Local read watermarks for every other member (no wire receipts
+                        // yet). highestLamport (plain MAX), not highestContiguousLamport:
+                        // this is a per-member peer-stream watermark, and the contiguous
+                        // count stalls at 0 once a member's stream legitimately starts
+                        // above lamport 1 (post chat-history-wipe ratchet), which would
+                        // strand the unread badge for that member forever.
+                        for (memberId in group.memberUserIds) {
+                            if (memberId.contentEquals(identity.userId)) continue
+                            val through = store.highestLamport(group.id, memberId)
+                            if (through > 0uL) {
+                                store.recordOutgoingReceipt(group.id, memberId, RECEIPT_TYPE_READ, through)
+                            }
+                        }
+                    }
+                    androidx.lifecycle.Lifecycle.Event.ON_STOP ->
+                        ChatVisibility.clearVisible(group.id)
+                    else -> {}
                 }
             }
-            onDispose { ChatVisibility.clearVisible(group.id) }
+            lifecycleOwner.lifecycle.addObserver(observer)
+            onDispose {
+                lifecycleOwner.lifecycle.removeObserver(observer)
+                ChatVisibility.clearVisible(group.id)
+            }
         }
         val sender = remember { GroupSender(store, identity) }
         GroupChatScreen(

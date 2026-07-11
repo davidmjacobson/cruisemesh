@@ -28,6 +28,7 @@ import androidx.core.content.ContextCompat
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
+import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.media.AttachmentPayload
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
@@ -254,6 +255,10 @@ class MeshService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
+        // Debug builds: ensure log capture is running even if the process was
+        // revived straight into the service without the UI (no-op in release
+        // and idempotent with MainActivity's call).
+        DebugFileLog.start(this)
         MeshRuntimeStatus.markStarting()
 
         if (running) {
@@ -678,6 +683,43 @@ class MeshService : Service() {
         }
     }
 
+    /**
+     * Fetches this config's relay mailbox and, per [InboundDisposition],
+     * either consumes each envelope for good or leaves it be.
+     *
+     * The fetch itself covers two disjoint concerns, combined into one hint
+     * set so they ride the same paginated fetch: [relayHintsForConfig] (mail
+     * addressed to us, pairwise or via a group we belong to) and
+     * [relayProxyHints] (mail addressed to a *contact*, fetched on their
+     * behalf -- relay proxy-polling, see that function's doc for why this is
+     * the fix for "a 1:1 message to a WiFi-less recipient never bridges
+     * across BLE clusters"). Every fetched envelope still goes through
+     * [handleRelayEnvelope] -> [processInboundEnvelope] exactly as before;
+     * what's new is that the ack decision now follows the returned
+     * [InboundDisposition] ([shouldAck]) instead of unconditionally acking
+     * everything the fetch returned. A proxied envelope comes back as
+     * CARRIED, not CONSUMED, so it is deliberately left on the relay --
+     * [MeshService.carryRelayEnvelope] already queued it for BLE delivery to
+     * its real recipient, and the relay copy remains the durable fallback
+     * until they (or another proxy) fetch and consume it, or it expires.
+     *
+     * The un-acked proxy envelopes DO still advance the cursor within this
+     * pass (`after = page.nextCursor` is unconditional), so the inner loop
+     * still terminates the same way it always did; they simply get
+     * re-fetched on the next poll pass. That's bounded and cheap (deduped by
+     * [GossipState.seenIds] on the way in) but not free -- see the TODO below
+     * for the follow-up that would avoid the re-fetch entirely.
+     *
+     * TODO(relay-proxy-polling follow-ups):
+     *  - A persistent per-contact proxy cursor (like `after`, but remembered
+     *    across passes instead of restarting at 0) would let us skip
+     *    re-fetching already-seen-but-still-CARRIED envelopes on every pass,
+     *    at the cost of a bit more state to persist and reconcile.
+     *  - [relayProxyHints] fetches every contact's hints on every pass, so
+     *    its cost scales with contact-list size. Fine for this app's small
+     *    family circles; would need a smarter server-side "for this family
+     *    token" fan-out if that ever became a large flat social graph.
+     */
     private fun pollRelayMailbox(
         config: RelayConfig,
         identity: Identity,
@@ -686,7 +728,9 @@ class MeshService : Service() {
         now: Long,
         network: Network?,
     ) {
-        val hints = relayHintsForConfig(identity.userId, now)
+        val selfHints = relayHintsForConfig(identity.userId, now)
+        val proxyHints = relayProxyHints(contacts, identity.userId, now)
+        val hints = dedupeHints(selfHints, proxyHints)
         if (hints.isEmpty()) return
         var after = 0L
         while (running && hasValidatedInternet()) {
@@ -698,16 +742,21 @@ class MeshService : Service() {
             if (page.envelopes.isEmpty()) return
             val ackIds = ArrayList<Long>(page.envelopes.size)
             for (envelope in page.envelopes) {
-                handleRelayEnvelope(envelope, identity)
-                ackIds += envelope.id
+                val disposition = handleRelayEnvelope(envelope, identity)
+                if (shouldAck(disposition)) {
+                    ackIds += envelope.id
+                }
             }
-            Log.i(TAG, "Acking ${ackIds.size} relay envelope(s) on ${config.relayUrl}: $ackIds")
-            RelayClient.ackEnvelopes(config, ackIds, network)
+            if (ackIds.isNotEmpty()) {
+                Log.i(TAG, "Acking ${ackIds.size} relay envelope(s) on ${config.relayUrl}: $ackIds")
+                RelayClient.ackEnvelopes(config, ackIds, network)
+            }
             after = page.nextCursor
             if (page.envelopes.size < RELAY_BATCH_LIMIT.toInt()) return
         }
     }
 
+    /** Mail addressed to us: our own hint, plus every group we belong to (DESIGN.md §6.5). */
     private fun relayHintsForConfig(
         ownUserId: ByteArray,
         now: Long,
@@ -720,6 +769,50 @@ class MeshService : Service() {
             }
         }
         return hints
+    }
+
+    /**
+     * "Proxy" hints for relay proxy-polling: the recent-day `recipient_hint`s
+     * for every contact that isn't us, so an internet-connected phone sitting
+     * in a BLE-only contact's cluster can also fetch mail addressed to *them*
+     * out of the shared family-token relay partition, then carry it over BLE
+     * the rest of the way ([MeshService.carryRelayEnvelope]). Without this,
+     * only the contact's own (internet-less) hint would ever be polled, and a
+     * 1:1 envelope addressed to them would sit unfetched forever.
+     *
+     * Bounded by family size: this fetches every contact's hints on every
+     * poll pass, so cost grows linearly with the contact list. That's fine
+     * for the small family circles this app targets; see the scaling TODO on
+     * [pollRelayMailbox] if that assumption ever changes.
+     */
+    private fun relayProxyHints(
+        contacts: List<Contact>,
+        ownUserId: ByteArray,
+        now: Long,
+    ): List<ByteArray> {
+        val hints = mutableListOf<ByteArray>()
+        for (contact in contacts) {
+            if (contact.userId.contentEquals(ownUserId)) continue
+            hints += recentHintsFor(contact.userId, now)
+        }
+        return hints
+    }
+
+    /**
+     * Combines [selfHints] and [proxyHints] into one fetch list, deduping by
+     * content (`ByteArray` has reference equality, so a plain `distinct()`
+     * would not catch two equal-content hints -- e.g. a contact hint that
+     * happens to coincide with a group hint we already fetch for ourselves).
+     */
+    private fun dedupeHints(selfHints: List<ByteArray>, proxyHints: List<ByteArray>): List<ByteArray> {
+        val seen = HashSet<String>(selfHints.size + proxyHints.size)
+        val out = ArrayList<ByteArray>(selfHints.size + proxyHints.size)
+        for (hint in selfHints + proxyHints) {
+            if (seen.add(UserIdHex.encode(hint))) {
+                out += hint
+            }
+        }
+        return out
     }
 
     private fun distinctRelayConfigs(contacts: List<Contact>, fallbackConfig: RelayConfig?): List<RelayConfig> =
@@ -1089,17 +1182,25 @@ class MeshService : Service() {
      * Delivery itself (decode body, the `chatId == verified sender` sanity
      * check explained in this class's KDoc, kind dispatch) is unchanged --
      * see [deliverOpenedEnvelope].
+     *
+     * [processInboundEnvelope] now returns an [InboundDisposition] so
+     * [pollRelayMailbox] (the relay path) can decide whether it's safe to ack
+     * the envelope; this BLE path has no such concept (a link frame isn't
+     * "acked"), so it just ignores the return value.
      */
     private fun handleEnvelope(address: String, envelope: Frame.Envelope, identity: Identity) {
         processInboundEnvelope(address, envelope, identity)
     }
 
-    private fun handleRelayEnvelope(envelope: com.cruisemesh.app.relay.RelayFetchedEnvelope, identity: Identity) {
+    private fun handleRelayEnvelope(
+        envelope: com.cruisemesh.app.relay.RelayFetchedEnvelope,
+        identity: Identity,
+    ): InboundDisposition {
         Log.i(
             TAG,
             "Handling relay envelope id=${envelope.id} msgId=${UserIdHex.encode(envelope.msgId)} hopTtl=${envelope.hopTtl}",
         )
-        processInboundEnvelope(
+        return processInboundEnvelope(
             sourceAddress = null,
             envelope = Frame.Envelope(
                 msgId = envelope.msgId,
@@ -1112,15 +1213,30 @@ class MeshService : Service() {
         )
     }
 
-    private fun processInboundEnvelope(sourceAddress: String?, envelope: Frame.Envelope, identity: Identity) {
+    /**
+     * [sourceAddress] doubles as the source discriminant relay proxy-polling
+     * needs: `null` means this envelope came FROM the relay
+     * ([handleRelayEnvelope]), non-null means it arrived over a live BLE link
+     * ([handleEnvelope]). The two foreign-carry branches below use that to
+     * pick [carryRelayEnvelope] (durable, never re-uploaded -- it's already on
+     * the relay) vs. the existing [carryForeignEnvelope] (durable-if-family,
+     * uploaded to the relay so an internet phone can proxy it onward) for
+     * envelopes we can't open ourselves. See [InboundDisposition] for what
+     * each return value means to the caller.
+     */
+    private fun processInboundEnvelope(
+        sourceAddress: String?,
+        envelope: Frame.Envelope,
+        identity: Identity,
+    ): InboundDisposition {
         val sourceLabel = sourceAddress ?: "relay"
         if (!GossipState.seenIds.checkAndRecord(envelope.msgId)) {
             // Already handled this msg_id; a redundant copy from the flood.
-            return
+            return InboundDisposition.SEEN
         }
         if (envelope.expiry <= System.currentTimeMillis()) {
             Log.i(TAG, "Dropping expired envelope from $sourceLabel (expiry=${envelope.expiry})")
-            return
+            return InboundDisposition.EXPIRED
         }
 
         val opened = try {
@@ -1135,18 +1251,27 @@ class MeshService : Service() {
             if (groupOpened != null) {
                 deliverOpenedGroupEnvelope(sourceLabel, groupOpened.first, groupOpened.second, identity)
                 relayForeignEnvelope(sourceAddress, envelope)
-                carryForeignEnvelope(envelope, forceFamily = true)
-                return
+                if (sourceAddress == null) {
+                    carryRelayEnvelope(envelope)
+                } else {
+                    carryForeignEnvelope(envelope, forceFamily = true)
+                }
+                return InboundDisposition.CONSUMED
             }
             // Not for us (or unopenable) -> foreign traffic. Two jobs, both
             // best-effort (DESIGN.md §5.3): flood it to whoever's connected
             // right now, and carry it so we can hand it to its recipient the
             // next time we meet them, even if that's hours from now.
             relayForeignEnvelope(sourceAddress, envelope)
-            carryForeignEnvelope(envelope)
-            return
+            if (sourceAddress == null) {
+                carryRelayEnvelope(envelope)
+            } else {
+                carryForeignEnvelope(envelope)
+            }
+            return InboundDisposition.CARRIED
         }
         deliverOpenedEnvelope(sourceLabel, opened, identity)
+        return InboundDisposition.CONSUMED
     }
 
     /**
@@ -1205,6 +1330,40 @@ class MeshService : Service() {
             }
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to enqueue carried envelope: ${e.message}")
+        }
+    }
+
+    /**
+     * Relay-sourced twin of [carryForeignEnvelope]: adds an envelope we
+     * fetched FROM the relay (relay proxy-polling, [relayProxyHints]) to the
+     * persistent carry queue for BLE delivery to its real recipient. Unlike
+     * [carryForeignEnvelope], this deliberately does NOT call
+     * [requestRelaySync] -- the envelope is already sitting on the relay (that
+     * is where we just fetched it from), so re-uploading it would only churn
+     * traffic and risk resurrecting a copy the real recipient already acked.
+     * [MessageStore.enqueueRelayCarriedEnvelope] enforces this on the core
+     * side too (`from_relay = 1` is excluded from the upload query), so this
+     * is belt-and-suspenders, but skipping the call here avoids scheduling a
+     * pointless relay-sync pass. Idempotent on `msg_id` like its sibling.
+     */
+    private fun carryRelayEnvelope(envelope: Frame.Envelope) {
+        val now = System.currentTimeMillis()
+        try {
+            val stored = store.enqueueRelayCarriedEnvelope(
+                CarriedEnvelope(
+                    msgId = envelope.msgId,
+                    hopTtl = envelope.hopTtl,
+                    expiry = envelope.expiry,
+                    recipientHint = envelope.recipientHint,
+                    sealed = envelope.sealed,
+                ),
+                now,
+            )
+            if (stored) {
+                Log.i(TAG, "Carrying relay-sourced envelope (proxy) for later BLE delivery")
+            }
+        } catch (e: CoreException) {
+            Log.w(TAG, "Failed to enqueue relay-carried envelope: ${e.message}")
         }
     }
 
@@ -1436,8 +1595,12 @@ class MeshService : Service() {
         )
         ChatEvents.notifyChatChanged(group.id)
 
-        // Local read watermark only (group wire receipts are deferred).
-        val throughLamport = store.highestContiguousLamport(group.id, senderUserId)
+        // Local read watermark only (group wire receipts are deferred). Uses
+        // highestLamport (plain MAX), not highestContiguousLamport: the
+        // latter stalls at 0 once the sender's stream legitimately starts
+        // above lamport 1 (post chat-history-wipe ratchet), which would
+        // leave this watermark -- and the unread badge -- stuck forever.
+        val throughLamport = store.highestLamport(group.id, senderUserId)
         store.recordOutgoingReceipt(group.id, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
         val isVisible = ChatVisibility.isVisible(group.id)
         if (isVisible) {
@@ -1562,7 +1725,11 @@ class MeshService : Service() {
         if (!inserted) return
         ChatEvents.notifyChatChanged(senderUserId)
 
-        val throughLamport = store.highestContiguousLamport(senderUserId, senderUserId)
+        // highestLamport (plain MAX), not highestContiguousLamport: this is
+        // a watermark over the peer's stream, and after the lamport ratchet
+        // that stream can legitimately start above 1, where the contiguous
+        // count would stall at 0 forever.
+        val throughLamport = store.highestLamport(senderUserId, senderUserId)
         store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
         var relayQueueChanged = queueOutgoingReceiptForRelay(
             identity = identity,
@@ -1649,7 +1816,11 @@ class MeshService : Service() {
         )
         ChatEvents.notifyChatChanged(senderUserId)
 
-        val throughLamport = store.highestContiguousLamport(senderUserId, senderUserId)
+        // highestLamport (plain MAX), not highestContiguousLamport: same
+        // peer-stream-watermark reasoning as above -- a contiguous-from-1
+        // count stalls at 0 once the sender's stream starts above 1 (post
+        // ratchet), stranding the delivered/read receipt and unread badge.
+        val throughLamport = store.highestLamport(senderUserId, senderUserId)
         store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
         var relayQueueChanged = false
         val isVisible = ChatVisibility.isVisible(senderUserId)
@@ -1810,7 +1981,18 @@ class MeshService : Service() {
     private fun handleChatViewed(peerUserId: ByteArray) {
         val identity = this.identity ?: return
         val contact = store.getContact(peerUserId) ?: return
-        val throughLamport = store.highestContiguousLamport(peerUserId, peerUserId)
+        // highestLamport (plain MAX), not highestContiguousLamport: the
+        // latter counts contiguously from lamport 1 and returns 0 at the
+        // first hole, but the lamport ratchet lets a peer's stream
+        // legitimately start above 1 after a chat history wipe (lamports
+        // below the new base never existed for anyone). A receiver holding
+        // e.g. {3, 4} from that peer would get 0 from the contiguous count
+        // forever, so opening the chat would never clear the unread badge
+        // or advance the read tick. MAX correctly reflects what we actually
+        // hold. The `== 0` guard below still means "nothing received yet,"
+        // since MAX is 0 only when the store truly has no message from
+        // this peer.
+        val throughLamport = store.highestLamport(peerUserId, peerUserId)
         if (throughLamport == 0uL) return // nothing received from this peer yet to ack as read
         store.recordOutgoingReceipt(peerUserId, peerUserId, RECEIPT_TYPE_READ, throughLamport)
         if (

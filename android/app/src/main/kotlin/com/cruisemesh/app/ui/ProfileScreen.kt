@@ -39,9 +39,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.createCameraCaptureUri
+import android.widget.Toast
 
 /** Hosted privacy policy (Play Console + in-app link). */
 const val PRIVACY_POLICY_URL = "https://cruisemesh.davidjacobson.work/privacy.html"
@@ -201,6 +203,33 @@ fun ProfileScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
             )
+
+            if (DebugFileLog.isEnabled(context)) {
+                Spacer(modifier = Modifier.height(32.dp))
+
+                Text("Debug", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "On-device log capture is on. Share it to send diagnostics.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Button(
+                    onClick = {
+                        val intent = DebugFileLog.shareIntent(context)
+                        if (intent != null) {
+                            context.startActivity(Intent.createChooser(intent, "Share debug log"))
+                        } else {
+                            Toast.makeText(context, "No log captured yet", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                ) {
+                    Text("Share debug log")
+                }
+            }
         }
     }
 }

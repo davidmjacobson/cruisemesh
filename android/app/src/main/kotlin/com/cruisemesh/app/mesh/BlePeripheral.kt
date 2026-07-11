@@ -42,6 +42,18 @@ private const val TAG = "BlePeripheral"
  * [onCentralSubscribed] fires at exactly that point, which is when
  * MeshService sends its half of the HELLO handshake. [onCentralDisconnected]
  * fires so callers can drop a stale address mapping.
+ *
+ * Link-death hardening (2026-07-10 silent-blackhole bug): live logs showed a
+ * peer's supervision-timeout death on one side (status=147) going completely
+ * unnoticed on the other -- [onNotificationSent] used to ignore its `status`
+ * and just send the next queued fragment, so a central that had already
+ * dropped the link kept looking "connected" here forever. MeshRouter kept
+ * the address mapped and `sendToUserId` kept returning true while every
+ * frame silently evaporated. Now a failed notify tears the link down via
+ * [tearDownLink] (mirrors [BleCentral]'s send-failure hardening), which
+ * fires [onCentralDisconnected] so the address gets unmapped -- the
+ * undelivered frame is not lost, it lives in the persistent store and
+ * redelivers via digest sync on the peer's next connection.
  */
 @SuppressLint("MissingPermission")
 class BlePeripheral(
@@ -79,14 +91,7 @@ class BlePeripheral(
             Log.i(TAG, "Central ${device.address} connection state=$newState")
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> connectedDevices[device.address] = device
-                BluetoothProfile.STATE_DISCONNECTED -> {
-                    connectedDevices.remove(device.address)
-                    negotiatedMtu.remove(device.address)
-                    reassemblers.remove(device.address)
-                    notifyQueues.remove(device.address)
-                    notifyInFlight.remove(device.address)
-                    onCentralDisconnected(device.address)
-                }
+                BluetoothProfile.STATE_DISCONNECTED -> tearDownLink(device.address, "status=$status")
             }
         }
 
@@ -145,6 +150,24 @@ class BlePeripheral(
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                // Mirrors BleCentral's onCharacteristicWrite hardening: a
+                // rejected notify means this central's link is already dead
+                // on its side (supervision-timeout death, stale gatt, etc.)
+                // even though our GATT server object still thinks it's
+                // connected -- the exact "phone A thinks the link is alive,
+                // phone B saw it die 30s ago" blackhole observed live
+                // 2026-07-10. cancelConnection() plus the map cleanup below
+                // returns this address to the digest-sync retry path instead
+                // of pretending the send succeeded.
+                Log.w(
+                    TAG,
+                    "onNotificationSent: notify failed for ${device.address} (status=$status); tearing down link",
+                )
+                gattServer?.cancelConnection(device)
+                tearDownLink(device.address, "notification send failed (status=$status)")
+                return
+            }
             notifyInFlight.remove(device.address)
             sendNextQueuedFragment(device)
         }
@@ -279,8 +302,33 @@ class BlePeripheral(
         if (notified) {
             notifyInFlight += address
         } else {
-            Log.w(TAG, "sendNextQueuedFragment: notifyCharacteristicChanged rejected for $address")
+            // Same reasoning as onNotificationSent's failure branch: a
+            // rejected notify on a link we believe is established (the
+            // in-flight guard above only lets one notify through at a time)
+            // means the link isn't usable. Leaving it mapped would
+            // black-hole every future send to this address.
+            Log.w(TAG, "sendNextQueuedFragment: notifyCharacteristicChanged rejected for $address; tearing down link")
+            gattServer?.cancelConnection(device)
+            tearDownLink(address, "notifyCharacteristicChanged rejected")
         }
+    }
+
+    /**
+     * Single per-address teardown path shared by the normal
+     * STATE_DISCONNECTED callback and the notify-failure paths
+     * (onNotificationSent / sendNextQueuedFragment) so the map cleanup and
+     * the [onCentralDisconnected] signal to MeshRouter can never drift apart
+     * -- mirrors [BleCentral.tearDownLink] (see that class's doc comment for
+     * the blackhole bug this fixes).
+     */
+    private fun tearDownLink(address: String, reason: String) {
+        Log.i(TAG, "tearDownLink: $address ($reason)")
+        connectedDevices.remove(address)
+        negotiatedMtu.remove(address)
+        reassemblers.remove(address)
+        notifyQueues.remove(address)
+        notifyInFlight.remove(address)
+        onCentralDisconnected(address)
     }
 
     private fun buildGattService(): BluetoothGattService {

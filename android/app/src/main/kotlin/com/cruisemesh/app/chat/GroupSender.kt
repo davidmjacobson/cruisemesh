@@ -21,6 +21,11 @@ private const val TAG = "GroupSender"
 /** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
 private const val KIND_TEXT: UByte = 1u
 
+/** Cumulative-receipt type bytes (DESIGN.md §7.2), mirroring the private
+ * copies already established in MainActivity.kt / ChatScreen.kt / MeshService.kt. */
+private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
+private const val RECEIPT_TYPE_READ: UByte = 2u
+
 /**
  * Creates groups, fans out pairwise `kind=4` invites, and authors group text
  * (DESIGN.md §6.5). Group text is sealed once with the shared group key and
@@ -89,7 +94,18 @@ class GroupSender(
         logLabel: String,
     ) {
         val chatId = group.id
-        val lamport = store.highestContiguousLamport(chatId, identity.userId) + 1uL
+        // Same ratchet-past-acked-receipts logic as 1:1 sends (MeshSender.kt's
+        // nextAuthoredLamport): guards against a deleted-and-recreated group
+        // chat wiping our own history while a member still holds our old
+        // stream. Group wire receipts don't exist yet, so receiptThrough
+        // always returns 0 here and maxOf degrades to plain
+        // highestContiguousLamport(...) + 1 -- this is forward-compatible
+        // wiring for whenever per-member group receipts land.
+        val lamport = nextAuthoredLamport(
+            ownContiguous = store.highestContiguousLamport(chatId, identity.userId),
+            ackedDelivered = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_DELIVERED),
+            ackedRead = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_READ),
+        )
         val timestamp = System.currentTimeMillis()
         val message = StoredMessage(
             chatId = chatId,
@@ -125,7 +141,13 @@ class GroupSender(
             Log.w(TAG, "encodeGroupInviteContent failed: ${e.message}")
             return
         }
-        val lamport = store.highestContiguousLamport(group.id, identity.userId) + 1uL
+        // See sendText's comment: same ratchet, and group receipts are still
+        // unwired so this degrades to highestContiguousLamport(...) + 1 today.
+        val lamport = nextAuthoredLamport(
+            ownContiguous = store.highestContiguousLamport(group.id, identity.userId),
+            ackedDelivered = store.receiptThrough(group.id, identity.userId, RECEIPT_TYPE_DELIVERED),
+            ackedRead = store.receiptThrough(group.id, identity.userId, RECEIPT_TYPE_READ),
+        )
         val timestamp = System.currentTimeMillis()
         val message = StoredMessage(
             chatId = group.id,

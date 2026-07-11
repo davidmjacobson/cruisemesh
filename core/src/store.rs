@@ -1,9 +1,13 @@
 //! Message + contact store: SQLite-backed persistence (DESIGN.md §7.1,
 //! §10). `insert_message` is idempotent on (chat_id, sender_user_id,
-//! lamport), so re-delivering the same envelope (expected under DTN) is
-//! safe. Per-chat lamport counters are maintained independently by each
-//! sender (DESIGN.md §7.1), so gap detection in [MessageStore::highest_contiguous_lamport]
-//! is keyed on (chat_id, sender_user_id), not chat_id alone.
+//! lamport): re-delivering the same envelope (expected under DTN) is a
+//! no-op. A conflict whose (timestamp, kind, payload) *don't* match is
+//! treated as the sender having forked/reset their stream rather than a
+//! duplicate -- see [MessageStore::insert_message]'s doc comment for the
+//! recovery this triggers. Per-chat lamport counters are maintained
+//! independently by each sender (DESIGN.md §7.1), so gap detection in
+//! [MessageStore::highest_contiguous_lamport] is keyed on (chat_id,
+//! sender_user_id), not chat_id alone.
 //!
 //! Contacts (DESIGN.md §6.2) live in the same store/connection rather than a
 //! separate file: they're the other half of "who can I seal a message to,"
@@ -201,16 +205,56 @@ impl MessageStore {
         let conn = Connection::open(&path).map_err(store_err)?;
         conn.execute_batch(SCHEMA).map_err(store_err)?;
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
+        // Relay proxy-polling (see enqueue_relay_carried_envelope): marks a
+        // carried envelope as one we pulled FROM the relay rather than one we
+        // received over BLE, so the relay-upload query can skip re-uploading
+        // it. Older on-disk stores predate the column.
+        ensure_column(
+            &conn,
+            "carried_envelopes",
+            "from_relay",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Insert a message. Returns `true` if a new row was inserted, `false`
-    /// if (chat_id, sender_user_id, lamport) was already present.
+    /// Insert a message from a remote sender's stream, distinguishing a true
+    /// duplicate from a *forked* stream instead of silently dropping both the
+    /// same way.
+    ///
+    /// A conflict on `(chat_id, sender_user_id, lamport)` is ambiguous on its
+    /// own: it could be a digest resend or relay copy of a message we already
+    /// have (same sealed content, arriving twice -- expected under DTN and
+    /// harmless to ignore), or it could be a sender who reset their stream
+    /// (e.g. deleted the chat and re-added the contact, per DESIGN.md §7.1's
+    /// "own outgoing stream has no gaps" -- deleting local history restarts
+    /// their lamport counter at 1) and is now re-using a lamport number we
+    /// already hold from their *old* stream for a genuinely new message. This
+    /// method tells the two apart by comparing the existing row's
+    /// `(timestamp, kind, payload)` against the incoming one:
+    ///
+    /// - **Identical** on all three -> true duplicate. No-op, returns `Ok(false)`,
+    ///   same behavior as the old plain `INSERT OR IGNORE`.
+    /// - **Different** -> a fork. The sender's old stream at and above this
+    ///   lamport is abandoned, so we drop our stale copy of that tail and
+    ///   insert the new message in its place. We also clear
+    ///   `outgoing_receipts` / `outgoing_receipt_envelopes` for this
+    ///   `(chat_id, sender_user_id)`: those are *our* "delivered/read through
+    ///   N" watermarks about *their* stream, and they were computed against
+    ///   the abandoned history -- left in place, they'd keep telling the
+    ///   sender (who now has no history past their reset) that we've already
+    ///   read messages they haven't sent yet, which is exactly the false ✓✓
+    ///   this recovery exists to stop. `receipts` (the peer's acks of *our*
+    ///   stream) is untouched -- unrelated to their stream resetting. All of
+    ///   this runs in one transaction so a crash mid-recovery can't leave the
+    ///   stale tail and the new message coexisting.
     pub fn insert_message(&self, message: StoredMessage) -> Result<bool, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let changed = conn
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
+
+        let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO messages
                     (chat_id, sender_user_id, lamport, timestamp, kind, payload)
@@ -224,8 +268,85 @@ impl MessageStore {
                     message.payload,
                 ],
             )
+            .map_err(store_err)?
+            > 0;
+
+        if inserted {
+            tx.commit().map_err(store_err)?;
+            return Ok(true);
+        }
+
+        // Conflict: a row already exists at this (chat_id, sender_user_id,
+        // lamport). Figure out whether it's the same message or a fork.
+        let existing: Option<(i64, i64, Vec<u8>)> = tx
+            .query_row(
+                "SELECT timestamp, kind, payload FROM messages
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+                params![message.chat_id, message.sender_user_id, message.lamport as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
             .map_err(store_err)?;
-        Ok(changed > 0)
+
+        let is_true_duplicate = match &existing {
+            Some((timestamp, kind, payload)) => {
+                *timestamp == message.timestamp
+                    && *kind == message.kind as i64
+                    && *payload == message.payload
+            }
+            // Shouldn't happen (we just failed to insert on a conflict), but
+            // if the row vanished under us, treat it as nothing to recover.
+            None => {
+                tx.commit().map_err(store_err)?;
+                return Ok(false);
+            }
+        };
+
+        if is_true_duplicate {
+            tx.commit().map_err(store_err)?;
+            return Ok(false);
+        }
+
+        // Fork: the sender re-numbered from below what we already hold.
+        // Drop our stale copy of the abandoned tail (this and every later
+        // lamport we have from their old stream -- they'll resend anything
+        // beyond this message under the new numbering too)...
+        tx.execute(
+            "DELETE FROM messages WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport >= ?3",
+            params![message.chat_id, message.sender_user_id, message.lamport as i64],
+        )
+        .map_err(store_err)?;
+        // ...and the watermarks we'd computed against that abandoned tail,
+        // so we stop reporting stale "delivered/read through N" back to the
+        // sender (root cause of the false ✓✓ this recovery fixes). These
+        // regenerate correctly from the normal receive/view paths.
+        tx.execute(
+            "DELETE FROM outgoing_receipts WHERE chat_id = ?1 AND sender_user_id = ?2",
+            params![message.chat_id, message.sender_user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM outgoing_receipt_envelopes WHERE chat_id = ?1 AND sender_user_id = ?2",
+            params![message.chat_id, message.sender_user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "INSERT INTO messages
+                (chat_id, sender_user_id, lamport, timestamp, kind, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                message.chat_id,
+                message.sender_user_id,
+                message.lamport as i64,
+                message.timestamp,
+                message.kind as i64,
+                message.payload,
+            ],
+        )
+        .map_err(store_err)?;
+
+        tx.commit().map_err(store_err)?;
+        Ok(true)
     }
 
     /// Atomically persist one locally authored message and the exact sealed
@@ -323,6 +444,56 @@ impl MessageStore {
     ) -> Result<u64, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         highest_contiguous_lamport_locked(&conn, &chat_id, &sender_user_id)
+    }
+
+    /// The highest lamport value actually held from this sender in this
+    /// chat -- a plain MAX, with no contiguity requirement. Returns 0 when
+    /// nothing has been received yet.
+    ///
+    /// This is deliberately a *different* primitive from
+    /// [`MessageStore::highest_contiguous_lamport`], and the split matters:
+    /// the lamport ratchet (`nextAuthoredLamport`, see the Kotlin side)
+    /// lets a sender's stream legitimately start above 1 after a chat
+    /// history wipe, because lamports below the new base never existed for
+    /// anyone -- there is nothing to be "contiguous from 1" with. A
+    /// receiver holding only e.g. {3, 4} from that sender has a perfectly
+    /// complete view of everything the sender ever sent, but
+    /// `highest_contiguous_lamport` reports 0 for it (it stops at the first
+    /// missing lamport, and 1 and 2 are permanently missing). Basing
+    /// delivered/read receipts and the local read/unread badge on that 0
+    /// makes them stall forever: `handle_chat_viewed`-style callers would
+    /// record read-through 0 and the unread count would never clear.
+    ///
+    /// `highest_lamport` fixes that by answering "what's the highest
+    /// message I actually hold from this sender" instead -- which is the
+    /// right basis for a receipt/badge watermark. It is *not* a safe
+    /// substitute for [`MessageStore::highest_contiguous_lamport`] in
+    /// digest sync ([`MessageStore::chat_digest`]): that path genuinely
+    /// needs the gap-aware contiguous count so it can detect a hole and
+    /// re-request the missing early messages (DESIGN.md §7.3). Reporting a
+    /// bare MAX there would let a real front-gap (message 1 lost in
+    /// transit, not wiped) go undetected forever, since the peer would
+    /// believe we already have everything up to the max we've seen.
+    ///
+    /// Moving receipts/badges to MAX is safe from a message-loss
+    /// standpoint: `record_receipt` (a peer acking delivery/read of *our*
+    /// stream) never prunes `outbound_envelopes` -- only expiry and
+    /// chat-delete do -- so an overstated watermark here cannot cause a
+    /// sender to drop an undelivered message of their own.
+    pub fn highest_lamport(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+    ) -> Result<u64, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT COALESCE(MAX(lamport), 0) FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2",
+            params![chat_id, sender_user_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(store_err)
+        .map(|n| n as u64)
     }
 
     /// A sync digest for `chat_id` (DESIGN.md §7.3): one [`DigestEntry`] per
@@ -769,8 +940,9 @@ impl MessageStore {
 
     /// Delete a contact and, with it, the entire 1:1 chat: the contact row,
     /// every message whose `chat_id` is their UserID (DESIGN.md §7.1: a 1:1
-    /// chat's id *is* the peer's UserID), and that chat's incoming/outgoing
-    /// receipt rows.
+    /// chat's id *is* the peer's UserID), that chat's incoming/outgoing
+    /// receipt rows, and every queued retry artifact keyed to this chat
+    /// (`outgoing_receipt_envelopes`, `outbound_envelopes`).
     ///
     /// Messages are deleted rather than retained, deliberately: the driving
     /// use case is pruning a dead contact whose identity changed (e.g. a
@@ -780,6 +952,20 @@ impl MessageStore {
     /// hoarding plaintext history for a peer the user chose to remove.
     /// Group messages from this sender are untouched (they live under the
     /// group's chat_id and belong to the group, not the contact).
+    ///
+    /// The two queued-envelope tables matter as much as `messages` here: a
+    /// deleted chat that left `outbound_envelopes` behind re-arms the
+    /// reset-stream trap fixed in fc6b9f9 (recover-from-forked-stream) --
+    /// stale queued envelopes can resend frames from the deleted history to
+    /// a peer whose lamport stream has since moved on, which is exactly the
+    /// shape of bug that recovery exists to catch, not reintroduce via a
+    /// leftover queue. And a leftover `receipts` row is exactly the
+    /// overstated ratchet that painted false read-ticks before that fix: a
+    /// delete must yield a genuinely blank slate, not a chat that looks
+    /// empty locally but still remembers watermarks against history the
+    /// user asked to erase. If the contact is re-added, the peer's replayed
+    /// receipts plus fork recovery re-establish consistency from scratch --
+    /// nothing here needs to survive a delete to make that work.
     ///
     /// Atomic (single transaction) and idempotent: deleting an unknown
     /// contact is a no-op. Returns `true` if a contact row was removed.
@@ -800,6 +986,11 @@ impl MessageStore {
         .map_err(store_err)?;
         tx.execute(
             "DELETE FROM outgoing_receipt_envelopes WHERE chat_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM outbound_envelopes WHERE chat_id = ?1",
             params![user_id],
         )
         .map_err(store_err)?;
@@ -892,8 +1083,14 @@ impl MessageStore {
             .collect()
     }
 
-    /// Delete a group definition, its membership rows, and the local chat
-    /// history / retry state keyed by that group id. Atomic and idempotent.
+    /// Delete a group definition, its membership rows, and every row of
+    /// local chat history / retry state keyed by that group id: `messages`,
+    /// `receipts`, `outgoing_receipts`, `outgoing_receipt_envelopes`, and
+    /// `outbound_envelopes` -- the same "genuinely blank slate" purge as
+    /// [`MessageStore::delete_contact`] (see that method's doc comment for
+    /// why leftover queued envelopes or receipt watermarks are a bug, not
+    /// just clutter: they re-arm the reset-stream trap fixed in fc6b9f9 and
+    /// paint false read-ticks). Atomic and idempotent.
     pub fn delete_group(&self, group_id: Vec<u8>) -> Result<bool, CoreError> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
@@ -1019,6 +1216,49 @@ impl MessageStore {
         }
         tx.commit().map_err(store_err)?;
         Ok(true)
+    }
+
+    /// Store an envelope pulled FROM the relay that we're proxying for its
+    /// real recipient (relay proxy-polling: an internet phone fetches a
+    /// contact's `recipient_hint`s alongside its own so a 1:1 message can
+    /// bridge across BLE clusters -- see `MeshService.pollRelayMailbox` /
+    /// `relayProxyHints` on the Kotlin side). This is the relay-sourced
+    /// twin of [`MessageStore::enqueue_carried_envelope`]: always
+    /// `is_family = 1` (the relay hint match already proved it's addressed
+    /// to someone we know, so it's kept until expiry and never evicted for
+    /// space) and `from_relay = 1`, which excludes it from
+    /// [`MessageStore::family_carried_envelopes`] -- the relay-upload query
+    /// -- because it is *already on the relay*; re-uploading it would just
+    /// churn traffic and could resurrect a copy the real recipient already
+    /// acked. It still shows up in [`MessageStore::carried_envelopes_for_hints`]
+    /// / [`MessageStore::carried_envelopes_for_peer_sync`] so we can hand it
+    /// to the real recipient over BLE. `INSERT OR IGNORE` keyed on `msg_id`,
+    /// so re-fetching the same still-unacked proxy envelope on a later poll
+    /// pass is a no-op. Returns whether a new row was inserted.
+    pub fn enqueue_relay_carried_envelope(
+        &self,
+        envelope: CarriedEnvelope,
+        now_ms: i64,
+    ) -> Result<bool, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let size = envelope.sealed.len() as i64;
+        let changed = conn
+            .execute(
+                "INSERT OR IGNORE INTO carried_envelopes
+                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family, received_at, size_bytes, from_relay)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 1)",
+                params![
+                    envelope.msg_id,
+                    envelope.hop_ttl as i64,
+                    envelope.expiry,
+                    envelope.recipient_hint,
+                    envelope.sealed,
+                    now_ms,
+                    size,
+                ],
+            )
+            .map_err(store_err)?;
+        Ok(changed > 0)
     }
 
     /// Carried envelopes whose `recipient_hint` matches any of `hints` and
@@ -1153,6 +1393,11 @@ impl MessageStore {
     /// Unexpired carried envelopes that were classified as family traffic
     /// when received, oldest first. Used by relay upload so one phone with
     /// internet can uplink ciphertext it is muling for known contacts.
+    /// Excludes `from_relay = 1` rows: those were pulled FROM the relay by
+    /// proxy-polling in the first place (see
+    /// [`MessageStore::enqueue_relay_carried_envelope`]), so re-uploading them
+    /// here would be pointless churn (and could resurrect an envelope the
+    /// real recipient already acked).
     pub fn family_carried_envelopes(
         &self,
         limit: u64,
@@ -1163,7 +1408,7 @@ impl MessageStore {
             .prepare(
                 "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
                  FROM carried_envelopes
-                 WHERE is_family = 1 AND expiry > ?1
+                 WHERE is_family = 1 AND from_relay = 0 AND expiry > ?1
                  ORDER BY received_at ASC, msg_id ASC
                  LIMIT ?2",
             )
@@ -1351,6 +1596,34 @@ fn ensure_contact_column(conn: &Connection, name: &str, column_def: &str) -> Res
     Ok(())
 }
 
+/// Generic version of [`ensure_contact_column`] for any table: adds `name`
+/// (with `column_def`) to `table` if an older on-disk schema doesn't already
+/// have it. Idempotent -- a no-op once the column exists.
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    column_def: &str,
+) -> Result<(), CoreError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(store_err)?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(store_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(store_err)?;
+    if names.iter().any(|existing| existing == name) {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {name} {column_def}"),
+        [],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1454,7 +1727,8 @@ CREATE TABLE IF NOT EXISTS carried_envelopes (
     sealed         BLOB NOT NULL,
     is_family      INTEGER NOT NULL,
     received_at    INTEGER NOT NULL,
-    size_bytes     INTEGER NOT NULL
+    size_bytes     INTEGER NOT NULL,
+    from_relay     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_carried_hint ON carried_envelopes(recipient_hint);
 CREATE INDEX IF NOT EXISTS idx_carried_expiry ON carried_envelopes(expiry);
@@ -1598,6 +1872,125 @@ mod tests {
     }
 
     #[test]
+    fn insert_message_true_duplicate_is_ignored() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(store
+            .insert_message(msg(b"chat-a", b"alice", 3, "hi"))
+            .unwrap());
+        // Same (chat_id, sender_user_id, lamport) *and* same (timestamp,
+        // kind, payload) -- a true duplicate (digest resend / relay replay
+        // of the identical sealed message), not a fork. No-op, row count
+        // unchanged.
+        assert!(!store
+            .insert_message(msg(b"chat-a", b"alice", 3, "hi"))
+            .unwrap());
+        assert_eq!(
+            store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn insert_message_fork_recovers_abandoned_tail_and_resets_outgoing_receipts() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // Alice's original stream: messages 1..5, and we'd told her (via
+        // outgoing_receipts) that we'd read through 5.
+        for lamport in 1..=5u64 {
+            store
+                .insert_message(msg(b"chat-a", b"alice", lamport, "old"))
+                .unwrap();
+        }
+        store
+            .record_outgoing_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_READ,
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_READ,
+                )
+                .unwrap(),
+            5
+        );
+
+        // Alice deleted the chat and re-added us: her lamport counter
+        // restarted, so she resends a genuinely new message 3 with different
+        // content/timestamp -- a fork, not a duplicate of the old message 3.
+        let mut forked = msg(b"chat-a", b"alice", 3, "new-after-reset");
+        forked.timestamp = 1_700_000_500_000;
+        assert!(store.insert_message(forked).unwrap());
+
+        // Old messages 3, 4, 5 are gone; the new message 3 replaces them.
+        let remaining = store.messages_for_chat(b"chat-a".to_vec()).unwrap();
+        assert_eq!(remaining.len(), 3); // 1, 2, and the new 3
+        let three = remaining.iter().find(|m| m.lamport == 3).unwrap();
+        assert_eq!(three.payload, b"new-after-reset");
+        assert_eq!(three.timestamp, 1_700_000_500_000);
+        assert!(remaining.iter().all(|m| m.lamport != 4 && m.lamport != 5));
+
+        // Our contiguous view of Alice's stream is now capped at the fork point.
+        assert_eq!(
+            store
+                .highest_contiguous_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+                .unwrap(),
+            3
+        );
+
+        // The stale "read through 5" watermark about Alice's *old* stream is
+        // cleared -- it was overstated relative to her reset stream and would
+        // otherwise keep painting false checkmarks on messages she hasn't
+        // sent yet under the new numbering.
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_READ,
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn insert_message_fork_recovery_does_not_touch_receipts_table() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for lamport in 1..=5u64 {
+            store
+                .insert_message(msg(b"chat-a", b"alice", lamport, "old"))
+                .unwrap();
+        }
+        // `receipts` in this chat is the peer's ack of *our own* outgoing
+        // stream ("self") -- unrelated to alice's stream resetting -- and
+        // must survive her fork recovery untouched.
+        store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"self".to_vec(),
+                crate::RECEIPT_TYPE_READ,
+                2,
+            )
+            .unwrap();
+
+        let mut forked = msg(b"chat-a", b"alice", 3, "new-after-reset");
+        forked.timestamp = 1_700_000_500_000;
+        assert!(store.insert_message(forked).unwrap());
+
+        assert_eq!(
+            store
+                .receipt_through(b"chat-a".to_vec(), b"self".to_vec(), crate::RECEIPT_TYPE_READ)
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn messages_are_isolated_per_chat() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store
@@ -1669,6 +2062,85 @@ mod tests {
         assert_eq!(
             store
                 .highest_contiguous_lamport(b"chat-a".to_vec(), b"bob".to_vec())
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn highest_lamport_is_zero_with_no_messages() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let n = store
+            .highest_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn highest_lamport_is_max_across_a_front_gap() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // Lamports 1 and 2 never existed for alice -- e.g. her stream base
+        // was ratcheted forward after a chat history wipe -- so her stream
+        // legitimately starts at 3. `highest_contiguous_lamport` would
+        // report 0 here (nothing contiguous from 1); `highest_lamport`
+        // reports what she's actually sent.
+        store
+            .insert_message(msg(b"chat-a", b"alice", 3, "three"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 4, "four"))
+            .unwrap();
+
+        let n = store
+            .highest_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+            .unwrap();
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn highest_lamport_is_max_across_an_internal_gap() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "one"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 2, "two"))
+            .unwrap();
+        // lamport 3 is missing -- message 4 arrived out of order (DTN
+        // reality) -- but we still hold the max the sender has reached.
+        store
+            .insert_message(msg(b"chat-a", b"alice", 4, "four"))
+            .unwrap();
+
+        let n = store
+            .highest_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+            .unwrap();
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn highest_lamport_is_per_sender_not_per_chat() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "hi"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 2, "there"))
+            .unwrap();
+        // Bob's own counter in the same chat starts independently at 1.
+        store
+            .insert_message(msg(b"chat-a", b"bob", 1, "hey"))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .highest_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .highest_lamport(b"chat-a".to_vec(), b"bob".to_vec())
                 .unwrap(),
             1
         );
@@ -2239,6 +2711,151 @@ mod tests {
             .is_empty());
     }
 
+    #[test]
+    fn delete_contact_purges_all_per_chat_state_and_leaves_other_chat_alone() {
+        // Regression test for the silent-blackhole-adjacent bug: a delete
+        // that only cleared `messages`/`receipts`/`outgoing_receipts` left
+        // `outgoing_receipt_envelopes` and `outbound_envelopes` behind,
+        // re-arming the reset-stream trap fixed in fc6b9f9 and leaving a
+        // "deleted" chat that could still resend frames from its erased
+        // history. Seed every one of the five per-chat tables for two
+        // contacts, delete one, and verify a genuinely blank slate for it
+        // while the other contact's chat is untouched.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        store.upsert_contact(contact(b"bob-id", "Bob")).unwrap();
+
+        // Alice's chat: one message from her, a receipt she gave us, an
+        // outgoing receipt watermark, its queued envelope, and one queued
+        // outbound message envelope.
+        store
+            .insert_message(msg(b"alice-id", b"alice-id", 1, "hi from alice"))
+            .unwrap();
+        store
+            .record_receipt(
+                b"alice-id".to_vec(),
+                b"me".to_vec(),
+                RECEIPT_TYPE_DELIVERED,
+                1,
+            )
+            .unwrap();
+        store
+            .record_outgoing_receipt(b"alice-id".to_vec(), b"alice-id".to_vec(), RECEIPT_TYPE_READ, 1)
+            .unwrap();
+        store
+            .upsert_outgoing_receipt_envelope(
+                outgoing_receipt_for(
+                    b"alice-id",
+                    b"alice-id",
+                    b"alice-id",
+                    RECEIPT_TYPE_READ,
+                    1,
+                    b"rcpt-alice-1",
+                ),
+                1_700_000_000_100,
+            )
+            .unwrap();
+        let alice_outgoing = msg(b"alice-id", b"me", 1, "reply to alice");
+        store
+            .insert_outgoing_message(
+                alice_outgoing.clone(),
+                outbound_for(&alice_outgoing, b"alice-id", b"msg-alice-out-1"),
+                1_700_000_000_200,
+            )
+            .unwrap();
+
+        // Bob's chat: the identical shape of state, to prove it survives.
+        store
+            .insert_message(msg(b"bob-id", b"bob-id", 1, "hi from bob"))
+            .unwrap();
+        store
+            .record_receipt(b"bob-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED, 1)
+            .unwrap();
+        store
+            .record_outgoing_receipt(b"bob-id".to_vec(), b"bob-id".to_vec(), RECEIPT_TYPE_READ, 1)
+            .unwrap();
+        store
+            .upsert_outgoing_receipt_envelope(
+                outgoing_receipt_for(
+                    b"bob-id",
+                    b"bob-id",
+                    b"bob-id",
+                    RECEIPT_TYPE_READ,
+                    1,
+                    b"rcpt-bob-1",
+                ),
+                1_700_000_000_100,
+            )
+            .unwrap();
+        let bob_outgoing = msg(b"bob-id", b"me", 1, "reply to bob");
+        let bob_outbound = outbound_for(&bob_outgoing, b"bob-id", b"msg-bob-out-1");
+        store
+            .insert_outgoing_message(bob_outgoing.clone(), bob_outbound.clone(), 1_700_000_000_200)
+            .unwrap();
+
+        assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
+
+        // All five per-chat tables are empty for alice's chat_id.
+        assert!(store
+            .messages_for_chat(b"alice-id".to_vec())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .receipt_through(b"alice-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(b"alice-id".to_vec(), b"alice-id".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_envelope(b"alice-id".to_vec(), b"alice-id".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            None
+        );
+        assert!(store
+            .outbound_envelopes_after(b"alice-id".to_vec(), b"me".to_vec(), 0)
+            .unwrap()
+            .is_empty());
+
+        // Bob's chat is untouched in every one of the same five tables
+        // (2 messages: bob's incoming one plus our outgoing reply).
+        assert_eq!(
+            store
+                .messages_for_chat(b"bob-id".to_vec())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .receipt_through(b"bob-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(b"bob-id".to_vec(), b"bob-id".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            1
+        );
+        assert!(store
+            .outgoing_receipt_envelope(b"bob-id".to_vec(), b"bob-id".to_vec(), RECEIPT_TYPE_READ)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .outbound_envelopes_after(b"bob-id".to_vec(), b"me".to_vec(), 0)
+                .unwrap(),
+            vec![bob_outbound],
+        );
+    }
+
     // --- groups (DESIGN.md §6.5) ------------------------------------------
 
     #[test]
@@ -2334,6 +2951,136 @@ mod tests {
                 .outgoing_receipt_through(group.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ)
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn delete_group_purges_all_per_chat_state_and_leaves_other_group_alone() {
+        // Mirrors delete_contact_purges_all_per_chat_state_and_leaves_other_chat_alone:
+        // seed all five per-chat tables for two groups, delete one, verify a
+        // blank slate for it and the other group's state untouched.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let group_a = group(0x11, "Family", 0x22, &[b"alice", b"bob"]);
+        let group_b = group(0x33, "Crew", 0x44, &[b"carol", b"dave"]);
+        store.upsert_group(group_a.clone()).unwrap();
+        store.upsert_group(group_b.clone()).unwrap();
+
+        store
+            .insert_message(msg(&group_a.id, b"alice", 1, "hi group a"))
+            .unwrap();
+        store
+            .record_receipt(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_DELIVERED, 1)
+            .unwrap();
+        store
+            .record_outgoing_receipt(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ, 1)
+            .unwrap();
+        store
+            .upsert_outgoing_receipt_envelope(
+                outgoing_receipt_for(
+                    &group_a.id,
+                    b"alice",
+                    b"alice",
+                    RECEIPT_TYPE_READ,
+                    1,
+                    b"rcpt-a-1",
+                ),
+                1_700_000_000_100,
+            )
+            .unwrap();
+        let a_outgoing = msg(&group_a.id, b"me", 1, "reply in group a");
+        store
+            .insert_outgoing_message(
+                a_outgoing.clone(),
+                outbound_for(&a_outgoing, b"alice", b"msg-a-out-1"),
+                1_700_000_000_200,
+            )
+            .unwrap();
+
+        store
+            .insert_message(msg(&group_b.id, b"carol", 1, "hi group b"))
+            .unwrap();
+        store
+            .record_receipt(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_DELIVERED, 1)
+            .unwrap();
+        store
+            .record_outgoing_receipt(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_READ, 1)
+            .unwrap();
+        store
+            .upsert_outgoing_receipt_envelope(
+                outgoing_receipt_for(
+                    &group_b.id,
+                    b"carol",
+                    b"carol",
+                    RECEIPT_TYPE_READ,
+                    1,
+                    b"rcpt-b-1",
+                ),
+                1_700_000_000_100,
+            )
+            .unwrap();
+        let b_outgoing = msg(&group_b.id, b"me", 1, "reply in group b");
+        let b_outbound = outbound_for(&b_outgoing, b"carol", b"msg-b-out-1");
+        store
+            .insert_outgoing_message(b_outgoing.clone(), b_outbound.clone(), 1_700_000_000_200)
+            .unwrap();
+
+        assert!(store.delete_group(group_a.id.clone()).unwrap());
+
+        // All five per-chat tables are empty for group_a's chat_id.
+        assert!(store
+            .messages_for_chat(group_a.id.clone())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .receipt_through(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_envelope(group_a.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            None
+        );
+        assert!(store
+            .outbound_envelopes_after(group_a.id.clone(), b"me".to_vec(), 0)
+            .unwrap()
+            .is_empty());
+
+        // group_b's state is untouched in every one of the same five tables
+        // (2 messages: carol's incoming one plus our outgoing reply).
+        assert_eq!(
+            store.messages_for_chat(group_b.id.clone()).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            store
+                .receipt_through(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            1
+        );
+        assert!(store
+            .outgoing_receipt_envelope(group_b.id.clone(), b"carol".to_vec(), RECEIPT_TYPE_READ)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .outbound_envelopes_after(group_b.id.clone(), b"me".to_vec(), 0)
+                .unwrap(),
+            vec![b_outbound],
         );
     }
 
@@ -2987,5 +3734,84 @@ mod tests {
             .collect();
         // fam survives despite being 400 bytes (> budget); foreign kept to f2,f3.
         assert_eq!(ids, vec![b"fam".to_vec(), b"f2".to_vec(), b"f3".to_vec()]);
+    }
+
+    // --- relay proxy-polling (from_relay) -----------------------------------
+
+    #[test]
+    fn relay_carried_envelope_is_deliverable_over_ble_but_never_reuploaded() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let env = carried(b"proxy", b"hint-a", 9_000, 10);
+        assert!(store
+            .enqueue_relay_carried_envelope(env.clone(), 1_000)
+            .unwrap());
+
+        // Deliverable over BLE to the real recipient...
+        let found = store
+            .carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 2_000)
+            .unwrap();
+        assert_eq!(found, vec![env]);
+
+        // ...but never re-uploaded to the relay it came from.
+        let uploadable = store.family_carried_envelopes(10, 2_000).unwrap();
+        assert!(uploadable.is_empty());
+    }
+
+    #[test]
+    fn normal_family_carried_envelope_is_still_reuploaded() {
+        // Unchanged behavior: a family envelope received over BLE (not from
+        // the relay) still surfaces in the relay-upload query.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let env = carried(b"ble-family", b"hint-a", 9_000, 10);
+        assert!(store
+            .enqueue_carried_envelope(env.clone(), true, 1_000, BIG_BUDGET)
+            .unwrap());
+
+        let uploadable = store.family_carried_envelopes(10, 2_000).unwrap();
+        assert_eq!(uploadable, vec![env]);
+    }
+
+    #[test]
+    fn open_migrates_an_old_carried_envelopes_table_to_add_from_relay() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cruisemesh-store-migration-carried-{unique}.sqlite"));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE carried_envelopes (
+                msg_id         BLOB PRIMARY KEY,
+                hop_ttl        INTEGER NOT NULL,
+                expiry         INTEGER NOT NULL,
+                recipient_hint BLOB NOT NULL,
+                sealed         BLOB NOT NULL,
+                is_family      INTEGER NOT NULL,
+                received_at    INTEGER NOT NULL,
+                size_bytes     INTEGER NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Opening an old store (pre-dating from_relay) must migrate the
+        // column, not error, and the new relay-sourced path must work
+        // against the migrated schema.
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        let env = carried(b"proxy", b"hint-a", 9_000, 10);
+        assert!(store
+            .enqueue_relay_carried_envelope(env.clone(), 1_000)
+            .unwrap());
+        let found = store
+            .carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 2_000)
+            .unwrap();
+        assert_eq!(found, vec![env]);
+
+        drop(store);
+        fs::remove_file(path).unwrap();
     }
 }

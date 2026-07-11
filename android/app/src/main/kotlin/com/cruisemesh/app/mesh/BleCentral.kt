@@ -14,12 +14,25 @@ import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import java.util.ArrayDeque
 
 private const val TAG = "BleCentral"
 private const val REQUESTED_MTU = 517
+
+// Live capture 2026-07-10 (two phones side by side in a car): a connectGatt
+// at 20:18:02.645 produced no callback at all until status=147 at
+// 20:18:32.662 -- a hung connect held one of Android's ~7 GATT client slots
+// for a full 30 seconds. With the dual-role mesh using 2 links per peer
+// pair, one unreachable (stale/rotated) address starves the slot pool and
+// every other peer churns status=133 waiting for a free slot. The connect
+// setup burst (connect -> MTU -> discover -> subscribe) takes ~300 ms in
+// practice at CONNECTION_PRIORITY_HIGH, so 12 s is generous headroom while
+// still freeing the slot well before the stack's own ~30 s give-up.
+private const val CONNECT_TIMEOUT_MS = 12_000L
 
 /**
  * Scanner + GATT-client (central) half of the dual BLE role (DESIGN.md §5.2).
@@ -52,6 +65,16 @@ private const val REQUESTED_MTU = 517
  * comment below); [onPeerDisconnected] fires so callers (MeshRouter, via
  * MeshService) can drop a stale address mapping instead of sending into the
  * void.
+ *
+ * Link-death hardening (2026-07-10 silent-blackhole bug, see the log
+ * evidence above [CONNECT_TIMEOUT_MS]): a hung connectGatt now gets a
+ * watchdog that frees the GATT slot instead of squatting on it for ~30 s
+ * (see [connectWatchdogs]/[fullyConnected]), and a failed write is now
+ * treated as proof the link is dead -- [tearDownLink] runs so MeshRouter
+ * unmaps the address instead of continuing to report `sendToUserId` success
+ * into the void. Frames already queued for a torn-down address are not
+ * lost: they live in the persistent store and redeliver via digest sync the
+ * next time that peer (or its readvertised address) reconnects.
  */
 @SuppressLint("MissingPermission")
 class BleCentral(
@@ -71,6 +94,25 @@ class BleCentral(
     private val writeQueues = mutableMapOf<String, ArrayDeque<ByteArray>>()
     private val writeInFlight = mutableSetOf<String>()
     private val scanDiagnostics = mutableMapOf<String, ScanDiagnostics>()
+
+    // GATT callbacks arrive on a binder thread, but Handler.postDelayed's
+    // callback runs on whichever Looper the Handler was built with -- use
+    // the main looper so watchdog firing (and its map mutations) lands on
+    // the same thread as the rest of this class's Android-framework calls.
+    private val handler = Handler(Looper.getMainLooper())
+
+    // Per-address pending "connect is taking too long" timer, keyed the same
+    // way as [connections] so a watchdog can always be found and cancelled
+    // by address alone.
+    private val connectWatchdogs = mutableMapOf<String, Runnable>()
+
+    // Addresses that have completed the full connect -> MTU -> discover ->
+    // subscribe setup burst (i.e. onPeerConnected has fired for them). The
+    // watchdog only acts on an address that is tracked in [connections] but
+    // missing from this set -- once setup completes, the connection is
+    // healthy and the watchdog is cancelled (see onDescriptorWrite) rather
+    // than left to fire uselessly.
+    private val fullyConnected = mutableSetOf<String>()
 
     /**
      * Advertised service UUIDs + device name + whether our service *data*
@@ -114,7 +156,9 @@ class BleCentral(
             val now = System.currentTimeMillis()
             if (!backoff.canAttempt(device.address, now)) return
             Log.i(TAG, "Discovered peer ${device.address}, connecting ($diagnostics)")
-            connections[device.address] = device.connectGatt(context, false, gattClientCallback)
+            val gatt = device.connectGatt(context, false, gattClientCallback)
+            connections[device.address] = gatt
+            scheduleConnectWatchdog(device.address, gatt)
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -157,13 +201,7 @@ class BleCentral(
                                 "under a fresh advertisement address ($diagnostics)",
                         )
                     }
-                    connections.remove(address)
-                    negotiatedMtu.remove(address)
-                    reassemblers.remove(address)
-                    writeQueues.remove(address)
-                    writeInFlight.remove(address)
-                    onPeerDisconnected(address)
-                    gatt.close()
+                    tearDownLink(gatt, "disconnected (status=$status)")
                 }
             }
         }
@@ -216,6 +254,11 @@ class BleCentral(
                 // Fully connected: clear this address's failure history so a
                 // peer that connects reliably never accumulates backoff.
                 backoff.recordSuccess(gatt.device.address)
+                // Setup is done -- the connect watchdog (1a) no longer has
+                // anything to guard against, and must not fire and tear
+                // down a perfectly healthy link.
+                fullyConnected += gatt.device.address
+                cancelConnectWatchdog(gatt.device.address)
                 onPeerConnected(gatt.device.address)
             }
         }
@@ -228,6 +271,27 @@ class BleCentral(
         ) {
             Log.i(TAG, "Characteristic write for ${gatt.device.address} status=$status")
             writeInFlight.remove(gatt.device.address)
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                // A failed write on a link this class still believes is
+                // live is exactly the observed blackhole: the far side's
+                // supervision-timeout death (status=147) is invisible here
+                // except as a rejected write, and the old code just logged
+                // and moved on, leaving the address mapped in MeshRouter
+                // forever ("sendToUserId" kept returning true while frames
+                // evaporated). Tear the link down so the address gets
+                // unmapped -- the fragment we just failed to deliver is not
+                // lost, it lives in the persistent store and redelivers via
+                // digest sync the next time this peer (or its readvertised
+                // address) reconnects.
+                Log.w(
+                    TAG,
+                    "onCharacteristicWrite: write failed for ${gatt.device.address} " +
+                        "(status=$status); tearing down link",
+                )
+                backoff.recordFailure(gatt.device.address, System.currentTimeMillis())
+                tearDownLink(gatt, "characteristic write failed (status=$status)")
+                return
+            }
             sendNextQueuedFragment(gatt)
         }
     }
@@ -273,6 +337,9 @@ class BleCentral(
             Log.w(TAG, "stopScan during stop() failed (adapter likely off): ${e.message}")
         }
         scanner = null
+        connectWatchdogs.values.forEach { handler.removeCallbacks(it) }
+        connectWatchdogs.clear()
+        fullyConnected.clear()
         connections.values.forEach { runCatching { it.close() } }
         connections.clear()
         negotiatedMtu.clear()
@@ -327,8 +394,74 @@ class BleCentral(
         if (written) {
             writeInFlight += address
         } else {
-            Log.w(TAG, "sendNextQueuedFragment: writeCharacteristic rejected for $address")
+            // Same reasoning as the onCharacteristicWrite failure branch: a
+            // rejected write on a link we believe is established (the
+            // in-flight guard above only lets one write through at a time,
+            // so this is not a "too busy" rejection) means the link isn't
+            // usable -- dead peer or stale gatt. Leaving it mapped would
+            // black-hole every future send to this address.
+            Log.w(TAG, "sendNextQueuedFragment: writeCharacteristic rejected for $address; tearing down link")
+            backoff.recordFailure(address, System.currentTimeMillis())
+            tearDownLink(gatt, "writeCharacteristic rejected")
         }
     }
 
+    /**
+     * Schedules the connect watchdog (see [CONNECT_TIMEOUT_MS]) for a
+     * freshly-issued connectGatt. If [address] has not reached
+     * [fullyConnected] by the time this fires, the connect is presumed
+     * hung -- the Android BLE stack was observed live holding a client slot
+     * for ~30 s with no callback at all before finally delivering
+     * status=147, and with only ~7 client slots shared across the whole
+     * dual-role mesh, one hung connect starves every other peer. Freeing
+     * the slot at 12 s (instead of waiting out the stack's own timeout)
+     * keeps the slot pool available for peers that can actually connect.
+     */
+    private fun scheduleConnectWatchdog(address: String, gatt: BluetoothGatt) {
+        val watchdog = Runnable {
+            if (address in fullyConnected || connections[address] !== gatt) {
+                // Already completed setup, or superseded by a newer
+                // connection attempt for this address -- nothing to do.
+                return@Runnable
+            }
+            Log.w(TAG, "connect watchdog: $address stuck for ${CONNECT_TIMEOUT_MS}ms; freeing slot")
+            runCatching { gatt.disconnect() }
+            runCatching { gatt.close() }
+            tearDownLink(gatt, "connect watchdog timeout (${CONNECT_TIMEOUT_MS}ms)")
+            backoff.recordFailure(address, System.currentTimeMillis())
+        }
+        connectWatchdogs[address] = watchdog
+        handler.postDelayed(watchdog, CONNECT_TIMEOUT_MS)
+    }
+
+    private fun cancelConnectWatchdog(address: String) {
+        connectWatchdogs.remove(address)?.let { handler.removeCallbacks(it) }
+    }
+
+    /**
+     * Single per-address teardown path shared by the normal
+     * STATE_DISCONNECTED callback, the connect watchdog, and the
+     * send-failure paths (onCharacteristicWrite / sendNextQueuedFragment) so
+     * none of them can drift out of sync with each other -- a link that's
+     * cleared from these maps but never signalled to MeshRouter (or vice
+     * versa) is exactly the silent-blackhole bug this class is hardened
+     * against. Always safe to call more than once for the same gatt
+     * (BluetoothGatt#close is idempotent); callers that already know the
+     * disconnect reason (status, failure count, diagnostics) log that
+     * themselves before calling in, so [reason] only needs to identify
+     * *which* call site triggered the teardown.
+     */
+    private fun tearDownLink(gatt: BluetoothGatt, reason: String) {
+        val address = gatt.device.address
+        Log.i(TAG, "tearDownLink: $address ($reason)")
+        connections.remove(address)
+        negotiatedMtu.remove(address)
+        reassemblers.remove(address)
+        writeQueues.remove(address)
+        writeInFlight.remove(address)
+        fullyConnected.remove(address)
+        cancelConnectWatchdog(address)
+        onPeerDisconnected(address)
+        gatt.close()
+    }
 }
