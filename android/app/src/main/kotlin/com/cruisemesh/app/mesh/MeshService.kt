@@ -72,7 +72,7 @@ import uniffi.cruisemesh_core.parseFrame
 import uniffi.cruisemesh_core.sealMessage
 
 private const val TAG = "MeshService"
-private const val NOTIFICATION_CHANNEL_ID = "cruisemesh_mesh"
+private const val NOTIFICATION_CHANNEL_ID = "cruisemesh_mesh_status"
 private const val NOTIFICATION_ID = 1
 
 /** `kind` bytes from DESIGN.md §7.1. */
@@ -2189,7 +2189,9 @@ class MeshService : Service() {
                 NOTIFICATION_CHANNEL_ID,
                 "CruiseMesh mesh sync",
                 NotificationManager.IMPORTANCE_LOW,
-            )
+            ).apply {
+                setShowBadge(false)
+            }
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
@@ -2202,6 +2204,7 @@ class MeshService : Service() {
                 },
             )
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setBadgeIconType(NotificationCompat.BADGE_ICON_NONE)
             .setOngoing(true)
             .build()
     }
