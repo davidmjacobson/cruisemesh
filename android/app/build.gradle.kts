@@ -1,8 +1,25 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
+
+// Release signing: populated from android/app/keystore.properties (gitignored,
+// see keystore.properties.example) or, for CI, the CRUISEMESH_RELEASE_* env
+// vars. Neither is required for local debug work — assembleRelease falls back
+// to debug signing when no upload key is configured, which is fine for local
+// testing but must not be shipped to Play.
+val keystoreProperties = Properties().apply {
+    val propsFile = rootProject.file("app/keystore.properties")
+    if (propsFile.exists()) {
+        FileInputStream(propsFile).use { load(it) }
+    }
+}
+fun signingProp(key: String, envVar: String): String? =
+    keystoreProperties.getProperty(key) ?: System.getenv(envVar)
 
 android {
     namespace = "com.cruisemesh.app"
@@ -11,9 +28,37 @@ android {
     defaultConfig {
         applicationId = "com.cruisemesh.app"
         minSdk = 26
-        targetSdk = 34
+        // Play Console requires new releases to target API 35+.
+        targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+    }
+
+    signingConfigs {
+        create("release") {
+            val storeFilePath = signingProp("storeFile", "CRUISEMESH_RELEASE_STORE_FILE")
+            if (storeFilePath != null) {
+                storeFile = rootProject.file("app/$storeFilePath")
+                storePassword = signingProp("storePassword", "CRUISEMESH_RELEASE_STORE_PASSWORD")
+                keyAlias = signingProp("keyAlias", "CRUISEMESH_RELEASE_KEY_ALIAS")
+                keyPassword = signingProp("keyPassword", "CRUISEMESH_RELEASE_KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            val releaseSigning = signingConfigs.getByName("release")
+            signingConfig = if (releaseSigning.storeFile != null) {
+                releaseSigning
+            } else {
+                logger.warn("No release keystore configured (app/keystore.properties) — signing assembleRelease with the debug key. Do NOT upload this build to Play.")
+                signingConfigs.getByName("debug")
+            }
+        }
     }
 
     compileOptions {

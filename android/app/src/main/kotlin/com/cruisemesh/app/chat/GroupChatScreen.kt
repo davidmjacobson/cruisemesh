@@ -1,5 +1,7 @@
 package com.cruisemesh.app.chat
 
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -93,6 +95,7 @@ fun GroupChatScreen(
 
     val listState = rememberLazyListState()
     val visibleMessages = remember(messages) { messages.filter { isVisibleChatKind(it.kind) } }
+    val reactions = remember(messages, ownUserId) { reactionSummariesByTarget(messages, ownUserId) }
     val grouping = remember(visibleMessages) {
         val meta = visibleMessages.map { ConversationMessageMeta(formatUserId(it.senderUserId), it.timestamp) }
         meta.indices.map { bubbleGroupingFor(meta, it) }
@@ -150,6 +153,15 @@ fun GroupChatScreen(
                         },
                         groupName = group.name,
                         grouping = grouping[index],
+                        reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
+                        onReact = { emoji ->
+                            val target = MessageTarget(message.senderUserId, message.lamport, message.kind)
+                            val existingOwn = reactions[target.stableKey]
+                                .orEmpty()
+                                .firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
+                            sender.sendReaction(group, target, if (existingOwn != null) "" else emoji)
+                            reload()
+                        },
                     )
                 }
             }
@@ -299,6 +311,8 @@ private fun GroupMessageBubble(
     senderLabel: String?,
     groupName: String,
     grouping: BubbleGrouping,
+    reactions: List<ReactionSummary> = emptyList(),
+    onReact: (String) -> Unit = {},
 ) {
     if (message.kind == KIND_GROUP_INVITE) {
         Box(
@@ -334,6 +348,7 @@ private fun GroupMessageBubble(
         bottomStart = if (!isOwn && grouping.joinsNext) 6.dp else 20.dp,
         bottomEnd = if (isOwn && grouping.joinsNext) 6.dp else 20.dp,
     )
+    var showReactionPicker by remember { mutableStateOf(false) }
 
     Row(
         modifier = Modifier
@@ -357,6 +372,7 @@ private fun GroupMessageBubble(
                 shape = shape,
                 color = bubbleColor,
                 contentColor = contentColor,
+                modifier = Modifier.groupMessageActions { showReactionPicker = true },
             ) {
                 Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                     Text(
@@ -375,6 +391,30 @@ private fun GroupMessageBubble(
                     }
                 }
             }
+            if (reactions.isNotEmpty()) {
+                ReactionRow(
+                    reactions = reactions,
+                    isOwn = isOwn,
+                    onReact = onReact,
+                )
+            }
         }
     }
+
+    if (showReactionPicker) {
+        ReactionPickerDialog(
+            onDismiss = { showReactionPicker = false },
+            onReact = { emoji ->
+                showReactionPicker = false
+                onReact(emoji)
+            },
+        )
+    }
 }
+
+@OptIn(ExperimentalFoundationApi::class)
+private fun Modifier.groupMessageActions(onLongClick: () -> Unit): Modifier =
+    combinedClickable(
+        onClick = {},
+        onLongClick = onLongClick,
+    )

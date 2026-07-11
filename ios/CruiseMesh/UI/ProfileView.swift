@@ -1,10 +1,14 @@
 import SwiftUI
 
+/// Hosted privacy policy (App Store / Play Console + in-app link).
+private let privacyPolicyURL = URL(string: "https://cruisemesh.davidjacobson.work/privacy.html")!
+
 struct ProfileView: View {
     let identity: Identity
     @ObservedObject var appModel: AppModel
     @ObservedObject private var runtime = MeshRuntimeStatus.shared
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
 
     @State private var displayName: String = ""
     @State private var relayUrl: String = ""
@@ -40,6 +44,14 @@ struct ProfileView: View {
                             if on { appModel.startMesh() } else { appModel.stopMesh() }
                         }
                     LabeledContent("Status", value: runtime.pillText)
+                }
+                Section("Legal") {
+                    Button("Privacy policy") {
+                        openURL(privacyPolicyURL)
+                    }
+                    Text(privacyPolicyURL.absoluteString)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             .navigationTitle("Profile")

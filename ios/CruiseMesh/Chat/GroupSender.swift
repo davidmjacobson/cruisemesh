@@ -56,6 +56,20 @@ final class GroupSender {
         let payload = Data(trimmed.utf8)
         guard !payload.isEmpty, group.memberUserIds.contains(identity.userId) else { return }
 
+        enqueueGroupMessage(group: group, kind: ProtocolKind.text, payload: payload, label: "sendText")
+    }
+
+    func sendReaction(group: Group, target: MessageTarget, emoji: String) {
+        guard group.memberUserIds.contains(identity.userId) else { return }
+        enqueueGroupMessage(
+            group: group,
+            kind: ProtocolKind.reaction,
+            payload: ReactionPayload(target: target, emoji: emoji).encode(),
+            label: "sendReaction"
+        )
+    }
+
+    private func enqueueGroupMessage(group: Group, kind: UInt8, payload: Data, label: String) {
         let chatId = group.id
         let lamport = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
@@ -64,7 +78,7 @@ final class GroupSender {
             senderUserId: identity.userId,
             lamport: lamport + 1,
             timestamp: timestamp,
-            kind: ProtocolKind.text,
+            kind: kind,
             payload: payload
         )
         guard let outbound = buildOutboundGroupEnvelope(identity: identity, group: group, message: message) else {
@@ -77,9 +91,9 @@ final class GroupSender {
         let frame = encodeOutboundEnvelopeFrame(outbound)
         let fanout = MeshRouter.relayToAll(frame: frame)
         if fanout == 0 {
-            log.info("sendText: no live links; group message stays local for carry/digest/relay")
+            log.info("\(label, privacy: .public): no live links; group message stays local for carry/digest/relay")
         } else {
-            log.info("sendText: flooded group message to \(fanout, privacy: .public) link(s)")
+            log.info("\(label, privacy: .public): flooded group message to \(fanout, privacy: .public) link(s)")
         }
     }
 

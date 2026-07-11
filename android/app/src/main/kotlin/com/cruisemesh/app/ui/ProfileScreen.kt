@@ -25,6 +25,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -43,6 +44,9 @@ import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.createCameraCaptureUri
 import android.widget.Toast
+
+/** Hosted privacy policy (Play Console + in-app link). */
+const val PRIVACY_POLICY_URL = "https://cruisemesh.davidjacobson.work/privacy.html"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -177,6 +181,28 @@ fun ProfileScreen(
                     Text("Start mesh")
                 }
             }
+
+            Spacer(modifier = Modifier.height(32.dp))
+
+            Text("Legal", style = MaterialTheme.typography.titleMedium)
+            TextButton(
+                onClick = {
+                    context.startActivity(
+                        Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL)),
+                    )
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+            ) {
+                Text("Privacy policy")
+            }
+            Text(
+                text = PRIVACY_POLICY_URL,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
 
             if (DebugFileLog.isEnabled(context)) {
                 Spacer(modifier = Modifier.height(32.dp))

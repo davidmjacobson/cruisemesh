@@ -30,6 +30,10 @@ struct ChatView: View {
         messages.filter { isVisibleChatKind($0.kind) }
     }
 
+    private var reactions: [String: [ReactionSummary]] {
+        reactionSummariesByTarget(messages: messages, ownUserId: identity.userId)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Bottom-anchor the thread so a new/short chat keeps the latest
@@ -61,7 +65,15 @@ struct ChatView: View {
                                         name: contact.name,
                                         displayId: formatUserId(userId: contact.userId)
                                     ).0,
-                                    onStatus: { statusMessage = $0 }
+                                    reactions: reactions[MessageTarget(
+                                        senderUserId: message.senderUserId,
+                                        lamport: message.lamport,
+                                        kind: message.kind
+                                    ).stableKey] ?? [],
+                                    onStatus: { statusMessage = $0 },
+                                    onReact: { emoji in
+                                        sendReaction(to: message, emoji: emoji)
+                                    }
                                 )
                                 .id(message.lamport)
                             }
@@ -297,6 +309,19 @@ struct ChatView: View {
         reload()
     }
 
+    private func sendReaction(to message: StoredMessage, emoji: String) {
+        let target = MessageTarget(
+            senderUserId: message.senderUserId,
+            lamport: message.lamport,
+            kind: message.kind
+        )
+        let existingOwn = reactions[target.stableKey]?.contains {
+            $0.emoji == emoji && $0.reactedByOwnUser
+        } ?? false
+        sender.sendReaction(contact: contact, target: target, emoji: existingOwn ? "" : emoji)
+        reload()
+    }
+
     private func isNewDay(_ index: Int) -> Bool {
         let cal = Calendar.current
         let current = Date(timeIntervalSince1970: TimeInterval(visible[index].timestamp) / 1000)
@@ -327,7 +352,9 @@ private struct MessageBubbleView: View {
     let isOwn: Bool
     let tick: TickStatus?
     let contactColor: Color
+    let reactions: [ReactionSummary]
     var onStatus: (String) -> Void = { _ in }
+    var onReact: (String) -> Void = { _ in }
     @State private var showLegend = false
 
     var body: some View {
@@ -351,6 +378,15 @@ private struct MessageBubbleView: View {
                 .foregroundStyle(isOwn ? Color.white : Color.primary)
                 .onTapGesture {
                     if tick != nil { showLegend = true }
+                }
+                .contextMenu {
+                    ForEach(reactionChoices, id: \.self) { emoji in
+                        Button(emoji) { onReact(emoji) }
+                    }
+                }
+
+                if !reactions.isEmpty {
+                    ReactionPillRow(reactions: reactions, isOwn: isOwn, onReact: onReact)
                 }
 
                 Text(timeLabel(message.timestamp))

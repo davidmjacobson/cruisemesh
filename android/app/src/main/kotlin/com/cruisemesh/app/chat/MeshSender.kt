@@ -3,6 +3,7 @@ package com.cruisemesh.app.chat
 import android.util.Log
 import com.cruisemesh.app.media.AttachmentPayload
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
+import com.cruisemesh.app.media.KIND_REACTION
 import com.cruisemesh.app.mesh.MeshRouter
 import com.cruisemesh.app.mesh.RelaySyncEvents
 import com.cruisemesh.app.mesh.buildOutboundAuthoredEnvelope
@@ -60,6 +61,9 @@ interface MeshSender {
      * (attachment manifest with embedded blob; DESIGN.md §8).
      */
     fun sendAttachment(contact: Contact, attachment: AttachmentPayload)
+
+    /** Sends or clears this user's emoji reaction to [target]. */
+    fun sendReaction(contact: Contact, target: MessageTarget, emoji: String)
 }
 
 /**
@@ -111,6 +115,15 @@ class RealMeshSender(
             kind = KIND_ATTACHMENT_MANIFEST,
             payload = attachment.encode(),
             logLabel = "sendAttachment",
+        )
+    }
+
+    override fun sendReaction(contact: Contact, target: MessageTarget, emoji: String) {
+        enqueueAuthored(
+            contact = contact,
+            kind = KIND_REACTION,
+            payload = ReactionPayload(target, emoji).encode(),
+            logLabel = "sendReaction",
         )
     }
 

@@ -406,7 +406,7 @@ final class MeshController: ObservableObject {
         guard body.chatId == opened.senderUserId else { return }
 
         switch body.kind {
-        case ProtocolKind.text, ProtocolKind.attachmentManifest:
+        case ProtocolKind.text, ProtocolKind.attachmentManifest, ProtocolKind.reaction:
             handleIncomingChat(
                 sourceAddress: sourceAddress,
                 senderUserId: opened.senderUserId,
@@ -469,7 +469,7 @@ final class MeshController: ObservableObject {
             return
         }
         switch body.kind {
-        case ProtocolKind.text:
+        case ProtocolKind.text, ProtocolKind.reaction:
             handleIncomingGroupChatMessage(group: group, senderUserId: opened.senderUserId, body: body)
         default:
             log.info("Dropping group envelope from \(sourceLabel, privacy: .public): unhandled kind=\(body.kind)")
@@ -503,7 +503,7 @@ final class MeshController: ObservableObject {
                 receiptType: ReceiptType.read,
                 throughLamport: throughLamport
             )
-        } else {
+        } else if isVisibleChatKind(body.kind) {
             let senderName = (try? store.getContact(userId: senderUserId))?.name
                 ?? String(UserIdHex.encode(senderUserId).prefix(8))
             let preview = String(data: body.content, encoding: .utf8) ?? ""
@@ -655,7 +655,7 @@ final class MeshController: ObservableObject {
                 )
             }
         }
-        if !visible {
+        if !visible, isVisibleChatKind(kind) {
             let preview: String
             if kind == ProtocolKind.attachmentManifest {
                 preview = AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))

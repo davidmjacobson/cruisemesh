@@ -16,7 +16,7 @@ func buildOutboundGroupEnvelope(
     group: Group,
     message: StoredMessage
 ) -> OutboundEnvelope? {
-    guard message.kind == ProtocolKind.text else {
+    guard message.kind == ProtocolKind.text || message.kind == ProtocolKind.reaction else {
         groupLog.warning("Refusing to queue unsupported group message kind=\(message.kind)")
         return nil
     }

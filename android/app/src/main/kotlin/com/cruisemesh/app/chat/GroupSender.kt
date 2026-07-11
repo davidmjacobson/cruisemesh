@@ -12,6 +12,7 @@ import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
 import com.cruisemesh.app.media.KIND_GROUP_INVITE
+import com.cruisemesh.app.media.KIND_REACTION
 import uniffi.cruisemesh_core.createGroup
 import uniffi.cruisemesh_core.encodeGroupInviteContent
 
@@ -78,6 +79,20 @@ class GroupSender(
         val payload = text.toByteArray(Charsets.UTF_8)
         if (payload.isEmpty()) return
 
+        enqueueGroupMessage(group, KIND_TEXT, payload, "sendText")
+    }
+
+    /** Sends or clears this user's emoji reaction to [target] in [group]. */
+    fun sendReaction(group: Group, target: MessageTarget, emoji: String) {
+        enqueueGroupMessage(group, KIND_REACTION, ReactionPayload(target, emoji).encode(), "sendReaction")
+    }
+
+    private fun enqueueGroupMessage(
+        group: Group,
+        kind: UByte,
+        payload: ByteArray,
+        logLabel: String,
+    ) {
         val chatId = group.id
         // Same ratchet-past-acked-receipts logic as 1:1 sends (MeshSender.kt's
         // nextAuthoredLamport): guards against a deleted-and-recreated group
@@ -97,7 +112,7 @@ class GroupSender(
             senderUserId = identity.userId,
             lamport = lamport,
             timestamp = timestamp,
-            kind = KIND_TEXT,
+            kind = kind,
             payload = payload,
         )
         val outbound = buildOutboundGroupEnvelope(identity, group, message) ?: return
@@ -108,9 +123,9 @@ class GroupSender(
         val frame = encodeOutboundEnvelopeFrame(outbound)
         val fanout = MeshRouter.relayToAll(frame)
         if (fanout == 0) {
-            Log.i(TAG, "sendText: no live links; group message stays local for carry/digest/relay")
+            Log.i(TAG, "$logLabel: no live links; group message stays local for carry/digest/relay")
         } else {
-            Log.i(TAG, "sendText: flooded group message to $fanout link(s)")
+            Log.i(TAG, "$logLabel: flooded group message to $fanout link(s)")
         }
     }
 
