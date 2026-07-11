@@ -46,6 +46,7 @@ import com.cruisemesh.app.chat.GroupChatScreen
 import com.cruisemesh.app.chat.GroupSender
 import com.cruisemesh.app.chat.RealMeshSender
 import com.cruisemesh.app.chat.UserIdHex
+import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.friending.ContactsScreen
 import com.cruisemesh.app.friending.FriendRequestSender
 import com.cruisemesh.app.ui.ConnectivityWarning
@@ -93,6 +94,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Debug builds: start capturing this process's log to a file so it can
+        // be shared without adb (no-op in release). Idempotent with MeshService.
+        DebugFileLog.start(this)
         pendingDeepLink.value = deepLinkFromIntent(intent)
         setContent {
             CruiseMeshTheme {
