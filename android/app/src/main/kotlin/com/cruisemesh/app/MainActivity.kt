@@ -711,10 +711,15 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
     if (group != null) {
         DisposableEffect(groupIdHex) {
             ChatVisibility.setVisible(group.id)
-            // Local read watermarks for every other member (no wire receipts yet).
+            // Local read watermarks for every other member (no wire receipts
+            // yet). highestLamport (plain MAX), not highestContiguousLamport:
+            // this is a per-member peer-stream watermark, and the contiguous
+            // count stalls at 0 once a member's stream legitimately starts
+            // above lamport 1 (post chat-history-wipe ratchet), which would
+            // strand the unread badge for that member forever.
             for (memberId in group.memberUserIds) {
                 if (memberId.contentEquals(identity.userId)) continue
-                val through = store.highestContiguousLamport(group.id, memberId)
+                val through = store.highestLamport(group.id, memberId)
                 if (through > 0uL) {
                     store.recordOutgoingReceipt(group.id, memberId, RECEIPT_TYPE_READ, through)
                 }

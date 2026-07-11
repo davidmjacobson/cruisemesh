@@ -436,6 +436,56 @@ impl MessageStore {
         highest_contiguous_lamport_locked(&conn, &chat_id, &sender_user_id)
     }
 
+    /// The highest lamport value actually held from this sender in this
+    /// chat -- a plain MAX, with no contiguity requirement. Returns 0 when
+    /// nothing has been received yet.
+    ///
+    /// This is deliberately a *different* primitive from
+    /// [`MessageStore::highest_contiguous_lamport`], and the split matters:
+    /// the lamport ratchet (`nextAuthoredLamport`, see the Kotlin side)
+    /// lets a sender's stream legitimately start above 1 after a chat
+    /// history wipe, because lamports below the new base never existed for
+    /// anyone -- there is nothing to be "contiguous from 1" with. A
+    /// receiver holding only e.g. {3, 4} from that sender has a perfectly
+    /// complete view of everything the sender ever sent, but
+    /// `highest_contiguous_lamport` reports 0 for it (it stops at the first
+    /// missing lamport, and 1 and 2 are permanently missing). Basing
+    /// delivered/read receipts and the local read/unread badge on that 0
+    /// makes them stall forever: `handle_chat_viewed`-style callers would
+    /// record read-through 0 and the unread count would never clear.
+    ///
+    /// `highest_lamport` fixes that by answering "what's the highest
+    /// message I actually hold from this sender" instead -- which is the
+    /// right basis for a receipt/badge watermark. It is *not* a safe
+    /// substitute for [`MessageStore::highest_contiguous_lamport`] in
+    /// digest sync ([`MessageStore::chat_digest`]): that path genuinely
+    /// needs the gap-aware contiguous count so it can detect a hole and
+    /// re-request the missing early messages (DESIGN.md §7.3). Reporting a
+    /// bare MAX there would let a real front-gap (message 1 lost in
+    /// transit, not wiped) go undetected forever, since the peer would
+    /// believe we already have everything up to the max we've seen.
+    ///
+    /// Moving receipts/badges to MAX is safe from a message-loss
+    /// standpoint: `record_receipt` (a peer acking delivery/read of *our*
+    /// stream) never prunes `outbound_envelopes` -- only expiry and
+    /// chat-delete do -- so an overstated watermark here cannot cause a
+    /// sender to drop an undelivered message of their own.
+    pub fn highest_lamport(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+    ) -> Result<u64, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT COALESCE(MAX(lamport), 0) FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2",
+            params![chat_id, sender_user_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(store_err)
+        .map(|n| n as u64)
+    }
+
     /// A sync digest for `chat_id` (DESIGN.md §7.3): one [`DigestEntry`] per
     /// distinct sender who has ever posted in this chat, each with their
     /// [`MessageStore::highest_contiguous_lamport`]. Ordered by
@@ -1925,6 +1975,85 @@ mod tests {
         assert_eq!(
             store
                 .highest_contiguous_lamport(b"chat-a".to_vec(), b"bob".to_vec())
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn highest_lamport_is_zero_with_no_messages() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let n = store
+            .highest_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn highest_lamport_is_max_across_a_front_gap() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // Lamports 1 and 2 never existed for alice -- e.g. her stream base
+        // was ratcheted forward after a chat history wipe -- so her stream
+        // legitimately starts at 3. `highest_contiguous_lamport` would
+        // report 0 here (nothing contiguous from 1); `highest_lamport`
+        // reports what she's actually sent.
+        store
+            .insert_message(msg(b"chat-a", b"alice", 3, "three"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 4, "four"))
+            .unwrap();
+
+        let n = store
+            .highest_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+            .unwrap();
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn highest_lamport_is_max_across_an_internal_gap() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "one"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 2, "two"))
+            .unwrap();
+        // lamport 3 is missing -- message 4 arrived out of order (DTN
+        // reality) -- but we still hold the max the sender has reached.
+        store
+            .insert_message(msg(b"chat-a", b"alice", 4, "four"))
+            .unwrap();
+
+        let n = store
+            .highest_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+            .unwrap();
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn highest_lamport_is_per_sender_not_per_chat() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "hi"))
+            .unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 2, "there"))
+            .unwrap();
+        // Bob's own counter in the same chat starts independently at 1.
+        store
+            .insert_message(msg(b"chat-a", b"bob", 1, "hey"))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .highest_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .highest_lamport(b"chat-a".to_vec(), b"bob".to_vec())
                 .unwrap(),
             1
         );
