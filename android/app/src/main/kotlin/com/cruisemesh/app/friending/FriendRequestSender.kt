@@ -3,6 +3,7 @@ package com.cruisemesh.app.friending
 import android.content.Context
 import android.util.Log
 import com.cruisemesh.app.chat.UserIdHex
+import com.cruisemesh.app.chat.nextAuthoredLamport
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.mesh.MeshRouter
 import com.cruisemesh.app.mesh.RelaySyncEvents
@@ -17,6 +18,11 @@ import uniffi.cruisemesh_core.makeFriendCard
 
 private const val TAG = "FriendRequestSender"
 private const val KIND_FRIEND_REQUEST: UByte = 3u
+
+/** Cumulative-receipt type bytes (DESIGN.md §7.2), mirroring the private
+ * copies already established in MainActivity.kt / ChatScreen.kt / MeshService.kt. */
+private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
+private const val RECEIPT_TYPE_READ: UByte = 2u
 
 /**
  * Queues the mutual-friending follow-up from DESIGN.md §6.2: once we scan a
@@ -38,7 +44,16 @@ object FriendRequestSender {
             relay?.relayUrl,
             relay?.relayToken,
         )
-        val lamport = store.highestContiguousLamport(contact.userId, identity.userId) + 1uL
+        // Same ratchet-past-acked-receipts logic as 1:1 text sends
+        // (MeshSender.kt's nextAuthoredLamport): a friend request also lands
+        // in the 1:1 chat's lamport stream, so it needs the same guard
+        // against reissuing a lamport the peer already holds from before a
+        // chat delete + re-add wiped our own history.
+        val lamport = nextAuthoredLamport(
+            ownContiguous = store.highestContiguousLamport(contact.userId, identity.userId),
+            ackedDelivered = store.receiptThrough(contact.userId, identity.userId, RECEIPT_TYPE_DELIVERED),
+            ackedRead = store.receiptThrough(contact.userId, identity.userId, RECEIPT_TYPE_READ),
+        )
         val timestamp = System.currentTimeMillis()
         val message = StoredMessage(
             chatId = contact.userId,

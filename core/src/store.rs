@@ -1,9 +1,13 @@
 //! Message + contact store: SQLite-backed persistence (DESIGN.md §7.1,
 //! §10). `insert_message` is idempotent on (chat_id, sender_user_id,
-//! lamport), so re-delivering the same envelope (expected under DTN) is
-//! safe. Per-chat lamport counters are maintained independently by each
-//! sender (DESIGN.md §7.1), so gap detection in [MessageStore::highest_contiguous_lamport]
-//! is keyed on (chat_id, sender_user_id), not chat_id alone.
+//! lamport): re-delivering the same envelope (expected under DTN) is a
+//! no-op. A conflict whose (timestamp, kind, payload) *don't* match is
+//! treated as the sender having forked/reset their stream rather than a
+//! duplicate -- see [MessageStore::insert_message]'s doc comment for the
+//! recovery this triggers. Per-chat lamport counters are maintained
+//! independently by each sender (DESIGN.md §7.1), so gap detection in
+//! [MessageStore::highest_contiguous_lamport] is keyed on (chat_id,
+//! sender_user_id), not chat_id alone.
 //!
 //! Contacts (DESIGN.md §6.2) live in the same store/connection rather than a
 //! separate file: they're the other half of "who can I seal a message to,"
@@ -206,11 +210,41 @@ impl MessageStore {
         })
     }
 
-    /// Insert a message. Returns `true` if a new row was inserted, `false`
-    /// if (chat_id, sender_user_id, lamport) was already present.
+    /// Insert a message from a remote sender's stream, distinguishing a true
+    /// duplicate from a *forked* stream instead of silently dropping both the
+    /// same way.
+    ///
+    /// A conflict on `(chat_id, sender_user_id, lamport)` is ambiguous on its
+    /// own: it could be a digest resend or relay copy of a message we already
+    /// have (same sealed content, arriving twice -- expected under DTN and
+    /// harmless to ignore), or it could be a sender who reset their stream
+    /// (e.g. deleted the chat and re-added the contact, per DESIGN.md §7.1's
+    /// "own outgoing stream has no gaps" -- deleting local history restarts
+    /// their lamport counter at 1) and is now re-using a lamport number we
+    /// already hold from their *old* stream for a genuinely new message. This
+    /// method tells the two apart by comparing the existing row's
+    /// `(timestamp, kind, payload)` against the incoming one:
+    ///
+    /// - **Identical** on all three -> true duplicate. No-op, returns `Ok(false)`,
+    ///   same behavior as the old plain `INSERT OR IGNORE`.
+    /// - **Different** -> a fork. The sender's old stream at and above this
+    ///   lamport is abandoned, so we drop our stale copy of that tail and
+    ///   insert the new message in its place. We also clear
+    ///   `outgoing_receipts` / `outgoing_receipt_envelopes` for this
+    ///   `(chat_id, sender_user_id)`: those are *our* "delivered/read through
+    ///   N" watermarks about *their* stream, and they were computed against
+    ///   the abandoned history -- left in place, they'd keep telling the
+    ///   sender (who now has no history past their reset) that we've already
+    ///   read messages they haven't sent yet, which is exactly the false ✓✓
+    ///   this recovery exists to stop. `receipts` (the peer's acks of *our*
+    ///   stream) is untouched -- unrelated to their stream resetting. All of
+    ///   this runs in one transaction so a crash mid-recovery can't leave the
+    ///   stale tail and the new message coexisting.
     pub fn insert_message(&self, message: StoredMessage) -> Result<bool, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
-        let changed = conn
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
+
+        let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO messages
                     (chat_id, sender_user_id, lamport, timestamp, kind, payload)
@@ -224,8 +258,85 @@ impl MessageStore {
                     message.payload,
                 ],
             )
+            .map_err(store_err)?
+            > 0;
+
+        if inserted {
+            tx.commit().map_err(store_err)?;
+            return Ok(true);
+        }
+
+        // Conflict: a row already exists at this (chat_id, sender_user_id,
+        // lamport). Figure out whether it's the same message or a fork.
+        let existing: Option<(i64, i64, Vec<u8>)> = tx
+            .query_row(
+                "SELECT timestamp, kind, payload FROM messages
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+                params![message.chat_id, message.sender_user_id, message.lamport as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
             .map_err(store_err)?;
-        Ok(changed > 0)
+
+        let is_true_duplicate = match &existing {
+            Some((timestamp, kind, payload)) => {
+                *timestamp == message.timestamp
+                    && *kind == message.kind as i64
+                    && *payload == message.payload
+            }
+            // Shouldn't happen (we just failed to insert on a conflict), but
+            // if the row vanished under us, treat it as nothing to recover.
+            None => {
+                tx.commit().map_err(store_err)?;
+                return Ok(false);
+            }
+        };
+
+        if is_true_duplicate {
+            tx.commit().map_err(store_err)?;
+            return Ok(false);
+        }
+
+        // Fork: the sender re-numbered from below what we already hold.
+        // Drop our stale copy of the abandoned tail (this and every later
+        // lamport we have from their old stream -- they'll resend anything
+        // beyond this message under the new numbering too)...
+        tx.execute(
+            "DELETE FROM messages WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport >= ?3",
+            params![message.chat_id, message.sender_user_id, message.lamport as i64],
+        )
+        .map_err(store_err)?;
+        // ...and the watermarks we'd computed against that abandoned tail,
+        // so we stop reporting stale "delivered/read through N" back to the
+        // sender (root cause of the false ✓✓ this recovery fixes). These
+        // regenerate correctly from the normal receive/view paths.
+        tx.execute(
+            "DELETE FROM outgoing_receipts WHERE chat_id = ?1 AND sender_user_id = ?2",
+            params![message.chat_id, message.sender_user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM outgoing_receipt_envelopes WHERE chat_id = ?1 AND sender_user_id = ?2",
+            params![message.chat_id, message.sender_user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "INSERT INTO messages
+                (chat_id, sender_user_id, lamport, timestamp, kind, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                message.chat_id,
+                message.sender_user_id,
+                message.lamport as i64,
+                message.timestamp,
+                message.kind as i64,
+                message.payload,
+            ],
+        )
+        .map_err(store_err)?;
+
+        tx.commit().map_err(store_err)?;
+        Ok(true)
     }
 
     /// Atomically persist one locally authored message and the exact sealed
@@ -1594,6 +1705,125 @@ mod tests {
         assert_eq!(
             store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(),
             1
+        );
+    }
+
+    #[test]
+    fn insert_message_true_duplicate_is_ignored() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(store
+            .insert_message(msg(b"chat-a", b"alice", 3, "hi"))
+            .unwrap());
+        // Same (chat_id, sender_user_id, lamport) *and* same (timestamp,
+        // kind, payload) -- a true duplicate (digest resend / relay replay
+        // of the identical sealed message), not a fork. No-op, row count
+        // unchanged.
+        assert!(!store
+            .insert_message(msg(b"chat-a", b"alice", 3, "hi"))
+            .unwrap());
+        assert_eq!(
+            store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn insert_message_fork_recovers_abandoned_tail_and_resets_outgoing_receipts() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // Alice's original stream: messages 1..5, and we'd told her (via
+        // outgoing_receipts) that we'd read through 5.
+        for lamport in 1..=5u64 {
+            store
+                .insert_message(msg(b"chat-a", b"alice", lamport, "old"))
+                .unwrap();
+        }
+        store
+            .record_outgoing_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_READ,
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_READ,
+                )
+                .unwrap(),
+            5
+        );
+
+        // Alice deleted the chat and re-added us: her lamport counter
+        // restarted, so she resends a genuinely new message 3 with different
+        // content/timestamp -- a fork, not a duplicate of the old message 3.
+        let mut forked = msg(b"chat-a", b"alice", 3, "new-after-reset");
+        forked.timestamp = 1_700_000_500_000;
+        assert!(store.insert_message(forked).unwrap());
+
+        // Old messages 3, 4, 5 are gone; the new message 3 replaces them.
+        let remaining = store.messages_for_chat(b"chat-a".to_vec()).unwrap();
+        assert_eq!(remaining.len(), 3); // 1, 2, and the new 3
+        let three = remaining.iter().find(|m| m.lamport == 3).unwrap();
+        assert_eq!(three.payload, b"new-after-reset");
+        assert_eq!(three.timestamp, 1_700_000_500_000);
+        assert!(remaining.iter().all(|m| m.lamport != 4 && m.lamport != 5));
+
+        // Our contiguous view of Alice's stream is now capped at the fork point.
+        assert_eq!(
+            store
+                .highest_contiguous_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+                .unwrap(),
+            3
+        );
+
+        // The stale "read through 5" watermark about Alice's *old* stream is
+        // cleared -- it was overstated relative to her reset stream and would
+        // otherwise keep painting false checkmarks on messages she hasn't
+        // sent yet under the new numbering.
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_READ,
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn insert_message_fork_recovery_does_not_touch_receipts_table() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for lamport in 1..=5u64 {
+            store
+                .insert_message(msg(b"chat-a", b"alice", lamport, "old"))
+                .unwrap();
+        }
+        // `receipts` in this chat is the peer's ack of *our own* outgoing
+        // stream ("self") -- unrelated to alice's stream resetting -- and
+        // must survive her fork recovery untouched.
+        store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"self".to_vec(),
+                crate::RECEIPT_TYPE_READ,
+                2,
+            )
+            .unwrap();
+
+        let mut forked = msg(b"chat-a", b"alice", 3, "new-after-reset");
+        forked.timestamp = 1_700_000_500_000;
+        assert!(store.insert_message(forked).unwrap());
+
+        assert_eq!(
+            store
+                .receipt_through(b"chat-a".to_vec(), b"self".to_vec(), crate::RECEIPT_TYPE_READ)
+                .unwrap(),
+            2
         );
     }
 
