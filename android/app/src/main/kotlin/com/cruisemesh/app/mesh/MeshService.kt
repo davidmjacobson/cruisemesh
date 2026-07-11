@@ -28,6 +28,7 @@ import androidx.core.content.ContextCompat
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
+import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.media.AttachmentPayload
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
@@ -252,6 +253,10 @@ class MeshService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
+        // Debug builds: ensure log capture is running even if the process was
+        // revived straight into the service without the UI (no-op in release
+        // and idempotent with MainActivity's call).
+        DebugFileLog.start(this)
         MeshRuntimeStatus.markStarting()
 
         if (running) {
