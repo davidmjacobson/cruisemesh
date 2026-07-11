@@ -75,14 +75,23 @@ class BlePeripheral(
     private val reassemblers = mutableMapOf<String, FrameReassembler>()
     private val notifyQueues = mutableMapOf<String, ArrayDeque<ByteArray>>()
     private val notifyInFlight = mutableSetOf<String>()
+    @Volatile private var advertising = false
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+            advertising = true
             Log.i(TAG, "Advertising started")
         }
 
         override fun onStartFailure(errorCode: Int) {
-            Log.w(TAG, "Advertising failed: $errorCode")
+            // ADVERTISE_FAILED_ALREADY_STARTED just means we're already
+            // advertising (a benign restart race) -- treat it as running, not
+            // a failure. Any other code means we're not advertising, so leave
+            // the flag clear and a later beginAdvertising() will retry.
+            advertising = errorCode == ADVERTISE_FAILED_ALREADY_STARTED
+            if (errorCode != ADVERTISE_FAILED_ALREADY_STARTED) {
+                Log.w(TAG, "Advertising failed: $errorCode")
+            }
         }
     }
 
@@ -90,7 +99,19 @@ class BlePeripheral(
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             Log.i(TAG, "Central ${device.address} connection state=$newState")
             when (newState) {
-                BluetoothProfile.STATE_CONNECTED -> connectedDevices[device.address] = device
+                BluetoothProfile.STATE_CONNECTED -> {
+                    connectedDevices[device.address] = device
+                    // Legacy connectable advertising auto-stops the instant a
+                    // central connects. Without restarting it, this phone goes
+                    // dark to every other peer for the rest of the process
+                    // (observed live 2026-07-11: the first peer to connect took
+                    // the only peripheral slot and inbound 1:1 delivery died).
+                    // The stack has already stopped the advertisement, so clear
+                    // the flag before restarting so beginAdvertising() actually
+                    // re-arms it.
+                    advertising = false
+                    beginAdvertising()
+                }
                 BluetoothProfile.STATE_DISCONNECTED -> tearDownLink(device.address, "status=$status")
             }
         }
@@ -195,6 +216,24 @@ class BlePeripheral(
         }
 
         advertiser = btAdapter.bluetoothLeAdvertiser
+        beginAdvertising()
+    }
+
+    /**
+     * (Re)starts connectable advertising unless it is already running.
+     * Called from [start], again on every central connect (Android's legacy
+     * connectable advertising stops itself the moment a connection forms), and
+     * after a link tears down -- so the peripheral stays discoverable for
+     * additional and subsequent centrals instead of going dark after its first
+     * connection. The [advertising] guard keeps redundant calls (e.g. a
+     * teardown while other links are still up) from thrashing the advertiser.
+     */
+    private fun beginAdvertising() {
+        if (advertising) return
+        // Don't advertise a torn-down server: stop() nulls gattServer, and a
+        // late STATE_DISCONNECTED callback must not resurrect advertising.
+        if (gattServer == null) return
+        val adv = advertiser ?: return
         val settings = AdvertiseSettings.Builder()
             // BALANCED (restored from LOW_POWER 2026-07-10): the longer LOW_POWER
             // advertising interval made this peer hard for a central to catch for
@@ -218,13 +257,14 @@ class BlePeripheral(
         val scanResponse = AdvertiseData.Builder()
             .addServiceData(ParcelUuid(MeshConstants.SERVICE_UUID), MeshConstants.LOCAL_INSTANCE_ID)
             .build()
-        advertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
+        adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
     }
 
     fun stop() {
         // stopAdvertising throws if the adapter is already off -- the case when
         // stop() runs because Bluetooth was turned off. Swallow it; advertising
         // is gone either way.
+        advertising = false
         try {
             advertiser?.stopAdvertising(advertiseCallback)
         } catch (e: Exception) {
@@ -329,6 +369,9 @@ class BlePeripheral(
         notifyQueues.remove(address)
         notifyInFlight.remove(address)
         onCentralDisconnected(address)
+        // A link just dropped; make sure we're advertising again so this peer
+        // stays reachable. No-ops if advertising is already up.
+        beginAdvertising()
     }
 
     private fun buildGattService(): BluetoothGattService {
