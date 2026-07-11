@@ -22,6 +22,10 @@ struct GroupChatView: View {
         messages.filter { isVisibleChatKind($0.kind) }
     }
 
+    private var reactions: [String: [ReactionSummary]] {
+        reactionSummariesByTarget(messages: messages, ownUserId: identity.userId)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             GeometryReader { geo in
@@ -38,7 +42,15 @@ struct GroupChatView: View {
                                         userId: message.senderUserId,
                                         name: senderName(message.senderUserId),
                                         displayId: formatUserId(userId: message.senderUserId)
-                                    ).0
+                                    ).0,
+                                    reactions: reactions[MessageTarget(
+                                        senderUserId: message.senderUserId,
+                                        lamport: message.lamport,
+                                        kind: message.kind
+                                    ).stableKey] ?? [],
+                                    onReact: { emoji in
+                                        sendReaction(to: message, emoji: emoji)
+                                    }
                                 )
                                 .id(messageId(message))
                             }
@@ -168,6 +180,19 @@ struct GroupChatView: View {
         messages = (try? store.messagesForChat(chatId: group.id)) ?? []
         MeshController.shared.notifyChatViewed(chatId: group.id)
     }
+
+    private func sendReaction(to message: StoredMessage, emoji: String) {
+        let target = MessageTarget(
+            senderUserId: message.senderUserId,
+            lamport: message.lamport,
+            kind: message.kind
+        )
+        let existingOwn = reactions[target.stableKey]?.contains {
+            $0.emoji == emoji && $0.reactedByOwnUser
+        } ?? false
+        sender.sendReaction(group: group, target: target, emoji: existingOwn ? "" : emoji)
+        reload()
+    }
 }
 
 private struct GroupMessageRow: View {
@@ -176,6 +201,8 @@ private struct GroupMessageRow: View {
     let groupName: String
     let senderLabel: String?
     let contactColor: Color
+    let reactions: [ReactionSummary]
+    let onReact: (String) -> Void
 
     var body: some View {
         if message.kind == ProtocolKind.groupInvite {
@@ -201,6 +228,14 @@ private struct GroupMessageRow: View {
                                 .fill(isOwn ? Color.accentColor : contactColor.opacity(0.24))
                         )
                         .foregroundStyle(isOwn ? Color.white : Color.primary)
+                        .contextMenu {
+                            ForEach(reactionChoices, id: \.self) { emoji in
+                                Button(emoji) { onReact(emoji) }
+                            }
+                        }
+                    if !reactions.isEmpty {
+                        ReactionPillRow(reactions: reactions, isOwn: isOwn, onReact: onReact)
+                    }
                     Text(timeLabel(message.timestamp))
                         .font(.caption2)
                         .foregroundStyle(.secondary)

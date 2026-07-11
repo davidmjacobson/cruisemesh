@@ -1,6 +1,7 @@
 package com.cruisemesh.app.mesh
 
 import android.util.Log
+import com.cruisemesh.app.media.KIND_REACTION
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
@@ -21,6 +22,9 @@ private const val DEFAULT_HOP_TTL: UByte = 7u
 /** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
 private const val KIND_TEXT: UByte = 1u
 
+private fun isAuthoredGroupKind(kind: UByte): Boolean =
+    kind == KIND_TEXT || kind == KIND_REACTION
+
 /**
  * Seals one locally authored group text message with the shared group key
  * (DESIGN.md §6.5). The public header's `recipient_hint` hashes the group id
@@ -36,7 +40,7 @@ fun buildOutboundGroupEnvelope(
     group: Group,
     message: StoredMessage,
 ): OutboundEnvelope? {
-    if (message.kind != KIND_TEXT) {
+    if (!isAuthoredGroupKind(message.kind)) {
         Log.w(TAG, "Refusing to queue unsupported group message kind=${message.kind}")
         return null
     }

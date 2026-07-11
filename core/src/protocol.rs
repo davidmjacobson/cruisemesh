@@ -32,7 +32,8 @@
 //! offset  size  field
 //! 0       1     kind            (u8; text=1, receipt=2, friend-request=3,
 //!                               group-invite=4, attachment-manifest=16,
-//!                               attachment-chunk=17, per DESIGN.md §7.1)
+//!                               attachment-chunk=17, reaction=18, per
+//!                               DESIGN.md §7.1)
 //! 1       2     chat_id_len     (u16 BE)
 //! 3       N     chat_id         (N = chat_id_len bytes)
 //! 3+N     8     lamport         (u64 BE)
@@ -244,6 +245,8 @@ pub const KIND_ATTACHMENT_MANIFEST: u8 = 16;
 /// Reserved for content-addressed attachment chunks (DESIGN.md §8). Not
 /// yet produced or consumed by the current client.
 pub const KIND_ATTACHMENT_CHUNK: u8 = 17;
+/// Hidden chat-stream event carrying an emoji reaction to another message.
+pub const KIND_REACTION: u8 = 18;
 
 /// `ReceiptContent.receipt_type` value: recipient's device decrypted and
 /// stored the message (the ✓✓ tick, DESIGN.md §7.2).

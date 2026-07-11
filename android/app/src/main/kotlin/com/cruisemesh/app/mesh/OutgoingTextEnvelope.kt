@@ -2,6 +2,7 @@ package com.cruisemesh.app.mesh
 
 import android.util.Log
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
+import com.cruisemesh.app.media.KIND_REACTION
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.Identity
@@ -29,7 +30,8 @@ private fun isAuthoredChatKind(kind: UByte): Boolean =
     kind == KIND_TEXT ||
         kind == KIND_FRIEND_REQUEST ||
         kind == KIND_GROUP_INVITE ||
-        kind == KIND_ATTACHMENT_MANIFEST
+        kind == KIND_ATTACHMENT_MANIFEST ||
+        kind == KIND_REACTION
 
 /**
  * Seals one locally authored chat-stream message into the persistent outbound

@@ -31,6 +31,8 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.media.AttachmentPayload
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
+import com.cruisemesh.app.media.KIND_REACTION
+import com.cruisemesh.app.media.isVisibleChatKind
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
 import com.cruisemesh.app.relay.RelayClient
@@ -1353,6 +1355,7 @@ class MeshService : Service() {
                 identity,
                 KIND_ATTACHMENT_MANIFEST,
             )
+            KIND_REACTION -> handleIncomingChatMessage(address, opened.senderUserId, body, identity, KIND_REACTION)
             KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
             KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, opened.senderUserId, body, identity)
             KIND_GROUP_INVITE -> handleIncomingGroupInvite(address, opened.senderUserId, body, identity)
@@ -1397,6 +1400,7 @@ class MeshService : Service() {
         }
         when (body.kind) {
             KIND_TEXT -> handleIncomingGroupChatMessage(address, group, opened.senderUserId, body)
+            KIND_REACTION -> handleIncomingGroupChatMessage(address, group, opened.senderUserId, body)
             else -> Log.i(TAG, "Dropping group envelope from $address: unhandled kind=${body.kind}")
         }
     }
@@ -1438,7 +1442,7 @@ class MeshService : Service() {
         val isVisible = ChatVisibility.isVisible(group.id)
         if (isVisible) {
             store.recordOutgoingReceipt(group.id, senderUserId, RECEIPT_TYPE_READ, throughLamport)
-        } else {
+        } else if (isVisibleChatKind(body.kind)) {
             val senderName = store.getContact(senderUserId)?.name
                 ?: UserIdHex.encode(senderUserId).take(8)
             val preview = body.content.toString(Charsets.UTF_8)
@@ -1692,7 +1696,7 @@ class MeshService : Service() {
             // waiting for ChatViewEvents, which only fires when a chat
             // *becomes* visible, not for messages arriving while it already is.
             sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
-        } else {
+        } else if (isVisibleChatKind(kind)) {
             val preview = when (kind) {
                 KIND_ATTACHMENT_MANIFEST ->
                     AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))

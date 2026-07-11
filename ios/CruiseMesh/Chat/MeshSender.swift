@@ -4,6 +4,7 @@ import os.log
 protocol MeshSender {
     func sendText(contact: Contact, text: String)
     func sendAttachment(contact: Contact, attachment: AttachmentPayload)
+    func sendReaction(contact: Contact, target: MessageTarget, emoji: String)
 }
 
 final class RealMeshSender: MeshSender {
@@ -30,6 +31,15 @@ final class RealMeshSender: MeshSender {
             kind: ProtocolKind.attachmentManifest,
             payload: attachment.encode(),
             label: "sendAttachment"
+        )
+    }
+
+    func sendReaction(contact: Contact, target: MessageTarget, emoji: String) {
+        enqueue(
+            contact: contact,
+            kind: ProtocolKind.reaction,
+            payload: ReactionPayload(target: target, emoji: emoji).encode(),
+            label: "sendReaction"
         )
     }
 

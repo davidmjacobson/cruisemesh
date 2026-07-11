@@ -10,9 +10,11 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -115,6 +117,8 @@ private const val MAX_VOICE_MS = 60_000
 
 /** Below this hold duration a mic press is treated as an accidental tap, not a memo. */
 private const val MIN_VOICE_MS = 500L
+
+val REACTION_CHOICES = listOf("👍", "❤️", "😂", "😮", "😢", "🙏")
 
 /**
  * A single 1:1 chat thread (DESIGN.md §7.1: for a 1:1 chat, `chat_id` is
@@ -290,6 +294,10 @@ fun ChatScreen(
                 reload()
             }
         },
+        onReact = { target, emoji ->
+            sender.sendReaction(contact, target, emoji)
+            reload()
+        },
         onPickGallery = {
             galleryLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
         },
@@ -350,6 +358,7 @@ private fun ConversationScreen(
     onStartVoice: () -> Boolean = { false },
     onStopVoice: () -> Unit = {},
     onCancelVoice: () -> Unit = {},
+    onReact: (MessageTarget, String) -> Unit = { _, _ -> },
     onBack: () -> Unit,
     onDeleteContact: () -> Unit,
 ) {
@@ -362,19 +371,8 @@ private fun ConversationScreen(
         ChatListLogic.avatarHueAndInitials(contact.userId, contact.name, displayId)
     }
     val visibleMessages = remember(messages) { messages.filter { isVisibleChatKind(it.kind) } }
-    val gaps = remember(visibleMessages) {
-        val result = mutableSetOf<Int>()
-        val lastLamport = mutableMapOf<String, ULong>()
-        visibleMessages.forEachIndexed { index, msg ->
-            val senderHex = formatUserId(msg.senderUserId)
-            val previous = lastLamport[senderHex]
-            if (previous != null && msg.lamport > previous + 1uL) {
-                result.add(index)
-            }
-            lastLamport[senderHex] = maxOf(previous ?: 0uL, msg.lamport)
-        }
-        result
-    }
+    val gaps = remember(messages, visibleMessages) { visibleGapIndices(messages, visibleMessages) }
+    val reactions = remember(messages, ownUserId) { reactionSummariesByTarget(messages, ownUserId) }
     val grouping = remember(visibleMessages) {
         val meta = visibleMessages.map { ConversationMessageMeta(formatUserId(it.senderUserId), it.timestamp) }
         meta.indices.map { bubbleGroupingFor(meta, it) }
@@ -442,6 +440,16 @@ private fun ConversationScreen(
                         tick = if (isOwn) tickStatusFor(message.lamport, deliveredThrough, readThrough) else null,
                         contactColor = if (isOwn) null else contactColor,
                         grouping = grouping[index],
+                        reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
+                        onReact = { emoji ->
+                            val existingOwn = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey]
+                                .orEmpty()
+                                .firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
+                            onReact(
+                                MessageTarget(message.senderUserId, message.lamport, message.kind),
+                                if (existingOwn != null) "" else emoji,
+                            )
+                        },
                     )
                 }
             }
@@ -827,6 +835,8 @@ private fun MessageBubble(
     tick: TickStatus?,
     contactColor: Color?,
     grouping: BubbleGrouping,
+    reactions: List<ReactionSummary> = emptyList(),
+    onReact: (String) -> Unit = {},
 ) {
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
@@ -836,6 +846,7 @@ private fun MessageBubble(
     val contentColor = if (isOwn) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
     val tickBaseColor = if (bubbleColor.luminance() > 0.5f) Color.Black else Color.White
     var showLegend by remember { mutableStateOf(false) }
+    var showReactionPicker by remember { mutableStateOf(false) }
     val topPadding = if (grouping.joinsPrevious) 2.dp else 10.dp
     val bottomPadding = if (grouping.joinsNext) 2.dp else 6.dp
     val shape = RoundedCornerShape(
@@ -859,7 +870,12 @@ private fun MessageBubble(
                 color = bubbleColor,
                 contentColor = contentColor,
                 shape = shape,
-                modifier = Modifier.clickable(enabled = tick != null) { showLegend = true },
+                modifier = Modifier.messageActions(
+                    onClick = {
+                        if (tick != null) showLegend = true
+                    },
+                    onLongClick = { showReactionPicker = true },
+                ),
             ) {
                 Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
                     when (message.kind) {
@@ -900,6 +916,14 @@ private fun MessageBubble(
                 }
             }
 
+            if (reactions.isNotEmpty()) {
+                ReactionRow(
+                    reactions = reactions,
+                    isOwn = isOwn,
+                    onReact = onReact,
+                )
+            }
+
             if (grouping.showTimestamp) {
                 Text(
                     text = formatConversationTimestamp(message.timestamp),
@@ -923,6 +947,91 @@ private fun MessageBubble(
             }
         )
     }
+
+    if (showReactionPicker) {
+        ReactionPickerDialog(
+            onDismiss = { showReactionPicker = false },
+            onReact = { emoji ->
+                showReactionPicker = false
+                onReact(emoji)
+            },
+        )
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+private fun Modifier.messageActions(
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+): Modifier = combinedClickable(
+    onClick = onClick,
+    onLongClick = onLongClick,
+)
+
+@Composable
+fun ReactionRow(
+    reactions: List<ReactionSummary>,
+    isOwn: Boolean,
+    onReact: (String) -> Unit,
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier.padding(
+            start = if (isOwn) 0.dp else 10.dp,
+            top = 3.dp,
+            end = if (isOwn) 10.dp else 0.dp,
+        ),
+    ) {
+        for (reaction in reactions) {
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = if (reaction.reactedByOwnUser) {
+                    MaterialTheme.colorScheme.primaryContainer
+                } else {
+                    MaterialTheme.colorScheme.surfaceVariant
+                },
+                modifier = Modifier.clickable { onReact(reaction.emoji) },
+            ) {
+                Text(
+                    text = if (reaction.count > 1) "${reaction.emoji} ${reaction.count}" else reaction.emoji,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ReactionPickerDialog(
+    onDismiss: () -> Unit,
+    onReact: (String) -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("React") },
+        text = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (emoji in REACTION_CHOICES) {
+                    Surface(
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clickable { onReact(emoji) },
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(emoji, style = MaterialTheme.typography.titleLarge)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 @Composable

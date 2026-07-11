@@ -147,6 +147,9 @@ const val KIND_ATTACHMENT_MANIFEST: UByte = 16u
 /** DESIGN.md §7.1 reserved: attachment-chunk (not used for inline v1). */
 const val KIND_ATTACHMENT_CHUNK: UByte = 17u
 
+/** DESIGN.md §7.1 extension: a hidden chat-stream reaction targeting another message. */
+const val KIND_REACTION: UByte = 18u
+
 /** DESIGN.md §7.1: pairwise-sealed group invite (shown as a system line). */
 const val KIND_GROUP_INVITE: UByte = 4u
 

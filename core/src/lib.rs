@@ -25,8 +25,8 @@ pub use protocol::{
     encode_digest, encode_envelope_frame, encode_hello, encode_message_body,
     encode_receipt_content, generate_msg_id, parse_frame, Frame, MessageBody, ReceiptContent,
     DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL, KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST,
-    KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_RECEIPT, KIND_TEXT, RECEIPT_TYPE_DELIVERED,
-    RECEIPT_TYPE_READ,
+    KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_REACTION, KIND_RECEIPT, KIND_TEXT,
+    RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 pub use store::{
     CarriedEnvelope, Contact, DigestEntry, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
