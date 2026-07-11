@@ -61,9 +61,13 @@ import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.mesh.ChatViewEvents
+import com.cruisemesh.app.mesh.ContactReachability
+import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
 import com.cruisemesh.app.mesh.MeshService
+import com.cruisemesh.app.mesh.ReachabilityLevel
+import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
 import com.cruisemesh.app.relay.RelayImport
@@ -71,9 +75,13 @@ import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ChatListScreen
 import com.cruisemesh.app.ui.ChatSummary
 import com.cruisemesh.app.ui.CruiseMeshTheme
+import com.cruisemesh.app.ui.LocalReachabilityPalette
+import com.cruisemesh.app.ui.MeshStatusDotColor
+import com.cruisemesh.app.ui.MeshStatusTextLogic
 import com.cruisemesh.app.ui.NewGroupScreen
 import com.cruisemesh.app.ui.OnboardingScreen
 import com.cruisemesh.app.ui.ProfileScreen
+import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
@@ -296,12 +304,124 @@ private fun OnboardingRoute(identity: Identity, onComplete: () -> Unit) {
     )
 }
 
+/**
+ * CONNECTIVITY_INDICATOR.md §3.5: reachability levels decay purely with time
+ * (a contact drifts ONLINE_RELAY -> RECENT -> OFFLINE with no event firing),
+ * so the UI needs a clock tick to re-evaluate on, not just flow updates. Ticks
+ * every 30 s, and only while the activity is RESUMED -- no background work.
+ */
+@Composable
+private fun rememberConnectivityNowMs(): Long {
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    var isResumed by remember { mutableStateOf(false) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> isResumed = true
+                androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> isResumed = false
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(isResumed) {
+        if (isResumed) {
+            nowMs = System.currentTimeMillis()
+            while (true) {
+                kotlinx.coroutines.delay(30_000L)
+                nowMs = System.currentTimeMillis()
+            }
+        }
+    }
+    return nowMs
+}
+
+/** CONNECTIVITY_INDICATOR.md §2.2: reachability for one userId from a snapshot of [MeshConnectivityStatus]. */
+private fun reachabilityLevelForUserId(
+    userId: ByteArray,
+    nearbyPeerIds: Set<String>,
+    relayHealth: RelayHealth,
+    contactLastSeen: Map<String, Long>,
+    nowMs: Long,
+): ReachabilityLevel {
+    val hex = UserIdHex.encode(userId)
+    return ContactReachability.compute(
+        directLink = hex in nearbyPeerIds,
+        // Relay presence (CONNECTIVITY_INDICATOR.md §6) is Phase 2, not implemented yet.
+        presenceLastSeenMs = null,
+        selfRelayHealthy = relayHealth is RelayHealth.Ok,
+        peerLastSeenMs = contactLastSeen[hex],
+        nearbyPeerCount = nearbyPeerIds.size,
+        nowMs = nowMs,
+    )
+}
+
+/** §2.4: a group's badge shows the best level among its members, excluding self. */
+private fun computeSummaryReachability(
+    summary: ChatSummary,
+    ownUserId: ByteArray,
+    nearbyPeerIds: Set<String>,
+    relayHealth: RelayHealth,
+    contactLastSeen: Map<String, Long>,
+    nowMs: Long,
+): ReachabilityLevel {
+    fun levelFor(userId: ByteArray) =
+        reachabilityLevelForUserId(userId, nearbyPeerIds, relayHealth, contactLastSeen, nowMs)
+
+    if (!summary.isGroup) {
+        val contact = summary.contact ?: return ReachabilityLevel.OFFLINE
+        return levelFor(contact.userId)
+    }
+    val group = summary.group ?: return ReachabilityLevel.OFFLINE
+    return group.memberUserIds
+        .filterNot { it.contentEquals(ownUserId) }
+        .map { levelFor(it) }
+        // Enum declaration order is best-to-worst (see ReachabilityLevel KDoc).
+        .minByOrNull { it.ordinal }
+        ?: ReachabilityLevel.OFFLINE
+}
+
+/** §2.4: "{n} of {m} reachable" -- n = members at NEARBY or ONLINE_RELAY, m = member count excluding self. */
+private fun groupReachableCounts(
+    group: Group,
+    ownUserId: ByteArray,
+    nearbyPeerIds: Set<String>,
+    relayHealth: RelayHealth,
+    contactLastSeen: Map<String, Long>,
+    nowMs: Long,
+): Pair<Int, Int> {
+    val others = group.memberUserIds.filterNot { it.contentEquals(ownUserId) }
+    val reachable = others.count { userId ->
+        val level = reachabilityLevelForUserId(userId, nearbyPeerIds, relayHealth, contactLastSeen, nowMs)
+        level == ReachabilityLevel.NEARBY || level == ReachabilityLevel.ONLINE_RELAY
+    }
+    return reachable to others.size
+}
+
+/** Resolves a [MeshStatusDotColor] to an actual [androidx.compose.ui.graphics.Color] via the current theme palette. */
+@Composable
+private fun MeshStatusDotColor?.toComposeColor(): androidx.compose.ui.graphics.Color? {
+    val palette = LocalReachabilityPalette.current
+    return when (this) {
+        MeshStatusDotColor.GREEN -> palette.nearby
+        MeshStatusDotColor.BLUE -> palette.onlineRelay
+        MeshStatusDotColor.AMBER -> palette.recent
+        MeshStatusDotColor.NEUTRAL, null -> null
+    }
+}
+
 @Composable
 private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val context = LocalContext.current
     val store = remember { AppStore.get(context) }
     val runtimeStatus by MeshRuntimeStatus.state.collectAsState()
     val bluetoothAudioConnected by MeshRuntimeStatus.bluetoothAudioConnected.collectAsState()
+    val nearbyPeerIds by MeshConnectivityStatus.nearbyPeerIds.collectAsState()
+    val relayHealth by MeshConnectivityStatus.relay.collectAsState()
+    val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
+    val connectivityNowMs = rememberConnectivityNowMs()
     var transientMeshStatus by remember { mutableStateOf<String?>(null) }
     var ownDisplayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     var ownAvatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
@@ -451,6 +571,25 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         onDispose { navController.removeOnDestinationChangedListener(listener) }
     }
 
+    val displaySummaries = remember(summaries, nearbyPeerIds, relayHealth, contactLastSeen, connectivityNowMs) {
+        summaries.map { summary ->
+            summary.copy(
+                reachability = computeSummaryReachability(
+                    summary,
+                    identity.userId,
+                    nearbyPeerIds,
+                    relayHealth,
+                    contactLastSeen,
+                    connectivityNowMs,
+                ),
+            )
+        }
+    }
+    val pillStatus = remember(runtimeStatus, nearbyPeerIds, relayHealth) {
+        MeshStatusTextLogic.build(runtimeStatus, nearbyPeerIds.size, relayHealth)
+    }
+    val pillDotColor = pillStatus.dot.toComposeColor()
+
     ChatListScreen(
         ownUserId = identity.userId,
         ownDisplayName = ownDisplayName,
@@ -479,7 +618,8 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 navController.navigate("profile")
             }
         },
-        meshStatusText = transientMeshStatus ?: runtimeStatus.label,
+        meshStatusText = transientMeshStatus ?: pillStatus.text,
+        meshStatusDotColor = if (transientMeshStatus != null) null else pillDotColor,
         connectivityWarning = when {
             !hasPermissions -> ConnectivityWarning(
                 title = "Permissions required — mesh is off",
@@ -509,7 +649,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 // tapping still re-reads nothing harmful.
             }
         },
-        summaries = summaries
+        summaries = displaySummaries
     )
 }
 
@@ -704,6 +844,20 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             }
         }
         val sender = remember { RealMeshSender(store, identity) }
+        val nearbyPeerIds by MeshConnectivityStatus.nearbyPeerIds.collectAsState()
+        val relayHealth by MeshConnectivityStatus.relay.collectAsState()
+        val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
+        val connectivityNowMs = rememberConnectivityNowMs()
+        val reachability = remember(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, connectivityNowMs) {
+            reachabilityLevelForUserId(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, connectivityNowMs)
+        }
+        val reachabilityStatusText = remember(reachability, contactLastSeen, connectivityNowMs) {
+            ContactReachability.chatHeaderCopy(
+                reachability,
+                contactLastSeen[UserIdHex.encode(contact.userId)],
+                connectivityNowMs,
+            )
+        }
         ChatScreen(
             contact = contact,
             ownUserId = identity.userId,
@@ -714,6 +868,8 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
                 store.deleteContact(contact.userId)
                 navController.popBackStack()
             },
+            reachability = reachability,
+            reachabilityStatusText = reachabilityStatusText,
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }
@@ -764,6 +920,13 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
             }
         }
         val sender = remember { GroupSender(store, identity) }
+        val nearbyPeerIds by MeshConnectivityStatus.nearbyPeerIds.collectAsState()
+        val relayHealth by MeshConnectivityStatus.relay.collectAsState()
+        val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
+        val connectivityNowMs = rememberConnectivityNowMs()
+        val reachableMemberCount = remember(group, nearbyPeerIds, relayHealth, contactLastSeen, connectivityNowMs) {
+            groupReachableCounts(group, identity.userId, nearbyPeerIds, relayHealth, contactLastSeen, connectivityNowMs).first
+        }
         GroupChatScreen(
             group = group,
             ownUserId = identity.userId,
@@ -775,6 +938,7 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
                 store.deleteGroup(group.id)
                 navController.popBackStack()
             },
+            reachableMemberCount = reachableMemberCount,
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }

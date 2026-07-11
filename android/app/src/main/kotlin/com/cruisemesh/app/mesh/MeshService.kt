@@ -251,6 +251,9 @@ class MeshService : Service() {
 
         override fun onLost(network: Network) {
             if (relayBindNetwork == network) relayBindNetwork = null
+            if (!hasValidatedInternet()) {
+                MeshConnectivityStatus.setRelayHealth(RelayHealth.NoInternet)
+            }
         }
     }
     private val relayPollRunnable = object : Runnable {
@@ -345,6 +348,7 @@ class MeshService : Service() {
         // stop() above tears down connections without per-address disconnect
         // callbacks, so clear the router's mappings wholesale.
         MeshRouter.reset()
+        MeshConnectivityStatus.clear()
         super.onDestroy()
     }
 
@@ -397,6 +401,7 @@ class MeshService : Service() {
         meshRolesRunning = false
         // stop() tears links down without per-address disconnect callbacks.
         MeshRouter.reset()
+        MeshConnectivityStatus.setNearbyPeers(emptySet())
         refreshRuntimeState()
         refreshForegroundNotification()
     }
@@ -550,7 +555,11 @@ class MeshService : Service() {
     }
 
     private fun requestRelaySync(reason: String) {
-        if (!running || identity == null || !hasValidatedInternet()) return
+        if (!running || identity == null) return
+        if (!hasValidatedInternet()) {
+            MeshConnectivityStatus.setRelayHealth(RelayHealth.NoInternet)
+            return
+        }
         synchronized(relaySyncLock) {
             if (relaySyncInFlight) {
                 relaySyncPending = true
@@ -564,6 +573,7 @@ class MeshService : Service() {
                     performRelaySyncPass(reason)
                 } catch (e: Exception) {
                     Log.w(TAG, "Relay sync failed ($reason): ${e.message}")
+                    MeshConnectivityStatus.setRelayHealth(RelayHealth.Failing(System.currentTimeMillis()))
                 }
                 val rerun = synchronized(relaySyncLock) {
                     if (relaySyncPending && running && hasValidatedInternet()) {
@@ -597,10 +607,14 @@ class MeshService : Service() {
         uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now, network)
 
         val configs = distinctRelayConfigs(contacts, fallbackConfig)
-        if (configs.isEmpty()) return
+        if (configs.isEmpty()) {
+            MeshConnectivityStatus.setRelayHealth(RelayHealth.NoConfig)
+            return
+        }
         for (config in configs) {
             pollRelayMailbox(config, identity, contacts, fallbackConfig, now, network)
         }
+        MeshConnectivityStatus.setRelayHealth(RelayHealth.Ok(now))
         val netDesc = if (network != null) "${networkLabel(network)}(pinned)" else "${networkLabel(connectivityManager.activeNetwork)}(default)"
         Log.i(TAG, "Relay sync complete: configs=${configs.size} net=$netDesc reason=$reason")
     }
@@ -941,6 +955,7 @@ class MeshService : Service() {
 
     private fun onCentralPeerDisconnected(address: String) {
         MeshRouter.onDisconnected(address)
+        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
     }
 
     private fun onPeripheralCentralSubscribed(address: String) {
@@ -950,6 +965,7 @@ class MeshService : Service() {
 
     private fun onPeripheralCentralDisconnected(address: String) {
         MeshRouter.onDisconnected(address)
+        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
     }
 
     /** Sends our HELLO (DESIGN.md §5.2) as the first frame on a link that just became usable. */
@@ -1008,6 +1024,8 @@ class MeshService : Service() {
         // MeshRouter.userIdFor(address) lookup before this registration is
         // visible.
         MeshRouter.onHello(address, userId)
+        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+        MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(userId), System.currentTimeMillis())
         Log.i(TAG, "HELLO from $address: userId=${UserIdHex.encode(userId)}")
 
         // Hand off anything we're muling for this peer (DESIGN.md §5.3 carry
@@ -1906,6 +1924,7 @@ class MeshService : Service() {
             TAG,
             "Stored kind=$kind from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
         )
+        MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(senderUserId), System.currentTimeMillis())
         ChatEvents.notifyChatChanged(senderUserId)
 
         // highestLamport (plain MAX), not highestContiguousLamport: same
@@ -2017,6 +2036,7 @@ class MeshService : Service() {
             "Receipt from $address: ackedSender=${UserIdHex.encode(receipt.senderUserId)} " +
                 "throughLamport=${receipt.lamport} type=${receipt.receiptType}",
         )
+        MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(envelopeSenderUserId), System.currentTimeMillis())
         store.recordReceipt(
             chatId = envelopeSenderUserId, // local convention: chat keyed by the other party -- see class KDoc
             senderUserId = identity.userId, // whose messages this receipt is about: ours

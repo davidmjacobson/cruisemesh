@@ -119,4 +119,29 @@ class MeshRouterStateTest {
             state.connectedRoutes(),
         )
     }
+
+    @Test
+    fun `helloedUserIds collapses the same peer's dual-role links into one entry`() {
+        val state = MeshRouterState()
+        val alice = userId(1)
+        state.onConnected("CENTRAL-LINK", MeshRouterState.Transport.CENTRAL)
+        state.onHello("CENTRAL-LINK", alice)
+        state.onConnected("PERIPHERAL-LINK", MeshRouterState.Transport.PERIPHERAL)
+        state.onHello("PERIPHERAL-LINK", alice)
+
+        assertEquals(setOf(com.cruisemesh.app.chat.UserIdHex.encode(alice)), state.helloedUserIds())
+
+        state.onDisconnected("CENTRAL-LINK")
+        assertEquals(setOf(com.cruisemesh.app.chat.UserIdHex.encode(alice)), state.helloedUserIds())
+
+        state.onDisconnected("PERIPHERAL-LINK")
+        assertEquals(emptySet<String>(), state.helloedUserIds())
+    }
+
+    @Test
+    fun `helloedUserIds excludes connected addresses that have not HELLO'd yet`() {
+        val state = MeshRouterState()
+        state.onConnected("AA:BB", MeshRouterState.Transport.CENTRAL)
+        assertEquals(emptySet<String>(), state.helloedUserIds())
+    }
 }
