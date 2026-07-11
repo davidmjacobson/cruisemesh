@@ -9,9 +9,14 @@ import androidx.annotation.VisibleForTesting
  * [com.cruisemesh.app.mesh.MeshService]).
  *
  * Registered/unregistered by the chat route in
- * [com.cruisemesh.app.MainActivity] via a `DisposableEffect`, so "visible"
- * tracks composition: set when the chat enters the screen, cleared when it
- * leaves.
+ * [com.cruisemesh.app.MainActivity] via a lifecycle-aware `DisposableEffect`
+ * keyed on the chat destination's lifecycle: set on `ON_START` (the chat is
+ * actually on screen -- its nav destination is resumed AND the app is
+ * foregrounded) and cleared on `ON_STOP` (navigated away OR app backgrounded).
+ * This is deliberately NOT plain composition tracking: the NavHost composition
+ * survives backgrounding, so a composition-only clear would keep a chat marked
+ * "visible" while the user is in another app -- suppressing its notifications
+ * (and sending false read receipts) until the process was fully destroyed.
  *
  * Two consumers, both outside this class (this class only *answers*
  * "is chat X on screen?" -- it never decides what to do about it):
