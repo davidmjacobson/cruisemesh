@@ -205,6 +205,16 @@ impl MessageStore {
         let conn = Connection::open(&path).map_err(store_err)?;
         conn.execute_batch(SCHEMA).map_err(store_err)?;
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
+        // Relay proxy-polling (see enqueue_relay_carried_envelope): marks a
+        // carried envelope as one we pulled FROM the relay rather than one we
+        // received over BLE, so the relay-upload query can skip re-uploading
+        // it. Older on-disk stores predate the column.
+        ensure_column(
+            &conn,
+            "carried_envelopes",
+            "from_relay",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1208,6 +1218,49 @@ impl MessageStore {
         Ok(true)
     }
 
+    /// Store an envelope pulled FROM the relay that we're proxying for its
+    /// real recipient (relay proxy-polling: an internet phone fetches a
+    /// contact's `recipient_hint`s alongside its own so a 1:1 message can
+    /// bridge across BLE clusters -- see `MeshService.pollRelayMailbox` /
+    /// `relayProxyHints` on the Kotlin side). This is the relay-sourced
+    /// twin of [`MessageStore::enqueue_carried_envelope`]: always
+    /// `is_family = 1` (the relay hint match already proved it's addressed
+    /// to someone we know, so it's kept until expiry and never evicted for
+    /// space) and `from_relay = 1`, which excludes it from
+    /// [`MessageStore::family_carried_envelopes`] -- the relay-upload query
+    /// -- because it is *already on the relay*; re-uploading it would just
+    /// churn traffic and could resurrect a copy the real recipient already
+    /// acked. It still shows up in [`MessageStore::carried_envelopes_for_hints`]
+    /// / [`MessageStore::carried_envelopes_for_peer_sync`] so we can hand it
+    /// to the real recipient over BLE. `INSERT OR IGNORE` keyed on `msg_id`,
+    /// so re-fetching the same still-unacked proxy envelope on a later poll
+    /// pass is a no-op. Returns whether a new row was inserted.
+    pub fn enqueue_relay_carried_envelope(
+        &self,
+        envelope: CarriedEnvelope,
+        now_ms: i64,
+    ) -> Result<bool, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let size = envelope.sealed.len() as i64;
+        let changed = conn
+            .execute(
+                "INSERT OR IGNORE INTO carried_envelopes
+                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family, received_at, size_bytes, from_relay)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 1)",
+                params![
+                    envelope.msg_id,
+                    envelope.hop_ttl as i64,
+                    envelope.expiry,
+                    envelope.recipient_hint,
+                    envelope.sealed,
+                    now_ms,
+                    size,
+                ],
+            )
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
     /// Carried envelopes whose `recipient_hint` matches any of `hints` and
     /// that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
     /// The caller passes the set of hints a just-met peer could match --
@@ -1340,6 +1393,11 @@ impl MessageStore {
     /// Unexpired carried envelopes that were classified as family traffic
     /// when received, oldest first. Used by relay upload so one phone with
     /// internet can uplink ciphertext it is muling for known contacts.
+    /// Excludes `from_relay = 1` rows: those were pulled FROM the relay by
+    /// proxy-polling in the first place (see
+    /// [`MessageStore::enqueue_relay_carried_envelope`]), so re-uploading them
+    /// here would be pointless churn (and could resurrect an envelope the
+    /// real recipient already acked).
     pub fn family_carried_envelopes(
         &self,
         limit: u64,
@@ -1350,7 +1408,7 @@ impl MessageStore {
             .prepare(
                 "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
                  FROM carried_envelopes
-                 WHERE is_family = 1 AND expiry > ?1
+                 WHERE is_family = 1 AND from_relay = 0 AND expiry > ?1
                  ORDER BY received_at ASC, msg_id ASC
                  LIMIT ?2",
             )
@@ -1538,6 +1596,34 @@ fn ensure_contact_column(conn: &Connection, name: &str, column_def: &str) -> Res
     Ok(())
 }
 
+/// Generic version of [`ensure_contact_column`] for any table: adds `name`
+/// (with `column_def`) to `table` if an older on-disk schema doesn't already
+/// have it. Idempotent -- a no-op once the column exists.
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    column_def: &str,
+) -> Result<(), CoreError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(store_err)?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(store_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(store_err)?;
+    if names.iter().any(|existing| existing == name) {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {name} {column_def}"),
+        [],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1641,7 +1727,8 @@ CREATE TABLE IF NOT EXISTS carried_envelopes (
     sealed         BLOB NOT NULL,
     is_family      INTEGER NOT NULL,
     received_at    INTEGER NOT NULL,
-    size_bytes     INTEGER NOT NULL
+    size_bytes     INTEGER NOT NULL,
+    from_relay     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_carried_hint ON carried_envelopes(recipient_hint);
 CREATE INDEX IF NOT EXISTS idx_carried_expiry ON carried_envelopes(expiry);
@@ -3647,5 +3734,84 @@ mod tests {
             .collect();
         // fam survives despite being 400 bytes (> budget); foreign kept to f2,f3.
         assert_eq!(ids, vec![b"fam".to_vec(), b"f2".to_vec(), b"f3".to_vec()]);
+    }
+
+    // --- relay proxy-polling (from_relay) -----------------------------------
+
+    #[test]
+    fn relay_carried_envelope_is_deliverable_over_ble_but_never_reuploaded() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let env = carried(b"proxy", b"hint-a", 9_000, 10);
+        assert!(store
+            .enqueue_relay_carried_envelope(env.clone(), 1_000)
+            .unwrap());
+
+        // Deliverable over BLE to the real recipient...
+        let found = store
+            .carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 2_000)
+            .unwrap();
+        assert_eq!(found, vec![env]);
+
+        // ...but never re-uploaded to the relay it came from.
+        let uploadable = store.family_carried_envelopes(10, 2_000).unwrap();
+        assert!(uploadable.is_empty());
+    }
+
+    #[test]
+    fn normal_family_carried_envelope_is_still_reuploaded() {
+        // Unchanged behavior: a family envelope received over BLE (not from
+        // the relay) still surfaces in the relay-upload query.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let env = carried(b"ble-family", b"hint-a", 9_000, 10);
+        assert!(store
+            .enqueue_carried_envelope(env.clone(), true, 1_000, BIG_BUDGET)
+            .unwrap());
+
+        let uploadable = store.family_carried_envelopes(10, 2_000).unwrap();
+        assert_eq!(uploadable, vec![env]);
+    }
+
+    #[test]
+    fn open_migrates_an_old_carried_envelopes_table_to_add_from_relay() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cruisemesh-store-migration-carried-{unique}.sqlite"));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE carried_envelopes (
+                msg_id         BLOB PRIMARY KEY,
+                hop_ttl        INTEGER NOT NULL,
+                expiry         INTEGER NOT NULL,
+                recipient_hint BLOB NOT NULL,
+                sealed         BLOB NOT NULL,
+                is_family      INTEGER NOT NULL,
+                received_at    INTEGER NOT NULL,
+                size_bytes     INTEGER NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Opening an old store (pre-dating from_relay) must migrate the
+        // column, not error, and the new relay-sourced path must work
+        // against the migrated schema.
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        let env = carried(b"proxy", b"hint-a", 9_000, 10);
+        assert!(store
+            .enqueue_relay_carried_envelope(env.clone(), 1_000)
+            .unwrap());
+        let found = store
+            .carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 2_000)
+            .unwrap();
+        assert_eq!(found, vec![env]);
+
+        drop(store);
+        fs::remove_file(path).unwrap();
     }
 }
