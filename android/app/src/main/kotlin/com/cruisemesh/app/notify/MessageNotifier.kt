@@ -102,6 +102,18 @@ object MessageNotifier {
         )
     }
 
+    /**
+     * Dismisses the notification (if any) for [chatId]'s chat. Called when
+     * that chat becomes visible so a notification posted while the app was
+     * backgrounded clears the moment the user is looking at the chat.
+     * [chatId] is the same key used to post it: the contact userId for a 1:1
+     * chat, the group id for a group chat.
+     */
+    fun cancel(context: Context, chatId: ByteArray) {
+        context.getSystemService(NotificationManager::class.java)
+            ?.cancel(chatId.contentHashCode())
+    }
+
     private fun postChatNotification(
         context: Context,
         chatId: ByteArray,
