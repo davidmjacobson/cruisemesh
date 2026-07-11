@@ -1,12 +1,17 @@
 # Connectivity Indicator — per-contact reachability at a glance
 
-**Status: design, not yet implemented.** This doc is written to be handed to an
-implementation agent (Sonnet / codex). It specifies WHAT to build and WHERE;
-follow existing code patterns in the named files for HOW.
+**Status: Phase 1 implemented (2026-07-11, branch `agent/connectivity-indicator-phase1`,
+off `agent/ble-1to1-muling`).** `ContactReachability` + `MeshConnectivityStatus` +
+`helloedUserIds()` + all §3 UI (avatar dots, pill upgrade, chat header, contact
+sheet, group header) are coded and unit-tested. `MESH_CARRY_ENABLED = true`
+since Phase 0 (`BLE_1TO1_MULING.md`) shipped first on PR #21.
+`ONLINE_RELAY`/blue dots cannot occur yet — Phase 2 (§6 relay presence
+protocol: new relayd endpoint + migration) is not implemented. Manual/fleet
+testing (§8) has not been run yet.
 
 **Dependency:** the `MESH_CARRY` tier (§2) assumes 1:1 BLE muling works — see
-`BLE_1TO1_MULING.md`. Land that first (or ship Phase 1 with `MESH_CARRY`
-disabled until it lands).
+`BLE_1TO1_MULING.md`. That landed first (PR #21), so this Phase 1 build has it
+enabled.
 
 ## 1. Goal
 

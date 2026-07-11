@@ -70,6 +70,9 @@ object MeshRouter {
     /** The userId [address] identified as, if known. */
     fun userIdFor(address: String): ByteArray? = state.userIdFor(address)
 
+    /** Distinct HELLO'd peer userIds, hex-encoded; see [MeshRouterState.helloedUserIds]. */
+    fun helloedUserIds(): Set<String> = state.helloedUserIds()
+
     /**
      * Sends [frame] to whichever live link has identified itself as [userId].
      * Returns false if no connected link currently maps to that userId --

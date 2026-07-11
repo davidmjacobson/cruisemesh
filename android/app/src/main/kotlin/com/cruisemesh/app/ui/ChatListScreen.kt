@@ -43,6 +43,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.cruisemesh.app.chat.tickStatusFor
+import com.cruisemesh.app.mesh.ReachabilityLevel
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.StoredMessage
@@ -62,6 +63,7 @@ data class ChatSummary(
     val unreadCount: Int,
     val ownDeliveredThrough: ULong,
     val ownReadThrough: ULong,
+    val reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -72,7 +74,8 @@ data class ChatSummary(
             lastMessage == other.lastMessage &&
             unreadCount == other.unreadCount &&
             ownDeliveredThrough == other.ownDeliveredThrough &&
-            ownReadThrough == other.ownReadThrough
+            ownReadThrough == other.ownReadThrough &&
+            reachability == other.reachability
     }
 
     override fun hashCode(): Int = chatId.contentHashCode()
@@ -90,6 +93,7 @@ fun ChatListScreen(
     onProfileClick: () -> Unit,
     onMeshStatusClick: () -> Unit,
     meshStatusText: String,
+    meshStatusDotColor: androidx.compose.ui.graphics.Color? = null,
     connectivityWarning: ConnectivityWarning? = null,
     onConnectivityWarningClick: () -> Unit = {},
     summaries: List<ChatSummary>
@@ -145,6 +149,7 @@ fun ChatListScreen(
 
             MeshStatusPill(
                 text = meshStatusText,
+                dotColor = meshStatusDotColor,
                 onClick = onMeshStatusClick,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
             )
@@ -239,6 +244,7 @@ fun ChatRow(
             userId = summary.chatId,
             name = summary.title,
             displayId = displayId,
+            reachability = summary.reachability,
         )
 
         Spacer(modifier = Modifier.width(16.dp))

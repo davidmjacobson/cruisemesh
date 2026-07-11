@@ -1,5 +1,7 @@
 package com.cruisemesh.app.mesh
 
+import com.cruisemesh.app.chat.UserIdHex
+
 /**
  * Pure address<->userId mapping backing [MeshRouter] (DESIGN.md §5.2 dual
  * BLE roles, §7.3 interim sync). Kept as a plain class with no Android
@@ -90,6 +92,18 @@ class MeshRouterState {
             return null
         }
     }
+
+    /**
+     * Distinct HELLO'd peer userIds, hex-encoded (CONNECTIVITY_INDICATOR.md
+     * §5.1) -- every phone runs dual BLE roles at once, so the same peer can
+     * hold two entries here; hex-encoding before collecting into a [Set]
+     * collapses those duplicates since [ByteArray] has no structural
+     * equality of its own.
+     */
+    fun helloedUserIds(): Set<String> =
+        synchronized(peersByAddress) {
+            peersByAddress.values.mapNotNullTo(mutableSetOf()) { peer -> peer.userId?.let { UserIdHex.encode(it) } }
+        }
 
     /** Forget every connection, e.g. when the mesh service stops and all links die with it. */
     fun clear() {

@@ -34,11 +34,13 @@ fun ContactDetailsSheet(
     contact: Contact,
     onDeleteContact: () -> Unit,
     onDismiss: () -> Unit,
+    connectivityText: String? = null,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         ContactDetailsSheetContent(
             contact = contact,
             onDeleteContact = onDeleteContact,
+            connectivityText = connectivityText,
             modifier = Modifier.padding(bottom = 24.dp),
         )
     }
@@ -49,6 +51,7 @@ fun ContactDetailsSheetContent(
     contact: Contact,
     onDeleteContact: () -> Unit,
     modifier: Modifier = Modifier,
+    connectivityText: String? = null,
 ) {
     val displayId = formatUserId(contact.userId)
     val displayName = ChatListLogic.displayNameOrId(contact.name, displayId)
@@ -77,6 +80,28 @@ fun ContactDetailsSheetContent(
             modifier = Modifier.padding(top = 8.dp),
             textAlign = TextAlign.Center,
         )
+
+        if (connectivityText != null) {
+            OutlinedCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 24.dp),
+                shape = RoundedCornerShape(24.dp),
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Text(
+                        text = "Connectivity",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    Text(
+                        text = connectivityText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+            }
+        }
 
         OutlinedCard(
             modifier = Modifier

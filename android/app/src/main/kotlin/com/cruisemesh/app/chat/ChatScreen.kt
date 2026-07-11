@@ -88,6 +88,8 @@ import com.cruisemesh.app.media.MediaCompressor
 import com.cruisemesh.app.media.VoiceRecorder
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.media.isVisibleChatKind
+import com.cruisemesh.app.mesh.ContactReachability
+import com.cruisemesh.app.mesh.ReachabilityLevel
 import com.cruisemesh.app.ui.AvatarBadge
 import com.cruisemesh.app.ui.BubbleGrouping
 import com.cruisemesh.app.ui.ChatListLogic
@@ -153,6 +155,8 @@ fun ChatScreen(
     store: MessageStore,
     onBack: () -> Unit,
     onDeleteContact: () -> Unit,
+    reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
+    reachabilityStatusText: String = ContactReachability.chatHeaderCopy(ReachabilityLevel.OFFLINE, null, 0L),
 ) {
     val context = LocalContext.current
     var messages by remember(contact.userId) { mutableStateOf(store.messagesForChat(contact.userId)) }
@@ -336,6 +340,8 @@ fun ChatScreen(
         onCancelVoice = { voiceRecorder.cancel() },
         onBack = onBack,
         onDeleteContact = onDeleteContact,
+        reachability = reachability,
+        reachabilityStatusText = reachabilityStatusText,
     )
 }
 
@@ -363,6 +369,8 @@ private fun ConversationScreen(
     onReact: (MessageTarget, String) -> Unit = { _, _ -> },
     onBack: () -> Unit,
     onDeleteContact: () -> Unit,
+    reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
+    reachabilityStatusText: String = ContactReachability.chatHeaderCopy(ReachabilityLevel.OFFLINE, null, 0L),
 ) {
     val listState = rememberLazyListState()
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
@@ -398,6 +406,8 @@ private fun ConversationScreen(
                 contact = contact,
                 displayId = displayId,
                 displayName = displayName,
+                statusText = reachabilityStatusText,
+                reachability = reachability,
                 onBack = onBack,
                 onOpenDetails = { showContactDetails = true },
             )
@@ -478,6 +488,7 @@ private fun ConversationScreen(
     if (showContactDetails) {
         ContactDetailsSheet(
             contact = contact,
+            connectivityText = reachabilityStatusText,
             onDeleteContact = {
                 showContactDetails = false
                 confirmDelete = true
@@ -747,6 +758,8 @@ private fun ConversationTopBar(
     contact: Contact,
     displayId: String,
     displayName: String,
+    statusText: String,
+    reachability: ReachabilityLevel,
     onBack: () -> Unit,
     onOpenDetails: () -> Unit,
 ) {
@@ -775,6 +788,7 @@ private fun ConversationTopBar(
                     name = contact.name,
                     displayId = displayId,
                     size = 36.dp,
+                    reachability = reachability,
                 )
                 Spacer(modifier = Modifier.width(12.dp))
                 Column {
@@ -785,7 +799,7 @@ private fun ConversationTopBar(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = "View contact details",
+                        text = statusText,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

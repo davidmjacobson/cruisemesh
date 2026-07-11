@@ -5,6 +5,43 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.graphics.Color
+
+/**
+ * CONNECTIVITY_INDICATOR.md §3.1: semantic colors for [ReachabilityLevel]
+ * dots/badges, kept separate from the Material3 [MaterialTheme.colorScheme]
+ * tokens since they carry a fixed meaning (green=nearby, blue=relay,
+ * amber=recent/mesh-carry) that must not shift with the app's primary hue.
+ */
+data class ReachabilityPalette(
+    val nearby: Color,
+    val onlineRelay: Color,
+    val recent: Color,
+    /** Also used for the MESH_CARRY hollow-ring stroke -- same hue as [recent], shape (not color) distinguishes them. */
+    val meshCarry: Color,
+    /** Neutral dot for mesh states that carry no reachability signal (STARTING/STOPPED/NO_BLUETOOTH). */
+    val neutral: Color,
+)
+
+private val LightReachabilityPalette = ReachabilityPalette(
+    nearby = Color(0xFF2E7D32),
+    onlineRelay = Color(0xFF1565C0),
+    recent = Color(0xFFF9A825),
+    meshCarry = Color(0xFFF9A825),
+    neutral = Color(0xFF8A9AA1),
+)
+
+private val DarkReachabilityPalette = ReachabilityPalette(
+    nearby = Color(0xFF81C784),
+    onlineRelay = Color(0xFF64B5F6),
+    recent = Color(0xFFFFD54F),
+    meshCarry = Color(0xFFFFD54F),
+    neutral = Color(0xFF6E7B81),
+)
+
+val LocalReachabilityPalette = staticCompositionLocalOf { LightReachabilityPalette }
 
 private val CruiseMeshLightColors = lightColorScheme(
     primary = androidx.compose.ui.graphics.Color(0xFF0E6777),
@@ -53,8 +90,12 @@ fun CruiseMeshTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     content: @Composable () -> Unit
 ) {
-    MaterialTheme(
-        colorScheme = if (darkTheme) CruiseMeshDarkColors else CruiseMeshLightColors,
-        content = content,
-    )
+    CompositionLocalProvider(
+        LocalReachabilityPalette provides if (darkTheme) DarkReachabilityPalette else LightReachabilityPalette,
+    ) {
+        MaterialTheme(
+            colorScheme = if (darkTheme) CruiseMeshDarkColors else CruiseMeshLightColors,
+            content = content,
+        )
+    }
 }

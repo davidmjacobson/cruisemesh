@@ -68,6 +68,7 @@ fun GroupChatScreen(
     store: MessageStore,
     onBack: () -> Unit,
     onDeleteGroup: () -> Unit,
+    reachableMemberCount: Int? = null,
 ) {
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
     var draft by remember { mutableStateOf("") }
@@ -116,6 +117,7 @@ fun GroupChatScreen(
             GroupConversationTopBar(
                 group = group,
                 memberCount = group.memberUserIds.size,
+                reachableMemberCount = reachableMemberCount,
                 onBack = onBack,
                 onOpenDetails = { showDetails = true },
             )
@@ -257,6 +259,7 @@ fun GroupChatScreen(
 private fun GroupConversationTopBar(
     group: Group,
     memberCount: Int,
+    reachableMemberCount: Int?,
     onBack: () -> Unit,
     onOpenDetails: () -> Unit,
 ) {
@@ -289,8 +292,13 @@ private fun GroupConversationTopBar(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    val subtitle = if (reachableMemberCount != null) {
+                        "$reachableMemberCount of $memberCount reachable"
+                    } else {
+                        "$memberCount members · tap for details"
+                    }
                     Text(
-                        text = "$memberCount members · tap for details",
+                        text = subtitle,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 0.dp),
