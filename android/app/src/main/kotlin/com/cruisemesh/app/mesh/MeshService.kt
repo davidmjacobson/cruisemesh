@@ -1437,8 +1437,12 @@ class MeshService : Service() {
         )
         ChatEvents.notifyChatChanged(group.id)
 
-        // Local read watermark only (group wire receipts are deferred).
-        val throughLamport = store.highestContiguousLamport(group.id, senderUserId)
+        // Local read watermark only (group wire receipts are deferred). Uses
+        // highestLamport (plain MAX), not highestContiguousLamport: the
+        // latter stalls at 0 once the sender's stream legitimately starts
+        // above lamport 1 (post chat-history-wipe ratchet), which would
+        // leave this watermark -- and the unread badge -- stuck forever.
+        val throughLamport = store.highestLamport(group.id, senderUserId)
         store.recordOutgoingReceipt(group.id, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
         val isVisible = ChatVisibility.isVisible(group.id)
         if (isVisible) {
@@ -1563,7 +1567,11 @@ class MeshService : Service() {
         if (!inserted) return
         ChatEvents.notifyChatChanged(senderUserId)
 
-        val throughLamport = store.highestContiguousLamport(senderUserId, senderUserId)
+        // highestLamport (plain MAX), not highestContiguousLamport: this is
+        // a watermark over the peer's stream, and after the lamport ratchet
+        // that stream can legitimately start above 1, where the contiguous
+        // count would stall at 0 forever.
+        val throughLamport = store.highestLamport(senderUserId, senderUserId)
         store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
         var relayQueueChanged = queueOutgoingReceiptForRelay(
             identity = identity,
@@ -1650,7 +1658,11 @@ class MeshService : Service() {
         )
         ChatEvents.notifyChatChanged(senderUserId)
 
-        val throughLamport = store.highestContiguousLamport(senderUserId, senderUserId)
+        // highestLamport (plain MAX), not highestContiguousLamport: same
+        // peer-stream-watermark reasoning as above -- a contiguous-from-1
+        // count stalls at 0 once the sender's stream starts above 1 (post
+        // ratchet), stranding the delivered/read receipt and unread badge.
+        val throughLamport = store.highestLamport(senderUserId, senderUserId)
         store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
         var relayQueueChanged = false
         val isVisible = ChatVisibility.isVisible(senderUserId)
@@ -1811,7 +1823,18 @@ class MeshService : Service() {
     private fun handleChatViewed(peerUserId: ByteArray) {
         val identity = this.identity ?: return
         val contact = store.getContact(peerUserId) ?: return
-        val throughLamport = store.highestContiguousLamport(peerUserId, peerUserId)
+        // highestLamport (plain MAX), not highestContiguousLamport: the
+        // latter counts contiguously from lamport 1 and returns 0 at the
+        // first hole, but the lamport ratchet lets a peer's stream
+        // legitimately start above 1 after a chat history wipe (lamports
+        // below the new base never existed for anyone). A receiver holding
+        // e.g. {3, 4} from that peer would get 0 from the contiguous count
+        // forever, so opening the chat would never clear the unread badge
+        // or advance the read tick. MAX correctly reflects what we actually
+        // hold. The `== 0` guard below still means "nothing received yet,"
+        // since MAX is 0 only when the store truly has no message from
+        // this peer.
+        val throughLamport = store.highestLamport(peerUserId, peerUserId)
         if (throughLamport == 0uL) return // nothing received from this peer yet to ack as read
         store.recordOutgoingReceipt(peerUserId, peerUserId, RECEIPT_TYPE_READ, throughLamport)
         if (
