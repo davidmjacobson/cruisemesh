@@ -73,7 +73,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -995,7 +995,7 @@ private fun MessageBubble(
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
 ) {
     var showLegend by remember { mutableStateOf(false) }
-    var boundsInRoot by remember { mutableStateOf(Rect.Zero) }
+    var boundsInWindow by remember { mutableStateOf(Rect.Zero) }
     val topPadding = if (grouping.joinsPrevious) 2.dp else 10.dp
     val bottomPadding = if (grouping.joinsNext) 2.dp else 6.dp
     val shape = bubbleShapeFor(isOwn, grouping)
@@ -1019,10 +1019,10 @@ private fun MessageBubble(
                 reactions = reactions,
                 onReact = onReact,
                 modifier = Modifier
-                    .onGloballyPositioned { coords -> boundsInRoot = coords.boundsInRoot() }
+                    .onGloballyPositioned { coords -> boundsInWindow = coords.boundsInWindow() }
                     .messageActions(
                         onClick = { if (tick != null) showLegend = true },
-                        onLongClick = { onLongPress(target, boundsInRoot) },
+                        onLongClick = { onLongPress(target, boundsInWindow) },
                     ),
             )
             if (grouping.showTimestamp) {

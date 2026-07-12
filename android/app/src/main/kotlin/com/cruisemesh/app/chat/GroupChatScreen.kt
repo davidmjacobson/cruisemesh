@@ -42,7 +42,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -461,7 +461,7 @@ private fun GroupMessageBubble(
         return
     }
 
-    var boundsInRoot by remember { mutableStateOf(Rect.Zero) }
+    var boundsInWindow by remember { mutableStateOf(Rect.Zero) }
     val topPadding = if (grouping.joinsPrevious) 2.dp else 10.dp
     val bottomPadding = if (grouping.joinsNext) 2.dp else 6.dp
     val shape = bubbleShapeFor(isOwn, grouping)
@@ -484,9 +484,9 @@ private fun GroupMessageBubble(
             reactions = reactions,
             onReact = onReact,
             modifier = Modifier
-                .onGloballyPositioned { coords -> boundsInRoot = coords.boundsInRoot() }
+                .onGloballyPositioned { coords -> boundsInWindow = coords.boundsInWindow() }
                 .messageActions(
-                    onLongClick = { onLongPress(target, boundsInRoot) },
+                    onLongClick = { onLongPress(target, boundsInWindow) },
                 ),
         )
     }
