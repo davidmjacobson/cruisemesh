@@ -9,6 +9,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -24,6 +25,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -43,6 +45,7 @@ import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.createCameraCaptureUri
+import com.cruisemesh.app.relay.RelayConfigStore
 import android.widget.Toast
 
 /** Hosted privacy policy (Play Console + in-app link). */
@@ -64,6 +67,7 @@ fun ProfileScreen(
     var displayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     val initialDisplayName = remember { ProfileStore.loadDisplayName(context) }
     var avatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
+    var shareOnline by remember { mutableStateOf(RelayConfigStore.shareOnline(context)) }
     fun bumpAndSync() {
         onProfileChanged(ProfileStore.bumpOwnAvatarEpoch(context))
     }
@@ -199,6 +203,28 @@ fun ProfileScreen(
                 Button(onClick = onStartMesh, modifier = Modifier.padding(top = 16.dp)) {
                     Text("Start mesh")
                 }
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+
+            Text("Relay Presence", style = MaterialTheme.typography.titleMedium)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Share when I'm online",
+                    modifier = Modifier.weight(1f),
+                )
+                Switch(
+                    checked = shareOnline,
+                    onCheckedChange = {
+                        shareOnline = it
+                        RelayConfigStore.setShareOnline(context, it)
+                    },
+                )
             }
 
             Spacer(modifier = Modifier.height(32.dp))

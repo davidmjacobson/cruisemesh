@@ -367,15 +367,17 @@ private fun reachabilityLevelForUserId(
     nearbyPeerIds: Set<String>,
     relayHealth: RelayHealth,
     contactLastSeen: Map<String, Long>,
+    presenceLastSeen: Map<String, Long>,
     nowMs: Long,
 ): ReachabilityLevel {
     val hex = UserIdHex.encode(userId)
+    val presenceSeen = presenceLastSeen[hex]
+    val peerSeen = listOfNotNull(contactLastSeen[hex], presenceSeen).maxOrNull()
     return ContactReachability.compute(
         directLink = hex in nearbyPeerIds,
-        // Relay presence (CONNECTIVITY_INDICATOR.md §6) is Phase 2, not implemented yet.
-        presenceLastSeenMs = null,
-        selfRelayHealthy = relayHealth is RelayHealth.Ok,
-        peerLastSeenMs = contactLastSeen[hex],
+        presenceLastSeenMs = presenceSeen,
+        selfRelayHealthy = ContactReachability.selfRelayHealthy(relayHealth, nowMs),
+        peerLastSeenMs = peerSeen,
         nearbyPeerCount = nearbyPeerIds.size,
         nowMs = nowMs,
     )
@@ -388,10 +390,11 @@ private fun computeSummaryReachability(
     nearbyPeerIds: Set<String>,
     relayHealth: RelayHealth,
     contactLastSeen: Map<String, Long>,
+    presenceLastSeen: Map<String, Long>,
     nowMs: Long,
 ): ReachabilityLevel {
     fun levelFor(userId: ByteArray) =
-        reachabilityLevelForUserId(userId, nearbyPeerIds, relayHealth, contactLastSeen, nowMs)
+        reachabilityLevelForUserId(userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, nowMs)
 
     if (!summary.isGroup) {
         val contact = summary.contact ?: return ReachabilityLevel.OFFLINE
@@ -413,15 +416,23 @@ private fun groupReachableCounts(
     nearbyPeerIds: Set<String>,
     relayHealth: RelayHealth,
     contactLastSeen: Map<String, Long>,
+    presenceLastSeen: Map<String, Long>,
     nowMs: Long,
 ): Pair<Int, Int> {
     val others = group.memberUserIds.filterNot { it.contentEquals(ownUserId) }
     val reachable = others.count { userId ->
-        val level = reachabilityLevelForUserId(userId, nearbyPeerIds, relayHealth, contactLastSeen, nowMs)
+        val level = reachabilityLevelForUserId(userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, nowMs)
         level == ReachabilityLevel.NEARBY || level == ReachabilityLevel.ONLINE_RELAY
     }
     return reachable to others.size
 }
+
+private fun freshRelayHealthForDisplay(relayHealth: RelayHealth, nowMs: Long): RelayHealth =
+    if (relayHealth is RelayHealth.Ok && !ContactReachability.selfRelayHealthy(relayHealth, nowMs)) {
+        RelayHealth.Failing(relayHealth.lastSyncMs)
+    } else {
+        relayHealth
+    }
 
 /** Resolves a [MeshStatusDotColor] to an actual [androidx.compose.ui.graphics.Color] via the current theme palette. */
 @Composable
@@ -444,6 +455,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val nearbyPeerIds by MeshConnectivityStatus.nearbyPeerIds.collectAsState()
     val relayHealth by MeshConnectivityStatus.relay.collectAsState()
     val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
+    val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
     val connectivityNowMs = rememberConnectivityNowMs()
     var transientMeshStatus by remember { mutableStateOf<String?>(null) }
     var ownDisplayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
@@ -605,7 +617,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         onDispose { navController.removeOnDestinationChangedListener(listener) }
     }
 
-    val displaySummaries = remember(summaries, nearbyPeerIds, relayHealth, contactLastSeen, connectivityNowMs) {
+    val displaySummaries = remember(summaries, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs) {
         summaries.map { summary ->
             summary.copy(
                 reachability = computeSummaryReachability(
@@ -614,13 +626,17 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                     nearbyPeerIds,
                     relayHealth,
                     contactLastSeen,
+                    presenceLastSeen,
                     connectivityNowMs,
                 ),
             )
         }
     }
-    val pillStatus = remember(runtimeStatus, nearbyPeerIds, relayHealth) {
-        MeshStatusTextLogic.build(runtimeStatus, nearbyPeerIds.size, relayHealth)
+    val displayRelayHealth = remember(relayHealth, connectivityNowMs) {
+        freshRelayHealthForDisplay(relayHealth, connectivityNowMs)
+    }
+    val pillStatus = remember(runtimeStatus, nearbyPeerIds, displayRelayHealth) {
+        MeshStatusTextLogic.build(runtimeStatus, nearbyPeerIds.size, displayRelayHealth)
     }
     val pillDotColor = pillStatus.dot.toComposeColor()
 
@@ -970,14 +986,25 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
         val nearbyPeerIds by MeshConnectivityStatus.nearbyPeerIds.collectAsState()
         val relayHealth by MeshConnectivityStatus.relay.collectAsState()
         val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
+        val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
         val connectivityNowMs = rememberConnectivityNowMs()
-        val reachability = remember(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, connectivityNowMs) {
-            reachabilityLevelForUserId(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, connectivityNowMs)
+        val reachability = remember(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs) {
+            reachabilityLevelForUserId(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs)
         }
-        val reachabilityStatusText = remember(reachability, contactLastSeen, connectivityNowMs) {
+        val reachabilityStatusText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs) {
+            val hex = UserIdHex.encode(contact.userId)
             ContactReachability.chatHeaderCopy(
                 reachability,
-                contactLastSeen[UserIdHex.encode(contact.userId)],
+                listOfNotNull(contactLastSeen[hex], presenceLastSeen[hex]).maxOrNull(),
+                connectivityNowMs,
+            )
+        }
+        val reachabilityDetailsText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs) {
+            val hex = UserIdHex.encode(contact.userId)
+            ContactReachability.contactDetailsCopy(
+                reachability,
+                listOfNotNull(contactLastSeen[hex], presenceLastSeen[hex]).maxOrNull(),
+                presenceLastSeen[hex],
                 connectivityNowMs,
             )
         }
@@ -993,6 +1020,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             },
             reachability = reachability,
             reachabilityStatusText = reachabilityStatusText,
+            reachabilityDetailsText = reachabilityDetailsText,
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }
@@ -1046,9 +1074,10 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
         val nearbyPeerIds by MeshConnectivityStatus.nearbyPeerIds.collectAsState()
         val relayHealth by MeshConnectivityStatus.relay.collectAsState()
         val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
+        val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
         val connectivityNowMs = rememberConnectivityNowMs()
-        val reachableMemberCount = remember(group, nearbyPeerIds, relayHealth, contactLastSeen, connectivityNowMs) {
-            groupReachableCounts(group, identity.userId, nearbyPeerIds, relayHealth, contactLastSeen, connectivityNowMs).first
+        val reachableMemberCount = remember(group, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs) {
+            groupReachableCounts(group, identity.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs).first
         }
         GroupChatScreen(
             group = group,

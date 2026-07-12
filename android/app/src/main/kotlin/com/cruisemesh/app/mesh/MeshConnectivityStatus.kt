@@ -32,6 +32,11 @@ object MeshConnectivityStatus {
     /** hex userId -> epoch ms we last had evidence the contact's device was alive. */
     val contactLastSeen: StateFlow<Map<String, Long>> = _contactLastSeen.asStateFlow()
 
+    private val _presenceLastSeen = MutableStateFlow<Map<String, Long>>(emptyMap())
+
+    /** hex userId -> epoch ms inferred from relay presence, used for ONLINE_RELAY. */
+    val presenceLastSeen: StateFlow<Map<String, Long>> = _presenceLastSeen.asStateFlow()
+
     fun setNearbyPeers(peers: Set<String>) {
         _nearbyPeerIds.value = peers
     }
@@ -48,10 +53,19 @@ object MeshConnectivityStatus {
         }
     }
 
+    /** Records relay-presence freshness for [userIdHex], keeping the freshest timestamp. */
+    fun mergePresenceLastSeen(userIdHex: String, seenAtMs: Long) {
+        val current = _presenceLastSeen.value
+        if (seenAtMs > (current[userIdHex] ?: 0L)) {
+            _presenceLastSeen.value = current + (userIdHex to seenAtMs)
+        }
+    }
+
     /** Mesh service stopped: every signal above is stale, so drop it all rather than show it frozen. */
     fun clear() {
         _nearbyPeerIds.value = emptySet()
         _relay.value = RelayHealth.NoConfig
         _contactLastSeen.value = emptyMap()
+        _presenceLastSeen.value = emptyMap()
     }
 }

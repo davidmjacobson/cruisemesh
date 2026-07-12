@@ -58,6 +58,33 @@ class ContactReachabilityTest {
     }
 
     @Test
+    fun `stale own relay health suppresses ONLINE_RELAY even with fresh presence`() {
+        val now = 2 * ContactReachability.RELAY_POLL_INTERVAL_MS + 1
+        val relayHealthy = ContactReachability.selfRelayHealthy(RelayHealth.Ok(0L), now)
+        val level = ContactReachability.compute(
+            directLink = false,
+            presenceLastSeenMs = now,
+            selfRelayHealthy = relayHealthy,
+            peerLastSeenMs = null,
+            nearbyPeerCount = 0,
+            nowMs = now,
+        )
+        assertEquals(false, relayHealthy)
+        assertEquals(ReachabilityLevel.OFFLINE, level)
+    }
+
+    @Test
+    fun `fresh own relay health includes the two-poll boundary`() {
+        assertEquals(
+            true,
+            ContactReachability.selfRelayHealthy(
+                RelayHealth.Ok(0L),
+                2 * ContactReachability.RELAY_POLL_INTERVAL_MS,
+            ),
+        )
+    }
+
+    @Test
     fun `unhealthy relay does not suppress RECENT`() {
         val level = ContactReachability.compute(
             directLink = false,
@@ -110,6 +137,20 @@ class ContactReachabilityTest {
     }
 
     @Test
+    fun `disabled mesh carry collapses nearby peer fallback to OFFLINE`() {
+        val level = ContactReachability.compute(
+            directLink = false,
+            presenceLastSeenMs = null,
+            selfRelayHealthy = false,
+            peerLastSeenMs = null,
+            nearbyPeerCount = 1,
+            nowMs = 0L,
+            meshCarryEnabled = false,
+        )
+        assertEquals(ReachabilityLevel.OFFLINE, level)
+    }
+
+    @Test
     fun `nothing at all is OFFLINE`() {
         val level = ContactReachability.compute(
             directLink = false,
@@ -131,6 +172,32 @@ class ContactReachabilityTest {
         assertEquals(
             "Active 2h ago",
             ContactReachability.chatHeaderCopy(ReachabilityLevel.RECENT, 0L, 120 * 60_000L),
+        )
+    }
+
+    @Test
+    fun `contactDetailsCopy includes relay path detail when presence is known`() {
+        assertEquals(
+            "Online via relay · Last seen via relay 2m ago",
+            ContactReachability.contactDetailsCopy(
+                ReachabilityLevel.ONLINE_RELAY,
+                peerLastSeenMs = 60_000L,
+                presenceLastSeenMs = 60_000L,
+                nowMs = 180_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun `contactDetailsCopy includes generic last seen detail without relay presence`() {
+        assertEquals(
+            "Active 1h ago · Last seen 1h ago",
+            ContactReachability.contactDetailsCopy(
+                ReachabilityLevel.RECENT,
+                peerLastSeenMs = 0L,
+                presenceLastSeenMs = null,
+                nowMs = 60 * 60_000L,
+            ),
         )
     }
 

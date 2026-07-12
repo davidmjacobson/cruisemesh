@@ -115,6 +115,50 @@ class RelayClientTest {
         }
     }
 
+    @Test
+    fun `sync presence sends announce and query hints`() {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """
+                {
+                  "now_ms": 1700000060000,
+                  "presence": [
+                    {
+                      "hint": "${base64Url(ByteArray(8) { 5 })}",
+                      "last_seen_ms": 1700000055000
+                    }
+                  ]
+                }
+                """.trimIndent(),
+            ),
+        )
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val page = RelayClient.syncPresence(
+                config,
+                announce = listOf(ByteArray(8) { 1 }),
+                query = listOf(ByteArray(8) { 5 }),
+            )
+            assertEquals(1, page.presence.size)
+            assertEquals(1_700_000_060_000L, page.nowMs)
+            assertEquals(1_700_000_055_000L, page.presence[0].lastSeenMs)
+            assertArrayEquals(ByteArray(8) { 5 }, page.presence[0].hint)
+
+            val request = server.takeRequest()
+            assertEquals("/presence", request.path)
+            assertEquals("Bearer family-token", request.getHeader("Authorization"))
+            assertEquals("CruiseMeshRelayClient/0.1", request.getHeader("User-Agent"))
+            assertEquals("1", request.getHeader("bypass-tunnel-reminder"))
+            val json = JsonParser.parseString(request.body.readUtf8()).asJsonObject
+            assertEquals(base64Url(ByteArray(8) { 1 }), json["announce"].asJsonArray[0].asString)
+            assertEquals(base64Url(ByteArray(8) { 5 }), json["query"].asJsonArray[0].asString)
+        } finally {
+            server.shutdown()
+        }
+    }
+
     private fun sampleOutboundEnvelope() = OutboundEnvelope(
         msgId = ByteArray(16) { 1 },
         recipientUserId = ByteArray(16) { 9 },

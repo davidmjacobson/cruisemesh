@@ -111,6 +111,7 @@ private const val MS_PER_DAY: Long = 24L * 60 * 60 * 1000
  * `DEFAULT_EXPIRY_MS` / `MS_PER_DAY`.
  */
 private const val CARRY_HINT_DAY_WINDOW: Long = 7
+private const val PRESENCE_HINT_DAY_WINDOW: Long = 3
 
 /** DESIGN.md §5.3: the bounded budget (~5 MB) of *foreign* muled envelopes; family (known-recipient) traffic is exempt. */
 private const val FOREIGN_CARRY_BUDGET_BYTES: Long = 5L * 1024 * 1024
@@ -294,6 +295,7 @@ class MeshService : Service() {
             // makes that one redundant in the normal path but both stay, as
             // defense-in-depth).
             MeshRuntimeStatus.markActive()
+            publishInitialRelayHealth()
             Log.i(TAG, "onStartCommand: mesh already running; ignoring")
             return START_STICKY
         }
@@ -327,6 +329,7 @@ class MeshService : Service() {
         RelaySyncEvents.register { requestRelaySync("queue changed") }
 
         running = true
+        publishInitialRelayHealth()
         registerBluetoothAudioReceiver()
         registerBluetoothStateReceiver()
         registerRelayNetworkCallback()
@@ -530,6 +533,23 @@ class MeshService : Service() {
     private fun hasValidatedInternet(): Boolean =
         isDefaultValidated() || (!isDefaultVpn() && relayBindNetwork != null)
 
+    private fun publishInitialRelayHealth() {
+        val contacts = try {
+            store.listContacts()
+        } catch (e: CoreException) {
+            Log.w(TAG, "Failed to inspect contacts for initial relay status: ${e.message}")
+            emptyList()
+        }
+        val configs = distinctRelayConfigs(contacts, RelayConfigStore.load(this))
+        MeshConnectivityStatus.setRelayHealth(
+            when {
+                configs.isEmpty() -> RelayHealth.NoConfig
+                !hasValidatedInternet() -> RelayHealth.NoInternet
+                else -> RelayHealth.Failing(System.currentTimeMillis())
+            },
+        )
+    }
+
     private fun defaultCaps(): NetworkCapabilities? =
         connectivityManager.activeNetwork?.let { connectivityManager.getNetworkCapabilities(it) }
 
@@ -626,6 +646,7 @@ class MeshService : Service() {
         }
         for (config in configs) {
             pollRelayMailbox(config, identity, contacts, fallbackConfig, now, network)
+            syncRelayPresence(config, identity, contacts, fallbackConfig, now, network)
         }
         MeshConnectivityStatus.setRelayHealth(RelayHealth.Ok(now))
         val netDesc = if (network != null) "${networkLabel(network)}(pinned)" else "${networkLabel(connectivityManager.activeNetwork)}(default)"
@@ -901,6 +922,52 @@ class MeshService : Service() {
             return RelayConfig(relayUrl, relayToken)
         }
         return fallbackConfig
+    }
+
+    private fun syncRelayPresence(
+        config: RelayConfig,
+        identity: Identity,
+        contacts: List<Contact>,
+        fallbackConfig: RelayConfig?,
+        now: Long,
+        network: Network?,
+    ) {
+        val contactsForConfig = contacts.filter { contact ->
+            resolvedRelayConfig(contact, fallbackConfig) == config
+        }
+        if (contactsForConfig.isEmpty()) return
+        val announce = if (RelayConfigStore.shareOnline(this)) {
+            recentPresenceHintsFor(identity.userId, now)
+        } else {
+            emptyList()
+        }
+        val query = dedupeHints(
+            emptyList(),
+            contactsForConfig.flatMap { contact -> recentPresenceHintsFor(contact.userId, now) },
+        )
+        if (announce.isEmpty() && query.isEmpty()) return
+        val contactByHint = HashMap<String, Contact>(query.size)
+        for (contact in contactsForConfig) {
+            for (hint in recentPresenceHintsFor(contact.userId, now)) {
+                contactByHint[UserIdHex.encode(hint)] = contact
+            }
+        }
+        try {
+            val localNow = System.currentTimeMillis()
+            val page = RelayClient.syncPresence(config, announce, query, network)
+            for (presence in page.presence) {
+                val contact = contactByHint[UserIdHex.encode(presence.hint)] ?: continue
+                val ageMs = (page.nowMs - presence.lastSeenMs).coerceAtLeast(0L)
+                val localSeenAt = localNow - ageMs
+                MeshConnectivityStatus.mergePresenceLastSeen(UserIdHex.encode(contact.userId), localSeenAt)
+            }
+            Log.i(
+                TAG,
+                "Synced relay presence on ${config.relayUrl}: announce=${announce.size} query=${query.size} hits=${page.presence.size}",
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Relay presence sync failed on ${config.relayUrl}: ${e.message}")
+        }
     }
 
     private fun contactMatchingHint(contacts: List<Contact>, hint: ByteArray, now: Long): Contact? {
@@ -1567,6 +1634,11 @@ class MeshService : Service() {
      */
     private fun recentHintsFor(userId: ByteArray, now: Long): List<ByteArray> =
         (0..CARRY_HINT_DAY_WINDOW).map { daysAgo ->
+            computeRecipientHint(userId, now - daysAgo * MS_PER_DAY)
+        }
+
+    private fun recentPresenceHintsFor(userId: ByteArray, now: Long): List<ByteArray> =
+        (0..PRESENCE_HINT_DAY_WINDOW).map { daysAgo ->
             computeRecipientHint(userId, now - daysAgo * MS_PER_DAY)
         }
 
