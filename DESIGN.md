@@ -239,6 +239,13 @@ enough for relays/mules to route and recipients to cheaply test "for me?",
 without a stable global identifier on the wire. Sender identity is **inside**
 the ciphertext. Relay servers store sealed envelopes and hints, nothing else.
 
+Relay presence (`POST /presence`) intentionally changes one relay-side
+observable: a syncing phone may announce its own recent-day hints so friends can
+see "online via relay." That lets the relay know "this connection currently
+owns this rotating hint" and its online pattern. Hints still rotate daily, and
+users can turn off "Share when I'm online"; querying friends' presence still
+works when announcing is off.
+
 ### 6.5 Groups
 
 - A group = ID + name + member list + a symmetric **group key** (XChaCha20-Poly1305).

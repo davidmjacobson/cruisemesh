@@ -32,6 +32,16 @@ data class RelayFetchPage(
     val nextCursor: Long,
 )
 
+data class RelayPresence(
+    val hint: ByteArray,
+    val lastSeenMs: Long,
+)
+
+data class RelayPresencePage(
+    val nowMs: Long,
+    val presence: List<RelayPresence>,
+)
+
 /**
  * Thin HTTPS client for `cruisemesh-relayd`. It moves only the §6.4 public
  * envelope header shape plus the sealed bytes; plaintext message metadata
@@ -107,6 +117,34 @@ object RelayClient {
         val connection = openConnection(buildUrl(config.relayUrl, "/envelopes/ack"), "POST", config, network)
         connection.writeJson(body)
         connection.useJsonResponse { }
+    }
+
+    fun syncPresence(
+        config: RelayConfig,
+        announce: List<ByteArray>,
+        query: List<ByteArray>,
+        network: Network? = null,
+    ): RelayPresencePage {
+        val body = gson.toJson(
+            PresenceRequest(
+                announce = announce.map(::base64Url),
+                query = query.map(::base64Url),
+            ),
+        )
+        val connection = openConnection(buildUrl(config.relayUrl, "/presence"), "POST", config, network)
+        connection.writeJson(body)
+        return connection.useJsonResponse { responseBody ->
+            val response = gson.fromJson(responseBody, PresenceResponse::class.java)
+            RelayPresencePage(
+                nowMs = response.nowMs,
+                presence = response.presence.map { item ->
+                    RelayPresence(
+                        hint = base64UrlDecode(item.hint),
+                        lastSeenMs = item.lastSeenMs,
+                    )
+                },
+            )
+        }
     }
 
     private fun postEnvelope(
@@ -200,6 +238,21 @@ object RelayClient {
 
     private data class AckRequest(
         @SerializedName("ids") val ids: List<Long>,
+    )
+
+    private data class PresenceRequest(
+        @SerializedName("announce") val announce: List<String>,
+        @SerializedName("query") val query: List<String>,
+    )
+
+    private data class PresenceResponse(
+        @SerializedName("now_ms") val nowMs: Long,
+        @SerializedName("presence") val presence: List<PresencePayload>,
+    )
+
+    private data class PresencePayload(
+        @SerializedName("hint") val hint: String,
+        @SerializedName("last_seen_ms") val lastSeenMs: Long,
     )
 
     private data class GetEnvelopesResponse(
