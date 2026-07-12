@@ -295,6 +295,7 @@ class MeshService : Service() {
             // makes that one redundant in the normal path but both stay, as
             // defense-in-depth).
             MeshRuntimeStatus.markActive()
+            publishInitialRelayHealth()
             Log.i(TAG, "onStartCommand: mesh already running; ignoring")
             return START_STICKY
         }
@@ -328,6 +329,7 @@ class MeshService : Service() {
         RelaySyncEvents.register { requestRelaySync("queue changed") }
 
         running = true
+        publishInitialRelayHealth()
         registerBluetoothAudioReceiver()
         registerBluetoothStateReceiver()
         registerRelayNetworkCallback()
@@ -530,6 +532,23 @@ class MeshService : Service() {
     /** True when a usable validated internet path exists for relay traffic. */
     private fun hasValidatedInternet(): Boolean =
         isDefaultValidated() || (!isDefaultVpn() && relayBindNetwork != null)
+
+    private fun publishInitialRelayHealth() {
+        val contacts = try {
+            store.listContacts()
+        } catch (e: CoreException) {
+            Log.w(TAG, "Failed to inspect contacts for initial relay status: ${e.message}")
+            emptyList()
+        }
+        val configs = distinctRelayConfigs(contacts, RelayConfigStore.load(this))
+        MeshConnectivityStatus.setRelayHealth(
+            when {
+                configs.isEmpty() -> RelayHealth.NoConfig
+                !hasValidatedInternet() -> RelayHealth.NoInternet
+                else -> RelayHealth.Failing(System.currentTimeMillis())
+            },
+        )
+    }
 
     private fun defaultCaps(): NetworkCapabilities? =
         connectivityManager.activeNetwork?.let { connectivityManager.getNetworkCapabilities(it) }

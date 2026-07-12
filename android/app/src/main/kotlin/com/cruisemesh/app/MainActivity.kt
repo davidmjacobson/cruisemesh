@@ -376,7 +376,7 @@ private fun reachabilityLevelForUserId(
     return ContactReachability.compute(
         directLink = hex in nearbyPeerIds,
         presenceLastSeenMs = presenceSeen,
-        selfRelayHealthy = relayHealth is RelayHealth.Ok,
+        selfRelayHealthy = ContactReachability.selfRelayHealthy(relayHealth, nowMs),
         peerLastSeenMs = peerSeen,
         nearbyPeerCount = nearbyPeerIds.size,
         nowMs = nowMs,
@@ -426,6 +426,13 @@ private fun groupReachableCounts(
     }
     return reachable to others.size
 }
+
+private fun freshRelayHealthForDisplay(relayHealth: RelayHealth, nowMs: Long): RelayHealth =
+    if (relayHealth is RelayHealth.Ok && !ContactReachability.selfRelayHealthy(relayHealth, nowMs)) {
+        RelayHealth.Failing(relayHealth.lastSyncMs)
+    } else {
+        relayHealth
+    }
 
 /** Resolves a [MeshStatusDotColor] to an actual [androidx.compose.ui.graphics.Color] via the current theme palette. */
 @Composable
@@ -625,8 +632,11 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             )
         }
     }
-    val pillStatus = remember(runtimeStatus, nearbyPeerIds, relayHealth) {
-        MeshStatusTextLogic.build(runtimeStatus, nearbyPeerIds.size, relayHealth)
+    val displayRelayHealth = remember(relayHealth, connectivityNowMs) {
+        freshRelayHealthForDisplay(relayHealth, connectivityNowMs)
+    }
+    val pillStatus = remember(runtimeStatus, nearbyPeerIds, displayRelayHealth) {
+        MeshStatusTextLogic.build(runtimeStatus, nearbyPeerIds.size, displayRelayHealth)
     }
     val pillDotColor = pillStatus.dot.toComposeColor()
 
@@ -989,6 +999,15 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
                 connectivityNowMs,
             )
         }
+        val reachabilityDetailsText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs) {
+            val hex = UserIdHex.encode(contact.userId)
+            ContactReachability.contactDetailsCopy(
+                reachability,
+                listOfNotNull(contactLastSeen[hex], presenceLastSeen[hex]).maxOrNull(),
+                presenceLastSeen[hex],
+                connectivityNowMs,
+            )
+        }
         ChatScreen(
             contact = contact,
             ownUserId = identity.userId,
@@ -1001,6 +1020,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             },
             reachability = reachability,
             reachabilityStatusText = reachabilityStatusText,
+            reachabilityDetailsText = reachabilityDetailsText,
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }

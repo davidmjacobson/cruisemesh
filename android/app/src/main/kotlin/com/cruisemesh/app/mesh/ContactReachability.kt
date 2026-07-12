@@ -33,6 +33,9 @@ enum class ReachabilityLevel {
  * of its own.
  */
 object ContactReachability {
+    /** Existing relay poll cadence; duplicated here so UI reachability logic stays pure/testable. */
+    const val RELAY_POLL_INTERVAL_MS = 60_000L
+
     /** 2.5x the 60 s relay poll: "their phone is actively syncing right now." */
     const val PRESENCE_ONLINE_WINDOW_MS = 150_000L
 
@@ -52,9 +55,9 @@ object ContactReachability {
      *   from the same lookup the send path uses, so NEARBY means "a send
      *   right now would take the BLE path."
      * @param presenceLastSeenMs relay-presence last-seen for this contact
-     *   (CONNECTIVITY_INDICATOR.md §6, not implemented yet in Phase 1 --
-     *   callers pass null until then, so [ReachabilityLevel.ONLINE_RELAY]
-     *   simply never fires).
+     *   (CONNECTIVITY_INDICATOR.md §6). Relay presence is kept separate from
+     *   general last-seen evidence so only actual relay presence can light up
+     *   [ReachabilityLevel.ONLINE_RELAY].
      * @param selfRelayHealthy our own last relay sync pass succeeded
      *   recently and we have validated internet.
      * @param peerLastSeenMs max of: relay presence, last HELLO on any link,
@@ -70,12 +73,13 @@ object ContactReachability {
         peerLastSeenMs: Long?,
         nearbyPeerCount: Int,
         nowMs: Long,
+        meshCarryEnabled: Boolean = MESH_CARRY_ENABLED,
     ): ReachabilityLevel = when {
         directLink -> ReachabilityLevel.NEARBY
         selfRelayHealthy && presenceLastSeenMs != null && nowMs - presenceLastSeenMs <= PRESENCE_ONLINE_WINDOW_MS ->
             ReachabilityLevel.ONLINE_RELAY
         peerLastSeenMs != null && nowMs - peerLastSeenMs <= RECENT_WINDOW_MS -> ReachabilityLevel.RECENT
-        MESH_CARRY_ENABLED && nearbyPeerCount > 0 -> ReachabilityLevel.MESH_CARRY
+        meshCarryEnabled && nearbyPeerCount > 0 -> ReachabilityLevel.MESH_CARRY
         else -> ReachabilityLevel.OFFLINE
     }
 
@@ -98,5 +102,27 @@ object ContactReachability {
         ReachabilityLevel.RECENT -> "Recently active"
         ReachabilityLevel.MESH_CARRY -> "Reachable through the mesh"
         ReachabilityLevel.OFFLINE -> null
+    }
+
+    fun selfRelayHealthy(relayHealth: RelayHealth, nowMs: Long): Boolean =
+        relayHealth is RelayHealth.Ok && nowMs - relayHealth.lastSyncMs <= 2 * RELAY_POLL_INTERVAL_MS
+
+    fun contactDetailsCopy(
+        level: ReachabilityLevel,
+        peerLastSeenMs: Long?,
+        presenceLastSeenMs: Long?,
+        nowMs: Long,
+    ): String {
+        val base = chatHeaderCopy(level, peerLastSeenMs, nowMs)
+        return when {
+            presenceLastSeenMs != null -> "$base · Last seen via relay ${ageText(presenceLastSeenMs, nowMs)} ago"
+            peerLastSeenMs != null -> "$base · Last seen ${ageText(peerLastSeenMs, nowMs)} ago"
+            else -> base
+        }
+    }
+
+    private fun ageText(seenAtMs: Long, nowMs: Long): String {
+        val minutes = ((nowMs - seenAtMs) / 60_000L).coerceAtLeast(0L)
+        return if (minutes >= 60) "${minutes / 60}h" else "${minutes}m"
     }
 }
