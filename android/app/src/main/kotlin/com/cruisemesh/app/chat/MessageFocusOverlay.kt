@@ -13,10 +13,13 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -42,6 +45,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -55,9 +59,17 @@ data class FocusedMessage(
 
 private val OVERLAY_SPACING = 8.dp
 private val OVERLAY_MARGIN = 16.dp
+/** Extra breathing room beyond the system status/navigation bars so the bar and menu never sit flush against a screen edge. */
+private val OVERLAY_EDGE_CLEARANCE = 16.dp
 private const val SCRIM_ALPHA = 0.55f
 private const val ENTRANCE_MS = 150
 private const val EXIT_MS = 120
+
+// Rough pre-measurement estimate for the bar (6 circular 40dp reaction
+// buttons) and menu (two DropdownMenuItems) so the very first frame already
+// places them close to correct instead of snapping in from a zero-size guess.
+private val ESTIMATED_BAR_SIZE = DpSize(268.dp, 52.dp)
+private val ESTIMATED_MENU_SIZE = DpSize(180.dp, 96.dp)
 
 /**
  * MESSAGE_LONGPRESS_OVERLAY.md: full-screen scrim over everything (list, top
@@ -102,8 +114,14 @@ fun MessageFocusOverlay(
 
     BackHandler(onBack = ::dismiss)
 
-    var barSize by remember { mutableStateOf(IntSize.Zero) }
-    var menuSize by remember { mutableStateOf(IntSize.Zero) }
+    val estimatedBarSize = with(density) {
+        IntSize(ESTIMATED_BAR_SIZE.width.roundToPx(), ESTIMATED_BAR_SIZE.height.roundToPx())
+    }
+    val estimatedMenuSize = with(density) {
+        IntSize(ESTIMATED_MENU_SIZE.width.roundToPx(), ESTIMATED_MENU_SIZE.height.roundToPx())
+    }
+    var barSize by remember { mutableStateOf(estimatedBarSize) }
+    var menuSize by remember { mutableStateOf(estimatedMenuSize) }
 
     BoxWithConstraints(
         modifier = Modifier
@@ -112,8 +130,13 @@ fun MessageFocusOverlay(
             .pointerInput(Unit) { detectTapGestures { dismiss() } }
             .semantics { contentDescription = "Dismiss message options" },
     ) {
+        val edgeClearancePx = with(density) { OVERLAY_EDGE_CLEARANCE.toPx() }
         val screenRightPx = with(density) { maxWidth.toPx() }
-        val screenBottomPx = with(density) { maxHeight.toPx() }
+        // Keep the bar/menu clear of the status bar and nav bar/gesture pill,
+        // plus a little extra padding so they never sit flush on an edge.
+        val screenTopPx = WindowInsets.statusBars.getTop(density).toFloat() + edgeClearancePx
+        val screenBottomPx = with(density) { maxHeight.toPx() } -
+            WindowInsets.navigationBars.getBottom(density).toFloat() - edgeClearancePx
         val spacingPx = with(density) { OVERLAY_SPACING.toPx() }
         val marginPx = with(density) { OVERLAY_MARGIN.toPx() }
 
@@ -128,7 +151,7 @@ fun MessageFocusOverlay(
             barHeight = barSize.height.toFloat(),
             menuWidth = menuSize.width.toFloat(),
             menuHeight = menuSize.height.toFloat(),
-            screenTop = 0f,
+            screenTop = screenTopPx,
             screenBottom = screenBottomPx,
             screenLeft = 0f,
             screenRight = screenRightPx,
@@ -246,7 +269,10 @@ private fun MessageActionPanel(
         shadowElevation = 6.dp,
         modifier = Modifier
             .padding(top = 6.dp)
-            .widthIn(min = 176.dp),
+            // DropdownMenuItem fills whatever width it's given -- without a max
+            // here (normally supplied by DropdownMenu's own popup sizing) it
+            // would stretch to the full screen width instead of hugging its text.
+            .widthIn(min = 176.dp, max = 220.dp),
     ) {
         Column(modifier = Modifier.padding(vertical = 6.dp)) {
             DropdownMenuItem(

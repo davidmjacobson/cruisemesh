@@ -43,6 +43,7 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -77,6 +78,7 @@ fun GroupChatScreen(
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    val keyboardController = LocalSoftwareKeyboardController.current
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
     var draft by remember { mutableStateOf("") }
     var showDetails by remember { mutableStateOf(false) }
@@ -118,6 +120,19 @@ fun GroupChatScreen(
         val existingOwn = reactions[target.stableKey].orEmpty().firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
         sender.sendReaction(group, target, if (existingOwn != null) "" else emoji)
         reload()
+    }
+
+    // The overlay takes over the full screen, so drop the keyboard while it's
+    // open (freeing that space for the scrim) and bring it back once closed --
+    // a no-op either way if the composer wasn't focused to begin with.
+    fun openOverlay(target: MessageTarget, bounds: Rect) {
+        keyboardController?.hide()
+        focused = FocusedMessage(target, bounds)
+    }
+
+    fun closeOverlay() {
+        focused = null
+        keyboardController?.show()
     }
 
     LaunchedEffect(visibleMessages.size) {
@@ -175,7 +190,7 @@ fun GroupChatScreen(
                         onReact = { emoji ->
                             toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
                         },
-                        onLongPress = { target, bounds -> focused = FocusedMessage(target, bounds) },
+                        onLongPress = { target, bounds -> openOverlay(target, bounds) },
                     )
                 }
             }
@@ -287,21 +302,21 @@ fun GroupChatScreen(
                 isOwn = focusedIsOwn,
                 canCopy = focusedCopyText.isNotBlank(),
                 ownReactionEmoji = focusedOwnReaction,
-                onDismiss = { focused = null },
+                onDismiss = { closeOverlay() },
                 onReact = { emoji ->
                     toggleReaction(currentFocused.target, emoji)
-                    focused = null
+                    closeOverlay()
                 },
                 onCopy = {
                     if (focusedCopyText.isNotBlank()) {
                         clipboard.setText(AnnotatedString(focusedCopyText))
                         Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
                     }
-                    focused = null
+                    closeOverlay()
                 },
                 onInfo = {
                     infoMessage = focusedMessage
-                    focused = null
+                    closeOverlay()
                 },
             ) {
                 GroupMessageBubbleVisual(
@@ -313,7 +328,7 @@ fun GroupChatScreen(
                     reactions = focusedReactions,
                     onReact = { emoji ->
                         toggleReaction(currentFocused.target, emoji)
-                        focused = null
+                        closeOverlay()
                     },
                 )
             }

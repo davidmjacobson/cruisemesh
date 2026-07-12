@@ -75,6 +75,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -386,6 +387,7 @@ private fun ConversationScreen(
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    val keyboardController = LocalSoftwareKeyboardController.current
     val listState = rememberLazyListState()
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
     val displayName = remember(contact.name, displayId) {
@@ -412,6 +414,19 @@ private fun ConversationScreen(
     fun toggleReaction(target: MessageTarget, emoji: String) {
         val existingOwn = reactions[target.stableKey].orEmpty().firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
         onReact(target, if (existingOwn != null) "" else emoji)
+    }
+
+    // The overlay takes over the full screen, so drop the keyboard while it's
+    // open (freeing that space for the scrim) and bring it back once closed --
+    // a no-op either way if the composer wasn't focused to begin with.
+    fun openOverlay(target: MessageTarget, bounds: Rect) {
+        keyboardController?.hide()
+        focused = FocusedMessage(target, bounds)
+    }
+
+    fun closeOverlay() {
+        focused = null
+        keyboardController?.show()
     }
 
     LaunchedEffect(visibleMessages.size) {
@@ -479,7 +494,7 @@ private fun ConversationScreen(
                         onReact = { emoji ->
                             toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
                         },
-                        onLongPress = { target, bounds -> focused = FocusedMessage(target, bounds) },
+                        onLongPress = { target, bounds -> openOverlay(target, bounds) },
                     )
                 }
             }
@@ -561,21 +576,21 @@ private fun ConversationScreen(
                 isOwn = focusedIsOwn,
                 canCopy = focusedCopyText.isNotBlank(),
                 ownReactionEmoji = focusedOwnReaction,
-                onDismiss = { focused = null },
+                onDismiss = { closeOverlay() },
                 onReact = { emoji ->
                     toggleReaction(currentFocused.target, emoji)
-                    focused = null
+                    closeOverlay()
                 },
                 onCopy = {
                     if (focusedCopyText.isNotBlank()) {
                         clipboard.setText(AnnotatedString(focusedCopyText))
                         Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
                     }
-                    focused = null
+                    closeOverlay()
                 },
                 onInfo = {
                     infoMessage = focusedMessage
-                    focused = null
+                    closeOverlay()
                 },
             ) {
                 MessageBubbleVisual(
@@ -587,7 +602,7 @@ private fun ConversationScreen(
                     reactions = focusedReactions,
                     onReact = { emoji ->
                         toggleReaction(currentFocused.target, emoji)
-                        focused = null
+                        closeOverlay()
                     },
                 )
             }
