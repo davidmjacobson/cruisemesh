@@ -1,13 +1,13 @@
 # Connectivity Indicator — per-contact reachability at a glance
 
-**Status: Phase 1 implemented (2026-07-11, branch `agent/connectivity-indicator-phase1`,
+**Status: Phase 2 implemented (2026-07-12, on top of Phase 1 from `agent/connectivity-indicator-phase1`,
 off `agent/ble-1to1-muling`).** `ContactReachability` + `MeshConnectivityStatus` +
 `helloedUserIds()` + all §3 UI (avatar dots, pill upgrade, chat header, contact
 sheet, group header) are coded and unit-tested. `MESH_CARRY_ENABLED = true`
-since Phase 0 (`BLE_1TO1_MULING.md`) shipped first on PR #21.
-`ONLINE_RELAY`/blue dots cannot occur yet — Phase 2 (§6 relay presence
-protocol: new relayd endpoint + migration) is not implemented. Manual/fleet
-testing (§8) has not been run yet.
+since Phase 0 (`BLE_1TO1_MULING.md`) shipped first on PR #21. `relayd` now
+serves `POST /presence`, Android syncs it during the existing relay poll, and
+`ONLINE_RELAY`/blue dots can occur when both peers are actively syncing.
+Manual/fleet testing (§8) has not been run yet.
 
 **Dependency:** the `MESH_CARRY` tier (§2) assumes 1:1 BLE muling works — see
 `BLE_1TO1_MULING.md`. That landed first (PR #21), so this Phase 1 build has it
@@ -386,9 +386,9 @@ Phase 0 has landed; otherwise ship with `MESH_CARRY_ENABLED = false`).
 `ONLINE_RELAY` can't occur yet (no presence data) — the enum and UI handle it
 from day one.
 
-**Phase 2 — relay presence.** §6 end to end: relayd endpoint + migration,
-`RelayClient.syncPresence`, sync-pass integration, settings toggle. Lights up
-blue `ONLINE_RELAY` and relay-fed `RECENT`.
+**Phase 2 — relay presence.** Implemented 2026-07-12: relayd endpoint +
+presence table, `RelayClient.syncPresence`, sync-pass integration, and
+settings toggle. Lights up blue `ONLINE_RELAY` and relay-fed `RECENT`.
 
 **Phase 3 — candidates, not committed:** BLE RSSI → bar-strength within
 NEARBY; HELLO capability flags ("I have internet") to split MESH_CARRY into

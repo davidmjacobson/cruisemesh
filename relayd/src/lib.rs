@@ -72,6 +72,9 @@ const RECIPIENT_HINT_LEN: usize = 8;
 const MSG_ID_LEN: usize = 16;
 const DEFAULT_FETCH_LIMIT: usize = 100;
 const MAX_FETCH_LIMIT: usize = 500;
+const MAX_PRESENCE_ANNOUNCE: usize = 4;
+const MAX_PRESENCE_QUERY: usize = 512;
+const PRESENCE_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
 
 /// Capacity of the global POST→WS broadcast. Lagging subscribers that fall
 /// more than this many events behind are disconnected (`Lagged`); they
@@ -135,6 +138,12 @@ pub struct StoredEnvelope {
     pub sealed: Vec<u8>,
     pub expiry_ms: i64,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredPresence {
+    pub hint: Vec<u8>,
+    pub last_seen_ms: i64,
 }
 
 impl RelayStore {
@@ -314,7 +323,71 @@ impl RelayStore {
                 params![now_ms, retention_floor],
             )
             .map_err(|e| e.to_string())?;
-        Ok(deleted as u64)
+        let presence_floor = now_ms.saturating_sub(PRESENCE_RETENTION_MS);
+        let deleted_presence = conn
+            .execute(
+                "DELETE FROM presence WHERE last_seen_ms <= ?1",
+                params![presence_floor],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok((deleted + deleted_presence) as u64)
+    }
+
+    pub fn sync_presence(
+        &self,
+        family_token: &str,
+        announce: &[Vec<u8>],
+        query: &[Vec<u8>],
+        now_ms: i64,
+    ) -> Result<Vec<StoredPresence>, String> {
+        self.prune_expired(now_ms)?;
+        let mut conn = self.conn.lock().expect("relay store mutex poisoned");
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO presence (family_token, hint, last_seen_ms)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(family_token, hint) DO UPDATE SET
+                        last_seen_ms = excluded.last_seen_ms",
+                )
+                .map_err(|e| e.to_string())?;
+            for hint in announce {
+                stmt.execute(params![family_token, hint, now_ms])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..query.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT hint, last_seen_ms
+             FROM presence
+             WHERE family_token = ?1 AND hint IN ({placeholders})
+             ORDER BY last_seen_ms DESC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let mut bindings: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(query.len() + 1);
+        bindings.push(&family_token);
+        for hint in query {
+            bindings.push(hint);
+        }
+        let rows = stmt
+            .query_map(bindings.as_slice(), |row| {
+                Ok(StoredPresence {
+                    hint: row.get(0)?,
+                    last_seen_ms: row.get(1)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn count_for_family(&self, family_token: &str) -> Result<u64, String> {
@@ -386,6 +459,7 @@ pub fn app(state: AppState) -> Router {
         .route("/ws", get(ws_handler))
         .route("/envelopes", post(post_envelope).get(get_envelopes))
         .route("/envelopes/ack", post(ack_envelopes))
+        .route("/presence", post(sync_presence))
         .with_state(state)
 }
 
@@ -444,7 +518,9 @@ async fn post_envelope(
     }
     let sealed = decode_base64_field(&request.sealed, "sealed")?;
     if sealed.is_empty() {
-        return Err(ApiError::bad_request("sealed must not be empty".to_string()));
+        return Err(ApiError::bad_request(
+            "sealed must not be empty".to_string(),
+        ));
     }
     let now = now_ms();
     let id = state
@@ -516,7 +592,9 @@ async fn get_envelopes(
         .map(|hint| decode_base64_field(hint, "hints"))
         .collect::<Result<Vec<_>, _>>()?;
     if hints.is_empty() {
-        return Err(ApiError::bad_request("at least one hint is required".to_string()));
+        return Err(ApiError::bad_request(
+            "at least one hint is required".to_string(),
+        ));
     }
     for hint in &hints {
         if hint.len() != RECIPIENT_HINT_LEN {
@@ -578,6 +656,75 @@ async fn ack_envelopes(
     Ok(Json(AckResponse { deleted }))
 }
 
+#[derive(Deserialize)]
+struct PresenceRequest {
+    announce: Vec<String>,
+    query: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PresenceItem {
+    hint: String,
+    last_seen_ms: i64,
+}
+
+#[derive(Serialize)]
+struct PresenceResponse {
+    now_ms: i64,
+    presence: Vec<PresenceItem>,
+}
+
+async fn sync_presence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PresenceRequest>,
+) -> Result<Json<PresenceResponse>, ApiError> {
+    let family_token = bearer_token(&headers, &state.auth_tokens)?;
+    if request.announce.len() > MAX_PRESENCE_ANNOUNCE {
+        return Err(ApiError::bad_request(format!(
+            "announce must contain at most {MAX_PRESENCE_ANNOUNCE} hints"
+        )));
+    }
+    if request.query.len() > MAX_PRESENCE_QUERY {
+        return Err(ApiError::bad_request(format!(
+            "query must contain at most {MAX_PRESENCE_QUERY} hints"
+        )));
+    }
+    let announce = decode_presence_hints(&request.announce, "announce")?;
+    let query = decode_presence_hints(&request.query, "query")?;
+    let now = now_ms();
+    let rows = state
+        .store
+        .sync_presence(&family_token, &announce, &query, now)
+        .map_err(ApiError::internal)?;
+    Ok(Json(PresenceResponse {
+        now_ms: now,
+        presence: rows
+            .into_iter()
+            .map(|row| PresenceItem {
+                hint: encode_base64_field(&row.hint),
+                last_seen_ms: row.last_seen_ms,
+            })
+            .collect(),
+    }))
+}
+
+fn decode_presence_hints(values: &[String], field: &str) -> Result<Vec<Vec<u8>>, ApiError> {
+    let mut seen = HashSet::with_capacity(values.len());
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let hint = decode_base64_field(value, field)?;
+        if hint.len() != RECIPIENT_HINT_LEN {
+            return Err(ApiError::bad_request(format!(
+                "{field} entries must be {RECIPIENT_HINT_LEN} bytes after base64url decoding"
+            )));
+        }
+        if seen.insert(hint.clone()) {
+            out.push(hint);
+        }
+    }
+    Ok(out)
+}
 
 #[derive(Deserialize)]
 struct WsQuery {
@@ -614,7 +761,9 @@ async fn ws_handler(
         .map(|hint| decode_base64_field(hint, "hints"))
         .collect::<Result<Vec<_>, _>>()?;
     if hints.is_empty() {
-        return Err(ApiError::bad_request("at least one hint is required".to_string()));
+        return Err(ApiError::bad_request(
+            "at least one hint is required".to_string(),
+        ));
     }
     for hint in &hints {
         if hint.len() != RECIPIENT_HINT_LEN {
@@ -638,11 +787,7 @@ async fn ws_handler(
 
 async fn ws_send_text(socket: &mut WebSocket, text: String) -> bool {
     matches!(
-        tokio::time::timeout(
-            WS_WRITE_TIMEOUT,
-            socket.send(Message::Text(text.into())),
-        )
-        .await,
+        tokio::time::timeout(WS_WRITE_TIMEOUT, socket.send(Message::Text(text.into())),).await,
         Ok(Ok(()))
     )
 }
@@ -720,7 +865,7 @@ async fn handle_ws(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // Bound memory: drop slow/dead consumers; reconnect
                         // + replay from cursor heals (module docs).
-                        
+
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -764,9 +909,9 @@ fn bearer_token(headers: &HeaderMap, allowed_tokens: &HashSet<String>) -> Result
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| ApiError::unauthorized("missing Authorization header".to_string()))?;
-    let token = auth
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| ApiError::unauthorized("Authorization must be Bearer <token>".to_string()))?;
+    let token = auth.strip_prefix("Bearer ").ok_or_else(|| {
+        ApiError::unauthorized("Authorization must be Bearer <token>".to_string())
+    })?;
     if !allowed_tokens.contains(token) {
         return Err(ApiError::unauthorized("unknown family token".to_string()));
     }
@@ -834,6 +979,13 @@ CREATE INDEX IF NOT EXISTS idx_envelopes_family_hint_id
     ON envelopes(family_token, recipient_hint, id);
 CREATE INDEX IF NOT EXISTS idx_envelopes_expiry ON envelopes(expiry_ms);
 CREATE INDEX IF NOT EXISTS idx_envelopes_created_at ON envelopes(created_at_ms);
+CREATE TABLE IF NOT EXISTS presence (
+    family_token  TEXT NOT NULL,
+    hint          BLOB NOT NULL,
+    last_seen_ms  INTEGER NOT NULL,
+    PRIMARY KEY(family_token, hint)
+);
+CREATE INDEX IF NOT EXISTS idx_presence_last_seen ON presence(last_seen_ms);
 ";
 
 #[cfg(test)]
@@ -1130,9 +1282,7 @@ mod tests {
         assert_eq!(store.count_for_family("family-a").unwrap(), 2);
 
         // Partial ack leaves the other row for a re-fetch from after=0.
-        let deleted = store
-            .ack_envelopes("family-a", vec![first[0].id])
-            .unwrap();
+        let deleted = store.ack_envelopes("family-a", vec![first[0].id]).unwrap();
         assert_eq!(deleted, 1);
         let remaining = store
             .fetch_envelopes("family-a", vec![sample_hint(1)], 0, 10, now)
@@ -1151,7 +1301,10 @@ mod tests {
         );
         // Tighter client expiry (e.g. 7-day envelope TTL) is preserved.
         let seven_days = created + 7 * 24 * 60 * 60 * 1000;
-        assert_eq!(RelayStore::effective_expiry(created, seven_days), seven_days);
+        assert_eq!(
+            RelayStore::effective_expiry(created, seven_days),
+            seven_days
+        );
     }
 
     #[test]
@@ -1341,5 +1494,119 @@ mod tests {
             .unwrap();
         let json3 = body_json(app.oneshot(rewind).await.unwrap()).await;
         assert_eq!(json3["envelopes"].as_array().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn presence_announce_then_query_is_scoped_to_family() {
+        let app = test_app();
+        let hint = encode_base64_field(&sample_hint(7));
+        let other = encode_base64_field(&sample_hint(8));
+
+        let announce = Request::builder()
+            .method("POST")
+            .uri("/presence")
+            .header("authorization", "Bearer family-a")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "announce": [hint],
+                    "query": [hint, other],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(announce).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["presence"].as_array().unwrap().len(), 1);
+        assert_eq!(json["presence"][0]["hint"], hint);
+        let server_now = json["now_ms"].as_i64().unwrap();
+        let last_seen = json["presence"][0]["last_seen_ms"].as_i64().unwrap();
+        assert!(last_seen <= server_now);
+
+        let cross_family = Request::builder()
+            .method("POST")
+            .uri("/presence")
+            .header("authorization", "Bearer family-b")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "announce": [],
+                    "query": [hint],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let json = body_json(app.oneshot(cross_family).await.unwrap()).await;
+        assert!(json["presence"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn presence_validates_hint_lengths_and_limits() {
+        let too_many_announce = Request::builder()
+            .method("POST")
+            .uri("/presence")
+            .header("authorization", "Bearer family-a")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "announce": (0..5).map(|_| encode_base64_field(&sample_hint(1))).collect::<Vec<_>>(),
+                    "query": [],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = test_app().oneshot(too_many_announce).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let bad_hint = Request::builder()
+            .method("POST")
+            .uri("/presence")
+            .header("authorization", "Bearer family-a")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "announce": [encode_base64_field(&[1, 2, 3])],
+                    "query": [],
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = test_app().oneshot(bad_hint).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn prune_expired_removes_stale_presence_rows() {
+        let (_db, store) = test_store();
+        let now = 1_700_000_000_000i64;
+        store
+            .sync_presence(
+                "family-a",
+                &[sample_hint(1)],
+                &[],
+                now - PRESENCE_RETENTION_MS - 1,
+            )
+            .unwrap();
+        store
+            .sync_presence(
+                "family-a",
+                &[sample_hint(2)],
+                &[],
+                now - PRESENCE_RETENTION_MS + 1,
+            )
+            .unwrap();
+
+        store.prune_expired(now).unwrap();
+        let rows = store
+            .sync_presence("family-a", &[], &[sample_hint(1), sample_hint(2)], now)
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![StoredPresence {
+                hint: sample_hint(2),
+                last_seen_ms: now - PRESENCE_RETENTION_MS + 1,
+            }]
+        );
     }
 }

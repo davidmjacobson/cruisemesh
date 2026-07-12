@@ -5,6 +5,7 @@ import android.content.Context
 private const val PREFS_NAME = "cruisemesh_relay"
 private const val PREF_RELAY_URL = "relay_url"
 private const val PREF_RELAY_TOKEN = "relay_token"
+private const val PREF_SHARE_ONLINE = "share_online"
 
 data class RelayConfig(
     val relayUrl: String,
@@ -32,6 +33,17 @@ object RelayConfigStore {
         }
         prefs.putString(PREF_RELAY_URL, normalizedUrl)
             .putString(PREF_RELAY_TOKEN, normalizedToken)
+            .apply()
+    }
+
+    fun shareOnline(context: Context): Boolean =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(PREF_SHARE_ONLINE, true)
+
+    fun setShareOnline(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_SHARE_ONLINE, enabled)
             .apply()
     }
 }
