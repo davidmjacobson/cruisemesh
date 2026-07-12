@@ -1016,8 +1016,10 @@ mod tests {
     }
 
     fn test_app() -> Router {
-        let db = NamedTempFile::new().unwrap();
-        let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
+        // In-memory DB: the router owns the store's single connection, and a
+        // NamedTempFile guard dropped here would unlink the file and turn
+        // every write into SQLITE_READONLY_DBMOVED.
+        let store = RelayStore::open(":memory:").unwrap();
         app(AppState::new(
             store,
             HashSet::from(["family-a".to_string(), "family-b".to_string()]),
