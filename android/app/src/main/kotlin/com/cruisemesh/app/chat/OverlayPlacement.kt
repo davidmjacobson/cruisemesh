@@ -3,11 +3,11 @@ package com.cruisemesh.app.chat
 /**
  * Pure placement math for [MessageFocusOverlay]
  * (MESSAGE_LONGPRESS_OVERLAY.md §5): keeps the reaction bar above and the
- * action menu below the focused bubble, sliding the whole stack to stay
- * on-screen, or pinning bar-to-top/menu-to-bottom when the stack is taller
- * than the viewport. Kept free of Compose/Android types so it's
- * unit-testable without a Compose host, same pattern as [ConversationLayout]
- * / `MeshRouterState`.
+ * action menu below the focused bubble when there is room. The bubble itself
+ * stays anchored at the long-press position; when an edge is tight, the bar
+ * and menu move around that fixed anchor. Kept free of Compose/Android types
+ * so it's unit-testable without a Compose host, same pattern as
+ * [ConversationLayout] / `MeshRouterState`.
  */
 object OverlayPlacement {
 
@@ -38,32 +38,40 @@ object OverlayPlacement {
         margin: Float,
         isOwn: Boolean,
     ): Result {
-        val available = screenBottom - screenTop
-        val totalHeight = barHeight + spacing + bubbleBounds.height + spacing + menuHeight
+        val bubbleTop = bubbleBounds.top
+        val naturalBarTop = bubbleBounds.top - spacing - barHeight
+        val naturalMenuTop = bubbleBounds.bottom + spacing
+        val barFitsAbove = naturalBarTop >= screenTop
+        val menuFitsBelow = naturalMenuTop + menuHeight <= screenBottom
 
-        val (bubbleTop, barTop, menuTop) = if (totalHeight > available) {
-            // Rule 4: too tall to fit -- pin bar to top, menu to bottom, bubble
-            // top-aligned under the bar (may extend under the menu).
-            val pinnedBarTop = screenTop
-            val pinnedMenuTop = screenBottom - menuHeight
-            val pinnedBubbleTop = pinnedBarTop + barHeight + spacing
-            Triple(pinnedBubbleTop, pinnedBarTop, pinnedMenuTop)
+        var barTop = if (barFitsAbove) {
+            naturalBarTop
         } else {
-            val naturalBarTop = bubbleBounds.top - spacing - barHeight
-            val naturalMenuTop = bubbleBounds.bottom + spacing
-
-            var shift = 0f
-            // Rule 2: near top -- shift the whole stack down just enough.
-            if (naturalBarTop + shift < screenTop) {
-                shift += screenTop - (naturalBarTop + shift)
-            }
-            // Rule 3: near bottom -- shift the whole stack up just enough.
-            val menuBottom = naturalMenuTop + shift + menuHeight
-            if (menuBottom > screenBottom) {
-                shift += screenBottom - menuBottom
-            }
-            Triple(bubbleBounds.top + shift, naturalBarTop + shift, naturalMenuTop + shift)
+            naturalMenuTop
         }
+
+        var menuTop = if (menuFitsBelow) {
+            naturalMenuTop
+        } else {
+            bubbleBounds.top - spacing - menuHeight
+        }
+
+        val overlap = barTop < menuTop + menuHeight && menuTop < barTop + barHeight
+        if (overlap) {
+            if (barTop >= bubbleBounds.bottom) {
+                menuTop = barTop + barHeight + spacing
+            } else {
+                barTop = menuTop - spacing - barHeight
+            }
+        }
+
+        fun clampVerticalTop(value: Float, elementHeight: Float): Float {
+            val maxTop = (screenBottom - elementHeight).coerceAtLeast(screenTop)
+            return value.coerceIn(screenTop, maxTop)
+        }
+
+        barTop = clampVerticalTop(barTop, barHeight)
+        menuTop = clampVerticalTop(menuTop, menuHeight)
 
         fun horizontalLeft(elementWidth: Float): Float {
             val raw = if (isOwn) bubbleBounds.right - elementWidth else bubbleBounds.left

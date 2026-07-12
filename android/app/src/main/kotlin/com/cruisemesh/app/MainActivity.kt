@@ -84,6 +84,7 @@ import com.cruisemesh.app.ui.ChatSummary
 import com.cruisemesh.app.ui.CruiseMeshTheme
 import com.cruisemesh.app.ui.LocalReachabilityPalette
 import com.cruisemesh.app.ui.MeshStatusDotColor
+import com.cruisemesh.app.ui.MeshStatusLegendDialog
 import com.cruisemesh.app.ui.MeshStatusTextLogic
 import com.cruisemesh.app.ui.NewGroupScreen
 import com.cruisemesh.app.ui.OnboardingScreen
@@ -468,6 +469,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     var transientMeshStatus by remember { mutableStateOf<String?>(null) }
     var ownDisplayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     var ownAvatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
+    var showMeshStatusLegend by remember { mutableStateOf(false) }
     val uiPrefs = remember(context) { context.getSharedPreferences(UI_PREFS_NAME, Context.MODE_PRIVATE) }
     var bluetoothAudioWarningDismissed by remember { mutableStateOf(false) }
     var hideBluetoothAudioWarning by remember {
@@ -669,13 +671,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         },
         onNewChatClick = { navController.navigate("contacts") },
         onProfileClick = { navController.navigate("profile") },
-        onMeshStatusClick = {
-            if (runtimeStatus == MeshRuntimeState.STOPPED) {
-                permissionLauncher.launch(MeshService.requiredPermissions())
-            } else {
-                navController.navigate("profile")
-            }
-        },
+        onMeshStatusClick = { showMeshStatusLegend = true },
         meshStatusText = transientMeshStatus ?: pillStatus.text,
         meshStatusDotColor = if (transientMeshStatus != null) null else pillDotColor,
         connectivityWarning = when {
@@ -716,6 +712,15 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         },
         summaries = displaySummaries
     )
+
+    if (showMeshStatusLegend) {
+        MeshStatusLegendDialog(
+            statusText = transientMeshStatus ?: pillStatus.text,
+            canStartMesh = runtimeStatus == MeshRuntimeState.STOPPED,
+            onStartMesh = { permissionLauncher.launch(MeshService.requiredPermissions()) },
+            onDismiss = { showMeshStatusLegend = false },
+        )
+    }
 }
 
 @Composable

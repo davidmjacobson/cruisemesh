@@ -20,12 +20,12 @@ final class AppModel: ObservableObject {
             self.meshEnabled = UserDefaults.standard.bool(forKey: Self.meshEnabledKey)
         }
         MeshController.shared.configure(identity: id)
-        MessageNotifier.requestPermission()
     }
 
     func startMesh() {
         meshEnabled = true
         UserDefaults.standard.set(true, forKey: Self.meshEnabledKey)
+        MessageNotifier.requestPermission()
         MeshController.shared.start()
     }
 

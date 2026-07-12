@@ -41,6 +41,8 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
@@ -51,7 +53,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 
-/** Captured at long-press time: which message and where its bubble sits on screen (root coords). */
+/** Captured at long-press time: which message and where its bubble sits on screen (window coords). */
 data class FocusedMessage(
     val target: MessageTarget,
     val bounds: Rect,
@@ -76,8 +78,8 @@ private val ESTIMATED_MENU_SIZE = DpSize(180.dp, 96.dp)
  * bar, composer) with the pressed bubble re-drawn undimmed at its original
  * screen position via [bubbleContent], plus a floating reaction bar above it
  * and an action menu below -- as overlay layers, not inserted into the
- * message stream. [focused].bounds anchors the bubble; [OverlayPlacement]
- * works out where the bar/menu land.
+ * message stream. [focused].bounds anchors the bubble in window coordinates;
+ * [OverlayPlacement] works out where the bar/menu land in the overlay.
  */
 @Composable
 fun MessageFocusOverlay(
@@ -122,10 +124,12 @@ fun MessageFocusOverlay(
     }
     var barSize by remember { mutableStateOf(estimatedBarSize) }
     var menuSize by remember { mutableStateOf(estimatedMenuSize) }
+    var overlayBoundsInWindow by remember { mutableStateOf(Rect.Zero) }
 
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
+            .onGloballyPositioned { coords -> overlayBoundsInWindow = coords.boundsInWindow() }
             .background(Color.Black.copy(alpha = SCRIM_ALPHA * entrance.value))
             .pointerInput(Unit) { detectTapGestures { dismiss() } }
             .semantics { contentDescription = "Dismiss message options" },
@@ -139,13 +143,19 @@ fun MessageFocusOverlay(
             WindowInsets.navigationBars.getBottom(density).toFloat() - edgeClearancePx
         val spacingPx = with(density) { OVERLAY_SPACING.toPx() }
         val marginPx = with(density) { OVERLAY_MARGIN.toPx() }
+        val bubbleBounds = Rect(
+            left = focused.bounds.left - overlayBoundsInWindow.left,
+            top = focused.bounds.top - overlayBoundsInWindow.top,
+            right = focused.bounds.right - overlayBoundsInWindow.left,
+            bottom = focused.bounds.bottom - overlayBoundsInWindow.top,
+        )
 
         val placement = OverlayPlacement.compute(
             bubbleBounds = OverlayPlacement.Bounds(
-                left = focused.bounds.left,
-                top = focused.bounds.top,
-                right = focused.bounds.right,
-                bottom = focused.bounds.bottom,
+                left = bubbleBounds.left,
+                top = bubbleBounds.top,
+                right = bubbleBounds.right,
+                bottom = bubbleBounds.bottom,
             ),
             barWidth = barSize.width.toFloat(),
             barHeight = barSize.height.toFloat(),
@@ -164,7 +174,7 @@ fun MessageFocusOverlay(
         // pulses once on open, swallows taps so tapping it doesn't dismiss.
         Box(
             modifier = Modifier
-                .offset(focused.bounds.left, placement.bubbleTop)
+                .offset(bubbleBounds.left, placement.bubbleTop)
                 .graphicsLayer {
                     scaleX = pulse.value
                     scaleY = pulse.value
@@ -205,7 +215,7 @@ fun MessageFocusOverlay(
     }
 }
 
-/** Positions a child at an absolute (px, px) offset within the enclosing Box -- root coordinates from [FocusedMessage.bounds] / [OverlayPlacement] land here directly. */
+/** Positions a child at an absolute (px, px) offset within the enclosing Box. */
 private fun Modifier.offset(xPx: Float, yPx: Float): Modifier =
     this.offset { IntOffset(xPx.toInt(), yPx.toInt()) }
 

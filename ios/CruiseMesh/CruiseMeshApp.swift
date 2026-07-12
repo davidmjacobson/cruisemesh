@@ -4,18 +4,27 @@ import UserNotifications
 @main
 struct CruiseMeshApp: App {
     @StateObject private var appModel = AppModel()
+    @State private var onboardingCompleted = OnboardingStore.isCompleted()
 
     var body: some Scene {
         WindowGroup {
-            ChatListView(identity: appModel.identity, appModel: appModel)
-                .environmentObject(appModel)
-                .onAppear {
-                    UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
+            SwiftUI.Group {
+                if onboardingCompleted {
+                    ChatListView(identity: appModel.identity, appModel: appModel)
+                } else {
+                    OnboardingView(identity: appModel.identity, appModel: appModel) {
+                        onboardingCompleted = true
+                    }
                 }
-                .onOpenURL { url in
-                    // Reserved for future cruisemesh:// deep links
-                    _ = url
-                }
+            }
+            .environmentObject(appModel)
+            .onAppear {
+                UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
+            }
+            .onOpenURL { url in
+                // Reserved for future cruisemesh:// deep links
+                _ = url
+            }
         }
     }
 }

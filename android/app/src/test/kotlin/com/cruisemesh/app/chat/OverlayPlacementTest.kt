@@ -53,12 +53,11 @@ class OverlayPlacementTest {
     }
 
     @Test
-    fun `bar one pixel past the top edge shifts the whole stack down`() {
+    fun `bar one pixel past the top edge keeps bubble anchored and stacks controls below`() {
         val result = compute(OverlayPlacement.Bounds(left = 50f, top = 57f, right = 250f, bottom = 107f))
-        // Same final layout as the exact-boundary case: shifted down by exactly 1px.
-        assertEquals(58f, result.bubbleTop)
-        assertEquals(0f, result.barTop)
-        assertEquals(116f, result.menuTop)
+        assertEquals(57f, result.bubbleTop)
+        assertEquals(115f, result.barTop)
+        assertEquals(173f, result.menuTop)
     }
 
     @Test
@@ -70,21 +69,21 @@ class OverlayPlacementTest {
     }
 
     @Test
-    fun `menu one pixel past the bottom edge shifts the whole stack up`() {
+    fun `menu one pixel past the bottom edge keeps bubble anchored and stacks controls above`() {
         val result = compute(OverlayPlacement.Bounds(left = 50f, top = 643f, right = 250f, bottom = 693f))
-        assertEquals(642f, result.bubbleTop)
-        assertEquals(584f, result.barTop)
-        assertEquals(700f, result.menuTop)
+        assertEquals(643f, result.bubbleTop)
+        assertEquals(477f, result.barTop)
+        assertEquals(535f, result.menuTop)
     }
 
     @Test
-    fun `stack taller than the viewport pins bar to top and menu to bottom`() {
+    fun `stack taller than the viewport keeps bubble anchor and clamps controls`() {
         val result = compute(
             bounds = OverlayPlacement.Bounds(left = 50f, top = 1000f, right = 250f, bottom = 1050f),
             screenBottom = 200f,
         )
-        assertEquals(0f, result.barTop)
-        assertEquals(58f, result.bubbleTop)
+        assertEquals(150f, result.barTop)
+        assertEquals(1000f, result.bubbleTop)
         assertEquals(100f, result.menuTop)
     }
 

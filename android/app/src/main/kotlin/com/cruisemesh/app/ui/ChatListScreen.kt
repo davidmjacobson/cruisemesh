@@ -1,5 +1,10 @@
 package com.cruisemesh.app.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import android.content.res.Configuration
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -9,17 +14,18 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.Button
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -117,24 +123,6 @@ fun ChatListScreen(
                         )
                     }
                 },
-                actions = {
-                    var showMenu by remember { mutableStateOf(false) }
-                    IconButton(onClick = { showMenu = true }) {
-                        Icon(Icons.Default.MoreVert, contentDescription = "More")
-                    }
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = { showMenu = false }
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Friends") },
-                            onClick = { 
-                                showMenu = false
-                                onNewChatClick() 
-                            }
-                        )
-                    }
-                }
             )
         },
         floatingActionButton = {
@@ -161,10 +149,34 @@ fun ChatListScreen(
 
             if (summaries.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(horizontal = 32.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(72.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.secondaryContainer),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                Icons.Default.Add,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.size(34.dp),
+                            )
+                        }
                         Text(
-                            text = "No conversations yet",
-                            style = MaterialTheme.typography.titleMedium
+                            text = "All quiet on deck",
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.padding(top = 18.dp),
+                        )
+                        Text(
+                            text = "Add a friend to start messaging over Bluetooth — no Wi-Fi needed.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 6.dp),
                         )
                         Button(
                             onClick = onNewChatClick,
@@ -178,12 +190,13 @@ fun ChatListScreen(
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
                     items(summaries, key = { it.chatId.contentHashCode() }) { summary ->
                         var showDeleteDialog by remember { mutableStateOf(false) }
+                        var showRowMenu by remember { mutableStateOf(false) }
 
                         if (showDeleteDialog) {
                             AlertDialog(
                                 onDismissRequest = { showDeleteDialog = false },
                                 title = {
-                                    Text(if (summary.isGroup) "Delete group" else "Delete Contact")
+                                    Text(if (summary.isGroup) "Delete group" else "Delete contact")
                                 },
                                 text = {
                                     Text(
@@ -206,12 +219,26 @@ fun ChatListScreen(
                             )
                         }
 
-                        ChatRow(
-                            summary = summary,
-                            ownUserId = ownUserId,
-                            onClick = { onChatClick(summary) },
-                            onLongClick = { showDeleteDialog = true }
-                        )
+                        Box {
+                            ChatRow(
+                                summary = summary,
+                                ownUserId = ownUserId,
+                                onClick = { onChatClick(summary) },
+                                onLongClick = { showRowMenu = true }
+                            )
+                            DropdownMenu(
+                                expanded = showRowMenu,
+                                onDismissRequest = { showRowMenu = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("Delete") },
+                                    onClick = {
+                                        showRowMenu = false
+                                        showDeleteDialog = true
+                                    },
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -251,6 +278,7 @@ fun ChatRow(
             displayId = displayId,
             reachability = summary.reachability,
             photoBytes = if (summary.isGroup) null else summary.avatarBytes,
+            isGroup = summary.isGroup,
         )
 
         Spacer(modifier = Modifier.width(16.dp))
@@ -262,7 +290,7 @@ fun ChatRow(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = if (summary.isGroup) "👥 $displayName" else displayName,
+                    text = displayName,
                     style = MaterialTheme.typography.bodyLarge.copy(
                         fontWeight = if (isUnread) FontWeight.Bold else FontWeight.Normal
                     ),
@@ -324,17 +352,23 @@ fun ChatRow(
                     )
                 }
                 
-                if (summary.unreadCount > 0) {
+                AnimatedVisibility(
+                    visible = summary.unreadCount > 0,
+                    enter = scaleIn() + fadeIn(),
+                    exit = scaleOut() + fadeOut(),
+                ) {
                     Box(
                         modifier = Modifier
                             .padding(start = 8.dp)
-                            .size(20.dp)
+                            .height(20.dp)
+                            .widthIn(min = 20.dp)
                             .clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.primary),
+                            .background(MaterialTheme.colorScheme.primary)
+                            .padding(horizontal = 6.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = summary.unreadCount.toString(),
+                            text = ChatListLogic.unreadBadgeText(summary.unreadCount),
                             color = MaterialTheme.colorScheme.onPrimary,
                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp)
                         )

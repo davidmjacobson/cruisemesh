@@ -28,19 +28,19 @@ enum ChatListLogic {
         if cal.isDate(now, inSameDayAs: then) {
             let f = DateFormatter()
             f.dateFormat = "h:mm a"
-            f.locale = Locale(identifier: "en_US")
+            f.locale = .current
             return f.string(from: then)
         }
         let diff = nowMs - timestampMs
         if diff >= 0 && diff < 7 * 24 * 60 * 60 * 1000 {
             let f = DateFormatter()
             f.dateFormat = "EEE"
-            f.locale = Locale(identifier: "en_US")
+            f.locale = .current
             return f.string(from: then)
         }
         let f = DateFormatter()
         f.dateFormat = "MMM d"
-        f.locale = Locale(identifier: "en_US")
+        f.locale = .current
         return f.string(from: then)
     }
 

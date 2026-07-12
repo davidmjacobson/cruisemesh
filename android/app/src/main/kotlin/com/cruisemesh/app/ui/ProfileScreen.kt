@@ -9,6 +9,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -18,8 +19,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -110,7 +113,7 @@ fun ProfileScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Profile & Settings") },
+                title = { Text("Profile & settings") },
                 navigationIcon = {
                     IconButton(onClick = {
                         if (displayName.trim() != initialDisplayName.trim()) {
@@ -118,7 +121,7 @@ fun ProfileScreen(
                         }
                         onBack()
                     }) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 }
             )
@@ -173,127 +176,146 @@ fun ProfileScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            Text("Account backup", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "Save your identity and messages to an encrypted file so you can restore them if you reinstall or switch phones. Restore is offered on first launch.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp),
-            )
-            Button(
-                onClick = onBackUp,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 12.dp),
-            ) {
-                Text("Back up account")
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            Text("Your device identity", style = MaterialTheme.typography.bodyMedium)
-
-            Text(
-                displayId,
-                style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
-                modifier = Modifier.padding(top = 16.dp)
-            )
-
-            Text(
-                fingerprint.joinToString(" "),
-                style = MaterialTheme.typography.bodyLarge,
-                modifier = Modifier.padding(top = 8.dp)
-            )
-
-            Text(
-                "(Read these aloud to verify)",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp)
-            )
-
-            Spacer(modifier = Modifier.height(32.dp))
-
-            Text("Mesh Status", style = MaterialTheme.typography.titleMedium)
-
-            Text(meshStatus, modifier = Modifier.padding(top = 8.dp))
-
-            if (onStartMesh != null) {
-                Button(onClick = onStartMesh, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Start mesh")
-                }
-            }
-
-            Spacer(modifier = Modifier.height(32.dp))
-
-            Text("Relay Presence", style = MaterialTheme.typography.titleMedium)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+            ProfileSection(title = "Account backup") {
                 Text(
-                    "Share when I'm online",
-                    modifier = Modifier.weight(1f),
-                )
-                Switch(
-                    checked = shareOnline,
-                    onCheckedChange = {
-                        shareOnline = it
-                        RelayConfigStore.setShareOnline(context, it)
-                    },
-                )
-            }
-
-            Spacer(modifier = Modifier.height(32.dp))
-
-            Text("Legal", style = MaterialTheme.typography.titleMedium)
-            TextButton(
-                onClick = {
-                    context.startActivity(
-                        Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL)),
-                    )
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 8.dp),
-            ) {
-                Text("Privacy policy")
-            }
-            Text(
-                text = PRIVACY_POLICY_URL,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp),
-            )
-
-            if (DebugFileLog.isEnabled(context)) {
-                Spacer(modifier = Modifier.height(32.dp))
-
-                Text("Debug", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    "On-device log capture is on. Share it to send diagnostics.",
+                    "Save your identity and messages to an encrypted file so you can restore them if you reinstall or switch phones. Restore is offered on first launch.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 4.dp),
                 )
                 Button(
+                    onClick = onBackUp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 12.dp),
+                ) {
+                    Text("Back up account")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            ProfileSection(title = "Device identity") {
+                Text(
+                    displayId,
+                    style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+
+                Text(
+                    fingerprint.joinToString(" "),
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+
+                Text(
+                    "Read these aloud to verify.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            ProfileSection(title = "Mesh status") {
+                Text(meshStatus, modifier = Modifier.padding(top = 4.dp))
+
+                if (onStartMesh != null) {
+                    Button(onClick = onStartMesh, modifier = Modifier.padding(top = 16.dp)) {
+                        Text("Start mesh")
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            ProfileSection(title = "Relay presence") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Share when I'm online",
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = shareOnline,
+                        onCheckedChange = {
+                            shareOnline = it
+                            RelayConfigStore.setShareOnline(context, it)
+                        },
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            ProfileSection(title = "Legal") {
+                TextButton(
                     onClick = {
-                        val intent = DebugFileLog.shareIntent(context)
-                        if (intent != null) {
-                            context.startActivity(Intent.createChooser(intent, "Share debug log"))
-                        } else {
-                            Toast.makeText(context, "No log captured yet", Toast.LENGTH_SHORT).show()
-                        }
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL)),
+                        )
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 8.dp),
+                        .padding(top = 4.dp),
                 ) {
-                    Text("Share debug log")
+                    Text("Privacy policy")
                 }
             }
+
+            if (DebugFileLog.isEnabled(context)) {
+                Spacer(modifier = Modifier.height(16.dp))
+
+                ProfileSection(title = "Debug") {
+                    Text(
+                        "On-device log capture is on. Share it to send diagnostics.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                    Button(
+                        onClick = {
+                            val intent = DebugFileLog.shareIntent(context)
+                            if (intent != null) {
+                                context.startActivity(Intent.createChooser(intent, "Share debug log"))
+                            } else {
+                                Toast.makeText(context, "No log captured yet", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                    ) {
+                        Text("Share debug log")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileSection(
+    title: String,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.46f)),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            horizontalAlignment = Alignment.Start,
+        ) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            content()
         }
     }
 }

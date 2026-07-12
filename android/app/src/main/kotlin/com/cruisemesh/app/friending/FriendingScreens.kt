@@ -12,11 +12,16 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -27,6 +32,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -34,12 +40,13 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.width
@@ -51,9 +58,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -63,11 +72,13 @@ import com.cruisemesh.app.ui.AvatarBadge
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.friendCardUserId
+import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.makeFriendCard
 import uniffi.cruisemesh_core.makeFriendLink
 import uniffi.cruisemesh_core.parseFriendText
 
 /** Shows this device's own FriendCard (DESIGN.md §6.2) as a QR code to be scanned by a peer. */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
     val context = LocalContext.current
@@ -75,6 +86,8 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
     var name by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     var relayUrl by remember { mutableStateOf(savedRelay?.relayUrl.orEmpty()) }
     var relayToken by remember { mutableStateOf(savedRelay?.relayToken.orEmpty()) }
+    var showAdvanced by remember { mutableStateOf(false) }
+    val fingerprint = remember(identity.userId) { fingerprintWords(identity.userId) }
     val friendLink = remember(name, relayUrl, relayToken, identity) {
         val cardJson =
         makeFriendCard(
@@ -87,16 +100,51 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
     }
     val qrBitmap = remember(friendLink) { encodeQrBitmap(friendLink) }
 
-    Scaffold { innerPadding ->
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("My friend card") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+            )
+        },
+    ) { innerPadding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
+                .verticalScroll(rememberScrollState())
                 .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
+            verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text("Your friend card", style = MaterialTheme.typography.headlineSmall)
+            Text(
+                "Let a friend scan this code to add you.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = Color.White,
+                tonalElevation = 2.dp,
+                shadowElevation = 2.dp,
+            ) {
+                Image(
+                    bitmap = qrBitmap,
+                    contentDescription = "Friend card QR code",
+                    modifier = Modifier
+                        .padding(16.dp)
+                        .size(240.dp),
+                )
+            }
+            Text(
+                fingerprint.joinToString(" "),
+                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.padding(horizontal = 8.dp),
+            )
             OutlinedTextField(
                 value = name,
                 onValueChange = {
@@ -104,33 +152,39 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
                     ProfileStore.saveDisplayName(context, it)
                 },
                 label = { Text("Your name") },
-                modifier = Modifier.padding(top = 16.dp),
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
             )
-            OutlinedTextField(
-                value = relayUrl,
-                onValueChange = {
-                    relayUrl = it
-                    RelayConfigStore.save(context, relayUrl = it, relayToken = relayToken)
-                },
-                label = { Text("Relay URL (optional)") },
-                modifier = Modifier.padding(top = 12.dp),
-            )
-            OutlinedTextField(
-                value = relayToken,
-                onValueChange = {
-                    relayToken = it
-                    RelayConfigStore.save(context, relayUrl = relayUrl, relayToken = it)
-                },
-                label = { Text("Relay token (optional)") },
-                modifier = Modifier.padding(top = 12.dp),
-            )
-            Image(
-                bitmap = qrBitmap,
-                contentDescription = "Friend card QR code",
-                modifier = Modifier.padding(top = 24.dp),
-            )
+
+            TextButton(onClick = { showAdvanced = !showAdvanced }) {
+                Text(if (showAdvanced) "Hide advanced relay settings" else "Advanced relay settings")
+            }
+            if (showAdvanced) {
+                OutlinedTextField(
+                    value = relayUrl,
+                    onValueChange = {
+                        relayUrl = it
+                        RelayConfigStore.save(context, relayUrl = it, relayToken = relayToken)
+                    },
+                    label = { Text("Relay URL (optional)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = relayToken,
+                    onValueChange = {
+                        relayToken = it
+                        RelayConfigStore.save(context, relayUrl = relayUrl, relayToken = it)
+                    },
+                    label = { Text("Relay token (optional)") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+
             Row(
-                modifier = Modifier.padding(top = 16.dp),
+                modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Button(
@@ -141,10 +195,11 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
                             .putExtra(Intent.EXTRA_TEXT, text)
                         context.startActivity(Intent.createChooser(intent, "Share friend card"))
                     },
+                    modifier = Modifier.weight(1f),
                 ) {
-                    Text("Share card as text")
+                    Text("Share card")
                 }
-                Button(
+                TextButton(
                     onClick = {
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         clipboard.setPrimaryClip(ClipData.newPlainText("CruiseMesh friend card", friendLink))
@@ -153,9 +208,6 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
                 ) {
                     Text("Copy")
                 }
-            }
-            Button(onClick = onBack, modifier = Modifier.padding(top = 24.dp)) {
-                Text("Back")
             }
         }
     }
@@ -229,6 +281,7 @@ fun ScanScreen(
                     previewView
                 },
             )
+            ScanViewfinderOverlay()
         }
 
         Column(
@@ -239,15 +292,67 @@ fun ScanScreen(
             verticalArrangement = Arrangement.Bottom,
         ) {
             val currentAdded = added
-            Text(
-                if (currentAdded != null) "Added ${currentAdded.name} as a contact" else status,
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                tonalElevation = 2.dp,
+            ) {
+                Text(
+                    if (currentAdded != null) "Added ${currentAdded.name} as a contact" else status,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                )
+            }
             Button(onClick = onBack, modifier = Modifier.padding(top = 16.dp)) {
                 Text(if (currentAdded != null) "Done" else "Cancel")
             }
         }
+    }
+}
+
+@Composable
+private fun ScanViewfinderOverlay() {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val frameSize = minOf(maxWidth - 64.dp, 280.dp)
+        val sideScrimWidth = ((maxWidth - frameSize) / 2).coerceAtLeast(0.dp)
+        val topScrimHeight = ((maxHeight - frameSize) / 2).coerceAtLeast(0.dp)
+        val scrim = Color.Black.copy(alpha = 0.46f)
+
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .height(topScrimHeight)
+                .background(scrim),
+        )
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .height(topScrimHeight)
+                .background(scrim),
+        )
+        Box(
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .width(sideScrimWidth)
+                .height(frameSize)
+                .background(scrim),
+        )
+        Box(
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .width(sideScrimWidth)
+                .height(frameSize)
+                .background(scrim),
+        )
+        Box(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .size(frameSize)
+                .border(3.dp, Color.White.copy(alpha = 0.92f), RoundedCornerShape(28.dp)),
+        )
     }
 }
 
@@ -268,7 +373,7 @@ fun AddFriendScreen(
                 title = { Text("Add a friend") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
             )
@@ -350,7 +455,7 @@ fun ContactsScreen(
                 title = { Text("New chat") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 }
             )
@@ -397,7 +502,13 @@ fun ContactsScreen(
                                 .background(MaterialTheme.colorScheme.surfaceVariant),
                             contentAlignment = Alignment.Center
                         ) {
-                            Text("👥", style = MaterialTheme.typography.titleMedium)
+                            AvatarBadge(
+                                userId = byteArrayOf(0x47, 0x52),
+                                name = "New group",
+                                displayId = "New group",
+                                size = 48.dp,
+                                isGroup = true,
+                            )
                         }
                         Spacer(modifier = Modifier.width(16.dp))
                         Text(

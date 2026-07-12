@@ -22,9 +22,12 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -35,8 +38,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
@@ -70,7 +73,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -387,7 +390,9 @@ private fun ConversationScreen(
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    val density = LocalDensity.current
     val keyboardController = LocalSoftwareKeyboardController.current
+    val currentImeBottomPx = WindowInsets.ime.getBottom(density)
     val listState = rememberLazyListState()
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
     val displayName = remember(contact.name, displayId) {
@@ -406,7 +411,12 @@ private fun ConversationScreen(
     var showContactDetails by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var focused by remember(contact.userId) { mutableStateOf<FocusedMessage?>(null) }
+    var overlayImeBottomPx by remember(contact.userId) { mutableStateOf(0) }
+    var restoreKeyboardAfterOverlay by remember(contact.userId) { mutableStateOf(false) }
     var infoMessage by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
+    val overlayImeSpacerHeight = with(density) {
+        (overlayImeBottomPx - currentImeBottomPx).coerceAtLeast(0).toDp()
+    }
     // Newest-first for reverseLayout LazyColumn: index 0 sits at the bottom
     // edge (just above the composer / keyboard), empty space stays above.
     val displayMessages = remember(visibleMessages) { visibleMessages.asReversed() }
@@ -416,17 +426,32 @@ private fun ConversationScreen(
         onReact(target, if (existingOwn != null) "" else emoji)
     }
 
-    // The overlay takes over the full screen, so drop the keyboard while it's
-    // open (freeing that space for the scrim) and bring it back once closed --
-    // a no-op either way if the composer wasn't focused to begin with.
+    // Keep the pre-overlay IME footprint reserved while the keyboard closes so
+    // the pressed bubble does not slide away under the user's finger.
     fun openOverlay(target: MessageTarget, bounds: Rect) {
+        val imeOffset = currentImeBottomPx.toFloat()
+        overlayImeBottomPx = currentImeBottomPx
+        restoreKeyboardAfterOverlay = currentImeBottomPx > 0
+        focused = FocusedMessage(
+            target = target,
+            bounds = Rect(
+                left = bounds.left,
+                top = bounds.top - imeOffset,
+                right = bounds.right,
+                bottom = bounds.bottom - imeOffset,
+            ),
+        )
         keyboardController?.hide()
-        focused = FocusedMessage(target, bounds)
     }
 
     fun closeOverlay() {
+        val shouldRestoreKeyboard = restoreKeyboardAfterOverlay
         focused = null
-        keyboardController?.show()
+        overlayImeBottomPx = 0
+        restoreKeyboardAfterOverlay = false
+        if (shouldRestoreKeyboard) {
+            keyboardController?.show()
+        }
     }
 
     LaunchedEffect(visibleMessages.size) {
@@ -515,6 +540,15 @@ private fun ConversationScreen(
                 onStopVoice = onStopVoice,
                 onCancelVoice = onCancelVoice,
             )
+
+            if (overlayImeSpacerHeight > 0.dp) {
+                Spacer(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(overlayImeSpacerHeight)
+                        .background(MaterialTheme.colorScheme.background),
+                )
+            }
         }
     }
 
@@ -616,7 +650,7 @@ private fun ConversationScreen(
         val infoTick = if (infoIsOwn) tickStatusFor(currentInfoMessage.lamport, deliveredThrough, readThrough) else null
         AlertDialog(
             onDismissRequest = { infoMessage = null },
-            title = { Text("Message Info") },
+            title = { Text("Message info") },
             text = { Text(messageInfoText(currentInfoMessage, infoIsOwn, infoTick)) },
             confirmButton = {
                 TextButton(onClick = { infoMessage = null }) { Text("OK") }
@@ -872,7 +906,7 @@ private fun ConversationTopBar(
         navigationIcon = {
             IconButton(onClick = onBack) {
                 Icon(
-                    imageVector = Icons.Default.ArrowBack,
+                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                     contentDescription = "Back",
                 )
             }
@@ -918,7 +952,7 @@ private fun ConversationTopBar(
 @Composable
 private fun DaySeparator(timestampMs: Long) {
     val label = remember(timestampMs) {
-        java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US).format(java.util.Date(timestampMs))
+        java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.getDefault()).format(java.util.Date(timestampMs))
     }
     Box(
         modifier = Modifier
@@ -943,7 +977,7 @@ private fun GapIndicator() {
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            text = "some messages may still be in transit",
+            text = "Some messages are still making their way across the ship",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
         )
@@ -970,7 +1004,7 @@ private fun MessageBubble(
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
 ) {
     var showLegend by remember { mutableStateOf(false) }
-    var boundsInRoot by remember { mutableStateOf(Rect.Zero) }
+    var boundsInWindow by remember { mutableStateOf(Rect.Zero) }
     val topPadding = if (grouping.joinsPrevious) 2.dp else 10.dp
     val bottomPadding = if (grouping.joinsNext) 2.dp else 6.dp
     val shape = bubbleShapeFor(isOwn, grouping)
@@ -994,10 +1028,10 @@ private fun MessageBubble(
                 reactions = reactions,
                 onReact = onReact,
                 modifier = Modifier
-                    .onGloballyPositioned { coords -> boundsInRoot = coords.boundsInRoot() }
+                    .onGloballyPositioned { coords -> boundsInWindow = coords.boundsInWindow() }
                     .messageActions(
                         onClick = { if (tick != null) showLegend = true },
-                        onLongClick = { onLongPress(target, boundsInRoot) },
+                        onLongClick = { onLongPress(target, boundsInWindow) },
                     ),
             )
             if (grouping.showTimestamp) {
@@ -1014,7 +1048,7 @@ private fun MessageBubble(
     if (showLegend && tick != null) {
         AlertDialog(
             onDismissRequest = { showLegend = false },
-            title = { Text("Message Status") },
+            title = { Text("Message status") },
             text = {
                 Text(tickLegendText(tick))
             },
@@ -1161,11 +1195,11 @@ private fun messageCopyText(message: StoredMessage): String =
 fun messageInfoText(message: StoredMessage, isOwn: Boolean, tick: TickStatus?): String {
     val sentAt = java.text.SimpleDateFormat(
         "MMMM d, yyyy h:mm a",
-        java.util.Locale.US,
+        java.util.Locale.getDefault(),
     ).format(java.util.Date(message.timestamp))
     val direction = if (isOwn) "Sent by you" else "Received"
     val status = tick?.let { "\nStatus: ${tickLegendText(it)}" }.orEmpty()
-    return "$direction\nTime: $sentAt\nLamport: ${message.lamport}$status"
+    return "$direction\nTime: $sentAt$status"
 }
 
 @Composable

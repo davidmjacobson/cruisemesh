@@ -39,7 +39,7 @@ fun formatConversationTimestamp(
     timestampMs: Long,
     timeZone: TimeZone = TimeZone.getDefault(),
 ): String {
-    val formatter = SimpleDateFormat("h:mm a", Locale.US)
+    val formatter = SimpleDateFormat("h:mm a", Locale.getDefault())
     formatter.timeZone = timeZone
     return formatter.format(timestampMs)
 }

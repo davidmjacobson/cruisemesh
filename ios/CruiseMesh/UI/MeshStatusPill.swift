@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MeshStatusPill: View {
     @ObservedObject var runtime = MeshRuntimeStatus.shared
+    @State private var pulse = false
     let onTap: () -> Void
 
     var body: some View {
@@ -10,6 +11,8 @@ struct MeshStatusPill: View {
                 Circle()
                     .fill(dotColor)
                     .frame(width: 8, height: 8)
+                    .scaleEffect(shouldPulse ? (pulse ? 1.22 : 0.84) : 1)
+                    .opacity(shouldPulse ? (pulse ? 1 : 0.62) : 1)
                 Text(runtime.pillText)
                     .font(.caption.weight(.medium))
             }
@@ -18,6 +21,18 @@ struct MeshStatusPill: View {
             .background(Capsule().fill(Color(.secondarySystemBackground)))
         }
         .buttonStyle(.plain)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
+                pulse = true
+            }
+        }
+    }
+
+    private var shouldPulse: Bool {
+        switch runtime.state {
+        case .starting, .meshing: return true
+        case .stopped, .pausedForBluetoothAudio, .syncingViaRelay: return false
+        }
     }
 
     private var dotColor: Color {

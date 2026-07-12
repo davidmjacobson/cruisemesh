@@ -36,6 +36,9 @@ object ChatListLogic {
     fun avatarContentDescription(name: String, displayId: String): String =
         "Avatar for ${displayNameOrId(name, displayId)}"
 
+    fun unreadBadgeText(count: Int): String =
+        if (count > 99) "99+" else count.coerceAtLeast(0).toString()
+
     fun formatRelativeTime(timestampMs: Long, nowMs: Long = System.currentTimeMillis()): String {
         val now = Calendar.getInstance().apply { timeInMillis = nowMs }
         val then = Calendar.getInstance().apply { timeInMillis = timestampMs }
@@ -45,15 +48,15 @@ object ChatListLogic {
                         now.get(Calendar.DAY_OF_YEAR) == then.get(Calendar.DAY_OF_YEAR)
                         
         if (isSameDay) {
-            return SimpleDateFormat("h:mm a", Locale.US).format(then.time)
+            return SimpleDateFormat("h:mm a", Locale.getDefault()).format(then.time)
         }
         
         // within 7 days
         if (diffMs in 0 until (7 * 24 * 60 * 60 * 1000L)) {
-            return SimpleDateFormat("EEE", Locale.US).format(then.time)
+            return SimpleDateFormat("EEE", Locale.getDefault()).format(then.time)
         }
         
-        return SimpleDateFormat("MMM d", Locale.US).format(then.time)
+        return SimpleDateFormat("MMM d", Locale.getDefault()).format(then.time)
     }
 
     fun computeUnread(messages: List<StoredMessage>, ownUserId: ByteArray, readThrough: ULong): Int {

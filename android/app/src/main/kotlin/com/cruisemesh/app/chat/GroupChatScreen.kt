@@ -6,9 +6,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -17,7 +20,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -39,10 +42,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
@@ -78,13 +82,20 @@ fun GroupChatScreen(
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    val density = LocalDensity.current
     val keyboardController = LocalSoftwareKeyboardController.current
+    val currentImeBottomPx = WindowInsets.ime.getBottom(density)
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
     var draft by remember { mutableStateOf("") }
     var showDetails by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var focused by remember(group.id) { mutableStateOf<FocusedMessage?>(null) }
+    var overlayImeBottomPx by remember(group.id) { mutableStateOf(0) }
+    var restoreKeyboardAfterOverlay by remember(group.id) { mutableStateOf(false) }
     var infoMessage by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
+    val overlayImeSpacerHeight = with(density) {
+        (overlayImeBottomPx - currentImeBottomPx).coerceAtLeast(0).toDp()
+    }
 
     fun reload() {
         messages = store.messagesForChat(group.id)
@@ -122,17 +133,32 @@ fun GroupChatScreen(
         reload()
     }
 
-    // The overlay takes over the full screen, so drop the keyboard while it's
-    // open (freeing that space for the scrim) and bring it back once closed --
-    // a no-op either way if the composer wasn't focused to begin with.
+    // Keep the pre-overlay IME footprint reserved while the keyboard closes so
+    // the pressed bubble does not slide away under the user's finger.
     fun openOverlay(target: MessageTarget, bounds: Rect) {
+        val imeOffset = currentImeBottomPx.toFloat()
+        overlayImeBottomPx = currentImeBottomPx
+        restoreKeyboardAfterOverlay = currentImeBottomPx > 0
+        focused = FocusedMessage(
+            target = target,
+            bounds = Rect(
+                left = bounds.left,
+                top = bounds.top - imeOffset,
+                right = bounds.right,
+                bottom = bounds.bottom - imeOffset,
+            ),
+        )
         keyboardController?.hide()
-        focused = FocusedMessage(target, bounds)
     }
 
     fun closeOverlay() {
+        val shouldRestoreKeyboard = restoreKeyboardAfterOverlay
         focused = null
-        keyboardController?.show()
+        overlayImeBottomPx = 0
+        restoreKeyboardAfterOverlay = false
+        if (shouldRestoreKeyboard) {
+            keyboardController?.show()
+        }
     }
 
     LaunchedEffect(visibleMessages.size) {
@@ -222,6 +248,15 @@ fun GroupChatScreen(
                 ) {
                     Text("Send")
                 }
+            }
+
+            if (overlayImeSpacerHeight > 0.dp) {
+                Spacer(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(overlayImeSpacerHeight)
+                        .background(MaterialTheme.colorScheme.background),
+                )
             }
         }
     }
@@ -340,7 +375,7 @@ fun GroupChatScreen(
     if (currentInfoMessage != null) {
         AlertDialog(
             onDismissRequest = { infoMessage = null },
-            title = { Text("Message Info") },
+            title = { Text("Message info") },
             text = { Text(messageInfoText(currentInfoMessage, currentInfoMessage.senderUserId.contentEquals(ownUserId), null)) },
             confirmButton = {
                 TextButton(onClick = { infoMessage = null }) { Text("OK") }
@@ -361,7 +396,7 @@ private fun GroupConversationTopBar(
     TopAppBar(
         navigationIcon = {
             IconButton(onClick = onBack) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
         },
         title = {
@@ -374,6 +409,7 @@ private fun GroupConversationTopBar(
                     name = group.name,
                     displayId = group.name,
                     size = 36.dp,
+                    isGroup = true,
                 )
                 Spacer(modifier = Modifier.width(12.dp))
                 Column(
@@ -434,7 +470,7 @@ private fun GroupMessageBubble(
         return
     }
 
-    var boundsInRoot by remember { mutableStateOf(Rect.Zero) }
+    var boundsInWindow by remember { mutableStateOf(Rect.Zero) }
     val topPadding = if (grouping.joinsPrevious) 2.dp else 10.dp
     val bottomPadding = if (grouping.joinsNext) 2.dp else 6.dp
     val shape = bubbleShapeFor(isOwn, grouping)
@@ -457,9 +493,9 @@ private fun GroupMessageBubble(
             reactions = reactions,
             onReact = onReact,
             modifier = Modifier
-                .onGloballyPositioned { coords -> boundsInRoot = coords.boundsInRoot() }
+                .onGloballyPositioned { coords -> boundsInWindow = coords.boundsInWindow() }
                 .messageActions(
-                    onLongClick = { onLongPress(target, boundsInRoot) },
+                    onLongClick = { onLongPress(target, boundsInWindow) },
                 ),
         )
     }
