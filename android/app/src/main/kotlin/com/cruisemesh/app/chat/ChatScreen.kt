@@ -71,12 +71,14 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -864,6 +866,8 @@ private fun MessageBubble(
     reactions: List<ReactionSummary> = emptyList(),
     onReact: (String) -> Unit = {},
 ) {
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
     } else {
@@ -872,7 +876,9 @@ private fun MessageBubble(
     val contentColor = if (isOwn) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
     val tickBaseColor = if (bubbleColor.luminance() > 0.5f) Color.Black else Color.White
     var showLegend by remember { mutableStateOf(false) }
-    var showReactionPicker by remember { mutableStateOf(false) }
+    var showMessageActions by remember { mutableStateOf(false) }
+    var showInfo by remember { mutableStateOf(false) }
+    val copyText = remember(message.payload, message.kind) { messageCopyText(message) }
     val topPadding = if (grouping.joinsPrevious) 2.dp else 10.dp
     val bottomPadding = if (grouping.joinsNext) 2.dp else 6.dp
     val shape = RoundedCornerShape(
@@ -892,15 +898,28 @@ private fun MessageBubble(
             horizontalAlignment = if (isOwn) Alignment.End else Alignment.Start,
             modifier = Modifier.widthIn(max = 300.dp),
         ) {
+            if (showMessageActions) {
+                ReactionPickerBar(
+                    onReact = { emoji ->
+                        showMessageActions = false
+                        onReact(emoji)
+                    },
+                )
+            }
+
             Surface(
                 color = bubbleColor,
                 contentColor = contentColor,
                 shape = shape,
                 modifier = Modifier.messageActions(
                     onClick = {
-                        if (tick != null) showLegend = true
+                        if (showMessageActions) {
+                            showMessageActions = false
+                        } else if (tick != null) {
+                            showLegend = true
+                        }
                     },
-                    onLongClick = { showReactionPicker = true },
+                    onLongClick = { showMessageActions = true },
                 ),
             ) {
                 Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
@@ -950,6 +969,23 @@ private fun MessageBubble(
                 )
             }
 
+            if (showMessageActions) {
+                MessageActionPanel(
+                    canCopy = copyText.isNotBlank(),
+                    onCopy = {
+                        showMessageActions = false
+                        if (copyText.isNotBlank()) {
+                            clipboard.setText(AnnotatedString(copyText))
+                            Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    onInfo = {
+                        showMessageActions = false
+                        showInfo = true
+                    },
+                )
+            }
+
             if (grouping.showTimestamp) {
                 Text(
                     text = formatConversationTimestamp(message.timestamp),
@@ -974,12 +1010,15 @@ private fun MessageBubble(
         )
     }
 
-    if (showReactionPicker) {
-        ReactionPickerDialog(
-            onDismiss = { showReactionPicker = false },
-            onReact = { emoji ->
-                showReactionPicker = false
-                onReact(emoji)
+    if (showInfo) {
+        AlertDialog(
+            onDismissRequest = { showInfo = false },
+            title = { Text("Message Info") },
+            text = {
+                Text(messageInfoText(message, isOwn, tick))
+            },
+            confirmButton = {
+                TextButton(onClick = { showInfo = false }) { Text("OK") }
             },
         )
     }
@@ -1061,6 +1100,82 @@ fun ReactionPickerDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         },
     )
+}
+
+@Composable
+private fun ReactionPickerBar(
+    onReact: (String) -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(28.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        tonalElevation = 6.dp,
+        shadowElevation = 6.dp,
+        modifier = Modifier.padding(bottom = 6.dp),
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+        ) {
+            for (emoji in REACTION_CHOICES) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .clickable { onReact(emoji) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(emoji, style = MaterialTheme.typography.titleLarge)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageActionPanel(
+    canCopy: Boolean,
+    onCopy: () -> Unit,
+    onInfo: () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        tonalElevation = 6.dp,
+        shadowElevation = 6.dp,
+        modifier = Modifier
+            .padding(top = 6.dp)
+            .widthIn(min = 176.dp),
+    ) {
+        Column(modifier = Modifier.padding(vertical = 6.dp)) {
+            DropdownMenuItem(
+                text = { Text("Copy") },
+                enabled = canCopy,
+                onClick = onCopy,
+            )
+            DropdownMenuItem(
+                text = { Text("Info") },
+                onClick = onInfo,
+            )
+        }
+    }
+}
+
+private fun messageCopyText(message: StoredMessage): String =
+    when (message.kind) {
+        KIND_ATTACHMENT_MANIFEST -> AttachmentPayload.decode(message.payload)?.caption.orEmpty()
+        else -> message.payload.toString(Charsets.UTF_8)
+    }
+
+private fun messageInfoText(message: StoredMessage, isOwn: Boolean, tick: TickStatus?): String {
+    val sentAt = java.text.SimpleDateFormat(
+        "MMMM d, yyyy h:mm a",
+        java.util.Locale.US,
+    ).format(java.util.Date(message.timestamp))
+    val direction = if (isOwn) "Sent by you" else "Received"
+    val status = tick?.let { "\nStatus: ${tickLegendText(it)}" }.orEmpty()
+    return "$direction\nTime: $sentAt\nLamport: ${message.lamport}$status"
 }
 
 @Composable
