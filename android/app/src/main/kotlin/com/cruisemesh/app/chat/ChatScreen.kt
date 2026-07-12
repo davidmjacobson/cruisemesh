@@ -22,12 +22,9 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -59,6 +56,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -78,7 +76,6 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -391,8 +388,7 @@ private fun ConversationScreen(
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     val density = LocalDensity.current
-    val keyboardController = LocalSoftwareKeyboardController.current
-    val currentImeBottomPx = WindowInsets.ime.getBottom(density)
+    val keyboardFreeze = rememberOverlayKeyboardFreeze()
     val listState = rememberLazyListState()
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
     val displayName = remember(contact.name, displayId) {
@@ -411,12 +407,7 @@ private fun ConversationScreen(
     var showContactDetails by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var focused by remember(contact.userId) { mutableStateOf<FocusedMessage?>(null) }
-    var overlayImeBottomPx by remember(contact.userId) { mutableStateOf(0) }
-    var restoreKeyboardAfterOverlay by remember(contact.userId) { mutableStateOf(false) }
     var infoMessage by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
-    val overlayImeSpacerHeight = with(density) {
-        (overlayImeBottomPx - currentImeBottomPx).coerceAtLeast(0).toDp()
-    }
     // Newest-first for reverseLayout LazyColumn: index 0 sits at the bottom
     // edge (just above the composer / keyboard), empty space stays above.
     val displayMessages = remember(visibleMessages) { visibleMessages.asReversed() }
@@ -426,31 +417,23 @@ private fun ConversationScreen(
         onReact(target, if (existingOwn != null) "" else emoji)
     }
 
-    // Keep the pre-overlay IME footprint reserved while the keyboard closes so
-    // the pressed bubble does not slide away under the user's finger.
+    // The overlay takes over the full screen, so drop the keyboard while it's
+    // open and bring it back once closed. OverlayKeyboardFreeze keeps the
+    // conversation pixel-frozen while the keyboard animates, Signal-style.
     fun openOverlay(target: MessageTarget, bounds: Rect) {
-        val imeOffset = currentImeBottomPx.toFloat()
-        overlayImeBottomPx = currentImeBottomPx
-        restoreKeyboardAfterOverlay = currentImeBottomPx > 0
-        focused = FocusedMessage(
-            target = target,
-            bounds = Rect(
-                left = bounds.left,
-                top = bounds.top - imeOffset,
-                right = bounds.right,
-                bottom = bounds.bottom - imeOffset,
-            ),
-        )
-        keyboardController?.hide()
+        keyboardFreeze.onOverlayOpened()
+        focused = FocusedMessage(target, bounds)
     }
 
     fun closeOverlay() {
-        val shouldRestoreKeyboard = restoreKeyboardAfterOverlay
         focused = null
-        overlayImeBottomPx = 0
-        restoreKeyboardAfterOverlay = false
-        if (shouldRestoreKeyboard) {
-            keyboardController?.show()
+        keyboardFreeze.onOverlayClosed()
+    }
+
+    val overlayOpen = focused != null
+    LaunchedEffect(overlayOpen) {
+        if (!overlayOpen) {
+            keyboardFreeze.releaseWhenKeyboardReturns()
         }
     }
 
@@ -477,12 +460,16 @@ private fun ConversationScreen(
         }
     ) { innerPadding ->
         // Scaffold's contentWindowInsets (safeDrawing) already include IME, so
-        // do not also call imePadding() here — that double-counts keyboard height
-        // and leaves a large blank gap above the soft keyboard.
+        // do not also call imePadding() here — that double-counts keyboard height.
+        // keyboardFreeze mirrors this same live bottom inset back to itself so it
+        // can pin the total constant while the overlay is open (see OverlayKeyboardFreeze).
+        val bottomInsetPx = with(density) { innerPadding.calculateBottomPadding().toPx() }
+        SideEffect { keyboardFreeze.trackLiveBottomInset(bottomInsetPx) }
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
+                .padding(bottom = with(density) { keyboardFreeze.extraBottomPx.toDp() })
                 .padding(horizontal = 16.dp)
         ) {
             LazyColumn(
@@ -540,15 +527,6 @@ private fun ConversationScreen(
                 onStopVoice = onStopVoice,
                 onCancelVoice = onCancelVoice,
             )
-
-            if (overlayImeSpacerHeight > 0.dp) {
-                Spacer(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(overlayImeSpacerHeight)
-                        .background(MaterialTheme.colorScheme.background),
-                )
-            }
         }
     }
 
