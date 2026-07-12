@@ -60,6 +60,7 @@ fun ProfileScreen(
     meshStatus: String,
     onStartMesh: (() -> Unit)?,
     onShowMyQr: () -> Unit,
+    onBackUp: () -> Unit,
     onProfileChanged: (Long) -> Unit = {},
     onBack: () -> Unit
 ) {
@@ -168,6 +169,24 @@ fun ProfileScreen(
 
             Button(onClick = onShowMyQr, modifier = Modifier.fillMaxWidth()) {
                 Text("Show my friend card")
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Text("Account backup", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Save your identity and messages to an encrypted file so you can restore them if you reinstall or switch phones. Restore is offered on first launch.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            Button(
+                onClick = onBackUp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 12.dp),
+            ) {
+                Text("Back up account")
             }
 
             Spacer(modifier = Modifier.height(24.dp))
@@ -295,6 +314,7 @@ fun ProfileScreenPreview() {
             meshStatus = "Mesh off",
             onStartMesh = {},
             onShowMyQr = {},
+            onBackUp = {},
             onBack = {}
         )
     }

@@ -62,6 +62,7 @@ fun OnboardingScreen(
     onRemovePhoto: () -> Unit,
     onRequestMeshPermissions: () -> Unit,
     onRequestBatteryExemption: () -> Unit,
+    onRestore: () -> Unit,
     onComplete: () -> Unit,
 ) {
     var page by rememberSaveable { mutableStateOf(0) }
@@ -185,7 +186,7 @@ fun OnboardingScreen(
                                 .padding(24.dp),
                         ) {
                             when (currentPage) {
-                                0 -> WelcomeSlide()
+                                0 -> WelcomeSlide(onRestore = onRestore)
                                 1 -> DeliverySlide()
                                 2 -> PermissionsSlide(
                                     meshPermissionsGranted = meshPermissionsGranted,
@@ -213,7 +214,7 @@ fun OnboardingScreen(
 }
 
 @Composable
-private fun WelcomeSlide() {
+private fun WelcomeSlide(onRestore: () -> Unit) {
     SlideScaffold(
         eyebrow = "Nearby-first messaging",
         title = "Welcome to CruiseMesh",
@@ -223,6 +224,12 @@ private fun WelcomeSlide() {
             title = "Built for the moments when networks disappear",
             detail = "Keep conversations moving on hikes, cruises, festivals, road trips, and anywhere coverage is unreliable.",
         )
+        TextButton(
+            onClick = onRestore,
+            modifier = Modifier.padding(top = 8.dp),
+        ) {
+            Text("Already set up? Restore from a backup")
+        }
     }
 }
 
