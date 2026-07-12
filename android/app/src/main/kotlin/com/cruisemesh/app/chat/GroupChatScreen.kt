@@ -6,17 +6,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.exclude
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -37,6 +32,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,6 +44,7 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -82,6 +79,7 @@ fun GroupChatScreen(
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    val density = LocalDensity.current
     val keyboardFreeze = rememberOverlayKeyboardFreeze()
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
     var draft by remember { mutableStateOf("") }
@@ -155,11 +153,6 @@ fun GroupChatScreen(
 
     Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
-        // IME is excluded here and applied once, ourselves, via
-        // keyboardFreeze.insets below -- see OverlayKeyboardFreeze for why
-        // layering our own inset on top of Scaffold's (still-live) IME inset
-        // doesn't work.
-        contentWindowInsets = WindowInsets.safeDrawing.exclude(WindowInsets.ime),
         topBar = {
             GroupConversationTopBar(
                 group = group,
@@ -170,11 +163,17 @@ fun GroupChatScreen(
             )
         },
     ) { innerPadding ->
+        // Scaffold's contentWindowInsets (safeDrawing) already include IME, so
+        // do not also call imePadding() here — that double-counts keyboard height.
+        // keyboardFreeze mirrors this same live bottom inset back to itself so it
+        // can pin the total constant while the overlay is open (see OverlayKeyboardFreeze).
+        val bottomInsetPx = with(density) { innerPadding.calculateBottomPadding().toPx() }
+        SideEffect { keyboardFreeze.trackLiveBottomInset(bottomInsetPx) }
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .windowInsetsPadding(keyboardFreeze.insets)
+                .padding(bottom = with(density) { keyboardFreeze.extraBottomPx.toDp() })
                 .padding(horizontal = 16.dp),
         ) {
             LazyColumn(
