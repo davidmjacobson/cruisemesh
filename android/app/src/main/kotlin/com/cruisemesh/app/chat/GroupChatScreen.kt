@@ -6,9 +6,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -43,6 +46,7 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
@@ -78,13 +82,20 @@ fun GroupChatScreen(
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    val density = LocalDensity.current
     val keyboardController = LocalSoftwareKeyboardController.current
+    val currentImeBottomPx = WindowInsets.ime.getBottom(density)
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
     var draft by remember { mutableStateOf("") }
     var showDetails by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var focused by remember(group.id) { mutableStateOf<FocusedMessage?>(null) }
+    var overlayImeBottomPx by remember(group.id) { mutableStateOf(0) }
+    var restoreKeyboardAfterOverlay by remember(group.id) { mutableStateOf(false) }
     var infoMessage by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
+    val overlayImeSpacerHeight = with(density) {
+        (overlayImeBottomPx - currentImeBottomPx).coerceAtLeast(0).toDp()
+    }
 
     fun reload() {
         messages = store.messagesForChat(group.id)
@@ -122,17 +133,23 @@ fun GroupChatScreen(
         reload()
     }
 
-    // The overlay takes over the full screen, so drop the keyboard while it's
-    // open (freeing that space for the scrim) and bring it back once closed --
-    // a no-op either way if the composer wasn't focused to begin with.
+    // Keep the pre-overlay IME footprint reserved while the keyboard closes so
+    // the pressed bubble does not slide away under the user's finger.
     fun openOverlay(target: MessageTarget, bounds: Rect) {
-        keyboardController?.hide()
+        overlayImeBottomPx = currentImeBottomPx
+        restoreKeyboardAfterOverlay = currentImeBottomPx > 0
         focused = FocusedMessage(target, bounds)
+        keyboardController?.hide()
     }
 
     fun closeOverlay() {
+        val shouldRestoreKeyboard = restoreKeyboardAfterOverlay
         focused = null
-        keyboardController?.show()
+        overlayImeBottomPx = 0
+        restoreKeyboardAfterOverlay = false
+        if (shouldRestoreKeyboard) {
+            keyboardController?.show()
+        }
     }
 
     LaunchedEffect(visibleMessages.size) {
@@ -222,6 +239,15 @@ fun GroupChatScreen(
                 ) {
                     Text("Send")
                 }
+            }
+
+            if (overlayImeSpacerHeight > 0.dp) {
+                Spacer(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(overlayImeSpacerHeight)
+                        .background(MaterialTheme.colorScheme.background),
+                )
             }
         }
     }

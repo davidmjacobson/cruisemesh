@@ -22,9 +22,12 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -387,7 +390,9 @@ private fun ConversationScreen(
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    val density = LocalDensity.current
     val keyboardController = LocalSoftwareKeyboardController.current
+    val currentImeBottomPx = WindowInsets.ime.getBottom(density)
     val listState = rememberLazyListState()
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
     val displayName = remember(contact.name, displayId) {
@@ -406,7 +411,12 @@ private fun ConversationScreen(
     var showContactDetails by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var focused by remember(contact.userId) { mutableStateOf<FocusedMessage?>(null) }
+    var overlayImeBottomPx by remember(contact.userId) { mutableStateOf(0) }
+    var restoreKeyboardAfterOverlay by remember(contact.userId) { mutableStateOf(false) }
     var infoMessage by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
+    val overlayImeSpacerHeight = with(density) {
+        (overlayImeBottomPx - currentImeBottomPx).coerceAtLeast(0).toDp()
+    }
     // Newest-first for reverseLayout LazyColumn: index 0 sits at the bottom
     // edge (just above the composer / keyboard), empty space stays above.
     val displayMessages = remember(visibleMessages) { visibleMessages.asReversed() }
@@ -416,17 +426,23 @@ private fun ConversationScreen(
         onReact(target, if (existingOwn != null) "" else emoji)
     }
 
-    // The overlay takes over the full screen, so drop the keyboard while it's
-    // open (freeing that space for the scrim) and bring it back once closed --
-    // a no-op either way if the composer wasn't focused to begin with.
+    // Keep the pre-overlay IME footprint reserved while the keyboard closes so
+    // the pressed bubble does not slide away under the user's finger.
     fun openOverlay(target: MessageTarget, bounds: Rect) {
-        keyboardController?.hide()
+        overlayImeBottomPx = currentImeBottomPx
+        restoreKeyboardAfterOverlay = currentImeBottomPx > 0
         focused = FocusedMessage(target, bounds)
+        keyboardController?.hide()
     }
 
     fun closeOverlay() {
+        val shouldRestoreKeyboard = restoreKeyboardAfterOverlay
         focused = null
-        keyboardController?.show()
+        overlayImeBottomPx = 0
+        restoreKeyboardAfterOverlay = false
+        if (shouldRestoreKeyboard) {
+            keyboardController?.show()
+        }
     }
 
     LaunchedEffect(visibleMessages.size) {
@@ -515,6 +531,15 @@ private fun ConversationScreen(
                 onStopVoice = onStopVoice,
                 onCancelVoice = onCancelVoice,
             )
+
+            if (overlayImeSpacerHeight > 0.dp) {
+                Spacer(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(overlayImeSpacerHeight)
+                        .background(MaterialTheme.colorScheme.background),
+                )
+            }
         }
     }
 
