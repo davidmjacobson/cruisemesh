@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -43,7 +44,6 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -78,7 +78,7 @@ fun GroupChatScreen(
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
-    val keyboardController = LocalSoftwareKeyboardController.current
+    val keyboardFreeze = rememberOverlayKeyboardFreeze()
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
     var draft by remember { mutableStateOf("") }
     var showDetails by remember { mutableStateOf(false) }
@@ -123,16 +123,23 @@ fun GroupChatScreen(
     }
 
     // The overlay takes over the full screen, so drop the keyboard while it's
-    // open (freeing that space for the scrim) and bring it back once closed --
-    // a no-op either way if the composer wasn't focused to begin with.
+    // open and bring it back once closed. OverlayKeyboardFreeze keeps the
+    // conversation pixel-frozen while the keyboard animates, Signal-style.
     fun openOverlay(target: MessageTarget, bounds: Rect) {
-        keyboardController?.hide()
+        keyboardFreeze.onOverlayOpened()
         focused = FocusedMessage(target, bounds)
     }
 
     fun closeOverlay() {
         focused = null
-        keyboardController?.show()
+        keyboardFreeze.onOverlayClosed()
+    }
+
+    val overlayOpen = focused != null
+    LaunchedEffect(overlayOpen) {
+        if (!overlayOpen) {
+            keyboardFreeze.releaseWhenKeyboardReturns()
+        }
     }
 
     LaunchedEffect(visibleMessages.size) {
@@ -160,6 +167,7 @@ fun GroupChatScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
+                .windowInsetsPadding(keyboardFreeze.insets)
                 .padding(horizontal = 16.dp),
         ) {
             LazyColumn(
