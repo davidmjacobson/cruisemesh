@@ -429,9 +429,18 @@ private fun ConversationScreen(
     // Keep the pre-overlay IME footprint reserved while the keyboard closes so
     // the pressed bubble does not slide away under the user's finger.
     fun openOverlay(target: MessageTarget, bounds: Rect) {
+        val imeOffset = currentImeBottomPx.toFloat()
         overlayImeBottomPx = currentImeBottomPx
         restoreKeyboardAfterOverlay = currentImeBottomPx > 0
-        focused = FocusedMessage(target, bounds)
+        focused = FocusedMessage(
+            target = target,
+            bounds = Rect(
+                left = bounds.left,
+                top = bounds.top - imeOffset,
+                right = bounds.right,
+                bottom = bounds.bottom - imeOffset,
+            ),
+        )
         keyboardController?.hide()
     }
 
