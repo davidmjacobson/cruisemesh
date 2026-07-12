@@ -7,13 +7,14 @@
 
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
-use data_encoding::BASE32_NOPAD;
+use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
 const USER_ID_LEN: usize = 16;
+const FRIEND_LINK_PREFIX: &str = "CMFRIEND1:";
 
 /// A locally generated identity: both keypairs, private material included.
 ///
@@ -136,6 +137,15 @@ pub fn make_friend_card(
     serde_json::to_string(&card).expect("FriendCard always serializes")
 }
 
+/// Compact, chat-app-safe text form of a FriendCard.
+#[uniffi::export]
+pub fn make_friend_link(card_json: String) -> String {
+    format!(
+        "{FRIEND_LINK_PREFIX}{}",
+        BASE64URL_NOPAD.encode(card_json.as_bytes())
+    )
+}
+
 /// Parse a friend-card JSON payload received via QR scan or pasted text.
 #[uniffi::export]
 pub fn parse_friend_card(json: String) -> Result<FriendCard, CoreError> {
@@ -156,17 +166,90 @@ pub fn parse_friend_card(json: String) -> Result<FriendCard, CoreError> {
     Ok(card)
 }
 
+/// Parse either the compact `CMFRIEND1:` link form or legacy raw FriendCard JSON.
+#[uniffi::export]
+pub fn parse_friend_text(text: String) -> Result<FriendCard, CoreError> {
+    let trimmed = text.trim();
+    if let Some(encoded) = trimmed.strip_prefix(FRIEND_LINK_PREFIX) {
+        let compact: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+        let json = BASE64URL_NOPAD
+            .decode(compact.as_bytes())
+            .map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+        let json =
+            String::from_utf8(json).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+        return parse_friend_card(json);
+    }
+    parse_friend_card(trimmed.to_string())
+        .map_err(|_| CoreError::InvalidFriendCard("not a CruiseMesh friend card".to_string()))
+}
+
 /// Small nautical/travel-themed wordlist for fingerprint phrases. Not
 /// security-critical (only 4 words are shown), so a compact list is fine.
 const WORDLIST: [&str; 64] = [
-    "anchor", "atoll", "beacon", "bilge", "boatswain", "bosun", "bow", "breeze",
-    "bridge", "buoy", "cabin", "captain", "chart", "clipper", "coast", "compass",
-    "coral", "current", "dock", "dolphin", "ferry", "fjord", "flag", "fleet",
-    "galley", "gangway", "harbor", "helm", "horizon", "island", "jetty", "keel",
-    "knot", "lagoon", "lantern", "latitude", "lighthouse", "longitude", "mast", "mate",
-    "moor", "navigate", "ocean", "oar", "pier", "port", "quay", "reef",
-    "rudder", "sail", "sextant", "shore", "starboard", "stern", "swell", "tide",
-    "tropic", "vessel", "voyage", "wake", "wave", "wharf", "wind", "yacht",
+    "anchor",
+    "atoll",
+    "beacon",
+    "bilge",
+    "boatswain",
+    "bosun",
+    "bow",
+    "breeze",
+    "bridge",
+    "buoy",
+    "cabin",
+    "captain",
+    "chart",
+    "clipper",
+    "coast",
+    "compass",
+    "coral",
+    "current",
+    "dock",
+    "dolphin",
+    "ferry",
+    "fjord",
+    "flag",
+    "fleet",
+    "galley",
+    "gangway",
+    "harbor",
+    "helm",
+    "horizon",
+    "island",
+    "jetty",
+    "keel",
+    "knot",
+    "lagoon",
+    "lantern",
+    "latitude",
+    "lighthouse",
+    "longitude",
+    "mast",
+    "mate",
+    "moor",
+    "navigate",
+    "ocean",
+    "oar",
+    "pier",
+    "port",
+    "quay",
+    "reef",
+    "rudder",
+    "sail",
+    "sextant",
+    "shore",
+    "starboard",
+    "stern",
+    "swell",
+    "tide",
+    "tropic",
+    "vessel",
+    "voyage",
+    "wake",
+    "wave",
+    "wharf",
+    "wind",
+    "yacht",
 ];
 
 #[cfg(test)]
@@ -198,6 +281,53 @@ mod tests {
         assert_eq!(card.relay_url, Some("https://relay.example".to_string()));
         assert_eq!(card.relay_token, Some("family-token".to_string()));
         assert_eq!(friend_card_user_id(card), id.user_id);
+    }
+
+    #[test]
+    fn friend_link_round_trips() {
+        let id = generate_identity();
+        let json = make_friend_card("Dave".to_string(), id.clone(), None, None);
+        let link = make_friend_link(json);
+        assert!(link.starts_with(FRIEND_LINK_PREFIX));
+        let card = parse_friend_text(link).expect("valid link");
+        assert_eq!(friend_card_user_id(card), id.user_id);
+    }
+
+    #[test]
+    fn parse_friend_text_accepts_raw_json_and_whitespace() {
+        let id = generate_identity();
+        let json = make_friend_card("Dave".to_string(), id.clone(), None, None);
+        let card = parse_friend_text(format!("\n  {json} \t")).expect("valid raw json");
+        assert_eq!(friend_card_user_id(card), id.user_id);
+    }
+
+    #[test]
+    fn parse_friend_text_strips_wrapped_link_body() {
+        let id = generate_identity();
+        let json = make_friend_card(
+            "Dave".to_string(),
+            id.clone(),
+            Some("https://relay.example".to_string()),
+            Some("token".to_string()),
+        );
+        let link = make_friend_link(json);
+        let wrapped = format!("  {}\n{}\t  ", &link[..24], &link[24..]);
+        let card = parse_friend_text(wrapped).expect("valid wrapped link");
+        assert_eq!(friend_card_user_id(card.clone()), id.user_id);
+        assert_eq!(card.relay_url, Some("https://relay.example".to_string()));
+        assert_eq!(card.relay_token, Some("token".to_string()));
+    }
+
+    #[test]
+    fn parse_friend_text_rejects_bad_link() {
+        let err = parse_friend_text("CMFRIEND1:not valid base64".to_string()).unwrap_err();
+        assert!(matches!(err, CoreError::InvalidFriendCard(_)));
+    }
+
+    #[test]
+    fn parse_friend_text_rejects_unknown_prefix() {
+        let err = parse_friend_text("CMFRIEND2:abc".to_string()).unwrap_err();
+        assert!(matches!(err, CoreError::InvalidFriendCard(_)));
     }
 
     #[test]

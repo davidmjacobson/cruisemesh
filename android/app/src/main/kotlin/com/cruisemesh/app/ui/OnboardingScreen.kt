@@ -347,7 +347,7 @@ private fun ProfileSlide(
             onTakePhoto = onTakePhoto,
             onChoosePhoto = onChoosePhoto,
             onRemovePhoto = onRemovePhoto,
-            helperText = "Your photo stays on this device for now. We can add profile-photo sharing to friending later without changing this setup flow.",
+            helperText = "Your photo is shared with friends after you connect.",
         )
 
         Text(

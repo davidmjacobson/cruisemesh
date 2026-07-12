@@ -4,6 +4,7 @@ import SwiftUI
 /// safety-word fingerprint verification, and delete.
 struct ContactDetailsSheet: View {
     let contact: Contact
+    var avatarData: Data? = nil
     let onDelete: () -> Void
     @Environment(\.dismiss) private var dismiss
 
@@ -17,7 +18,12 @@ struct ContactDetailsSheet: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 0) {
-                    AvatarView(userId: contact.userId, name: contact.name, size: 72)
+                    AvatarView(
+                        userId: contact.userId,
+                        name: contact.name,
+                        size: 72,
+                        photo: avatarData.flatMap { UIImage(data: $0) }
+                    )
                         .padding(.top, 8)
 
                     Text(displayName)

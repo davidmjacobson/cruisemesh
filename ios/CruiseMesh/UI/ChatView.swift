@@ -10,6 +10,7 @@ struct ChatView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var messages: [StoredMessage] = []
+    @State private var avatarData: Data?
     @State private var deliveredThrough: UInt64 = 0
     @State private var readThrough: UInt64 = 0
     @State private var draft = ""
@@ -133,7 +134,12 @@ struct ChatView: View {
             ToolbarItem(placement: .principal) {
                 Button { showDetails = true } label: {
                     HStack {
-                        AvatarView(userId: contact.userId, name: contact.name, size: 32)
+                        AvatarView(
+                            userId: contact.userId,
+                            name: contact.name,
+                            size: 32,
+                            photo: avatarData.flatMap { UIImage(data: $0) }
+                        )
                         VStack(alignment: .leading) {
                             Text(ChatListLogic.displayNameOrId(
                                 name: contact.name,
@@ -248,7 +254,7 @@ struct ChatView: View {
             }
         }
         .sheet(isPresented: $showDetails) {
-            ContactDetailsSheet(contact: contact) {
+            ContactDetailsSheet(contact: contact, avatarData: avatarData) {
                 showDetails = false
                 confirmDelete = true
             }
@@ -274,6 +280,7 @@ struct ChatView: View {
 
     private func reload() {
         messages = (try? store.messagesForChat(chatId: contact.userId)) ?? []
+        avatarData = (try? store.contactAvatar(userId: contact.userId)) ?? nil
         deliveredThrough = (try? store.receiptThrough(
             chatId: contact.userId,
             senderUserId: identity.userId,

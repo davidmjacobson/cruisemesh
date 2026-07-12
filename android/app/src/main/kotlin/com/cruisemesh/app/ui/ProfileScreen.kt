@@ -57,16 +57,25 @@ fun ProfileScreen(
     meshStatus: String,
     onStartMesh: (() -> Unit)?,
     onShowMyQr: () -> Unit,
+    onProfileChanged: (Long) -> Unit = {},
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
     var displayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
+    val initialDisplayName = remember { ProfileStore.loadDisplayName(context) }
     var avatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
+    fun bumpAndSync() {
+        onProfileChanged(ProfileStore.bumpOwnAvatarEpoch(context))
+    }
     val pickPhotoLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia(),
     ) { uri ->
         if (uri != null) {
-            avatarPath = ProfilePhotoStore.saveFromUri(context, uri) ?: avatarPath
+            val saved = ProfilePhotoStore.saveFromUri(context, uri)
+            if (saved != null) {
+                avatarPath = saved
+                bumpAndSync()
+            }
         }
     }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
@@ -76,7 +85,11 @@ fun ProfileScreen(
         val uri = pendingCameraUri
         pendingCameraUri = null
         if (success && uri != null) {
-            avatarPath = ProfilePhotoStore.saveFromUri(context, uri) ?: avatarPath
+            val saved = ProfilePhotoStore.saveFromUri(context, uri)
+            if (saved != null) {
+                avatarPath = saved
+                bumpAndSync()
+            }
         }
     }
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
@@ -94,7 +107,12 @@ fun ProfileScreen(
             TopAppBar(
                 title = { Text("Profile & Settings") },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(onClick = {
+                        if (displayName.trim() != initialDisplayName.trim()) {
+                            bumpAndSync()
+                        }
+                        onBack()
+                    }) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "Back")
                     }
                 }
@@ -137,8 +155,9 @@ fun ProfileScreen(
                 onRemovePhoto = {
                     ProfilePhotoStore.clear(context)
                     avatarPath = null
+                    bumpAndSync()
                 },
-                helperText = "Your profile photo is local to this device for now.",
+                helperText = "Your profile photo is shared with friends.",
             )
 
             Spacer(modifier = Modifier.height(24.dp))

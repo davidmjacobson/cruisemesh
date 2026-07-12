@@ -12,6 +12,7 @@ struct ChatSummary: Identifiable {
     let unreadCount: Int
     let ownDeliveredThrough: UInt64
     let ownReadThrough: UInt64
+    let avatarData: Data?
 }
 
 /// Navigation target for the chat list — a 1:1 contact chat or a group chat.
@@ -108,7 +109,12 @@ struct ChatListView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button { showProfile = true } label: {
-                        AvatarView(userId: identity.userId, name: appModel.displayName, size: 32)
+                        AvatarView(
+                            userId: identity.userId,
+                            name: appModel.displayName,
+                            size: 32,
+                            photo: ProfilePhotoStore.loadAvatarImage()
+                        )
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -235,7 +241,8 @@ struct ChatListView: View {
                     readThrough: localReadThrough
                 ),
                 ownDeliveredThrough: deliveredThrough,
-                ownReadThrough: readThrough
+                ownReadThrough: readThrough,
+                avatarData: (try? store.contactAvatar(userId: c.userId)) ?? nil
             )
         }
         let groups = (try? store.listGroups()) ?? []
@@ -260,7 +267,8 @@ struct ChatListView: View {
                 lastMessage: ChatListLogic.lastVisibleMessage(messages),
                 unreadCount: unread,
                 ownDeliveredThrough: 0,
-                ownReadThrough: 0
+                ownReadThrough: 0,
+                avatarData: nil
             )
         }
         summaries = (direct + groupSummaries)
@@ -280,7 +288,12 @@ private struct ChatRowView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            AvatarView(userId: summary.chatId, name: summary.title, size: 48)
+            AvatarView(
+                userId: summary.chatId,
+                name: summary.title,
+                size: 48,
+                photo: summary.avatarData.flatMap { UIImage(data: $0) }
+            )
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text(summary.isGroup ? "👥 \(displayName)" : displayName)

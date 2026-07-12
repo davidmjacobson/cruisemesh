@@ -428,6 +428,13 @@ final class MeshController: ObservableObject {
                 body: body,
                 identity: identity
             )
+        case ProtocolKind.profileSync:
+            handleIncomingProfileSync(
+                sourceAddress: sourceAddress,
+                senderUserId: opened.senderUserId,
+                body: body,
+                identity: identity
+            )
         case ProtocolKind.groupInvite:
             handleIncomingGroupInvite(
                 sourceLabel: sourceLabel,
@@ -703,6 +710,13 @@ final class MeshController: ObservableObject {
             relayToken: card.relayToken
         )
         try? store.upsertContact(contact: contact)
+        ProfileSyncSender.queueToContact(
+            store: store,
+            identity: identity,
+            contact: contact,
+            displayName: ProfileStore.loadDisplayName(),
+            epoch: ProfileStore.loadOwnAvatarEpoch()
+        )
         let inserted = (try? store.insertMessage(message: StoredMessage(
             chatId: senderUserId,
             senderUserId: senderUserId,
@@ -731,6 +745,70 @@ final class MeshController: ObservableObject {
             )
         }
         log.info("Imported contact \(contact.name, privacy: .public) from friend request")
+    }
+
+    private func handleIncomingProfileSync(
+        sourceAddress: String?,
+        senderUserId: Data,
+        body: MessageBody,
+        identity: Identity
+    ) {
+        guard let existing = try? store.getContact(userId: senderUserId),
+              let content = try? decodeProfileSyncContent(bytes: body.content) else { return }
+        let inserted = (try? store.insertMessage(message: StoredMessage(
+            chatId: senderUserId,
+            senderUserId: senderUserId,
+            lamport: body.lamport,
+            timestamp: body.timestamp,
+            kind: ProtocolKind.profileSync,
+            payload: body.content
+        ))) ?? false
+        guard inserted else { return }
+
+        let applied = (try? store.setContactAvatar(
+            userId: senderUserId,
+            avatar: content.avatar.isEmpty ? nil : content.avatar,
+            epoch: content.avatarEpoch
+        )) ?? false
+        if applied, content.name != existing.name {
+            let updated = Contact(
+                userId: existing.userId,
+                name: content.name,
+                signPk: existing.signPk,
+                agreePk: existing.agreePk,
+                relayUrl: existing.relayUrl,
+                relayToken: existing.relayToken
+            )
+            try? store.upsertContact(contact: updated)
+        }
+        ChatEvents.notifyChatChanged(senderUserId)
+
+        let contact = (try? store.getContact(userId: senderUserId)) ?? existing
+        let through = (try? store.highestContiguousLamport(chatId: senderUserId, senderUserId: senderUserId)) ?? 0
+        try? store.recordOutgoingReceipt(
+            chatId: senderUserId,
+            senderUserId: senderUserId,
+            receiptType: ReceiptType.delivered,
+            throughLamport: through
+        )
+        if let sourceAddress {
+            sendReceiptOnAddress(
+                identity: identity,
+                contact: contact,
+                address: sourceAddress,
+                receiptType: ReceiptType.delivered,
+                ackedSenderUserId: senderUserId,
+                throughLamport: through
+            )
+        } else {
+            sendReceiptToContact(
+                identity: identity,
+                contact: contact,
+                receiptType: ReceiptType.delivered,
+                ackedSenderUserId: senderUserId,
+                throughLamport: through
+            )
+        }
     }
 
     private func deliverCarriedMessagesForImportedGroup(group: Group, identity: Identity) {

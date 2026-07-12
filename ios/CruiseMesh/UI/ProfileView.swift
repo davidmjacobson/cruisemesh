@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 /// Hosted privacy policy (App Store / Play Console + in-app link).
@@ -14,11 +15,39 @@ struct ProfileView: View {
     @State private var relayUrl: String = ""
     @State private var relayToken: String = ""
     @State private var meshOn = true
+    @State private var avatarImage: UIImage?
+    @State private var photoItem: PhotosPickerItem?
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("You") {
+                    HStack {
+                        Spacer()
+                        AvatarView(
+                            userId: identity.userId,
+                            name: displayName,
+                            size: 80,
+                            photo: avatarImage
+                        )
+                        Spacer()
+                    }
+                    PhotosPicker(selection: $photoItem, matching: .images) {
+                        Label("Choose profile photo", systemImage: "photo")
+                    }
+                    if avatarImage != nil {
+                        Button("Remove profile photo", role: .destructive) {
+                            ProfilePhotoStore.clear()
+                            avatarImage = nil
+                            let epoch = ProfileStore.bumpOwnAvatarEpoch()
+                            ProfileSyncSender.queueToAllContacts(
+                                store: AppStore.get(),
+                                identity: identity,
+                                displayName: displayName,
+                                epoch: epoch
+                            )
+                        }
+                    }
                     TextField("Display name", text: $displayName)
                     LabeledContent("User ID", value: formatUserId(userId: identity.userId))
                     LabeledContent(
@@ -61,10 +90,20 @@ struct ProfileView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
+                        let previousName = appModel.displayName
                         let trimmedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
                         ProfileStore.saveDisplayName(trimmedName)
                         appModel.displayName = trimmedName
                         RelayConfigStore.save(relayUrl: relayUrl, relayToken: relayToken)
+                        if trimmedName != previousName {
+                            let epoch = ProfileStore.bumpOwnAvatarEpoch()
+                            ProfileSyncSender.queueToAllContacts(
+                                store: AppStore.get(),
+                                identity: identity,
+                                displayName: trimmedName,
+                                epoch: epoch
+                            )
+                        }
                         dismiss()
                     }
                 }
@@ -76,6 +115,25 @@ struct ProfileView: View {
                     relayToken = cfg.relayToken
                 }
                 meshOn = appModel.meshEnabled
+                avatarImage = ProfilePhotoStore.loadAvatarImage()
+            }
+            .onChange(of: photoItem) { item in
+                guard let item else { return }
+                Task {
+                    guard let data = try? await item.loadTransferable(type: Data.self),
+                          let image = UIImage(data: data),
+                          let saved = ProfilePhotoStore.save(image: image) else { return }
+                    await MainActor.run {
+                        avatarImage = saved
+                        let epoch = ProfileStore.bumpOwnAvatarEpoch()
+                        ProfileSyncSender.queueToAllContacts(
+                            store: AppStore.get(),
+                            identity: identity,
+                            displayName: displayName,
+                            epoch: epoch
+                        )
+                    }
+                }
             }
         }
     }

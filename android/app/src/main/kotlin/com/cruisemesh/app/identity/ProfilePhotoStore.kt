@@ -9,12 +9,15 @@ import android.util.Log
 import androidx.exifinterface.media.ExifInterface
 import java.io.File
 import java.io.FileOutputStream
+import java.io.ByteArrayOutputStream
 import kotlin.math.max
 
 private const val TAG = "ProfilePhotoStore"
 private const val PROFILE_DIR = "profile"
 private const val PROFILE_PHOTO_FILE = "avatar.jpg"
 private const val PROFILE_PHOTO_EDGE = 512
+private const val WIRE_PHOTO_EDGE = 256
+private const val WIRE_PHOTO_MAX_BYTES = 24 * 1024
 
 /** Persists the local profile photo shown in onboarding and the app chrome. */
 object ProfilePhotoStore {
@@ -37,6 +40,33 @@ object ProfilePhotoStore {
 
     /** Persist an already-decoded bitmap (e.g. tests or preview captures). */
     fun saveFromBitmap(context: Context, bitmap: Bitmap): String? = saveBitmap(context, bitmap)
+
+    fun loadWireAvatarBytes(context: Context): ByteArray {
+        val path = loadAvatarPath(context) ?: return ByteArray(0)
+        val bitmap = BitmapFactory.decodeFile(path) ?: return ByteArray(0)
+        return try {
+            encodeWireAvatar(bitmap)
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    fun encodeWireAvatar(bitmap: Bitmap): ByteArray {
+        val normalized = bitmap.centerCrop(WIRE_PHOTO_EDGE)
+        try {
+            for (quality in listOf(85, 70, 55, 40)) {
+                val out = ByteArrayOutputStream()
+                check(normalized.compress(Bitmap.CompressFormat.JPEG, quality, out))
+                val bytes = out.toByteArray()
+                if (bytes.size <= WIRE_PHOTO_MAX_BYTES || quality == 40) {
+                    return if (bytes.size <= WIRE_PHOTO_MAX_BYTES) bytes else ByteArray(0)
+                }
+            }
+            return ByteArray(0)
+        } finally {
+            if (normalized !== bitmap) normalized.recycle()
+        }
+    }
 
     private fun saveBitmap(context: Context, bitmap: Bitmap): String? =
         runCatching {

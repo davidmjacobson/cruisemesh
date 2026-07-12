@@ -237,6 +237,9 @@ pub const KIND_FRIEND_REQUEST: u8 = 3;
 /// `MessageBody.kind` value for a pairwise-sealed group invite whose
 /// `content` is an encoded [`crate::Group`] record.
 pub const KIND_GROUP_INVITE: u8 = 4;
+/// `MessageBody.kind` value for a profile-sync: durable contact metadata
+/// (display name + avatar), newest epoch wins.
+pub const KIND_PROFILE_SYNC: u8 = 5;
 /// `MessageBody.kind` value for an attachment manifest (DESIGN.md §7.1
 /// reserved, §8). Android currently embeds the media blob inline in the
 /// manifest payload for BLE/relay-friendly sizes; `KIND_ATTACHMENT_CHUNK`
@@ -268,6 +271,8 @@ const FRAME_TYPE_DIGEST: u8 = 0x03;
 const MSG_ID_LEN: usize = 16;
 const RECIPIENT_HINT_LEN: usize = 8;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+const PROFILE_SYNC_VERSION: u8 = 1;
+const PROFILE_SYNC_MAX_AVATAR_BYTES: usize = 64 * 1024;
 
 /// The plaintext body that gets encoded, then handed as `payload` to
 /// [`crate::seal_message`] (DESIGN.md §7.1). See the module docs for the
@@ -324,6 +329,16 @@ pub struct ReceiptContent {
     pub receipt_type: u8,
 }
 
+/// The decoded form of a profile-sync `content` (a `MessageBody` with
+/// `kind = KIND_PROFILE_SYNC`). Empty `avatar` means the sender removed
+/// their profile photo.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct ProfileSyncContent {
+    pub avatar_epoch: i64,
+    pub name: String,
+    pub avatar: Vec<u8>,
+}
+
 /// Encode a [`ReceiptContent`] to its wire form (see module docs for layout).
 #[uniffi::export]
 pub fn encode_receipt_content(content: ReceiptContent) -> Vec<u8> {
@@ -351,6 +366,46 @@ pub fn decode_receipt_content(bytes: Vec<u8>) -> Result<ReceiptContent, CoreErro
         sender_user_id,
         lamport,
         receipt_type,
+    })
+}
+
+/// Encode a [`ProfileSyncContent`] to its wire form.
+#[uniffi::export]
+pub fn encode_profile_sync_content(content: ProfileSyncContent) -> Vec<u8> {
+    let name = content.name.as_bytes();
+    let mut out = Vec::with_capacity(1 + 8 + 2 + name.len() + 4 + content.avatar.len());
+    out.push(PROFILE_SYNC_VERSION);
+    out.extend_from_slice(&content.avatar_epoch.to_be_bytes());
+    write_bytes16(&mut out, name);
+    write_bytes32(&mut out, &content.avatar);
+    out
+}
+
+/// Decode a [`ProfileSyncContent`] from its wire form.
+#[uniffi::export]
+pub fn decode_profile_sync_content(bytes: Vec<u8>) -> Result<ProfileSyncContent, CoreError> {
+    let mut cursor = Cursor::new(&bytes);
+    let version = cursor.take_u8()?;
+    if version != PROFILE_SYNC_VERSION {
+        return Err(CoreError::Malformed(format!(
+            "unknown profile-sync version: {version}"
+        )));
+    }
+    let avatar_epoch = cursor.take_i64()?;
+    let name = String::from_utf8(cursor.take_bytes16()?)
+        .map_err(|e| CoreError::Malformed(e.to_string()))?;
+    let avatar_len = cursor.take_u32()? as usize;
+    if avatar_len > PROFILE_SYNC_MAX_AVATAR_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "profile avatar too large: {avatar_len} bytes"
+        )));
+    }
+    let avatar = cursor.take(avatar_len)?.to_vec();
+    cursor.finish()?;
+    Ok(ProfileSyncContent {
+        avatar_epoch,
+        name,
+        avatar,
     })
 }
 
@@ -759,6 +814,70 @@ mod tests {
         }
     }
 
+    fn sample_profile_sync() -> ProfileSyncContent {
+        ProfileSyncContent {
+            avatar_epoch: 1_700_000_123_456,
+            name: "Alice".to_string(),
+            avatar: vec![0xFF, 0xD8, 0x11, 0x22, 0xFF, 0xD9],
+        }
+    }
+
+    #[test]
+    fn profile_sync_content_round_trips() {
+        let content = sample_profile_sync();
+        let encoded = encode_profile_sync_content(content.clone());
+        let decoded = decode_profile_sync_content(encoded).expect("decodes");
+        assert_eq!(decoded, content);
+    }
+
+    #[test]
+    fn profile_sync_content_round_trips_with_empty_fields() {
+        let content = ProfileSyncContent {
+            avatar_epoch: 0,
+            name: String::new(),
+            avatar: Vec::new(),
+        };
+        let encoded = encode_profile_sync_content(content.clone());
+        let decoded = decode_profile_sync_content(encoded).expect("decodes");
+        assert_eq!(decoded, content);
+    }
+
+    #[test]
+    fn profile_sync_content_decode_rejects_truncation_at_each_field() {
+        let encoded = encode_profile_sync_content(sample_profile_sync());
+        for len in 0..encoded.len() {
+            let err = decode_profile_sync_content(encoded[..len].to_vec()).unwrap_err();
+            assert!(matches!(err, CoreError::Malformed(_)), "len {len}");
+        }
+    }
+
+    #[test]
+    fn profile_sync_content_decode_rejects_trailing_garbage() {
+        let mut encoded = encode_profile_sync_content(sample_profile_sync());
+        encoded.push(0);
+        let err = decode_profile_sync_content(encoded).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn profile_sync_content_decode_rejects_unknown_version() {
+        let mut encoded = encode_profile_sync_content(sample_profile_sync());
+        encoded[0] = 2;
+        let err = decode_profile_sync_content(encoded).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn profile_sync_content_decode_rejects_oversized_avatar() {
+        let mut encoded = Vec::new();
+        encoded.push(PROFILE_SYNC_VERSION);
+        encoded.extend_from_slice(&1i64.to_be_bytes());
+        encoded.extend_from_slice(&0u16.to_be_bytes());
+        encoded.extend_from_slice(&((PROFILE_SYNC_MAX_AVATAR_BYTES + 1) as u32).to_be_bytes());
+        let err = decode_profile_sync_content(encoded).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
     #[test]
     fn receipt_content_round_trips() {
         let receipt = sample_receipt();
@@ -1105,5 +1224,32 @@ mod tests {
         let decoded_receipt =
             decode_receipt_content(decoded_body.content).expect("decodes receipt content");
         assert_eq!(decoded_receipt, receipt);
+    }
+
+    #[test]
+    fn profile_sync_body_survives_seal_and_open_round_trip() {
+        let alice = generate_identity();
+        let bob = generate_identity();
+
+        let content = sample_profile_sync();
+        let body = MessageBody {
+            kind: KIND_PROFILE_SYNC,
+            chat_id: bob.user_id.clone(),
+            lamport: 1,
+            timestamp: 1_700_000_001_000,
+            content: encode_profile_sync_content(content.clone()),
+        };
+        let payload = encode_message_body(body.clone());
+
+        let sealed =
+            seal_message(alice.clone(), bob.agree_pk.clone(), payload).expect("seal succeeds");
+        let opened = open_message(bob, sealed).expect("open succeeds");
+        assert_eq!(opened.sender_user_id, alice.user_id);
+
+        let decoded_body = decode_message_body(opened.payload).expect("decodes body");
+        assert_eq!(decoded_body.kind, KIND_PROFILE_SYNC);
+        let decoded_content =
+            decode_profile_sync_content(decoded_body.content).expect("decodes profile sync");
+        assert_eq!(decoded_content, content);
     }
 }

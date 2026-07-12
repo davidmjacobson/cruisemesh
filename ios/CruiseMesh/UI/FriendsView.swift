@@ -22,10 +22,10 @@ struct FriendsView: View {
                         Label("My friend card", systemImage: "qrcode")
                     }
                 }
-                Section("Paste friend card JSON") {
-                    TextField("Friend card JSON", text: $pasteText, axis: .vertical)
+                Section("Paste friend card") {
+                    TextField("Friend card", text: $pasteText, axis: .vertical)
                         .lineLimit(3...8)
-                    Button("Import") { importJSON(pasteText) }
+                    Button("Import") { importText(pasteText) }
                 }
                 Section("Friends") {
                     ForEach(contacts, id: \.userId) { contact in
@@ -33,7 +33,12 @@ struct FriendsView: View {
                             ChatView(contact: contact, identity: identity)
                         } label: {
                             HStack {
-                                AvatarView(userId: contact.userId, name: contact.name)
+                                AvatarView(
+                                    userId: contact.userId,
+                                    name: contact.name,
+                                    photo: (try? AppStore.get().contactAvatar(userId: contact.userId))
+                                        .flatMap { UIImage(data: $0) }
+                                )
                                 VStack(alignment: .leading) {
                                     Text(ChatListLogic.displayNameOrId(
                                         name: contact.name,
@@ -60,7 +65,7 @@ struct FriendsView: View {
             .sheet(isPresented: $showScan) {
                 QRScannerView { code in
                     showScan = false
-                    importJSON(code)
+                    importText(code)
                 }
             }
             .alert("Import failed", isPresented: Binding(
@@ -80,9 +85,9 @@ struct FriendsView: View {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    private func importJSON(_ json: String) {
+    private func importText(_ text: String) {
         do {
-            let card = try parseFriendCard(json: json)
+            let card = try parseFriendText(text: extractFriendToken(text))
             let userId = friendCardUserId(card: card)
             guard userId != identity.userId else {
                 error = "That is your own card"
@@ -109,6 +114,13 @@ struct FriendsView: View {
                 contact: contact,
                 displayName: appModel.displayName
             )
+            ProfileSyncSender.queueToContact(
+                store: AppStore.get(),
+                identity: identity,
+                contact: contact,
+                displayName: appModel.displayName,
+                epoch: ProfileStore.loadOwnAvatarEpoch()
+            )
             reload()
             pasteText = ""
         } catch {
@@ -131,7 +143,8 @@ struct MyQRView: View {
                     relayUrl: RelayConfigStore.load()?.relayUrl,
                     relayToken: RelayConfigStore.load()?.relayToken
                 )
-                if let image = QRCodeGenerator.image(from: json, size: 240) {
+                let link = makeFriendLink(cardJson: json)
+                if let image = QRCodeGenerator.image(from: link, size: 240) {
                     Image(uiImage: image)
                         .interpolation(.none)
                         .resizable()
@@ -147,8 +160,13 @@ struct MyQRView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
-                ShareLink(item: json) {
+                ShareLink(item: "Add me on CruiseMesh — copy this whole message and paste it in the app:\n\(link)") {
                     Label("Share card text", systemImage: "square.and.arrow.up")
+                }
+                Button {
+                    UIPasteboard.general.string = link
+                } label: {
+                    Label("Copy link", systemImage: "doc.on.doc")
                 }
                 Spacer()
             }

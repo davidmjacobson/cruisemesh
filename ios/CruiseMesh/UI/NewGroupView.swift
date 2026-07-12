@@ -36,7 +36,13 @@ struct NewGroupView: View {
                                         ? "checkmark.circle.fill"
                                         : "circle")
                                         .foregroundStyle(selected.contains(contact.userId) ? Color.accentColor : .secondary)
-                                    AvatarView(userId: contact.userId, name: contact.name, size: 36)
+                                    AvatarView(
+                                        userId: contact.userId,
+                                        name: contact.name,
+                                        size: 36,
+                                        photo: (try? AppStore.get().contactAvatar(userId: contact.userId))
+                                            .flatMap { UIImage(data: $0) }
+                                    )
                                     Text(ChatListLogic.displayNameOrId(
                                         name: contact.name,
                                         displayId: formatUserId(userId: contact.userId)

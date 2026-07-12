@@ -41,6 +41,7 @@ import uniffi.cruisemesh_core.formatUserId
 @Composable
 fun NewGroupScreen(
     contacts: List<Contact>,
+    avatarBytesByUserId: Map<String, ByteArray> = emptyMap(),
     onCreate: (name: String, members: List<Contact>) -> Unit,
     onBack: () -> Unit,
 ) {
@@ -119,6 +120,7 @@ fun NewGroupScreen(
                                 name = contact.name,
                                 displayId = displayId,
                                 size = 40.dp,
+                                photoBytes = avatarBytesByUserId[displayId],
                             )
                             Spacer(modifier = Modifier.width(12.dp))
                             Text(
