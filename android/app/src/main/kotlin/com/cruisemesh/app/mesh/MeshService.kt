@@ -136,6 +136,17 @@ private const val DIGEST_CARRIED_MSG_IDS_LIMIT: ULong = 512uL
 private const val OWN_OUTBOUND_SPRAY_BUDGET_BYTES: Long = 256L * 1024
 
 /**
+ * BLE_1TO1_MULING.md §6 follow-up: bounded per-digest-exchange budget
+ * (sealed-byte size) for spraying our own still-undelivered outgoing receipt
+ * envelopes to a mule so it can carry them back toward the original message
+ * senders. Receipts are tiny (a fixed cumulative watermark, no message body),
+ * so this is far smaller than [OWN_OUTBOUND_SPRAY_BUDGET_BYTES] -- 64 KiB is
+ * hundreds of receipts, a backstop against a pathological backlog rather than
+ * a normal-case limiter.
+ */
+private const val OWN_RECEIPT_SPRAY_BUDGET_BYTES: Long = 64L * 1024
+
+/**
  * Runs both BLE GATT roles simultaneously (DESIGN.md §5.2) so this device can
  * be discovered by, and discover, any other CruiseMesh phone in range.
  *
@@ -1197,6 +1208,7 @@ class MeshService : Service() {
         }
         sprayCarriedEnvelopesTo(address, resolvedPeerUserId, recentMsgIds)
         sprayOwnPendingOutboundTo(address, resolvedPeerUserId, recentMsgIds, identity)
+        sprayOwnPendingReceiptsTo(address, resolvedPeerUserId, recentMsgIds)
         if (contact == null) {
             Log.i(TAG, "DIGEST from unrecognized userId=${UserIdHex.encode(resolvedPeerUserId)}; sprayed carry queue only")
         }
@@ -1247,6 +1259,56 @@ class MeshService : Service() {
             }
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to spray own pending outbound to $address: ${e.message}")
+        }
+    }
+
+    /**
+     * BLE_1TO1_MULING.md §6 follow-up: offers this digest peer our own
+     * still-undelivered outgoing receipt envelopes -- the DELIVERED/READ acks
+     * we owe the original *senders* of messages we've received -- so a mule
+     * can carry them back toward those senders. Without this, a message
+     * delivered over a pure-offline A -> mule -> C hop lands on C but C's
+     * receipt only reaches A via relay upload or a direct A<->C link, so A's
+     * tick can stay "sent" indefinitely even though C got and read it.
+     *
+     * The receipt envelopes are already sealed to the sender with a
+     * recipient-keyed hint (see [buildOutgoingReceiptEnvelope]), so a mule
+     * that isn't the sender treats them exactly like any other foreign
+     * envelope: it can't open them, floods and family-carries them onward via
+     * the shipped [processInboundEnvelope] -> [carryForeignEnvelope] path, and
+     * hands them off when it meets the sender -- no protocol or core change,
+     * mirroring how Hook B reuses that same downstream pipeline for messages.
+     *
+     * Receipts owed to [peerUserId] itself are excluded: [syncReceiptsFirst]
+     * already delivered those directly on this same digest exchange.
+     */
+    private fun sprayOwnPendingReceiptsTo(
+        address: String,
+        peerUserId: ByteArray,
+        peerKnownMsgIds: List<ByteArray>,
+    ) {
+        val now = System.currentTimeMillis()
+        try {
+            val peerKnownHex = peerKnownMsgIds.mapTo(mutableSetOf()) { UserIdHex.encode(it) }
+            val toSpray = OwnReceiptSpraySelector.select(
+                store.pendingRelayOutgoingReceiptEnvelopes(RELAY_BATCH_LIMIT, now),
+                peerUserId,
+                peerKnownHex,
+                now,
+                OWN_RECEIPT_SPRAY_BUDGET_BYTES,
+            )
+            if (toSpray.isEmpty()) return
+            var sprayed = 0
+            for (envelope in toSpray) {
+                if (MeshRouter.sendToAddress(address, encodeOutgoingReceiptEnvelopeFrame(envelope))) {
+                    sprayed++
+                }
+            }
+            if (sprayed > 0) {
+                Log.i(TAG, "Sprayed $sprayed own pending receipt envelope(s) to mule $address")
+            }
+        } catch (e: CoreException) {
+            Log.w(TAG, "Failed to spray own pending receipts to $address: ${e.message}")
         }
     }
 

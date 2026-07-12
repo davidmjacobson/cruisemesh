@@ -4,8 +4,8 @@
 fleet verification.** Hooks A and B (§3) and the seenIds restart hardening
 (§5) are coded and unit-tested (§7); the 3-phone fleet test plan in §7 has
 not been run yet. Companion doc: `CONNECTIVITY_INDICATOR.md` (which assumes
-this fix ships first — see §8). Follow-up tracked in GitHub issue: receipts
-still don't mule (§6).
+this fix ships first — see §8). The receipt-muling follow-up (GitHub issue
+#20) is now also implemented as Hook C (§6).
 
 ## 1. The bug (still open as of 2026-07-11)
 
@@ -165,17 +165,66 @@ joining receipts), **not** part of this change.
   `outbound_envelopes` too and get muled by Hook B. That's desirable
   (friending someone who's out of range works via a mule) — no special-casing.
 
-## 6. Known limitation: receipts still don't mule (follow-up, separate PR)
+## 6. Receipt muling — implemented (2026-07-12, GitHub issue #20)
+
+**Status: implemented (branch `agent/ble-receipt-muling`), pending fleet
+verification.** Originally deferred (below) so message-path muling could be
+validated on the fleet first; now built with the same shape as Hook B.
+
+### 6.1 The gap it closes
 
 After a mule delivers the message, the recipient's DELIVERED/READ receipt
-travels only via relay upload or a *direct* link back to the sender. In a
-pure-offline multi-hop scenario the message arrives but the sender's tick can
-stay "sent". Delivery itself is fixed by this doc; tick freshness is not.
+previously travelled only via relay upload or a *direct* link back to the
+sender. In a pure-offline A → mule → C hop the message arrives but the
+sender's tick stays "sent" — delivery was fixed by §3, tick freshness was not.
 
-Follow-up with the same shape as Hook B: spray
-`store.pendingRelayOutgoingReceiptEnvelopes` (they're tiny) to digest peers,
-letting mules flood/carry them back. Do it as a second PR so the message-path
-change gets validated on the fleet first.
+### 6.2 The fix: Hook C (digest-time receipt spray)
+
+`sprayOwnPendingReceiptsTo(address, peerUserId, peerKnownMsgIds)` in
+`MeshService`, called from `handleDigest` right after `sprayOwnPendingOutboundTo`.
+It offers the digest peer our own `store.pendingRelayOutgoingReceiptEnvelopes`
+(the un-posted, unexpired receipt queue) so the peer can mule them back toward
+the original message senders:
+
+```
+pending = store.pendingRelayOutgoingReceiptEnvelopes(RELAY_BATCH_LIMIT, now)
+for env in pending (oldest first):
+    skip if env.recipientUserId == peerUserId   // syncReceiptsFirst already sent it directly
+    skip if env.expiry <= now
+    skip if env.msgId ∈ peerKnownMsgIds          // peer already carries it
+    skip if byte budget exhausted
+    MeshRouter.sendToAddress(address, encodeOutgoingReceiptEnvelopeFrame(env))
+```
+
+- **No new machinery.** Receipt envelopes are *already* sealed to the sender
+  with a recipient-keyed hint (`buildOutgoingReceiptEnvelope`), so a mule that
+  isn't the sender treats them exactly like any other foreign envelope: can't
+  open → floods + family-carries via the shipped `processInboundEnvelope` →
+  `carryForeignEnvelope` path → drains on meeting the sender. No protocol, no
+  frame type, no core/Rust change — same reuse property as Hook B.
+- **Terminal condition:** `pendingRelayOutgoingReceiptEnvelopes` already
+  excludes relay-posted and expired rows, so a receipt stops being sprayed
+  once it reaches a relay (the durable path took over) or ages out.
+- **Selection logic** is a pure, unit-tested function `OwnReceiptSpraySelector`
+  (mirrors `OwnOutboundSpraySelector`): excludes the peer's own receipts,
+  expired, peer-known msgIds; oldest-first byte budget
+  `OWN_RECEIPT_SPRAY_BUDGET_BYTES = 64 KiB` (receipts are tiny — this is a
+  backstop, not a normal-case limiter).
+- **`seenIds` hardening reuse:** `buildOutgoingReceiptEnvelope` already records
+  each receipt's `msgId` in `GossipState.seenIds`, so a mule flooding our own
+  receipt back is dropped as SEEN (same protection as §5 for messages).
+
+### 6.3 Testing
+
+Unit: `OwnReceiptSpraySelectorTest` — excludes peer's own receipts; excludes
+expired (boundary = expired); excludes peer-known msgIds; respects byte budget
+oldest-first; empty when nothing pending. (Runs without the host core lib —
+pure data-class construction, no FFI.)
+
+Fleet (continues §7's scenario 2, the pure-offline hop): after B mules A's
+message to C and C reads it, B should carry C's DELIVERED/READ receipt back to
+A on their next reconnect — A's tick advances to delivered/read without any
+phone touching the internet.
 
 ## 7. Testing
 
