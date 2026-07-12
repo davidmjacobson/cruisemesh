@@ -265,3 +265,37 @@ to 16.dp screen margins.
 
 Everything else (reaction encode/decode, `ReactionRow`, dialogs, theme,
 mesh code) is untouched.
+
+## 10. Keyboard freeze — follow-up fix (2026-07-12, PR #33)
+
+The shipped overlay flickered when opened with the keyboard up: opening it
+hides the IME, the chat Scaffold's content insets include the IME, so the
+whole conversation (bottom-pinned list + composer) re-laid-out every frame
+of the hide animation and chased the keyboard down the screen behind the
+half-transparent scrim — with the bright bubble copy visibly detaching from
+its dimmed original. Same in reverse on dismissal. Signal keeps the pressed
+bubble exactly where it is while the background dims and the keyboard slides
+away.
+
+Fix: `OverlayKeyboardFreeze` (shared by both chat screens).
+
+- `onOverlayOpened()` captures the live IME bottom inset, then hides the
+  keyboard.
+- While frozen, the content column adds
+  `windowInsetsPadding(WindowInsets(bottom = captured).exclude(ime))` below
+  the Scaffold padding: bottom padding = (captured − live IME), so the total
+  bottom inset is constant while the keyboard animates out, sits closed, and
+  animates back in — the conversation never moves a pixel under the scrim.
+  Evaluated at layout time; adds no per-frame recomposition.
+- `onOverlayClosed()` re-shows the keyboard only if it was open at press
+  time (the old unconditional `show()` could pop the keyboard open after a
+  long-press in a keyboard-closed chat).
+- `releaseWhenKeyboardReturns()` (LaunchedEffect on overlay close) drops the
+  freeze once the returning keyboard reaches its captured height — a visual
+  no-op — with a 1 s fallback timeout if it never returns.
+
+Tests: `OverlayKeyboardFreezeTest` (JVM) — inset math holds the total
+constant, keyboard-closed no-op, conditional re-show, all three release
+paths. Manual checklist addition: long-press with keyboard open — bubble
+must not move while the keyboard slides away, and dismissal must be equally
+stable.
