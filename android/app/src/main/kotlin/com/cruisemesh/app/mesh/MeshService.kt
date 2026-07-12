@@ -89,6 +89,12 @@ private const val KIND_PROFILE_SYNC: UByte = 5u
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
 private const val RECEIPT_TYPE_READ: UByte = 2u
 
+internal fun bluetoothAudioConnectedFromProfileState(state: Int): Boolean? = when (state) {
+    BluetoothProfile.STATE_CONNECTED -> true
+    BluetoothProfile.STATE_DISCONNECTED -> false
+    else -> null
+}
+
 /** DESIGN.md §5.3: hop budget a freshly authored envelope's §6.4 header starts with. Mirrors core's `DEFAULT_HOP_TTL`. */
 private const val DEFAULT_HOP_TTL: UByte = 7u
 
@@ -208,7 +214,10 @@ class MeshService : Service() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val action = intent?.action ?: return
             val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)
-            refreshBluetoothAudioStatus("$action state=$state")
+            refreshBluetoothAudioStatus(
+                "$action state=$state",
+                bluetoothAudioConnectedFromProfileState(state),
+            )
         }
     }
     /**
@@ -923,12 +932,11 @@ class MeshService : Service() {
      * [A2dpAudioBackoff] is reused purely as a connect/disconnect transition
      * detector here; its Mode names predate this policy change.
      */
-    private fun refreshBluetoothAudioStatus(reason: String) {
-        val connected = when (a2dpAudioBackoff.update(isA2dpConnected())) {
-            A2dpAudioBackoff.Mode.ACTIVE -> false
-            A2dpAudioBackoff.Mode.PAUSED_FOR_A2DP -> true
-            null -> return
-        }
+    private fun refreshBluetoothAudioStatus(reason: String, observedConnected: Boolean? = null) {
+        val connected = observedConnected ?: isA2dpConnected()
+        val changedMode = a2dpAudioBackoff.update(connected)
+        if (changedMode == null && bluetoothAudioConnected == connected) return
+
         bluetoothAudioConnected = connected
         MeshRuntimeStatus.setBluetoothAudioConnected(connected)
         Log.i(
