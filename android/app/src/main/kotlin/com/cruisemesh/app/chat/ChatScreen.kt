@@ -22,10 +22,14 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.exclude
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -445,6 +449,11 @@ private fun ConversationScreen(
 
     Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
+        // IME is excluded here and applied once, ourselves, via
+        // keyboardFreeze.insets below -- see OverlayKeyboardFreeze for why
+        // layering our own inset on top of Scaffold's (still-live) IME inset
+        // doesn't work.
+        contentWindowInsets = WindowInsets.safeDrawing.exclude(WindowInsets.ime),
         topBar = {
             ConversationTopBar(
                 contact = contact,
@@ -458,9 +467,6 @@ private fun ConversationScreen(
             )
         }
     ) { innerPadding ->
-        // Scaffold's contentWindowInsets (safeDrawing) already include IME, so
-        // do not also call imePadding() here — that double-counts keyboard height
-        // and leaves a large blank gap above the soft keyboard.
         Column(
             modifier = Modifier
                 .fillMaxSize()

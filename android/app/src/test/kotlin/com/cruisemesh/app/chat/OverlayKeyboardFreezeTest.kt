@@ -39,13 +39,16 @@ class OverlayKeyboardFreezeTest {
     ) = OverlayKeyboardFreeze(keyboard, ime, density, releaseTimeoutMs)
 
     @Test
-    fun `insets are zero while not frozen even with the keyboard open`() {
-        val freeze = freezeOf(FakeKeyboard(), FakeImeInsets(bottom = 300))
-        assertEquals(0, freeze.insets.getBottom(density))
+    fun `insets mirror the live ime while not frozen`() {
+        val ime = FakeImeInsets(bottom = 300)
+        val freeze = freezeOf(FakeKeyboard(), ime)
+        assertEquals(300, freeze.insets.getBottom(density))
+        ime.bottom = 120
+        assertEquals(120, freeze.insets.getBottom(density))
     }
 
     @Test
-    fun `open captures keyboard height and keeps total bottom inset constant as ime hides`() {
+    fun `open captures keyboard height and pins the inset there regardless of live ime`() {
         val keyboard = FakeKeyboard()
         val ime = FakeImeInsets(bottom = 300)
         val freeze = freezeOf(keyboard, ime)
@@ -53,10 +56,11 @@ class OverlayKeyboardFreezeTest {
         freeze.onOverlayOpened()
 
         assertEquals(1, keyboard.hideCalls)
-        // Mid-hide and fully hidden: freeze tops the live inset back up to 300.
-        assertEquals(0, freeze.insets.getBottom(density))
+        // Frozen: the inset stays pinned at the captured value no matter what
+        // the live ime does mid-animation, at rest closed, or moving again.
+        assertEquals(300, freeze.insets.getBottom(density))
         ime.bottom = 120
-        assertEquals(180, freeze.insets.getBottom(density))
+        assertEquals(300, freeze.insets.getBottom(density))
         ime.bottom = 0
         assertEquals(300, freeze.insets.getBottom(density))
     }

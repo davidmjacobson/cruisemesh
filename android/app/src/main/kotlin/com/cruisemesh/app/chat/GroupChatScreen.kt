@@ -6,10 +6,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.exclude
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -151,6 +155,11 @@ fun GroupChatScreen(
 
     Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
+        // IME is excluded here and applied once, ourselves, via
+        // keyboardFreeze.insets below -- see OverlayKeyboardFreeze for why
+        // layering our own inset on top of Scaffold's (still-live) IME inset
+        // doesn't work.
+        contentWindowInsets = WindowInsets.safeDrawing.exclude(WindowInsets.ime),
         topBar = {
             GroupConversationTopBar(
                 group = group,
@@ -161,8 +170,6 @@ fun GroupChatScreen(
             )
         },
     ) { innerPadding ->
-        // Scaffold already applies safeDrawing (incl. IME) via innerPadding.
-        // Extra imePadding() double-counts keyboard height above the soft keyboard.
         Column(
             modifier = Modifier
                 .fillMaxSize()
