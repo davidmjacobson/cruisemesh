@@ -58,6 +58,13 @@ class ChatListLogicTest {
     }
 
     @Test
+    fun unreadBadgeTextCapsAtNinetyNinePlus() {
+        assertEquals("0", ChatListLogic.unreadBadgeText(0))
+        assertEquals("12", ChatListLogic.unreadBadgeText(12))
+        assertEquals("99+", ChatListLogic.unreadBadgeText(120))
+    }
+
+    @Test
     fun computeUnreadClearsOnMaxWatermarkButStallsOnContiguousWatermark() {
         // Regression shape for the highestContiguousLamport -> highestLamport
         // fix (MeshService.handleChatViewed etc.): a peer's stream can

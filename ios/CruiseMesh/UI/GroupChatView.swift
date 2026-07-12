@@ -32,7 +32,7 @@ struct GroupChatView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(Array(visible.enumerated()), id: \.offset) { index, message in
+                            ForEach(Array(visible.enumerated()), id: \.element.stableGroupRowId) { index, message in
                                 GroupMessageRow(
                                     message: message,
                                     isOwn: message.senderUserId == identity.userId,
@@ -71,17 +71,27 @@ struct GroupChatView: View {
 
             HStack(alignment: .center, spacing: 8) {
                 TextField("Message", text: $draft, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
                     .lineLimit(1...4)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(Color(uiColor: .secondarySystemBackground))
+                    )
 
-                Button("Send") {
+                Button {
                     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !text.isEmpty else { return }
                     sender.sendText(group: group, text: text)
                     draft = ""
                     reload()
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 32, weight: .semibold))
                 }
-                .buttonStyle(.borderedProminent)
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .opacity(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.36 : 1)
+                .accessibilityLabel("Send")
             }
             .padding(12)
             .background(.bar)
@@ -92,7 +102,7 @@ struct GroupChatView: View {
             ToolbarItem(placement: .principal) {
                 Button { showDetails = true } label: {
                     HStack {
-                        AvatarView(userId: group.id, name: group.name, size: 32)
+                        AvatarView(userId: group.id, name: group.name, size: 32, isGroup: true)
                         VStack(alignment: .leading) {
                             Text(group.name)
                                 .font(.headline)
@@ -249,7 +259,7 @@ private struct GroupMessageRow: View {
     private func timeLabel(_ ms: Int64) -> String {
         let f = DateFormatter()
         f.dateFormat = "h:mm a"
-        f.locale = Locale(identifier: "en_US")
+        f.locale = .current
         return f.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000))
     }
 }
@@ -283,5 +293,11 @@ private struct GroupDetailsSheet: View {
                 }
             }
         }
+    }
+}
+
+private extension StoredMessage {
+    var stableGroupRowId: String {
+        "\(UserIdHex.encode(senderUserId))-\(lamport)-\(kind)"
     }
 }

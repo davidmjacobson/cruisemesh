@@ -35,8 +35,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
@@ -616,7 +616,7 @@ private fun ConversationScreen(
         val infoTick = if (infoIsOwn) tickStatusFor(currentInfoMessage.lamport, deliveredThrough, readThrough) else null
         AlertDialog(
             onDismissRequest = { infoMessage = null },
-            title = { Text("Message Info") },
+            title = { Text("Message info") },
             text = { Text(messageInfoText(currentInfoMessage, infoIsOwn, infoTick)) },
             confirmButton = {
                 TextButton(onClick = { infoMessage = null }) { Text("OK") }
@@ -872,7 +872,7 @@ private fun ConversationTopBar(
         navigationIcon = {
             IconButton(onClick = onBack) {
                 Icon(
-                    imageVector = Icons.Default.ArrowBack,
+                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                     contentDescription = "Back",
                 )
             }
@@ -918,7 +918,7 @@ private fun ConversationTopBar(
 @Composable
 private fun DaySeparator(timestampMs: Long) {
     val label = remember(timestampMs) {
-        java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US).format(java.util.Date(timestampMs))
+        java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.getDefault()).format(java.util.Date(timestampMs))
     }
     Box(
         modifier = Modifier
@@ -943,7 +943,7 @@ private fun GapIndicator() {
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            text = "some messages may still be in transit",
+            text = "Some messages are still making their way across the ship",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
         )
@@ -1014,7 +1014,7 @@ private fun MessageBubble(
     if (showLegend && tick != null) {
         AlertDialog(
             onDismissRequest = { showLegend = false },
-            title = { Text("Message Status") },
+            title = { Text("Message status") },
             text = {
                 Text(tickLegendText(tick))
             },
@@ -1161,11 +1161,11 @@ private fun messageCopyText(message: StoredMessage): String =
 fun messageInfoText(message: StoredMessage, isOwn: Boolean, tick: TickStatus?): String {
     val sentAt = java.text.SimpleDateFormat(
         "MMMM d, yyyy h:mm a",
-        java.util.Locale.US,
+        java.util.Locale.getDefault(),
     ).format(java.util.Date(message.timestamp))
     val direction = if (isOwn) "Sent by you" else "Received"
     val status = tick?.let { "\nStatus: ${tickLegendText(it)}" }.orEmpty()
-    return "$direction\nTime: $sentAt\nLamport: ${message.lamport}$status"
+    return "$direction\nTime: $sentAt$status"
 }
 
 @Composable

@@ -7,6 +7,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
@@ -17,6 +18,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.contentDescription
@@ -38,13 +40,18 @@ fun AvatarBadge(
     photoPath: String? = null,
     photoBytes: ByteArray? = null,
     reachability: ReachabilityLevel? = null,
+    isGroup: Boolean = false,
 ) {
     val (avatarColor, initials) = remember(userId, name, displayId) {
         ChatListLogic.avatarHueAndInitials(userId, name, displayId)
     }
     val contentColor = remember(avatarColor) { ChatListLogic.avatarTextColor(avatarColor) }
-    val contentDescription = remember(name, displayId, reachability) {
-        val base = ChatListLogic.avatarContentDescription(name, displayId)
+    val contentDescription = remember(name, displayId, reachability, isGroup) {
+        val base = if (isGroup) {
+            "Group avatar for ${ChatListLogic.displayNameOrId(name, displayId)}"
+        } else {
+            ChatListLogic.avatarContentDescription(name, displayId)
+        }
         val suffix = reachability?.let { ContactReachability.contentDescriptionSuffix(it) }
         if (suffix != null) "$base. $suffix" else base
     }
@@ -58,6 +65,7 @@ fun AvatarBadge(
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
         }
     }
+    val displayedBitmap = if (isGroup) null else avatarBitmap
 
     Box(modifier = modifier.size(size)) {
         Surface(
@@ -65,18 +73,20 @@ fun AvatarBadge(
                 .fillMaxSize()
                 .semantics { this.contentDescription = contentDescription },
             shape = CircleShape,
-            color = if (avatarBitmap == null) avatarColor else MaterialTheme.colorScheme.surface,
+            color = if (displayedBitmap == null) avatarColor else MaterialTheme.colorScheme.surface,
             contentColor = contentColor,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)),
         ) {
             Box(contentAlignment = Alignment.Center) {
-                if (avatarBitmap != null) {
+                if (displayedBitmap != null) {
                     Image(
-                        bitmap = avatarBitmap,
+                        bitmap = displayedBitmap,
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),
                     )
+                } else if (isGroup) {
+                    GroupAvatarGlyph(size = size, color = contentColor)
                 } else {
                     Text(
                         text = initials,
@@ -106,5 +116,27 @@ fun AvatarBadge(
                     .border(width = 2.dp, color = if (isHollow) dotColor else borderColor, shape = CircleShape),
             )
         }
+    }
+}
+
+@Composable
+private fun GroupAvatarGlyph(size: Dp, color: Color) {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Surface(
+            modifier = Modifier
+                .offset(x = size * -0.10f, y = size * 0.06f)
+                .size(size * 0.36f),
+            shape = CircleShape,
+            color = color.copy(alpha = 0.86f),
+            border = BorderStroke(1.dp, color.copy(alpha = 0.36f)),
+        ) {}
+        Surface(
+            modifier = Modifier
+                .offset(x = size * 0.12f, y = size * -0.06f)
+                .size(size * 0.44f),
+            shape = CircleShape,
+            color = color,
+            border = BorderStroke(1.dp, color.copy(alpha = 0.36f)),
+        ) {}
     }
 }

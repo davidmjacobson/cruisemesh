@@ -81,6 +81,9 @@ struct ChatListView: View {
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, 32)
+                        Button("Add a friend") { showFriends = true }
+                            .buttonStyle(.borderedProminent)
+                            .padding(.top, 6)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
@@ -164,21 +167,6 @@ struct ChatListView: View {
                     .padding(.vertical, 6)
                 }
             }
-            .overlay(alignment: .bottomTrailing) {
-                Menu {
-                    Button("New message") { showFriends = true }
-                    Button("New group") { showNewGroup = true }
-                } label: {
-                    Image(systemName: "square.and.pencil")
-                        .font(.title2.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 56, height: 56)
-                        .background(Circle().fill(Color.accentColor))
-                        .shadow(radius: 4)
-                }
-                .padding(20)
-                .accessibilityLabel("New chat")
-            }
             .sheet(isPresented: $showFriends) {
                 FriendsView(identity: identity, appModel: appModel) {
                     showFriends = false
@@ -194,12 +182,8 @@ struct ChatListView: View {
             .sheet(isPresented: $showProfile) {
                 ProfileView(identity: identity, appModel: appModel)
             }
-            .alert("Mesh", isPresented: $showMeshHelp) {
-                Button("Start mesh") { appModel.startMesh() }
-                Button("Stop mesh", role: .destructive) { appModel.stopMesh() }
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(MeshRuntimeStatus.shared.pillText + "\n\nOpen the app when you sit down with family so phones can sync over Bluetooth.")
+            .sheet(isPresented: $showMeshHelp) {
+                MeshStatusSheet(appModel: appModel)
             }
             .onAppear {
                 reload()
@@ -313,11 +297,12 @@ private struct ChatRowView: View {
                 userId: summary.chatId,
                 name: summary.title,
                 size: 48,
-                photo: summary.avatarData.flatMap { UIImage(data: $0) }
+                photo: summary.avatarData.flatMap { UIImage(data: $0) },
+                isGroup: summary.isGroup
             )
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(summary.isGroup ? "👥 \(displayName)" : displayName)
+                    Text(displayName)
                         .font(.headline)
                         .fontWeight(summary.unreadCount > 0 ? .bold : .semibold)
                     Spacer()
@@ -344,7 +329,7 @@ private struct ChatRowView: View {
                     }
                     Spacer()
                     if summary.unreadCount > 0 {
-                        Text("\(summary.unreadCount)")
+                        Text(unreadBadgeText(summary.unreadCount))
                             .font(.caption2.bold())
                             .foregroundStyle(.white)
                             .padding(.horizontal, 7)
@@ -356,4 +341,107 @@ private struct ChatRowView: View {
         }
         .padding(.vertical, 4)
     }
+}
+
+private struct MeshStatusSheet: View {
+    @ObservedObject var appModel: AppModel
+    @ObservedObject private var runtime = MeshRuntimeStatus.shared
+    @Environment(\.dismiss) private var dismiss
+
+    private var meshOn: Binding<Bool> {
+        Binding(
+            get: {
+                if case .stopped = runtime.state { return false }
+                return true
+            },
+            set: { enabled in
+                if enabled {
+                    appModel.startMesh()
+                } else {
+                    appModel.stopMesh()
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Current status") {
+                    HStack {
+                        StatusDot(color: dotColor(for: runtime.state))
+                        Text(runtime.pillText)
+                    }
+                    Toggle("Mesh running", isOn: meshOn)
+                }
+                Section("Reachability dots") {
+                    LegendRow(color: .green, label: "Nearby", detail: "Direct Bluetooth link")
+                    LegendRow(color: .blue, label: "Relay", detail: "Online through relay")
+                    LegendRow(color: .orange, label: "Recent", detail: "Seen recently")
+                    LegendRow(color: .orange, hollow: true, label: "Carried", detail: "Nearby phones may carry messages")
+                    LegendRow(color: .gray, label: "Offline", detail: "No recent route")
+                }
+                Section {
+                    Text("Open the app when you sit down with family so phones can sync over Bluetooth.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Mesh status")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private func dotColor(for state: MeshRuntimeState) -> Color {
+        switch state {
+        case .stopped: return .gray
+        case .starting: return .orange
+        case .meshing: return .green
+        case .pausedForBluetoothAudio: return .yellow
+        case .syncingViaRelay: return .blue
+        }
+    }
+}
+
+private struct LegendRow: View {
+    let color: Color
+    var hollow = false
+    let label: String
+    let detail: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            StatusDot(color: color, hollow: hollow)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct StatusDot: View {
+    let color: Color
+    var hollow = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(hollow ? Color.clear : color)
+            Circle()
+                .stroke(color, lineWidth: hollow ? 2 : 0)
+        }
+        .frame(width: 12, height: 12)
+    }
+}
+
+private func unreadBadgeText(_ count: Int) -> String {
+    count > 99 ? "99+" : "\(max(0, count))"
 }

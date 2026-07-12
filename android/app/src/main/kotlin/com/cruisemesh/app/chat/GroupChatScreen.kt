@@ -17,7 +17,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -340,7 +340,7 @@ fun GroupChatScreen(
     if (currentInfoMessage != null) {
         AlertDialog(
             onDismissRequest = { infoMessage = null },
-            title = { Text("Message Info") },
+            title = { Text("Message info") },
             text = { Text(messageInfoText(currentInfoMessage, currentInfoMessage.senderUserId.contentEquals(ownUserId), null)) },
             confirmButton = {
                 TextButton(onClick = { infoMessage = null }) { Text("OK") }
@@ -361,7 +361,7 @@ private fun GroupConversationTopBar(
     TopAppBar(
         navigationIcon = {
             IconButton(onClick = onBack) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
         },
         title = {
@@ -374,6 +374,7 @@ private fun GroupConversationTopBar(
                     name = group.name,
                     displayId = group.name,
                     size = 36.dp,
+                    isGroup = true,
                 )
                 Spacer(modifier = Modifier.width(12.dp))
                 Column(

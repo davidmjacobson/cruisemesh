@@ -19,6 +19,7 @@ struct ChatView: View {
     @State private var confirmDelete = false
     @State private var photoItem: PhotosPickerItem?
     @State private var showCamera = false
+    @State private var pendingPhoto: Data?
     @State private var statusMessage: String?
     @State private var cancellable: AnyCancellable?
     @State private var voiceRecorder = VoiceRecorder()
@@ -43,7 +44,7 @@ struct ChatView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 4) {
-                            ForEach(Array(visible.enumerated()), id: \.offset) { index, message in
+                            ForEach(Array(visible.enumerated()), id: \.element.stableRowId) { index, message in
                                 if isNewDay(index) {
                                     Text(dayLabel(message.timestamp))
                                         .font(.caption2)
@@ -71,12 +72,13 @@ struct ChatView: View {
                                         lamport: message.lamport,
                                         kind: message.kind
                                     ).stableKey] ?? [],
+                                    grouping: messageGrouping(at: index),
                                     onStatus: { statusMessage = $0 },
                                     onReact: { emoji in
                                         sendReaction(to: message, emoji: emoji)
                                     }
                                 )
-                                .id(message.lamport)
+                                .id(message.stableRowId)
                             }
                         }
                         .padding(.horizontal, 12)
@@ -93,34 +95,48 @@ struct ChatView: View {
                 }
             }
 
-            HStack(alignment: .center, spacing: 8) {
-                Menu {
-                    PhotosPicker(selection: $photoItem, matching: .images) {
-                        Label("Photo library", systemImage: "photo")
+            VStack(spacing: 8) {
+                if let pendingPhoto {
+                    PendingPhotoPreview(jpeg: pendingPhoto) {
+                        self.pendingPhoto = nil
                     }
-                    Button { showCamera = true } label: {
-                        Label("Take photo", systemImage: "camera")
-                    }
-                    Button { showVoice = true } label: {
-                        Label("Voice memo", systemImage: "mic")
-                    }
-                } label: {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.title2)
                 }
+                HStack(alignment: .bottom, spacing: 8) {
+                    Menu {
+                        PhotosPicker(selection: $photoItem, matching: .images) {
+                            Label("Photo library", systemImage: "photo")
+                        }
+                        Button { showCamera = true } label: {
+                            Label("Take photo", systemImage: "camera")
+                        }
+                        Button { showVoice = true } label: {
+                            Label("Voice memo", systemImage: "mic")
+                        }
+                    } label: {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.system(size: 28))
+                    }
+                    .accessibilityLabel("Attach")
 
-                TextField("Message", text: $draft, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .lineLimit(1...4)
+                    TextField("Message", text: $draft, axis: .vertical)
+                        .lineLimit(1...4)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color(uiColor: .secondarySystemBackground))
+                        )
 
-                Button("Send") {
-                    let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !text.isEmpty else { return }
-                    sender.sendText(contact: contact, text: text)
-                    draft = ""
-                    reload()
+                    Button {
+                        sendCurrentDraft()
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 32, weight: .semibold))
+                    }
+                    .disabled(!canSend)
+                    .opacity(canSend ? 1 : 0.36)
+                    .accessibilityLabel("Send")
                 }
-                .buttonStyle(.borderedProminent)
             }
             .padding(12)
             .background(.bar)
@@ -172,16 +188,7 @@ struct ChatView: View {
             Task {
                 if let data = try? await item.loadTransferable(type: Data.self),
                    let jpeg = MediaCompressor.compressImage(data: data) {
-                    sender.sendAttachment(
-                        contact: contact,
-                        attachment: AttachmentPayload(
-                            mediaType: .image,
-                            mimeType: "image/jpeg",
-                            durationMs: 0,
-                            blob: jpeg
-                        )
-                    )
-                    reload()
+                    pendingPhoto = jpeg
                 } else {
                     statusMessage = "Could not prepare photo"
                 }
@@ -191,16 +198,7 @@ struct ChatView: View {
         .sheet(isPresented: $showCamera) {
             CameraPicker { image in
                 if let jpeg = MediaCompressor.compress(image: image) {
-                    sender.sendAttachment(
-                        contact: contact,
-                        attachment: AttachmentPayload(
-                            mediaType: .image,
-                            mimeType: "image/jpeg",
-                            durationMs: 0,
-                            blob: jpeg
-                        )
-                    )
-                    reload()
+                    pendingPhoto = jpeg
                 } else {
                     statusMessage = "Could not prepare photo"
                 }
@@ -278,6 +276,36 @@ struct ChatView: View {
         }
     }
 
+    private var canSend: Bool {
+        pendingPhoto != nil || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func sendCurrentDraft() {
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let photo = pendingPhoto {
+            sender.sendAttachment(
+                contact: contact,
+                attachment: AttachmentPayload(
+                    mediaType: .image,
+                    mimeType: "image/jpeg",
+                    durationMs: 0,
+                    blob: photo,
+                    caption: text
+                )
+            )
+            pendingPhoto = nil
+            draft = ""
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            reload()
+            return
+        }
+        guard !text.isEmpty else { return }
+        sender.sendText(contact: contact, text: text)
+        draft = ""
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        reload()
+    }
+
     private func reload() {
         messages = (try? store.messagesForChat(chatId: contact.userId)) ?? []
         avatarData = (try? store.contactAvatar(userId: contact.userId)) ?? nil
@@ -340,17 +368,71 @@ struct ChatView: View {
     private func dayLabel(_ timestampMs: Int64) -> String {
         let f = DateFormatter()
         f.dateFormat = "MMMM d, yyyy"
-        f.locale = Locale(identifier: "en_US")
+        f.locale = .current
         return f.string(from: Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000))
+    }
+
+    private func messageGrouping(at index: Int) -> MessageGrouping {
+        let current = visible[index]
+        let previous = index > 0 ? visible[index - 1] : nil
+        let next = index + 1 < visible.count ? visible[index + 1] : nil
+        return MessageGrouping(
+            joinsPrevious: previous.map { shouldGroup($0, current) } ?? false,
+            joinsNext: next.map { shouldGroup(current, $0) } ?? false
+        )
+    }
+
+    private func shouldGroup(_ first: StoredMessage, _ second: StoredMessage) -> Bool {
+        guard first.senderUserId == second.senderUserId else { return false }
+        let gap = second.timestamp - first.timestamp
+        guard gap >= 0 && gap <= 5 * 60 * 1000 else { return false }
+        let cal = Calendar.current
+        let a = Date(timeIntervalSince1970: TimeInterval(first.timestamp) / 1000)
+        let b = Date(timeIntervalSince1970: TimeInterval(second.timestamp) / 1000)
+        return cal.isDate(a, inSameDayAs: b)
     }
 
     private func scrollToLatest(proxy: ScrollViewProxy, animated: Bool = true) {
         guard let last = visible.last else { return }
         if animated {
-            withAnimation { proxy.scrollTo(last.lamport, anchor: .bottom) }
+            withAnimation { proxy.scrollTo(last.stableRowId, anchor: .bottom) }
         } else {
-            proxy.scrollTo(last.lamport, anchor: .bottom)
+            proxy.scrollTo(last.stableRowId, anchor: .bottom)
         }
+    }
+}
+
+private struct MessageGrouping {
+    let joinsPrevious: Bool
+    let joinsNext: Bool
+
+    var showTimestamp: Bool { !joinsNext }
+}
+
+private struct ChatBubbleShape: Shape {
+    let topLeadingRadius: CGFloat
+    let bottomLeadingRadius: CGFloat
+    let bottomTrailingRadius: CGFloat
+    let topTrailingRadius: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        let maxRadius = min(rect.width, rect.height) / 2
+        let tl = min(topLeadingRadius, maxRadius)
+        let tr = min(topTrailingRadius, maxRadius)
+        let br = min(bottomTrailingRadius, maxRadius)
+        let bl = min(bottomLeadingRadius, maxRadius)
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX + tl, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX - tr, y: rect.minY))
+        path.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.minY + tr), control: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - br))
+        path.addQuadCurve(to: CGPoint(x: rect.maxX - br, y: rect.maxY), control: CGPoint(x: rect.maxX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX + bl, y: rect.maxY))
+        path.addQuadCurve(to: CGPoint(x: rect.minX, y: rect.maxY - bl), control: CGPoint(x: rect.minX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + tl))
+        path.addQuadCurve(to: CGPoint(x: rect.minX + tl, y: rect.minY), control: CGPoint(x: rect.minX, y: rect.minY))
+        path.closeSubpath()
+        return path
     }
 }
 
@@ -360,23 +442,16 @@ private struct MessageBubbleView: View {
     let tick: TickStatus?
     let contactColor: Color
     let reactions: [ReactionSummary]
+    let grouping: MessageGrouping
     var onStatus: (String) -> Void = { _ in }
     var onReact: (String) -> Void = { _ in }
     @State private var showLegend = false
-    @State private var showMessageActions = false
     @State private var showInfo = false
 
     var body: some View {
         HStack {
             if isOwn { Spacer(minLength: 40) }
             VStack(alignment: isOwn ? .trailing : .leading, spacing: 4) {
-                if showMessageActions {
-                    ReactionActionBar { emoji in
-                        showMessageActions = false
-                        onReact(emoji)
-                    }
-                }
-
                 VStack(alignment: .leading, spacing: 6) {
                     content
                     if let tick {
@@ -388,58 +463,57 @@ private struct MessageBubbleView: View {
                 }
                 .padding(10)
                 .background(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    bubbleShape
                         .fill(isOwn ? Color.accentColor : contactColor.opacity(0.24))
                 )
                 .foregroundStyle(isOwn ? Color.white : Color.primary)
                 .onTapGesture {
-                    if showMessageActions {
-                        showMessageActions = false
-                    } else if tick != nil {
+                    if tick != nil {
                         showLegend = true
                     }
                 }
-                .onLongPressGesture {
-                    withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
-                        showMessageActions = true
-                    }
-                }
-
-                if showMessageActions {
-                    MessageActionPanel(
-                        canCopy: !messageCopyText(message).isEmpty,
-                        onCopy: {
-                            let text = messageCopyText(message)
-                            if !text.isEmpty {
-                                UIPasteboard.general.string = text
-                                onStatus("Copied")
-                            }
-                            showMessageActions = false
-                        },
-                        onInfo: {
-                            showMessageActions = false
-                            showInfo = true
+                .contextMenu {
+                    ForEach(reactionChoices, id: \.self) { emoji in
+                        Button(emoji) {
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            onReact(emoji)
                         }
-                    )
+                    }
+                    if !messageCopyText(message).isEmpty {
+                        Button {
+                            UIPasteboard.general.string = messageCopyText(message)
+                            onStatus("Copied")
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                        }
+                    }
+                    Button {
+                        showInfo = true
+                    } label: {
+                        Label("Info", systemImage: "info.circle")
+                    }
                 }
 
                 if !reactions.isEmpty {
                     ReactionPillRow(reactions: reactions, isOwn: isOwn, onReact: onReact)
                 }
 
-                Text(timeLabel(message.timestamp))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if grouping.showTimestamp {
+                    Text(timeLabel(message.timestamp))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
             if !isOwn { Spacer(minLength: 40) }
         }
-        .padding(.vertical, 2)
+        .padding(.top, grouping.joinsPrevious ? 1 : 8)
+        .padding(.bottom, grouping.joinsNext ? 1 : 4)
         .alert("Message status", isPresented: $showLegend) {
             Button("OK", role: .cancel) {}
         } message: {
             if let tick { Text(tickLegendText(tick)) }
         }
-        .alert("Message Info", isPresented: $showInfo) {
+        .alert("Message info", isPresented: $showInfo) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(messageInfoText(message: message, isOwn: isOwn, tick: tick))
@@ -470,9 +544,55 @@ private struct MessageBubbleView: View {
     private func timeLabel(_ ms: Int64) -> String {
         let f = DateFormatter()
         f.dateFormat = "h:mm a"
-        f.locale = Locale(identifier: "en_US")
+        f.locale = .current
         return f.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000))
     }
+
+    private var bubbleShape: ChatBubbleShape {
+        ChatBubbleShape(
+            topLeadingRadius: !isOwn && grouping.joinsPrevious ? 6 : 18,
+            bottomLeadingRadius: !isOwn && grouping.joinsNext ? 6 : 18,
+            bottomTrailingRadius: isOwn && grouping.joinsNext ? 6 : 18,
+            topTrailingRadius: isOwn && grouping.joinsPrevious ? 6 : 18
+        )
+    }
+}
+
+private struct PendingPhotoPreview: View {
+    let jpeg: Data
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            if let image = UIImage(data: jpeg) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 72, height: 72)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Photo ready")
+                    .font(.subheadline.weight(.semibold))
+                Text("Add a caption or send as-is.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityLabel("Remove photo")
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemBackground))
+        )
+    }
+
 }
 
 private struct ReactionActionBar: View {
@@ -548,11 +668,18 @@ private func messageCopyText(_ message: StoredMessage) -> String {
 private func messageInfoText(message: StoredMessage, isOwn: Bool, tick: TickStatus?) -> String {
     let f = DateFormatter()
     f.dateFormat = "MMMM d, yyyy h:mm a"
-    f.locale = Locale(identifier: "en_US")
+    f.locale = .current
     let sentAt = f.string(from: Date(timeIntervalSince1970: TimeInterval(message.timestamp) / 1000))
     let direction = isOwn ? "Sent by you" : "Received"
     let status = tick.map { "\nStatus: \(tickLegendText($0))" } ?? ""
-    return "\(direction)\nTime: \(sentAt)\nLamport: \(message.lamport)\(status)"
+    return "\(direction)\nTime: \(sentAt)\(status)"
+}
+
+private extension StoredMessage {
+    var stableRowId: String {
+        let sender = senderUserId.map { String(format: "%02x", $0) }.joined()
+        return "\(sender):\(lamport):\(kind)"
+    }
 }
 
 /// Chat photo: keeps native aspect ratio and offers Save via long-press.
