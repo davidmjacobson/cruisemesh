@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["core", "relayd"]
+
+[workspace.package]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/davidmjacobson/cruisemesh"
