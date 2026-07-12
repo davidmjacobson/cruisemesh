@@ -32,10 +32,8 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
@@ -66,11 +64,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -383,6 +384,8 @@ private fun ConversationScreen(
     reachabilityStatusText: String = ContactReachability.chatHeaderCopy(ReachabilityLevel.OFFLINE, null, 0L),
     reachabilityDetailsText: String = reachabilityStatusText,
 ) {
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     val listState = rememberLazyListState()
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
     val displayName = remember(contact.name, displayId) {
@@ -400,9 +403,16 @@ private fun ConversationScreen(
     }
     var showContactDetails by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var focused by remember(contact.userId) { mutableStateOf<FocusedMessage?>(null) }
+    var infoMessage by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
     // Newest-first for reverseLayout LazyColumn: index 0 sits at the bottom
     // edge (just above the composer / keyboard), empty space stays above.
     val displayMessages = remember(visibleMessages) { visibleMessages.asReversed() }
+
+    fun toggleReaction(target: MessageTarget, emoji: String) {
+        val existingOwn = reactions[target.stableKey].orEmpty().firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
+        onReact(target, if (existingOwn != null) "" else emoji)
+    }
 
     LaunchedEffect(visibleMessages.size) {
         if (visibleMessages.isNotEmpty()) {
@@ -411,6 +421,7 @@ private fun ConversationScreen(
         }
     }
 
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
         topBar = {
             ConversationTopBar(
@@ -466,14 +477,9 @@ private fun ConversationScreen(
                         grouping = grouping[index],
                         reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
                         onReact = { emoji ->
-                            val existingOwn = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey]
-                                .orEmpty()
-                                .firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
-                            onReact(
-                                MessageTarget(message.senderUserId, message.lamport, message.kind),
-                                if (existingOwn != null) "" else emoji,
-                            )
+                            toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
                         },
+                        onLongPress = { target, bounds -> focused = FocusedMessage(target, bounds) },
                     )
                 }
             }
@@ -529,6 +535,76 @@ private fun ConversationScreen(
                 TextButton(onClick = { confirmDelete = false }) {
                     Text("Cancel")
                 }
+            },
+        )
+    }
+
+    val currentFocused = focused
+    if (currentFocused != null) {
+        val focusedMessage = visibleMessages.firstOrNull {
+            MessageTarget(it.senderUserId, it.lamport, it.kind).stableKey == currentFocused.target.stableKey
+        }
+        // focusedMessage is null only if the message vanished from under us
+        // (e.g. deleted) while the overlay was open; just render nothing.
+        if (focusedMessage != null) {
+            val focusedIsOwn = focusedMessage.senderUserId.contentEquals(ownUserId)
+            val focusedIndex = visibleMessages.indexOf(focusedMessage)
+            val focusedGrouping = grouping.getOrNull(focusedIndex) ?: BubbleGrouping(joinsPrevious = false, joinsNext = false)
+            val focusedShape = bubbleShapeFor(focusedIsOwn, focusedGrouping)
+            val focusedTick = if (focusedIsOwn) tickStatusFor(focusedMessage.lamport, deliveredThrough, readThrough) else null
+            val focusedReactions = reactions[currentFocused.target.stableKey].orEmpty()
+            val focusedCopyText = remember(focusedMessage.payload, focusedMessage.kind) { messageCopyText(focusedMessage) }
+            val focusedOwnReaction = focusedReactions.firstOrNull { it.reactedByOwnUser }?.emoji
+
+            MessageFocusOverlay(
+                focused = currentFocused,
+                isOwn = focusedIsOwn,
+                canCopy = focusedCopyText.isNotBlank(),
+                ownReactionEmoji = focusedOwnReaction,
+                onDismiss = { focused = null },
+                onReact = { emoji ->
+                    toggleReaction(currentFocused.target, emoji)
+                    focused = null
+                },
+                onCopy = {
+                    if (focusedCopyText.isNotBlank()) {
+                        clipboard.setText(AnnotatedString(focusedCopyText))
+                        Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                    }
+                    focused = null
+                },
+                onInfo = {
+                    infoMessage = focusedMessage
+                    focused = null
+                },
+            ) {
+                MessageBubbleVisual(
+                    message = focusedMessage,
+                    isOwn = focusedIsOwn,
+                    tick = focusedTick,
+                    contactColor = if (focusedIsOwn) null else contactColor,
+                    shape = focusedShape,
+                    reactions = focusedReactions,
+                    onReact = { emoji ->
+                        toggleReaction(currentFocused.target, emoji)
+                        focused = null
+                    },
+                )
+            }
+        }
+    }
+    } // Box
+
+    val currentInfoMessage = infoMessage
+    if (currentInfoMessage != null) {
+        val infoIsOwn = currentInfoMessage.senderUserId.contentEquals(ownUserId)
+        val infoTick = if (infoIsOwn) tickStatusFor(currentInfoMessage.lamport, deliveredThrough, readThrough) else null
+        AlertDialog(
+            onDismissRequest = { infoMessage = null },
+            title = { Text("Message Info") },
+            text = { Text(messageInfoText(currentInfoMessage, infoIsOwn, infoTick)) },
+            confirmButton = {
+                TextButton(onClick = { infoMessage = null }) { Text("OK") }
             },
         )
     }
@@ -859,6 +935,14 @@ private fun GapIndicator() {
     }
 }
 
+/** Same corner-radius treatment 1:1 and group bubbles share: 6dp on the "joined" side, 20dp elsewhere. */
+fun bubbleShapeFor(isOwn: Boolean, grouping: BubbleGrouping): RoundedCornerShape = RoundedCornerShape(
+    topStart = if (!isOwn && grouping.joinsPrevious) 6.dp else 20.dp,
+    topEnd = if (isOwn && grouping.joinsPrevious) 6.dp else 20.dp,
+    bottomStart = if (!isOwn && grouping.joinsNext) 6.dp else 20.dp,
+    bottomEnd = if (isOwn && grouping.joinsNext) 6.dp else 20.dp,
+)
+
 @Composable
 private fun MessageBubble(
     message: StoredMessage,
@@ -868,28 +952,16 @@ private fun MessageBubble(
     grouping: BubbleGrouping,
     reactions: List<ReactionSummary> = emptyList(),
     onReact: (String) -> Unit = {},
+    onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
 ) {
-    val clipboard = LocalClipboardManager.current
-    val context = LocalContext.current
-    val bubbleColor = if (isOwn) {
-        MaterialTheme.colorScheme.primary
-    } else {
-        contactColor?.copy(alpha = 0.24f) ?: MaterialTheme.colorScheme.surfaceVariant
-    }
-    val contentColor = if (isOwn) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
-    val tickBaseColor = if (bubbleColor.luminance() > 0.5f) Color.Black else Color.White
     var showLegend by remember { mutableStateOf(false) }
-    var showMessageActions by remember { mutableStateOf(false) }
-    var showInfo by remember { mutableStateOf(false) }
-    val copyText = remember(message.payload, message.kind) { messageCopyText(message) }
+    var boundsInRoot by remember { mutableStateOf(Rect.Zero) }
     val topPadding = if (grouping.joinsPrevious) 2.dp else 10.dp
     val bottomPadding = if (grouping.joinsNext) 2.dp else 6.dp
-    val shape = RoundedCornerShape(
-        topStart = if (!isOwn && grouping.joinsPrevious) 6.dp else 20.dp,
-        topEnd = if (isOwn && grouping.joinsPrevious) 6.dp else 20.dp,
-        bottomStart = if (!isOwn && grouping.joinsNext) 6.dp else 20.dp,
-        bottomEnd = if (isOwn && grouping.joinsNext) 6.dp else 20.dp,
-    )
+    val shape = bubbleShapeFor(isOwn, grouping)
+    val target = remember(message.senderUserId, message.lamport, message.kind) {
+        MessageTarget(message.senderUserId, message.lamport, message.kind)
+    }
 
     Row(
         modifier = Modifier
@@ -897,98 +969,22 @@ private fun MessageBubble(
             .padding(top = topPadding, bottom = bottomPadding),
         horizontalArrangement = if (isOwn) Arrangement.End else Arrangement.Start,
     ) {
-        Column(
-            horizontalAlignment = if (isOwn) Alignment.End else Alignment.Start,
-            modifier = Modifier.widthIn(max = 300.dp),
-        ) {
-            if (showMessageActions) {
-                ReactionPickerBar(
-                    onReact = { emoji ->
-                        showMessageActions = false
-                        onReact(emoji)
-                    },
-                )
-            }
-
-            Surface(
-                color = bubbleColor,
-                contentColor = contentColor,
+        Column(horizontalAlignment = if (isOwn) Alignment.End else Alignment.Start) {
+            MessageBubbleVisual(
+                message = message,
+                isOwn = isOwn,
+                tick = tick,
+                contactColor = contactColor,
                 shape = shape,
-                modifier = Modifier.messageActions(
-                    onClick = {
-                        if (showMessageActions) {
-                            showMessageActions = false
-                        } else if (tick != null) {
-                            showLegend = true
-                        }
-                    },
-                    onLongClick = { showMessageActions = true },
-                ),
-            ) {
-                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-                    when (message.kind) {
-                        KIND_ATTACHMENT_MANIFEST -> {
-                            val attachment = remember(message.payload) {
-                                AttachmentPayload.decode(message.payload)
-                            }
-                            if (attachment == null) {
-                                Text("Unsupported attachment")
-                            } else {
-                                AttachmentBubbleContent(attachment = attachment, contentColor = contentColor)
-                            }
-                        }
-                        else -> {
-                            Text(message.payload.toString(Charsets.UTF_8))
-                        }
-                    }
-                    if (tick != null) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 4.dp),
-                            horizontalArrangement = Arrangement.End,
-                        ) {
-                            val tint = when (tick) {
-                                TickStatus.SENT -> tickBaseColor.copy(alpha = 0.88f)
-                                TickStatus.DELIVERED -> tickBaseColor.copy(alpha = 0.74f)
-                                TickStatus.READ -> tickBaseColor
-                            }
-                            SignalTick(
-                                status = tick,
-                                tint = tint,
-                                bubbleColor = bubbleColor,
-                                modifier = Modifier.padding(start = 8.dp, bottom = 2.dp),
-                            )
-                        }
-                    }
-                }
-            }
-
-            if (reactions.isNotEmpty()) {
-                ReactionRow(
-                    reactions = reactions,
-                    isOwn = isOwn,
-                    onReact = onReact,
-                )
-            }
-
-            if (showMessageActions) {
-                MessageActionPanel(
-                    canCopy = copyText.isNotBlank(),
-                    onCopy = {
-                        showMessageActions = false
-                        if (copyText.isNotBlank()) {
-                            clipboard.setText(AnnotatedString(copyText))
-                            Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
-                        }
-                    },
-                    onInfo = {
-                        showMessageActions = false
-                        showInfo = true
-                    },
-                )
-            }
-
+                reactions = reactions,
+                onReact = onReact,
+                modifier = Modifier
+                    .onGloballyPositioned { coords -> boundsInRoot = coords.boundsInRoot() }
+                    .messageActions(
+                        onClick = { if (tick != null) showLegend = true },
+                        onLongClick = { onLongPress(target, boundsInRoot) },
+                    ),
+            )
             if (grouping.showTimestamp) {
                 Text(
                     text = formatConversationTimestamp(message.timestamp),
@@ -1012,24 +1008,94 @@ private fun MessageBubble(
             }
         )
     }
+}
 
-    if (showInfo) {
-        AlertDialog(
-            onDismissRequest = { showInfo = false },
-            title = { Text("Message Info") },
-            text = {
-                Text(messageInfoText(message, isOwn, tick))
-            },
-            confirmButton = {
-                TextButton(onClick = { showInfo = false }) { Text("OK") }
-            },
-        )
+/**
+ * The bubble's visual only -- Surface with its content plus the reaction
+ * chips below, no click handling. Used both by the list item ([MessageBubble])
+ * and by [MessageFocusOverlay]'s undimmed floating copy, so the two render
+ * pixel-identically (MESSAGE_LONGPRESS_OVERLAY.md §4).
+ */
+@Composable
+fun MessageBubbleVisual(
+    message: StoredMessage,
+    isOwn: Boolean,
+    tick: TickStatus?,
+    contactColor: Color?,
+    shape: RoundedCornerShape,
+    reactions: List<ReactionSummary>,
+    onReact: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val bubbleColor = if (isOwn) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        contactColor?.copy(alpha = 0.24f) ?: MaterialTheme.colorScheme.surfaceVariant
+    }
+    val contentColor = if (isOwn) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+    val tickBaseColor = if (bubbleColor.luminance() > 0.5f) Color.Black else Color.White
+
+    Column(
+        horizontalAlignment = if (isOwn) Alignment.End else Alignment.Start,
+        modifier = modifier.widthIn(max = 300.dp),
+    ) {
+        Surface(
+            color = bubbleColor,
+            contentColor = contentColor,
+            shape = shape,
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                when (message.kind) {
+                    KIND_ATTACHMENT_MANIFEST -> {
+                        val attachment = remember(message.payload) {
+                            AttachmentPayload.decode(message.payload)
+                        }
+                        if (attachment == null) {
+                            Text("Unsupported attachment")
+                        } else {
+                            AttachmentBubbleContent(attachment = attachment, contentColor = contentColor)
+                        }
+                    }
+                    else -> {
+                        Text(message.payload.toString(Charsets.UTF_8))
+                    }
+                }
+                if (tick != null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp),
+                        horizontalArrangement = Arrangement.End,
+                    ) {
+                        val tint = when (tick) {
+                            TickStatus.SENT -> tickBaseColor.copy(alpha = 0.88f)
+                            TickStatus.DELIVERED -> tickBaseColor.copy(alpha = 0.74f)
+                            TickStatus.READ -> tickBaseColor
+                        }
+                        SignalTick(
+                            status = tick,
+                            tint = tint,
+                            bubbleColor = bubbleColor,
+                            modifier = Modifier.padding(start = 8.dp, bottom = 2.dp),
+                        )
+                    }
+                }
+            }
+        }
+
+        if (reactions.isNotEmpty()) {
+            ReactionRow(
+                reactions = reactions,
+                isOwn = isOwn,
+                onReact = onReact,
+            )
+        }
     }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
-private fun Modifier.messageActions(
-    onClick: () -> Unit,
+fun Modifier.messageActions(
+    onClick: () -> Unit = {},
     onLongClick: () -> Unit,
 ): Modifier = combinedClickable(
     onClick = onClick,
@@ -1071,107 +1137,13 @@ fun ReactionRow(
     }
 }
 
-@Composable
-fun ReactionPickerDialog(
-    onDismiss: () -> Unit,
-    onReact: (String) -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("React") },
-        text = {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
-            ) {
-                for (emoji in REACTION_CHOICES) {
-                    Surface(
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.surfaceVariant,
-                        modifier = Modifier
-                            .size(44.dp)
-                            .clickable { onReact(emoji) },
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Text(emoji, style = MaterialTheme.typography.titleLarge)
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-@Composable
-private fun ReactionPickerBar(
-    onReact: (String) -> Unit,
-) {
-    Surface(
-        shape = RoundedCornerShape(28.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        tonalElevation = 6.dp,
-        shadowElevation = 6.dp,
-        modifier = Modifier.padding(bottom = 6.dp),
-    ) {
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-        ) {
-            for (emoji in REACTION_CHOICES) {
-                Box(
-                    modifier = Modifier
-                        .size(40.dp)
-                        .clip(CircleShape)
-                        .clickable { onReact(emoji) },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(emoji, style = MaterialTheme.typography.titleLarge)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun MessageActionPanel(
-    canCopy: Boolean,
-    onCopy: () -> Unit,
-    onInfo: () -> Unit,
-) {
-    Surface(
-        shape = RoundedCornerShape(16.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        tonalElevation = 6.dp,
-        shadowElevation = 6.dp,
-        modifier = Modifier
-            .padding(top = 6.dp)
-            .widthIn(min = 176.dp),
-    ) {
-        Column(modifier = Modifier.padding(vertical = 6.dp)) {
-            DropdownMenuItem(
-                text = { Text("Copy") },
-                enabled = canCopy,
-                onClick = onCopy,
-            )
-            DropdownMenuItem(
-                text = { Text("Info") },
-                onClick = onInfo,
-            )
-        }
-    }
-}
-
 private fun messageCopyText(message: StoredMessage): String =
     when (message.kind) {
         KIND_ATTACHMENT_MANIFEST -> AttachmentPayload.decode(message.payload)?.caption.orEmpty()
         else -> message.payload.toString(Charsets.UTF_8)
     }
 
-private fun messageInfoText(message: StoredMessage, isOwn: Boolean, tick: TickStatus?): String {
+fun messageInfoText(message: StoredMessage, isOwn: Boolean, tick: TickStatus?): String {
     val sentAt = java.text.SimpleDateFormat(
         "MMMM d, yyyy h:mm a",
         java.util.Locale.US,

@@ -1,7 +1,6 @@
 package com.cruisemesh.app.chat
 
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.combinedClickable
+import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,6 +38,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.media.KIND_GROUP_INVITE
@@ -70,10 +75,14 @@ fun GroupChatScreen(
     onDeleteGroup: () -> Unit,
     reachableMemberCount: Int? = null,
 ) {
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
     var draft by remember { mutableStateOf("") }
     var showDetails by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var focused by remember(group.id) { mutableStateOf<FocusedMessage?>(null) }
+    var infoMessage by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
 
     fun reload() {
         messages = store.messagesForChat(group.id)
@@ -105,6 +114,12 @@ fun GroupChatScreen(
     // edge (just above the composer / keyboard), empty space stays above.
     val displayMessages = remember(visibleMessages) { visibleMessages.asReversed() }
 
+    fun toggleReaction(target: MessageTarget, emoji: String) {
+        val existingOwn = reactions[target.stableKey].orEmpty().firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
+        sender.sendReaction(group, target, if (existingOwn != null) "" else emoji)
+        reload()
+    }
+
     LaunchedEffect(visibleMessages.size) {
         if (visibleMessages.isNotEmpty()) {
             // reverseLayout start is the bottom; pin the newest message there.
@@ -112,6 +127,7 @@ fun GroupChatScreen(
         }
     }
 
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
         topBar = {
             GroupConversationTopBar(
@@ -157,13 +173,9 @@ fun GroupChatScreen(
                         grouping = grouping[index],
                         reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
                         onReact = { emoji ->
-                            val target = MessageTarget(message.senderUserId, message.lamport, message.kind)
-                            val existingOwn = reactions[target.stableKey]
-                                .orEmpty()
-                                .firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
-                            sender.sendReaction(group, target, if (existingOwn != null) "" else emoji)
-                            reload()
+                            toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
                         },
+                        onLongPress = { target, bounds -> focused = FocusedMessage(target, bounds) },
                     )
                 }
             }
@@ -252,6 +264,74 @@ fun GroupChatScreen(
             },
         )
     }
+
+    val currentFocused = focused
+    if (currentFocused != null) {
+        val focusedMessage = visibleMessages.firstOrNull {
+            MessageTarget(it.senderUserId, it.lamport, it.kind).stableKey == currentFocused.target.stableKey
+        }
+        // focusedMessage is null only if the message vanished from under us
+        // (e.g. deleted) while the overlay was open; just render nothing.
+        if (focusedMessage != null) {
+            val focusedIsOwn = focusedMessage.senderUserId.contentEquals(ownUserId)
+            val focusedIndex = visibleMessages.indexOf(focusedMessage)
+            val focusedGrouping = grouping.getOrNull(focusedIndex) ?: BubbleGrouping(joinsPrevious = false, joinsNext = false)
+            val focusedShape = bubbleShapeFor(focusedIsOwn, focusedGrouping)
+            val focusedReactions = reactions[currentFocused.target.stableKey].orEmpty()
+            val focusedCopyText = remember(focusedMessage.payload) { String(focusedMessage.payload, Charsets.UTF_8) }
+            val focusedOwnReaction = focusedReactions.firstOrNull { it.reactedByOwnUser }?.emoji
+            val focusedSenderLabel = if (!focusedIsOwn) senderName(focusedMessage.senderUserId) else null
+
+            MessageFocusOverlay(
+                focused = currentFocused,
+                isOwn = focusedIsOwn,
+                canCopy = focusedCopyText.isNotBlank(),
+                ownReactionEmoji = focusedOwnReaction,
+                onDismiss = { focused = null },
+                onReact = { emoji ->
+                    toggleReaction(currentFocused.target, emoji)
+                    focused = null
+                },
+                onCopy = {
+                    if (focusedCopyText.isNotBlank()) {
+                        clipboard.setText(AnnotatedString(focusedCopyText))
+                        Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                    }
+                    focused = null
+                },
+                onInfo = {
+                    infoMessage = focusedMessage
+                    focused = null
+                },
+            ) {
+                GroupMessageBubbleVisual(
+                    message = focusedMessage,
+                    isOwn = focusedIsOwn,
+                    senderLabel = focusedSenderLabel,
+                    shape = focusedShape,
+                    showTimestamp = focusedGrouping.showTimestamp,
+                    reactions = focusedReactions,
+                    onReact = { emoji ->
+                        toggleReaction(currentFocused.target, emoji)
+                        focused = null
+                    },
+                )
+            }
+        }
+    }
+    } // Box
+
+    val currentInfoMessage = infoMessage
+    if (currentInfoMessage != null) {
+        AlertDialog(
+            onDismissRequest = { infoMessage = null },
+            title = { Text("Message Info") },
+            text = { Text(messageInfoText(currentInfoMessage, currentInfoMessage.senderUserId.contentEquals(ownUserId), null)) },
+            confirmButton = {
+                TextButton(onClick = { infoMessage = null }) { Text("OK") }
+            },
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -321,6 +401,7 @@ private fun GroupMessageBubble(
     grouping: BubbleGrouping,
     reactions: List<ReactionSummary> = emptyList(),
     onReact: (String) -> Unit = {},
+    onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
 ) {
     if (message.kind == KIND_GROUP_INVITE) {
         Box(
@@ -338,6 +419,54 @@ private fun GroupMessageBubble(
         return
     }
 
+    var boundsInRoot by remember { mutableStateOf(Rect.Zero) }
+    val topPadding = if (grouping.joinsPrevious) 2.dp else 10.dp
+    val bottomPadding = if (grouping.joinsNext) 2.dp else 6.dp
+    val shape = bubbleShapeFor(isOwn, grouping)
+    val target = remember(message.senderUserId, message.lamport, message.kind) {
+        MessageTarget(message.senderUserId, message.lamport, message.kind)
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = topPadding, bottom = bottomPadding),
+        horizontalArrangement = if (isOwn) Arrangement.End else Arrangement.Start,
+    ) {
+        GroupMessageBubbleVisual(
+            message = message,
+            isOwn = isOwn,
+            senderLabel = senderLabel,
+            shape = shape,
+            showTimestamp = grouping.showTimestamp,
+            reactions = reactions,
+            onReact = onReact,
+            modifier = Modifier
+                .onGloballyPositioned { coords -> boundsInRoot = coords.boundsInRoot() }
+                .messageActions(
+                    onLongClick = { onLongPress(target, boundsInRoot) },
+                ),
+        )
+    }
+}
+
+/**
+ * The group bubble's visual only -- sender label, Surface with text + inline
+ * timestamp, and the reaction chips below, no click handling. Used both by
+ * the list item ([GroupMessageBubble]) and by [MessageFocusOverlay]'s
+ * undimmed floating copy.
+ */
+@Composable
+fun GroupMessageBubbleVisual(
+    message: StoredMessage,
+    isOwn: Boolean,
+    senderLabel: String?,
+    shape: RoundedCornerShape,
+    showTimestamp: Boolean,
+    reactions: List<ReactionSummary>,
+    onReact: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
     } else {
@@ -348,81 +477,47 @@ private fun GroupMessageBubble(
     } else {
         MaterialTheme.colorScheme.onSurface
     }
-    val topPadding = if (grouping.joinsPrevious) 2.dp else 10.dp
-    val bottomPadding = if (grouping.joinsNext) 2.dp else 6.dp
-    val shape = RoundedCornerShape(
-        topStart = if (!isOwn && grouping.joinsPrevious) 6.dp else 20.dp,
-        topEnd = if (isOwn && grouping.joinsPrevious) 6.dp else 20.dp,
-        bottomStart = if (!isOwn && grouping.joinsNext) 6.dp else 20.dp,
-        bottomEnd = if (isOwn && grouping.joinsNext) 6.dp else 20.dp,
-    )
-    var showReactionPicker by remember { mutableStateOf(false) }
 
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = topPadding, bottom = bottomPadding),
-        horizontalArrangement = if (isOwn) Arrangement.End else Arrangement.Start,
+    Column(
+        horizontalAlignment = if (isOwn) Alignment.End else Alignment.Start,
+        modifier = modifier.widthIn(max = 280.dp),
     ) {
-        Column(
-            horizontalAlignment = if (isOwn) Alignment.End else Alignment.Start,
-            modifier = Modifier.widthIn(max = 280.dp),
+        if (senderLabel != null) {
+            Text(
+                text = senderLabel,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(start = 12.dp, bottom = 2.dp),
+            )
+        }
+        Surface(
+            shape = shape,
+            color = bubbleColor,
+            contentColor = contentColor,
         ) {
-            if (senderLabel != null) {
+            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                 Text(
-                    text = senderLabel,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(start = 12.dp, bottom = 2.dp),
+                    text = String(message.payload, Charsets.UTF_8),
+                    style = MaterialTheme.typography.bodyLarge,
                 )
-            }
-            Surface(
-                shape = shape,
-                color = bubbleColor,
-                contentColor = contentColor,
-                modifier = Modifier.groupMessageActions { showReactionPicker = true },
-            ) {
-                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                if (showTimestamp) {
                     Text(
-                        text = String(message.payload, Charsets.UTF_8),
-                        style = MaterialTheme.typography.bodyLarge,
+                        text = formatConversationTimestamp(message.timestamp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = contentColor.copy(alpha = 0.7f),
+                        modifier = Modifier
+                            .align(Alignment.End)
+                            .padding(top = 4.dp),
                     )
-                    if (grouping.showTimestamp) {
-                        Text(
-                            text = formatConversationTimestamp(message.timestamp),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = contentColor.copy(alpha = 0.7f),
-                            modifier = Modifier
-                                .align(Alignment.End)
-                                .padding(top = 4.dp),
-                        )
-                    }
                 }
             }
-            if (reactions.isNotEmpty()) {
-                ReactionRow(
-                    reactions = reactions,
-                    isOwn = isOwn,
-                    onReact = onReact,
-                )
-            }
+        }
+        if (reactions.isNotEmpty()) {
+            ReactionRow(
+                reactions = reactions,
+                isOwn = isOwn,
+                onReact = onReact,
+            )
         }
     }
-
-    if (showReactionPicker) {
-        ReactionPickerDialog(
-            onDismiss = { showReactionPicker = false },
-            onReact = { emoji ->
-                showReactionPicker = false
-                onReact(emoji)
-            },
-        )
-    }
 }
-
-@OptIn(ExperimentalFoundationApi::class)
-private fun Modifier.groupMessageActions(onLongClick: () -> Unit): Modifier =
-    combinedClickable(
-        onClick = {},
-        onLongClick = onLongClick,
-    )
