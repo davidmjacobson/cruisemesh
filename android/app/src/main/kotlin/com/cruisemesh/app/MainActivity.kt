@@ -97,6 +97,8 @@ import uniffi.cruisemesh_core.parseFriendText
 
 private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
+private const val UI_PREFS_NAME = "cruisemesh_ui"
+private const val PREF_HIDE_BLUETOOTH_AUDIO_WARNING = "hide_bluetooth_audio_warning"
 
 data class PendingDeepLink(
     val idHex: String,
@@ -446,6 +448,11 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     var transientMeshStatus by remember { mutableStateOf<String?>(null) }
     var ownDisplayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     var ownAvatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
+    val uiPrefs = remember(context) { context.getSharedPreferences(UI_PREFS_NAME, Context.MODE_PRIVATE) }
+    var bluetoothAudioWarningDismissed by remember { mutableStateOf(false) }
+    var hideBluetoothAudioWarning by remember {
+        mutableStateOf(uiPrefs.getBoolean(PREF_HIDE_BLUETOOTH_AUDIO_WARNING, false))
+    }
 
     var permissionRefreshToken by remember { mutableStateOf(0) }
     val hasPermissions = remember(context, permissionRefreshToken) {
@@ -526,6 +533,11 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     LaunchedEffect(runtimeStatus) {
         if (runtimeStatus != MeshRuntimeState.STOPPED) {
             transientMeshStatus = null
+        }
+    }
+    LaunchedEffect(bluetoothAudioConnected) {
+        if (!bluetoothAudioConnected) {
+            bluetoothAudioWarningDismissed = false
         }
     }
 
@@ -655,10 +667,11 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 actionLabel = "Open Bluetooth settings",
                 severity = ConnectivityWarningSeverity.Blocking,
             )
-            bluetoothAudioConnected -> ConnectivityWarning(
+            bluetoothAudioConnected && !bluetoothAudioWarningDismissed && !hideBluetoothAudioWarning -> ConnectivityWarning(
                 title = "Bluetooth audio connected",
                 body = "The mesh is still running, but wireless earbuds/speakers can slow nearby delivery. Watch for glitches.",
-                actionLabel = "Got it",
+                actionLabel = "Dismiss",
+                secondaryActionLabel = "Don't show this again",
                 severity = ConnectivityWarningSeverity.Caution,
             )
             else -> null
@@ -667,8 +680,14 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             when {
                 !hasPermissions -> permissionLauncher.launch(MeshService.requiredPermissions())
                 !bluetoothEnabled -> context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
-                // Caution banners are dismiss-by-action only (no state to clear);
-                // tapping still re-reads nothing harmful.
+                bluetoothAudioConnected -> bluetoothAudioWarningDismissed = true
+            }
+        },
+        onConnectivityWarningSecondaryClick = {
+            if (bluetoothAudioConnected) {
+                hideBluetoothAudioWarning = true
+                bluetoothAudioWarningDismissed = true
+                uiPrefs.edit().putBoolean(PREF_HIDE_BLUETOOTH_AUDIO_WARNING, true).apply()
             }
         },
         summaries = displaySummaries

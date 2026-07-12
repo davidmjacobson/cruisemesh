@@ -21,6 +21,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -53,6 +54,7 @@ data class ConnectivityWarning(
     val title: String,
     val body: String,
     val actionLabel: String,
+    val secondaryActionLabel: String? = null,
     val severity: ConnectivityWarningSeverity = ConnectivityWarningSeverity.Blocking,
 )
 
@@ -65,6 +67,7 @@ data class ConnectivityWarning(
 fun ConnectivityWarningBanner(
     warning: ConnectivityWarning,
     onClick: () -> Unit,
+    onSecondaryClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val containerColor = when (warning.severity) {
@@ -137,6 +140,15 @@ fun ConnectivityWarningBanner(
                 ),
             ) {
                 Text(warning.actionLabel)
+            }
+            if (warning.secondaryActionLabel != null && onSecondaryClick != null) {
+                TextButton(
+                    onClick = onSecondaryClick,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.textButtonColors(contentColor = contentColor),
+                ) {
+                    Text(warning.secondaryActionLabel)
+                }
             }
         }
     }
