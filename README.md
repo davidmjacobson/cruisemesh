@@ -1,7 +1,8 @@
 # CruiseMesh
 
 Offline-first family messaging for cruise ships. See [DESIGN.md](DESIGN.md) for the
-full design and milestone plan.
+full design and milestone plan, [ROADMAP.md](ROADMAP.md) for the short version, and
+[SECURITY-DESIGN.md](SECURITY-DESIGN.md) for what's encrypted and what isn't.
 
 ## Layout
 
@@ -75,3 +76,15 @@ Optional env vars:
 **Production deploy** (Docker + Caddy TLS, family-token provisioning, DB-path
 gotcha): see [`relayd/DEPLOY.md`](relayd/DEPLOY.md) and
 [`relayd/docker-compose.yml`](relayd/docker-compose.yml).
+
+## License
+
+CruiseMesh is free software, licensed under the
+[GNU AGPL-3.0-or-later](LICENSE). Everything here — the apps, the protocol,
+and the relay server — is and stays open source and self-hostable.
+
+Standing promises to users: no ads, no selling data or telemetry, no
+paywalled encryption or receipts, no artificial limits on friends or groups.
+
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) (DCO sign-off
+required; CLA for non-trivial changes).
