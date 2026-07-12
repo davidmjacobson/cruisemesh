@@ -25,12 +25,15 @@ struct ChatListView: View {
     let identity: Identity
     @ObservedObject var appModel: AppModel
     @ObservedObject private var bluetooth = BluetoothAccess.shared
+    @ObservedObject private var runtime = MeshRuntimeStatus.shared
     @State private var summaries: [ChatSummary] = []
     @State private var showFriends = false
     @State private var showProfile = false
     @State private var showNewGroup = false
     @State private var showMeshHelp = false
     @State private var cancellable: AnyCancellable?
+    @State private var bluetoothAudioWarningDismissed = false
+    @AppStorage("hideBluetoothAudioWarning") private var hideBluetoothAudioWarning = false
 
     private var connectivityWarning: ConnectivityWarning? {
         if bluetooth.isAuthorizationBlocked {
@@ -49,11 +52,14 @@ struct ChatListView: View {
                 severity: .blocking
             )
         }
-        if case .pausedForBluetoothAudio = MeshRuntimeStatus.shared.state {
+        if case .pausedForBluetoothAudio = runtime.state,
+           !bluetoothAudioWarningDismissed,
+           !hideBluetoothAudioWarning {
             return ConnectivityWarning(
                 title: "Bluetooth audio connected",
                 body: "The mesh may pause or slow while wireless audio is active. Watch for delayed delivery.",
-                actionLabel: "Got it",
+                actionLabel: "Dismiss",
+                secondaryActionLabel: "Don't show this again",
                 severity: .caution
             )
         }
@@ -130,16 +136,25 @@ struct ChatListView: View {
             .safeAreaInset(edge: .top) {
                 VStack(spacing: 0) {
                     if let warning = connectivityWarning {
-                        ConnectivityWarningBanner(warning: warning) {
-                            if warning.severity == .blocking {
-                                bluetooth.openSystemSettings()
-                            }
-                        }
+                        ConnectivityWarningBanner(
+                            warning: warning,
+                            onAction: {
+                                if warning.severity == .blocking {
+                                    bluetooth.openSystemSettings()
+                                } else {
+                                    bluetoothAudioWarningDismissed = true
+                                }
+                            },
+                            onSecondaryAction: warning.severity == .caution ? {
+                                hideBluetoothAudioWarning = true
+                                bluetoothAudioWarningDismissed = true
+                            } : nil
+                        )
                     }
                     MeshStatusPill {
                         if bluetooth.isAuthorizationBlocked || bluetooth.isRadioOff {
                             bluetooth.openSystemSettings()
-                        } else if case .stopped = MeshRuntimeStatus.shared.state {
+                        } else if case .stopped = runtime.state {
                             appModel.startMesh()
                         } else {
                             showMeshHelp = true
@@ -190,6 +205,12 @@ struct ChatListView: View {
                 reload()
                 cancellable = ChatEvents.subject.sink { _ in reload() }
                 appModel.startMeshIfEnabled()
+            }
+            .onChange(of: runtime.state) { state in
+                if case .pausedForBluetoothAudio = state {
+                    return
+                }
+                bluetoothAudioWarningDismissed = false
             }
         }
     }

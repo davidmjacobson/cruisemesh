@@ -41,6 +41,7 @@ struct ConnectivityWarning: Equatable {
     let title: String
     let body: String
     let actionLabel: String
+    var secondaryActionLabel: String? = nil
     var severity: ConnectivityWarningSeverity = .blocking
 }
 
@@ -48,6 +49,7 @@ struct ConnectivityWarning: Equatable {
 struct ConnectivityWarningBanner: View {
     let warning: ConnectivityWarning
     let onAction: () -> Void
+    var onSecondaryAction: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -72,6 +74,15 @@ struct ConnectivityWarningBanner: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(buttonTint)
+            if let secondaryActionLabel = warning.secondaryActionLabel,
+               let onSecondaryAction {
+                Button(action: onSecondaryAction) {
+                    Text(secondaryActionLabel)
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderless)
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)

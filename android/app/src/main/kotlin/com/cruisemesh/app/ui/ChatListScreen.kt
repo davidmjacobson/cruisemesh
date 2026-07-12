@@ -99,6 +99,7 @@ fun ChatListScreen(
     meshStatusDotColor: androidx.compose.ui.graphics.Color? = null,
     connectivityWarning: ConnectivityWarning? = null,
     onConnectivityWarningClick: () -> Unit = {},
+    onConnectivityWarningSecondaryClick: (() -> Unit)? = null,
     summaries: List<ChatSummary>
 ) {
     Scaffold(
@@ -147,6 +148,7 @@ fun ChatListScreen(
                 ConnectivityWarningBanner(
                     warning = connectivityWarning,
                     onClick = onConnectivityWarningClick,
+                    onSecondaryClick = onConnectivityWarningSecondaryClick,
                 )
             }
 
