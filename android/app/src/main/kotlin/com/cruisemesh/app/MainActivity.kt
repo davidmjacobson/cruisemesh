@@ -61,6 +61,8 @@ import com.cruisemesh.app.friending.ScanScreen
 import com.cruisemesh.app.friending.extractFriendToken
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.OnboardingStore
+import com.cruisemesh.app.identity.backup.BackupExportScreen
+import com.cruisemesh.app.identity.backup.BackupRestoreScreen
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.createCameraCaptureUri
@@ -157,7 +159,10 @@ fun CruiseMeshApp(
         startDestination = if (onboardingCompleted) "home" else "onboarding",
     ) {
         composable("onboarding") {
-            OnboardingRoute(identity) {
+            OnboardingRoute(
+                identity = identity,
+                onRestore = { navController.navigate("restore") },
+            ) {
                 onboardingCompleted = true
                 navController.navigate("home") {
                     popUpTo("onboarding") { inclusive = true }
@@ -166,6 +171,8 @@ fun CruiseMeshApp(
         }
         composable("home") { HomeRoute(identity, navController) }
         composable("profile") { ProfileRoute(identity, navController) }
+        composable("backup") { BackupExportScreen(onBack = { navController.popBackStack() }) }
+        composable("restore") { BackupRestoreScreen(onBack = { navController.popBackStack() }) }
         composable("myQr") { MyQrScreen(identity, onBack = { navController.popBackStack() }) }
         composable("addFriend") { AddFriendRoute(identity, navController) }
         composable("scan") { ScanRoute(identity, navController) }
@@ -193,7 +200,7 @@ fun CruiseMeshApp(
 }
 
 @Composable
-private fun OnboardingRoute(identity: Identity, onComplete: () -> Unit) {
+private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplete: () -> Unit) {
     val context = LocalContext.current
     val displayId = remember(identity) { formatUserId(identity.userId) }
     var displayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
@@ -313,6 +320,7 @@ private fun OnboardingRoute(identity: Identity, onComplete: () -> Unit) {
                 batteryOptimizationLauncher.launch(batteryOptimizationIntent(context))
             }
         },
+        onRestore = onRestore,
         onComplete = {
             if (displayName.isBlank()) {
                 displayName = ProfileStore.defaultDisplayName()
@@ -768,6 +776,7 @@ private fun ProfileRoute(identity: Identity, navController: NavHostController) {
             { permissionLauncher.launch(MeshService.requiredPermissions()) }
         } else null,
         onShowMyQr = { navController.navigate("myQr") },
+        onBackUp = { navController.navigate("backup") },
         onProfileChanged = { epoch ->
             ProfileSyncSender.queueToAllContacts(context, store, identity, epoch)
         },
