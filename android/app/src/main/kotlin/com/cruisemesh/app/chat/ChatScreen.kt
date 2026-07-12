@@ -159,6 +159,7 @@ fun ChatScreen(
     onDeleteContact: () -> Unit,
     reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
     reachabilityStatusText: String = ContactReachability.chatHeaderCopy(ReachabilityLevel.OFFLINE, null, 0L),
+    reachabilityDetailsText: String = reachabilityStatusText,
 ) {
     val context = LocalContext.current
     var currentContact by remember(contact.userId) { mutableStateOf(contact) }
@@ -349,6 +350,7 @@ fun ChatScreen(
         onDeleteContact = onDeleteContact,
         reachability = reachability,
         reachabilityStatusText = reachabilityStatusText,
+        reachabilityDetailsText = reachabilityDetailsText,
     )
 }
 
@@ -379,6 +381,7 @@ private fun ConversationScreen(
     onDeleteContact: () -> Unit,
     reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
     reachabilityStatusText: String = ContactReachability.chatHeaderCopy(ReachabilityLevel.OFFLINE, null, 0L),
+    reachabilityDetailsText: String = reachabilityStatusText,
 ) {
     val listState = rememberLazyListState()
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
@@ -497,7 +500,7 @@ private fun ConversationScreen(
     if (showContactDetails) {
         ContactDetailsSheet(
             contact = contact,
-            connectivityText = reachabilityStatusText,
+            connectivityText = reachabilityDetailsText,
             avatarBytes = contactAvatar,
             onDeleteContact = {
                 showContactDetails = false

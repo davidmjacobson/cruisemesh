@@ -379,7 +379,26 @@ private fun ChatListScreenEmptyPreview() {
 private fun ChatListScreenPreview() {
     val ownUserId = byteArrayOf(0x44, 0x11)
     val mayaId = byteArrayOf(0x01, 0x02)
+    val eliId = byteArrayOf(0x03, 0x04)
+    val noorId = byteArrayOf(0x05, 0x06)
+    val samId = byteArrayOf(0x07, 0x08)
     val groupId = ByteArray(16) { 0x11 }
+    fun contact(id: ByteArray, name: String) = Contact(
+        userId = id,
+        name = name,
+        signPk = ByteArray(32),
+        agreePk = ByteArray(32),
+        relayUrl = null,
+        relayToken = null,
+    )
+    fun message(senderId: ByteArray, chatId: ByteArray, text: String, lamport: ULong) = StoredMessage(
+        senderUserId = senderId,
+        chatId = chatId,
+        lamport = lamport,
+        timestamp = 1_783_614_000_000L + lamport.toLong() * 60_000L,
+        kind = 1u.toUByte(),
+        payload = text.toByteArray(),
+    )
     CruiseMeshTheme {
         ChatListScreen(
             ownUserId = ownUserId,
@@ -396,25 +415,45 @@ private fun ChatListScreenPreview() {
                     chatId = mayaId,
                     title = "Maya",
                     isGroup = false,
-                    contact = Contact(
-                        userId = mayaId,
-                        name = "Maya",
-                        signPk = ByteArray(32),
-                        agreePk = ByteArray(32),
-                        relayUrl = null,
-                        relayToken = null,
-                    ),
-                    lastMessage = StoredMessage(
-                        senderUserId = mayaId,
-                        chatId = mayaId,
-                        lamport = 8uL,
-                        timestamp = 1_783_614_000_000L,
-                        kind = 1u.toUByte(),
-                        payload = "Meet us by the aft elevators".toByteArray(),
-                    ),
+                    contact = contact(mayaId, "Maya"),
+                    lastMessage = message(mayaId, mayaId, "Nearby via Bluetooth", 8uL),
                     unreadCount = 2,
                     ownDeliveredThrough = 0uL,
                     ownReadThrough = 0uL,
+                    reachability = ReachabilityLevel.NEARBY,
+                ),
+                ChatSummary(
+                    chatId = eliId,
+                    title = "Eli",
+                    isGroup = false,
+                    contact = contact(eliId, "Eli"),
+                    lastMessage = message(eliId, eliId, "Online via relay", 7uL),
+                    unreadCount = 0,
+                    ownDeliveredThrough = 0uL,
+                    ownReadThrough = 0uL,
+                    reachability = ReachabilityLevel.ONLINE_RELAY,
+                ),
+                ChatSummary(
+                    chatId = noorId,
+                    title = "Noor",
+                    isGroup = false,
+                    contact = contact(noorId, "Noor"),
+                    lastMessage = message(noorId, noorId, "Recently active", 6uL),
+                    unreadCount = 0,
+                    ownDeliveredThrough = 0uL,
+                    ownReadThrough = 0uL,
+                    reachability = ReachabilityLevel.RECENT,
+                ),
+                ChatSummary(
+                    chatId = samId,
+                    title = "Sam",
+                    isGroup = false,
+                    contact = contact(samId, "Sam"),
+                    lastMessage = message(samId, samId, "Nearby phones can carry", 5uL),
+                    unreadCount = 0,
+                    ownDeliveredThrough = 0uL,
+                    ownReadThrough = 0uL,
+                    reachability = ReachabilityLevel.MESH_CARRY,
                 ),
                 ChatSummary(
                     chatId = groupId,
@@ -426,17 +465,11 @@ private fun ChatListScreenPreview() {
                         memberUserIds = listOf(ownUserId, mayaId),
                         key = ByteArray(32) { 0x22 },
                     ),
-                    lastMessage = StoredMessage(
-                        senderUserId = ownUserId,
-                        chatId = groupId,
-                        lamport = 2uL,
-                        timestamp = 1_783_615_000_000L,
-                        kind = 1u.toUByte(),
-                        payload = "Dinner at 7?".toByteArray(),
-                    ),
+                    lastMessage = message(ownUserId, groupId, "Dinner at 7?", 2uL),
                     unreadCount = 0,
                     ownDeliveredThrough = 0uL,
                     ownReadThrough = 0uL,
+                    reachability = ReachabilityLevel.OFFLINE,
                 ),
             )
         )
