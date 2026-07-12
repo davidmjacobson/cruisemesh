@@ -1,5 +1,6 @@
 package com.cruisemesh.app.mesh
 
+import android.bluetooth.BluetoothProfile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -34,5 +35,18 @@ class A2dpAudioBackoffTest {
         backoff.update(a2dpConnected = true)
 
         assertEquals(A2dpAudioBackoff.Mode.ACTIVE, backoff.update(a2dpConnected = false))
+    }
+
+    @Test
+    fun `broadcast connected and disconnected states are authoritative`() {
+        assertEquals(true, bluetoothAudioConnectedFromProfileState(BluetoothProfile.STATE_CONNECTED))
+        assertEquals(false, bluetoothAudioConnectedFromProfileState(BluetoothProfile.STATE_DISCONNECTED))
+    }
+
+    @Test
+    fun `transitional broadcast states fall back to profile query`() {
+        assertNull(bluetoothAudioConnectedFromProfileState(BluetoothProfile.STATE_CONNECTING))
+        assertNull(bluetoothAudioConnectedFromProfileState(BluetoothProfile.STATE_DISCONNECTING))
+        assertNull(bluetoothAudioConnectedFromProfileState(-1))
     }
 }
