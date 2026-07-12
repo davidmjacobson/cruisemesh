@@ -363,11 +363,20 @@ private struct MessageBubbleView: View {
     var onStatus: (String) -> Void = { _ in }
     var onReact: (String) -> Void = { _ in }
     @State private var showLegend = false
+    @State private var showMessageActions = false
+    @State private var showInfo = false
 
     var body: some View {
         HStack {
             if isOwn { Spacer(minLength: 40) }
             VStack(alignment: isOwn ? .trailing : .leading, spacing: 4) {
+                if showMessageActions {
+                    ReactionActionBar { emoji in
+                        showMessageActions = false
+                        onReact(emoji)
+                    }
+                }
+
                 VStack(alignment: .leading, spacing: 6) {
                     content
                     if let tick {
@@ -384,12 +393,34 @@ private struct MessageBubbleView: View {
                 )
                 .foregroundStyle(isOwn ? Color.white : Color.primary)
                 .onTapGesture {
-                    if tick != nil { showLegend = true }
-                }
-                .contextMenu {
-                    ForEach(reactionChoices, id: \.self) { emoji in
-                        Button(emoji) { onReact(emoji) }
+                    if showMessageActions {
+                        showMessageActions = false
+                    } else if tick != nil {
+                        showLegend = true
                     }
+                }
+                .onLongPressGesture {
+                    withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
+                        showMessageActions = true
+                    }
+                }
+
+                if showMessageActions {
+                    MessageActionPanel(
+                        canCopy: !messageCopyText(message).isEmpty,
+                        onCopy: {
+                            let text = messageCopyText(message)
+                            if !text.isEmpty {
+                                UIPasteboard.general.string = text
+                                onStatus("Copied")
+                            }
+                            showMessageActions = false
+                        },
+                        onInfo: {
+                            showMessageActions = false
+                            showInfo = true
+                        }
+                    )
                 }
 
                 if !reactions.isEmpty {
@@ -407,6 +438,11 @@ private struct MessageBubbleView: View {
             Button("OK", role: .cancel) {}
         } message: {
             if let tick { Text(tickLegendText(tick)) }
+        }
+        .alert("Message Info", isPresented: $showInfo) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(messageInfoText(message: message, isOwn: isOwn, tick: tick))
         }
     }
 
@@ -437,6 +473,86 @@ private struct MessageBubbleView: View {
         f.locale = Locale(identifier: "en_US")
         return f.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000))
     }
+}
+
+private struct ReactionActionBar: View {
+    let onReact: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(reactionChoices, id: \.self) { emoji in
+                Button {
+                    onReact(emoji)
+                } label: {
+                    Text(emoji)
+                        .font(.title2)
+                        .frame(width: 38, height: 38)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color(uiColor: .secondarySystemBackground))
+                .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
+        )
+        .padding(.bottom, 4)
+    }
+}
+
+private struct MessageActionPanel: View {
+    let canCopy: Bool
+    let onCopy: () -> Void
+    let onInfo: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button(action: onCopy) {
+                Label("Copy", systemImage: "doc.on.doc")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+            }
+            .disabled(!canCopy)
+
+            Divider().padding(.leading, 16)
+
+            Button(action: onInfo) {
+                Label("Info", systemImage: "info.circle")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+            }
+        }
+        .buttonStyle(.plain)
+        .frame(width: 190)
+        .foregroundStyle(Color.primary)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemBackground))
+                .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
+        )
+        .padding(.top, 4)
+    }
+}
+
+private func messageCopyText(_ message: StoredMessage) -> String {
+    if message.kind == ProtocolKind.attachmentManifest {
+        return AttachmentPayload.decode(message.payload)?.caption ?? ""
+    }
+    return String(data: message.payload, encoding: .utf8) ?? ""
+}
+
+private func messageInfoText(message: StoredMessage, isOwn: Bool, tick: TickStatus?) -> String {
+    let f = DateFormatter()
+    f.dateFormat = "MMMM d, yyyy h:mm a"
+    f.locale = Locale(identifier: "en_US")
+    let sentAt = f.string(from: Date(timeIntervalSince1970: TimeInterval(message.timestamp) / 1000))
+    let direction = isOwn ? "Sent by you" : "Received"
+    let status = tick.map { "\nStatus: \(tickLegendText($0))" } ?? ""
+    return "\(direction)\nTime: \(sentAt)\nLamport: \(message.lamport)\(status)"
 }
 
 /// Chat photo: keeps native aspect ratio and offers Save via long-press.
