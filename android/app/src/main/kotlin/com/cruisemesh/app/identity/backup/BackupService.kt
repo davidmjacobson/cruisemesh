@@ -4,8 +4,11 @@ import android.content.Context
 import android.net.Uri
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.OnboardingStore
+import com.cruisemesh.app.identity.ProfilePhotoStore
+import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.identity.decodeIdentity
 import com.cruisemesh.app.identity.encodeIdentity
+import com.cruisemesh.app.relay.RelayConfigStore
 
 /**
  * Android glue for account backup/restore (LOCAL_BACKUP_RESTORE.md §6/§7):
@@ -30,12 +33,19 @@ object BackupService {
             ?: throw IllegalStateException("No identity on this device to back up")
         val sqliteFile = context.filesDir.resolve(STORE_FILENAME)
         val sqliteBytes = if (sqliteFile.exists()) sqliteFile.readBytes() else ByteArray(0)
+        val relay = RelayConfigStore.load(context)
 
         val payload = BackupPayload(
             identity = encodeIdentity(identity),
             sqlite = sqliteBytes,
             srcVersionCode = appVersionCode(context),
             createdAtMs = System.currentTimeMillis(),
+            displayName = ProfileStore.loadDisplayName(context),
+            ownAvatar = ProfilePhotoStore.loadBackupBytes(context),
+            ownAvatarEpoch = ProfileStore.loadOwnAvatarEpoch(context),
+            relayUrl = relay?.relayUrl,
+            relayToken = relay?.relayToken,
+            shareOnline = RelayConfigStore.shareOnline(context),
         )
         return BackupCrypto.seal(passphrase, payload)
     }
@@ -73,6 +83,13 @@ object BackupService {
 
         // Re-wrap the restored keys under THIS device's fresh Keystore key.
         IdentityStore.save(context, identity)
+        payload.displayName?.let { ProfileStore.saveDisplayName(context, it) }
+        ProfilePhotoStore.restoreBackupBytes(context, payload.ownAvatar)
+        ProfileStore.restoreOwnAvatarEpoch(context, payload.ownAvatarEpoch)
+        if (payload.relayUrl != null && payload.relayToken != null) {
+            RelayConfigStore.save(context, payload.relayUrl, payload.relayToken)
+        }
+        RelayConfigStore.setShareOnline(context, payload.shareOnline)
         OnboardingStore.markCompleted(context)
     }
 

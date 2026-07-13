@@ -37,7 +37,8 @@ object BackupFormat {
     /** Ed25519 + X25519 identity blob length: userId + signPk + signSk + agreePk + agreeSk. */
     const val IDENTITY_LEN = 16 + 32 + 32 + 32 + 32 // 144
 
-    const val INNER_VERSION = 1
+    const val LEGACY_INNER_VERSION = 1
+    const val INNER_VERSION = 2
 
     /**
      * Passphrase key-derivation function ids. v1 ships [PBKDF2_HMAC_SHA256]
@@ -63,6 +64,12 @@ data class BackupPayload(
     val sqlite: ByteArray,
     val srcVersionCode: Int,
     val createdAtMs: Long,
+    val displayName: String? = null,
+    val ownAvatar: ByteArray = ByteArray(0),
+    val ownAvatarEpoch: Long = 0L,
+    val relayUrl: String? = null,
+    val relayToken: String? = null,
+    val shareOnline: Boolean = true,
 ) {
     // Value semantics on the byte arrays so tests (and equals-based logic) behave.
     override fun equals(other: Any?): Boolean {
@@ -71,7 +78,13 @@ data class BackupPayload(
         return identity.contentEquals(other.identity) &&
             sqlite.contentEquals(other.sqlite) &&
             srcVersionCode == other.srcVersionCode &&
-            createdAtMs == other.createdAtMs
+            createdAtMs == other.createdAtMs &&
+            displayName == other.displayName &&
+            ownAvatar.contentEquals(other.ownAvatar) &&
+            ownAvatarEpoch == other.ownAvatarEpoch &&
+            relayUrl == other.relayUrl &&
+            relayToken == other.relayToken &&
+            shareOnline == other.shareOnline
     }
 
     override fun hashCode(): Int {
@@ -79,6 +92,12 @@ data class BackupPayload(
         result = 31 * result + sqlite.contentHashCode()
         result = 31 * result + srcVersionCode
         result = 31 * result + createdAtMs.hashCode()
+        result = 31 * result + (displayName?.hashCode() ?: 0)
+        result = 31 * result + ownAvatar.contentHashCode()
+        result = 31 * result + ownAvatarEpoch.hashCode()
+        result = 31 * result + (relayUrl?.hashCode() ?: 0)
+        result = 31 * result + (relayToken?.hashCode() ?: 0)
+        result = 31 * result + shareOnline.hashCode()
         return result
     }
 }

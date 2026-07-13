@@ -981,6 +981,22 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
                         // chat still advances read state.
                         ChatVisibility.setVisible(contact.userId)
                         MessageNotifier.cancel(context, contact.userId)
+                        // Read state is local durable data and must advance even
+                        // when MeshService has not registered yet (for example
+                        // immediately after a restore while permissions are
+                        // still being granted). The event below separately
+                        // queues/transmits the peer-facing receipt when the
+                        // service is available.
+                        val through = store.highestLamport(contact.userId, contact.userId)
+                        if (through > 0uL) {
+                            store.recordOutgoingReceipt(
+                                contact.userId,
+                                contact.userId,
+                                RECEIPT_TYPE_READ,
+                                through,
+                            )
+                            com.cruisemesh.app.chat.ChatEvents.notifyChatChanged(contact.userId)
+                        }
                         ChatViewEvents.onChatViewed(contact.userId)
                     }
                     androidx.lifecycle.Lifecycle.Event.ON_STOP ->

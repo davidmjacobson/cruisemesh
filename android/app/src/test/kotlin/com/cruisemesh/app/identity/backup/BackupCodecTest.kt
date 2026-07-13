@@ -1,5 +1,6 @@
 package com.cruisemesh.app.identity.backup
 
+import java.nio.ByteBuffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
@@ -72,9 +73,37 @@ class BackupCodecTest {
             sqlite = ByteArray(1000) { (it % 256).toByte() },
             srcVersionCode = 42,
             createdAtMs = 1_700_000_000_000L,
+            displayName = "David 🚢",
+            ownAvatar = ByteArray(321) { it.toByte() },
+            ownAvatarEpoch = 1_720_000_123_456L,
+            relayUrl = "https://relay.example",
+            relayToken = "family-secret",
+            shareOnline = false,
         )
         val decoded = BackupCodec.decodeInner(BackupCodec.encodeInner(payload))
         assertEquals(payload, decoded)
+    }
+
+    @Test
+    fun `legacy v1 inner payload still decodes`() {
+        val identity = identity(4)
+        val sqlite = ByteArray(9) { it.toByte() }
+        val legacy = ByteBuffer.allocate(1 + 4 + 8 + 2 + identity.size + 4 + sqlite.size).apply {
+            put(BackupFormat.LEGACY_INNER_VERSION.toByte())
+            putInt(7)
+            putLong(123L)
+            putShort(identity.size.toShort())
+            put(identity)
+            putInt(sqlite.size)
+            put(sqlite)
+        }.array()
+
+        val decoded = BackupCodec.decodeInner(legacy)
+        assertArrayEquals(identity, decoded.identity)
+        assertArrayEquals(sqlite, decoded.sqlite)
+        assertEquals(null, decoded.displayName)
+        assertEquals(null, decoded.relayUrl)
+        assertEquals(true, decoded.shareOnline)
     }
 
     @Test
