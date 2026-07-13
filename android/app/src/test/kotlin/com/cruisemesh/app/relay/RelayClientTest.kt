@@ -14,6 +14,13 @@ import java.util.Base64
 class RelayClientTest {
 
     @Test
+    fun `relay URL normalization adds https and removes trailing slash`() {
+        assertEquals("https://relay.example", normalizeRelayUrl(" relay.example/ "))
+        assertEquals("https://relay.example", normalizeRelayUrl("https://relay.example/"))
+        assertEquals("http://10.0.2.2:8080", normalizeRelayUrl("http://10.0.2.2:8080/"))
+    }
+
+    @Test
     fun `post outbound envelope sends bearer auth and public header fields`() {
         val server = MockWebServer()
         server.enqueue(MockResponse().setResponseCode(200).setBody("""{"id":7}"""))

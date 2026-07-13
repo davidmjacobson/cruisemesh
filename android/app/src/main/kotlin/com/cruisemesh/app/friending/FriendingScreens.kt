@@ -4,6 +4,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.view.HapticFeedbackConstants
 import android.widget.Toast
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -59,14 +61,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.identity.ProfileStore
+import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.ui.AvatarBadge
 import uniffi.cruisemesh_core.Contact
@@ -80,13 +86,15 @@ import uniffi.cruisemesh_core.parseFriendText
 /** Shows this device's own FriendCard (DESIGN.md §6.2) as a QR code to be scanned by a peer. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
+fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Unit) {
     val context = LocalContext.current
+    val store = remember { AppStore.get(context) }
     val savedRelay = remember { RelayConfigStore.load(context) }
     var name by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     var relayUrl by remember { mutableStateOf(savedRelay?.relayUrl.orEmpty()) }
     var relayToken by remember { mutableStateOf(savedRelay?.relayToken.orEmpty()) }
     var showAdvanced by remember { mutableStateOf(false) }
+    var connectedFriend by remember { mutableStateOf<FriendAddedOutcome?>(null) }
     val fingerprint = remember(identity.userId) { fingerprintWords(identity.userId) }
     val friendLink = remember(name, relayUrl, relayToken, identity) {
         val cardJson =
@@ -98,7 +106,20 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
         )
         makeFriendLink(cardJson)
     }
-    val qrBitmap = remember(friendLink) { encodeQrBitmap(friendLink) }
+    val appLink = remember(friendLink) { "https://cruisemesh.app/f#$friendLink" }
+    val qrBitmap = remember(appLink) { encodeQrBitmap(appLink) }
+
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        FriendImportEvents.imports.collect { event ->
+            if (event.directBle) {
+                connectedFriend = FriendAddedOutcome(
+                    contact = event.contact,
+                    delivery = FriendRequestDelivery(reachedDirectly = true, lamport = 0uL),
+                    relayConfigured = RelayConfigStore.load(context) != null,
+                )
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -189,7 +210,7 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
             ) {
                 Button(
                     onClick = {
-                        val text = "Add me on CruiseMesh — copy this whole message and paste it in the app:\n$friendLink"
+                        val text = "Add me on CruiseMesh: $appLink"
                         val intent = Intent(Intent.ACTION_SEND)
                             .setType("text/plain")
                             .putExtra(Intent.EXTRA_TEXT, text)
@@ -202,7 +223,7 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
                 TextButton(
                     onClick = {
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        clipboard.setPrimaryClip(ClipData.newPlainText("CruiseMesh friend card", friendLink))
+                        clipboard.setPrimaryClip(ClipData.newPlainText("CruiseMesh friend card", appLink))
                         Toast.makeText(context, "Copied friend card link", Toast.LENGTH_SHORT).show()
                     },
                 ) {
@@ -211,19 +232,35 @@ fun MyQrScreen(identity: Identity, onBack: () -> Unit) {
             }
         }
     }
+
+    connectedFriend?.let { outcome ->
+        FriendConfirmationSheet(
+            outcome = outcome,
+            ownUserId = identity.userId,
+            store = store,
+            onSayHi = { onSayHi(outcome.contact) },
+            onAddAnother = null,
+            onDone = { connectedFriend = null },
+        )
+    }
 }
 
 /** Scans a peer's FriendCard QR code and imports them as a contact (DESIGN.md §6.2). */
 @Composable
 fun ScanScreen(
     ownUserId: ByteArray,
-    onContactAdded: (Contact) -> Unit,
-    onBack: () -> Unit,
+    store: uniffi.cruisemesh_core.MessageStore,
+    onContactAdded: (Contact) -> FriendAddedOutcome,
+    onSayHi: (Contact) -> Unit,
+    onDone: () -> Unit,
+    onBack: () -> Unit = onDone,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val view = LocalView.current
     var status by remember { mutableStateOf("Point the camera at a CruiseMesh friend card") }
-    var added by remember { mutableStateOf<Contact?>(null) }
+    var added by remember { mutableStateOf<FriendAddedOutcome?>(null) }
+    var frozenFrame by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
 
     Box(modifier = Modifier.fillMaxSize()) {
         if (added == null) {
@@ -245,7 +282,7 @@ fun ScanScreen(
                             QrAnalyzer { decoded ->
                                 if (added != null) return@QrAnalyzer
                                 try {
-                                    val card = parseFriendText(decoded)
+                                    val card = parseFriendText(extractFriendToken(decoded))
                                     val userId = friendCardUserId(card)
                                     if (userId.contentEquals(ownUserId)) {
                                         status = "That's your own card"
@@ -259,8 +296,16 @@ fun ScanScreen(
                                         relayUrl = card.relayUrl,
                                         relayToken = card.relayToken,
                                     )
-                                    added = contact
-                                    onContactAdded(contact)
+                                    frozenFrame = previewView.bitmap?.asImageBitmap()
+                                    val outcome = onContactAdded(contact)
+                                    added = outcome
+                                    view.performHapticFeedback(
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                            HapticFeedbackConstants.CONFIRM
+                                        } else {
+                                            HapticFeedbackConstants.LONG_PRESS
+                                        },
+                                    )
                                 } catch (e: Exception) {
                                     status = "Not a CruiseMesh friend card"
                                 }
@@ -284,7 +329,16 @@ fun ScanScreen(
             ScanViewfinderOverlay()
         }
 
-        Column(
+        if (added != null && frozenFrame != null) {
+            Image(
+                bitmap = frozenFrame!!,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+
+        if (added == null) Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(24.dp),
@@ -299,15 +353,30 @@ fun ScanScreen(
                 tonalElevation = 2.dp,
             ) {
                 Text(
-                    if (currentAdded != null) "Added ${currentAdded.name} as a contact" else status,
+                    status,
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
                 )
             }
-            Button(onClick = onBack, modifier = Modifier.padding(top = 16.dp)) {
-                Text(if (currentAdded != null) "Done" else "Cancel")
+            if (currentAdded == null) {
+                Button(onClick = onBack, modifier = Modifier.padding(top = 16.dp)) { Text("Cancel") }
             }
         }
+    }
+
+    added?.let { outcome ->
+        FriendConfirmationSheet(
+            outcome = outcome,
+            ownUserId = ownUserId,
+            store = store,
+            onSayHi = { onSayHi(outcome.contact) },
+            onAddAnother = {
+                added = null
+                frozenFrame = null
+                status = "Point the camera at a CruiseMesh friend card"
+            },
+            onDone = onDone,
+        )
     }
 }
 
@@ -361,11 +430,28 @@ private fun ScanViewfinderOverlay() {
 fun AddFriendScreen(
     onScanClick: () -> Unit,
     onImportText: (String) -> ImportFriendResult,
+    onConfirmContact: (Contact) -> FriendAddedOutcome,
+    ownUserId: ByteArray,
+    store: uniffi.cruisemesh_core.MessageStore,
+    initialText: String = "",
+    onSayHi: (Contact) -> Unit,
+    onDone: () -> Unit,
     onBack: () -> Unit,
 ) {
-    var pasted by remember { mutableStateOf("") }
+    var pasted by remember(initialText) { mutableStateOf(initialText) }
     var error by remember { mutableStateOf<String?>(null) }
-    var notice by remember { mutableStateOf<String?>(null) }
+    var preview by remember { mutableStateOf<FriendPreview?>(null) }
+    var added by remember { mutableStateOf<FriendAddedOutcome?>(null) }
+    val context = LocalContext.current
+
+    androidx.compose.runtime.LaunchedEffect(initialText) {
+        if (initialText.isNotBlank()) {
+            when (val result = onImportText(initialText)) {
+                is ImportFriendResult.Preview -> preview = result.preview
+                is ImportFriendResult.Error -> error = result.message
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -391,18 +477,25 @@ fun AddFriendScreen(
                 onValueChange = {
                     pasted = it
                     error = null
-                    notice = null
                 },
-                label = { Text("Paste friend card") },
+                label = { Text("Friend card") },
                 minLines = 4,
                 modifier = Modifier.fillMaxWidth(),
             )
+            TextButton(
+                onClick = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    pasted = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                    error = null
+                },
+                modifier = Modifier.align(Alignment.End),
+            ) { Text("Paste") }
             Button(
                 onClick = {
                     when (val result = onImportText(pasted)) {
-                        is ImportFriendResult.Success -> {
+                        is ImportFriendResult.Preview -> {
                             error = null
-                            notice = result.notice
+                            preview = result.preview
                         }
                         is ImportFriendResult.Error -> error = result.message
                     }
@@ -410,20 +503,42 @@ fun AddFriendScreen(
                 enabled = pasted.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Import")
+                Text("Preview friend")
             }
             error?.let {
                 Text(it, color = MaterialTheme.colorScheme.error)
             }
-            notice?.let {
-                Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
         }
+    }
+
+    preview?.let { current ->
+        FriendPreviewSheet(
+            preview = current,
+            onConfirm = {
+                added = onConfirmContact(current.contact)
+                preview = null
+                pasted = ""
+            },
+            onDismiss = { preview = null },
+        )
+    }
+    added?.let { outcome ->
+        FriendConfirmationSheet(
+            outcome = outcome,
+            ownUserId = ownUserId,
+            store = store,
+            onSayHi = { onSayHi(outcome.contact) },
+            onAddAnother = {
+                added = null
+                pasted = ""
+            },
+            onDone = onDone,
+        )
     }
 }
 
 sealed interface ImportFriendResult {
-    data class Success(val notice: String?) : ImportFriendResult
+    data class Preview(val preview: FriendPreview) : ImportFriendResult
     data class Error(val message: String) : ImportFriendResult
 }
 

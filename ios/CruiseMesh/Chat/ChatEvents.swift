@@ -18,3 +18,12 @@ enum RelaySyncEvents {
         subject.send(())
     }
 }
+
+struct FriendImportEvent {
+    let contact: Contact
+    let directBluetooth: Bool
+}
+
+enum FriendImportEvents {
+    static let subject = PassthroughSubject<FriendImportEvent, Never>()
+}

@@ -42,6 +42,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cruisemesh.app
         INFOPLIST_FILE: CruiseMesh/Info.plist
         CODE_SIGN_ENTITLEMENTS: CruiseMesh/CruiseMesh.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         DEVELOPMENT_TEAM: ""
         CODE_SIGN_STYLE: Automatic
         OTHER_LDFLAGS: ["$(inherited)", "-lc++"]

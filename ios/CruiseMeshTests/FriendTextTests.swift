@@ -22,4 +22,11 @@ final class FriendTextTests: XCTestCase {
             "{\"name\":\"A\"}"
         )
     }
+
+    func testStripsTrailingPunctuation() {
+        XCTAssertEqual(
+            extractFriendToken("Paste it: CMFRIEND1:abc_123-xyz."),
+            "CMFRIEND1:abc_123-xyz"
+        )
+    }
 }

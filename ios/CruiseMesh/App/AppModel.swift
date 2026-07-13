@@ -9,11 +9,13 @@ final class AppModel: ObservableObject {
     let identity: Identity
     @Published var displayName: String
     @Published private(set) var meshEnabled: Bool
+    @Published var pendingFriendToken: String?
 
     init() {
         let id = IdentityStore.loadOrCreate()
         self.identity = id
         self.displayName = ProfileStore.loadDisplayName()
+        self.pendingFriendToken = nil
         if UserDefaults.standard.object(forKey: Self.meshEnabledKey) == nil {
             self.meshEnabled = true
         } else {

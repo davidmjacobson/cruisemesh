@@ -5,19 +5,26 @@ struct RelayConfig: Equatable {
     var relayToken: String
 }
 
+func normalizeRelayUrl(_ value: String) -> String {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    guard !trimmed.isEmpty else { return "" }
+    return trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+}
+
 enum RelayConfigStore {
     private static let urlKey = "cruisemesh.relay.url"
     private static let tokenKey = "cruisemesh.relay.token"
 
     static func load() -> RelayConfig? {
-        let url = (UserDefaults.standard.string(forKey: urlKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = normalizeRelayUrl(UserDefaults.standard.string(forKey: urlKey) ?? "")
         let token = (UserDefaults.standard.string(forKey: tokenKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !url.isEmpty, !token.isEmpty else { return nil }
         return RelayConfig(relayUrl: url, relayToken: token)
     }
 
     static func save(relayUrl: String, relayToken: String) {
-        let url = relayUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = normalizeRelayUrl(relayUrl)
         let token = relayToken.trimmingCharacters(in: .whitespacesAndNewlines)
         if url.isEmpty || token.isEmpty {
             UserDefaults.standard.removeObject(forKey: urlKey)

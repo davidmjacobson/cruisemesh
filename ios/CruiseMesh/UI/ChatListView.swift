@@ -168,8 +168,13 @@ struct ChatListView: View {
                 }
             }
             .sheet(isPresented: $showFriends) {
-                FriendsView(identity: identity, appModel: appModel) {
+                FriendsView(
+                    identity: identity,
+                    appModel: appModel,
+                    initialToken: appModel.pendingFriendToken
+                ) {
                     showFriends = false
+                    appModel.pendingFriendToken = nil
                     reload()
                 }
             }
@@ -189,6 +194,7 @@ struct ChatListView: View {
                 reload()
                 cancellable = ChatEvents.subject.sink { _ in reload() }
                 appModel.startMeshIfEnabled()
+                if appModel.pendingFriendToken != nil { showFriends = true }
             }
             .onChange(of: runtime.state) { state in
                 if case .pausedForBluetoothAudio = state {
@@ -360,6 +366,9 @@ private struct MeshStatusSheet: View {
                 } else {
                     appModel.stopMesh()
                 }
+            }
+            .onChange(of: appModel.pendingFriendToken) { token in
+                if token != nil { showFriends = true }
             }
         )
     }

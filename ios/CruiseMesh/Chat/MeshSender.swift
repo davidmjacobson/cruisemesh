@@ -45,8 +45,18 @@ final class RealMeshSender: MeshSender {
 
     private func enqueue(contact: Contact, kind: UInt8, payload: Data, label: String) {
         let chatId = contact.userId
-        let lamport = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0
-        let next = lamport + 1
+        let own = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0
+        let delivered = (try? store.receiptThrough(
+            chatId: chatId,
+            senderUserId: identity.userId,
+            receiptType: ReceiptType.delivered
+        )) ?? 0
+        let read = (try? store.receiptThrough(
+            chatId: chatId,
+            senderUserId: identity.userId,
+            receiptType: ReceiptType.read
+        )) ?? 0
+        let next = max(max(own, delivered), read) + 1
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
         let message = StoredMessage(
             chatId: chatId,
@@ -62,8 +72,21 @@ final class RealMeshSender: MeshSender {
         _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
         ChatEvents.notifyChatChanged(chatId)
         RelaySyncEvents.requestSync()
-        if !MeshRouter.sendToUserId(userId: contact.userId, frame: encodeOutboundEnvelopeFrame(outbound)) {
-            log.info("\(label, privacy: .public): \(contact.name, privacy: .public) not connected; queued")
+        // A pending kind-3 friend card must reach the peer before the first
+        // visible message, otherwise the message is stored as coming from an
+        // unknown sender until a reverse scan. Replay the unacknowledged
+        // authored stream in Lamport order on every new send.
+        let pending = ((try? store.outboundEnvelopesAfter(
+            chatId: chatId,
+            senderUserId: identity.userId,
+            afterLamport: delivered
+        )) ?? []).sorted { $0.lamport < $1.lamport }
+        for pendingEnvelope in pending {
+            let frame = encodeOutboundEnvelopeFrame(pendingEnvelope)
+            if !MeshRouter.sendToUserId(userId: contact.userId, frame: frame) {
+                let muled = MeshRouter.relayToAll(frame: frame)
+                log.info("\(label, privacy: .public): sprayed pending lamport \(pendingEnvelope.lamport) to \(muled) mule link(s)")
+            }
         }
     }
 }

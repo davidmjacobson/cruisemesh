@@ -701,6 +701,7 @@ final class MeshController: ObservableObject {
         guard let json = String(data: body.content, encoding: .utf8),
               let card = try? parseFriendCard(json: json),
               friendCardUserId(card: card) == senderUserId else { return }
+        let wasKnown = (try? store.getContact(userId: senderUserId)) != nil
         let contact = Contact(
             userId: senderUserId,
             name: card.name,
@@ -743,6 +744,10 @@ final class MeshController: ObservableObject {
                 ackedSenderUserId: senderUserId,
                 throughLamport: through
             )
+        }
+        if !wasKnown {
+            FriendImportEvents.subject.send(FriendImportEvent(contact: contact, directBluetooth: sourceAddress != nil))
+            MessageNotifier.notifyFriendAdded(contact: contact)
         }
         log.info("Imported contact \(contact.name, privacy: .public) from friend request")
     }

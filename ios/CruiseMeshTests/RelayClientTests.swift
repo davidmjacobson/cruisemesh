@@ -42,6 +42,12 @@ private final class RelayMockURLProtocol: URLProtocol {
 }
 
 final class RelayClientTests: XCTestCase {
+
+    func testRelayURLNormalizationAddsHTTPSAndRemovesTrailingSlash() {
+        XCTAssertEqual(normalizeRelayUrl(" relay.example/ "), "https://relay.example")
+        XCTAssertEqual(normalizeRelayUrl("https://relay.example/"), "https://relay.example")
+        XCTAssertEqual(normalizeRelayUrl("http://127.0.0.1:8080/"), "http://127.0.0.1:8080")
+    }
     private var previousSession: URLSession!
 
     override func setUp() {

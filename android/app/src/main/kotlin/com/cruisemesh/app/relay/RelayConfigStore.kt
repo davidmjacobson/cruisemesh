@@ -12,19 +12,26 @@ data class RelayConfig(
     val relayToken: String,
 )
 
+/** Canonical relay base URL used for persisted settings and imported cards. */
+fun normalizeRelayUrl(value: String): String {
+    val trimmed = value.trim().trimEnd('/')
+    if (trimmed.isEmpty()) return ""
+    return if (trimmed.contains("://")) trimmed else "https://$trimmed"
+}
+
 /** Persists the optional family relay configuration used for QR sharing and fallback sync. */
 object RelayConfigStore {
 
     fun load(context: Context): RelayConfig? {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val relayUrl = prefs.getString(PREF_RELAY_URL, null)?.trim().orEmpty()
+        val relayUrl = normalizeRelayUrl(prefs.getString(PREF_RELAY_URL, null).orEmpty())
         val relayToken = prefs.getString(PREF_RELAY_TOKEN, null)?.trim().orEmpty()
         if (relayUrl.isEmpty() || relayToken.isEmpty()) return null
         return RelayConfig(relayUrl, relayToken)
     }
 
     fun save(context: Context, relayUrl: String, relayToken: String) {
-        val normalizedUrl = relayUrl.trim()
+        val normalizedUrl = normalizeRelayUrl(relayUrl)
         val normalizedToken = relayToken.trim()
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
         if (normalizedUrl.isEmpty() || normalizedToken.isEmpty()) {

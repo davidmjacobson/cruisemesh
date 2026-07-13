@@ -5,12 +5,12 @@ enum FriendRequestSender {
     private static let log = Logger(subsystem: "com.cruisemesh", category: "FriendRequest")
 
     /// After importing a scanned friend card, queue a signed kind=3 back.
-    static func sendMutualFriendRequest(
+    @discardableResult static func sendMutualFriendRequest(
         store: MessageStore,
         identity: Identity,
         contact: Contact,
         displayName: String
-    ) {
+    ) -> FriendRequestDelivery {
         let cardJson = makeFriendCard(
             name: displayName.isEmpty ? "Friend" : displayName,
             identity: identity,
@@ -29,13 +29,22 @@ enum FriendRequestSender {
             payload: Data(cardJson.utf8)
         )
         guard let outbound = buildOutboundAuthoredEnvelope(identity: identity, contact: contact, message: message) else {
-            return
+            return FriendRequestDelivery(reachedDirectly: false, lamport: lamport)
         }
         _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
         ChatEvents.notifyChatChanged(chatId)
         RelaySyncEvents.requestSync()
-        if !MeshRouter.sendToUserId(userId: contact.userId, frame: encodeOutboundEnvelopeFrame(outbound)) {
-            log.info("Friend request queued for later delivery to \(contact.name, privacy: .public)")
+        let frame = encodeOutboundEnvelopeFrame(outbound)
+        let reachedDirectly = MeshRouter.sendToUserId(userId: contact.userId, frame: frame)
+        if !reachedDirectly {
+            let muled = MeshRouter.relayToAll(frame: frame)
+            log.info("Friend request queued for later delivery to \(contact.name, privacy: .public); sprayed to \(muled) mule link(s)")
         }
+        return FriendRequestDelivery(reachedDirectly: reachedDirectly, lamport: lamport)
     }
+}
+
+struct FriendRequestDelivery: Hashable {
+    let reachedDirectly: Bool
+    let lamport: UInt64
 }

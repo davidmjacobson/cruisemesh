@@ -211,8 +211,7 @@ object RelayClient {
     }
 
     private fun buildUrl(baseUrl: String, pathAndQuery: String): String {
-        val trimmed = baseUrl.trim().trimEnd('/')
-        return "$trimmed$pathAndQuery"
+        return "${normalizeRelayUrl(baseUrl)}$pathAndQuery"
     }
 
     private fun base64Url(bytes: ByteArray): String =
