@@ -29,6 +29,21 @@ object ProfilePhotoStore {
         avatarFile(context).delete()
     }
 
+    /** Exact normalized JPEG bytes used by encrypted account backup. */
+    fun loadBackupBytes(context: Context): ByteArray =
+        avatarFile(context).takeIf { it.isFile && it.length() > 0L }?.readBytes() ?: ByteArray(0)
+
+    /** Restore exact normalized JPEG bytes from an authenticated account backup. */
+    fun restoreBackupBytes(context: Context, bytes: ByteArray) {
+        if (bytes.isEmpty()) {
+            clear(context)
+            return
+        }
+        val file = avatarFile(context)
+        file.parentFile?.mkdirs()
+        file.writeBytes(bytes)
+    }
+
     fun saveFromUri(context: Context, uri: Uri): String? {
         val bitmap = decodeSampledBitmap(context, uri) ?: return null
         return try {

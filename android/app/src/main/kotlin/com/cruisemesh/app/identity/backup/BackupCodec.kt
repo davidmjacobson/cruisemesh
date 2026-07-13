@@ -68,7 +68,15 @@ object BackupCodec {
         require(payload.identity.size == BackupFormat.IDENTITY_LEN) {
             "identity must be ${BackupFormat.IDENTITY_LEN} bytes, was ${payload.identity.size}"
         }
-        val size = 1 + 4 + 8 + 2 + payload.identity.size + 4 + payload.sqlite.size
+        val displayName = payload.displayName.orEmpty().toByteArray(Charsets.UTF_8)
+        val relayUrl = payload.relayUrl.orEmpty().toByteArray(Charsets.UTF_8)
+        val relayToken = payload.relayToken.orEmpty().toByteArray(Charsets.UTF_8)
+        require(displayName.size <= 0xFFFF) { "display name is too long" }
+        require(relayUrl.size <= 0xFFFF) { "relay URL is too long" }
+        require(relayToken.size <= 0xFFFF) { "relay token is too long" }
+        val size = 1 + 4 + 8 + 2 + payload.identity.size + 4 + payload.sqlite.size +
+            2 + displayName.size + 4 + payload.ownAvatar.size + 8 +
+            2 + relayUrl.size + 2 + relayToken.size + 1
         return ByteBuffer.allocate(size).apply {
             put(BackupFormat.INNER_VERSION.toByte())
             putInt(payload.srcVersionCode)
@@ -77,6 +85,16 @@ object BackupCodec {
             put(payload.identity)
             putInt(payload.sqlite.size)
             put(payload.sqlite)
+            putShort(displayName.size.toShort())
+            put(displayName)
+            putInt(payload.ownAvatar.size)
+            put(payload.ownAvatar)
+            putLong(payload.ownAvatarEpoch)
+            putShort(relayUrl.size.toShort())
+            put(relayUrl)
+            putShort(relayToken.size.toShort())
+            put(relayToken)
+            put((if (payload.shareOnline) 1 else 0).toByte())
         }.array()
     }
 
@@ -85,7 +103,9 @@ object BackupCodec {
         try {
             val buf = ByteBuffer.wrap(plaintext)
             val innerVersion = buf.get().toInt() and 0xFF
-            if (innerVersion != BackupFormat.INNER_VERSION) throw BackupException.UnsupportedVersion(innerVersion)
+            if (innerVersion != BackupFormat.LEGACY_INNER_VERSION && innerVersion != BackupFormat.INNER_VERSION) {
+                throw BackupException.UnsupportedVersion(innerVersion)
+            }
             val srcVersionCode = buf.getInt()
             val createdAtMs = buf.getLong()
             val identityLen = buf.getShort().toInt() and 0xFFFF
@@ -94,11 +114,45 @@ object BackupCodec {
             val sqliteLen = buf.getInt()
             if (sqliteLen < 0 || sqliteLen > buf.remaining()) throw BackupException.Truncated
             val sqlite = ByteArray(sqliteLen).also { buf.get(it) }
-            return BackupPayload(identity, sqlite, srcVersionCode, createdAtMs)
+            if (innerVersion == BackupFormat.LEGACY_INNER_VERSION) {
+                return BackupPayload(identity, sqlite, srcVersionCode, createdAtMs)
+            }
+
+            val displayName = readUtf8(buf).ifEmpty { null }
+            val avatarLen = buf.getInt()
+            if (avatarLen < 0 || avatarLen > buf.remaining()) throw BackupException.Truncated
+            val ownAvatar = ByteArray(avatarLen).also { buf.get(it) }
+            val ownAvatarEpoch = buf.getLong()
+            val relayUrl = readUtf8(buf).ifEmpty { null }
+            val relayToken = readUtf8(buf).ifEmpty { null }
+            val shareOnline = when (buf.get().toInt() and 0xFF) {
+                0 -> false
+                1 -> true
+                else -> throw BackupException.Truncated
+            }
+            if (buf.hasRemaining()) throw BackupException.Truncated
+            return BackupPayload(
+                identity = identity,
+                sqlite = sqlite,
+                srcVersionCode = srcVersionCode,
+                createdAtMs = createdAtMs,
+                displayName = displayName,
+                ownAvatar = ownAvatar,
+                ownAvatarEpoch = ownAvatarEpoch,
+                relayUrl = relayUrl,
+                relayToken = relayToken,
+                shareOnline = shareOnline,
+            )
         } catch (_: BufferUnderflowException) {
             throw BackupException.Truncated
         } catch (_: IndexOutOfBoundsException) {
             throw BackupException.Truncated
         }
+    }
+
+    private fun readUtf8(buf: ByteBuffer): String {
+        val length = buf.getShort().toInt() and 0xFFFF
+        if (length > buf.remaining()) throw BackupException.Truncated
+        return ByteArray(length).also { buf.get(it) }.toString(Charsets.UTF_8)
     }
 }

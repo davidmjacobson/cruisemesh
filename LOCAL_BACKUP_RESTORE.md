@@ -28,7 +28,8 @@ Data lives in two stores:
 | Data | Where | Notes |
 |------|-------|-------|
 | **Identity**: `userId`(16) + `signPk`/`signSk`(32 ea, Ed25519) + `agreePk`/`agreeSk`(32 ea, X25519) = **144 bytes** | SharedPreferences `cruisemesh_identity`, AES-GCM-encrypted | wrapping key lives in **Android Keystore**, alias `cruisemesh_identity_key` |
-| **Messages + contacts + groups + avatars + relay/receipt queue state** | SQLite `filesDir/cruisemesh.sqlite` (Rust core `MessageStore`) | opened lazily by `AppStore.get()` |
+| **Messages + contacts + groups + contact avatars + relay/receipt queue state** | SQLite `filesDir/cruisemesh.sqlite` (Rust core `MessageStore`) | opened lazily by `AppStore.get()` |
+| **Own profile + relay fallback**: display name, own avatar/epoch, relay URL/token, presence-sharing preference | SharedPreferences + `filesDir/profile/avatar.jpg` | included by inner format v2; v1 backups omit these fields |
 
 The trap: the Keystore wrapping key is **non-exportable and hardware-bound — it
 never leaves secure hardware and is destroyed on uninstall.** So backing up the
@@ -77,11 +78,12 @@ BackupPlaintext {
 }
 ```
 
-Everything else (profile name, avatar, relay config in `RelayConfigStore`,
-onboarding flag) is either derivable, non-critical, or re-synced by peers. v1
-restores identity + message store; profile display name is re-derivable from the
-user's own contact record / re-entered at onboarding. (If we want name+avatar
-exactly preserved, add them to the header in a point release — cheap, additive.)
+Inner format v1 restored identity + message store only. Inner format v2 also
+preserves the user's display name, own avatar and avatar epoch, relay fallback
+URL/token, and presence-sharing preference. The decoder remains backward
+compatible with v1 files; their omitted settings retain fresh-install defaults.
+The onboarding-completed flag is deliberately re-established by a successful
+restore rather than stored in the file.
 
 ---
 

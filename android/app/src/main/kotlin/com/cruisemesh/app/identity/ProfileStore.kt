@@ -40,6 +40,14 @@ object ProfileStore {
         return epoch
     }
 
+    /** Reinstalls the profile-photo revision carried by an authenticated backup. */
+    fun restoreOwnAvatarEpoch(context: Context, epoch: Long) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putLong(PREF_OWN_AVATAR_EPOCH, epoch.coerceAtLeast(0L))
+            .apply()
+    }
+
     fun defaultDisplayName(): String =
         Build.MODEL?.trim().takeUnless { it.isNullOrEmpty() } ?: "CruiseMesh user"
 }
