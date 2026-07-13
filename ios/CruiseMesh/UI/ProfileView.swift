@@ -2,7 +2,7 @@ import PhotosUI
 import SwiftUI
 
 /// Hosted privacy policy (App Store / Play Console + in-app link).
-private let privacyPolicyURL = URL(string: "https://cruisemesh.davidjacobson.work/privacy.html")!
+private let privacyPolicyURL = URL(string: "https://cruisemesh.app/privacy")!
 
 struct ProfileView: View {
     let identity: Identity
