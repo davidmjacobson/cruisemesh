@@ -6,13 +6,10 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 /**
- * JVM tests for [OverlayKeyboardFreeze]: while frozen, `extraBottomPx` plus
- * whatever the caller feeds in via [OverlayKeyboardFreeze.trackLiveBottomInset]
- * (standing in for Scaffold's own live bottom inset) must always sum to
- * exactly the value captured at [OverlayKeyboardFreeze.onOverlayOpened] --
- * both numbers come from the same tracked source, so there's nothing left to
- * drift apart. Uses a hand-rolled keyboard-controller fake; no Compose host
- * needed.
+ * JVM tests for [OverlayKeyboardFreeze]: while frozen, `extraBottomPx` must
+ * cancel any increase in the usable viewport edge supplied through
+ * [OverlayKeyboardFreeze.trackLiveContentBottom]. Uses a hand-rolled
+ * keyboard-controller fake; no Compose host needed.
  */
 class OverlayKeyboardFreezeTest {
 
@@ -31,40 +28,39 @@ class OverlayKeyboardFreezeTest {
     @Test
     fun `extraBottomPx is zero while not frozen even with a live inset`() {
         val freeze = freezeOf(FakeKeyboard())
-        freeze.trackLiveBottomInset(300f)
+        freeze.trackLiveContentBottom(500f, imeVisible = true)
         assertEquals(0f, freeze.extraBottomPx)
     }
 
     @Test
-    fun `open captures the live inset and total stays pinned as it drops to zero`() {
+    fun `open captures the content edge and padding cancels viewport growth`() {
         val keyboard = FakeKeyboard()
         val freeze = freezeOf(keyboard)
-        var live = 300f
-        freeze.trackLiveBottomInset(live)
+        var live = 500f
+        freeze.trackLiveContentBottom(live, imeVisible = true)
 
         freeze.onOverlayOpened()
 
         assertEquals(1, keyboard.hideCalls)
-        // Frozen: live + extra must sum to the captured 300 at every point
-        // along the animation, including the tail where the live source
-        // (Scaffold's real inset) does something nonlinear -- it doesn't
-        // matter here since we never re-derive it, just diff against it.
-        live = 300f; freeze.trackLiveBottomInset(live)
-        assertEquals(300f, live + freeze.extraBottomPx)
-        live = 48f; freeze.trackLiveBottomInset(live) // e.g. floored at navigationBars height
-        assertEquals(300f, live + freeze.extraBottomPx)
-        live = 0f; freeze.trackLiveBottomInset(live)
-        assertEquals(300f, live + freeze.extraBottomPx)
+        // Frozen: usable edge minus compensating bottom padding stays at the
+        // captured keyboard-open position throughout the resize animation.
+        live = 500f; freeze.trackLiveContentBottom(live, imeVisible = true)
+        assertEquals(500f, live - freeze.extraBottomPx)
+        live = 650f; freeze.trackLiveContentBottom(live, imeVisible = true)
+        assertEquals(500f, live - freeze.extraBottomPx)
+        live = 800f; freeze.trackLiveContentBottom(live, imeVisible = false)
+        assertEquals(500f, live - freeze.extraBottomPx)
     }
 
     @Test
-    fun `open with no live inset is a no-op and close does not pop the keyboard`() {
+    fun `open with navigation inset but no IME is a no-op and close does not pop the keyboard`() {
         val keyboard = FakeKeyboard()
         val freeze = freezeOf(keyboard)
-        freeze.trackLiveBottomInset(0f)
+        freeze.trackLiveContentBottom(800f, imeVisible = false)
 
         freeze.onOverlayOpened()
         assertEquals(0f, freeze.extraBottomPx)
+        assertEquals(0, keyboard.hideCalls)
 
         freeze.onOverlayClosed()
         assertEquals(0, keyboard.showCalls)
@@ -74,10 +70,10 @@ class OverlayKeyboardFreezeTest {
     fun `close reshows the keyboard when it was open at press time`() {
         val keyboard = FakeKeyboard()
         val freeze = freezeOf(keyboard)
-        freeze.trackLiveBottomInset(300f)
+        freeze.trackLiveContentBottom(500f, imeVisible = true)
 
         freeze.onOverlayOpened()
-        freeze.trackLiveBottomInset(0f)
+        freeze.trackLiveContentBottom(800f, imeVisible = false)
         freeze.onOverlayClosed()
 
         assertEquals(1, keyboard.showCalls)
@@ -93,25 +89,25 @@ class OverlayKeyboardFreezeTest {
     @Test
     fun `release unfreezes once the live inset is back at its captured height`() = runBlocking {
         val freeze = freezeOf(FakeKeyboard())
-        freeze.trackLiveBottomInset(300f)
+        freeze.trackLiveContentBottom(500f, imeVisible = true)
 
         freeze.onOverlayOpened()
-        freeze.trackLiveBottomInset(0f)
-        freeze.trackLiveBottomInset(300f) // keyboard returned before release ran
+        freeze.trackLiveContentBottom(800f, imeVisible = false)
+        freeze.trackLiveContentBottom(500f, imeVisible = true) // keyboard returned before release ran
 
         freeze.releaseWhenKeyboardReturns()
         // Unfrozen: no compensation left on top of the live inset.
-        freeze.trackLiveBottomInset(0f)
+        freeze.trackLiveContentBottom(800f, imeVisible = false)
         assertEquals(0f, freeze.extraBottomPx)
     }
 
     @Test
     fun `release falls back to the timeout when the live inset never returns`() = runBlocking {
         val freeze = freezeOf(FakeKeyboard(), releaseTimeoutMs = 50)
-        freeze.trackLiveBottomInset(300f)
+        freeze.trackLiveContentBottom(500f, imeVisible = true)
 
         freeze.onOverlayOpened()
-        freeze.trackLiveBottomInset(0f)
+        freeze.trackLiveContentBottom(800f, imeVisible = false)
         assertEquals(300f, freeze.extraBottomPx)
 
         freeze.releaseWhenKeyboardReturns()
