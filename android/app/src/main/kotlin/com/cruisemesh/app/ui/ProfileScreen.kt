@@ -52,7 +52,7 @@ import com.cruisemesh.app.relay.RelayConfigStore
 import android.widget.Toast
 
 /** Hosted privacy policy (Play Console + in-app link). */
-const val PRIVACY_POLICY_URL = "https://cruisemesh.davidjacobson.work/privacy.html"
+const val PRIVACY_POLICY_URL = "https://cruisemesh.app/privacy"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
