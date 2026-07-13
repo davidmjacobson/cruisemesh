@@ -19,7 +19,7 @@ struct ReactionPayload: Equatable {
 
     func encode() -> Data {
         var out = Data()
-        out.append(wireVersion)
+        out.append(Self.wireVersion)
         writeBytes16(target.senderUserId, to: &out)
         out.append(contentsOf: target.lamport.bigEndianBytes)
         out.append(target.kind)
@@ -137,7 +137,7 @@ private struct DataCursor {
 
     mutating func readBytes16() -> Data? {
         guard let len = readUInt16() else { return nil }
-        return read(count: Int(len)).map(Data.init)
+        return read(count: Int(len)).map { Data($0) }
     }
 
     mutating func readUtf16(maxBytes: Int) -> String? {
