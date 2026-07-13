@@ -24,4 +24,12 @@ class FriendTextTest {
     fun returnsTrimmedInputWhenNoToken() {
         assertEquals("""{"name":"A"}""", extractFriendToken("  {\"name\":\"A\"} \n"))
     }
+
+    @Test
+    fun stripsTrailingPunctuationFromToken() {
+        assertEquals(
+            "CMFRIEND1:abc_123-xyz",
+            extractFriendToken("Paste it: CMFRIEND1:abc_123-xyz."),
+        )
+    }
 }

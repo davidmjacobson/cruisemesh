@@ -80,6 +80,18 @@ object MessageNotifier {
         )
     }
 
+    /** Announces that an authenticated mutual friend request imported a new friend. */
+    fun notifyFriendAdded(context: Context, contact: Contact) {
+        postChatNotification(
+            context = context,
+            chatId = contact.userId,
+            title = contact.name,
+            text = "${contact.name} added you. Say hi.",
+            deepLinkHex = UserIdHex.encode(contact.userId),
+            isGroup = false,
+        )
+    }
+
     /**
      * Posts (or updates) a notification for an incoming group message. Tapping
      * opens the group chat via [EXTRA_CHAT_IS_GROUP] + [EXTRA_CHAT_USER_ID_HEX]

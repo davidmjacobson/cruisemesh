@@ -20,6 +20,20 @@ enum MessageNotifier {
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
 
+    static func notifyFriendAdded(contact: Contact) {
+        let content = UNMutableNotificationContent()
+        content.title = contact.name
+        content.body = "\(contact.name) added you. Say hi."
+        content.sound = .default
+        content.userInfo = [chatUserIdKey: UserIdHex.encode(contact.userId)]
+        let request = UNNotificationRequest(
+            identifier: UserIdHex.encode(contact.userId),
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+    }
+
     static func notifyIncomingGroupMessage(group: Group, senderName: String, preview: String) {
         let content = UNMutableNotificationContent()
         content.title = group.name

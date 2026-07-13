@@ -141,8 +141,7 @@ enum RelayClient {
     }
 
     private static func buildURL(_ base: String, path: String) throws -> URL {
-        let trimmed = base.hasSuffix("/") ? String(base.dropLast()) : base
-        guard let url = URL(string: trimmed + path) else {
+        guard let url = URL(string: normalizeRelayUrl(base) + path) else {
             throw NSError(domain: "RelayClient", code: 1, userInfo: [NSLocalizedDescriptionKey: "bad URL"])
         }
         return url

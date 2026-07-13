@@ -10,6 +10,7 @@ import org.junit.Test
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
+import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.generateIdentity
 import java.nio.file.Files
 import java.nio.file.Path
@@ -167,6 +168,43 @@ class RealMeshSenderMulingTest {
 
         assertEquals(1, sentFrames.size)
         assertEquals("BOB-ADDR", sentFrames[0].first)
+    }
+
+    @Test
+    fun `first chat message replays an unacknowledged friend card before the text`() {
+        val alice = generateIdentity()
+        val bob = generateIdentity()
+        val bobContact = contactFor(bob, "Bob")
+        val store = MessageStore.open(":memory:")
+
+        val friendRequest = StoredMessage(
+            chatId = bob.userId,
+            senderUserId = alice.userId,
+            lamport = 1uL,
+            timestamp = 1L,
+            kind = 3u,
+            payload = "friend-card".toByteArray(),
+        )
+        val friendEnvelope = com.cruisemesh.app.mesh.buildOutboundAuthoredEnvelope(
+            alice,
+            bobContact,
+            friendRequest,
+        )!!
+        store.insertOutgoingMessage(friendRequest, friendEnvelope, 1L)
+
+        val sentFrames = mutableListOf<ByteArray>()
+        MeshRouter.registerCentral { _, frame -> sentFrames += frame }
+        MeshRouter.registerPeripheral { _, _ -> }
+        MeshRouter.onConnected("BOB-ADDR", MeshRouterState.Transport.CENTRAL)
+        MeshRouter.onHello("BOB-ADDR", bob.userId)
+
+        RealMeshSender(store, alice).sendText(bobContact, "hi")
+
+        val pending = store.outboundEnvelopesAfter(bob.userId, alice.userId, 0uL).sortedBy { it.lamport }
+        assertEquals(2, pending.size)
+        assertEquals(2, sentFrames.size)
+        assertArrayEquals(encodeOutboundEnvelopeFrame(pending[0]), sentFrames[0])
+        assertArrayEquals(encodeOutboundEnvelopeFrame(pending[1]), sentFrames[1])
     }
 
     @Test

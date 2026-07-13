@@ -36,7 +36,7 @@ object FriendRequestSender {
         store: MessageStore,
         identity: Identity,
         contact: Contact,
-    ) {
+    ): FriendRequestDelivery {
         val relay = RelayConfigStore.load(context)
         val cardJson = makeFriendCard(
             ProfileStore.loadDisplayName(context),
@@ -63,15 +63,21 @@ object FriendRequestSender {
             kind = KIND_FRIEND_REQUEST,
             payload = cardJson.toByteArray(Charsets.UTF_8),
         )
-        val outbound = buildOutboundAuthoredEnvelope(identity, contact, message) ?: return
+        val outbound = buildOutboundAuthoredEnvelope(identity, contact, message)
+            ?: return FriendRequestDelivery(reachedDirectly = false, lamport = lamport)
         store.insertOutgoingMessage(message, outbound, timestamp)
         RelaySyncEvents.requestSync()
 
-        if (!MeshRouter.sendToUserId(contact.userId, encodeOutboundEnvelopeFrame(outbound))) {
+        val frame = encodeOutboundEnvelopeFrame(outbound)
+        val reachedDirectly = MeshRouter.sendToUserId(contact.userId, frame)
+        if (!reachedDirectly) {
+            val muled = MeshRouter.relayToAll(frame)
             Log.i(
                 TAG,
-                "Queued friend request for ${UserIdHex.encode(contact.userId)}; peer not currently connected",
+                "Queued friend request for ${UserIdHex.encode(contact.userId)}; " +
+                    "peer not currently connected, sprayed to $muled mule link(s)",
             )
         }
+        return FriendRequestDelivery(reachedDirectly = reachedDirectly, lamport = lamport)
     }
 }

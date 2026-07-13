@@ -134,9 +134,10 @@ class RealMeshSender(
         logLabel: String,
     ) {
         val chatId = contact.userId
+        val ackedDelivered = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_DELIVERED)
         val lamport = nextAuthoredLamport(
             ownContiguous = store.highestContiguousLamport(chatId, identity.userId),
-            ackedDelivered = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_DELIVERED),
+            ackedDelivered = ackedDelivered,
             ackedRead = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_READ),
         )
         val timestamp = System.currentTimeMillis()
@@ -154,20 +155,28 @@ class RealMeshSender(
         ChatEvents.notifyChatChanged(chatId)
         RelaySyncEvents.requestSync()
 
-        val frame = encodeOutboundEnvelopeFrame(outbound)
-        if (!MeshRouter.sendToUserId(contact.userId, frame)) {
-            // No direct link to the recipient right now -- give the sealed
-            // envelope to whoever IS connected so it can mule to the
-            // recipient later (BLE_1TO1_MULING.md Hook A). Muling peers can't
-            // open it (sealed to the recipient), so they carry/flood it via
-            // the existing foreign-envelope path; skipped entirely when the
-            // direct send above already succeeded, since that path plus
-            // receipts/digest resend already covers delivery.
-            val muled = MeshRouter.relayToAll(frame)
-            Log.i(
-                TAG,
-                "$logLabel: ${contact.name} not currently connected; sprayed to $muled mule link(s), message stays queued",
-            )
+        // Preserve causal order during the one-sided friending window. The
+        // friend-card request is an earlier row in this same authored stream.
+        // If its first BLE attempt happened before the peer's link was ready,
+        // sending only this new text lets the text arrive first as an unknown
+        // sender; it then stays hidden until a reverse scan imports us. Replay
+        // every still-unacknowledged envelope in lamport order so the card is
+        // always queued on the link before the first visible message.
+        val pending = store
+            .outboundEnvelopesAfter(chatId, identity.userId, ackedDelivered)
+            .sortedBy { it.lamport }
+        for (pendingEnvelope in pending) {
+            val frame = encodeOutboundEnvelopeFrame(pendingEnvelope)
+            if (!MeshRouter.sendToUserId(contact.userId, frame)) {
+                // No direct link to the recipient right now -- give the sealed
+                // envelope to whoever IS connected so it can mule to the
+                // recipient later (BLE_1TO1_MULING.md Hook A).
+                val muled = MeshRouter.relayToAll(frame)
+                Log.i(
+                    TAG,
+                    "$logLabel: ${contact.name} not currently connected; sprayed pending lamport=${pendingEnvelope.lamport} to $muled mule link(s)",
+                )
+            }
         }
     }
 }

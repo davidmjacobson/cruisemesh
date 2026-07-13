@@ -22,8 +22,12 @@ struct CruiseMeshApp: App {
                 UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
             }
             .onOpenURL { url in
-                // Reserved for future cruisemesh:// deep links
-                _ = url
+                guard url.host == "cruisemesh.app", (url.path == "/f" || url.path == "/f/"),
+                      let fragment = url.fragment else { return }
+                let token = extractFriendToken(fragment)
+                if token.hasPrefix("CMFRIEND1:") {
+                    appModel.pendingFriendToken = token
+                }
             }
         }
     }

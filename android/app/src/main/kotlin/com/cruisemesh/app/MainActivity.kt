@@ -41,6 +41,8 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.NavType
+import androidx.navigation.navArgument
 import com.cruisemesh.app.chat.ChatScreen
 import com.cruisemesh.app.chat.GroupChatScreen
 import com.cruisemesh.app.chat.GroupSender
@@ -51,6 +53,8 @@ import com.cruisemesh.app.friending.ContactsScreen
 import com.cruisemesh.app.friending.FriendRequestSender
 import com.cruisemesh.app.friending.AddFriendScreen
 import com.cruisemesh.app.friending.ImportFriendResult
+import com.cruisemesh.app.friending.FriendAddedOutcome
+import com.cruisemesh.app.friending.FriendPreview
 import com.cruisemesh.app.ui.ConnectivityWarning
 import com.cruisemesh.app.ui.ConnectivityWarningSeverity
 import android.widget.Toast
@@ -104,8 +108,9 @@ private const val UI_PREFS_NAME = "cruisemesh_ui"
 private const val PREF_HIDE_BLUETOOTH_AUDIO_WARNING = "hide_bluetooth_audio_warning"
 
 data class PendingDeepLink(
-    val idHex: String,
-    val isGroup: Boolean,
+    val idHex: String = "",
+    val isGroup: Boolean = false,
+    val friendToken: String? = null,
 )
 
 class MainActivity : ComponentActivity() {
@@ -137,9 +142,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun deepLinkFromIntent(intent: Intent?): PendingDeepLink? {
-        val hex = intent?.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX) ?: return null
-        val isGroup = intent.getBooleanExtra(MessageNotifier.EXTRA_CHAT_IS_GROUP, false)
-        return PendingDeepLink(hex, isGroup)
+        val hex = intent?.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)
+        if (hex != null) {
+            return PendingDeepLink(hex, intent.getBooleanExtra(MessageNotifier.EXTRA_CHAT_IS_GROUP, false))
+        }
+        val uri = intent?.data ?: return null
+        if (
+            uri.scheme == "https" &&
+            uri.host == "cruisemesh.app" &&
+            (uri.path == "/f" || uri.path == "/f/")
+        ) {
+            val token = uri.fragment?.let(::extractFriendToken)?.takeIf { it.startsWith("CMFRIEND1:") }
+            if (token != null) return PendingDeepLink(friendToken = token)
+        }
+        return null
     }
 }
 
@@ -174,8 +190,17 @@ fun CruiseMeshApp(
         composable("profile") { ProfileRoute(identity, navController) }
         composable("backup") { BackupExportScreen(onBack = { navController.popBackStack() }) }
         composable("restore") { BackupRestoreScreen(onBack = { navController.popBackStack() }) }
-        composable("myQr") { MyQrScreen(identity, onBack = { navController.popBackStack() }) }
-        composable("addFriend") { AddFriendRoute(identity, navController) }
+        composable("myQr") {
+            MyQrScreen(
+                identity,
+                onSayHi = { openFriendChat(navController, it) },
+                onBack = { navController.popBackStack() },
+            )
+        }
+        composable(
+            "addFriend?token={token}",
+            arguments = listOf(navArgument("token") { type = NavType.StringType; nullable = true; defaultValue = null }),
+        ) { entry -> AddFriendRoute(identity, navController, entry.arguments?.getString("token")) }
         composable("scan") { ScanRoute(identity, navController) }
         composable("contacts") { ContactsRoute(navController) }
         composable("newGroup") { NewGroupRoute(identity, navController) }
@@ -192,7 +217,8 @@ fun CruiseMeshApp(
     LaunchedEffect(pendingDeepLink, onboardingCompleted) {
         val link = pendingDeepLink ?: return@LaunchedEffect
         if (!onboardingCompleted) return@LaunchedEffect
-        val route = if (link.isGroup) "group/${link.idHex}" else "chat/${link.idHex}"
+        val route = link.friendToken?.let { "addFriend?token=${Uri.encode(it)}" }
+            ?: if (link.isGroup) "group/${link.idHex}" else "chat/${link.idHex}"
         navController.navigate(route) {
             launchSingleTop = true
         }
@@ -810,10 +836,11 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
     if (hasCameraPermission) {
         ScanScreen(
             ownUserId = identity.userId,
+            store = store,
             onContactAdded = { scanned ->
                 val contact = RelayImport.reconcileOnImport(context, store, scanned)
                 store.upsertContact(contact)
-                FriendRequestSender.queueForScannedContact(context, store, identity, contact)
+                val delivery = FriendRequestSender.queueForScannedContact(context, store, identity, contact)
                 ProfileSyncSender.queueToContact(
                     context,
                     store,
@@ -821,7 +848,10 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
                     contact,
                     ProfileStore.loadOwnAvatarEpoch(context),
                 )
+                FriendAddedOutcome(contact, delivery, RelayConfigStore.load(context) != null)
             },
+            onSayHi = { openFriendChat(navController, it) },
+            onDone = { returnToContacts(navController) },
             onBack = { navController.popBackStack() },
         )
     } else {
@@ -841,7 +871,7 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
 }
 
 @Composable
-private fun AddFriendRoute(identity: Identity, navController: NavHostController) {
+private fun AddFriendRoute(identity: Identity, navController: NavHostController, initialToken: String? = null) {
     val context = LocalContext.current
     val store = remember { AppStore.get(context) }
 
@@ -854,44 +884,65 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController)
                 if (userId.contentEquals(identity.userId)) {
                     ImportFriendResult.Error("That's your own card")
                 } else {
-                    val contact = RelayImport.reconcileOnImport(
-                        context,
-                        store,
-                        Contact(
+                    val candidate = Contact(
                             userId = userId,
                             name = card.name,
                             signPk = card.signPk,
                             agreePk = card.agreePk,
                             relayUrl = card.relayUrl,
                             relayToken = card.relayToken,
-                        ),
                     )
-                    store.upsertContact(contact)
-                    FriendRequestSender.queueForScannedContact(context, store, identity, contact)
-                    ProfileSyncSender.queueToContact(
-                        context,
-                        store,
-                        identity,
-                        contact,
-                        ProfileStore.loadOwnAvatarEpoch(context),
-                    )
-                    val notice = if (RelayConfigStore.load(context) == null) {
-                        "Added ${contact.name}. You don't have a relay set up, so messages will wait until your phones are near each other."
-                    } else {
-                        null
+                    val collision = store.listContacts().firstOrNull {
+                        it.name.equals(candidate.name, ignoreCase = true) &&
+                            !it.userId.contentEquals(candidate.userId)
                     }
-                    if (notice != null) {
-                        Toast.makeText(context, notice, Toast.LENGTH_LONG).show()
+                    val warning = collision?.let {
+                        "You already have a ${candidate.name}; this card has different security keys. Compare the fingerprint words before adding it."
                     }
-                    navController.navigate("chat/${UserIdHex.encode(contact.userId)}")
-                    ImportFriendResult.Success(notice)
+                    ImportFriendResult.Preview(FriendPreview(candidate, warning))
                 }
             } catch (_: Exception) {
-                ImportFriendResult.Error("Not a CruiseMesh friend card")
+                if (text.contains("CMFRIEND1:")) {
+                    ImportFriendResult.Error("That looks like a friend card but part of it is missing. Copy the whole message and try again.")
+                } else {
+                    ImportFriendResult.Error("Not a CruiseMesh friend card")
+                }
             }
         },
+        onConfirmContact = { candidate ->
+            val contact = RelayImport.reconcileOnImport(context, store, candidate)
+            store.upsertContact(contact)
+            val delivery = FriendRequestSender.queueForScannedContact(context, store, identity, contact)
+            ProfileSyncSender.queueToContact(
+                context,
+                store,
+                identity,
+                contact,
+                ProfileStore.loadOwnAvatarEpoch(context),
+            )
+            FriendAddedOutcome(contact, delivery, RelayConfigStore.load(context) != null)
+        },
+        ownUserId = identity.userId,
+        store = store,
+        initialText = initialToken.orEmpty(),
+        onSayHi = { openFriendChat(navController, it) },
+        onDone = { returnToContacts(navController) },
         onBack = { navController.popBackStack() },
     )
+}
+
+private fun openFriendChat(navController: NavHostController, contact: Contact) {
+    navController.navigate("chat/${UserIdHex.encode(contact.userId)}") {
+        popUpTo("home")
+        launchSingleTop = true
+    }
+}
+
+private fun returnToContacts(navController: NavHostController) {
+    navController.navigate("contacts") {
+        popUpTo("home")
+        launchSingleTop = true
+    }
 }
 
 @Composable

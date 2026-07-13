@@ -30,6 +30,7 @@ import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.friending.ProfileSyncSender
+import com.cruisemesh.app.friending.FriendImportEvents
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.AttachmentPayload
@@ -41,6 +42,7 @@ import com.cruisemesh.app.notify.MessageNotifier
 import com.cruisemesh.app.relay.RelayClient
 import com.cruisemesh.app.relay.RelayConfig
 import com.cruisemesh.app.relay.RelayConfigStore
+import com.cruisemesh.app.relay.normalizeRelayUrl
 import com.cruisemesh.app.relay.RelayImport
 import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.Contact
@@ -655,11 +657,27 @@ class MeshService : Service() {
             MeshConnectivityStatus.setRelayHealth(RelayHealth.NoConfig)
             return
         }
+        var anyRelaySucceeded = false
+        var ownRelaySucceeded = fallbackConfig == null
         for (config in configs) {
-            pollRelayMailbox(config, identity, contacts, fallbackConfig, now, network)
-            syncRelayPresence(config, identity, contacts, fallbackConfig, now, network)
+            try {
+                pollRelayMailbox(config, identity, contacts, fallbackConfig, now, network)
+                syncRelayPresence(config, identity, contacts, fallbackConfig, now, network)
+                anyRelaySucceeded = true
+                if (config == fallbackConfig) ownRelaySucceeded = true
+            } catch (e: Exception) {
+                // A contact can carry stale relay credentials from an older
+                // friend card. That relay failing must not abort polling of
+                // the remaining relays or declare our own configured relay
+                // unreachable when it succeeded.
+                Log.w(TAG, "Relay sync failed for ${config.relayUrl}: ${e.message}")
+            }
         }
-        MeshConnectivityStatus.setRelayHealth(RelayHealth.Ok(now))
+        if (ownRelaySucceeded && anyRelaySucceeded) {
+            MeshConnectivityStatus.setRelayHealth(RelayHealth.Ok(now))
+        } else {
+            MeshConnectivityStatus.setRelayHealth(RelayHealth.Failing(now))
+        }
         val netDesc = if (network != null) "${networkLabel(network)}(pinned)" else "${networkLabel(connectivityManager.activeNetwork)}(default)"
         Log.i(TAG, "Relay sync complete: configs=${configs.size} net=$netDesc reason=$reason")
     }
@@ -927,7 +945,7 @@ class MeshService : Service() {
         }
 
     private fun resolvedRelayConfig(contact: Contact, fallbackConfig: RelayConfig?): RelayConfig? {
-        val relayUrl = contact.relayUrl?.trim().orEmpty()
+        val relayUrl = normalizeRelayUrl(contact.relayUrl.orEmpty())
         val relayToken = contact.relayToken?.trim().orEmpty()
         if (relayUrl.isNotEmpty() && relayToken.isNotEmpty()) {
             return RelayConfig(relayUrl, relayToken)
@@ -1521,7 +1539,7 @@ class MeshService : Service() {
             }
             return InboundDisposition.CARRIED
         }
-        deliverOpenedEnvelope(sourceLabel, opened, identity)
+        deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity)
         return InboundDisposition.CONSUMED
     }
 
@@ -1749,7 +1767,7 @@ class MeshService : Service() {
      * Reached only for envelopes addressed to us; foreign traffic never gets
      * here (see [handleEnvelope]).
      */
-    private fun deliverOpenedEnvelope(address: String, opened: OpenedMessage, identity: Identity) {
+    private fun deliverOpenedEnvelope(address: String, directBle: Boolean, opened: OpenedMessage, identity: Identity) {
         val body = try {
             decodeMessageBody(opened.payload)
         } catch (e: CoreException) {
@@ -1772,7 +1790,7 @@ class MeshService : Service() {
             )
             KIND_REACTION -> handleIncomingChatMessage(address, opened.senderUserId, body, identity, KIND_REACTION)
             KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
-            KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, opened.senderUserId, body, identity)
+            KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, directBle, opened.senderUserId, body, identity)
             KIND_GROUP_INVITE -> handleIncomingGroupInvite(address, opened.senderUserId, body, identity)
             KIND_PROFILE_SYNC -> handleIncomingProfileSync(address, opened.senderUserId, body, identity)
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
@@ -1941,6 +1959,7 @@ class MeshService : Service() {
      */
     private fun handleIncomingFriendRequest(
         address: String,
+        directBle: Boolean,
         senderUserId: ByteArray,
         body: MessageBody,
         identity: Identity,
@@ -1956,6 +1975,7 @@ class MeshService : Service() {
             return
         }
 
+        val wasKnown = store.getContact(senderUserId) != null
         val contact = RelayImport.reconcileOnImport(
             this,
             store,
@@ -2020,6 +2040,10 @@ class MeshService : Service() {
         sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
         if (isVisible) {
             sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
+        }
+        if (!wasKnown) {
+            FriendImportEvents.notifyImported(contact, directBle)
+            MessageNotifier.notifyFriendAdded(this, contact)
         }
         Log.i(TAG, "Imported contact ${contact.name} from friend request on $address")
     }
