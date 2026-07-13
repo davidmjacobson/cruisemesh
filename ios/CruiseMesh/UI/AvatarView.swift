@@ -14,7 +14,7 @@ struct AvatarView: View {
             name: name,
             displayId: displayId
         )
-        Group {
+        SwiftUI.Group {
             if let photo, !isGroup {
                 Image(uiImage: photo)
                     .resizable()
