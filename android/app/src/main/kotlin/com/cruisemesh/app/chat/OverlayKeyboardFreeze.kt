@@ -4,6 +4,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -18,12 +19,12 @@ import kotlinx.coroutines.withTimeoutOrNull
  * where it is while the background dims and the keyboard slides away.
  *
  * Opening the overlay hides the soft keyboard (the scrim owns the whole
- * screen). Scaffold's content insets include the IME, so without
- * intervention the list (bottom-pinned via reverseLayout) and composer
- * re-layout every frame of the hide animation and chase the keyboard down
- * the screen — clearly visible through the half-transparent scrim, with the
- * overlay's bright bubble copy detaching from its dimmed original. Same
- * flicker in reverse when the overlay closes.
+ * screen). Android's adjust-resize behavior changes the Compose viewport as
+ * the IME moves. Without intervention the list (bottom-pinned via
+ * reverseLayout) and composer re-layout every frame of the hide animation
+ * and chase the keyboard down the screen — clearly visible through the
+ * half-transparent scrim, with the overlay's bright bubble copy detaching
+ * from its dimmed original. Same flicker in reverse when the overlay closes.
  *
  * Two earlier versions of this tried to independently *recompute* what
  * Scaffold's bottom inset was doing (first by subtracting a live
@@ -35,16 +36,16 @@ import kotlinx.coroutines.withTimeoutOrNull
  * sum), so a raw IME reading and Scaffold's actual applied inset part ways
  * for the last ~48px of the close animation.
  *
- * This version doesn't reconstruct anything: [trackLiveBottomInset] is fed
- * the *actual* `innerPadding.calculateBottomPadding()` Scaffold computed,
- * every recomposition, straight from the call site. [extraBottomPx] is
- * simply `captured − thatSameLiveNumber`, so caller adds it back with a
- * plain `.padding(bottom = ...)`: total = live (from Scaffold) + (captured −
- * live) = captured, always, by construction — there is no second source of
- * truth left to drift out of sync.
+ * [trackLiveContentBottom] is fed the viewport's usable bottom edge (viewport
+ * height minus Scaffold's bottom system-bar padding). While frozen,
+ * [extraBottomPx] adds back exactly the amount by which that edge has moved
+ * down: `liveContentBottom - capturedContentBottom`. This keeps the content
+ * at its keyboard-open position without applying an IME inset on top of an
+ * already-resized viewport. IME visibility is tracked separately so the
+ * navigation bar is not mistaken for an open keyboard.
  *
- * The freeze releases itself once the live inset returns to the captured
- * height (a visual no-op, since the two now agree), or after
+ * The freeze releases itself once the returning keyboard restores the
+ * captured content edge (a visual no-op, since the two now agree), or after
  * [releaseTimeoutMs] if it never returns (e.g. the composer lost focus while
  * the overlay was open).
  */
@@ -53,34 +54,38 @@ class OverlayKeyboardFreeze internal constructor(
     private val keyboardController: SoftwareKeyboardController?,
     private val releaseTimeoutMs: Long = RELEASE_TIMEOUT_MS,
 ) {
-    private var liveBottomPx by mutableFloatStateOf(0f)
-    private var frozenBottomPx by mutableFloatStateOf(0f)
+    private var liveContentBottomPx by mutableFloatStateOf(0f)
+    private var liveImeVisible by mutableStateOf(false)
+    private var frozenContentBottomPx by mutableFloatStateOf(0f)
+    private var restoreKeyboard by mutableStateOf(false)
 
     /**
-     * Call every recomposition of the Scaffold content lambda with
-     * `innerPadding.calculateBottomPadding()` converted to px, so the freeze
-     * always has Scaffold's real current bottom inset on hand to diff
-     * against and to capture from.
+     * Call every recomposition with the viewport's usable bottom edge in px:
+     * viewport height minus Scaffold's current bottom system-bar padding.
      */
-    fun trackLiveBottomInset(px: Float) {
-        liveBottomPx = px
+    fun trackLiveContentBottom(px: Float, imeVisible: Boolean) {
+        liveContentBottomPx = px
+        liveImeVisible = imeVisible
     }
 
     /**
-     * Extra bottom padding to add on top of Scaffold's own (still-live)
-     * inset so the total stays pinned at the height captured by
+     * Extra bottom padding that keeps the usable content edge pinned at the
+     * position captured by
      * [onOverlayOpened]. Zero while not frozen.
      */
     val extraBottomPx: Float
         get() {
-            val frozen = frozenBottomPx
-            return if (frozen <= 0f) 0f else (frozen - liveBottomPx).coerceAtLeast(0f)
+            val frozen = frozenContentBottomPx
+            return if (frozen <= 0f) 0f else (liveContentBottomPx - frozen).coerceAtLeast(0f)
         }
 
-    /** Call before showing the overlay: captures the current inset, then hides the keyboard. */
+    /** Call before showing the overlay: captures the content edge, then hides the keyboard. */
     fun onOverlayOpened() {
-        frozenBottomPx = liveBottomPx
-        keyboardController?.hide()
+        restoreKeyboard = liveImeVisible
+        frozenContentBottomPx = if (restoreKeyboard) liveContentBottomPx else 0f
+        if (restoreKeyboard) {
+            keyboardController?.hide()
+        }
     }
 
     /**
@@ -89,7 +94,7 @@ class OverlayKeyboardFreeze internal constructor(
      * the keyboard open after a long-press in a keyboard-closed chat.
      */
     fun onOverlayClosed() {
-        if (frozenBottomPx > 0f) {
+        if (restoreKeyboard) {
             keyboardController?.show()
         }
     }
@@ -102,11 +107,17 @@ class OverlayKeyboardFreeze internal constructor(
      * overlay closing.
      */
     suspend fun releaseWhenKeyboardReturns() {
-        if (frozenBottomPx <= 0f) return
-        withTimeoutOrNull(releaseTimeoutMs) {
-            snapshotFlow { liveBottomPx >= frozenBottomPx }.first { it }
+        if (frozenContentBottomPx <= 0f) {
+            restoreKeyboard = false
+            return
         }
-        frozenBottomPx = 0f
+        withTimeoutOrNull(releaseTimeoutMs) {
+            snapshotFlow {
+                liveImeVisible && liveContentBottomPx <= frozenContentBottomPx
+            }.first { it }
+        }
+        frozenContentBottomPx = 0f
+        restoreKeyboard = false
     }
 
     companion object {

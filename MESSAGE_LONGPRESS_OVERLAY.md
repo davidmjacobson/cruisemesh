@@ -279,14 +279,14 @@ away.
 
 Fix: `OverlayKeyboardFreeze` (shared by both chat screens).
 
-- `onOverlayOpened()` captures the live IME bottom inset, then hides the
-  keyboard.
-- While frozen, the content column adds
-  `windowInsetsPadding(WindowInsets(bottom = captured).exclude(ime))` below
-  the Scaffold padding: bottom padding = (captured − live IME), so the total
-  bottom inset is constant while the keyboard animates out, sits closed, and
-  animates back in — the conversation never moves a pixel under the scrim.
-  Evaluated at layout time; adds no per-frame recomposition.
+- `onOverlayOpened()` captures the live usable content edge (the
+  adjust-resized viewport height minus Scaffold's bottom system-bar inset),
+  then hides the keyboard. IME visibility is tracked separately so the
+  navigation bar is not mistaken for an open keyboard.
+- While frozen, the content column adds the increase in the live content
+  edge as bottom padding. The usable conversation height therefore remains
+  constant while the keyboard animates out, sits closed, and animates back
+  in, without applying IME padding on top of an already-resized viewport.
 - `onOverlayClosed()` re-shows the keyboard only if it was open at press
   time (the old unconditional `show()` could pop the keyboard open after a
   long-press in a keyboard-closed chat).
