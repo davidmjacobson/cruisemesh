@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothA2dp
 import android.bluetooth.BluetoothAdapter
@@ -26,6 +27,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.AppStore
+import com.cruisemesh.app.MainActivity
 import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
@@ -87,6 +89,8 @@ import uniffi.cruisemesh_core.verifyIntroductionTicket
 private const val TAG = "MeshService"
 private const val NOTIFICATION_CHANNEL_ID = "cruisemesh_mesh_status"
 private const val NOTIFICATION_ID = 1
+private const val OPEN_APP_REQUEST_CODE = 1001
+private const val STOP_SERVICE_REQUEST_CODE = 1002
 
 /** `kind` bytes from DESIGN.md §7.1. */
 private const val KIND_TEXT: UByte = 1u
@@ -303,6 +307,18 @@ class MeshService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            Log.i(TAG, "Stopping mesh at the user's request")
+            MeshStartupPreferences.markExplicitlyStopped(this)
+            MeshRuntimeStatus.markStopped()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        // A manual/app start begins a new session. BootReceiver checks the
+        // explicit-stop bit before it ever reaches this path.
+        MeshStartupPreferences.clearExplicitStop(this)
         startForeground(NOTIFICATION_ID, buildNotification())
         // Debug builds: ensure log capture is running even if the process was
         // revived straight into the service without the UI (no-op in release
@@ -2761,6 +2777,20 @@ class MeshService : Service() {
             }
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
+        val contentIntent = PendingIntent.getActivity(
+            this,
+            OPEN_APP_REQUEST_CODE,
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val stopIntent = PendingIntent.getService(
+            this,
+            STOP_SERVICE_REQUEST_CODE,
+            Intent(this, MeshService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("CruiseMesh")
             .setContentText(
@@ -2772,6 +2802,12 @@ class MeshService : Service() {
             )
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setBadgeIconType(NotificationCompat.BADGE_ICON_NONE)
+            .setContentIntent(contentIntent)
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Stop CruiseMesh",
+                stopIntent,
+            )
             .setOngoing(true)
             .build()
     }
@@ -2781,6 +2817,8 @@ class MeshService : Service() {
     }
 
     companion object {
+        const val ACTION_STOP = "com.cruisemesh.app.action.STOP_MESH"
+
         /** Permissions MeshService needs before it will start its BLE roles. */
         fun requiredPermissions(): Array<String> {
             val base = mutableListOf<String>()

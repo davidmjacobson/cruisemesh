@@ -29,6 +29,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -39,6 +41,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -64,6 +67,7 @@ import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
+import kotlinx.coroutines.launch
 
 /**
  * Group chat thread (DESIGN.md §6.5). Local `chat_id` is the group id.
@@ -90,9 +94,17 @@ fun GroupChatScreen(
     var confirmDelete by remember { mutableStateOf(false) }
     var focused by remember(group.id) { mutableStateOf<FocusedMessage?>(null) }
     var infoMessage by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
 
     fun reload() {
         messages = store.messagesForChat(group.id)
+    }
+
+    fun showSendFailure() {
+        coroutineScope.launch {
+            snackbarHostState.showSnackbar("Couldn't send. Your message is still here.")
+        }
     }
 
     fun senderName(userId: ByteArray): String {
@@ -166,6 +178,7 @@ fun GroupChatScreen(
                 onOpenDetails = { showDetails = true },
             )
         },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { innerPadding ->
         // This device uses adjustResize, so the viewport already excludes the
         // IME. Track its usable bottom edge rather than adding IME padding a
@@ -231,9 +244,12 @@ fun GroupChatScreen(
                     onClick = {
                         val text = draft.trim()
                         if (text.isNotEmpty()) {
-                            sender.sendText(group, text)
-                            draft = ""
-                            reload()
+                            if (sender.sendText(group, text) == SendResult.STORED) {
+                                draft = ""
+                                reload()
+                            } else {
+                                showSendFailure()
+                            }
                         }
                     },
                     modifier = Modifier

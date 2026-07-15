@@ -75,16 +75,22 @@ class GroupSender(
     }
 
     /** Sends [text] into [group]'s chat stream, sealed with the group key. */
-    fun sendText(group: Group, text: String) {
+    fun sendText(group: Group, text: String): SendResult {
         val payload = text.toByteArray(Charsets.UTF_8)
-        if (payload.isEmpty()) return
+        if (payload.isEmpty()) return SendResult.FAILED
 
-        enqueueGroupMessage(group, KIND_TEXT, payload, "sendText")
+        return enqueueGroupMessage(group, KIND_TEXT, payload, "sendText")
     }
 
     /** Sends or clears this user's emoji reaction to [target] in [group]. */
-    fun sendReaction(group: Group, target: MessageTarget, emoji: String) {
-        enqueueGroupMessage(group, KIND_REACTION, ReactionPayload(target, emoji).encode(), "sendReaction")
+    fun sendReaction(group: Group, target: MessageTarget, emoji: String): SendResult {
+        val payload = try {
+            ReactionPayload(target, emoji).encode()
+        } catch (e: Exception) {
+            Log.e(TAG, "sendReaction: could not encode group reaction", e)
+            return SendResult.FAILED
+        }
+        return enqueueGroupMessage(group, KIND_REACTION, payload, "sendReaction")
     }
 
     private fun enqueueGroupMessage(
@@ -92,41 +98,57 @@ class GroupSender(
         kind: UByte,
         payload: ByteArray,
         logLabel: String,
-    ) {
-        val chatId = group.id
-        // Same ratchet-past-acked-receipts logic as 1:1 sends (MeshSender.kt's
-        // nextAuthoredLamport): guards against a deleted-and-recreated group
-        // chat wiping our own history while a member still holds our old
-        // stream. Group wire receipts don't exist yet, so receiptThrough
-        // always returns 0 here and maxOf degrades to plain
-        // highestContiguousLamport(...) + 1 -- this is forward-compatible
-        // wiring for whenever per-member group receipts land.
-        val lamport = nextAuthoredLamport(
-            ownContiguous = store.highestContiguousLamport(chatId, identity.userId),
-            ackedDelivered = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_DELIVERED),
-            ackedRead = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_READ),
-        )
-        val timestamp = System.currentTimeMillis()
-        val message = StoredMessage(
-            chatId = chatId,
-            senderUserId = identity.userId,
-            lamport = lamport,
-            timestamp = timestamp,
-            kind = kind,
-            payload = payload,
-        )
-        val outbound = buildOutboundGroupEnvelope(identity, group, message) ?: return
-        store.insertOutgoingMessage(message, outbound, timestamp)
-        ChatEvents.notifyChatChanged(chatId)
-        RelaySyncEvents.requestSync()
-
-        val frame = encodeOutboundEnvelopeFrame(outbound)
-        val fanout = MeshRouter.relayToAll(frame)
-        if (fanout == 0) {
-            Log.i(TAG, "$logLabel: no live links; group message stays local for carry/digest/relay")
-        } else {
-            Log.i(TAG, "$logLabel: flooded group message to $fanout link(s)")
+    ): SendResult {
+        val queued = try {
+            val chatId = group.id
+            // Same ratchet-past-acked-receipts logic as 1:1 sends (MeshSender.kt's
+            // nextAuthoredLamport): guards against a deleted-and-recreated group
+            // chat wiping our own history while a member still holds our old
+            // stream. Group wire receipts don't exist yet, so receiptThrough
+            // always returns 0 here and maxOf degrades to plain
+            // highestContiguousLamport(...) + 1 -- this is forward-compatible
+            // wiring for whenever per-member group receipts land.
+            val lamport = nextAuthoredLamport(
+                ownContiguous = store.highestContiguousLamport(chatId, identity.userId),
+                ackedDelivered = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_DELIVERED),
+                ackedRead = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_READ),
+            )
+            val timestamp = System.currentTimeMillis()
+            val message = StoredMessage(
+                chatId = chatId,
+                senderUserId = identity.userId,
+                lamport = lamport,
+                timestamp = timestamp,
+                kind = kind,
+                payload = payload,
+            )
+            val outbound = buildOutboundGroupEnvelope(identity, group, message)
+            if (outbound == null) {
+                Log.e(TAG, "$logLabel: could not build the durable group envelope for ${group.name}")
+                return SendResult.FAILED
+            }
+            store.insertOutgoingMessage(message, outbound, timestamp)
+            chatId to outbound
+        } catch (e: Exception) {
+            Log.e(TAG, "$logLabel: group message was not stored for ${group.name}", e)
+            return SendResult.FAILED
         }
+
+        val (chatId, outbound) = queued
+        try {
+            ChatEvents.notifyChatChanged(chatId)
+            RelaySyncEvents.requestSync()
+            val frame = encodeOutboundEnvelopeFrame(outbound)
+            val fanout = MeshRouter.relayToAll(frame)
+            if (fanout == 0) {
+                Log.i(TAG, "$logLabel: no live links; group message stays local for carry/digest/relay")
+            } else {
+                Log.i(TAG, "$logLabel: flooded group message to $fanout link(s)")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "$logLabel: stored locally; immediate group delivery will retry", e)
+        }
+        return SendResult.STORED
     }
 
     /**
