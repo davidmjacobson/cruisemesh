@@ -11,10 +11,12 @@ private final class RelayMockURLProtocol: URLProtocol {
 
     static var responses: [CannedResponse] = []
     static var requests: [URLRequest] = []
+    static var requestBodies: [Data?] = []
 
     static func reset() {
         responses = []
         requests = []
+        requestBodies = []
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -22,6 +24,7 @@ private final class RelayMockURLProtocol: URLProtocol {
 
     override func startLoading() {
         Self.requests.append(request)
+        Self.requestBodies.append(Self.readBody(from: request))
         guard !Self.responses.isEmpty else {
             client?.urlProtocol(self, didFailWithError: NSError(domain: "RelayMock", code: 1))
             return
@@ -39,6 +42,34 @@ private final class RelayMockURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+
+    private static func readBody(from request: URLRequest) -> Data? {
+        if let body = request.httpBody {
+            return body
+        }
+        guard let stream = request.httpBodyStream else {
+            return nil
+        }
+
+        stream.open()
+        defer { stream.close() }
+
+        let bufferSize = 4_096
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+        defer { buffer.deallocate() }
+
+        var body = Data()
+        while true {
+            let bytesRead = stream.read(buffer, maxLength: bufferSize)
+            if bytesRead < 0 {
+                return nil
+            }
+            if bytesRead == 0 {
+                return body
+            }
+            body.append(buffer, count: bytesRead)
+        }
+    }
 }
 
 final class RelayClientTests: XCTestCase {
@@ -79,7 +110,9 @@ final class RelayClientTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "CruiseMeshRelayClient-iOS/0.1")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Bypass-Tunnel-Reminder"), "1")
 
-        let json = try JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as! [String: Any]
+        let json = try JSONSerialization.jsonObject(
+            with: XCTUnwrap(RelayMockURLProtocol.requestBodies[0])
+        ) as! [String: Any]
         XCTAssertEqual(json["msg_id"] as? String, base64Url(Data(repeating: 1, count: 16)))
         XCTAssertEqual((json["hop_ttl"] as? NSNumber)?.intValue, 7)
         XCTAssertEqual(json["recipient_hint"] as? String, base64Url(Data(repeating: 2, count: 8)))
@@ -98,7 +131,9 @@ final class RelayClientTests: XCTestCase {
         let request = try XCTUnwrap(RelayMockURLProtocol.requests.first)
         XCTAssertEqual(request.url?.path, "/envelopes")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer family-token")
-        let json = try JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as! [String: Any]
+        let json = try JSONSerialization.jsonObject(
+            with: XCTUnwrap(RelayMockURLProtocol.requestBodies[0])
+        ) as! [String: Any]
         XCTAssertEqual(json["msg_id"] as? String, base64Url(Data(repeating: 6, count: 16)))
         XCTAssertEqual((json["expiry_ms"] as? NSNumber)?.int64Value, 1_700_000_070_000)
     }
@@ -153,7 +188,9 @@ final class RelayClientTests: XCTestCase {
 
         let ackRequest = RelayMockURLProtocol.requests[1]
         XCTAssertEqual(ackRequest.url?.path, "/envelopes/ack")
-        let ackJson = try JSONSerialization.jsonObject(with: XCTUnwrap(ackRequest.httpBody)) as! [String: Any]
+        let ackJson = try JSONSerialization.jsonObject(
+            with: XCTUnwrap(RelayMockURLProtocol.requestBodies[1])
+        ) as! [String: Any]
         let ids = ackJson["ids"] as! [Any]
         XCTAssertEqual((ids[0] as? NSNumber)?.int64Value, 9)
     }
