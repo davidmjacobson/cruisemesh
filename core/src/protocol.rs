@@ -40,6 +40,10 @@
 //! 11+N    8     timestamp       (i64 BE; ms since Unix epoch)
 //! 19+N    4     content_len     (u32 BE)
 //! 23+N    M     content         (M = content_len bytes)
+//! then, zero or more private extensions:
+//!         1     extension_type  (u8; 1 = reply-to msg_id)
+//!         2     extension_len   (u16 BE)
+//!         X     extension_value (X = extension_len bytes)
 //! ```
 //!
 //! `chat_id` uses a 16-bit length prefix (not 32-bit) because chat ids are
@@ -51,7 +55,12 @@
 //! `content`), rather than failing, on the theory that a BLE text-messaging
 //! app never legitimately produces such a value. Decoding is fully checked
 //! and never panics on attacker-controlled input; malformed or truncated
-//! bytes return [`CoreError::Malformed`].
+//! bytes return [`CoreError::Malformed`]. Unknown well-formed extensions are
+//! skipped so adding future encrypted metadata does not make the base message
+//! unreadable. [`decode_message_body`] intentionally returns only the legacy
+//! fields; [`decode_extended_message_body`] also surfaces known extensions.
+//! The reply-to extension is a 16-byte envelope `msg_id` inside the signed
+//! and sealed payload, so public headers reveal no conversation linkage.
 //!
 //! ## Receipts (DESIGN.md §7.2)
 //!
@@ -280,6 +289,7 @@ const FRAME_TYPE_DIGEST: u8 = 0x03;
 
 const MSG_ID_LEN: usize = 16;
 const RECIPIENT_HINT_LEN: usize = 8;
+const MESSAGE_EXTENSION_REPLY_TO_MSG_ID: u8 = 1;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 const PROFILE_SYNC_VERSION: u8 = 2;
 const PROFILE_SYNC_MAX_AVATAR_BYTES: usize = 64 * 1024;
@@ -302,6 +312,18 @@ pub struct MessageBody {
     pub content: Vec<u8>,
 }
 
+/// A decoded message body plus optional encrypted metadata appended after
+/// the legacy content field. Unknown extension types are skipped.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct ExtendedMessageBody {
+    pub kind: u8,
+    pub chat_id: Vec<u8>,
+    pub lamport: u64,
+    pub timestamp: i64,
+    pub content: Vec<u8>,
+    pub reply_to_msg_id: Option<Vec<u8>>,
+}
+
 /// Encode a [`MessageBody`] to its wire form (see module docs for layout).
 #[uniffi::export]
 pub fn encode_message_body(body: MessageBody) -> Vec<u8> {
@@ -314,23 +336,77 @@ pub fn encode_message_body(body: MessageBody) -> Vec<u8> {
     out
 }
 
+/// Encode a message body with an encrypted reference to the message being
+/// replied to. The fixed-width id is the target envelope's public `msg_id`,
+/// but it remains private here because the extension is inside the seal.
+#[uniffi::export]
+pub fn encode_message_body_with_reply(
+    body: MessageBody,
+    reply_to_msg_id: Vec<u8>,
+) -> Result<Vec<u8>, CoreError> {
+    if reply_to_msg_id.len() != MSG_ID_LEN {
+        return Err(CoreError::Malformed(format!(
+            "reply_to_msg_id must be exactly {MSG_ID_LEN} bytes"
+        )));
+    }
+    let mut out = encode_message_body(body);
+    out.push(MESSAGE_EXTENSION_REPLY_TO_MSG_ID);
+    out.extend_from_slice(&(MSG_ID_LEN as u16).to_be_bytes());
+    out.extend_from_slice(&reply_to_msg_id);
+    Ok(out)
+}
+
 /// Decode a [`MessageBody`] from its wire form. Rejects truncated input,
-/// corrupt length prefixes, and unexpected trailing bytes.
+/// corrupt length prefixes, and malformed extension TLVs while ignoring
+/// well-formed extensions the legacy record does not surface.
 #[uniffi::export]
 pub fn decode_message_body(bytes: Vec<u8>) -> Result<MessageBody, CoreError> {
+    let extended = decode_extended_message_body(bytes)?;
+    Ok(MessageBody {
+        kind: extended.kind,
+        chat_id: extended.chat_id,
+        lamport: extended.lamport,
+        timestamp: extended.timestamp,
+        content: extended.content,
+    })
+}
+
+/// Decode the legacy message fields and any known append-only extensions.
+/// Unknown well-formed TLVs are ignored for forward compatibility.
+#[uniffi::export]
+pub fn decode_extended_message_body(bytes: Vec<u8>) -> Result<ExtendedMessageBody, CoreError> {
     let mut cursor = Cursor::new(&bytes);
     let kind = cursor.take_u8()?;
     let chat_id = cursor.take_bytes16()?;
     let lamport = cursor.take_u64()?;
     let timestamp = cursor.take_i64()?;
     let content = cursor.take_bytes32()?;
-    cursor.finish()?;
-    Ok(MessageBody {
+    let mut reply_to_msg_id = None;
+    while !cursor.is_finished() {
+        let extension_type = cursor.take_u8()?;
+        let extension_len = cursor.take_u16()? as usize;
+        let value = cursor.take(extension_len)?;
+        if extension_type == MESSAGE_EXTENSION_REPLY_TO_MSG_ID {
+            if extension_len != MSG_ID_LEN {
+                return Err(CoreError::Malformed(format!(
+                    "reply-to extension must be exactly {MSG_ID_LEN} bytes"
+                )));
+            }
+            if reply_to_msg_id.is_some() {
+                return Err(CoreError::Malformed(
+                    "duplicate reply-to extension".to_string(),
+                ));
+            }
+            reply_to_msg_id = Some(value.to_vec());
+        }
+    }
+    Ok(ExtendedMessageBody {
         kind,
         chat_id,
         lamport,
         timestamp,
         content,
+        reply_to_msg_id,
     })
 }
 
@@ -1012,6 +1088,10 @@ impl<'a> Cursor<'a> {
         Ok(self.take(len)?.to_vec())
     }
 
+    fn is_finished(&self) -> bool {
+        self.pos == self.data.len()
+    }
+
     /// Consumes and returns every remaining byte (no length prefix -- used
     /// where, like the envelope frame's `sealed` tail, the field's length is
     /// implicitly "whatever's left").
@@ -1080,6 +1160,53 @@ mod tests {
         let encoded = encode_message_body(body.clone());
         let decoded = decode_message_body(encoded).expect("decodes");
         assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn reply_extension_round_trips_without_changing_legacy_body() {
+        let body = sample_body();
+        let reply_to = vec![7; MSG_ID_LEN];
+        let encoded = encode_message_body_with_reply(body.clone(), reply_to.clone()).unwrap();
+
+        let extended = decode_extended_message_body(encoded.clone()).unwrap();
+        assert_eq!(extended.kind, body.kind);
+        assert_eq!(extended.chat_id, body.chat_id);
+        assert_eq!(extended.lamport, body.lamport);
+        assert_eq!(extended.timestamp, body.timestamp);
+        assert_eq!(extended.content, body.content);
+        assert_eq!(extended.reply_to_msg_id, Some(reply_to));
+
+        // Compatibility bridge: code that only understands the original
+        // fields can still render the reply's text and ignores the quote.
+        assert_eq!(decode_message_body(encoded).unwrap(), body);
+    }
+
+    #[test]
+    fn unknown_message_extensions_are_skipped() {
+        let body = sample_body();
+        let mut encoded = encode_message_body(body.clone());
+        encoded.push(99);
+        encoded.extend_from_slice(&3u16.to_be_bytes());
+        encoded.extend_from_slice(b"new");
+
+        let extended = decode_extended_message_body(encoded).unwrap();
+        assert_eq!(extended.reply_to_msg_id, None);
+        assert_eq!(extended.content, body.content);
+    }
+
+    #[test]
+    fn reply_extension_requires_one_msg_id() {
+        let error =
+            encode_message_body_with_reply(sample_body(), vec![1; MSG_ID_LEN - 1]).unwrap_err();
+        assert!(matches!(error, CoreError::Malformed(_)));
+
+        let mut duplicated =
+            encode_message_body_with_reply(sample_body(), vec![1; MSG_ID_LEN]).unwrap();
+        duplicated.push(MESSAGE_EXTENSION_REPLY_TO_MSG_ID);
+        duplicated.extend_from_slice(&(MSG_ID_LEN as u16).to_be_bytes());
+        duplicated.extend_from_slice(&vec![2; MSG_ID_LEN]);
+        let error = decode_extended_message_body(duplicated).unwrap_err();
+        assert!(matches!(error, CoreError::Malformed(_)));
     }
 
     #[test]
@@ -1693,6 +1820,21 @@ mod tests {
 
         let decoded = decode_message_body(opened.payload).expect("decodes");
         assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn reply_reference_survives_inside_the_sealed_payload() {
+        let sender = generate_identity();
+        let recipient = generate_identity();
+        let reply_to = vec![8; MSG_ID_LEN];
+        let payload =
+            encode_message_body_with_reply(sample_body(), reply_to.clone()).expect("encodes");
+
+        let sealed = seal_message(sender, recipient.agree_pk.clone(), payload).expect("seals");
+        let opened = open_message(recipient, sealed).expect("opens");
+        let decoded = decode_extended_message_body(opened.payload).expect("decodes");
+
+        assert_eq!(decoded.reply_to_msg_id, Some(reply_to));
     }
 
     #[test]
