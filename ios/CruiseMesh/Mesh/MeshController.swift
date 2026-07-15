@@ -332,7 +332,13 @@ final class MeshController: ObservableObject {
         }
         do {
             let opened = try openMessage(recipient: identity, sealed: sealed)
-            deliverOpened(sourceLabel: sourceLabel, sourceAddress: sourceAddress, opened: opened, identity: identity)
+            deliverOpened(
+                sourceLabel: sourceLabel,
+                sourceAddress: sourceAddress,
+                opened: opened,
+                identity: identity,
+                msgId: msgId
+            )
         } catch {
             // Pairwise open failed: either foreign 1:1 traffic, or a group
             // envelope sealed with a shared key (DESIGN.md §6.5). Try groups
@@ -344,7 +350,8 @@ final class MeshController: ObservableObject {
                     sourceLabel: sourceLabel,
                     group: group,
                     opened: opened,
-                    identity: identity
+                    identity: identity,
+                    msgId: msgId
                 )
                 relayForeign(
                     sourceAddress: sourceAddress,
@@ -395,14 +402,22 @@ final class MeshController: ObservableObject {
         sourceLabel: String,
         sourceAddress: String?,
         opened: OpenedMessage,
-        identity: Identity
+        identity: Identity,
+        msgId: Data
     ) {
-        let body: MessageBody
+        let extendedBody: ExtendedMessageBody
         do {
-            body = try decodeMessageBody(bytes: opened.payload)
+            extendedBody = try decodeExtendedMessageBody(bytes: opened.payload)
         } catch {
             return
         }
+        let body = MessageBody(
+            kind: extendedBody.kind,
+            chatId: extendedBody.chatId,
+            lamport: extendedBody.lamport,
+            timestamp: extendedBody.timestamp,
+            content: extendedBody.content
+        )
         guard body.chatId == opened.senderUserId else { return }
 
         switch body.kind {
@@ -412,7 +427,9 @@ final class MeshController: ObservableObject {
                 senderUserId: opened.senderUserId,
                 body: body,
                 identity: identity,
-                kind: body.kind
+                kind: body.kind,
+                msgId: msgId,
+                replyToMsgId: extendedBody.replyToMsgId
             )
         case ProtocolKind.receipt:
             handleIncomingReceipt(
@@ -469,7 +486,8 @@ final class MeshController: ObservableObject {
         sourceLabel: String,
         group: Group,
         opened: OpenedMessage,
-        identity: Identity
+        identity: Identity,
+        msgId: Data
     ) {
         guard group.memberUserIds.contains(opened.senderUserId) else {
             log.warning("Dropping group envelope from \(sourceLabel, privacy: .public): signer is not a member of \(group.name, privacy: .public)")
@@ -479,33 +497,56 @@ final class MeshController: ObservableObject {
             log.warning("Dropping group envelope from \(sourceLabel, privacy: .public): we are not a member of \(group.name, privacy: .public)")
             return
         }
-        let body: MessageBody
+        let extendedBody: ExtendedMessageBody
         do {
-            body = try decodeMessageBody(bytes: opened.payload)
+            extendedBody = try decodeExtendedMessageBody(bytes: opened.payload)
         } catch {
             return
         }
+        let body = MessageBody(
+            kind: extendedBody.kind,
+            chatId: extendedBody.chatId,
+            lamport: extendedBody.lamport,
+            timestamp: extendedBody.timestamp,
+            content: extendedBody.content
+        )
         guard body.chatId == group.id else {
             log.warning("Dropping group envelope from \(sourceLabel, privacy: .public): body.chatId does not match group id")
             return
         }
         switch body.kind {
         case ProtocolKind.text, ProtocolKind.reaction:
-            handleIncomingGroupChatMessage(group: group, senderUserId: opened.senderUserId, body: body)
+            handleIncomingGroupChatMessage(
+                group: group,
+                senderUserId: opened.senderUserId,
+                body: body,
+                msgId: msgId,
+                replyToMsgId: extendedBody.replyToMsgId
+            )
         default:
             log.info("Dropping group envelope from \(sourceLabel, privacy: .public): unhandled kind=\(body.kind)")
         }
     }
 
-    private func handleIncomingGroupChatMessage(group: Group, senderUserId: Data, body: MessageBody) {
-        let inserted = (try? store.insertMessage(message: StoredMessage(
-            chatId: group.id,
-            senderUserId: senderUserId,
-            lamport: body.lamport,
-            timestamp: body.timestamp,
-            kind: body.kind,
-            payload: body.content
-        ))) ?? false
+    private func handleIncomingGroupChatMessage(
+        group: Group,
+        senderUserId: Data,
+        body: MessageBody,
+        msgId: Data,
+        replyToMsgId: Data?
+    ) {
+        let inserted = (try? store.insertIncomingMessage(
+            message: StoredMessage(
+                chatId: group.id,
+                senderUserId: senderUserId,
+                lamport: body.lamport,
+                timestamp: body.timestamp,
+                kind: body.kind,
+                payload: body.content
+            ),
+            msgId: msgId,
+            replyToMsgId: replyToMsgId
+        )) ?? false
         guard inserted else { return }
         ChatEvents.notifyChatChanged(group.id)
 
@@ -593,16 +634,22 @@ final class MeshController: ObservableObject {
         senderUserId: Data,
         body: MessageBody,
         identity: Identity,
-        kind: UInt8
+        kind: UInt8,
+        msgId: Data,
+        replyToMsgId: Data?
     ) {
-        let inserted = (try? store.insertMessage(message: StoredMessage(
-            chatId: senderUserId,
-            senderUserId: senderUserId,
-            lamport: body.lamport,
-            timestamp: body.timestamp,
-            kind: kind,
-            payload: body.content
-        ))) ?? false
+        let inserted = (try? store.insertIncomingMessage(
+            message: StoredMessage(
+                chatId: senderUserId,
+                senderUserId: senderUserId,
+                lamport: body.lamport,
+                timestamp: body.timestamp,
+                kind: kind,
+                payload: body.content
+            ),
+            msgId: msgId,
+            replyToMsgId: replyToMsgId
+        )) ?? false
         guard inserted else { return }
         ChatEvents.notifyChatChanged(senderUserId)
 
@@ -1015,7 +1062,8 @@ final class MeshController: ObservableObject {
                 sourceLabel: "carry queue",
                 group: group,
                 opened: opened,
-                identity: identity
+                identity: identity,
+                msgId: envelope.msgId
             )
         }
     }

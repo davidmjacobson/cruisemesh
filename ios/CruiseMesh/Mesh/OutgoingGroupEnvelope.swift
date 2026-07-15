@@ -14,7 +14,8 @@ private let groupLog = Logger(subsystem: "com.cruisemesh", category: "OutgoingGr
 func buildOutboundGroupEnvelope(
     identity: Identity,
     group: Group,
-    message: StoredMessage
+    message: StoredMessage,
+    replyToMsgId: Data? = nil
 ) -> OutboundEnvelope? {
     guard message.kind == ProtocolKind.text || message.kind == ProtocolKind.reaction else {
         groupLog.warning("Refusing to queue unsupported group message kind=\(message.kind)")
@@ -38,11 +39,17 @@ func buildOutboundGroupEnvelope(
     )
     do {
         let msgId = generateMsgId()
+        let encodedBody: Data
+        if let replyToMsgId {
+            encodedBody = try encodeMessageBodyWithReply(body: body, replyToMsgId: replyToMsgId)
+        } else {
+            encodedBody = encodeMessageBody(body: body)
+        }
         GossipState.seenIds.record(msgId: msgId)
         let sealed = try sealGroupMessage(
             sender: identity,
             group: group,
-            payload: encodeMessageBody(body: body)
+            payload: encodedBody
         )
         return OutboundEnvelope(
             msgId: msgId,

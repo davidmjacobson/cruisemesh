@@ -6,7 +6,8 @@ private let log = Logger(subsystem: "com.cruisemesh", category: "OutgoingEnvelop
 func buildOutboundAuthoredEnvelope(
     identity: Identity,
     contact: Contact,
-    message: StoredMessage
+    message: StoredMessage,
+    replyToMsgId: Data? = nil
 ) -> OutboundEnvelope? {
     guard isAuthoredChatKind(message.kind) else {
         log.warning("Refusing unsupported authored kind=\(message.kind)")
@@ -21,11 +22,17 @@ func buildOutboundAuthoredEnvelope(
     )
     do {
         let msgId = generateMsgId()
+        let encodedBody: Data
+        if let replyToMsgId {
+            encodedBody = try encodeMessageBodyWithReply(body: body, replyToMsgId: replyToMsgId)
+        } else {
+            encodedBody = encodeMessageBody(body: body)
+        }
         GossipState.seenIds.record(msgId: msgId)
         let sealed = try sealMessage(
             sender: identity,
             recipientAgreePk: contact.agreePk,
-            payload: encodeMessageBody(body: body)
+            payload: encodedBody
         )
         return OutboundEnvelope(
             msgId: msgId,
