@@ -48,6 +48,7 @@ import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.createCameraCaptureUri
+import com.cruisemesh.app.mesh.MeshStartupPreferences
 import com.cruisemesh.app.relay.RelayConfigStore
 import android.widget.Toast
 
@@ -72,6 +73,7 @@ fun ProfileScreen(
     val initialDisplayName = remember { ProfileStore.loadDisplayName(context) }
     var avatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
     var shareOnline by remember { mutableStateOf(RelayConfigStore.shareOnline(context)) }
+    var startAutomatically by remember { mutableStateOf(MeshStartupPreferences.isAutoStartEnabled(context)) }
     fun bumpAndSync() {
         onProfileChanged(ProfileStore.bumpOwnAvatarEpoch(context))
     }
@@ -225,6 +227,34 @@ fun ProfileScreen(
                     Button(onClick = onStartMesh, modifier = Modifier.padding(top = 16.dp)) {
                         Text("Start mesh")
                     }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            ProfileSection(title = "Startup") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Start CruiseMesh automatically")
+                        Text(
+                            "Run the mesh after this phone restarts.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
+                    Switch(
+                        checked = startAutomatically,
+                        onCheckedChange = {
+                            startAutomatically = it
+                            MeshStartupPreferences.setAutoStartEnabled(context, it)
+                        },
+                    )
                 }
             }
 
