@@ -136,7 +136,7 @@ class RealMeshSenderMulingTest {
         MeshRouter.onConnected("MULE-ADDR", MeshRouterState.Transport.CENTRAL)
         MeshRouter.onHello("MULE-ADDR", mule.userId)
 
-        sender.sendText(bobContact, "hello from the pool deck")
+        assertEquals(SendResult.STORED, sender.sendText(bobContact, "hello from the pool deck"))
 
         val stored = store.outboundEnvelopesAfter(bobContact.userId, alice.userId, 0uL)
         assertEquals(1, stored.size)
@@ -219,9 +219,48 @@ class RealMeshSenderMulingTest {
         MeshRouter.registerCentral { address, frame -> sentFrames += address to frame }
         MeshRouter.registerPeripheral { _, _ -> }
 
-        sender.sendText(bobContact, "hello into the void")
+        assertEquals(SendResult.STORED, sender.sendText(bobContact, "hello into the void"))
 
         assertEquals(0, sentFrames.size)
+        assertEquals(1, store.outboundEnvelopesAfter(bobContact.userId, alice.userId, 0uL).size)
+    }
+
+    @Test
+    fun `envelope failure reports not stored so the composer can retain its draft`() {
+        val alice = generateIdentity()
+        val bob = generateIdentity()
+        val invalidContact = Contact(
+            userId = bob.userId,
+            name = "Invalid key",
+            signPk = bob.signPk,
+            agreePk = byteArrayOf(1),
+            relayUrl = null,
+            relayToken = null,
+        )
+        val store = MessageStore.open(":memory:")
+
+        val result = RealMeshSender(store, alice).sendText(invalidContact, "keep this draft")
+
+        assertEquals(SendResult.FAILED, result)
+        assertEquals(0, store.messagesForChat(invalidContact.userId).size)
+        assertEquals(0, store.outboundEnvelopesAfter(invalidContact.userId, alice.userId, 0uL).size)
+    }
+
+    @Test
+    fun `transport exception after persistence still reports stored and leaves a retry row`() {
+        val alice = generateIdentity()
+        val bob = generateIdentity()
+        val bobContact = contactFor(bob, "Bob")
+        val store = MessageStore.open(":memory:")
+        MeshRouter.registerCentral { _, _ -> error("stale transport") }
+        MeshRouter.registerPeripheral { _, _ -> }
+        MeshRouter.onConnected("BOB-ADDR", MeshRouterState.Transport.CENTRAL)
+        MeshRouter.onHello("BOB-ADDR", bob.userId)
+
+        val result = RealMeshSender(store, alice).sendText(bobContact, "persist before radio")
+
+        assertEquals(SendResult.STORED, result)
+        assertEquals(1, store.messagesForChat(bobContact.userId).size)
         assertEquals(1, store.outboundEnvelopesAfter(bobContact.userId, alice.userId, 0uL).size)
     }
 }

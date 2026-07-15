@@ -54,16 +54,22 @@ fun nextAuthoredLamport(ownContiguous: ULong, ackedDelivered: ULong, ackedRead: 
  */
 interface MeshSender {
     /** Sends `text` as a `kind=1` message to `contact`'s chat. */
-    fun sendText(contact: Contact, text: String)
+    fun sendText(contact: Contact, text: String): SendResult
 
     /**
      * Sends an inline attachment as a `kind=16` chat-stream message
      * (attachment manifest with embedded blob; DESIGN.md §8).
      */
-    fun sendAttachment(contact: Contact, attachment: AttachmentPayload)
+    fun sendAttachment(contact: Contact, attachment: AttachmentPayload): SendResult
 
     /** Sends or clears this user's emoji reaction to [target]. */
-    fun sendReaction(contact: Contact, target: MessageTarget, emoji: String)
+    fun sendReaction(contact: Contact, target: MessageTarget, emoji: String): SendResult
+}
+
+/** Whether an authored message made it into the durable local message/outbound transaction. */
+enum class SendResult {
+    STORED,
+    FAILED,
 }
 
 /**
@@ -96,33 +102,44 @@ class RealMeshSender(
     private val store: MessageStore,
     private val identity: Identity,
 ) : MeshSender {
-    override fun sendText(contact: Contact, text: String) {
+    override fun sendText(contact: Contact, text: String): SendResult =
         enqueueAuthored(
             contact = contact,
             kind = KIND_TEXT,
             payload = text.toByteArray(Charsets.UTF_8),
             logLabel = "sendText",
         )
-    }
 
-    override fun sendAttachment(contact: Contact, attachment: AttachmentPayload) {
+    override fun sendAttachment(contact: Contact, attachment: AttachmentPayload): SendResult {
         if (attachment.blob.size > AttachmentPayload.MAX_BLOB_BYTES) {
             Log.w(TAG, "Refusing attachment larger than ${AttachmentPayload.MAX_BLOB_BYTES} bytes")
-            return
+            return SendResult.FAILED
         }
-        enqueueAuthored(
+        val payload = try {
+            attachment.encode()
+        } catch (e: Exception) {
+            Log.e(TAG, "sendAttachment: could not encode attachment", e)
+            return SendResult.FAILED
+        }
+        return enqueueAuthored(
             contact = contact,
             kind = KIND_ATTACHMENT_MANIFEST,
-            payload = attachment.encode(),
+            payload = payload,
             logLabel = "sendAttachment",
         )
     }
 
-    override fun sendReaction(contact: Contact, target: MessageTarget, emoji: String) {
-        enqueueAuthored(
+    override fun sendReaction(contact: Contact, target: MessageTarget, emoji: String): SendResult {
+        val payload = try {
+            ReactionPayload(target, emoji).encode()
+        } catch (e: Exception) {
+            Log.e(TAG, "sendReaction: could not encode reaction", e)
+            return SendResult.FAILED
+        }
+        return enqueueAuthored(
             contact = contact,
             kind = KIND_REACTION,
-            payload = ReactionPayload(target, emoji).encode(),
+            payload = payload,
             logLabel = "sendReaction",
         )
     }
@@ -132,51 +149,69 @@ class RealMeshSender(
         kind: UByte,
         payload: ByteArray,
         logLabel: String,
-    ) {
-        val chatId = contact.userId
-        val ackedDelivered = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_DELIVERED)
-        val lamport = nextAuthoredLamport(
-            ownContiguous = store.highestContiguousLamport(chatId, identity.userId),
-            ackedDelivered = ackedDelivered,
-            ackedRead = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_READ),
-        )
-        val timestamp = System.currentTimeMillis()
-
-        val message = StoredMessage(
-            chatId = chatId,
-            senderUserId = identity.userId,
-            lamport = lamport,
-            timestamp = timestamp,
-            kind = kind,
-            payload = payload,
-        )
-        val outbound = buildOutboundAuthoredEnvelope(identity, contact, message) ?: return
-        store.insertOutgoingMessage(message, outbound, timestamp)
-        ChatEvents.notifyChatChanged(chatId)
-        RelaySyncEvents.requestSync()
-
-        // Preserve causal order during the one-sided friending window. The
-        // friend-card request is an earlier row in this same authored stream.
-        // If its first BLE attempt happened before the peer's link was ready,
-        // sending only this new text lets the text arrive first as an unknown
-        // sender; it then stays hidden until a reverse scan imports us. Replay
-        // every still-unacknowledged envelope in lamport order so the card is
-        // always queued on the link before the first visible message.
-        val pending = store
-            .outboundEnvelopesAfter(chatId, identity.userId, ackedDelivered)
-            .sortedBy { it.lamport }
-        for (pendingEnvelope in pending) {
-            val frame = encodeOutboundEnvelopeFrame(pendingEnvelope)
-            if (!MeshRouter.sendToUserId(contact.userId, frame)) {
-                // No direct link to the recipient right now -- give the sealed
-                // envelope to whoever IS connected so it can mule to the
-                // recipient later (BLE_1TO1_MULING.md Hook A).
-                val muled = MeshRouter.relayToAll(frame)
-                Log.i(
-                    TAG,
-                    "$logLabel: ${contact.name} not currently connected; sprayed pending lamport=${pendingEnvelope.lamport} to $muled mule link(s)",
-                )
+    ): SendResult {
+        val queued = try {
+            val chatId = contact.userId
+            val ackedDelivered = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_DELIVERED)
+            val lamport = nextAuthoredLamport(
+                ownContiguous = store.highestContiguousLamport(chatId, identity.userId),
+                ackedDelivered = ackedDelivered,
+                ackedRead = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_READ),
+            )
+            val timestamp = System.currentTimeMillis()
+            val message = StoredMessage(
+                chatId = chatId,
+                senderUserId = identity.userId,
+                lamport = lamport,
+                timestamp = timestamp,
+                kind = kind,
+                payload = payload,
+            )
+            val outbound = buildOutboundAuthoredEnvelope(identity, contact, message)
+            if (outbound == null) {
+                Log.e(TAG, "$logLabel: could not build the durable outbound envelope for ${contact.name}")
+                return SendResult.FAILED
             }
+            store.insertOutgoingMessage(message, outbound, timestamp)
+            chatId to ackedDelivered
+        } catch (e: Exception) {
+            Log.e(TAG, "$logLabel: message was not stored for ${contact.name}", e)
+            return SendResult.FAILED
         }
+
+        val (chatId, ackedDelivered) = queued
+        try {
+            ChatEvents.notifyChatChanged(chatId)
+            RelaySyncEvents.requestSync()
+
+            // Preserve causal order during the one-sided friending window. The
+            // friend-card request is an earlier row in this same authored stream.
+            // If its first BLE attempt happened before the peer's link was ready,
+            // sending only this new text lets the text arrive first as an unknown
+            // sender; it then stays hidden until a reverse scan imports us. Replay
+            // every still-unacknowledged envelope in lamport order so the card is
+            // always queued on the link before the first visible message.
+            val pending = store
+                .outboundEnvelopesAfter(chatId, identity.userId, ackedDelivered)
+                .sortedBy { it.lamport }
+            for (pendingEnvelope in pending) {
+                val frame = encodeOutboundEnvelopeFrame(pendingEnvelope)
+                if (!MeshRouter.sendToUserId(contact.userId, frame)) {
+                    // No direct link to the recipient right now -- give the sealed
+                    // envelope to whoever IS connected so it can mule to the
+                    // recipient later (BLE_1TO1_MULING.md Hook A).
+                    val muled = MeshRouter.relayToAll(frame)
+                    Log.i(
+                        TAG,
+                        "$logLabel: ${contact.name} not currently connected; sprayed pending lamport=${pendingEnvelope.lamport} to $muled mule link(s)",
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            // The durable transaction already succeeded. A stale or failing
+            // transport must leave the message visible and queued for retry.
+            Log.w(TAG, "$logLabel: stored locally; immediate delivery will retry", e)
+        }
+        return SendResult.STORED
     }
 }
