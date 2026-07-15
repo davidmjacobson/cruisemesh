@@ -13,6 +13,7 @@ import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.defaultExpiry
 import uniffi.cruisemesh_core.encodeEnvelopeFrame
 import uniffi.cruisemesh_core.encodeMessageBody
+import uniffi.cruisemesh_core.encodeMessageBodyWithReply
 import uniffi.cruisemesh_core.generateMsgId
 import uniffi.cruisemesh_core.sealMessage
 
@@ -50,6 +51,7 @@ fun buildOutboundAuthoredEnvelope(
     identity: Identity,
     contact: Contact,
     message: StoredMessage,
+    replyToMsgId: ByteArray? = null,
 ): OutboundEnvelope? {
     if (!isAuthoredChatKind(message.kind)) {
         Log.w(TAG, "Refusing to queue unsupported authored message kind=${message.kind}")
@@ -65,6 +67,11 @@ fun buildOutboundAuthoredEnvelope(
     )
     return try {
         val msgId = generateMsgId()
+        val encodedBody = if (replyToMsgId == null) {
+            encodeMessageBody(body)
+        } else {
+            encodeMessageBodyWithReply(body, replyToMsgId)
+        }
         // Remember our own msg_id so if the mesh later floods this envelope
         // back to us we drop it as a duplicate instead of treating it as
         // foreign traffic.
@@ -80,7 +87,7 @@ fun buildOutboundAuthoredEnvelope(
             hopTtl = DEFAULT_HOP_TTL,
             expiry = defaultExpiry(message.timestamp),
             recipientHint = computeRecipientHint(contact.userId, message.timestamp),
-            sealed = sealMessage(identity, contact.agreePk, encodeMessageBody(body)),
+            sealed = sealMessage(identity, contact.agreePk, encodedBody),
         )
     } catch (e: CoreException) {
         Log.w(TAG, "Failed to seal outgoing kind=${message.kind} for ${contact.name}: ${e.message}")

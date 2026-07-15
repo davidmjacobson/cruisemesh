@@ -68,10 +68,10 @@ private const val ENTRANCE_MS = 150
 private const val EXIT_MS = 120
 
 // Rough pre-measurement estimate for the bar (6 circular 40dp reaction
-// buttons) and menu (two DropdownMenuItems) so the very first frame already
+// buttons) and menu (three DropdownMenuItems) so the very first frame already
 // places them close to correct instead of snapping in from a zero-size guess.
 private val ESTIMATED_BAR_SIZE = DpSize(268.dp, 52.dp)
-private val ESTIMATED_MENU_SIZE = DpSize(180.dp, 96.dp)
+private val ESTIMATED_MENU_SIZE = DpSize(180.dp, 144.dp)
 
 /**
  * MESSAGE_LONGPRESS_OVERLAY.md: full-screen scrim over everything (list, top
@@ -85,10 +85,12 @@ private val ESTIMATED_MENU_SIZE = DpSize(180.dp, 96.dp)
 fun MessageFocusOverlay(
     focused: FocusedMessage,
     isOwn: Boolean,
+    canReply: Boolean,
     canCopy: Boolean,
     ownReactionEmoji: String?,
     onDismiss: () -> Unit,
     onReact: (String) -> Unit,
+    onReply: () -> Unit,
     onCopy: () -> Unit,
     onInfo: () -> Unit,
     bubbleContent: @Composable () -> Unit,
@@ -207,7 +209,9 @@ fun MessageFocusOverlay(
                 .pointerInput(Unit) { detectTapGestures { } },
         ) {
             MessageActionPanel(
+                canReply = canReply,
                 canCopy = canCopy,
+                onReply = onReply,
                 onCopy = onCopy,
                 onInfo = onInfo,
             )
@@ -268,7 +272,9 @@ private fun ReactionPickerBar(
 
 @Composable
 private fun MessageActionPanel(
+    canReply: Boolean,
     canCopy: Boolean,
+    onReply: () -> Unit,
     onCopy: () -> Unit,
     onInfo: () -> Unit,
 ) {
@@ -285,6 +291,11 @@ private fun MessageActionPanel(
             .widthIn(min = 176.dp, max = 220.dp),
     ) {
         Column(modifier = Modifier.padding(vertical = 6.dp)) {
+            DropdownMenuItem(
+                text = { Text("Reply") },
+                enabled = canReply,
+                onClick = onReply,
+            )
             DropdownMenuItem(
                 text = { Text("Copy") },
                 enabled = canCopy,

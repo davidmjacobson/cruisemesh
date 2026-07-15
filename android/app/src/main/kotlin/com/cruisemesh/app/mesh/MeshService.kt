@@ -67,7 +67,7 @@ import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.decodeGroupInviteContent
 import uniffi.cruisemesh_core.decodeFriendDirectoryContent
 import uniffi.cruisemesh_core.decodeIntroducedFriendRequest
-import uniffi.cruisemesh_core.decodeMessageBody
+import uniffi.cruisemesh_core.decodeExtendedMessageBody
 import uniffi.cruisemesh_core.decodeProfileSyncContent
 import uniffi.cruisemesh_core.decodeReceiptContent
 import uniffi.cruisemesh_core.defaultExpiry
@@ -1536,6 +1536,7 @@ class MeshService : Service() {
                     groupOpened.second,
                     identity,
                     arrival,
+                    envelope.msgId,
                 )
                 relayForeignEnvelope(sourceAddress, envelope)
                 if (sourceAddress == null) {
@@ -1558,7 +1559,7 @@ class MeshService : Service() {
             return InboundDisposition.CARRIED
         }
         val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
-        deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival)
+        deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
         return InboundDisposition.CONSUMED
     }
 
@@ -1807,20 +1808,37 @@ class MeshService : Service() {
         opened: OpenedMessage,
         identity: Identity,
         arrival: MessageArrival,
+        msgId: ByteArray,
     ) {
-        val body = try {
-            decodeMessageBody(opened.payload)
+        val extendedBody = try {
+            decodeExtendedMessageBody(opened.payload)
         } catch (e: CoreException) {
             Log.w(TAG, "Dropping envelope from $address: failed to decode body (${e.message})")
             return
         }
+        val body = MessageBody(
+            kind = extendedBody.kind,
+            chatId = extendedBody.chatId,
+            lamport = extendedBody.lamport,
+            timestamp = extendedBody.timestamp,
+            content = extendedBody.content,
+        )
         if (!body.chatId.contentEquals(opened.senderUserId)) {
             Log.w(TAG, "Dropping envelope from $address: chatId does not match the verified sender")
             return
         }
 
         when (body.kind) {
-            KIND_TEXT -> handleIncomingChatMessage(address, opened.senderUserId, body, identity, KIND_TEXT, arrival)
+            KIND_TEXT -> handleIncomingChatMessage(
+                address,
+                opened.senderUserId,
+                body,
+                identity,
+                KIND_TEXT,
+                arrival,
+                msgId,
+                extendedBody.replyToMsgId,
+            )
             KIND_ATTACHMENT_MANIFEST -> handleIncomingChatMessage(
                 address,
                 opened.senderUserId,
@@ -1828,6 +1846,8 @@ class MeshService : Service() {
                 identity,
                 KIND_ATTACHMENT_MANIFEST,
                 arrival,
+                msgId,
+                extendedBody.replyToMsgId,
             )
             KIND_REACTION -> handleIncomingChatMessage(
                 address,
@@ -1836,6 +1856,8 @@ class MeshService : Service() {
                 identity,
                 KIND_REACTION,
                 arrival,
+                msgId,
+                extendedBody.replyToMsgId,
             )
             KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
             KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, directBle, opened.senderUserId, body, identity)
@@ -1865,6 +1887,7 @@ class MeshService : Service() {
         opened: OpenedMessage,
         identity: Identity,
         arrival: MessageArrival,
+        msgId: ByteArray,
     ) {
         if (!group.memberUserIds.any { it.contentEquals(opened.senderUserId) }) {
             Log.w(
@@ -1879,19 +1902,42 @@ class MeshService : Service() {
             return
         }
 
-        val body = try {
-            decodeMessageBody(opened.payload)
+        val extendedBody = try {
+            decodeExtendedMessageBody(opened.payload)
         } catch (e: CoreException) {
             Log.w(TAG, "Dropping group envelope from $address: failed to decode body (${e.message})")
             return
         }
+        val body = MessageBody(
+            kind = extendedBody.kind,
+            chatId = extendedBody.chatId,
+            lamport = extendedBody.lamport,
+            timestamp = extendedBody.timestamp,
+            content = extendedBody.content,
+        )
         if (!body.chatId.contentEquals(group.id)) {
             Log.w(TAG, "Dropping group envelope from $address: body.chatId does not match group id")
             return
         }
         when (body.kind) {
-            KIND_TEXT -> handleIncomingGroupChatMessage(address, group, opened.senderUserId, body, arrival)
-            KIND_REACTION -> handleIncomingGroupChatMessage(address, group, opened.senderUserId, body, arrival)
+            KIND_TEXT -> handleIncomingGroupChatMessage(
+                address,
+                group,
+                opened.senderUserId,
+                body,
+                arrival,
+                msgId,
+                extendedBody.replyToMsgId,
+            )
+            KIND_REACTION -> handleIncomingGroupChatMessage(
+                address,
+                group,
+                opened.senderUserId,
+                body,
+                arrival,
+                msgId,
+                extendedBody.replyToMsgId,
+            )
             else -> Log.i(TAG, "Dropping group envelope from $address: unhandled kind=${body.kind}")
         }
     }
@@ -1902,8 +1948,10 @@ class MeshService : Service() {
         senderUserId: ByteArray,
         body: MessageBody,
         arrival: MessageArrival,
+        msgId: ByteArray,
+        replyToMsgId: ByteArray?,
     ) {
-        val inserted = store.insertMessage(
+        val inserted = store.insertIncomingMessage(
             StoredMessage(
                 chatId = group.id,
                 senderUserId = senderUserId,
@@ -1912,6 +1960,8 @@ class MeshService : Service() {
                 kind = body.kind,
                 payload = body.content,
             ),
+            msgId,
+            replyToMsgId,
         )
         if (!inserted) {
             Log.i(
@@ -2400,8 +2450,10 @@ class MeshService : Service() {
         identity: Identity,
         kind: UByte,
         arrival: MessageArrival,
+        msgId: ByteArray,
+        replyToMsgId: ByteArray?,
     ) {
-        val inserted = store.insertMessage(
+        val inserted = store.insertIncomingMessage(
             StoredMessage(
                 chatId = senderUserId,
                 senderUserId = senderUserId,
@@ -2410,6 +2462,8 @@ class MeshService : Service() {
                 kind = kind,
                 payload = body.content,
             ),
+            msgId,
+            replyToMsgId,
         )
         if (!inserted) {
             Log.i(

@@ -75,11 +75,11 @@ class GroupSender(
     }
 
     /** Sends [text] into [group]'s chat stream, sealed with the group key. */
-    fun sendText(group: Group, text: String) {
+    fun sendText(group: Group, text: String, replyToMsgId: ByteArray? = null) {
         val payload = text.toByteArray(Charsets.UTF_8)
         if (payload.isEmpty()) return
 
-        enqueueGroupMessage(group, KIND_TEXT, payload, "sendText")
+        enqueueGroupMessage(group, KIND_TEXT, payload, "sendText", replyToMsgId)
     }
 
     /** Sends or clears this user's emoji reaction to [target] in [group]. */
@@ -92,6 +92,7 @@ class GroupSender(
         kind: UByte,
         payload: ByteArray,
         logLabel: String,
+        replyToMsgId: ByteArray? = null,
     ) {
         val chatId = group.id
         // Same ratchet-past-acked-receipts logic as 1:1 sends (MeshSender.kt's
@@ -115,8 +116,12 @@ class GroupSender(
             kind = kind,
             payload = payload,
         )
-        val outbound = buildOutboundGroupEnvelope(identity, group, message) ?: return
-        store.insertOutgoingMessage(message, outbound, timestamp)
+        val outbound = buildOutboundGroupEnvelope(identity, group, message, replyToMsgId) ?: return
+        if (replyToMsgId == null) {
+            store.insertOutgoingMessage(message, outbound, timestamp)
+        } else {
+            store.insertOutgoingReply(message, outbound, replyToMsgId, timestamp)
+        }
         ChatEvents.notifyChatChanged(chatId)
         RelaySyncEvents.requestSync()
 
