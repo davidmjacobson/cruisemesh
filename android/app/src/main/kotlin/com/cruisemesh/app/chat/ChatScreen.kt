@@ -204,9 +204,9 @@ fun ChatScreen(
         pendingPhoto = jpeg
     }
 
-    fun showSendFailure() {
+    fun showSendFailure(message: String = "Couldn't send. Your message is still here.") {
         coroutineScope.launch {
-            snackbarHostState.showSnackbar("Couldn't send. Your message is still here.")
+            snackbarHostState.showSnackbar(message)
         }
     }
 
@@ -237,7 +237,9 @@ fun ChatScreen(
         if (result == SendResult.STORED) {
             reload()
         } else {
-            showSendFailure()
+            // The recording file is already gone, so the generic "still here"
+            // copy would be wrong for a voice memo.
+            showSendFailure("Couldn't send the voice memo. Try recording it again.")
         }
     }
 
