@@ -42,8 +42,6 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -410,6 +408,7 @@ private fun ConversationScreen(
     var confirmDelete by remember { mutableStateOf(false) }
     var focused by remember(contact.userId) { mutableStateOf<FocusedMessage?>(null) }
     var infoMessage by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
+    var viewerPhoto by remember(contact.userId) { mutableStateOf<ByteArray?>(null) }
     // Newest-first for reverseLayout LazyColumn: index 0 sits at the bottom
     // edge (just above the composer / keyboard), empty space stays above.
     val displayMessages = remember(visibleMessages) { visibleMessages.asReversed() }
@@ -511,6 +510,7 @@ private fun ConversationScreen(
                         onReact = { emoji ->
                             toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
                         },
+                        onPhotoClick = { viewerPhoto = it },
                         onLongPress = { target, bounds -> openOverlay(target, bounds) },
                     )
                 }
@@ -638,6 +638,14 @@ private fun ConversationScreen(
             confirmButton = {
                 TextButton(onClick = { infoMessage = null }) { Text("OK") }
             },
+        )
+    }
+
+    val currentViewerPhoto = viewerPhoto
+    if (currentViewerPhoto != null) {
+        PhotoViewerOverlay(
+            jpeg = currentViewerPhoto,
+            onDismiss = { viewerPhoto = null },
         )
     }
 }
@@ -984,6 +992,7 @@ private fun MessageBubble(
     grouping: BubbleGrouping,
     reactions: List<ReactionSummary> = emptyList(),
     onReact: (String) -> Unit = {},
+    onPhotoClick: (ByteArray) -> Unit = {},
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
 ) {
     var showLegend by remember { mutableStateOf(false) }
@@ -994,6 +1003,7 @@ private fun MessageBubble(
     val target = remember(message.senderUserId, message.lamport, message.kind) {
         MessageTarget(message.senderUserId, message.lamport, message.kind)
     }
+    val photoBytes = remember(message.kind, message.payload) { messageImageBytes(message) }
 
     Row(
         modifier = Modifier
@@ -1013,7 +1023,13 @@ private fun MessageBubble(
                 modifier = Modifier
                     .onGloballyPositioned { coords -> boundsInWindow = coords.boundsInWindow() }
                     .messageActions(
-                        onClick = { if (tick != null) showLegend = true },
+                        onClick = {
+                            if (photoBytes != null) {
+                                onPhotoClick(photoBytes)
+                            } else if (tick != null) {
+                                showLegend = true
+                            }
+                        },
                         onLongClick = { onLongPress(target, boundsInWindow) },
                     ),
             )
@@ -1175,6 +1191,12 @@ private fun messageCopyText(message: StoredMessage): String =
         else -> message.payload.toString(Charsets.UTF_8)
     }
 
+internal fun messageImageBytes(message: StoredMessage): ByteArray? {
+    if (message.kind != KIND_ATTACHMENT_MANIFEST) return null
+    val attachment = AttachmentPayload.decode(message.payload) ?: return null
+    return attachment.blob.takeIf { attachment.mediaType == AttachmentPayload.MediaType.IMAGE }
+}
+
 fun messageInfoText(message: StoredMessage, isOwn: Boolean, tick: TickStatus?): String {
     val sentAt = java.text.SimpleDateFormat(
         "MMMM d, yyyy h:mm a",
@@ -1218,17 +1240,16 @@ private fun AttachmentBubbleContent(
 
 /**
  * Renders a chat photo at its native aspect ratio (no center-crop), capped to
- * the bubble width and a reasonable max height. Tap opens a small menu so the
- * user can save the JPEG into Pictures/CruiseMesh.
+ * the bubble width and a reasonable max height. Gesture handling stays on the
+ * outer bubble so tap can open the full-screen viewer and long-press can open
+ * the existing message-focus overlay without nested click targets competing.
  */
 @Composable
 private fun ChatImageAttachment(jpeg: ByteArray) {
-    val context = LocalContext.current
     val decoded = remember(jpeg) {
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
     }
     val imageBitmap = remember(decoded) { decoded?.asImageBitmap() }
-    var menuOpen by remember { mutableStateOf(false) }
 
     if (decoded == null || imageBitmap == null) {
         Text("Photo (could not display)")
@@ -1245,38 +1266,14 @@ private fun ChatImageAttachment(jpeg: ByteArray) {
         val widthDp = with(density) { widthPx.toDp() }
         val heightDp = with(density) { heightPx.toDp() }
 
-        Box {
-            Image(
-                bitmap = imageBitmap,
-                contentDescription = "Photo — tap for options",
-                contentScale = ContentScale.Fit,
-                modifier = Modifier
-                    .size(widthDp, heightDp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .clickable { menuOpen = true },
-            )
-            DropdownMenu(
-                expanded = menuOpen,
-                onDismissRequest = { menuOpen = false },
-            ) {
-                DropdownMenuItem(
-                    text = { Text("Save image") },
-                    onClick = {
-                        menuOpen = false
-                        val uri = ImageGallery.saveJpeg(context, jpeg)
-                        Toast.makeText(
-                            context,
-                            if (uri != null) {
-                                "Saved to Pictures/CruiseMesh"
-                            } else {
-                                "Could not save image"
-                            },
-                            Toast.LENGTH_SHORT,
-                        ).show()
-                    },
-                )
-            }
-        }
+        Image(
+            bitmap = imageBitmap,
+            contentDescription = "Photo — tap to view full screen",
+            contentScale = ContentScale.Fit,
+            modifier = Modifier
+                .size(widthDp, heightDp)
+                .clip(RoundedCornerShape(12.dp)),
+        )
     }
 }
 
