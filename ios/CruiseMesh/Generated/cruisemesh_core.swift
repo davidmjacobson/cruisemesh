@@ -838,6 +838,12 @@ public protocol MessageStoreProtocol : AnyObject {
     func markOutgoingReceiptEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64) throws  -> Bool
 
     /**
+     * First-arrival diagnostics for one message, or `None` for locally
+     * authored/legacy rows that predate diagnostics.
+     */
+    func messageArrival(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> MessageArrival?
+
+    /**
      * Messages from `sender_user_id` in `chat_id` with `lamport >
      * after_lamport`, oldest first -- what a peer whose digest reported
      * `after_lamport` for this sender is missing (DESIGN.md §7.3).
@@ -920,6 +926,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * if no such receipt has been recorded.
      */
     func receiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8) throws  -> UInt64
+
+    /**
+     * Attach first-arrival diagnostics to an already inserted incoming
+     * message. A redundant mesh/relay copy never overwrites the original
+     * route, hop count, or receive time.
+     */
+    func recordMessageArrival(chatId: Data, senderUserId: Data, lamport: UInt64, arrival: MessageArrival) throws  -> Bool
 
     /**
      * Record that *this device* has delivered/read messages authored by
@@ -1520,6 +1533,20 @@ open func markOutgoingReceiptEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64)
 }
 
     /**
+     * First-arrival diagnostics for one message, or `None` for locally
+     * authored/legacy rows that predate diagnostics.
+     */
+open func messageArrival(chatId: Data, senderUserId: Data, lamport: UInt64)throws  -> MessageArrival? {
+    return try  FfiConverterOptionTypeMessageArrival.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_message_arrival(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterUInt64.lower(lamport),$0
+    )
+})
+}
+
+    /**
      * Messages from `sender_user_id` in `chat_id` with `lamport >
      * after_lamport`, oldest first -- what a peer whose digest reported
      * `after_lamport` for this sender is missing (DESIGN.md §7.3).
@@ -1677,6 +1704,22 @@ open func receiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8)th
         FfiConverterData.lower(chatId),
         FfiConverterData.lower(senderUserId),
         FfiConverterUInt8.lower(receiptType),$0
+    )
+})
+}
+
+    /**
+     * Attach first-arrival diagnostics to an already inserted incoming
+     * message. A redundant mesh/relay copy never overwrites the original
+     * route, hop count, or receive time.
+     */
+open func recordMessageArrival(chatId: Data, senderUserId: Data, lamport: UInt64, arrival: MessageArrival)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_record_message_arrival(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterUInt64.lower(lamport),
+        FfiConverterTypeMessageArrival.lower(arrival),$0
     )
 })
 }
@@ -3237,6 +3280,84 @@ public func FfiConverterTypeIntroductionTicket_lower(_ value: IntroductionTicket
 
 
 /**
+ * Local-only diagnostics for how an incoming message reached this device.
+ * `transport`: 0 = BLE direct, 1 = BLE through another device, 2 = relay.
+ */
+public struct MessageArrival {
+    public var transport: UInt8
+    public var hopsTaken: UInt8
+    public var receivedAt: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(transport: UInt8, hopsTaken: UInt8, receivedAt: Int64) {
+        self.transport = transport
+        self.hopsTaken = hopsTaken
+        self.receivedAt = receivedAt
+    }
+}
+
+
+
+extension MessageArrival: Equatable, Hashable {
+    public static func ==(lhs: MessageArrival, rhs: MessageArrival) -> Bool {
+        if lhs.transport != rhs.transport {
+            return false
+        }
+        if lhs.hopsTaken != rhs.hopsTaken {
+            return false
+        }
+        if lhs.receivedAt != rhs.receivedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(transport)
+        hasher.combine(hopsTaken)
+        hasher.combine(receivedAt)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageArrival: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageArrival {
+        return
+            try MessageArrival(
+                transport: FfiConverterUInt8.read(from: &buf),
+                hopsTaken: FfiConverterUInt8.read(from: &buf),
+                receivedAt: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MessageArrival, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.transport, into: &buf)
+        FfiConverterUInt8.write(value.hopsTaken, into: &buf)
+        FfiConverterInt64.write(value.receivedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageArrival_lift(_ buf: RustBuffer) throws -> MessageArrival {
+    return try FfiConverterTypeMessageArrival.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageArrival_lower(_ value: MessageArrival) -> RustBuffer {
+    return FfiConverterTypeMessageArrival.lower(value)
+}
+
+
+/**
  * The plaintext body that gets encoded, then handed as `payload` to
  * [`crate::seal_message`] (DESIGN.md §7.1). See the module docs for the
  * exact byte layout and for why `version`/sender UserID aren't fields here.
@@ -4409,6 +4530,30 @@ fileprivate struct FfiConverterOptionTypeGroup: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeMessageArrival: FfiConverterRustBuffer {
+    typealias SwiftType = MessageArrival?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMessageArrival.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMessageArrival.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeOutgoingReceiptEnvelope: FfiConverterRustBuffer {
     typealias SwiftType = OutgoingReceiptEnvelope?
 
@@ -5314,6 +5459,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_outgoing_receipt_envelope_relay_posted() != 16233) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_arrival() != 44635) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_messages_after() != 55946) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5345,6 +5493,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_receipt_through() != 17794) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_message_arrival() != 42850) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_outgoing_receipt() != 8142) {

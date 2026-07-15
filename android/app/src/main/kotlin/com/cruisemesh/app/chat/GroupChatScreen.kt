@@ -358,10 +358,20 @@ fun GroupChatScreen(
 
     val currentInfoMessage = infoMessage
     if (currentInfoMessage != null) {
+        val infoIsOwn = currentInfoMessage.senderUserId.contentEquals(ownUserId)
+        val infoArrival = if (infoIsOwn) {
+            null
+        } else {
+            store.messageArrival(
+                currentInfoMessage.chatId,
+                currentInfoMessage.senderUserId,
+                currentInfoMessage.lamport,
+            )
+        }
         AlertDialog(
             onDismissRequest = { infoMessage = null },
             title = { Text("Message info") },
-            text = { Text(messageInfoText(currentInfoMessage, currentInfoMessage.senderUserId.contentEquals(ownUserId), null)) },
+            text = { Text(messageInfoText(currentInfoMessage, infoIsOwn, null, infoArrival)) },
             confirmButton = {
                 TextButton(onClick = { infoMessage = null }) { Text("OK") }
             },

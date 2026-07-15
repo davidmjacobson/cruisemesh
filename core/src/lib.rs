@@ -35,5 +35,6 @@ pub use protocol::{
 };
 pub use store::{
     CarriedEnvelope, Contact, ContactDiscoveryPolicy, ContactProvenance, DigestEntry,
-    FriendSuggestion, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, StoredMessage,
+    FriendSuggestion, MessageArrival, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
+    StoredMessage,
 };

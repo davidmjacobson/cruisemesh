@@ -110,6 +110,7 @@ import com.cruisemesh.app.ui.bubbleGroupingFor
 import com.cruisemesh.app.ui.formatConversationTimestamp
 import com.cruisemesh.app.ui.tickLegendText
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
@@ -285,6 +286,9 @@ fun ChatScreen(
         contactAvatar = contactAvatar,
         deliveredThrough = deliveredThrough,
         readThrough = readThrough,
+        arrivalFor = { message ->
+            store.messageArrival(message.chatId, message.senderUserId, message.lamport)
+        },
         draft = draft,
         onDraftChange = { draft = it },
         pendingPhoto = pendingPhoto,
@@ -370,6 +374,7 @@ private fun ConversationScreen(
     contactAvatar: ByteArray? = null,
     deliveredThrough: ULong,
     readThrough: ULong,
+    arrivalFor: (StoredMessage) -> MessageArrival? = { null },
     draft: String,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
@@ -631,10 +636,15 @@ private fun ConversationScreen(
     if (currentInfoMessage != null) {
         val infoIsOwn = currentInfoMessage.senderUserId.contentEquals(ownUserId)
         val infoTick = if (infoIsOwn) tickStatusFor(currentInfoMessage.lamport, deliveredThrough, readThrough) else null
+        val infoArrival = if (infoIsOwn) {
+            null
+        } else {
+            arrivalFor(currentInfoMessage)
+        }
         AlertDialog(
             onDismissRequest = { infoMessage = null },
             title = { Text("Message info") },
-            text = { Text(messageInfoText(currentInfoMessage, infoIsOwn, infoTick)) },
+            text = { Text(messageInfoText(currentInfoMessage, infoIsOwn, infoTick, infoArrival)) },
             confirmButton = {
                 TextButton(onClick = { infoMessage = null }) { Text("OK") }
             },
@@ -1175,14 +1185,36 @@ private fun messageCopyText(message: StoredMessage): String =
         else -> message.payload.toString(Charsets.UTF_8)
     }
 
-fun messageInfoText(message: StoredMessage, isOwn: Boolean, tick: TickStatus?): String {
+fun messageInfoText(
+    message: StoredMessage,
+    isOwn: Boolean,
+    tick: TickStatus?,
+    arrival: MessageArrival? = null,
+): String {
     val sentAt = java.text.SimpleDateFormat(
         "MMMM d, yyyy h:mm a",
         java.util.Locale.getDefault(),
     ).format(java.util.Date(message.timestamp))
     val direction = if (isOwn) "Sent by you" else "Received"
     val status = tick?.let { "\nStatus: ${tickLegendText(it)}" }.orEmpty()
-    return "$direction\nTime: $sentAt$status"
+    val arrivalLine = arrival?.let { "\n${messageArrivalText(it)}" }.orEmpty()
+    return "$direction\nTime: $sentAt$status$arrivalLine"
+}
+
+private fun messageArrivalText(arrival: MessageArrival): String {
+    val route = when (arrival.transport.toInt()) {
+        0 -> "direct BLE"
+        1 -> "another device over BLE"
+        2 -> "relay"
+        else -> "unknown route"
+    }
+    val hops = arrival.hopsTaken.toInt()
+    val hopLabel = "$hops ${if (hops == 1) "hop" else "hops"}"
+    val receivedAt = java.text.SimpleDateFormat(
+        "h:mm a",
+        java.util.Locale.getDefault(),
+    ).format(java.util.Date(arrival.receivedAt))
+    return "Arrived via $route · $hopLabel · $receivedAt"
 }
 
 @Composable
