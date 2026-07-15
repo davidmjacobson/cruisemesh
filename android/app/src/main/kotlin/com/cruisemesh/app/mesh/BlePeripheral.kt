@@ -80,7 +80,7 @@ class BlePeripheral(
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
             advertising = true
-            Log.i(TAG, "Advertising started")
+            Log.i(TAG, "Advertising started with txPower=${settingsInEffect.txPowerLevel}")
         }
 
         override fun onStartFailure(errorCode: Int) {
@@ -240,10 +240,10 @@ class BlePeripheral(
             // a direct connect (status=133 churn / slow first connect). The mesh
             // no longer pauses for Bluetooth audio, so favor a faster, more
             // catchable advertisement -- re-verify earbud audio doesn't stutter.
-            // TX power stays MEDIUM -- that governs range (ship-scale mesh); it's
-            // the advertising *interval* (the mode) that drives coexistence.
+            // TX power is HIGH for the range experiment; this changes discovery
+            // reach without increasing the BALANCED advertising duty cycle.
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .setConnectable(true)
             .build()
         val data = AdvertiseData.Builder()
