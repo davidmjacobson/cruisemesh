@@ -33,6 +33,7 @@ struct ChatListView: View {
     @State private var showMeshHelp = false
     @State private var cancellable: AnyCancellable?
     @State private var bluetoothAudioWarningDismissed = false
+    @State private var publishedFriendDirectory = false
     @AppStorage("hideBluetoothAudioWarning") private var hideBluetoothAudioWarning = false
 
     private var connectivityWarning: ConnectivityWarning? {
@@ -194,6 +195,16 @@ struct ChatListView: View {
                 reload()
                 cancellable = ChatEvents.subject.sink { _ in reload() }
                 appModel.startMeshIfEnabled()
+                if !publishedFriendDirectory {
+                    publishedFriendDirectory = true
+                    ProfileSyncSender.queueToAllContacts(
+                        store: AppStore.get(),
+                        identity: identity,
+                        displayName: appModel.displayName,
+                        epoch: ProfileStore.loadOwnAvatarEpoch()
+                    )
+                    FriendDirectorySender.queueToAllContacts(store: AppStore.get(), identity: identity)
+                }
                 if appModel.pendingFriendToken != nil { showFriends = true }
             }
             .onChange(of: runtime.state) { state in
@@ -214,6 +225,7 @@ struct ChatListView: View {
             _ = try? AppStore.get().deleteGroup(groupId: summary.chatId)
         } else {
             try? AppStore.get().deleteContact(userId: summary.chatId)
+            FriendDirectorySender.queueToAllContacts(store: AppStore.get(), identity: identity)
         }
         reload()
     }

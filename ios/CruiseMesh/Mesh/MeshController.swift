@@ -435,6 +435,20 @@ final class MeshController: ObservableObject {
                 body: body,
                 identity: identity
             )
+        case ProtocolKind.friendDirectory:
+            handleIncomingFriendDirectory(
+                sourceAddress: sourceAddress,
+                senderUserId: opened.senderUserId,
+                body: body,
+                identity: identity
+            )
+        case ProtocolKind.introducedFriendRequest:
+            handleIncomingIntroducedFriendRequest(
+                sourceAddress: sourceAddress,
+                senderUserId: opened.senderUserId,
+                body: body,
+                identity: identity
+            )
         case ProtocolKind.groupInvite:
             handleIncomingGroupInvite(
                 sourceLabel: sourceLabel,
@@ -698,6 +712,9 @@ final class MeshController: ObservableObject {
         body: MessageBody,
         identity: Identity
     ) {
+        let pending = ((try? store.listFriendSuggestions(
+            nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+        )) ?? []).first { $0.state == 1 && $0.candidate.userId == senderUserId }
         guard let json = String(data: body.content, encoding: .utf8),
               let card = try? parseFriendCard(json: json),
               friendCardUserId(card: card) == senderUserId else { return }
@@ -711,6 +728,13 @@ final class MeshController: ObservableObject {
             relayToken: card.relayToken
         )
         try? store.upsertContact(contact: contact)
+        try? store.upsertContactProvenance(provenance: ContactProvenance(
+            userId: senderUserId,
+            source: pending == nil ? 0 : 1,
+            introducerUserId: pending?.introducerUserId,
+            introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+        ))
+        if pending != nil { try? store.removeFriendSuggestion(candidateUserId: senderUserId) }
         ProfileSyncSender.queueToContact(
             store: store,
             identity: identity,
@@ -746,6 +770,7 @@ final class MeshController: ObservableObject {
             )
         }
         if !wasKnown {
+            FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
             FriendImportEvents.subject.send(FriendImportEvent(contact: contact, directBluetooth: sourceAddress != nil))
             MessageNotifier.notifyFriendAdded(contact: contact)
         }
@@ -769,6 +794,13 @@ final class MeshController: ObservableObject {
             payload: body.content
         ))) ?? false
         guard inserted else { return }
+
+        let policyChanged = (try? store.upsertContactDiscoveryPolicy(policy: ContactDiscoveryPolicy(
+            userId: senderUserId,
+            protocolVersion: content.friendsOfFriendsVersion,
+            enabled: content.friendsOfFriendsEnabled,
+            revision: content.friendsOfFriendsRevision
+        ))) ?? false
 
         let applied = (try? store.setContactAvatar(
             userId: senderUserId,
@@ -796,6 +828,163 @@ final class MeshController: ObservableObject {
             receiptType: ReceiptType.delivered,
             throughLamport: through
         )
+        if let sourceAddress {
+            sendReceiptOnAddress(
+                identity: identity,
+                contact: contact,
+                address: sourceAddress,
+                receiptType: ReceiptType.delivered,
+                ackedSenderUserId: senderUserId,
+                throughLamport: through
+            )
+        } else {
+            sendReceiptToContact(
+                identity: identity,
+                contact: contact,
+                receiptType: ReceiptType.delivered,
+                ackedSenderUserId: senderUserId,
+                throughLamport: through
+            )
+        }
+        if policyChanged {
+            FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
+        }
+    }
+
+    private func handleIncomingFriendDirectory(
+        sourceAddress: String?,
+        senderUserId: Data,
+        body: MessageBody,
+        identity: Identity
+    ) {
+        guard let contact = try? store.getContact(userId: senderUserId),
+              let content = try? decodeFriendDirectoryContent(bytes: body.content) else { return }
+        let inserted = (try? store.insertMessage(message: StoredMessage(
+            chatId: senderUserId,
+            senderUserId: senderUserId,
+            lamport: body.lamport,
+            timestamp: body.timestamp,
+            kind: ProtocolKind.friendDirectory,
+            payload: body.content
+        ))) ?? false
+        guard inserted else { return }
+        if FriendsOfFriendsStore.isEnabled() {
+            guard (try? store.applyFriendDirectory(
+                introducerUserId: senderUserId,
+                recipientUserId: identity.userId,
+                content: content,
+                nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            )) != nil else { return }
+            ChatEvents.notifyChatChanged(senderUserId)
+        }
+        acknowledgeHiddenMessage(
+            sourceAddress: sourceAddress,
+            senderUserId: senderUserId,
+            identity: identity,
+            contact: contact
+        )
+    }
+
+    private func handleIncomingIntroducedFriendRequest(
+        sourceAddress: String?,
+        senderUserId: Data,
+        body: MessageBody,
+        identity: Identity
+    ) {
+        guard FriendsOfFriendsStore.isEnabled(),
+              let request = try? decodeIntroducedFriendRequest(bytes: body.content),
+              let card = try? parseFriendCard(json: request.friendCardJson),
+              friendCardUserId(card: card) == senderUserId,
+              let introducer = try? store.getContact(userId: request.ticket.introducerUserId),
+              (try? verifyIntroductionTicket(
+                ticket: request.ticket,
+                introducerSignPk: introducer.signPk,
+                expectedCandidateUserId: identity.userId,
+                expectedInviteeUserId: senderUserId,
+                expectedCandidatePolicyRevision: FriendsOfFriendsStore.revision(),
+                nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+              )) == true else { return }
+
+        let wasKnown = (try? store.getContact(userId: senderUserId)) != nil
+        let contact = Contact(
+            userId: senderUserId,
+            name: card.name,
+            signPk: card.signPk,
+            agreePk: card.agreePk,
+            relayUrl: card.relayUrl,
+            relayToken: card.relayToken
+        )
+        try? store.upsertContact(contact: contact)
+        try? store.upsertContactProvenance(provenance: ContactProvenance(
+            userId: senderUserId,
+            source: 1,
+            introducerUserId: introducer.userId,
+            introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+        ))
+        try? store.removeFriendSuggestion(candidateUserId: senderUserId)
+        _ = try? store.insertMessage(message: StoredMessage(
+            chatId: senderUserId,
+            senderUserId: senderUserId,
+            lamport: body.lamport,
+            timestamp: body.timestamp,
+            kind: ProtocolKind.introducedFriendRequest,
+            payload: body.content
+        ))
+        acknowledgeHiddenMessage(
+            sourceAddress: sourceAddress,
+            senderUserId: senderUserId,
+            identity: identity,
+            contact: contact
+        )
+        FriendRequestSender.sendMutualFriendRequest(
+            store: store,
+            identity: identity,
+            contact: contact,
+            displayName: ProfileStore.loadDisplayName()
+        )
+        ProfileSyncSender.queueToContact(
+            store: store,
+            identity: identity,
+            contact: contact,
+            displayName: ProfileStore.loadDisplayName(),
+            epoch: ProfileStore.loadOwnAvatarEpoch()
+        )
+        FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
+        ChatEvents.notifyChatChanged(senderUserId)
+        if !wasKnown {
+            FriendImportEvents.subject.send(FriendImportEvent(
+                contact: contact,
+                directBluetooth: sourceAddress != nil
+            ))
+            MessageNotifier.notifyFriendAdded(contact: contact)
+        }
+    }
+
+    private func acknowledgeHiddenMessage(
+        sourceAddress: String?,
+        senderUserId: Data,
+        identity: Identity,
+        contact: Contact
+    ) {
+        let through = (try? store.highestLamport(
+            chatId: senderUserId,
+            senderUserId: senderUserId
+        )) ?? 0
+        try? store.recordOutgoingReceipt(
+            chatId: senderUserId,
+            senderUserId: senderUserId,
+            receiptType: ReceiptType.delivered,
+            throughLamport: through
+        )
+        if queueOutgoingReceiptForRelay(
+            identity: identity,
+            contact: contact,
+            receiptType: ReceiptType.delivered,
+            ackedSenderUserId: senderUserId,
+            throughLamport: through
+        ) {
+            RelaySyncEvents.requestSync()
+        }
         if let sourceAddress {
             sendReceiptOnAddress(
                 identity: identity,

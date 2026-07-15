@@ -47,6 +47,7 @@ import androidx.core.content.ContextCompat
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
+import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.relay.RelayConfigStore
 import android.widget.Toast
@@ -65,6 +66,7 @@ fun ProfileScreen(
     onShowMyQr: () -> Unit,
     onBackUp: () -> Unit,
     onProfileChanged: (Long) -> Unit = {},
+    onFriendsOfFriendsChanged: (Boolean) -> Unit = {},
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -72,6 +74,7 @@ fun ProfileScreen(
     val initialDisplayName = remember { ProfileStore.loadDisplayName(context) }
     var avatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
     var shareOnline by remember { mutableStateOf(RelayConfigStore.shareOnline(context)) }
+    var friendsOfFriends by remember { mutableStateOf(FriendsOfFriendsStore.isEnabled(context)) }
     fun bumpAndSync() {
         onProfileChanged(ProfileStore.bumpOwnAvatarEpoch(context))
     }
@@ -246,6 +249,34 @@ fun ProfileScreen(
                         onCheckedChange = {
                             shareOnline = it
                             RelayConfigStore.setShareOnline(context, it)
+                        },
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            ProfileSection(title = "Privacy") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Friends of friends")
+                        Text(
+                            "Let friends introduce you to people they know. Your messages and phone contacts are never shared.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                    Switch(
+                        checked = friendsOfFriends,
+                        onCheckedChange = {
+                            friendsOfFriends = it
+                            onFriendsOfFriendsChanged(it)
                         },
                     )
                 }
