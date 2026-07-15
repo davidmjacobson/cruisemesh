@@ -10,7 +10,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Select stable Rust
         run: rustup default stable
@@ -19,7 +19,7 @@ jobs:
         run: brew install xcodegen
 
       - name: Build the Rust XCFramework
-        run: core/build-ios.sh
+        run: bash core/build-ios.sh
 
       - name: Generate the Xcode project
         working-directory: ios
