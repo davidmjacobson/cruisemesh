@@ -260,6 +260,7 @@ struct ChatView: View {
         .alert("Delete contact?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) {
                 try? store.deleteContact(userId: contact.userId)
+                FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
                 dismiss()
             }
             Button("Cancel", role: .cancel) {}

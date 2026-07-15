@@ -32,8 +32,19 @@ object ProfileSyncSender {
     ) {
         val avatar = ProfilePhotoStore.loadWireAvatarBytes(context)
         val name = ProfileStore.loadDisplayName(context)
+        val friendsOfFriendsEnabled = FriendsOfFriendsStore.isEnabled(context)
+        val friendsOfFriendsRevision = FriendsOfFriendsStore.revision(context)
         for (contact in store.listContacts()) {
-            queueToContact(store, identity, contact, epoch, name, avatar)
+            queueToContact(
+                store,
+                identity,
+                contact,
+                epoch,
+                name,
+                avatar,
+                friendsOfFriendsEnabled,
+                friendsOfFriendsRevision,
+            )
         }
     }
 
@@ -51,6 +62,8 @@ object ProfileSyncSender {
             epoch = epoch,
             name = ProfileStore.loadDisplayName(context),
             avatar = ProfilePhotoStore.loadWireAvatarBytes(context),
+            friendsOfFriendsEnabled = FriendsOfFriendsStore.isEnabled(context),
+            friendsOfFriendsRevision = FriendsOfFriendsStore.revision(context),
         )
     }
 
@@ -61,8 +74,9 @@ object ProfileSyncSender {
         epoch: Long,
         name: String,
         avatar: ByteArray,
+        friendsOfFriendsEnabled: Boolean,
+        friendsOfFriendsRevision: ULong,
     ) {
-        if (epoch <= 0L) return
         val lamport = nextAuthoredLamport(
             ownContiguous = store.highestContiguousLamport(contact.userId, identity.userId),
             ackedDelivered = store.receiptThrough(contact.userId, identity.userId, RECEIPT_TYPE_DELIVERED),
@@ -74,6 +88,9 @@ object ProfileSyncSender {
                 avatarEpoch = epoch,
                 name = name,
                 avatar = avatar,
+                friendsOfFriendsVersion = 1u,
+                friendsOfFriendsEnabled = friendsOfFriendsEnabled,
+                friendsOfFriendsRevision = friendsOfFriendsRevision,
             ),
         )
         val message = StoredMessage(

@@ -49,7 +49,6 @@ enum ProfileSyncSender {
         epoch: Int64,
         avatar: Data
     ) {
-        guard epoch > 0 else { return }
         let chatId = contact.userId
         let own = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0
         let delivered = (try? store.receiptThrough(
@@ -67,7 +66,10 @@ enum ProfileSyncSender {
         let payload = encodeProfileSyncContent(content: ProfileSyncContent(
             avatarEpoch: epoch,
             name: displayName.isEmpty ? "Friend" : displayName,
-            avatar: avatar
+            avatar: avatar,
+            friendsOfFriendsVersion: 1,
+            friendsOfFriendsEnabled: FriendsOfFriendsStore.isEnabled(),
+            friendsOfFriendsRevision: FriendsOfFriendsStore.revision()
         ))
         let message = StoredMessage(
             chatId: chatId,

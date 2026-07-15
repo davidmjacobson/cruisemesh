@@ -181,6 +181,12 @@ and the design must remain boring enough to describe in one page.
   friend-request envelope back; friendship is mutual once both sides hold each
   other's keys. Contact card shows a short fingerprint phrase (4 words) for verbal
   verification, Signal-safety-number style.
+- **Friends-of-friends introductions** can reduce a connected family's
+  physical setup from `N(N - 1) / 2` to `N - 1` QR scans. Public contact cards are
+  suggested through named mutual friends; the user explicitly adds a suggestion,
+  and the candidate's phone enforces its own default-on discovery setting. The
+  protocol, privacy boundary, and rollout are specified in
+  [`specs/friends-of-friends.md`](specs/friends-of-friends.md).
 
 ### 6.2.1 Contact profile photos
 

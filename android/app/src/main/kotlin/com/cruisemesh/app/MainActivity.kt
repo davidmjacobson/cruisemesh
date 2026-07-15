@@ -61,6 +61,8 @@ import android.widget.Toast
 import androidx.core.app.ActivityCompat
 import com.cruisemesh.app.friending.MyQrScreen
 import com.cruisemesh.app.friending.ProfileSyncSender
+import com.cruisemesh.app.friending.FriendDirectorySender
+import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.friending.ScanScreen
 import com.cruisemesh.app.friending.extractFriendToken
 import com.cruisemesh.app.identity.IdentityStore
@@ -100,6 +102,7 @@ import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.generateIdentity
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.parseFriendText
 
@@ -205,7 +208,7 @@ fun CruiseMeshApp(
             arguments = listOf(navArgument("token") { type = NavType.StringType; nullable = true; defaultValue = null }),
         ) { entry -> AddFriendRoute(identity, navController, entry.arguments?.getString("token")) }
         composable("scan") { ScanRoute(identity, navController) }
-        composable("contacts") { ContactsRoute(navController) }
+        composable("contacts") { ContactsRoute(identity, navController) }
         composable("newGroup") { NewGroupRoute(identity, navController) }
         composable("chat/{userIdHex}") { backStackEntry ->
             val userIdHex = backStackEntry.arguments?.getString("userIdHex").orEmpty()
@@ -488,6 +491,15 @@ private fun MeshStatusDotColor?.toComposeColor(): androidx.compose.ui.graphics.C
 private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val context = LocalContext.current
     val store = remember { AppStore.get(context) }
+    LaunchedEffect(Unit) {
+        ProfileSyncSender.queueToAllContacts(
+            context,
+            store,
+            identity,
+            ProfileStore.loadOwnAvatarEpoch(context),
+        )
+        FriendDirectorySender.queueToAllContacts(context, store, identity)
+    }
     val runtimeStatus by MeshRuntimeStatus.state.collectAsState()
     val bluetoothAudioConnected by MeshRuntimeStatus.bluetoothAudioConnected.collectAsState()
     val nearbyPeerIds by MeshConnectivityStatus.nearbyPeerIds.collectAsState()
@@ -695,6 +707,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 store.deleteGroup(summary.chatId)
             } else {
                 store.deleteContact(summary.chatId)
+                FriendDirectorySender.queueToAllContacts(context, store, identity)
             }
             reloadSummaries()
         },
@@ -814,6 +827,17 @@ private fun ProfileRoute(identity: Identity, navController: NavHostController) {
         onProfileChanged = { epoch ->
             ProfileSyncSender.queueToAllContacts(context, store, identity, epoch)
         },
+        onFriendsOfFriendsChanged = { enabled ->
+            FriendsOfFriendsStore.setEnabled(context, enabled)
+            if (!enabled) store.clearFriendSuggestions()
+            ProfileSyncSender.queueToAllContacts(
+                context,
+                store,
+                identity,
+                ProfileStore.loadOwnAvatarEpoch(context),
+            )
+            FriendDirectorySender.queueToAllContacts(context, store, identity)
+        },
         onBack = { navController.popBackStack() }
     )
 }
@@ -843,6 +867,10 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
             onContactAdded = { scanned ->
                 val contact = RelayImport.reconcileOnImport(context, store, scanned)
                 store.upsertContact(contact)
+                store.upsertContactProvenance(
+                    ContactProvenance(contact.userId, 0u, null, System.currentTimeMillis()),
+                )
+                store.removeFriendSuggestion(contact.userId)
                 val delivery = FriendRequestSender.queueForScannedContact(context, store, identity, contact)
                 ProfileSyncSender.queueToContact(
                     context,
@@ -851,6 +879,7 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
                     contact,
                     ProfileStore.loadOwnAvatarEpoch(context),
                 )
+                FriendDirectorySender.queueToAllContacts(context, store, identity)
                 FriendAddedOutcome(contact, delivery, RelayConfigStore.load(context) != null)
             },
             onSayHi = { openFriendChat(navController, it) },
@@ -915,6 +944,10 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
         onConfirmContact = { candidate ->
             val contact = RelayImport.reconcileOnImport(context, store, candidate)
             store.upsertContact(contact)
+            store.upsertContactProvenance(
+                ContactProvenance(contact.userId, 0u, null, System.currentTimeMillis()),
+            )
+            store.removeFriendSuggestion(contact.userId)
             val delivery = FriendRequestSender.queueForScannedContact(context, store, identity, contact)
             ProfileSyncSender.queueToContact(
                 context,
@@ -923,7 +956,14 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
                 contact,
                 ProfileStore.loadOwnAvatarEpoch(context),
             )
+            FriendDirectorySender.queueToAllContacts(context, store, identity)
             FriendAddedOutcome(contact, delivery, RelayConfigStore.load(context) != null)
+        },
+        onRequestSuggestion = { suggestion ->
+            FriendDirectorySender.requestSuggestedFriend(context, store, identity, suggestion)
+        },
+        onHideSuggestion = { suggestion ->
+            store.setFriendSuggestionState(suggestion.candidate.userId, 2u)
         },
         ownUserId = identity.userId,
         store = store,
@@ -949,7 +989,7 @@ private fun returnToContacts(navController: NavHostController) {
 }
 
 @Composable
-private fun ContactsRoute(navController: NavHostController) {
+private fun ContactsRoute(identity: Identity, navController: NavHostController) {
     val context = LocalContext.current
     val store = remember { AppStore.get(context) }
     var contacts by remember { mutableStateOf(store.listContacts()) }
@@ -980,6 +1020,7 @@ private fun ContactsRoute(navController: NavHostController) {
         onContactClick = { contact -> navController.navigate("chat/${UserIdHex.encode(contact.userId)}") },
         onContactDelete = { contact ->
             store.deleteContact(contact.userId)
+            FriendDirectorySender.queueToAllContacts(context, store, identity)
             reloadContacts()
         },
         onAddFriendClick = { navController.navigate("addFriend") },
@@ -1100,6 +1141,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             onBack = { navController.popBackStack() },
             onDeleteContact = {
                 store.deleteContact(contact.userId)
+                FriendDirectorySender.queueToAllContacts(context, store, identity)
                 navController.popBackStack()
             },
             reachability = reachability,

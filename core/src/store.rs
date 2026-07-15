@@ -97,7 +97,10 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use crate::groups::{canonicalize_members, validate_group};
-use crate::{CoreError, Group};
+use crate::{
+    verify_introduction_ticket, CoreError, FriendDirectoryContent, Group, IntroductionTicket,
+    SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST,
+};
 
 /// One stored message body (DESIGN.md §7.1). `timestamp` is milliseconds
 /// since the Unix epoch; `kind` matches the DESIGN.md §7.1 `kind` byte
@@ -124,6 +127,36 @@ pub struct Contact {
     pub agree_pk: Vec<u8>,
     pub relay_url: Option<String>,
     pub relay_token: Option<String>,
+}
+
+/// The last authenticated friends-of-friends policy advertised by a contact.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct ContactDiscoveryPolicy {
+    pub user_id: Vec<u8>,
+    pub protocol_version: u8,
+    pub enabled: bool,
+    pub revision: u64,
+}
+
+/// One candidate/source pair. Callers group rows with the same candidate
+/// UserID to present all known mutual friends.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct FriendSuggestion {
+    pub candidate: SuggestedFriendCard,
+    pub introducer_user_id: Vec<u8>,
+    pub ticket: IntroductionTicket,
+    /// 0 = available, 1 = requested, 2 = hidden.
+    pub state: u8,
+}
+
+/// How an accepted contact first entered the local trust graph.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct ContactProvenance {
+    pub user_id: Vec<u8>,
+    /// 0 = direct QR/link, 1 = introduced by another accepted contact.
+    pub source: u8,
+    pub introducer_user_id: Option<Vec<u8>>,
+    pub introduced_at_ms: i64,
 }
 
 /// One entry of a per-chat sync digest (DESIGN.md §7.3): "I have `sender_user_id`'s
@@ -1053,6 +1086,32 @@ impl MessageStore {
             params![user_id],
         )
         .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM contact_discovery_policy WHERE user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM contact_provenance WHERE user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM friend_suggestions
+             WHERE candidate_user_id = ?1 OR introducer_user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM friend_suggestion_state WHERE candidate_user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM friend_directory_state WHERE introducer_user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
         tx.commit().map_err(store_err)?;
         Ok(removed > 0)
     }
@@ -1077,6 +1136,326 @@ impl MessageStore {
             .map_err(store_err)?;
         let rows = stmt.query_map([], row_to_contact).map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Apply an authenticated contact's discovery policy if it is newer.
+    pub fn upsert_contact_discovery_policy(
+        &self,
+        policy: ContactDiscoveryPolicy,
+    ) -> Result<bool, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn
+            .execute(
+                "INSERT INTO contact_discovery_policy
+                    (user_id, protocol_version, enabled, revision)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                    protocol_version = excluded.protocol_version,
+                    enabled = excluded.enabled,
+                    revision = excluded.revision
+                 WHERE excluded.revision > contact_discovery_policy.revision",
+                params![
+                    policy.user_id,
+                    policy.protocol_version as i64,
+                    i64::from(policy.enabled),
+                    policy.revision as i64,
+                ],
+            )
+            .map_err(store_err)?
+            > 0;
+        Ok(changed)
+    }
+
+    pub fn get_contact_discovery_policy(
+        &self,
+        user_id: Vec<u8>,
+    ) -> Result<Option<ContactDiscoveryPolicy>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT user_id, protocol_version, enabled, revision
+             FROM contact_discovery_policy WHERE user_id = ?1",
+            params![user_id],
+            |row| {
+                Ok(ContactDiscoveryPolicy {
+                    user_id: row.get(0)?,
+                    protocol_version: row.get::<_, i64>(1)? as u8,
+                    enabled: row.get::<_, i64>(2)? != 0,
+                    revision: row.get::<_, i64>(3)? as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    /// Atomically replace all suggestions supplied by one introducer. The
+    /// directory's tickets are checked here so both mobile shells share the
+    /// same fail-closed behavior.
+    pub fn apply_friend_directory(
+        &self,
+        introducer_user_id: Vec<u8>,
+        recipient_user_id: Vec<u8>,
+        content: FriendDirectoryContent,
+        now_ms: i64,
+    ) -> Result<bool, CoreError> {
+        if content.version != 1 || content.entries.len() > 64 {
+            return Err(CoreError::Malformed("invalid friend directory".to_string()));
+        }
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
+        let introducer_sign_pk: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT sign_pk FROM contacts WHERE user_id = ?1",
+                params![introducer_user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let Some(introducer_sign_pk) = introducer_sign_pk else {
+            return Err(CoreError::Malformed(
+                "friend directory sender is not a contact".to_string(),
+            ));
+        };
+        let applied: Option<i64> = tx
+            .query_row(
+                "SELECT applied_revision FROM friend_directory_state
+                 WHERE introducer_user_id = ?1",
+                params![introducer_user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        if applied.is_some_and(|revision| revision as u64 >= content.revision) {
+            tx.commit().map_err(store_err)?;
+            return Ok(false);
+        }
+
+        for entry in &content.entries {
+            if entry.ticket.introducer_user_id != introducer_user_id
+                || !verify_introduction_ticket(
+                    entry.ticket.clone(),
+                    introducer_sign_pk.clone(),
+                    entry.candidate.user_id.clone(),
+                    recipient_user_id.clone(),
+                    entry.candidate_policy_revision,
+                    now_ms,
+                )?
+            {
+                return Err(CoreError::Malformed(
+                    "friend directory contains an invalid introduction ticket".to_string(),
+                ));
+            }
+
+            // A requested suggestion becomes retryable once there is no
+            // longer an unexpired introduced-request envelope queued for it.
+            // Hidden suggestions remain suppressed across snapshots.
+            let request_still_pending: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM outbound_envelopes
+                         WHERE recipient_user_id = ?1 AND kind = ?2 AND expiry > ?3
+                     )",
+                    params![
+                        &entry.candidate.user_id,
+                        KIND_INTRODUCED_FRIEND_REQUEST as i64,
+                        now_ms,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(store_err)?;
+            if !request_still_pending {
+                tx.execute(
+                    "DELETE FROM friend_suggestion_state
+                     WHERE candidate_user_id = ?1 AND state = 1",
+                    params![&entry.candidate.user_id],
+                )
+                .map_err(store_err)?;
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO friend_directory_state (introducer_user_id, applied_revision)
+             VALUES (?1, ?2)
+             ON CONFLICT(introducer_user_id) DO UPDATE SET
+                applied_revision = excluded.applied_revision",
+            params![introducer_user_id, content.revision as i64],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM friend_suggestions WHERE introducer_user_id = ?1",
+            params![introducer_user_id],
+        )
+        .map_err(store_err)?;
+        for entry in content.entries {
+            let ticket =
+                serde_json::to_vec(&entry.ticket).map_err(|e| CoreError::Store(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO friend_suggestions
+                    (candidate_user_id, introducer_user_id, name, sign_pk, agree_pk,
+                     candidate_policy_revision, ticket, expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    entry.candidate.user_id,
+                    introducer_user_id,
+                    entry.candidate.name,
+                    entry.candidate.sign_pk,
+                    entry.candidate.agree_pk,
+                    entry.candidate_policy_revision as i64,
+                    ticket,
+                    entry.ticket.expires_at_ms,
+                ],
+            )
+            .map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(true)
+    }
+
+    pub fn list_friend_suggestions(&self, now_ms: i64) -> Result<Vec<FriendSuggestion>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.candidate_user_id, s.name, s.sign_pk, s.agree_pk,
+                        s.introducer_user_id, s.ticket,
+                        COALESCE(x.state, 0)
+                 FROM friend_suggestions s
+                 LEFT JOIN friend_suggestion_state x
+                    ON x.candidate_user_id = s.candidate_user_id
+                 LEFT JOIN contacts c ON c.user_id = s.candidate_user_id
+                 WHERE c.user_id IS NULL AND s.expires_at_ms >= ?1
+                       AND COALESCE(x.state, 0) != 2
+                 ORDER BY lower(s.name), s.introducer_user_id",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![now_ms], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, i64>(6)? as u8,
+                ))
+            })
+            .map_err(store_err)?;
+        let mut suggestions = Vec::new();
+        for row in rows {
+            let (user_id, name, sign_pk, agree_pk, introducer_user_id, ticket_json, state) =
+                row.map_err(store_err)?;
+            let ticket: IntroductionTicket = serde_json::from_slice(&ticket_json)
+                .map_err(|e| CoreError::Store(e.to_string()))?;
+            suggestions.push(FriendSuggestion {
+                candidate: SuggestedFriendCard {
+                    name,
+                    user_id,
+                    sign_pk,
+                    agree_pk,
+                },
+                introducer_user_id,
+                ticket,
+                state,
+            });
+        }
+        Ok(suggestions)
+    }
+
+    /// State values: 0 available, 1 requested, 2 hidden.
+    pub fn set_friend_suggestion_state(
+        &self,
+        candidate_user_id: Vec<u8>,
+        state: u8,
+    ) -> Result<(), CoreError> {
+        if state > 2 {
+            return Err(CoreError::Malformed("invalid suggestion state".to_string()));
+        }
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "INSERT INTO friend_suggestion_state (candidate_user_id, state)
+             VALUES (?1, ?2)
+             ON CONFLICT(candidate_user_id) DO UPDATE SET state = excluded.state",
+            params![candidate_user_id, state as i64],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn remove_friend_suggestion(&self, candidate_user_id: Vec<u8>) -> Result<(), CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "DELETE FROM friend_suggestions WHERE candidate_user_id = ?1",
+            params![candidate_user_id],
+        )
+        .map_err(store_err)?;
+        conn.execute(
+            "DELETE FROM friend_suggestion_state WHERE candidate_user_id = ?1",
+            params![candidate_user_id],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn clear_friend_suggestions(&self) -> Result<(), CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute_batch(
+            "DELETE FROM friend_suggestions;
+             DELETE FROM friend_directory_state;",
+        )
+        .map_err(store_err)
+    }
+
+    pub fn upsert_contact_provenance(
+        &self,
+        provenance: ContactProvenance,
+    ) -> Result<(), CoreError> {
+        if provenance.source > 1 {
+            return Err(CoreError::Malformed(
+                "invalid contact provenance".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "INSERT INTO contact_provenance
+                (user_id, source, introducer_user_id, introduced_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id) DO UPDATE SET
+                source = CASE WHEN contact_provenance.source = 0 THEN 0 ELSE excluded.source END,
+                introducer_user_id = CASE WHEN contact_provenance.source = 0
+                    THEN contact_provenance.introducer_user_id ELSE excluded.introducer_user_id END,
+                introduced_at_ms = CASE WHEN contact_provenance.source = 0
+                    THEN contact_provenance.introduced_at_ms ELSE excluded.introduced_at_ms END",
+            params![
+                provenance.user_id,
+                provenance.source as i64,
+                provenance.introducer_user_id,
+                provenance.introduced_at_ms,
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn get_contact_provenance(
+        &self,
+        user_id: Vec<u8>,
+    ) -> Result<Option<ContactProvenance>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT user_id, source, introducer_user_id, introduced_at_ms
+             FROM contact_provenance WHERE user_id = ?1",
+            params![user_id],
+            |row| {
+                Ok(ContactProvenance {
+                    user_id: row.get(0)?,
+                    source: row.get::<_, i64>(1)? as u8,
+                    introducer_user_id: row.get(2)?,
+                    introduced_at_ms: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
     }
 
     /// Add or replace a group definition and its full membership. Updating an
@@ -1708,6 +2087,44 @@ CREATE TABLE IF NOT EXISTS contacts (
     avatar_epoch INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS contact_discovery_policy (
+    user_id BLOB PRIMARY KEY,
+    protocol_version INTEGER NOT NULL,
+    enabled INTEGER NOT NULL,
+    revision INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friend_directory_state (
+    introducer_user_id BLOB PRIMARY KEY,
+    applied_revision INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friend_suggestions (
+    candidate_user_id BLOB NOT NULL,
+    introducer_user_id BLOB NOT NULL,
+    name TEXT NOT NULL,
+    sign_pk BLOB NOT NULL,
+    agree_pk BLOB NOT NULL,
+    candidate_policy_revision INTEGER NOT NULL,
+    ticket BLOB NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(candidate_user_id, introducer_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_friend_suggestions_introducer
+    ON friend_suggestions(introducer_user_id);
+
+CREATE TABLE IF NOT EXISTS friend_suggestion_state (
+    candidate_user_id BLOB PRIMARY KEY,
+    state INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS contact_provenance (
+    user_id BLOB PRIMARY KEY,
+    source INTEGER NOT NULL,
+    introducer_user_id BLOB,
+    introduced_at_ms INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS groups (
     group_id   BLOB PRIMARY KEY,
     name       TEXT NOT NULL,
@@ -1798,7 +2215,10 @@ CREATE INDEX IF NOT EXISTS idx_carried_expiry ON carried_envelopes(expiry);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Group, KIND_GROUP_INVITE, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ};
+    use crate::{
+        create_introduction_ticket, generate_identity, FriendDirectoryEntry, Group,
+        KIND_GROUP_INVITE, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
+    };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2562,6 +2982,168 @@ mod tests {
             relay_url: None,
             relay_token: None,
         }
+    }
+
+    #[test]
+    fn contact_discovery_policy_only_moves_forward() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let id = vec![1; 16];
+        assert!(store
+            .upsert_contact_discovery_policy(ContactDiscoveryPolicy {
+                user_id: id.clone(),
+                protocol_version: 1,
+                enabled: true,
+                revision: 5,
+            })
+            .unwrap());
+        assert!(!store
+            .upsert_contact_discovery_policy(ContactDiscoveryPolicy {
+                user_id: id.clone(),
+                protocol_version: 1,
+                enabled: false,
+                revision: 4,
+            })
+            .unwrap());
+        let policy = store.get_contact_discovery_policy(id).unwrap().unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.revision, 5);
+    }
+
+    #[test]
+    fn friend_directory_replaces_one_source_and_honors_suppression() {
+        let alice = generate_identity();
+        let bob = generate_identity();
+        let carol = generate_identity();
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .upsert_contact(Contact {
+                user_id: alice.user_id.clone(),
+                name: "Alice".to_string(),
+                sign_pk: alice.sign_pk.clone(),
+                agree_pk: alice.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+            })
+            .unwrap();
+        let ticket = create_introduction_ticket(
+            alice.clone(),
+            carol.user_id.clone(),
+            bob.user_id.clone(),
+            3,
+            1_000,
+            100_000,
+            vec![9; 16],
+        )
+        .unwrap();
+        let directory = FriendDirectoryContent {
+            version: 1,
+            revision: 1,
+            entries: vec![FriendDirectoryEntry {
+                candidate: SuggestedFriendCard {
+                    name: "Carol".to_string(),
+                    user_id: carol.user_id.clone(),
+                    sign_pk: carol.sign_pk.clone(),
+                    agree_pk: carol.agree_pk.clone(),
+                },
+                candidate_policy_revision: 3,
+                ticket,
+            }],
+        };
+        assert!(store
+            .apply_friend_directory(
+                alice.user_id.clone(),
+                bob.user_id.clone(),
+                directory.clone(),
+                2_000,
+            )
+            .unwrap());
+        assert!(!store
+            .apply_friend_directory(alice.user_id.clone(), vec![2; 16], directory, 2_000,)
+            .unwrap());
+        let suggestions = store.list_friend_suggestions(2_000).unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].candidate.name, "Carol");
+
+        store
+            .set_friend_suggestion_state(suggestions[0].candidate.user_id.clone(), 1)
+            .unwrap();
+        let newer_ticket = create_introduction_ticket(
+            alice.clone(),
+            carol.user_id.clone(),
+            bob.user_id.clone(),
+            3,
+            2_000,
+            101_000,
+            vec![10; 16],
+        )
+        .unwrap();
+        assert!(store
+            .apply_friend_directory(
+                alice.user_id.clone(),
+                bob.user_id,
+                FriendDirectoryContent {
+                    version: 1,
+                    revision: 2,
+                    entries: vec![FriendDirectoryEntry {
+                        candidate: SuggestedFriendCard {
+                            name: "Carol".to_string(),
+                            user_id: carol.user_id,
+                            sign_pk: carol.sign_pk,
+                            agree_pk: carol.agree_pk,
+                        },
+                        candidate_policy_revision: 3,
+                        ticket: newer_ticket,
+                    }],
+                },
+                2_000,
+            )
+            .unwrap());
+        let suggestions = store.list_friend_suggestions(2_000).unwrap();
+        assert_eq!(suggestions[0].state, 0);
+
+        store
+            .set_friend_suggestion_state(suggestions[0].candidate.user_id.clone(), 2)
+            .unwrap();
+        assert!(store.list_friend_suggestions(2_000).unwrap().is_empty());
+
+        assert!(store
+            .apply_friend_directory(
+                alice.user_id,
+                vec![2; 16],
+                FriendDirectoryContent {
+                    version: 1,
+                    revision: 3,
+                    entries: Vec::new(),
+                },
+                2_000,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn direct_provenance_cannot_be_downgraded() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let user_id = vec![3; 16];
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: user_id.clone(),
+                source: 0,
+                introducer_user_id: None,
+                introduced_at_ms: 10,
+            })
+            .unwrap();
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: user_id.clone(),
+                source: 1,
+                introducer_user_id: Some(vec![4; 16]),
+                introduced_at_ms: 20,
+            })
+            .unwrap();
+        let provenance = store.get_contact_provenance(user_id).unwrap().unwrap();
+        assert_eq!(provenance.source, 0);
+        assert!(provenance.introducer_user_id.is_none());
+        assert_eq!(provenance.introduced_at_ms, 10);
     }
 
     #[test]

@@ -33,6 +33,9 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.friending.ProfileSyncSender
 import com.cruisemesh.app.friending.FriendImportEvents
+import com.cruisemesh.app.friending.FriendDirectorySender
+import com.cruisemesh.app.friending.FriendRequestSender
+import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.AttachmentPayload
@@ -48,6 +51,8 @@ import com.cruisemesh.app.relay.normalizeRelayUrl
 import com.cruisemesh.app.relay.RelayImport
 import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.ContactDiscoveryPolicy
+import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.DigestEntry
 import uniffi.cruisemesh_core.Frame
@@ -61,6 +66,8 @@ import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.decodeGroupInviteContent
+import uniffi.cruisemesh_core.decodeFriendDirectoryContent
+import uniffi.cruisemesh_core.decodeIntroducedFriendRequest
 import uniffi.cruisemesh_core.decodeMessageBody
 import uniffi.cruisemesh_core.decodeProfileSyncContent
 import uniffi.cruisemesh_core.decodeReceiptContent
@@ -77,6 +84,7 @@ import uniffi.cruisemesh_core.parseFriendCard
 import uniffi.cruisemesh_core.openMessage
 import uniffi.cruisemesh_core.parseFrame
 import uniffi.cruisemesh_core.sealMessage
+import uniffi.cruisemesh_core.verifyIntroductionTicket
 
 private const val TAG = "MeshService"
 private const val NOTIFICATION_CHANNEL_ID = "cruisemesh_mesh_status"
@@ -90,6 +98,8 @@ private const val KIND_RECEIPT: UByte = 2u
 private const val KIND_FRIEND_REQUEST: UByte = 3u
 private const val KIND_GROUP_INVITE: UByte = 4u
 private const val KIND_PROFILE_SYNC: UByte = 5u
+private const val KIND_FRIEND_DIRECTORY: UByte = 6u
+private const val KIND_INTRODUCED_FRIEND_REQUEST: UByte = 7u
 
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
@@ -1809,6 +1819,14 @@ class MeshService : Service() {
             KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, directBle, opened.senderUserId, body, identity)
             KIND_GROUP_INVITE -> handleIncomingGroupInvite(address, opened.senderUserId, body, identity)
             KIND_PROFILE_SYNC -> handleIncomingProfileSync(address, opened.senderUserId, body, identity)
+            KIND_FRIEND_DIRECTORY -> handleIncomingFriendDirectory(address, opened.senderUserId, body, identity)
+            KIND_INTRODUCED_FRIEND_REQUEST -> handleIncomingIntroducedFriendRequest(
+                address,
+                directBle,
+                opened.senderUserId,
+                body,
+                identity,
+            )
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
         }
     }
@@ -1980,6 +1998,9 @@ class MeshService : Service() {
         body: MessageBody,
         identity: Identity,
     ) {
+        val pendingSuggestion = store.listFriendSuggestions(System.currentTimeMillis()).firstOrNull {
+            it.state == 1.toUByte() && it.candidate.userId.contentEquals(senderUserId)
+        }
         val card = try {
             parseFriendCard(body.content.toString(Charsets.UTF_8))
         } catch (e: CoreException) {
@@ -2005,6 +2026,15 @@ class MeshService : Service() {
             ),
         )
         store.upsertContact(contact)
+        store.upsertContactProvenance(
+            ContactProvenance(
+                userId = senderUserId,
+                source = if (pendingSuggestion == null) 0u else 1u,
+                introducerUserId = pendingSuggestion?.introducerUserId,
+                introducedAtMs = System.currentTimeMillis(),
+            ),
+        )
+        if (pendingSuggestion != null) store.removeFriendSuggestion(senderUserId)
         ProfileSyncSender.queueToContact(
             this,
             store,
@@ -2093,6 +2123,15 @@ class MeshService : Service() {
         )
         if (!inserted) return
 
+        val policyChanged = store.upsertContactDiscoveryPolicy(
+            ContactDiscoveryPolicy(
+                userId = senderUserId,
+                protocolVersion = content.friendsOfFriendsVersion,
+                enabled = content.friendsOfFriendsEnabled,
+                revision = content.friendsOfFriendsRevision,
+            ),
+        )
+
         val applied = store.setContactAvatar(
             senderUserId,
             content.avatar.takeIf { it.isNotEmpty() },
@@ -2132,6 +2171,174 @@ class MeshService : Service() {
         if (isVisible) {
             sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
         }
+        if (policyChanged) {
+            FriendDirectorySender.queueToAllContacts(this, store, identity)
+        }
+    }
+
+    private fun handleIncomingFriendDirectory(
+        address: String,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+    ) {
+        val contact = store.getContact(senderUserId) ?: run {
+            Log.i(TAG, "Dropping friend directory from $address: sender is not a contact")
+            return
+        }
+        val content = try {
+            decodeFriendDirectoryContent(body.content)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping friend directory from $address: ${e.message}")
+            return
+        }
+        val inserted = store.insertMessage(
+            StoredMessage(
+                chatId = senderUserId,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_FRIEND_DIRECTORY,
+                payload = body.content,
+            ),
+        )
+        if (!inserted) return
+        if (FriendsOfFriendsStore.isEnabled(this)) {
+            try {
+                if (store.applyFriendDirectory(senderUserId, identity.userId, content, System.currentTimeMillis())) {
+                    ChatEvents.notifyChatChanged(senderUserId)
+                }
+            } catch (e: CoreException) {
+                Log.w(TAG, "Rejecting friend directory from $address: ${e.message}")
+                return
+            }
+        }
+        acknowledgeHiddenMessage(address, senderUserId, identity, contact)
+    }
+
+    private fun handleIncomingIntroducedFriendRequest(
+        address: String,
+        directBle: Boolean,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+    ) {
+        if (!FriendsOfFriendsStore.isEnabled(this)) {
+            Log.i(TAG, "Ignoring introduced friend request while friends-of-friends is disabled")
+            return
+        }
+        val request = try {
+            decodeIntroducedFriendRequest(body.content)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping introduced friend request from $address: ${e.message}")
+            return
+        }
+        val card = try {
+            parseFriendCard(request.friendCardJson)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping introduced friend request with invalid card: ${e.message}")
+            return
+        }
+        if (!friendCardUserId(card).contentEquals(senderUserId)) {
+            Log.w(TAG, "Dropping introduced friend request: card does not match authenticated sender")
+            return
+        }
+        val introducer = store.getContact(request.ticket.introducerUserId) ?: run {
+            Log.w(TAG, "Dropping introduced friend request: introducer is no longer a contact")
+            return
+        }
+        val valid = try {
+            verifyIntroductionTicket(
+                request.ticket,
+                introducer.signPk,
+                identity.userId,
+                senderUserId,
+                FriendsOfFriendsStore.revision(this),
+                System.currentTimeMillis(),
+            )
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping introduced friend request: ${e.message}")
+            return
+        }
+        if (!valid) {
+            Log.w(TAG, "Dropping introduced friend request: ticket validation failed")
+            return
+        }
+
+        val wasKnown = store.getContact(senderUserId) != null
+        val contact = RelayImport.reconcileOnImport(
+            this,
+            store,
+            Contact(
+                userId = senderUserId,
+                name = card.name,
+                signPk = card.signPk,
+                agreePk = card.agreePk,
+                relayUrl = card.relayUrl,
+                relayToken = card.relayToken,
+            ),
+        )
+        store.upsertContact(contact)
+        store.upsertContactProvenance(
+            ContactProvenance(
+                userId = senderUserId,
+                source = 1u,
+                introducerUserId = introducer.userId,
+                introducedAtMs = System.currentTimeMillis(),
+            ),
+        )
+        store.removeFriendSuggestion(senderUserId)
+        store.insertMessage(
+            StoredMessage(
+                chatId = senderUserId,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_INTRODUCED_FRIEND_REQUEST,
+                payload = body.content,
+            ),
+        )
+        acknowledgeHiddenMessage(address, senderUserId, identity, contact)
+        FriendRequestSender.queueForScannedContact(this, store, identity, contact)
+        ProfileSyncSender.queueToContact(
+            this,
+            store,
+            identity,
+            contact,
+            ProfileStore.loadOwnAvatarEpoch(this),
+        )
+        if (!wasKnown) FriendDirectorySender.queueToAllContacts(this, store, identity)
+        ChatEvents.notifyChatChanged(senderUserId)
+        if (!wasKnown) {
+            FriendImportEvents.notifyImported(contact, directBle)
+            MessageNotifier.notifyFriendAdded(this, contact)
+        }
+    }
+
+    private fun acknowledgeHiddenMessage(
+        address: String,
+        senderUserId: ByteArray,
+        identity: Identity,
+        contact: Contact,
+    ) {
+        val throughLamport = store.highestLamport(senderUserId, senderUserId)
+        store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
+        val queued = queueOutgoingReceiptForRelay(
+            identity = identity,
+            contact = contact,
+            receiptType = RECEIPT_TYPE_DELIVERED,
+            ackedSenderUserId = senderUserId,
+            throughLamport = throughLamport,
+        )
+        if (queued) RelaySyncEvents.requestSync()
+        sendReceiptOnAddress(
+            identity,
+            contact,
+            address,
+            RECEIPT_TYPE_DELIVERED,
+            senderUserId,
+            throughLamport,
+        )
     }
 
     /**
