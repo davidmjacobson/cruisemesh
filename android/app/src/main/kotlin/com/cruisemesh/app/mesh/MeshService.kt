@@ -2333,7 +2333,6 @@ class MeshService : Service() {
             ProfileStore.loadOwnAvatarEpoch(this),
         )
         if (!wasKnown) FriendDirectorySender.queueToAllContacts(this, store, identity)
-        FriendDirectorySender.queueToAllContacts(this, store, identity)
         ChatEvents.notifyChatChanged(senderUserId)
         if (!wasKnown) {
             FriendImportEvents.notifyImported(contact, directBle)
