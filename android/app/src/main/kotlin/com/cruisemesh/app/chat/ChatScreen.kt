@@ -1208,8 +1208,10 @@ private fun messageArrivalText(arrival: MessageArrival): String {
         2 -> "relay"
         else -> "unknown route"
     }
+    // hopsTaken is inferred from the default hop TTL, so a sender that
+    // authored with a non-default TTL skews it — present it as an estimate.
     val hops = arrival.hopsTaken.toInt()
-    val hopLabel = "$hops ${if (hops == 1) "hop" else "hops"}"
+    val hopLabel = "~$hops ${if (hops == 1) "hop" else "hops"}"
     val receivedAt = java.text.SimpleDateFormat(
         "h:mm a",
         java.util.Locale.getDefault(),
