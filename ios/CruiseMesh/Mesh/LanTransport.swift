@@ -361,25 +361,25 @@ final class LanTransport {
         var completed = false
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let self, let connection else { return }
-            queue.async {
-                guard !completed, scanGeneration == generation else { return }
+            queue.async { [weak self] in
+                guard let self, !completed, self.scanGeneration == generation else { return }
                 switch state {
                 case .ready:
                     completed = true
                     connection.cancel()
-                    scanConnections.removeValue(forKey: id)
-                    diagnostics.discovered("\(host):\(lanDefaultTcpPort())")
+                    self.scanConnections.removeValue(forKey: id)
+                    self.diagnostics.discovered("\(host):\(lanDefaultTcpPort())")
                     let key = "scan:\(host):\(lanDefaultTcpPort())"
-                    discoveredEndpoints[key] = endpoint
-                    connect(to: endpoint, serviceKey: key)
-                    diagnostics.scanAdvanced()
-                    startNextScanCandidate(generation: generation)
+                    self.discoveredEndpoints[key] = endpoint
+                    self.connect(to: endpoint, serviceKey: key)
+                    self.diagnostics.scanAdvanced()
+                    self.startNextScanCandidate(generation: generation)
                 case .failed, .cancelled:
                     completed = true
                     connection.cancel()
-                    scanConnections.removeValue(forKey: id)
-                    diagnostics.scanAdvanced()
-                    startNextScanCandidate(generation: generation)
+                    self.scanConnections.removeValue(forKey: id)
+                    self.diagnostics.scanAdvanced()
+                    self.startNextScanCandidate(generation: generation)
                 default:
                     break
                 }

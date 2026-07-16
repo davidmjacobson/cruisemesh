@@ -49,9 +49,10 @@ xcodebuild -create-xcframework \
     -headers "$gen_dir" \
     -output "$xcframework_out"
 
-# UniFFI Swift expects the C headers via a module map next to the generated Swift.
-# Copy modulemap into place for local SPM-style imports if needed.
-cp "$gen_dir/cruisemesh_coreFFI.modulemap" "$gen_dir/module.modulemap" 2>/dev/null || true
+# Xcode consumes the module map packaged inside the XCFramework. A second
+# generic `module.modulemap` beside the Swift source makes modern Xcode define
+# `cruisemesh_coreFFI` twice during dependency scanning.
+rm -f "$gen_dir/module.modulemap"
 
 echo "==> Done."
 echo "    Swift sources:  $gen_dir"
