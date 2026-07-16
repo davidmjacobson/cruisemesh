@@ -6,6 +6,7 @@ import android.net.Network
 import android.net.wifi.WifiInfo
 import android.util.Base64
 import com.cruisemesh.app.chat.UserIdHex
+import java.net.Inet4Address
 import java.security.MessageDigest
 
 internal class LanEndpointCache(context: Context) {
@@ -64,8 +65,9 @@ internal class LanEndpointCache(context: Context) {
 
 /**
  * Best-effort, permission-free network fingerprint. SSID is used when the OS
- * exposes it; otherwise DNS/domain topology provides a weaker fallback. Only
- * a truncated hash is persisted, never the raw network name.
+ * exposes it. The IPv4 /24 is the canonical cross-platform input so Android
+ * and iOS derive the same identifier without requiring SSID permission. DNS
+ * topology is a weaker fallback. Only a truncated hash is persisted.
  */
 internal fun lanNetworkId(
     connectivityManager: ConnectivityManager,
@@ -77,6 +79,10 @@ internal fun lanNetworkId(
     val ssid = wifiInfo?.ssid
         ?.takeUnless { it == "<unknown ssid>" || it.isBlank() }
     val link = connectivityManager.getLinkProperties(network)
+    val ipv4 = link?.linkAddresses
+        ?.mapNotNull { it.address as? Inet4Address }
+        ?.firstOrNull()
+    ipv4?.hostAddress?.let { return lanNetworkIdForIpv4(it) }
     val topology = buildList {
         ssid?.let { add("ssid:$it") }
         link?.dnsServers
@@ -88,6 +94,16 @@ internal fun lanNetworkId(
     if (topology.isEmpty()) return null
     val digest = MessageDigest.getInstance("SHA-256")
         .digest(("CruiseMesh LAN network v1\u0000" + topology.joinToString("|")).toByteArray())
+        .copyOf(16)
+    return Base64.encodeToString(digest, Base64.NO_WRAP or Base64.URL_SAFE)
+}
+
+internal fun lanNetworkIdForIpv4(address: String): String? {
+    val octets = address.split('.').mapNotNull { it.toIntOrNull() }
+    if (octets.size != 4 || octets.any { it !in 0..255 }) return null
+    val prefix = "${octets[0]}.${octets[1]}.${octets[2]}.0/24"
+    val digest = MessageDigest.getInstance("SHA-256")
+        .digest("CruiseMesh LAN network v1\u0000ipv4:$prefix".toByteArray())
         .copyOf(16)
     return Base64.encodeToString(digest, Base64.NO_WRAP or Base64.URL_SAFE)
 }

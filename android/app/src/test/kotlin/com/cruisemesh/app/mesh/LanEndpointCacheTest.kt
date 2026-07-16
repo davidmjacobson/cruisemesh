@@ -16,4 +16,13 @@ class LanEndpointCacheTest {
         assertNull(parseLanManualEndpoint("10.0.0.2:0", 45_892))
         assertNull(parseLanManualEndpoint("bad host", 45_892))
     }
+
+    @Test
+    fun networkFingerprintUsesTheSharedIpv4Slash24() {
+        assertEquals(
+            lanNetworkIdForIpv4("10.154.189.58"),
+            lanNetworkIdForIpv4("10.154.189.201"),
+        )
+        assertNull(lanNetworkIdForIpv4("not-an-ip"))
+    }
 }
