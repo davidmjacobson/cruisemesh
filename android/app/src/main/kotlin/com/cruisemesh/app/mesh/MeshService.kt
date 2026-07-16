@@ -1127,12 +1127,16 @@ class MeshService : Service() {
             Log.w(TAG, "Authenticated LAN link could not be registered")
             return
         }
+        val peerName = store.getContact(userId)?.name ?: "Accepted friend"
+        LanTransportDiagnostics.authenticated(address, peerName)
+        Log.i(TAG, "Secure LAN link active with $peerName")
         sendHello(address)
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
     }
 
     private fun onLanPeerDisconnected(address: String) {
         MeshRouter.onDisconnected(address)
+        LanTransportDiagnostics.disconnected(address)
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
     }
 

@@ -1,6 +1,9 @@
 package com.cruisemesh.app.ui
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -27,12 +30,14 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,8 +55,10 @@ import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.mesh.MeshStartupPreferences
+import com.cruisemesh.app.mesh.LanTransportDiagnostics
 import com.cruisemesh.app.relay.RelayConfigStore
 import android.widget.Toast
+import uniffi.cruisemesh_core.lanDefaultTcpPort
 
 /** Hosted privacy policy (Play Console + in-app link). */
 const val PRIVACY_POLICY_URL = "https://cruisemesh.app/privacy"
@@ -77,6 +84,8 @@ fun ProfileScreen(
     var shareOnline by remember { mutableStateOf(RelayConfigStore.shareOnline(context)) }
     var friendsOfFriends by remember { mutableStateOf(FriendsOfFriendsStore.isEnabled(context)) }
     var startAutomatically by remember { mutableStateOf(MeshStartupPreferences.isAutoStartEnabled(context)) }
+    var friendLanAddress by remember { mutableStateOf("") }
+    val lanStatus by LanTransportDiagnostics.state.collectAsState()
     fun bumpAndSync() {
         onProfileChanged(ProfileStore.bumpOwnAvatarEpoch(context))
     }
@@ -231,6 +240,89 @@ fun ProfileScreen(
                         Text("Start mesh")
                     }
                 }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            ProfileSection(title = "Local Wi-Fi (experimental)") {
+                Text(
+                    lanStatus.state,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                lanStatus.localEndpoint?.let { endpoint ->
+                    Text(
+                        "This phone: $endpoint",
+                        style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                    TextButton(
+                        onClick = {
+                            val clipboard =
+                                context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(
+                                ClipData.newPlainText("CruiseMesh LAN address", endpoint),
+                            )
+                            Toast.makeText(context, "Local address copied", Toast.LENGTH_SHORT).show()
+                        },
+                    ) {
+                        Text("Copy this phone's address")
+                    }
+                }
+                if (lanStatus.activePeerNames.isNotEmpty()) {
+                    Text(
+                        "Secure link: ${lanStatus.activePeerNames.joinToString()}",
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+                lanStatus.lastPeerEndpoint?.let {
+                    Text(
+                        "Last peer: $it",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+                lanStatus.lastError?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+                OutlinedTextField(
+                    value = friendLanAddress,
+                    onValueChange = { friendLanAddress = it },
+                    label = { Text("Friend IP address") },
+                    placeholder = { Text("10.0.0.42:45892") },
+                    supportingText = { Text("The port is optional.") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                )
+                Button(
+                    onClick = {
+                        val error = LanTransportDiagnostics.requestManualConnection(
+                            friendLanAddress,
+                            lanDefaultTcpPort().toInt(),
+                        )
+                        if (error != null) {
+                            Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+                        }
+                    },
+                    enabled = friendLanAddress.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Connect securely")
+                }
+                Text(
+                    "Manual connection only opens a TCP path. The other phone must already be an accepted friend and pass CruiseMesh's encrypted identity check.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
             }
 
             Spacer(modifier = Modifier.height(16.dp))

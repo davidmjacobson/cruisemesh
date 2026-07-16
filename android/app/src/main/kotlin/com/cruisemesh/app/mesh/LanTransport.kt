@@ -5,8 +5,10 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.nsd.DiscoveryRequest
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -15,6 +17,8 @@ import java.io.DataOutputStream
 import java.io.EOFException
 import java.io.IOException
 import java.net.BindException
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -79,12 +83,15 @@ internal class LanTransport(
     private var resolving = false
     private val pendingServices = ArrayDeque<NsdServiceInfo>()
     private val queuedServiceNames = mutableSetOf<String>()
+    private val eligibleWifiNetworks = linkedSetOf<Network>()
     private val instanceToken = ByteArray(8).also(secureRandom::nextBytes).toHex()
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             mainHandler.post {
-                if (!started || wifiNetwork == network) return@post
+                if (!started || !isEligibleWifiNetwork(network)) return@post
+                eligibleWifiNetworks += network
+                if (wifiNetwork != null) return@post
                 wifiNetwork = network
                 restartNetworkSession(network)
             }
@@ -92,9 +99,14 @@ internal class LanTransport(
 
         override fun onLost(network: Network) {
             mainHandler.post {
+                eligibleWifiNetworks -= network
                 if (wifiNetwork != network) return@post
                 wifiNetwork = null
                 teardownNetworkSession()
+                eligibleWifiNetworks.firstOrNull()?.let { replacement ->
+                    wifiNetwork = replacement
+                    restartNetworkSession(replacement)
+                }
             }
         }
     }
@@ -109,6 +121,9 @@ internal class LanTransport(
         try {
             connectivityManager.registerNetworkCallback(request, networkCallback)
             networkCallbackRegistered = true
+            LanTransportDiagnostics.registerManualConnector { endpoint ->
+                mainHandler.post { connectManually(endpoint) }
+            }
         } catch (error: RuntimeException) {
             Log.w(TAG, "Unable to monitor Wi-Fi for LAN transport", error)
         }
@@ -118,6 +133,7 @@ internal class LanTransport(
         check(Looper.myLooper() == Looper.getMainLooper())
         if (!started) return
         started = false
+        LanTransportDiagnostics.unregisterManualConnector()
         teardownNetworkSession()
         mainHandler.removeCallbacksAndMessages(null)
         if (networkCallbackRegistered) {
@@ -129,6 +145,7 @@ internal class LanTransport(
             networkCallbackRegistered = false
         }
         wifiNetwork = null
+        eligibleWifiNetworks.clear()
         acceptExecutor.shutdownNow()
         connectionExecutor.shutdownNow()
         writeExecutor.shutdownNow()
@@ -170,6 +187,9 @@ internal class LanTransport(
             port = listener.localPort
             setAttribute(TXT_VERSION, "1")
             setAttribute(TXT_INSTANCE, instanceToken)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                setNetwork(network)
+            }
         }
         val registration = makeRegistrationListener()
         registrationListener = registration
@@ -182,10 +202,26 @@ internal class LanTransport(
         val discovery = makeDiscoveryListener()
         discoveryListener = discovery
         try {
-            nsdManager.discoverServices(lanServiceType(), NsdManager.PROTOCOL_DNS_SD, discovery)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val request = DiscoveryRequest.Builder(lanServiceType())
+                    .setNetwork(network)
+                    .build()
+                nsdManager.discoverServices(request, appContext.mainExecutor, discovery)
+            } else {
+                @Suppress("DEPRECATION")
+                nsdManager.discoverServices(
+                    lanServiceType(),
+                    NsdManager.PROTOCOL_DNS_SD,
+                    discovery,
+                )
+            }
         } catch (error: RuntimeException) {
             Log.w(TAG, "Unable to discover LAN peers", error)
         }
+
+        val localEndpoint = localEndpoint(network, listener.localPort)
+        LanTransportDiagnostics.listening(localEndpoint)
+        Log.i(TAG, "LAN session ready on ${localEndpoint ?: "the selected Wi-Fi network"}")
     }
 
     private fun openListener(): ServerSocket? {
@@ -229,8 +265,52 @@ internal class LanTransport(
 
     private fun connectToService(serviceInfo: NsdServiceInfo) {
         val network = wifiNetwork ?: return
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            serviceInfo.network != null &&
+            serviceInfo.network != network
+        ) {
+            Log.d(TAG, "Ignoring LAN service resolved on a different network")
+            return
+        }
         val key = serviceInfo.serviceName
         resolvedServices[key] = serviceInfo
+        val endpoints = resolvedHosts(serviceInfo).map { InetSocketAddress(it, serviceInfo.port) }
+        if (endpoints.isEmpty()) {
+            LanTransportDiagnostics.connectionFailed(
+                serviceInfo.serviceName,
+                "Peer discovery returned no usable address",
+            )
+            return
+        }
+        LanTransportDiagnostics.discovered(endpointDisplay(endpoints.first()))
+        Log.d(TAG, "Resolved CruiseMesh LAN peer at ${endpointDisplay(endpoints.first())}")
+        connectToEndpoints(network, key, endpoints)
+    }
+
+    private fun connectManually(endpoint: LanManualEndpoint) {
+        if (!started) return
+        val network = wifiNetwork
+        if (network == null) {
+            LanTransportDiagnostics.connectionFailed(
+                endpoint.display,
+                "This phone is not connected to Wi-Fi",
+            )
+            return
+        }
+        Log.i(TAG, "Manual LAN connection requested to ${endpoint.display}")
+        connectToEndpoints(
+            network = network,
+            key = "manual:${endpoint.display}",
+            endpoints = listOf(InetSocketAddress(endpoint.host, endpoint.port)),
+        )
+    }
+
+    private fun connectToEndpoints(
+        network: Network,
+        key: String,
+        endpoints: List<InetSocketAddress>,
+    ) {
         if (!outboundServiceKeys.add(key)) return
         if (!tryAcquireSocketSlot()) {
             outboundServiceKeys.remove(key)
@@ -239,17 +319,30 @@ internal class LanTransport(
         }
         try {
             connectionExecutor.execute {
-                val socket = try {
-                    network.socketFactory.createSocket().apply {
-                        tcpNoDelay = true
-                        keepAlive = true
-                        connect(
-                            InetSocketAddress(resolvedHost(serviceInfo), serviceInfo.port),
-                            CONNECT_TIMEOUT_MS,
-                        )
+                var socket: Socket? = null
+                var lastError: Exception? = null
+                for (endpoint in endpoints) {
+                    LanTransportDiagnostics.connecting(endpointDisplay(endpoint))
+                    try {
+                        socket = network.socketFactory.createSocket().apply {
+                            tcpNoDelay = true
+                            keepAlive = true
+                            connect(endpoint, CONNECT_TIMEOUT_MS)
+                        }
+                        break
+                    } catch (error: Exception) {
+                        lastError = error
+                        socket?.closeQuietly()
+                        socket = null
                     }
-                } catch (error: Exception) {
-                    Log.d(TAG, "LAN peer connection attempt failed", error)
+                }
+                if (socket == null) {
+                    val endpoint = endpoints.firstOrNull()?.let(::endpointDisplay) ?: key
+                    Log.d(TAG, "LAN peer connection attempt failed", lastError)
+                    LanTransportDiagnostics.connectionFailed(
+                        endpoint,
+                        lastError?.message ?: "Connection timed out",
+                    )
                     outboundServiceKeys.remove(key)
                     releaseSocketSlot()
                     scheduleReconnect(key)
@@ -281,9 +374,11 @@ internal class LanTransport(
         outboundServiceKey: String?,
     ) {
         sockets += socket
+        val peerEndpoint = socket.remoteSocketAddress?.toString()?.removePrefix("/") ?: "peer"
         var address: String? = null
         var connection: LanConnection? = null
         var noise: LanNoiseSession? = null
+        var authenticated = false
         try {
             socket.tcpNoDelay = true
             socket.keepAlive = true
@@ -320,6 +415,7 @@ internal class LanTransport(
             connection = LanConnection(address, socket, output, session)
             connections[address] = connection
             onAuthenticated(address, trustedUserId)
+            authenticated = true
             Log.i(TAG, "Authenticated CruiseMesh peer over local Wi-Fi")
 
             while (started && !socket.isClosed) {
@@ -331,12 +427,26 @@ internal class LanTransport(
             // Normal peer disconnect.
         } catch (_: SocketTimeoutException) {
             Log.d(TAG, "LAN connection timed out during setup")
+            LanTransportDiagnostics.connectionFailed(peerEndpoint, "Secure setup timed out")
         } catch (error: CoreException) {
             Log.w(TAG, "LAN cryptographic session failed", error)
+            LanTransportDiagnostics.connectionFailed(peerEndpoint, "Secure setup failed")
         } catch (error: IOException) {
             Log.d(TAG, "LAN connection closed: ${error.message}")
+            if (!authenticated) {
+                LanTransportDiagnostics.connectionFailed(
+                    peerEndpoint,
+                    error.message ?: "Secure connection closed",
+                )
+            }
         } catch (error: RuntimeException) {
             Log.w(TAG, "LAN connection failed", error)
+            if (!authenticated) {
+                LanTransportDiagnostics.connectionFailed(
+                    peerEndpoint,
+                    error.message ?: "Connection failed",
+                )
+            }
         } finally {
             connection?.markClosed()
             if (connection == null) noise?.close()
@@ -445,7 +555,12 @@ internal class LanTransport(
                         token != null &&
                         shouldInitiateLanConnection(instanceToken, token) &&
                         version == "1" &&
-                        serviceInfo.port in 1..65_535
+                        serviceInfo.port in 1..65_535 &&
+                        (
+                            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                                serviceInfo.network == null ||
+                                serviceInfo.network == wifiNetwork
+                            )
                     ) {
                         connectToService(serviceInfo)
                     }
@@ -481,6 +596,7 @@ internal class LanTransport(
         serverSocket = null
         sockets.toList().forEach(Socket::closeQuietly)
         connections.clear()
+        LanTransportDiagnostics.waitingForWifi()
     }
 
     private fun stopDiscovery(listener: NsdManager.DiscoveryListener) {
@@ -509,6 +625,43 @@ internal class LanTransport(
 
     private fun releaseSocketSlot() {
         activeSocketCount.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+    }
+
+    private fun localEndpoint(network: Network, port: Int): String? {
+        val addresses = connectivityManager.getLinkProperties(network)
+            ?.linkAddresses
+            ?.map { it.address }
+            ?.filterNot { it.isAnyLocalAddress || it.isLoopbackAddress }
+            .orEmpty()
+        val address = addresses.firstOrNull { it is Inet4Address } ?: addresses.firstOrNull()
+        return address?.let { endpointDisplay(InetSocketAddress(it, port)) }
+    }
+
+    private fun isEligibleWifiNetwork(network: Network): Boolean {
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+        if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return false
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_WIFI_P2P)
+        ) {
+            return false
+        }
+        val interfaceName = connectivityManager.getLinkProperties(network)?.interfaceName.orEmpty()
+        return !interfaceName.startsWith("p2p", ignoreCase = true)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun resolvedHosts(serviceInfo: NsdServiceInfo): List<InetAddress> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            serviceInfo.hostAddresses
+        } else {
+            listOfNotNull(serviceInfo.host)
+        }
+    }
+
+    private fun endpointDisplay(endpoint: InetSocketAddress): String {
+        val host = endpoint.address?.hostAddress ?: endpoint.hostString
+        return if (host.contains(':')) "[$host]:${endpoint.port}" else "$host:${endpoint.port}"
     }
 
     private inner class LanConnection(
@@ -579,9 +732,6 @@ internal fun sameLanServiceType(value: String): Boolean =
  */
 internal fun shouldInitiateLanConnection(localToken: String, remoteToken: String): Boolean =
     localToken != remoteToken && localToken < remoteToken
-
-@Suppress("DEPRECATION")
-private fun resolvedHost(serviceInfo: NsdServiceInfo) = serviceInfo.host
 
 private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 

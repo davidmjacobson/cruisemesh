@@ -50,4 +50,28 @@ class LanTransportTest {
         )
         assertNull(trustedLanPeerUserId(listOf(alice, bob), ByteArray(32) { 9 }))
     }
+
+    @Test
+    fun `manual endpoint accepts an address with the default or explicit port`() {
+        assertEquals(
+            LanManualEndpoint("10.154.189.58", 45_892),
+            parseLanManualEndpoint("10.154.189.58", 45_892),
+        )
+        assertEquals(
+            LanManualEndpoint("10.154.189.58", 46_000),
+            parseLanManualEndpoint("10.154.189.58:46000", 45_892),
+        )
+        assertEquals(
+            LanManualEndpoint("fe80::1234", 45_892),
+            parseLanManualEndpoint("[fe80::1234]", 45_892),
+        )
+    }
+
+    @Test
+    fun `manual endpoint rejects malformed or out-of-range ports`() {
+        assertNull(parseLanManualEndpoint("", 45_892))
+        assertNull(parseLanManualEndpoint("10.0.0.2:", 45_892))
+        assertNull(parseLanManualEndpoint("10.0.0.2:not-a-port", 45_892))
+        assertNull(parseLanManualEndpoint("10.0.0.2:70000", 45_892))
+    }
 }
