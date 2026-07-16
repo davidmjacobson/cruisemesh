@@ -1,6 +1,9 @@
 package com.cruisemesh.app.ui
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -8,6 +11,7 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -20,6 +24,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -27,12 +32,14 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,10 +55,15 @@ import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.friending.FriendsOfFriendsStore
+import com.cruisemesh.app.friending.encodeQrBitmap
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.mesh.MeshStartupPreferences
+import com.cruisemesh.app.mesh.LanTransportDiagnostics
+import com.cruisemesh.app.mesh.lanEndpointLink
+import com.cruisemesh.app.mesh.parseLanManualEndpoint
 import com.cruisemesh.app.relay.RelayConfigStore
 import android.widget.Toast
+import uniffi.cruisemesh_core.lanDefaultTcpPort
 
 /** Hosted privacy policy (Play Console + in-app link). */
 const val PRIVACY_POLICY_URL = "https://cruisemesh.app/privacy"
@@ -77,6 +89,9 @@ fun ProfileScreen(
     var shareOnline by remember { mutableStateOf(RelayConfigStore.shareOnline(context)) }
     var friendsOfFriends by remember { mutableStateOf(FriendsOfFriendsStore.isEnabled(context)) }
     var startAutomatically by remember { mutableStateOf(MeshStartupPreferences.isAutoStartEnabled(context)) }
+    var friendLanAddress by remember { mutableStateOf("") }
+    var showLanQrEndpoint by remember { mutableStateOf<com.cruisemesh.app.mesh.LanManualEndpoint?>(null) }
+    val lanStatus by LanTransportDiagnostics.state.collectAsState()
     fun bumpAndSync() {
         onProfileChanged(ProfileStore.bumpOwnAvatarEpoch(context))
     }
@@ -235,6 +250,156 @@ fun ProfileScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
+            ProfileSection(title = "Local Wi-Fi (experimental)") {
+                Text(
+                    lanStatus.state,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                lanStatus.localEndpoint?.let { endpoint ->
+                    Text(
+                        "This phone: $endpoint",
+                        style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                    TextButton(
+                        onClick = {
+                            val clipboard =
+                                context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(
+                                ClipData.newPlainText("CruiseMesh LAN address", endpoint),
+                            )
+                            Toast.makeText(context, "Local address copied", Toast.LENGTH_SHORT).show()
+                        },
+                    ) {
+                        Text("Copy this phone's address")
+                    }
+                    TextButton(
+                        onClick = {
+                            showLanQrEndpoint = parseLanManualEndpoint(
+                                endpoint,
+                                lanDefaultTcpPort().toInt(),
+                            )
+                        },
+                    ) {
+                        Text("Show address QR")
+                    }
+                }
+                if (lanStatus.activePeerNames.isNotEmpty()) {
+                    Text(
+                        "Secure link: ${lanStatus.activePeerNames.joinToString()}",
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                    Button(
+                        onClick = {
+                            val error = LanTransportDiagnostics.requestConnectionTest()
+                            if (error != null) {
+                                Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                    ) {
+                        Text("Test encrypted LAN link")
+                    }
+                }
+                lanStatus.probeStatus?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+                if (lanStatus.sentFrames > 0 || lanStatus.receivedFrames > 0) {
+                    Text(
+                        "LAN frames: ${lanStatus.sentFrames} sent · ${lanStatus.receivedFrames} received",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+                lanStatus.lastPeerEndpoint?.let {
+                    Text(
+                        "Last peer: $it",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+                lanStatus.lastError?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+                OutlinedTextField(
+                    value = friendLanAddress,
+                    onValueChange = { friendLanAddress = it },
+                    label = { Text("Friend IP address") },
+                    placeholder = { Text("10.0.0.42:45892") },
+                    supportingText = { Text("The port is optional.") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                )
+                Button(
+                    onClick = {
+                        val error = LanTransportDiagnostics.requestManualConnection(
+                            friendLanAddress,
+                            lanDefaultTcpPort().toInt(),
+                        )
+                        if (error != null) {
+                            Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+                        }
+                    },
+                    enabled = friendLanAddress.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Connect securely")
+                }
+                Text(
+                    "Manual connection only opens a TCP path. The other phone must already be an accepted friend and pass CruiseMesh's encrypted identity check.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Button(
+                    onClick = {
+                        val error = LanTransportDiagnostics.requestSubnetScan()
+                        if (error != null) {
+                            Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+                        }
+                    },
+                    enabled = lanStatus.scanTotal == null,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                ) {
+                    Text("Search this /24 network")
+                }
+                if (lanStatus.scanTotal != null) {
+                    Text(
+                        "Checked ${lanStatus.scanProgress ?: 0} of ${lanStatus.scanTotal} addresses",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+                Text(
+                    "Subnet search is user-triggered, probes only TCP 45892 with low concurrency, and never expands to a /16.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
             ProfileSection(title = "Startup") {
                 Row(
                     modifier = Modifier
@@ -357,6 +522,34 @@ fun ProfileScreen(
                 }
             }
         }
+    }
+
+    showLanQrEndpoint?.let { endpoint ->
+        val link = remember(endpoint) { lanEndpointLink(endpoint) }
+        val qr = remember(link) { encodeQrBitmap(link) }
+        AlertDialog(
+            onDismissRequest = { showLanQrEndpoint = null },
+            title = { Text("CruiseMesh LAN address") },
+            text = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Image(
+                        bitmap = qr,
+                        contentDescription = "CruiseMesh LAN address QR code",
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text(
+                        "Scan with the other phone's camera to open CruiseMesh and connect securely.",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showLanQrEndpoint = null }) {
+                    Text("Done")
+                }
+            },
+        )
     }
 }
 

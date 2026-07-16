@@ -74,6 +74,7 @@ import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.mesh.ChatViewEvents
 import com.cruisemesh.app.mesh.ContactReachability
+import com.cruisemesh.app.mesh.LanTransportDiagnostics
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
@@ -81,6 +82,8 @@ import com.cruisemesh.app.mesh.MeshService
 import com.cruisemesh.app.mesh.MeshStartupPreferences
 import com.cruisemesh.app.mesh.ReachabilityLevel
 import com.cruisemesh.app.mesh.RelayHealth
+import com.cruisemesh.app.mesh.parseLanEndpointLink
+import com.cruisemesh.app.mesh.parseLanManualEndpoint
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
 import com.cruisemesh.app.relay.RelayImport
@@ -105,6 +108,7 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.parseFriendText
+import uniffi.cruisemesh_core.lanDefaultTcpPort
 
 private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
@@ -115,6 +119,7 @@ data class PendingDeepLink(
     val idHex: String = "",
     val isGroup: Boolean = false,
     val friendToken: String? = null,
+    val lanEndpoint: String? = null,
 )
 
 class MainActivity : ComponentActivity() {
@@ -160,6 +165,14 @@ class MainActivity : ComponentActivity() {
         ) {
             val token = uri.fragment?.let(::extractFriendToken)?.takeIf { it.startsWith("CMFRIEND1:") }
             if (token != null) return PendingDeepLink(friendToken = token)
+        }
+        if (
+            uri.scheme == "https" &&
+            uri.host == "cruisemesh.app" &&
+            (uri.path == "/lan" || uri.path == "/lan/")
+        ) {
+            val endpoint = parseLanEndpointLink(uri.fragment)
+            if (endpoint != null) return PendingDeepLink(lanEndpoint = endpoint.display)
         }
         return null
     }
@@ -223,6 +236,18 @@ fun CruiseMeshApp(
     LaunchedEffect(pendingDeepLink, onboardingCompleted) {
         val link = pendingDeepLink ?: return@LaunchedEffect
         if (!onboardingCompleted) return@LaunchedEffect
+        link.lanEndpoint?.let { endpointText ->
+            val endpoint = parseLanManualEndpoint(endpointText, lanDefaultTcpPort().toInt())
+            if (endpoint != null) {
+                LanTransportDiagnostics.queueManualConnection(endpoint)
+                if (MeshRuntimeStatus.state.value == MeshRuntimeState.STOPPED) {
+                    startMesh(context)
+                }
+                navController.navigate("profile") { launchSingleTop = true }
+            }
+            onPendingDeepLinkConsumed()
+            return@LaunchedEffect
+        }
         val route = link.friendToken?.let { "addFriend?token=${Uri.encode(it)}" }
             ?: if (link.isGroup) "group/${link.idHex}" else "chat/${link.idHex}"
         navController.navigate(route) {

@@ -2,6 +2,7 @@ package com.cruisemesh.app.mesh
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MeshRouterStateTest {
@@ -69,6 +70,71 @@ class MeshRouterStateTest {
     }
 
     @Test
+    fun `LAN is preferred when the same peer is also reachable over BLE`() {
+        val state = MeshRouterState()
+        val alice = userId(1)
+        state.onConnected("BLE", MeshRouterState.Transport.CENTRAL)
+        state.onHello("BLE", alice)
+        state.onConnected("LAN", MeshRouterState.Transport.LAN)
+        state.onHello("LAN", alice)
+
+        assertEquals(MeshRouterState.Transport.LAN to "LAN", state.routeFor(alice))
+
+        state.onDisconnected("LAN")
+        assertEquals(MeshRouterState.Transport.CENTRAL to "BLE", state.routeFor(alice))
+    }
+
+    @Test
+    fun `small frames race over LAN and one BLE route while large frames prefer LAN`() {
+        val routes = listOf(
+            MeshRouterState.Transport.LAN to "LAN",
+            MeshRouterState.Transport.CENTRAL to "BLE-1",
+            MeshRouterState.Transport.PERIPHERAL to "BLE-2",
+        )
+
+        assertEquals(
+            listOf(
+                MeshRouterState.Transport.LAN to "LAN",
+                MeshRouterState.Transport.CENTRAL to "BLE-1",
+            ),
+            transportSendPlan(routes, frameSize = 512),
+        )
+        assertEquals(
+            listOf(MeshRouterState.Transport.LAN to "LAN"),
+            transportSendPlan(routes, frameSize = 64 * 1024),
+        )
+    }
+
+    @Test
+    fun `authenticated mapping cannot be replaced by a conflicting HELLO`() {
+        val state = MeshRouterState()
+        val alice = userId(1)
+        val mallory = userId(9)
+        state.onConnected("LAN", MeshRouterState.Transport.LAN)
+
+        assertTrue(state.onHello("LAN", alice))
+        assertTrue(!state.onHello("LAN", mallory))
+        assertEquals(alice.toList(), state.userIdFor("LAN")!!.toList())
+    }
+
+    @Test
+    fun `clearing BLE transports preserves a live LAN route`() {
+        val state = MeshRouterState()
+        state.onConnected("BLE", MeshRouterState.Transport.CENTRAL)
+        state.onConnected("LAN", MeshRouterState.Transport.LAN)
+
+        state.clearTransports(
+            setOf(
+                MeshRouterState.Transport.CENTRAL,
+                MeshRouterState.Transport.PERIPHERAL,
+            ),
+        )
+
+        assertNull(state.transportFor("BLE"))
+        assertEquals(MeshRouterState.Transport.LAN, state.transportFor("LAN"))
+    }
+
+    @Test
     fun `two different peers never get confused with each other`() {
         val state = MeshRouterState()
         val alice = userId(1)
@@ -118,6 +184,20 @@ class MeshRouterStateTest {
             listOf(MeshRouterState.Transport.PERIPHERAL to "CC:DD"),
             state.connectedRoutes(),
         )
+    }
+
+    @Test
+    fun `identifiedRoutes includes only links that completed HELLO`() {
+        val state = MeshRouterState()
+        val alice = userId(1)
+        state.onConnected("BLE", MeshRouterState.Transport.CENTRAL)
+        state.onHello("BLE", alice)
+        state.onConnected("UNKNOWN", MeshRouterState.Transport.PERIPHERAL)
+
+        val route = state.identifiedRoutes().single()
+        assertEquals(MeshRouterState.Transport.CENTRAL, route.transport)
+        assertEquals("BLE", route.address)
+        assertEquals(alice.toList(), route.userId.toList())
     }
 
     @Test

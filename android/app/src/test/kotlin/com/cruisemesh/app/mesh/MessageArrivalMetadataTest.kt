@@ -16,6 +16,26 @@ class MessageArrivalMetadataTest {
     }
 
     @Test
+    fun `LAN distinguishes direct sender from a LAN mule`() {
+        assertEquals(
+            ARRIVAL_TRANSPORT_LAN_DIRECT,
+            arrivalTransport(
+                fromRelay = false,
+                linkPeerMatchesSender = true,
+                linkTransport = MeshRouterState.Transport.LAN,
+            ),
+        )
+        assertEquals(
+            ARRIVAL_TRANSPORT_LAN_MULED,
+            arrivalTransport(
+                fromRelay = false,
+                linkPeerMatchesSender = false,
+                linkTransport = MeshRouterState.Transport.LAN,
+            ),
+        )
+    }
+
+    @Test
     fun `hop count is derived from the original budget and safely clamped`() {
         assertEquals(0u.toUByte(), arrivalHopsTaken(7u))
         assertEquals(2u.toUByte(), arrivalHopsTaken(5u))

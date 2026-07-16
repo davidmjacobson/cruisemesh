@@ -24,6 +24,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
+import java.util.concurrent.atomic.AtomicLong
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.AppStore
@@ -69,6 +70,7 @@ import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.decodeGroupInviteContent
 import uniffi.cruisemesh_core.decodeFriendDirectoryContent
 import uniffi.cruisemesh_core.decodeIntroducedFriendRequest
+import uniffi.cruisemesh_core.decodeLanEndpointContent
 import uniffi.cruisemesh_core.decodeExtendedMessageBody
 import uniffi.cruisemesh_core.decodeProfileSyncContent
 import uniffi.cruisemesh_core.decodeReceiptContent
@@ -76,8 +78,10 @@ import uniffi.cruisemesh_core.defaultExpiry
 import uniffi.cruisemesh_core.encodeDigest
 import uniffi.cruisemesh_core.encodeEnvelopeFrame
 import uniffi.cruisemesh_core.encodeHello
+import uniffi.cruisemesh_core.encodeLanEndpoint
 import uniffi.cruisemesh_core.encodeMessageBody
 import uniffi.cruisemesh_core.encodeReceiptContent
+import uniffi.cruisemesh_core.encodeTransportProbe
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.generateMsgId
 import uniffi.cruisemesh_core.openGroupMessage
@@ -92,6 +96,7 @@ private const val NOTIFICATION_CHANNEL_ID = "cruisemesh_mesh_status"
 private const val NOTIFICATION_ID = 1
 private const val OPEN_APP_REQUEST_CODE = 1001
 private const val STOP_SERVICE_REQUEST_CODE = 1002
+private const val LAN_HEALTH_INTERVAL_MS = 30_000L
 
 /** `kind` bytes from DESIGN.md §7.1. */
 private const val KIND_TEXT: UByte = 1u
@@ -101,6 +106,7 @@ private const val KIND_GROUP_INVITE: UByte = 4u
 private const val KIND_PROFILE_SYNC: UByte = 5u
 private const val KIND_FRIEND_DIRECTORY: UByte = 6u
 private const val KIND_INTRODUCED_FRIEND_REQUEST: UByte = 7u
+private const val KIND_LAN_ENDPOINT_HINT: UByte = 8u
 
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
@@ -211,6 +217,9 @@ class MeshService : Service() {
     private var bluetoothAudioReceiverRegistered = false
     private var bluetoothStateReceiverRegistered = false
     private var relayNetworkCallbackRegistered = false
+    private var lanTransport: LanTransport? = null
+    private val lanHealthTracker = LanHealthTracker()
+    private val lanProbeNonce = AtomicLong(System.nanoTime())
     /**
      * The network relay traffic is pinned to: the best network with validated
      * internet, as granted by [ConnectivityManager.requestNetwork]. The system
@@ -231,6 +240,7 @@ class MeshService : Service() {
     private val connectivityManager by lazy {
         getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     }
+    private val lanEndpointCache by lazy { LanEndpointCache(this) }
     private val a2dpAudioBackoff = A2dpAudioBackoff()
 
     private val peripheral by lazy {
@@ -304,6 +314,12 @@ class MeshService : Service() {
             relayMainHandler.postDelayed(this, RELAY_POLL_INTERVAL_MS)
         }
     }
+    private val lanHealthRunnable = object : Runnable {
+        override fun run() {
+            checkLanHealth()
+            relayMainHandler.postDelayed(this, LAN_HEALTH_INTERVAL_MS)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -363,8 +379,24 @@ class MeshService : Service() {
         store = AppStore.get(this)
         seedSeenIdsFromOwnHistory(loadedIdentity)
 
+        val lan = LanTransport(
+            context = applicationContext,
+            identity = loadedIdentity,
+            trustedPeerForStaticKey = { remoteStaticKey ->
+                trustedLanPeerUserId(store.listContacts(), remoteStaticKey)
+            },
+            onNetworkReady = ::onLanNetworkReady,
+            onEndpointObserved = { userId, endpoint, networkId ->
+                lanEndpointCache.save(networkId, userId, endpoint)
+            },
+            onAuthenticated = ::onLanPeerAuthenticated,
+            onDisconnected = ::onLanPeerDisconnected,
+            onFrameReceived = ::onFrameReceived,
+        )
+        lanTransport = lan
         MeshRouter.registerCentral(central::sendFrame)
         MeshRouter.registerPeripheral(peripheral::sendFrame)
+        MeshRouter.registerLan(lan::sendFrame)
         ChatViewEvents.register(::handleChatViewed)
         RelaySyncEvents.register { requestRelaySync("queue changed") }
 
@@ -374,6 +406,9 @@ class MeshService : Service() {
         registerBluetoothStateReceiver()
         registerRelayNetworkCallback()
         scheduleRelayPolling()
+        LanTransportDiagnostics.registerProbeRequester(::requestManualLanProbe)
+        scheduleLanHealth()
+        lan.start()
         // The mesh runs regardless of Bluetooth audio now (see
         // refreshBluetoothAudioStatus); start the roles unconditionally rather
         // than gating them on an audio-clear check. (startMeshRoles is a no-op
@@ -391,15 +426,21 @@ class MeshService : Service() {
 
     override fun onDestroy() {
         running = false
+        lanTransport?.stop()
+        lanTransport = null
         MeshRuntimeStatus.markStopped()
         unregisterBluetoothAudioReceiver()
         unregisterBluetoothStateReceiver()
         unregisterRelayNetworkCallback()
         cancelRelayPolling()
+        cancelLanHealth()
+        LanTransportDiagnostics.unregisterProbeRequester()
+        lanHealthTracker.clear()
         RelaySyncEvents.unregister()
         stopMeshRoles()
         MeshRouter.unregisterCentral()
         MeshRouter.unregisterPeripheral()
+        MeshRouter.unregisterLan()
         ChatViewEvents.unregister()
         // stop() above tears down connections without per-address disconnect
         // callbacks, so clear the router's mappings wholesale.
@@ -455,9 +496,10 @@ class MeshService : Service() {
         peripheral.stop()
         central.stop()
         meshRolesRunning = false
-        // stop() tears links down without per-address disconnect callbacks.
-        MeshRouter.reset()
-        MeshConnectivityStatus.setNearbyPeers(emptySet())
+        // BLE stop tears links down without per-address disconnect callbacks.
+        // Preserve authenticated LAN routes, which remain usable.
+        MeshRouter.resetBle()
+        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
         refreshRuntimeState()
         refreshForegroundNotification()
     }
@@ -625,6 +667,15 @@ class MeshService : Service() {
 
     private fun cancelRelayPolling() {
         relayMainHandler.removeCallbacks(relayPollRunnable)
+    }
+
+    private fun scheduleLanHealth() {
+        relayMainHandler.removeCallbacks(lanHealthRunnable)
+        relayMainHandler.postDelayed(lanHealthRunnable, LAN_HEALTH_INTERVAL_MS)
+    }
+
+    private fun cancelLanHealth() {
+        relayMainHandler.removeCallbacks(lanHealthRunnable)
     }
 
     private fun requestRelaySync(reason: String) {
@@ -1103,6 +1154,77 @@ class MeshService : Service() {
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
     }
 
+    private fun onLanPeerAuthenticated(
+        address: String,
+        userId: ByteArray,
+        endpoint: LanManualEndpoint?,
+        networkId: String?,
+    ) {
+        MeshRouter.onConnected(address, MeshRouterState.Transport.LAN)
+        if (!MeshRouter.onHello(address, userId)) {
+            Log.w(TAG, "Authenticated LAN link could not be registered")
+            return
+        }
+        val peerName = store.getContact(userId)?.name ?: "Accepted friend"
+        endpoint?.let { lanEndpointCache.save(networkId, userId, it) }
+        LanTransportDiagnostics.authenticated(address, peerName)
+        Log.i(TAG, "Secure LAN link active with $peerName")
+        sendHello(address)
+        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+    }
+
+    private fun onLanPeerDisconnected(address: String) {
+        MeshRouter.onDisconnected(address)
+        lanHealthTracker.remove(address)
+        LanTransportDiagnostics.disconnected(address)
+        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+    }
+
+    private fun onLanNetworkReady(hint: Frame.LanEndpoint, networkId: String?) {
+        val frame = encodeLanEndpointFrame(hint) ?: return
+        for (route in MeshRouter.identifiedRoutes()) {
+            if (route.transport == MeshRouterState.Transport.LAN) continue
+            if (store.getContact(route.userId) == null) continue
+            MeshRouter.sendToAddress(route.address, frame)
+        }
+        for (contact in store.listContacts()) {
+            lanEndpointCache.load(networkId, contact.userId)?.let { endpoint ->
+                lanTransport?.connectCached(endpoint, contact.userId)
+            }
+        }
+        val ownIdentity = identity
+        if (ownIdentity != null) {
+            LanEndpointSender.queueToAllCapableContacts(
+                this,
+                store,
+                ownIdentity,
+                hint,
+                networkId,
+            )
+        }
+    }
+
+    private fun encodeLanEndpointFrame(hint: Frame.LanEndpoint): ByteArray? =
+        try {
+            encodeLanEndpoint(hint.instanceToken, hint.host, hint.port)
+        } catch (error: CoreException) {
+            Log.w(TAG, "Unable to encode LAN endpoint hint: ${error.message}")
+            null
+        }
+
+    private fun sendLanEndpointHintTo(address: String) {
+        val transport = MeshRouter.transportFor(address)
+        if (
+            transport != MeshRouterState.Transport.CENTRAL &&
+            transport != MeshRouterState.Transport.PERIPHERAL
+        ) {
+            return
+        }
+        val hint = lanTransport?.currentEndpointHint() ?: return
+        val frame = encodeLanEndpointFrame(hint) ?: return
+        MeshRouter.sendToAddress(address, frame)
+    }
+
     /** Sends our HELLO (DESIGN.md §5.2) as the first frame on a link that just became usable. */
     private fun sendHello(address: String) {
         val ownUserId = identity?.userId ?: return
@@ -1124,8 +1246,111 @@ class MeshService : Service() {
             is Frame.Hello -> handleHello(address, parsed.userId, identity)
             is Frame.Envelope -> handleEnvelope(address, parsed, identity)
             is Frame.Digest -> handleDigest(address, parsed.chatId, parsed.entries, parsed.recentMsgIds, identity)
+            is Frame.LanEndpoint -> handleLanEndpointHint(address, parsed)
+            is Frame.TransportProbe -> handleTransportProbe(address, parsed)
         }
     }
+
+    private fun handleLanEndpointHint(address: String, hint: Frame.LanEndpoint) {
+        if (MeshRouter.transportFor(address) == MeshRouterState.Transport.LAN) return
+        val peerUserId = MeshRouter.userIdFor(address) ?: run {
+            Log.w(TAG, "Dropping LAN endpoint hint before HELLO from $address")
+            return
+        }
+        if (store.getContact(peerUserId) == null) {
+            Log.i(TAG, "Ignoring LAN endpoint hint from an unrecognized peer")
+            return
+        }
+        LanCapabilityStore.markSupported(this, peerUserId)
+        val localHint = lanTransport?.currentEndpointHint()
+        val networkId = lanTransport?.currentNetworkId()
+        val ownIdentity = identity
+        val contact = store.getContact(peerUserId)
+        if (
+            localHint != null &&
+            networkId != null &&
+            ownIdentity != null &&
+            contact != null
+        ) {
+            LanEndpointSender.queueToContact(
+                this,
+                store,
+                ownIdentity,
+                contact,
+                localHint,
+                networkId,
+            )
+        }
+        if (
+            MeshRouter.identifiedRoutes().any {
+                it.transport == MeshRouterState.Transport.LAN &&
+                    it.userId.contentEquals(peerUserId)
+            }
+        ) {
+            return
+        }
+        lanTransport?.connectToHint(hint, peerUserId)
+    }
+
+    private fun handleTransportProbe(address: String, probe: Frame.TransportProbe) {
+        if (MeshRouter.transportFor(address) != MeshRouterState.Transport.LAN) return
+        if (probe.response) {
+            lanHealthTracker.response(address, probe.nonce, System.currentTimeMillis())
+                ?.let(LanTransportDiagnostics::probeSucceeded)
+        } else {
+            MeshRouter.sendToAddress(
+                address,
+                encodeTransportProbe(probe.nonce, response = true),
+            )
+        }
+    }
+
+    private fun requestManualLanProbe(): String? {
+        val route = MeshRouter.identifiedRoutes()
+            .firstOrNull { it.transport == MeshRouterState.Transport.LAN }
+            ?: return "No secure local Wi-Fi link is active"
+        return when (val decision = nextLanHealthDecision(route.address)) {
+            is LanHealthTracker.Decision.Send -> {
+                LanTransportDiagnostics.probeStarted()
+                MeshRouter.sendToAddress(
+                    route.address,
+                    encodeTransportProbe(decision.nonce, response = false),
+                )
+                null
+            }
+            LanHealthTracker.Decision.Wait -> "A LAN connection test is already running"
+            LanHealthTracker.Decision.Close -> {
+                lanTransport?.closeLink(route.address)
+                "The stale LAN link was closed; CruiseMesh will reconnect"
+            }
+        }
+    }
+
+    private fun checkLanHealth() {
+        for (route in MeshRouter.identifiedRoutes()) {
+            if (route.transport != MeshRouterState.Transport.LAN) continue
+            when (val decision = nextLanHealthDecision(route.address)) {
+                is LanHealthTracker.Decision.Send -> MeshRouter.sendToAddress(
+                    route.address,
+                    encodeTransportProbe(decision.nonce, response = false),
+                )
+                LanHealthTracker.Decision.Wait -> Unit
+                LanHealthTracker.Decision.Close -> {
+                    LanTransportDiagnostics.probeFailed(
+                        "Encrypted LAN heartbeat timed out; reconnecting",
+                    )
+                    lanTransport?.closeLink(route.address)
+                }
+            }
+        }
+    }
+
+    private fun nextLanHealthDecision(address: String): LanHealthTracker.Decision =
+        lanHealthTracker.next(
+            address = address,
+            nowMs = System.currentTimeMillis(),
+            nonce = lanProbeNonce.incrementAndGet().toULong(),
+        )
 
     /**
      * HELLO handling (DESIGN.md §5.2 handshake). Records the address->userId
@@ -1158,7 +1383,10 @@ class MeshService : Service() {
         // binder thread, can otherwise reach handleDigest's
         // MeshRouter.userIdFor(address) lookup before this registration is
         // visible.
-        MeshRouter.onHello(address, userId)
+        if (!MeshRouter.onHello(address, userId)) {
+            Log.w(TAG, "Dropping HELLO that conflicts with the authenticated identity for $address")
+            return
+        }
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
         MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(userId), System.currentTimeMillis())
         Log.i(TAG, "HELLO from $address: userId=${UserIdHex.encode(userId)}")
@@ -1173,6 +1401,8 @@ class MeshService : Service() {
         val digestEntries = contact?.let { store.chatDigest(it.userId) } ?: emptyList()
         if (contact == null) {
             Log.i(TAG, "HELLO from unrecognized userId=${UserIdHex.encode(userId)}; sending carry-suppression digest only")
+        } else {
+            sendLanEndpointHintTo(address)
         }
         val digestFrame = encodeDigest(identity.userId, digestEntries, store.carriedMsgIds(DIGEST_CARRIED_MSG_IDS_LIMIT))
         MeshRouter.sendToAddress(address, digestFrame)
@@ -1512,8 +1742,8 @@ class MeshService : Service() {
     /**
      * [sourceAddress] doubles as the source discriminant relay proxy-polling
      * needs: `null` means this envelope came FROM the relay
-     * ([handleRelayEnvelope]), non-null means it arrived over a live BLE link
-     * ([handleEnvelope]). The two foreign-carry branches below use that to
+     * ([handleRelayEnvelope]), non-null means it arrived over a live BLE or
+     * authenticated same-LAN link ([handleEnvelope]). The two foreign-carry branches below use that to
      * pick [carryRelayEnvelope] (durable, never re-uploaded -- it's already on
      * the relay) vs. the existing [carryForeignEnvelope] (durable-if-family,
      * uploaded to the relay so an internet phone can proxy it onward) for
@@ -1587,8 +1817,9 @@ class MeshService : Service() {
         val linkPeerMatchesSender = sourceAddress
             ?.let(MeshRouter::userIdFor)
             ?.contentEquals(senderUserId) == true
+        val linkTransport = sourceAddress?.let(MeshRouter::transportFor)
         return MessageArrival(
-            transport = arrivalTransport(sourceAddress == null, linkPeerMatchesSender),
+            transport = arrivalTransport(sourceAddress == null, linkPeerMatchesSender, linkTransport),
             hopsTaken = arrivalHopsTaken(receivedHopTtl, DEFAULT_HOP_TTL),
             receivedAt = System.currentTimeMillis(),
         )
@@ -1875,7 +2106,13 @@ class MeshService : Service() {
                 msgId,
                 extendedBody.replyToMsgId,
             )
-            KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
+            KIND_RECEIPT -> handleIncomingReceipt(
+                address,
+                opened.senderUserId,
+                body,
+                identity,
+                arrival,
+            )
             KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, directBle, opened.senderUserId, body, identity)
             KIND_GROUP_INVITE -> handleIncomingGroupInvite(address, opened.senderUserId, body, identity)
             KIND_PROFILE_SYNC -> handleIncomingProfileSync(address, opened.senderUserId, body, identity)
@@ -1887,8 +2124,60 @@ class MeshService : Service() {
                 body,
                 identity,
             )
+            KIND_LAN_ENDPOINT_HINT -> handleIncomingLanEndpointHint(
+                address,
+                opened.senderUserId,
+                body,
+                identity,
+            )
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
         }
+    }
+
+    private fun handleIncomingLanEndpointHint(
+        address: String,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+    ) {
+        val contact = store.getContact(senderUserId) ?: return
+        val content = try {
+            decodeLanEndpointContent(body.content)
+        } catch (error: CoreException) {
+            Log.w(TAG, "Dropping sealed LAN endpoint hint: ${error.message}")
+            return
+        }
+        val inserted = store.insertMessage(
+            StoredMessage(
+                chatId = senderUserId,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_LAN_ENDPOINT_HINT,
+                payload = body.content,
+            ),
+        )
+        if (!inserted) return
+
+        val hintedNetworkId = content.networkId.toString(Charsets.UTF_8)
+        val endpoint = LanManualEndpoint(content.host, content.port.toInt())
+        lanEndpointCache.save(hintedNetworkId, senderUserId, endpoint)
+        LanCapabilityStore.markSupported(this, senderUserId)
+        val now = System.currentTimeMillis()
+        if (
+            content.expiresAtMs > now &&
+            hintedNetworkId == lanTransport?.currentNetworkId()
+        ) {
+            lanTransport?.connectToHint(
+                Frame.LanEndpoint(
+                    instanceToken = content.instanceToken,
+                    host = content.host,
+                    port = content.port,
+                ),
+                senderUserId,
+            )
+        }
+        acknowledgeHiddenMessage(address, senderUserId, identity, contact)
     }
 
     /**
@@ -2133,6 +2422,7 @@ class MeshService : Service() {
             contact,
             ProfileStore.loadOwnAvatarEpoch(this),
         )
+        sendLanEndpointHintTo(address)
         val inserted = store.insertMessage(
             StoredMessage(
                 chatId = senderUserId,
@@ -2398,6 +2688,7 @@ class MeshService : Service() {
             contact,
             ProfileStore.loadOwnAvatarEpoch(this),
         )
+        sendLanEndpointHintTo(address)
         if (!wasKnown) FriendDirectorySender.queueToAllContacts(this, store, identity)
         ChatEvents.notifyChatChanged(senderUserId)
         if (!wasKnown) {
@@ -2578,7 +2869,13 @@ class MeshService : Service() {
      * KDoc). This never sends anything back, so it cannot loop into another
      * receipt (see [handleIncomingText]'s KDoc for the full argument).
      */
-    private fun handleIncomingReceipt(address: String, envelopeSenderUserId: ByteArray, body: MessageBody, identity: Identity) {
+    private fun handleIncomingReceipt(
+        address: String,
+        envelopeSenderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+        arrival: MessageArrival,
+    ) {
         val receipt = try {
             decodeReceiptContent(body.content)
         } catch (e: CoreException) {
@@ -2610,6 +2907,15 @@ class MeshService : Service() {
             senderUserId = identity.userId, // whose messages this receipt is about: ours
             receiptType = receipt.receiptType,
             throughLamport = receipt.lamport,
+        )
+        // A receipt is sent immediately back on the exact link that delivered
+        // the message. Keep the first confirmation route on the acknowledged
+        // outgoing message so its Info pane can prove LAN/BLE/relay delivery.
+        store.recordMessageArrival(
+            envelopeSenderUserId,
+            identity.userId,
+            receipt.lamport,
+            arrival,
         )
         ChatEvents.notifyChatChanged(envelopeSenderUserId)
     }

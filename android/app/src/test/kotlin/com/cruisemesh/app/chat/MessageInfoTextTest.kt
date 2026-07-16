@@ -67,4 +67,32 @@ class MessageInfoTextTest {
 
         assertTrue(info.contains("Arrived via another device over BLE · ~1 hop ·"))
     }
+
+    @Test
+    fun outgoingMessageInfoShowsTheDeliveryConfirmationRoute() {
+        val message = StoredMessage(
+            senderUserId = byteArrayOf(1),
+            chatId = byteArrayOf(2),
+            lamport = 3uL,
+            timestamp = 1_783_608_000_000L,
+            kind = 1u.toUByte(),
+            payload = "hello".toByteArray(),
+        )
+        val confirmation = MessageArrival(
+            transport = 3u,
+            hopsTaken = 0u,
+            receivedAt = 1_783_608_000_500L,
+        )
+
+        val info = messageInfoText(
+            message,
+            isOwn = true,
+            tick = TickStatus.DELIVERED,
+            arrival = confirmation,
+        )
+
+        assertTrue(info.contains("Status: Delivered"))
+        assertTrue(info.contains("Delivery confirmed via local Wi-Fi ·"))
+        assertFalse(info.contains("Arrived via"))
+    }
 }

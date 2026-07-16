@@ -118,7 +118,8 @@ pub struct StoredMessage {
 }
 
 /// Local-only diagnostics for how an incoming message reached this device.
-/// `transport`: 0 = BLE direct, 1 = BLE through another device, 2 = relay.
+/// `transport`: 0 = BLE direct, 1 = BLE through another device, 2 = relay,
+/// 3 = same-LAN direct, 4 = same-LAN through another device.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct MessageArrival {
     pub transport: u8,
@@ -693,7 +694,8 @@ impl MessageStore {
         lamport: u64,
         arrival: MessageArrival,
     ) -> Result<bool, CoreError> {
-        if arrival.transport > 2 {
+        // 0/1 = BLE direct/muled, 2 = relay, 3/4 = LAN direct/muled.
+        if arrival.transport > 4 {
             return Err(CoreError::Malformed(
                 "invalid message arrival transport".to_string(),
             ));
@@ -2761,6 +2763,40 @@ mod tests {
             store.messages_for_chat(message.chat_id.clone()).unwrap(),
             vec![message],
         );
+    }
+
+    #[test]
+    fn message_arrival_accepts_lan_routes_and_rejects_unknown_routes() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let message = msg(b"chat-a", b"alice", 1, "hi");
+        store.insert_message(message.clone()).unwrap();
+
+        assert!(store
+            .record_message_arrival(
+                message.chat_id.clone(),
+                message.sender_user_id.clone(),
+                message.lamport,
+                MessageArrival {
+                    transport: 4,
+                    hops_taken: 1,
+                    received_at: 1_700_000_000_500,
+                },
+            )
+            .unwrap());
+
+        assert!(matches!(
+            store.record_message_arrival(
+                message.chat_id,
+                message.sender_user_id,
+                message.lamport,
+                MessageArrival {
+                    transport: 5,
+                    hops_taken: 0,
+                    received_at: 1_700_000_000_600,
+                },
+            ),
+            Err(CoreError::Malformed(_))
+        ));
     }
 
     #[test]
