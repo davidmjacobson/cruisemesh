@@ -26,6 +26,7 @@ cargo run -p cruisemesh-core --bin uniffi-bindgen --features cruisemesh-core/cli
 
 echo "==> Cross-compiling for iOS device + simulators"
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios >/dev/null 2>&1 || true
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-16.0}"
 
 cargo build -p cruisemesh-core --release --target aarch64-apple-ios
 cargo build -p cruisemesh-core --release --target aarch64-apple-ios-sim
