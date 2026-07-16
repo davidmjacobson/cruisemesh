@@ -16,6 +16,8 @@ summary. Milestones are sequential because each one de-risks the next.
 ## Near-term focus
 
 - Finish Milestone 4 (groups, broadcast).
+- Field-test the authenticated same-LAN TCP transport across Android and iOS,
+  including permissive and client-isolated captive Wi-Fi.
 - **Notification reliability as a release gate:** background delivery must
   produce a timely local notification on real devices (screen off, battery
   saver, hours idle) before the app is offered to anyone beyond the

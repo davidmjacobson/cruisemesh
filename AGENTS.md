@@ -50,8 +50,24 @@ Rust and XcodeGen are installed in user-local directories. Non-interactive SSH
 commands may need this path explicitly:
 
 ```bash
-export PATH="$HOME/.cargo/bin:$HOME/.local/xcodegen-2.45.4/xcodegen/bin:$PATH"
+export PATH="$HOME/.cargo/bin:$HOME/.local/opt/xcodegen-2.45.4/xcodegen/bin:$PATH"
 ```
+
+The port-2222 listener is a user-owned `sshd`, not the shared Mac's system
+service. If the VNC/GUI login expires and the alias refuses connections, use
+the provider's system-SSH channel and account credentials supplied out of band,
+then validate and start the existing configuration in daemon mode:
+
+```bash
+config="$HOME/.local/var/user-sshd/sshd_config"
+log="$HOME/.local/var/user-sshd/sshd.log"
+/usr/sbin/sshd -t -f "$config"
+/usr/sbin/sshd -f "$config" -E "$log"
+/usr/sbin/lsof -nP -iTCP:2222 -sTCP:LISTEN
+```
+
+Do not add `-D` for this recovery command: normal daemon mode detaches the
+listener from the temporary system-SSH session and the expiring GUI login.
 
 From the temporary worktree, build the shared core, generate the Xcode project,
 and run the iOS suite against an available simulator:

@@ -415,6 +415,22 @@ fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
+    typealias FfiType = UInt16
+    typealias SwiftType = UInt16
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt16 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     typealias FfiType = UInt32
     typealias SwiftType = UInt32
@@ -546,15 +562,245 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 
-public protocol MessageStoreProtocol : AnyObject {
+public protocol LanNoiseSessionProtocol : AnyObject {
+    
+    /**
+     * Decrypt one Noise record. Returns a complete CruiseMesh protocol frame
+     * after the final record, or `None` while a multi-record frame is still
+     * being assembled.
+     */
+    func decryptRecord(record: Data) throws  -> Data?
+    
+    /**
+     * Encrypt one complete CruiseMesh protocol frame into one or more Noise
+     * records. Native shells prefix each returned record with a u32 BE length
+     * before writing it to TCP.
+     */
+    func encryptFrame(frame: Data) throws  -> [Data]
+    
+    func isHandshakeFinished()  -> Bool
+    
+    /**
+     * Consume the next Noise XX handshake message. CruiseMesh does not put
+     * application data in handshake payloads; non-empty payloads fail closed.
+     */
+    func readHandshakeMessage(message: Data) throws 
+    
+    /**
+     * The remote X25519 static public key once Noise has revealed it.
+     * Initiators can inspect this after reading message 2 and must reject an
+     * unknown key before sending message 3. Responders learn it after message
+     * 3, immediately before the session enters transport mode.
+     */
+    func remoteStaticKey()  -> Data?
+    
+    /**
+     * Produce the next Noise XX handshake message. Callers follow the
+     * standard XX sequence: initiator write, responder write, initiator
+     * write, with the opposite side reading after each step.
+     */
+    func writeHandshakeMessage() throws  -> Data
+    
+}
 
+open class LanNoiseSession:
+    LanNoiseSessionProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_lannoisesession(self.pointer, $0) }
+    }
+    /**
+     * Create one side of a Noise XX connection using this device's existing
+     * 32-byte X25519 agreement private key.
+     */
+public convenience init(initiator: Bool, localPrivateKey: Data)throws  {
+    let pointer =
+        try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_constructor_lannoisesession_new(
+        FfiConverterBool.lower(initiator),
+        FfiConverterData.lower(localPrivateKey),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_lannoisesession(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * Decrypt one Noise record. Returns a complete CruiseMesh protocol frame
+     * after the final record, or `None` while a multi-record frame is still
+     * being assembled.
+     */
+open func decryptRecord(record: Data)throws  -> Data? {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_decrypt_record(self.uniffiClonePointer(),
+        FfiConverterData.lower(record),$0
+    )
+})
+}
+    
+    /**
+     * Encrypt one complete CruiseMesh protocol frame into one or more Noise
+     * records. Native shells prefix each returned record with a u32 BE length
+     * before writing it to TCP.
+     */
+open func encryptFrame(frame: Data)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_encrypt_frame(self.uniffiClonePointer(),
+        FfiConverterData.lower(frame),$0
+    )
+})
+}
+    
+open func isHandshakeFinished() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_is_handshake_finished(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Consume the next Noise XX handshake message. CruiseMesh does not put
+     * application data in handshake payloads; non-empty payloads fail closed.
+     */
+open func readHandshakeMessage(message: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_read_handshake_message(self.uniffiClonePointer(),
+        FfiConverterData.lower(message),$0
+    )
+}
+}
+    
+    /**
+     * The remote X25519 static public key once Noise has revealed it.
+     * Initiators can inspect this after reading message 2 and must reject an
+     * unknown key before sending message 3. Responders learn it after message
+     * 3, immediately before the session enters transport mode.
+     */
+open func remoteStaticKey() -> Data? {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_remote_static_key(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Produce the next Noise XX handshake message. Callers follow the
+     * standard XX sequence: initiator write, responder write, initiator
+     * write, with the opposite side reading after each step.
+     */
+open func writeHandshakeMessage()throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_write_handshake_message(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLanNoiseSession: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = LanNoiseSession
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> LanNoiseSession {
+        return LanNoiseSession(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: LanNoiseSession) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanNoiseSession {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: LanNoiseSession, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanNoiseSession_lift(_ pointer: UnsafeMutableRawPointer) throws -> LanNoiseSession {
+    return try FfiConverterTypeLanNoiseSession.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanNoiseSession_lower(_ value: LanNoiseSession) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeLanNoiseSession.lower(value)
+}
+
+
+
+
+public protocol MessageStoreProtocol : AnyObject {
+    
     /**
      * Atomically replace all suggestions supplied by one introducer. The
      * directory's tickets are checked here so both mobile shells share the
      * same fail-closed behavior.
      */
     func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, content: FriendDirectoryContent, nowMs: Int64) throws  -> Bool
-
+    
     /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
@@ -565,7 +811,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * [`MessageStore::remove_carried_envelope`] it.
      */
     func carriedEnvelopesForHints(hints: [Data], nowMs: Int64) throws  -> [CarriedEnvelope]
-
+    
     /**
      * Carried envelopes suitable to spray to a non-recipient mule on peer
      * sync: unexpired as of `now_ms`, not already known to the peer
@@ -574,12 +820,12 @@ public protocol MessageStoreProtocol : AnyObject {
      * separately). Ordered oldest first.
      */
     func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64) throws  -> [CarriedEnvelope]
-
+    
     /**
      * Number of envelopes currently in the carry queue (diagnostics/tests).
      */
     func carriedLen() throws  -> UInt64
-
+    
     /**
      * Up to `limit` carried-envelope `msg_id`s, oldest first. This is the
      * exact-set stand-in for §7.3's "recent msg_id bloom filter": enough for
@@ -587,7 +833,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * resend them on every reconnect.
      */
     func carriedMsgIds(limit: UInt64) throws  -> [Data]
-
+    
     /**
      * A sync digest for `chat_id` (DESIGN.md §7.3): one [`DigestEntry`] per
      * distinct sender who has ever posted in this chat, each with their
@@ -597,19 +843,19 @@ public protocol MessageStoreProtocol : AnyObject {
      * digest (the recent-msg_id bloom filter is deferred).
      */
     func chatDigest(chatId: Data) throws  -> [DigestEntry]
-
-    func clearFriendSuggestions() throws
-
+    
+    func clearFriendSuggestions() throws 
+    
     /**
      * The canonical JPEG avatar bytes for a contact, if one has been synced.
      */
     func contactAvatar(userId: Data) throws  -> Data?
-
+    
     /**
      * The newest avatar/display-name profile-sync epoch applied for a contact.
      */
     func contactAvatarEpoch(userId: Data) throws  -> Int64
-
+    
     /**
      * Delete a contact and, with it, the entire 1:1 chat: the contact row,
      * every message whose `chat_id` is their UserID (DESIGN.md §7.1: a 1:1
@@ -644,7 +890,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * contact is a no-op. Returns `true` if a contact row was removed.
      */
     func deleteContact(userId: Data) throws  -> Bool
-
+    
     /**
      * Delete a group definition, its membership rows, and every row of
      * local chat history / retry state keyed by that group id: `messages`,
@@ -656,7 +902,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * paint false read-ticks). Atomic and idempotent.
      */
     func deleteGroup(groupId: Data) throws  -> Bool
-
+    
     /**
      * Store a foreign envelope for later store-and-forward delivery
      * (DESIGN.md §5.3 carry queue). Keyed on `msg_id`, so re-enqueuing an
@@ -675,7 +921,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * budget. All of this happens in one transaction.
      */
     func enqueueCarriedEnvelope(envelope: CarriedEnvelope, isFamily: Bool, receivedAtMs: Int64, foreignBudgetBytes: Int64) throws  -> Bool
-
+    
     /**
      * Store an envelope pulled FROM the relay that we're proxying for its
      * real recipient (relay proxy-polling: an internet phone fetches a
@@ -696,7 +942,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * pass is a no-op. Returns whether a new row was inserted.
      */
     func enqueueRelayCarriedEnvelope(envelope: CarriedEnvelope, nowMs: Int64) throws  -> Bool
-
+    
     /**
      * Unexpired carried envelopes that were classified as family traffic
      * when received, oldest first. Used by relay upload so one phone with
@@ -708,21 +954,21 @@ public protocol MessageStoreProtocol : AnyObject {
      * real recipient already acked).
      */
     func familyCarriedEnvelopes(limit: UInt64, nowMs: Int64) throws  -> [CarriedEnvelope]
-
+    
     /**
      * Look up a single contact by UserID, or `None` if not a contact.
      */
     func getContact(userId: Data) throws  -> Contact?
-
+    
     func getContactDiscoveryPolicy(userId: Data) throws  -> ContactDiscoveryPolicy?
-
+    
     func getContactProvenance(userId: Data) throws  -> ContactProvenance?
-
+    
     /**
      * Look up one imported group by id, including its current member list.
      */
     func getGroup(groupId: Data) throws  -> Group?
-
+    
     /**
      * The highest lamport value N such that every message `1..=N` from this
      * sender in this chat is present -- the point up to which there's no
@@ -730,7 +976,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * waiting"). Returns 0 if message 1 itself hasn't arrived yet.
      */
     func highestContiguousLamport(chatId: Data, senderUserId: Data) throws  -> UInt64
-
+    
     /**
      * The highest lamport value actually held from this sender in this
      * chat -- a plain MAX, with no contiguity requirement. Returns 0 when
@@ -768,13 +1014,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * sender to drop an undelivered message of their own.
      */
     func highestLamport(chatId: Data, senderUserId: Data) throws  -> UInt64
-
+    
     /**
      * Insert an opened incoming message together with the envelope id used
      * for quoting it and an optional encrypted reply target.
      */
     func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgId: Data?) throws  -> Bool
-
+    
     /**
      * Insert a message from a remote sender's stream, distinguishing a true
      * duplicate from a *forked* stream instead of silently dropping both the
@@ -808,7 +1054,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * stale tail and the new message coexisting.
      */
     func insertMessage(message: StoredMessage) throws  -> Bool
-
+    
     /**
      * Atomically persist one locally authored message and the exact sealed
      * envelope that should be retried for it over BLE and relay. The message
@@ -818,63 +1064,63 @@ public protocol MessageStoreProtocol : AnyObject {
      * second `msg_id`.
      */
     func insertOutgoingMessage(message: StoredMessage, envelope: OutboundEnvelope, queuedAtMs: Int64) throws  -> Bool
-
+    
     /**
      * Atomically persist a locally authored reply and its stable sealed
      * envelope. The target id remains local metadata as well as encrypted
      * body metadata, so rendering never needs to reopen ciphertext.
      */
     func insertOutgoingReply(message: StoredMessage, envelope: OutboundEnvelope, replyToMsgId: Data, queuedAtMs: Int64) throws  -> Bool
-
+    
     /**
      * All contacts, alphabetical by name.
      */
     func listContacts() throws  -> [Contact]
-
+    
     func listFriendSuggestions(nowMs: Int64) throws  -> [FriendSuggestion]
-
+    
     /**
      * All imported groups, alphabetical by name then id for stable ordering.
      */
     func listGroups() throws  -> [Group]
-
+    
     /**
      * Mark one outbound envelope as successfully posted to a relay. Returns
      * `true` if a queued row was updated.
      */
     func markOutboundEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64) throws  -> Bool
-
+    
     /**
      * Mark one outgoing receipt envelope as successfully posted to a relay.
      * Returns `true` if a queued row was updated.
      */
     func markOutgoingReceiptEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64) throws  -> Bool
-
+    
     /**
      * First-arrival diagnostics for one message, or `None` for locally
      * authored/legacy rows that predate diagnostics.
      */
     func messageArrival(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> MessageArrival?
-
+    
     /**
      * Resolve a quoted message by stable envelope id within one chat.
      * Missing history is expected and returns `None`.
      */
     func messageByMsgId(chatId: Data, msgId: Data) throws  -> StoredMessage?
-
+    
     /**
      * Stable id and optional reply target for one stored message. Returns
      * `None` for legacy rows whose inbound envelope id was never recorded.
      */
     func messageReference(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> MessageReference?
-
+    
     /**
      * Messages from `sender_user_id` in `chat_id` with `lamport >
      * after_lamport`, oldest first -- what a peer whose digest reported
      * `after_lamport` for this sender is missing (DESIGN.md §7.3).
      */
     func messagesAfter(chatId: Data, senderUserId: Data, afterLamport: UInt64) throws  -> [StoredMessage]
-
+    
     /**
      * All messages in a chat, oldest first by author timestamp.
      *
@@ -887,7 +1133,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * timestamps.
      */
     func messagesForChat(chatId: Data) throws  -> [StoredMessage]
-
+    
     /**
      * Exact sealed envelopes for this device's authored messages in
      * `chat_id` whose lamport is above `after_lamport`, oldest first. This
@@ -897,13 +1143,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * message-kind that participates in the chat lamport stream.
      */
     func outboundEnvelopesAfter(chatId: Data, senderUserId: Data, afterLamport: UInt64) throws  -> [OutboundEnvelope]
-
+    
     /**
      * The latest relay-uploadable receipt envelope persisted for this
      * cumulative outgoing receipt watermark, if any.
      */
     func outgoingReceiptEnvelope(chatId: Data, senderUserId: Data, receiptType: UInt8) throws  -> OutgoingReceiptEnvelope?
-
+    
     /**
      * The cumulative lamport this device should report back in an outgoing
      * receipt of `receipt_type` for `sender_user_id`'s messages in `chat_id`
@@ -911,54 +1157,54 @@ public protocol MessageStoreProtocol : AnyObject {
      * been recorded yet.
      */
     func outgoingReceiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8) throws  -> UInt64
-
+    
     /**
      * Relay-upload candidates: locally authored envelopes not yet marked as
      * posted to a relay, unexpired as of `now_ms`, oldest first.
      */
     func pendingRelayOutboundEnvelopes(limit: UInt64, nowMs: Int64) throws  -> [OutboundEnvelope]
-
+    
     /**
      * Relay-upload candidates: persisted receipt envelopes not yet marked as
      * posted to a relay, unexpired as of `now_ms`, oldest first.
      */
     func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64) throws  -> [OutgoingReceiptEnvelope]
-
+    
     /**
      * Delete every carried envelope whose `expiry` is at or before `now_ms`
      * (DESIGN.md §5.3: "carriers drop the envelope past this time"). Returns
      * how many were pruned.
      */
     func pruneExpiredCarried(nowMs: Int64) throws  -> UInt64
-
+    
     /**
      * Delete expired outbound envelopes as of `now_ms`. The plaintext
      * message history stays intact; this only prunes retry state whose public
      * expiry window has elapsed.
      */
     func pruneExpiredOutboundEnvelopes(nowMs: Int64) throws  -> UInt64
-
+    
     /**
      * Delete expired outgoing receipt envelopes as of `now_ms`. The
      * underlying outgoing receipt watermark remains in `outgoing_receipts`;
      * this only prunes the persisted sealed retry artifact.
      */
     func pruneExpiredOutgoingReceiptEnvelopes(nowMs: Int64) throws  -> UInt64
-
+    
     /**
      * The cumulative lamport a receipt of `receipt_type` covers for
      * `sender_user_id`'s messages in `chat_id` (DESIGN.md §7.2). Returns 0
      * if no such receipt has been recorded.
      */
     func receiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8) throws  -> UInt64
-
+    
     /**
      * Attach first-arrival diagnostics to an already inserted incoming
      * message. A redundant mesh/relay copy never overwrites the original
      * route, hop count, or receive time.
      */
     func recordMessageArrival(chatId: Data, senderUserId: Data, lamport: UInt64, arrival: MessageArrival) throws  -> Bool
-
+    
     /**
      * Record that *this device* has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` -- the
@@ -967,8 +1213,8 @@ public protocol MessageStoreProtocol : AnyObject {
      * [`MessageStore::record_receipt`]: once a receipt watermark advances,
      * stale retries must never regress it.
      */
-    func recordOutgoingReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64) throws
-
+    func recordOutgoingReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64) throws 
+    
     /**
      * Record that a peer has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` (DESIGN.md
@@ -978,50 +1224,50 @@ public protocol MessageStoreProtocol : AnyObject {
      * receipts can arrive out of order or be replayed under DTN, and a
      * stale/duplicate receipt must never regress what's already known.
      */
-    func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64) throws
-
+    func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64) throws 
+    
     /**
      * Drop a carried envelope by `msg_id` -- called once it's been handed to
      * its recipient (DESIGN.md §5.3: a mule's job is done on delivery).
      * Returns `true` if a row was removed.
      */
     func removeCarriedEnvelope(msgId: Data) throws  -> Bool
-
-    func removeFriendSuggestion(candidateUserId: Data) throws
-
+    
+    func removeFriendSuggestion(candidateUserId: Data) throws 
+    
     /**
      * Apply a contact avatar update only if `epoch` is newer than the stored
      * avatar epoch. `None` or an empty blob clears the avatar but still
      * records the newer epoch.
      */
     func setContactAvatar(userId: Data, avatar: Data?, epoch: Int64) throws  -> Bool
-
+    
     /**
      * State values: 0 available, 1 requested, 2 hidden.
      */
-    func setFriendSuggestionState(candidateUserId: Data, state: UInt8) throws
-
+    func setFriendSuggestionState(candidateUserId: Data, state: UInt8) throws 
+    
     /**
      * Add or update a contact, keyed on `user_id` -- re-scanning the same
      * FriendCard (e.g. after they update their display name) replaces the
      * row rather than erroring or duplicating.
      */
-    func upsertContact(contact: Contact) throws
-
+    func upsertContact(contact: Contact) throws 
+    
     /**
      * Apply an authenticated contact's discovery policy if it is newer.
      */
     func upsertContactDiscoveryPolicy(policy: ContactDiscoveryPolicy) throws  -> Bool
-
-    func upsertContactProvenance(provenance: ContactProvenance) throws
-
+    
+    func upsertContactProvenance(provenance: ContactProvenance) throws 
+    
     /**
      * Add or replace a group definition and its full membership. Updating an
      * existing group id replaces the stored key/member list atomically,
      * which is the v1 rotation path for membership changes.
      */
-    func upsertGroup(group: Group) throws
-
+    func upsertGroup(group: Group) throws 
+    
     /**
      * Persist or advance the exact sealed receipt envelope to relay-upload
      * for one logical outgoing receipt watermark. Same watermark -> no-op,
@@ -1029,7 +1275,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * and clear `relay_posted_at`; lower watermark -> ignored as stale.
      */
     func upsertOutgoingReceiptEnvelope(envelope: OutgoingReceiptEnvelope, queuedAtMs: Int64) throws  -> Bool
-
+    
 }
 
 open class MessageStore:
@@ -1079,7 +1325,7 @@ open class MessageStore:
         try! rustCall { uniffi_cruisemesh_core_fn_free_messagestore(pointer, $0) }
     }
 
-
+    
     /**
      * Open (creating if needed) the message store at `path`. Pass
      * `":memory:"` for an ephemeral in-process store.
@@ -1091,9 +1337,9 @@ public static func `open`(path: String)throws  -> MessageStore {
     )
 })
 }
+    
 
-
-
+    
     /**
      * Atomically replace all suggestions supplied by one introducer. The
      * directory's tickets are checked here so both mobile shells share the
@@ -1109,7 +1355,7 @@ open func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, co
     )
 })
 }
-
+    
     /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
@@ -1127,7 +1373,7 @@ open func carriedEnvelopesForHints(hints: [Data], nowMs: Int64)throws  -> [Carri
     )
 })
 }
-
+    
     /**
      * Carried envelopes suitable to spray to a non-recipient mule on peer
      * sync: unexpired as of `now_ms`, not already known to the peer
@@ -1144,7 +1390,7 @@ open func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data]
     )
 })
 }
-
+    
     /**
      * Number of envelopes currently in the carry queue (diagnostics/tests).
      */
@@ -1154,7 +1400,7 @@ open func carriedLen()throws  -> UInt64 {
     )
 })
 }
-
+    
     /**
      * Up to `limit` carried-envelope `msg_id`s, oldest first. This is the
      * exact-set stand-in for §7.3's "recent msg_id bloom filter": enough for
@@ -1168,7 +1414,7 @@ open func carriedMsgIds(limit: UInt64)throws  -> [Data] {
     )
 })
 }
-
+    
     /**
      * A sync digest for `chat_id` (DESIGN.md §7.3): one [`DigestEntry`] per
      * distinct sender who has ever posted in this chat, each with their
@@ -1184,13 +1430,13 @@ open func chatDigest(chatId: Data)throws  -> [DigestEntry] {
     )
 })
 }
-
+    
 open func clearFriendSuggestions()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_clear_friend_suggestions(self.uniffiClonePointer(),$0
     )
 }
 }
-
+    
     /**
      * The canonical JPEG avatar bytes for a contact, if one has been synced.
      */
@@ -1201,7 +1447,7 @@ open func contactAvatar(userId: Data)throws  -> Data? {
     )
 })
 }
-
+    
     /**
      * The newest avatar/display-name profile-sync epoch applied for a contact.
      */
@@ -1212,7 +1458,7 @@ open func contactAvatarEpoch(userId: Data)throws  -> Int64 {
     )
 })
 }
-
+    
     /**
      * Delete a contact and, with it, the entire 1:1 chat: the contact row,
      * every message whose `chat_id` is their UserID (DESIGN.md §7.1: a 1:1
@@ -1253,7 +1499,7 @@ open func deleteContact(userId: Data)throws  -> Bool {
     )
 })
 }
-
+    
     /**
      * Delete a group definition, its membership rows, and every row of
      * local chat history / retry state keyed by that group id: `messages`,
@@ -1271,7 +1517,7 @@ open func deleteGroup(groupId: Data)throws  -> Bool {
     )
 })
 }
-
+    
     /**
      * Store a foreign envelope for later store-and-forward delivery
      * (DESIGN.md §5.3 carry queue). Keyed on `msg_id`, so re-enqueuing an
@@ -1299,7 +1545,7 @@ open func enqueueCarriedEnvelope(envelope: CarriedEnvelope, isFamily: Bool, rece
     )
 })
 }
-
+    
     /**
      * Store an envelope pulled FROM the relay that we're proxying for its
      * real recipient (relay proxy-polling: an internet phone fetches a
@@ -1327,7 +1573,7 @@ open func enqueueRelayCarriedEnvelope(envelope: CarriedEnvelope, nowMs: Int64)th
     )
 })
 }
-
+    
     /**
      * Unexpired carried envelopes that were classified as family traffic
      * when received, oldest first. Used by relay upload so one phone with
@@ -1346,7 +1592,7 @@ open func familyCarriedEnvelopes(limit: UInt64, nowMs: Int64)throws  -> [Carried
     )
 })
 }
-
+    
     /**
      * Look up a single contact by UserID, or `None` if not a contact.
      */
@@ -1357,7 +1603,7 @@ open func getContact(userId: Data)throws  -> Contact? {
     )
 })
 }
-
+    
 open func getContactDiscoveryPolicy(userId: Data)throws  -> ContactDiscoveryPolicy? {
     return try  FfiConverterOptionTypeContactDiscoveryPolicy.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_get_contact_discovery_policy(self.uniffiClonePointer(),
@@ -1365,7 +1611,7 @@ open func getContactDiscoveryPolicy(userId: Data)throws  -> ContactDiscoveryPoli
     )
 })
 }
-
+    
 open func getContactProvenance(userId: Data)throws  -> ContactProvenance? {
     return try  FfiConverterOptionTypeContactProvenance.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_get_contact_provenance(self.uniffiClonePointer(),
@@ -1373,7 +1619,7 @@ open func getContactProvenance(userId: Data)throws  -> ContactProvenance? {
     )
 })
 }
-
+    
     /**
      * Look up one imported group by id, including its current member list.
      */
@@ -1384,7 +1630,7 @@ open func getGroup(groupId: Data)throws  -> Group? {
     )
 })
 }
-
+    
     /**
      * The highest lamport value N such that every message `1..=N` from this
      * sender in this chat is present -- the point up to which there's no
@@ -1399,7 +1645,7 @@ open func highestContiguousLamport(chatId: Data, senderUserId: Data)throws  -> U
     )
 })
 }
-
+    
     /**
      * The highest lamport value actually held from this sender in this
      * chat -- a plain MAX, with no contiguity requirement. Returns 0 when
@@ -1444,7 +1690,7 @@ open func highestLamport(chatId: Data, senderUserId: Data)throws  -> UInt64 {
     )
 })
 }
-
+    
     /**
      * Insert an opened incoming message together with the envelope id used
      * for quoting it and an optional encrypted reply target.
@@ -1458,7 +1704,7 @@ open func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgI
     )
 })
 }
-
+    
     /**
      * Insert a message from a remote sender's stream, distinguishing a true
      * duplicate from a *forked* stream instead of silently dropping both the
@@ -1498,7 +1744,7 @@ open func insertMessage(message: StoredMessage)throws  -> Bool {
     )
 })
 }
-
+    
     /**
      * Atomically persist one locally authored message and the exact sealed
      * envelope that should be retried for it over BLE and relay. The message
@@ -1516,7 +1762,7 @@ open func insertOutgoingMessage(message: StoredMessage, envelope: OutboundEnvelo
     )
 })
 }
-
+    
     /**
      * Atomically persist a locally authored reply and its stable sealed
      * envelope. The target id remains local metadata as well as encrypted
@@ -1532,7 +1778,7 @@ open func insertOutgoingReply(message: StoredMessage, envelope: OutboundEnvelope
     )
 })
 }
-
+    
     /**
      * All contacts, alphabetical by name.
      */
@@ -1542,7 +1788,7 @@ open func listContacts()throws  -> [Contact] {
     )
 })
 }
-
+    
 open func listFriendSuggestions(nowMs: Int64)throws  -> [FriendSuggestion] {
     return try  FfiConverterSequenceTypeFriendSuggestion.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_list_friend_suggestions(self.uniffiClonePointer(),
@@ -1550,7 +1796,7 @@ open func listFriendSuggestions(nowMs: Int64)throws  -> [FriendSuggestion] {
     )
 })
 }
-
+    
     /**
      * All imported groups, alphabetical by name then id for stable ordering.
      */
@@ -1560,7 +1806,7 @@ open func listGroups()throws  -> [Group] {
     )
 })
 }
-
+    
     /**
      * Mark one outbound envelope as successfully posted to a relay. Returns
      * `true` if a queued row was updated.
@@ -1573,7 +1819,7 @@ open func markOutboundEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64)throws 
     )
 })
 }
-
+    
     /**
      * Mark one outgoing receipt envelope as successfully posted to a relay.
      * Returns `true` if a queued row was updated.
@@ -1586,7 +1832,7 @@ open func markOutgoingReceiptEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64)
     )
 })
 }
-
+    
     /**
      * First-arrival diagnostics for one message, or `None` for locally
      * authored/legacy rows that predate diagnostics.
@@ -1600,7 +1846,7 @@ open func messageArrival(chatId: Data, senderUserId: Data, lamport: UInt64)throw
     )
 })
 }
-
+    
     /**
      * Resolve a quoted message by stable envelope id within one chat.
      * Missing history is expected and returns `None`.
@@ -1613,7 +1859,7 @@ open func messageByMsgId(chatId: Data, msgId: Data)throws  -> StoredMessage? {
     )
 })
 }
-
+    
     /**
      * Stable id and optional reply target for one stored message. Returns
      * `None` for legacy rows whose inbound envelope id was never recorded.
@@ -1627,7 +1873,7 @@ open func messageReference(chatId: Data, senderUserId: Data, lamport: UInt64)thr
     )
 })
 }
-
+    
     /**
      * Messages from `sender_user_id` in `chat_id` with `lamport >
      * after_lamport`, oldest first -- what a peer whose digest reported
@@ -1642,7 +1888,7 @@ open func messagesAfter(chatId: Data, senderUserId: Data, afterLamport: UInt64)t
     )
 })
 }
-
+    
     /**
      * All messages in a chat, oldest first by author timestamp.
      *
@@ -1661,7 +1907,7 @@ open func messagesForChat(chatId: Data)throws  -> [StoredMessage] {
     )
 })
 }
-
+    
     /**
      * Exact sealed envelopes for this device's authored messages in
      * `chat_id` whose lamport is above `after_lamport`, oldest first. This
@@ -1679,7 +1925,7 @@ open func outboundEnvelopesAfter(chatId: Data, senderUserId: Data, afterLamport:
     )
 })
 }
-
+    
     /**
      * The latest relay-uploadable receipt envelope persisted for this
      * cumulative outgoing receipt watermark, if any.
@@ -1693,7 +1939,7 @@ open func outgoingReceiptEnvelope(chatId: Data, senderUserId: Data, receiptType:
     )
 })
 }
-
+    
     /**
      * The cumulative lamport this device should report back in an outgoing
      * receipt of `receipt_type` for `sender_user_id`'s messages in `chat_id`
@@ -1709,7 +1955,7 @@ open func outgoingReceiptThrough(chatId: Data, senderUserId: Data, receiptType: 
     )
 })
 }
-
+    
     /**
      * Relay-upload candidates: locally authored envelopes not yet marked as
      * posted to a relay, unexpired as of `now_ms`, oldest first.
@@ -1722,7 +1968,7 @@ open func pendingRelayOutboundEnvelopes(limit: UInt64, nowMs: Int64)throws  -> [
     )
 })
 }
-
+    
     /**
      * Relay-upload candidates: persisted receipt envelopes not yet marked as
      * posted to a relay, unexpired as of `now_ms`, oldest first.
@@ -1735,7 +1981,7 @@ open func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64)throw
     )
 })
 }
-
+    
     /**
      * Delete every carried envelope whose `expiry` is at or before `now_ms`
      * (DESIGN.md §5.3: "carriers drop the envelope past this time"). Returns
@@ -1748,7 +1994,7 @@ open func pruneExpiredCarried(nowMs: Int64)throws  -> UInt64 {
     )
 })
 }
-
+    
     /**
      * Delete expired outbound envelopes as of `now_ms`. The plaintext
      * message history stays intact; this only prunes retry state whose public
@@ -1761,7 +2007,7 @@ open func pruneExpiredOutboundEnvelopes(nowMs: Int64)throws  -> UInt64 {
     )
 })
 }
-
+    
     /**
      * Delete expired outgoing receipt envelopes as of `now_ms`. The
      * underlying outgoing receipt watermark remains in `outgoing_receipts`;
@@ -1774,7 +2020,7 @@ open func pruneExpiredOutgoingReceiptEnvelopes(nowMs: Int64)throws  -> UInt64 {
     )
 })
 }
-
+    
     /**
      * The cumulative lamport a receipt of `receipt_type` covers for
      * `sender_user_id`'s messages in `chat_id` (DESIGN.md §7.2). Returns 0
@@ -1789,7 +2035,7 @@ open func receiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8)th
     )
 })
 }
-
+    
     /**
      * Attach first-arrival diagnostics to an already inserted incoming
      * message. A redundant mesh/relay copy never overwrites the original
@@ -1805,7 +2051,7 @@ open func recordMessageArrival(chatId: Data, senderUserId: Data, lamport: UInt64
     )
 })
 }
-
+    
     /**
      * Record that *this device* has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` -- the
@@ -1823,7 +2069,7 @@ open func recordOutgoingReceipt(chatId: Data, senderUserId: Data, receiptType: U
     )
 }
 }
-
+    
     /**
      * Record that a peer has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` (DESIGN.md
@@ -1842,7 +2088,7 @@ open func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, th
     )
 }
 }
-
+    
     /**
      * Drop a carried envelope by `msg_id` -- called once it's been handed to
      * its recipient (DESIGN.md §5.3: a mule's job is done on delivery).
@@ -1855,14 +2101,14 @@ open func removeCarriedEnvelope(msgId: Data)throws  -> Bool {
     )
 })
 }
-
+    
 open func removeFriendSuggestion(candidateUserId: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_remove_friend_suggestion(self.uniffiClonePointer(),
         FfiConverterData.lower(candidateUserId),$0
     )
 }
 }
-
+    
     /**
      * Apply a contact avatar update only if `epoch` is newer than the stored
      * avatar epoch. `None` or an empty blob clears the avatar but still
@@ -1877,7 +2123,7 @@ open func setContactAvatar(userId: Data, avatar: Data?, epoch: Int64)throws  -> 
     )
 })
 }
-
+    
     /**
      * State values: 0 available, 1 requested, 2 hidden.
      */
@@ -1888,7 +2134,7 @@ open func setFriendSuggestionState(candidateUserId: Data, state: UInt8)throws  {
     )
 }
 }
-
+    
     /**
      * Add or update a contact, keyed on `user_id` -- re-scanning the same
      * FriendCard (e.g. after they update their display name) replaces the
@@ -1900,7 +2146,7 @@ open func upsertContact(contact: Contact)throws  {try rustCallWithError(FfiConve
     )
 }
 }
-
+    
     /**
      * Apply an authenticated contact's discovery policy if it is newer.
      */
@@ -1911,14 +2157,14 @@ open func upsertContactDiscoveryPolicy(policy: ContactDiscoveryPolicy)throws  ->
     )
 })
 }
-
+    
 open func upsertContactProvenance(provenance: ContactProvenance)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_upsert_contact_provenance(self.uniffiClonePointer(),
         FfiConverterTypeContactProvenance.lower(provenance),$0
     )
 }
 }
-
+    
     /**
      * Add or replace a group definition and its full membership. Updating an
      * existing group id replaces the stored key/member list atomically,
@@ -1930,7 +2176,7 @@ open func upsertGroup(group: Group)throws  {try rustCallWithError(FfiConverterTy
     )
 }
 }
-
+    
     /**
      * Persist or advance the exact sealed receipt envelope to relay-upload
      * for one logical outgoing receipt watermark. Same watermark -> no-op,
@@ -1945,7 +2191,7 @@ open func upsertOutgoingReceiptEnvelope(envelope: OutgoingReceiptEnvelope, queue
     )
 })
 }
-
+    
 
 }
 
@@ -2009,7 +2255,7 @@ public func FfiConverterTypeMessageStore_lower(_ value: MessageStore) -> UnsafeM
  * send paths (see module docs).
  */
 public protocol SeenIdsProtocol : AnyObject {
-
+    
     /**
      * Record that we've now handled `msg_id`, returning `true` if it was
      * **new** (the caller should process/relay this envelope) or `false` if
@@ -2017,12 +2263,12 @@ public protocol SeenIdsProtocol : AnyObject {
      * test-and-set the flood receive path runs on every inbound envelope.
      */
     func checkAndRecord(msgId: Data)  -> Bool
-
+    
     /**
      * Current number of retained ids (for tests/diagnostics).
      */
     func len()  -> UInt64
-
+    
     /**
      * Record `msg_id` as seen without reporting novelty, for envelopes this
      * node *authored*: a sealed box can't be opened by its own sender
@@ -2031,8 +2277,8 @@ public protocol SeenIdsProtocol : AnyObject {
      * re-relayed. Idempotent -- recording an already-seen id is a no-op and
      * won't create a duplicate eviction-queue entry.
      */
-    func record(msgId: Data)
-
+    func record(msgId: Data) 
+    
 }
 
 /**
@@ -2097,9 +2343,9 @@ public convenience init() {
         try! rustCall { uniffi_cruisemesh_core_fn_free_seenids(pointer, $0) }
     }
 
+    
 
-
-
+    
     /**
      * Record that we've now handled `msg_id`, returning `true` if it was
      * **new** (the caller should process/relay this envelope) or `false` if
@@ -2113,7 +2359,7 @@ open func checkAndRecord(msgId: Data) -> Bool {
     )
 })
 }
-
+    
     /**
      * Current number of retained ids (for tests/diagnostics).
      */
@@ -2123,7 +2369,7 @@ open func len() -> UInt64 {
     )
 })
 }
-
+    
     /**
      * Record `msg_id` as seen without reporting novelty, for envelopes this
      * node *authored*: a sealed box can't be opened by its own sender
@@ -2138,7 +2384,7 @@ open func record(msgId: Data) {try! rustCall() {
     )
 }
 }
-
+    
 
 }
 
@@ -2262,10 +2508,10 @@ public struct FfiConverterTypeCarriedEnvelope: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CarriedEnvelope {
         return
             try CarriedEnvelope(
-                msgId: FfiConverterData.read(from: &buf),
-                hopTtl: FfiConverterUInt8.read(from: &buf),
-                expiry: FfiConverterInt64.read(from: &buf),
-                recipientHint: FfiConverterData.read(from: &buf),
+                msgId: FfiConverterData.read(from: &buf), 
+                hopTtl: FfiConverterUInt8.read(from: &buf), 
+                expiry: FfiConverterInt64.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf), 
                 sealed: FfiConverterData.read(from: &buf)
         )
     }
@@ -2364,11 +2610,11 @@ public struct FfiConverterTypeContact: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Contact {
         return
             try Contact(
-                userId: FfiConverterData.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
-                signPk: FfiConverterData.read(from: &buf),
-                agreePk: FfiConverterData.read(from: &buf),
-                relayUrl: FfiConverterOptionString.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                signPk: FfiConverterData.read(from: &buf), 
+                agreePk: FfiConverterData.read(from: &buf), 
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
                 relayToken: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -2453,9 +2699,9 @@ public struct FfiConverterTypeContactDiscoveryPolicy: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactDiscoveryPolicy {
         return
             try ContactDiscoveryPolicy(
-                userId: FfiConverterData.read(from: &buf),
-                protocolVersion: FfiConverterUInt8.read(from: &buf),
-                enabled: FfiConverterBool.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                protocolVersion: FfiConverterUInt8.read(from: &buf), 
+                enabled: FfiConverterBool.read(from: &buf), 
                 revision: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -2498,7 +2744,7 @@ public struct ContactProvenance {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(userId: Data,
+    public init(userId: Data, 
         /**
          * 0 = direct QR/link, 1 = introduced by another accepted contact.
          */source: UInt8, introducerUserId: Data?, introducedAtMs: Int64) {
@@ -2544,9 +2790,9 @@ public struct FfiConverterTypeContactProvenance: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactProvenance {
         return
             try ContactProvenance(
-                userId: FfiConverterData.read(from: &buf),
-                source: FfiConverterUInt8.read(from: &buf),
-                introducerUserId: FfiConverterOptionData.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                source: FfiConverterUInt8.read(from: &buf), 
+                introducerUserId: FfiConverterOptionData.read(from: &buf), 
                 introducedAtMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -2618,7 +2864,7 @@ public struct FfiConverterTypeDigestEntry: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DigestEntry {
         return
             try DigestEntry(
-                senderUserId: FfiConverterData.read(from: &buf),
+                senderUserId: FfiConverterData.read(from: &buf), 
                 throughLamport: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -2712,11 +2958,11 @@ public struct FfiConverterTypeExtendedMessageBody: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ExtendedMessageBody {
         return
             try ExtendedMessageBody(
-                kind: FfiConverterUInt8.read(from: &buf),
-                chatId: FfiConverterData.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
-                timestamp: FfiConverterInt64.read(from: &buf),
-                content: FfiConverterData.read(from: &buf),
+                kind: FfiConverterUInt8.read(from: &buf), 
+                chatId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
+                timestamp: FfiConverterInt64.read(from: &buf), 
+                content: FfiConverterData.read(from: &buf), 
                 replyToMsgId: FfiConverterOptionData.read(from: &buf)
         )
     }
@@ -2808,10 +3054,10 @@ public struct FfiConverterTypeFriendCard: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendCard {
         return
             try FriendCard(
-                name: FfiConverterString.read(from: &buf),
-                signPk: FfiConverterData.read(from: &buf),
-                agreePk: FfiConverterData.read(from: &buf),
-                relayUrl: FfiConverterOptionString.read(from: &buf),
+                name: FfiConverterString.read(from: &buf), 
+                signPk: FfiConverterData.read(from: &buf), 
+                agreePk: FfiConverterData.read(from: &buf), 
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
                 relayToken: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -2886,8 +3132,8 @@ public struct FfiConverterTypeFriendDirectoryContent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendDirectoryContent {
         return
             try FriendDirectoryContent(
-                version: FfiConverterUInt8.read(from: &buf),
-                revision: FfiConverterUInt64.read(from: &buf),
+                version: FfiConverterUInt8.read(from: &buf), 
+                revision: FfiConverterUInt64.read(from: &buf), 
                 entries: FfiConverterSequenceTypeFriendDirectoryEntry.read(from: &buf)
         )
     }
@@ -2960,8 +3206,8 @@ public struct FfiConverterTypeFriendDirectoryEntry: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendDirectoryEntry {
         return
             try FriendDirectoryEntry(
-                candidate: FfiConverterTypeSuggestedFriendCard.read(from: &buf),
-                candidatePolicyRevision: FfiConverterUInt64.read(from: &buf),
+                candidate: FfiConverterTypeSuggestedFriendCard.read(from: &buf), 
+                candidatePolicyRevision: FfiConverterUInt64.read(from: &buf), 
                 ticket: FfiConverterTypeIntroductionTicket.read(from: &buf)
         )
     }
@@ -3004,7 +3250,7 @@ public struct FriendSuggestion {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(candidate: SuggestedFriendCard, introducerUserId: Data, ticket: IntroductionTicket,
+    public init(candidate: SuggestedFriendCard, introducerUserId: Data, ticket: IntroductionTicket, 
         /**
          * 0 = available, 1 = requested, 2 = hidden.
          */state: UInt8) {
@@ -3050,9 +3296,9 @@ public struct FfiConverterTypeFriendSuggestion: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendSuggestion {
         return
             try FriendSuggestion(
-                candidate: FfiConverterTypeSuggestedFriendCard.read(from: &buf),
-                introducerUserId: FfiConverterData.read(from: &buf),
-                ticket: FfiConverterTypeIntroductionTicket.read(from: &buf),
+                candidate: FfiConverterTypeSuggestedFriendCard.read(from: &buf), 
+                introducerUserId: FfiConverterData.read(from: &buf), 
+                ticket: FfiConverterTypeIntroductionTicket.read(from: &buf), 
                 state: FfiConverterUInt8.read(from: &buf)
         )
     }
@@ -3136,9 +3382,9 @@ public struct FfiConverterTypeGroup: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Group {
         return
             try Group(
-                id: FfiConverterData.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
-                memberUserIds: FfiConverterSequenceData.read(from: &buf),
+                id: FfiConverterData.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                memberUserIds: FfiConverterSequenceData.read(from: &buf), 
                 key: FfiConverterData.read(from: &buf)
         )
     }
@@ -3230,10 +3476,10 @@ public struct FfiConverterTypeIdentity: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Identity {
         return
             try Identity(
-                userId: FfiConverterData.read(from: &buf),
-                signPk: FfiConverterData.read(from: &buf),
-                signSk: FfiConverterData.read(from: &buf),
-                agreePk: FfiConverterData.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                signPk: FfiConverterData.read(from: &buf), 
+                signSk: FfiConverterData.read(from: &buf), 
+                agreePk: FfiConverterData.read(from: &buf), 
                 agreeSk: FfiConverterData.read(from: &buf)
         )
     }
@@ -3308,8 +3554,8 @@ public struct FfiConverterTypeIntroducedFriendRequest: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IntroducedFriendRequest {
         return
             try IntroducedFriendRequest(
-                version: FfiConverterUInt8.read(from: &buf),
-                friendCardJson: FfiConverterString.read(from: &buf),
+                version: FfiConverterUInt8.read(from: &buf), 
+                friendCardJson: FfiConverterString.read(from: &buf), 
                 ticket: FfiConverterTypeIntroductionTicket.read(from: &buf)
         )
     }
@@ -3422,14 +3668,14 @@ public struct FfiConverterTypeIntroductionTicket: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IntroductionTicket {
         return
             try IntroductionTicket(
-                version: FfiConverterUInt8.read(from: &buf),
-                introducerUserId: FfiConverterData.read(from: &buf),
-                candidateUserId: FfiConverterData.read(from: &buf),
-                inviteeUserId: FfiConverterData.read(from: &buf),
-                candidatePolicyRevision: FfiConverterUInt64.read(from: &buf),
-                issuedAtMs: FfiConverterInt64.read(from: &buf),
-                expiresAtMs: FfiConverterInt64.read(from: &buf),
-                offerId: FfiConverterData.read(from: &buf),
+                version: FfiConverterUInt8.read(from: &buf), 
+                introducerUserId: FfiConverterData.read(from: &buf), 
+                candidateUserId: FfiConverterData.read(from: &buf), 
+                inviteeUserId: FfiConverterData.read(from: &buf), 
+                candidatePolicyRevision: FfiConverterUInt64.read(from: &buf), 
+                issuedAtMs: FfiConverterInt64.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf), 
+                offerId: FfiConverterData.read(from: &buf), 
                 signature: FfiConverterData.read(from: &buf)
         )
     }
@@ -3512,8 +3758,8 @@ public struct FfiConverterTypeMessageArrival: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageArrival {
         return
             try MessageArrival(
-                transport: FfiConverterUInt8.read(from: &buf),
-                hopsTaken: FfiConverterUInt8.read(from: &buf),
+                transport: FfiConverterUInt8.read(from: &buf), 
+                hopsTaken: FfiConverterUInt8.read(from: &buf), 
                 receivedAt: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -3603,10 +3849,10 @@ public struct FfiConverterTypeMessageBody: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageBody {
         return
             try MessageBody(
-                kind: FfiConverterUInt8.read(from: &buf),
-                chatId: FfiConverterData.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
-                timestamp: FfiConverterInt64.read(from: &buf),
+                kind: FfiConverterUInt8.read(from: &buf), 
+                chatId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
+                timestamp: FfiConverterInt64.read(from: &buf), 
                 content: FfiConverterData.read(from: &buf)
         )
     }
@@ -3679,7 +3925,7 @@ public struct FfiConverterTypeMessageReference: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageReference {
         return
             try MessageReference(
-                msgId: FfiConverterData.read(from: &buf),
+                msgId: FfiConverterData.read(from: &buf), 
                 replyToMsgId: FfiConverterOptionData.read(from: &buf)
         )
     }
@@ -3749,7 +3995,7 @@ public struct FfiConverterTypeOpenedMessage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OpenedMessage {
         return
             try OpenedMessage(
-                senderUserId: FfiConverterData.read(from: &buf),
+                senderUserId: FfiConverterData.read(from: &buf), 
                 payload: FfiConverterData.read(from: &buf)
         )
     }
@@ -3875,16 +4121,16 @@ public struct FfiConverterTypeOutboundEnvelope: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutboundEnvelope {
         return
             try OutboundEnvelope(
-                msgId: FfiConverterData.read(from: &buf),
-                recipientUserId: FfiConverterData.read(from: &buf),
-                chatId: FfiConverterData.read(from: &buf),
-                senderUserId: FfiConverterData.read(from: &buf),
-                kind: FfiConverterUInt8.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
-                timestamp: FfiConverterInt64.read(from: &buf),
-                hopTtl: FfiConverterUInt8.read(from: &buf),
-                expiry: FfiConverterInt64.read(from: &buf),
-                recipientHint: FfiConverterData.read(from: &buf),
+                msgId: FfiConverterData.read(from: &buf), 
+                recipientUserId: FfiConverterData.read(from: &buf), 
+                chatId: FfiConverterData.read(from: &buf), 
+                senderUserId: FfiConverterData.read(from: &buf), 
+                kind: FfiConverterUInt8.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
+                timestamp: FfiConverterInt64.read(from: &buf), 
+                hopTtl: FfiConverterUInt8.read(from: &buf), 
+                expiry: FfiConverterInt64.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf), 
                 sealed: FfiConverterData.read(from: &buf)
         )
     }
@@ -4020,16 +4266,16 @@ public struct FfiConverterTypeOutgoingReceiptEnvelope: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutgoingReceiptEnvelope {
         return
             try OutgoingReceiptEnvelope(
-                msgId: FfiConverterData.read(from: &buf),
-                recipientUserId: FfiConverterData.read(from: &buf),
-                chatId: FfiConverterData.read(from: &buf),
-                senderUserId: FfiConverterData.read(from: &buf),
-                receiptType: FfiConverterUInt8.read(from: &buf),
-                throughLamport: FfiConverterUInt64.read(from: &buf),
-                timestamp: FfiConverterInt64.read(from: &buf),
-                hopTtl: FfiConverterUInt8.read(from: &buf),
-                expiry: FfiConverterInt64.read(from: &buf),
-                recipientHint: FfiConverterData.read(from: &buf),
+                msgId: FfiConverterData.read(from: &buf), 
+                recipientUserId: FfiConverterData.read(from: &buf), 
+                chatId: FfiConverterData.read(from: &buf), 
+                senderUserId: FfiConverterData.read(from: &buf), 
+                receiptType: FfiConverterUInt8.read(from: &buf), 
+                throughLamport: FfiConverterUInt64.read(from: &buf), 
+                timestamp: FfiConverterInt64.read(from: &buf), 
+                hopTtl: FfiConverterUInt8.read(from: &buf), 
+                expiry: FfiConverterInt64.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf), 
                 sealed: FfiConverterData.read(from: &buf)
         )
     }
@@ -4133,11 +4379,11 @@ public struct FfiConverterTypeProfileSyncContent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProfileSyncContent {
         return
             try ProfileSyncContent(
-                avatarEpoch: FfiConverterInt64.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
-                avatar: FfiConverterData.read(from: &buf),
-                friendsOfFriendsVersion: FfiConverterUInt8.read(from: &buf),
-                friendsOfFriendsEnabled: FfiConverterBool.read(from: &buf),
+                avatarEpoch: FfiConverterInt64.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterData.read(from: &buf), 
+                friendsOfFriendsVersion: FfiConverterUInt8.read(from: &buf), 
+                friendsOfFriendsEnabled: FfiConverterBool.read(from: &buf), 
                 friendsOfFriendsRevision: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -4224,9 +4470,9 @@ public struct FfiConverterTypeReceiptContent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceiptContent {
         return
             try ReceiptContent(
-                chatId: FfiConverterData.read(from: &buf),
-                senderUserId: FfiConverterData.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
+                chatId: FfiConverterData.read(from: &buf), 
+                senderUserId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
                 receiptType: FfiConverterUInt8.read(from: &buf)
         )
     }
@@ -4323,11 +4569,11 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StoredMessage {
         return
             try StoredMessage(
-                chatId: FfiConverterData.read(from: &buf),
-                senderUserId: FfiConverterData.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
-                timestamp: FfiConverterInt64.read(from: &buf),
-                kind: FfiConverterUInt8.read(from: &buf),
+                chatId: FfiConverterData.read(from: &buf), 
+                senderUserId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
+                timestamp: FfiConverterInt64.read(from: &buf), 
+                kind: FfiConverterUInt8.read(from: &buf), 
                 payload: FfiConverterData.read(from: &buf)
         )
     }
@@ -4413,9 +4659,9 @@ public struct FfiConverterTypeSuggestedFriendCard: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SuggestedFriendCard {
         return
             try SuggestedFriendCard(
-                name: FfiConverterString.read(from: &buf),
-                userId: FfiConverterData.read(from: &buf),
-                signPk: FfiConverterData.read(from: &buf),
+                name: FfiConverterString.read(from: &buf), 
+                userId: FfiConverterData.read(from: &buf), 
+                signPk: FfiConverterData.read(from: &buf), 
                 agreePk: FfiConverterData.read(from: &buf)
         )
     }
@@ -4446,8 +4692,8 @@ public func FfiConverterTypeSuggestedFriendCard_lower(_ value: SuggestedFriendCa
 
 public enum CoreError {
 
-
-
+    
+    
     case InvalidFriendCard(String
     )
     case InvalidKeyLength(expected: UInt32, actual: UInt32
@@ -4472,14 +4718,14 @@ public struct FfiConverterTypeCoreError: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
+        
 
-
-
+        
         case 1: return .InvalidFriendCard(
             try FfiConverterString.read(from: &buf)
             )
         case 2: return .InvalidKeyLength(
-            expected: try FfiConverterUInt32.read(from: &buf),
+            expected: try FfiConverterUInt32.read(from: &buf), 
             actual: try FfiConverterUInt32.read(from: &buf)
             )
         case 3: return .Store(
@@ -4500,39 +4746,39 @@ public struct FfiConverterTypeCoreError: FfiConverterRustBuffer {
     public static func write(_ value: CoreError, into buf: inout [UInt8]) {
         switch value {
 
+        
 
-
-
-
+        
+        
         case let .InvalidFriendCard(v1):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(v1, into: &buf)
-
-
+            
+        
         case let .InvalidKeyLength(expected,actual):
             writeInt(&buf, Int32(2))
             FfiConverterUInt32.write(expected, into: &buf)
             FfiConverterUInt32.write(actual, into: &buf)
-
-
+            
+        
         case let .Store(v1):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(v1, into: &buf)
-
-
+            
+        
         case let .Crypto(v1):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(v1, into: &buf)
-
-
+            
+        
         case .SignatureInvalid:
             writeInt(&buf, Int32(5))
-
-
+        
+        
         case let .Malformed(v1):
             writeInt(&buf, Int32(6))
             FfiConverterString.write(v1, into: &buf)
-
+            
         }
     }
 }
@@ -4555,7 +4801,7 @@ extension CoreError: Foundation.LocalizedError {
  */
 
 public enum Frame {
-
+    
     case hello(userId: Data
     )
     case envelope(msgId: Data, hopTtl: UInt8, expiry: Int64, recipientHint: Data, sealed: Data
@@ -4574,29 +4820,29 @@ public struct FfiConverterTypeFrame: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Frame {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-
+        
         case 1: return .hello(userId: try FfiConverterData.read(from: &buf)
         )
-
+        
         case 2: return .envelope(msgId: try FfiConverterData.read(from: &buf), hopTtl: try FfiConverterUInt8.read(from: &buf), expiry: try FfiConverterInt64.read(from: &buf), recipientHint: try FfiConverterData.read(from: &buf), sealed: try FfiConverterData.read(from: &buf)
         )
-
+        
         case 3: return .digest(chatId: try FfiConverterData.read(from: &buf), entries: try FfiConverterSequenceTypeDigestEntry.read(from: &buf), recentMsgIds: try FfiConverterSequenceData.read(from: &buf)
         )
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: Frame, into buf: inout [UInt8]) {
         switch value {
-
-
+        
+        
         case let .hello(userId):
             writeInt(&buf, Int32(1))
             FfiConverterData.write(userId, into: &buf)
-
-
+            
+        
         case let .envelope(msgId,hopTtl,expiry,recipientHint,sealed):
             writeInt(&buf, Int32(2))
             FfiConverterData.write(msgId, into: &buf)
@@ -4604,14 +4850,14 @@ public struct FfiConverterTypeFrame: FfiConverterRustBuffer {
             FfiConverterInt64.write(expiry, into: &buf)
             FfiConverterData.write(recipientHint, into: &buf)
             FfiConverterData.write(sealed, into: &buf)
-
-
+            
+        
         case let .digest(chatId,entries,recentMsgIds):
             writeInt(&buf, Int32(3))
             FfiConverterData.write(chatId, into: &buf)
             FfiConverterSequenceTypeDigestEntry.write(entries, into: &buf)
             FfiConverterSequenceData.write(recentMsgIds, into: &buf)
-
+            
         }
     }
 }
@@ -5449,6 +5695,24 @@ public func generateMsgId() -> Data {
     )
 })
 }
+public func lanDefaultTcpPort() -> UInt16 {
+    return try!  FfiConverterUInt16.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_default_tcp_port($0
+    )
+})
+}
+public func lanMaxFrameSize() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_max_frame_size($0
+    )
+})
+}
+public func lanServiceType() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_service_type($0
+    )
+})
+}
 /**
  * Build the JSON payload shared via QR code / pasted text when friending.
  */
@@ -5678,6 +5942,15 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_generate_msg_id() != 28688) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_lan_default_tcp_port() != 33372) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_max_frame_size() != 29933) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_service_type() != 61768) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_make_friend_card() != 38013) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5709,6 +5982,24 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_verify_introduction_ticket() != 3092) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_decrypt_record() != 12115) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_encrypt_frame() != 54052) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_is_handshake_finished() != 36518) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_read_handshake_message() != 48838) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_remote_static_key() != 43732) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_write_handshake_message() != 61679) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_friend_directory() != 32757) {
@@ -5883,6 +6174,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_seenids_record() != 24410) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_lannoisesession_new() != 19269) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_messagestore_open() != 5259) {
