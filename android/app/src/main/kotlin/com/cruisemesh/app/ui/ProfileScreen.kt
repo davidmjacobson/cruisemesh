@@ -50,6 +50,7 @@ import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.mesh.MeshStartupPreferences
+import com.cruisemesh.app.mesh.SameLanProbeStatus
 import com.cruisemesh.app.relay.RelayConfigStore
 import android.widget.Toast
 
@@ -353,6 +354,21 @@ fun ProfileScreen(
                             .padding(top = 8.dp),
                     ) {
                         Text("Share debug log")
+                    }
+                    val lanProbe = SameLanProbeStatus.snapshot
+                    Text(
+                        text = "Same-LAN probe: ${lanProbe.detail}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 16.dp),
+                    )
+                    Button(
+                        onClick = SameLanProbeStatus::requestProbe,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                    ) {
+                        Text("Probe local network again")
                     }
                 }
             }

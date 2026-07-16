@@ -14,6 +14,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
@@ -211,6 +212,7 @@ class MeshService : Service() {
     private var bluetoothAudioReceiverRegistered = false
     private var bluetoothStateReceiverRegistered = false
     private var relayNetworkCallbackRegistered = false
+    private var sameLanProbeManager: SameLanProbeManager? = null
     /**
      * The network relay traffic is pinned to: the best network with validated
      * internet, as granted by [ConnectivityManager.requestNetwork]. The system
@@ -369,6 +371,9 @@ class MeshService : Service() {
         RelaySyncEvents.register { requestRelaySync("queue changed") }
 
         running = true
+        if ((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+            sameLanProbeManager = SameLanProbeManager(applicationContext).also { it.start() }
+        }
         publishInitialRelayHealth()
         registerBluetoothAudioReceiver()
         registerBluetoothStateReceiver()
@@ -391,6 +396,8 @@ class MeshService : Service() {
 
     override fun onDestroy() {
         running = false
+        sameLanProbeManager?.stop()
+        sameLanProbeManager = null
         MeshRuntimeStatus.markStopped()
         unregisterBluetoothAudioReceiver()
         unregisterBluetoothStateReceiver()
