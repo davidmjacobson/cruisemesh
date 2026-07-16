@@ -328,21 +328,33 @@ final class LanTransport {
         connections.removeValue(forKey: link.address)
         if let serviceKey = link.serviceKey {
             outboundAddresses.removeValue(forKey: serviceKey)
-            let attempt = reconnectAttempts[serviceKey, default: 0]
-            reconnectAttempts[serviceKey] = min(attempt + 1, Self.reconnectDelays.count - 1)
-            let delay = Self.reconnectDelays[min(attempt, Self.reconnectDelays.count - 1)]
-            if !link.wasAuthenticated {
+            if serviceKey.hasPrefix("scan:"), !link.wasAuthenticated {
+                // A successful TCP connect can still be an unrelated service
+                // on the default port. Do not retain or retry it after Noise
+                // rejects the peer; explicit scans remain bounded.
+                discoveredEndpoints.removeValue(forKey: serviceKey)
+                reconnectAttempts.removeValue(forKey: serviceKey)
                 diagnostics.connectionFailed(
-                    discoveredEndpoints[serviceKey].map { String(describing: $0) } ?? serviceKey,
-                    reason: "Secure connection failed; CruiseMesh will retry"
+                    serviceKey,
+                    reason: "The discovered TCP service was not an accepted CruiseMesh friend"
                 )
-            }
-            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self,
-                      started,
-                      outboundAddresses[serviceKey] == nil,
-                      let endpoint = discoveredEndpoints[serviceKey] else { return }
-                connect(to: endpoint, serviceKey: serviceKey)
+            } else {
+                let attempt = reconnectAttempts[serviceKey, default: 0]
+                reconnectAttempts[serviceKey] = min(attempt + 1, Self.reconnectDelays.count - 1)
+                let delay = Self.reconnectDelays[min(attempt, Self.reconnectDelays.count - 1)]
+                if !link.wasAuthenticated {
+                    diagnostics.connectionFailed(
+                        discoveredEndpoints[serviceKey].map { String(describing: $0) } ?? serviceKey,
+                        reason: "Secure connection failed; CruiseMesh will retry"
+                    )
+                }
+                queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self,
+                          started,
+                          outboundAddresses[serviceKey] == nil,
+                          let endpoint = discoveredEndpoints[serviceKey] else { return }
+                    connect(to: endpoint, serviceKey: serviceKey)
+                }
             }
         }
         if link.wasAuthenticated {
