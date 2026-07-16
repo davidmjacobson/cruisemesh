@@ -18,10 +18,24 @@ final class RealMeshSender: MeshSender {
     }
 
     func sendText(contact: Contact, text: String) {
-        enqueue(contact: contact, kind: ProtocolKind.text, payload: Data(text.utf8), label: "sendText")
+        sendText(contact: contact, text: text, replyToMsgId: nil)
+    }
+
+    func sendText(contact: Contact, text: String, replyToMsgId: Data?) {
+        enqueue(
+            contact: contact,
+            kind: ProtocolKind.text,
+            payload: Data(text.utf8),
+            label: "sendText",
+            replyToMsgId: replyToMsgId
+        )
     }
 
     func sendAttachment(contact: Contact, attachment: AttachmentPayload) {
+        sendAttachment(contact: contact, attachment: attachment, replyToMsgId: nil)
+    }
+
+    func sendAttachment(contact: Contact, attachment: AttachmentPayload, replyToMsgId: Data?) {
         guard attachment.blob.count <= AttachmentPayload.maxBlobBytes else {
             log.warning("Refusing oversized attachment")
             return
@@ -30,7 +44,8 @@ final class RealMeshSender: MeshSender {
             contact: contact,
             kind: ProtocolKind.attachmentManifest,
             payload: attachment.encode(),
-            label: "sendAttachment"
+            label: "sendAttachment",
+            replyToMsgId: replyToMsgId
         )
     }
 
@@ -43,7 +58,13 @@ final class RealMeshSender: MeshSender {
         )
     }
 
-    private func enqueue(contact: Contact, kind: UInt8, payload: Data, label: String) {
+    private func enqueue(
+        contact: Contact,
+        kind: UInt8,
+        payload: Data,
+        label: String,
+        replyToMsgId: Data? = nil
+    ) {
         let chatId = contact.userId
         let own = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0
         let delivered = (try? store.receiptThrough(
@@ -66,10 +87,24 @@ final class RealMeshSender: MeshSender {
             kind: kind,
             payload: payload
         )
-        guard let outbound = buildOutboundAuthoredEnvelope(identity: identity, contact: contact, message: message) else {
+        guard let outbound = buildOutboundAuthoredEnvelope(
+            identity: identity,
+            contact: contact,
+            message: message,
+            replyToMsgId: replyToMsgId
+        ) else {
             return
         }
-        _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
+        if let replyToMsgId {
+            _ = try? store.insertOutgoingReply(
+                message: message,
+                envelope: outbound,
+                replyToMsgId: replyToMsgId,
+                queuedAtMs: timestamp
+            )
+        } else {
+            _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
+        }
         ChatEvents.notifyChatChanged(chatId)
         RelaySyncEvents.requestSync()
         // A pending kind-3 friend card must reach the peer before the first
