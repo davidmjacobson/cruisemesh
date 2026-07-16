@@ -118,6 +118,10 @@
 //! - `0x02` = sealed envelope: crypto.rs's sealed blob, now wrapped in the
 //!   §6.4 public header described below.
 //! - `0x03` = DIGEST: a per-chat sync digest (DESIGN.md §7.3; layout below).
+//! - `0x04` = LAN_ENDPOINT: an accepted link peer's current TCP listener
+//!   candidate. This is reachability data, never authentication.
+//! - `0x05` = TRANSPORT_PROBE: a request/response nonce used to measure an
+//!   already-established transport without creating a chat message.
 //!
 //! **Why HELLO is deliberately unauthenticated:** BLE central/peripheral
 //! roles only give you a transient, unauthenticated link (a MAC-layer
@@ -286,9 +290,15 @@ pub const DEFAULT_EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const FRAME_TYPE_HELLO: u8 = 0x01;
 const FRAME_TYPE_ENVELOPE: u8 = 0x02;
 const FRAME_TYPE_DIGEST: u8 = 0x03;
+const FRAME_TYPE_LAN_ENDPOINT: u8 = 0x04;
+const FRAME_TYPE_TRANSPORT_PROBE: u8 = 0x05;
 
 const MSG_ID_LEN: usize = 16;
 const RECIPIENT_HINT_LEN: usize = 8;
+const LAN_INSTANCE_TOKEN_LEN: usize = 8;
+const LAN_ENDPOINT_VERSION: u8 = 1;
+const TRANSPORT_PROBE_VERSION: u8 = 1;
+const MAX_LAN_HOST_BYTES: usize = u8::MAX as usize;
 const MESSAGE_EXTENSION_REPLY_TO_MSG_ID: u8 = 1;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 const PROFILE_SYNC_VERSION: u8 = 2;
@@ -793,9 +803,8 @@ fn introduction_ticket_bytes(ticket: &IntroductionTicket) -> Result<Vec<u8>, Cor
     Ok(out)
 }
 
-/// A parsed BLE frame: an unauthenticated HELLO (see module docs for why
-/// that's a considered choice), an opaque sealed envelope, or a per-chat
-/// sync digest (DESIGN.md §7.3).
+/// A parsed link frame. HELLO, DIGEST, LAN endpoint hints, and probes are
+/// link-control traffic; message content remains inside sealed envelopes.
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
 pub enum Frame {
     Hello {
@@ -812,6 +821,15 @@ pub enum Frame {
         chat_id: Vec<u8>,
         entries: Vec<DigestEntry>,
         recent_msg_ids: Vec<Vec<u8>>,
+    },
+    LanEndpoint {
+        instance_token: Vec<u8>,
+        host: String,
+        port: u16,
+    },
+    TransportProbe {
+        nonce: u64,
+        response: bool,
     },
 }
 
@@ -935,6 +953,59 @@ pub fn encode_digest(
     out
 }
 
+/// Encode a LAN endpoint introduction. The opaque 8-byte instance token is
+/// the same connection-election value advertised through DNS-SD. The host is
+/// an IP literal or local hostname, limited to 255 UTF-8 bytes. A receiver
+/// must never trust the hint by itself: the resulting TCP connection still
+/// has to authenticate the expected accepted contact through Noise.
+#[uniffi::export]
+pub fn encode_lan_endpoint(
+    instance_token: Vec<u8>,
+    host: String,
+    port: u16,
+) -> Result<Vec<u8>, CoreError> {
+    if instance_token.len() != LAN_INSTANCE_TOKEN_LEN {
+        return Err(CoreError::Malformed(format!(
+            "LAN instance token must be {LAN_INSTANCE_TOKEN_LEN} bytes"
+        )));
+    }
+    if port == 0 {
+        return Err(CoreError::Malformed(
+            "LAN endpoint port must be non-zero".to_string(),
+        ));
+    }
+    let host_bytes = host.as_bytes();
+    if host_bytes.is_empty()
+        || host_bytes.len() > MAX_LAN_HOST_BYTES
+        || host.chars().any(char::is_whitespace)
+    {
+        return Err(CoreError::Malformed(
+            "LAN endpoint host is empty, too long, or contains whitespace".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(1 + 1 + LAN_INSTANCE_TOKEN_LEN + 2 + 1 + host_bytes.len());
+    out.push(FRAME_TYPE_LAN_ENDPOINT);
+    out.push(LAN_ENDPOINT_VERSION);
+    out.extend_from_slice(&instance_token);
+    out.extend_from_slice(&port.to_be_bytes());
+    out.push(host_bytes.len() as u8);
+    out.extend_from_slice(host_bytes);
+    Ok(out)
+}
+
+/// Encode an encrypted-link health probe. Callers choose a unique nonce and
+/// echo it back with `response = true`; no timestamps or identities cross the
+/// wire.
+#[uniffi::export]
+pub fn encode_transport_probe(nonce: u64, response: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(11);
+    out.push(FRAME_TYPE_TRANSPORT_PROBE);
+    out.push(TRANSPORT_PROBE_VERSION);
+    out.push(u8::from(response));
+    out.extend_from_slice(&nonce.to_be_bytes());
+    out
+}
+
 /// Parse a frame-type byte + body into a [`Frame`]. Rejects empty input, an
 /// unrecognized frame-type byte, a HELLO/envelope frame with no body, and a
 /// truncated or trailing-garbage DIGEST body.
@@ -999,6 +1070,59 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
                 entries,
                 recent_msg_ids,
             })
+        }
+        FRAME_TYPE_LAN_ENDPOINT => {
+            let mut cursor = Cursor::new(rest);
+            let version = cursor.take_u8()?;
+            if version != LAN_ENDPOINT_VERSION {
+                return Err(CoreError::Malformed(format!(
+                    "unsupported LAN endpoint version: {version}"
+                )));
+            }
+            let instance_token = cursor.take(LAN_INSTANCE_TOKEN_LEN)?.to_vec();
+            let port = cursor.take_u16()?;
+            if port == 0 {
+                return Err(CoreError::Malformed(
+                    "LAN endpoint port must be non-zero".to_string(),
+                ));
+            }
+            let host_len = cursor.take_u8()? as usize;
+            let host_bytes = cursor.take(host_len)?;
+            cursor.finish()?;
+            let host = std::str::from_utf8(host_bytes)
+                .map_err(|_| CoreError::Malformed("LAN endpoint host is not UTF-8".to_string()))?
+                .to_string();
+            if host.is_empty() || host.chars().any(char::is_whitespace) {
+                return Err(CoreError::Malformed(
+                    "LAN endpoint host is empty or contains whitespace".to_string(),
+                ));
+            }
+            Ok(Frame::LanEndpoint {
+                instance_token,
+                host,
+                port,
+            })
+        }
+        FRAME_TYPE_TRANSPORT_PROBE => {
+            let mut cursor = Cursor::new(rest);
+            let version = cursor.take_u8()?;
+            if version != TRANSPORT_PROBE_VERSION {
+                return Err(CoreError::Malformed(format!(
+                    "unsupported transport probe version: {version}"
+                )));
+            }
+            let response = match cursor.take_u8()? {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(CoreError::Malformed(format!(
+                        "invalid transport probe response flag: {other}"
+                    )))
+                }
+            };
+            let nonce = cursor.take_u64()?;
+            cursor.finish()?;
+            Ok(Frame::TransportProbe { nonce, response })
         }
         other => Err(CoreError::Malformed(format!(
             "unknown frame type byte: 0x{other:02x}"
@@ -1729,6 +1853,76 @@ mod tests {
             }
             other => panic!("expected Digest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lan_endpoint_frame_round_trips() {
+        let token = vec![0xAB; LAN_INSTANCE_TOKEN_LEN];
+        let framed =
+            encode_lan_endpoint(token.clone(), "10.154.189.58".to_string(), 45_892).unwrap();
+        assert_eq!(framed[0], FRAME_TYPE_LAN_ENDPOINT);
+        match parse_frame(framed).expect("parses") {
+            Frame::LanEndpoint {
+                instance_token,
+                host,
+                port,
+            } => {
+                assert_eq!(instance_token, token);
+                assert_eq!(host, "10.154.189.58");
+                assert_eq!(port, 45_892);
+            }
+            other => panic!("expected LAN endpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lan_endpoint_rejects_invalid_fields_and_trailing_data() {
+        assert!(encode_lan_endpoint(vec![1; 7], "10.0.0.2".to_string(), 45_892).is_err());
+        assert!(
+            encode_lan_endpoint(vec![1; LAN_INSTANCE_TOKEN_LEN], "10.0.0.2".to_string(), 0,)
+                .is_err()
+        );
+        assert!(encode_lan_endpoint(
+            vec![1; LAN_INSTANCE_TOKEN_LEN],
+            "not a host".to_string(),
+            45_892,
+        )
+        .is_err());
+
+        let mut framed = encode_lan_endpoint(
+            vec![1; LAN_INSTANCE_TOKEN_LEN],
+            "10.0.0.2".to_string(),
+            45_892,
+        )
+        .unwrap();
+        framed.push(0xFF);
+        assert!(parse_frame(framed).is_err());
+    }
+
+    #[test]
+    fn transport_probe_request_and_response_round_trip() {
+        for response in [false, true] {
+            let framed = encode_transport_probe(0x0102_0304_0506_0708, response);
+            assert_eq!(framed[0], FRAME_TYPE_TRANSPORT_PROBE);
+            assert_eq!(
+                parse_frame(framed).unwrap(),
+                Frame::TransportProbe {
+                    nonce: 0x0102_0304_0506_0708,
+                    response,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn transport_probe_rejects_bad_flag_and_trailing_data() {
+        let mut bad_flag = encode_transport_probe(7, false);
+        bad_flag[2] = 2;
+        assert!(parse_frame(bad_flag).is_err());
+
+        let mut trailing = encode_transport_probe(7, false);
+        trailing.push(0xFF);
+        assert!(parse_frame(trailing).is_err());
     }
 
     #[test]
