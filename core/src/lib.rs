@@ -7,6 +7,7 @@ mod crypto;
 mod gossip;
 mod groups;
 mod identity;
+mod lan_session;
 mod protocol;
 mod store;
 
@@ -19,6 +20,10 @@ pub use groups::{
 pub use identity::{
     fingerprint_words, generate_identity, make_friend_card, make_friend_link, parse_friend_card,
     parse_friend_text, CoreError, FriendCard, Identity,
+};
+pub use lan_session::{
+    lan_default_tcp_port, lan_max_frame_size, lan_service_type, LanNoiseSession,
+    LAN_DEFAULT_TCP_PORT, LAN_MAX_FRAME_SIZE, LAN_SERVICE_TYPE,
 };
 pub use protocol::{
     compute_recipient_hint, create_introduction_ticket, decode_extended_message_body,
