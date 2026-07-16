@@ -255,6 +255,7 @@ private struct GroupMessageRow: View {
     let onReact: (String) -> Void
     let onReply: () -> Void
     let onQuotedTap: (StoredMessage) -> Void
+    @State private var showInfo = false
 
     var body: some View {
         if message.kind == ProtocolKind.groupInvite {
@@ -301,6 +302,11 @@ private struct GroupMessageRow: View {
                             ForEach(reactionChoices, id: \.self) { emoji in
                                 Button(emoji) { onReact(emoji) }
                             }
+                            Button {
+                                showInfo = true
+                            } label: {
+                                Label("Info", systemImage: "info.circle")
+                            }
                         }
                     if !reactions.isEmpty {
                         ReactionPillRow(reactions: reactions, isOwn: isOwn, onReact: onReact)
@@ -312,6 +318,20 @@ private struct GroupMessageRow: View {
                 if !isOwn { Spacer(minLength: 40) }
             }
             .padding(.vertical, 2)
+            .alert("Message info", isPresented: $showInfo) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(messageInfoText(
+                    message: message,
+                    isOwn: isOwn,
+                    tick: nil,
+                    arrival: try? AppStore.get().messageArrival(
+                        chatId: message.chatId,
+                        senderUserId: message.senderUserId,
+                        lamport: message.lamport
+                    )
+                ))
+            }
         }
     }
 

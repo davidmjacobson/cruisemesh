@@ -3710,6 +3710,100 @@ public func FfiConverterTypeIntroductionTicket_lower(_ value: IntroductionTicket
 
 
 /**
+ * Short-lived endpoint candidate sent inside a sealed `kind = 8` message.
+ * `network_id` is a hashed local-network fingerprint, never a raw SSID.
+ */
+public struct LanEndpointContent {
+    public var instanceToken: Data
+    public var networkId: Data
+    public var host: String
+    public var port: UInt16
+    public var expiresAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(instanceToken: Data, networkId: Data, host: String, port: UInt16, expiresAtMs: Int64) {
+        self.instanceToken = instanceToken
+        self.networkId = networkId
+        self.host = host
+        self.port = port
+        self.expiresAtMs = expiresAtMs
+    }
+}
+
+
+
+extension LanEndpointContent: Equatable, Hashable {
+    public static func ==(lhs: LanEndpointContent, rhs: LanEndpointContent) -> Bool {
+        if lhs.instanceToken != rhs.instanceToken {
+            return false
+        }
+        if lhs.networkId != rhs.networkId {
+            return false
+        }
+        if lhs.host != rhs.host {
+            return false
+        }
+        if lhs.port != rhs.port {
+            return false
+        }
+        if lhs.expiresAtMs != rhs.expiresAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(instanceToken)
+        hasher.combine(networkId)
+        hasher.combine(host)
+        hasher.combine(port)
+        hasher.combine(expiresAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLanEndpointContent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanEndpointContent {
+        return
+            try LanEndpointContent(
+                instanceToken: FfiConverterData.read(from: &buf), 
+                networkId: FfiConverterData.read(from: &buf), 
+                host: FfiConverterString.read(from: &buf), 
+                port: FfiConverterUInt16.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LanEndpointContent, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.instanceToken, into: &buf)
+        FfiConverterData.write(value.networkId, into: &buf)
+        FfiConverterString.write(value.host, into: &buf)
+        FfiConverterUInt16.write(value.port, into: &buf)
+        FfiConverterInt64.write(value.expiresAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointContent_lift(_ buf: RustBuffer) throws -> LanEndpointContent {
+    return try FfiConverterTypeLanEndpointContent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointContent_lower(_ value: LanEndpointContent) -> RustBuffer {
+    return FfiConverterTypeLanEndpointContent.lower(value)
+}
+
+
+/**
  * Local-only diagnostics for how an incoming message reached this device.
  * `transport`: 0 = BLE direct, 1 = BLE through another device, 2 = relay.
  */
@@ -4795,9 +4889,8 @@ extension CoreError: Foundation.LocalizedError {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * A parsed BLE frame: an unauthenticated HELLO (see module docs for why
- * that's a considered choice), an opaque sealed envelope, or a per-chat
- * sync digest (DESIGN.md §7.3).
+ * A parsed link frame. HELLO, DIGEST, LAN endpoint hints, and probes are
+ * link-control traffic; message content remains inside sealed envelopes.
  */
 
 public enum Frame {
@@ -4807,6 +4900,10 @@ public enum Frame {
     case envelope(msgId: Data, hopTtl: UInt8, expiry: Int64, recipientHint: Data, sealed: Data
     )
     case digest(chatId: Data, entries: [DigestEntry], recentMsgIds: [Data]
+    )
+    case lanEndpoint(instanceToken: Data, host: String, port: UInt16
+    )
+    case transportProbe(nonce: UInt64, response: Bool
     )
 }
 
@@ -4828,6 +4925,12 @@ public struct FfiConverterTypeFrame: FfiConverterRustBuffer {
         )
         
         case 3: return .digest(chatId: try FfiConverterData.read(from: &buf), entries: try FfiConverterSequenceTypeDigestEntry.read(from: &buf), recentMsgIds: try FfiConverterSequenceData.read(from: &buf)
+        )
+        
+        case 4: return .lanEndpoint(instanceToken: try FfiConverterData.read(from: &buf), host: try FfiConverterString.read(from: &buf), port: try FfiConverterUInt16.read(from: &buf)
+        )
+        
+        case 5: return .transportProbe(nonce: try FfiConverterUInt64.read(from: &buf), response: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -4857,6 +4960,19 @@ public struct FfiConverterTypeFrame: FfiConverterRustBuffer {
             FfiConverterData.write(chatId, into: &buf)
             FfiConverterSequenceTypeDigestEntry.write(entries, into: &buf)
             FfiConverterSequenceData.write(recentMsgIds, into: &buf)
+            
+        
+        case let .lanEndpoint(instanceToken,host,port):
+            writeInt(&buf, Int32(4))
+            FfiConverterData.write(instanceToken, into: &buf)
+            FfiConverterString.write(host, into: &buf)
+            FfiConverterUInt16.write(port, into: &buf)
+            
+        
+        case let .transportProbe(nonce,response):
+            writeInt(&buf, Int32(5))
+            FfiConverterUInt64.write(nonce, into: &buf)
+            FfiConverterBool.write(response, into: &buf)
             
         }
     }
@@ -5478,6 +5594,13 @@ public func decodeIntroducedFriendRequest(bytes: Data)throws  -> IntroducedFrien
     )
 })
 }
+public func decodeLanEndpointContent(bytes: Data)throws  -> LanEndpointContent {
+    return try  FfiConverterTypeLanEndpointContent.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_decode_lan_endpoint_content(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
 /**
  * Decode a [`MessageBody`] from its wire form. Rejects truncated input,
  * corrupt length prefixes, and malformed extension TLVs while ignoring
@@ -5603,6 +5726,29 @@ public func encodeIntroducedFriendRequest(request: IntroducedFriendRequest) -> D
 })
 }
 /**
+ * Encode a LAN endpoint introduction. The opaque 8-byte instance token is
+ * the same connection-election value advertised through DNS-SD. The host is
+ * an IP literal or local hostname, limited to 255 UTF-8 bytes. A receiver
+ * must never trust the hint by itself: the resulting TCP connection still
+ * has to authenticate the expected accepted contact through Noise.
+ */
+public func encodeLanEndpoint(instanceToken: Data, host: String, port: UInt16)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_encode_lan_endpoint(
+        FfiConverterData.lower(instanceToken),
+        FfiConverterString.lower(host),
+        FfiConverterUInt16.lower(port),$0
+    )
+})
+}
+public func encodeLanEndpointContent(content: LanEndpointContent)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_encode_lan_endpoint_content(
+        FfiConverterTypeLanEndpointContent.lower(content),$0
+    )
+})
+}
+/**
  * Encode a [`MessageBody`] to its wire form (see module docs for layout).
  */
 public func encodeMessageBody(body: MessageBody) -> Data {
@@ -5642,6 +5788,19 @@ public func encodeReceiptContent(content: ReceiptContent) -> Data {
     return try!  FfiConverterData.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_encode_receipt_content(
         FfiConverterTypeReceiptContent.lower(content),$0
+    )
+})
+}
+/**
+ * Encode an encrypted-link health probe. Callers choose a unique nonce and
+ * echo it back with `response = true`; no timestamps or identities cross the
+ * wire.
+ */
+public func encodeTransportProbe(nonce: UInt64, response: Bool) -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_encode_transport_probe(
+        FfiConverterUInt64.lower(nonce),
+        FfiConverterBool.lower(response),$0
     )
 })
 }
@@ -5885,6 +6044,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_decode_introduced_friend_request() != 4415) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_decode_lan_endpoint_content() != 35972) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_decode_message_body() != 1469) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5915,6 +6077,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_introduced_friend_request() != 7571) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_encode_lan_endpoint() != 43015) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_encode_lan_endpoint_content() != 29267) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_encode_message_body() != 28014) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5925,6 +6093,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_receipt_content() != 55046) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_encode_transport_probe() != 39450) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_fingerprint_words() != 59656) {

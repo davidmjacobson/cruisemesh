@@ -7,6 +7,7 @@ enum MeshRouter {
     private static let log = Logger(subsystem: "com.cruisemesh", category: "MeshRouter")
     private static var centralSend: ((String, Data) -> Void)?
     private static var peripheralSend: ((String, Data) -> Void)?
+    private static var lanSend: ((String, Data) -> Void)?
     private static let lock = NSLock()
 
     static func registerCentral(send: @escaping (String, Data) -> Void) {
@@ -19,6 +20,11 @@ enum MeshRouter {
         peripheralSend = send
     }
 
+    static func registerLan(send: @escaping (String, Data) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        lanSend = send
+    }
+
     static func unregisterCentral() {
         lock.lock(); defer { lock.unlock() }
         centralSend = nil
@@ -29,7 +35,16 @@ enum MeshRouter {
         peripheralSend = nil
     }
 
+    static func unregisterLan() {
+        lock.lock(); defer { lock.unlock() }
+        lanSend = nil
+    }
+
     static func reset() { state.clear() }
+
+    static func resetBle() {
+        state.clear(transports: [.central, .peripheral])
+    }
 
     static func onConnected(address: String, transport: MeshRouterState.Transport) {
         state.onConnected(address: address, transport: transport)
@@ -39,7 +54,8 @@ enum MeshRouter {
         state.onDisconnected(address: address)
     }
 
-    static func onHello(address: String, userId: Data) {
+    @discardableResult
+    static func onHello(address: String, userId: Data) -> Bool {
         state.onHello(address: address, userId: userId)
     }
 
@@ -51,10 +67,22 @@ enum MeshRouter {
         state.connectedUserCount()
     }
 
+    static func transportFor(address: String) -> MeshRouterState.Transport? {
+        state.transportFor(address: address)
+    }
+
+    static func identifiedRoutes() -> [MeshRouterState.IdentifiedRoute] {
+        state.identifiedRoutes()
+    }
+
     @discardableResult
     static func sendToUserId(userId: Data, frame: Data) -> Bool {
-        guard let (transport, address) = state.routeFor(userId: userId) else { return false }
-        return dispatch(transport: transport, address: address, frame: frame)
+        let plan = transportSendPlan(routes: state.routesFor(userId: userId), frameSize: frame.count)
+        var sent = false
+        for (transport, address) in plan {
+            sent = dispatch(transport: transport, address: address, frame: frame) || sent
+        }
+        return sent
     }
 
     @discardableResult
@@ -90,6 +118,7 @@ enum MeshRouter {
         switch transport {
         case .central: send = centralSend
         case .peripheral: send = peripheralSend
+        case .lan: send = lanSend
         }
         lock.unlock()
         guard let send else { return false }

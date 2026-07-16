@@ -4,11 +4,22 @@ final class MeshRouterState {
     enum Transport: String {
         case central
         case peripheral
+        case lan
+
+        var routePriority: Int {
+            self == .lan ? 10 : 0
+        }
     }
 
     private struct Peer {
         var transport: Transport
         var userId: Data?
+    }
+
+    struct IdentifiedRoute: Equatable {
+        let transport: Transport
+        let address: String
+        let userId: Data
     }
 
     private var peersByAddress: [String: Peer] = [:]
@@ -24,9 +35,14 @@ final class MeshRouterState {
         peersByAddress.removeValue(forKey: address)
     }
 
-    func onHello(address: String, userId: Data) {
+    @discardableResult
+    func onHello(address: String, userId: Data) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        peersByAddress[address]?.userId = userId
+        guard var peer = peersByAddress[address] else { return false }
+        if let existing = peer.userId, existing != userId { return false }
+        peer.userId = userId
+        peersByAddress[address] = peer
+        return true
     }
 
     func userIdFor(address: String) -> Data? {
@@ -44,6 +60,14 @@ final class MeshRouterState {
         return peersByAddress.map { ($0.value.transport, $0.key) }
     }
 
+    func identifiedRoutes() -> [IdentifiedRoute] {
+        lock.lock(); defer { lock.unlock() }
+        return peersByAddress.compactMap { address, peer in
+            guard let userId = peer.userId else { return nil }
+            return IdentifiedRoute(transport: peer.transport, address: address, userId: userId)
+        }
+    }
+
     func connectedUserCount() -> Int {
         lock.lock(); defer { lock.unlock() }
         var seen = Set<Data>()
@@ -54,16 +78,40 @@ final class MeshRouterState {
     }
 
     func routeFor(userId: Data) -> (Transport, String)? {
+        routesFor(userId: userId).first
+    }
+
+    func routesFor(userId: Data) -> [(Transport, String)] {
         lock.lock(); defer { lock.unlock() }
-        for (address, peer) in peersByAddress {
-            guard let known = peer.userId, known == userId else { continue }
+        return peersByAddress.compactMap { address, peer in
+            guard peer.userId == userId else { return nil }
             return (peer.transport, address)
-        }
-        return nil
+        }.sorted { $0.0.routePriority > $1.0.routePriority }
+    }
+
+    func clear(transports: Set<Transport>) {
+        lock.lock(); defer { lock.unlock() }
+        peersByAddress = peersByAddress.filter { !transports.contains($0.value.transport) }
     }
 
     func clear() {
         lock.lock(); defer { lock.unlock() }
         peersByAddress.removeAll()
     }
+}
+
+/// Small control/text frames race over LAN and one BLE path. Larger frames use
+/// LAN only when it is available, avoiding expensive duplicate attachment data.
+func transportSendPlan(
+    routes: [(MeshRouterState.Transport, String)],
+    frameSize: Int
+) -> [(MeshRouterState.Transport, String)] {
+    guard let lan = routes.first(where: { $0.0 == .lan }) else {
+        return Array(routes.prefix(1))
+    }
+    guard frameSize <= 8 * 1_024,
+          let ble = routes.first(where: { $0.0 != .lan }) else {
+        return [lan]
+    }
+    return [lan, ble]
 }
