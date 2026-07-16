@@ -26,6 +26,7 @@ struct ChatView: View {
     @State private var voiceRecording = false
     @State private var replyingTo: StoredMessage?
     @State private var replyMetadata: [String: MessageReplyMetadata] = [:]
+    @State private var viewedPhoto: ViewedPhoto?
 
     private let store = AppStore.get()
     private var sender: RealMeshSender { RealMeshSender(store: store, identity: identity) }
@@ -89,6 +90,9 @@ struct ChatView: View {
                                     },
                                     onReply: {
                                         replyingTo = message
+                                    },
+                                    onPhotoTap: { jpeg in
+                                        viewedPhoto = ViewedPhoto(jpeg: jpeg)
                                     },
                                     onQuotedTap: { target in
                                         withAnimation {
@@ -279,6 +283,9 @@ struct ChatView: View {
                 showDetails = false
                 confirmDelete = true
             }
+        }
+        .fullScreenCover(item: $viewedPhoto) { photo in
+            PhotoViewerOverlay(jpeg: photo.jpeg)
         }
         .alert("Delete contact?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) {
@@ -492,6 +499,7 @@ private struct MessageBubbleView: View {
     var onStatus: (String) -> Void = { _ in }
     var onReact: (String) -> Void = { _ in }
     var onReply: () -> Void = {}
+    var onPhotoTap: (Data) -> Void = { _ in }
     var onQuotedTap: (StoredMessage) -> Void = { _ in }
     @State private var showLegend = false
     @State private var showInfo = false
@@ -593,6 +601,7 @@ private struct MessageBubbleView: View {
                         jpeg: attachment.blob,
                         canReply: canReply,
                         onReply: onReply,
+                        onOpen: onPhotoTap,
                         onStatus: onStatus
                     )
                 case .audio:
@@ -750,11 +759,17 @@ private extension StoredMessage {
     }
 }
 
+private struct ViewedPhoto: Identifiable {
+    let id = UUID()
+    let jpeg: Data
+}
+
 /// Chat photo: keeps native aspect ratio and offers Save via long-press.
 private struct ChatImageView: View {
     let jpeg: Data
     var canReply = false
     var onReply: () -> Void = {}
+    var onOpen: (Data) -> Void = { _ in }
     var onStatus: (String) -> Void = { _ in }
 
     var body: some View {
@@ -764,6 +779,10 @@ private struct ChatImageView: View {
                 .scaledToFit()
                 .frame(maxWidth: 280, maxHeight: 360)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    onOpen(jpeg)
+                }
                 .contextMenu {
                     if canReply {
                         Button(action: onReply) {
@@ -785,7 +804,7 @@ private struct ChatImageView: View {
                         Label("Save image", systemImage: "square.and.arrow.down")
                     }
                 }
-                .accessibilityHint("Long-press for save options")
+                .accessibilityHint("Double-tap to view full screen; long-press for message options")
         } else {
             Text("Photo (could not display)")
         }
