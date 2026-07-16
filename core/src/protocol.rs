@@ -263,6 +263,8 @@ pub const KIND_FRIEND_DIRECTORY: u8 = 6;
 /// A friend request authorized by a mutual friend's transferable ticket.
 /// Hidden from chat history.
 pub const KIND_INTRODUCED_FRIEND_REQUEST: u8 = 7;
+/// Encrypted, short-lived same-LAN endpoint candidate for an accepted contact.
+pub const KIND_LAN_ENDPOINT_HINT: u8 = 8;
 /// `MessageBody.kind` value for an attachment manifest (DESIGN.md §7.1
 /// reserved, §8). Android currently embeds the media blob inline in the
 /// manifest payload for BLE/relay-friendly sizes; `KIND_ATTACHMENT_CHUNK`
@@ -305,6 +307,7 @@ const PROFILE_SYNC_VERSION: u8 = 2;
 const PROFILE_SYNC_MAX_AVATAR_BYTES: usize = 64 * 1024;
 const FRIEND_DIRECTORY_VERSION: u8 = 1;
 const INTRODUCED_FRIEND_REQUEST_VERSION: u8 = 1;
+const LAN_ENDPOINT_CONTENT_VERSION: u8 = 1;
 const FRIEND_DIRECTORY_MAX_BYTES: usize = 64 * 1024;
 const FRIEND_DIRECTORY_MAX_ENTRIES: usize = 64;
 const INTRODUCTION_MAX_LIFETIME_MS: i64 = 30 * MS_PER_DAY;
@@ -490,6 +493,17 @@ pub struct IntroducedFriendRequest {
     pub ticket: IntroductionTicket,
 }
 
+/// Short-lived endpoint candidate sent inside a sealed `kind = 8` message.
+/// `network_id` is a hashed local-network fingerprint, never a raw SSID.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct LanEndpointContent {
+    pub instance_token: Vec<u8>,
+    pub network_id: Vec<u8>,
+    pub host: String,
+    pub port: u16,
+    pub expires_at_ms: i64,
+}
+
 /// Encode a [`ReceiptContent`] to its wire form (see module docs for layout).
 #[uniffi::export]
 pub fn encode_receipt_content(content: ReceiptContent) -> Vec<u8> {
@@ -580,6 +594,63 @@ pub fn decode_profile_sync_content(bytes: Vec<u8>) -> Result<ProfileSyncContent,
         friends_of_friends_version,
         friends_of_friends_enabled,
         friends_of_friends_revision,
+    })
+}
+
+#[uniffi::export]
+pub fn encode_lan_endpoint_content(content: LanEndpointContent) -> Result<Vec<u8>, CoreError> {
+    validate_lan_endpoint_fields(&content.instance_token, &content.host, content.port)?;
+    if content.network_id.len() > 32 {
+        return Err(CoreError::Malformed(
+            "LAN network id exceeds 32 bytes".to_string(),
+        ));
+    }
+    let host = content.host.as_bytes();
+    let mut out = Vec::with_capacity(
+        1 + LAN_INSTANCE_TOKEN_LEN + 2 + 8 + 1 + content.network_id.len() + 1 + host.len(),
+    );
+    out.push(LAN_ENDPOINT_CONTENT_VERSION);
+    out.extend_from_slice(&content.instance_token);
+    out.extend_from_slice(&content.port.to_be_bytes());
+    out.extend_from_slice(&content.expires_at_ms.to_be_bytes());
+    out.push(content.network_id.len() as u8);
+    out.extend_from_slice(&content.network_id);
+    out.push(host.len() as u8);
+    out.extend_from_slice(host);
+    Ok(out)
+}
+
+#[uniffi::export]
+pub fn decode_lan_endpoint_content(bytes: Vec<u8>) -> Result<LanEndpointContent, CoreError> {
+    let mut cursor = Cursor::new(&bytes);
+    let version = cursor.take_u8()?;
+    if version != LAN_ENDPOINT_CONTENT_VERSION {
+        return Err(CoreError::Malformed(format!(
+            "unsupported LAN endpoint content version: {version}"
+        )));
+    }
+    let instance_token = cursor.take(LAN_INSTANCE_TOKEN_LEN)?.to_vec();
+    let port = cursor.take_u16()?;
+    let expires_at_ms = cursor.take_i64()?;
+    let network_id_len = cursor.take_u8()? as usize;
+    if network_id_len > 32 {
+        return Err(CoreError::Malformed(
+            "LAN network id exceeds 32 bytes".to_string(),
+        ));
+    }
+    let network_id = cursor.take(network_id_len)?.to_vec();
+    let host_len = cursor.take_u8()? as usize;
+    let host = std::str::from_utf8(cursor.take(host_len)?)
+        .map_err(|_| CoreError::Malformed("LAN endpoint host is not UTF-8".to_string()))?
+        .to_string();
+    cursor.finish()?;
+    validate_lan_endpoint_fields(&instance_token, &host, port)?;
+    Ok(LanEndpointContent {
+        instance_token,
+        network_id,
+        host,
+        port,
+        expires_at_ms,
     })
 }
 
@@ -964,6 +1035,23 @@ pub fn encode_lan_endpoint(
     host: String,
     port: u16,
 ) -> Result<Vec<u8>, CoreError> {
+    validate_lan_endpoint_fields(&instance_token, &host, port)?;
+    let host_bytes = host.as_bytes();
+    let mut out = Vec::with_capacity(1 + 1 + LAN_INSTANCE_TOKEN_LEN + 2 + 1 + host_bytes.len());
+    out.push(FRAME_TYPE_LAN_ENDPOINT);
+    out.push(LAN_ENDPOINT_VERSION);
+    out.extend_from_slice(&instance_token);
+    out.extend_from_slice(&port.to_be_bytes());
+    out.push(host_bytes.len() as u8);
+    out.extend_from_slice(host_bytes);
+    Ok(out)
+}
+
+fn validate_lan_endpoint_fields(
+    instance_token: &[u8],
+    host: &str,
+    port: u16,
+) -> Result<(), CoreError> {
     if instance_token.len() != LAN_INSTANCE_TOKEN_LEN {
         return Err(CoreError::Malformed(format!(
             "LAN instance token must be {LAN_INSTANCE_TOKEN_LEN} bytes"
@@ -983,14 +1071,7 @@ pub fn encode_lan_endpoint(
             "LAN endpoint host is empty, too long, or contains whitespace".to_string(),
         ));
     }
-    let mut out = Vec::with_capacity(1 + 1 + LAN_INSTANCE_TOKEN_LEN + 2 + 1 + host_bytes.len());
-    out.push(FRAME_TYPE_LAN_ENDPOINT);
-    out.push(LAN_ENDPOINT_VERSION);
-    out.extend_from_slice(&instance_token);
-    out.extend_from_slice(&port.to_be_bytes());
-    out.push(host_bytes.len() as u8);
-    out.extend_from_slice(host_bytes);
-    Ok(out)
+    Ok(())
 }
 
 /// Encode an encrypted-link health probe. Callers choose a unique nonce and
@@ -1444,6 +1525,41 @@ mod tests {
         assert_eq!(decoded.friends_of_friends_version, 0);
         assert!(!decoded.friends_of_friends_enabled);
         assert_eq!(decoded.friends_of_friends_revision, 0);
+    }
+
+    #[test]
+    fn sealed_lan_endpoint_content_round_trips() {
+        let content = LanEndpointContent {
+            instance_token: vec![0xAB; LAN_INSTANCE_TOKEN_LEN],
+            network_id: b"hashed-network-id".to_vec(),
+            host: "10.154.189.58".to_string(),
+            port: 45_892,
+            expires_at_ms: 1_700_000_900_000,
+        };
+        let encoded = encode_lan_endpoint_content(content.clone()).unwrap();
+        assert_eq!(decode_lan_endpoint_content(encoded).unwrap(), content);
+    }
+
+    #[test]
+    fn sealed_lan_endpoint_content_rejects_invalid_fields() {
+        let valid = LanEndpointContent {
+            instance_token: vec![0xAB; LAN_INSTANCE_TOKEN_LEN],
+            network_id: vec![1; 16],
+            host: "10.0.0.2".to_string(),
+            port: 45_892,
+            expires_at_ms: 1_700_000_900_000,
+        };
+        let mut bad_token = valid.clone();
+        bad_token.instance_token.pop();
+        assert!(encode_lan_endpoint_content(bad_token).is_err());
+
+        let mut bad_network = valid.clone();
+        bad_network.network_id = vec![1; 33];
+        assert!(encode_lan_endpoint_content(bad_network).is_err());
+
+        let mut trailing = encode_lan_endpoint_content(valid).unwrap();
+        trailing.push(0xFF);
+        assert!(decode_lan_endpoint_content(trailing).is_err());
     }
 
     fn sample_directory() -> (Identity, Identity, Identity, FriendDirectoryContent) {
