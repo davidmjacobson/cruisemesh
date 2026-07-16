@@ -95,6 +95,9 @@ object MeshRouter {
     /** Distinct HELLO'd peer userIds, hex-encoded; see [MeshRouterState.helloedUserIds]. */
     fun helloedUserIds(): Set<String> = state.helloedUserIds()
 
+    /** Live routes that have identified themselves via HELLO. */
+    fun identifiedRoutes(): List<MeshRouterState.IdentifiedRoute> = state.identifiedRoutes()
+
     /**
      * Sends [frame] to whichever live link has identified itself as [userId].
      * Returns false if no connected link currently maps to that userId --

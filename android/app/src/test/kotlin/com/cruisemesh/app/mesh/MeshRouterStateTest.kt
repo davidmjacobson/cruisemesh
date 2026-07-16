@@ -166,6 +166,20 @@ class MeshRouterStateTest {
     }
 
     @Test
+    fun `identifiedRoutes includes only links that completed HELLO`() {
+        val state = MeshRouterState()
+        val alice = userId(1)
+        state.onConnected("BLE", MeshRouterState.Transport.CENTRAL)
+        state.onHello("BLE", alice)
+        state.onConnected("UNKNOWN", MeshRouterState.Transport.PERIPHERAL)
+
+        val route = state.identifiedRoutes().single()
+        assertEquals(MeshRouterState.Transport.CENTRAL, route.transport)
+        assertEquals("BLE", route.address)
+        assertEquals(alice.toList(), route.userId.toList())
+    }
+
+    @Test
     fun `helloedUserIds collapses the same peer's dual-role links into one entry`() {
         val state = MeshRouterState()
         val alice = userId(1)

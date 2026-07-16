@@ -1319,12 +1319,15 @@ fun messageInfoText(
     ).format(java.util.Date(message.timestamp))
     val direction = if (isOwn) "Sent by you" else "Received"
     val status = tick?.let { "\nStatus: ${tickLegendText(it)}" }.orEmpty()
-    val arrivalLine = arrival?.let { "\n${messageArrivalText(it)}" }.orEmpty()
+    val arrivalLine = arrival?.let {
+        if (isOwn) "\n${messageDeliveryConfirmationText(it)}"
+        else "\n${messageArrivalText(it)}"
+    }.orEmpty()
     return "$direction\nTime: $sentAt$status$arrivalLine"
 }
 
-private fun messageArrivalText(arrival: MessageArrival): String {
-    val route = when (arrival.transport.toInt()) {
+private fun messageRouteText(arrival: MessageArrival): String =
+    when (arrival.transport.toInt()) {
         0 -> "direct BLE"
         1 -> "another device over BLE"
         2 -> "relay"
@@ -1332,6 +1335,9 @@ private fun messageArrivalText(arrival: MessageArrival): String {
         4 -> "another device over local Wi-Fi"
         else -> "unknown route"
     }
+
+private fun messageArrivalText(arrival: MessageArrival): String {
+    val route = messageRouteText(arrival)
     // hopsTaken is inferred from the default hop TTL, so a sender that
     // authored with a non-default TTL skews it — present it as an estimate.
     val hops = arrival.hopsTaken.toInt()
@@ -1341,6 +1347,14 @@ private fun messageArrivalText(arrival: MessageArrival): String {
         java.util.Locale.getDefault(),
     ).format(java.util.Date(arrival.receivedAt))
     return "Arrived via $route · $hopLabel · $receivedAt"
+}
+
+private fun messageDeliveryConfirmationText(arrival: MessageArrival): String {
+    val confirmedAt = java.text.SimpleDateFormat(
+        "h:mm a",
+        java.util.Locale.getDefault(),
+    ).format(java.util.Date(arrival.receivedAt))
+    return "Delivery confirmed via ${messageRouteText(arrival)} · $confirmedAt"
 }
 
 @Composable

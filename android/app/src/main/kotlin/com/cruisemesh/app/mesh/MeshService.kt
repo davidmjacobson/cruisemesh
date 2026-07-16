@@ -370,6 +370,7 @@ class MeshService : Service() {
             trustedPeerForStaticKey = { remoteStaticKey ->
                 trustedLanPeerUserId(store.listContacts(), remoteStaticKey)
             },
+            onEndpointAvailable = ::onLanEndpointAvailable,
             onAuthenticated = ::onLanPeerAuthenticated,
             onDisconnected = ::onLanPeerDisconnected,
             onFrameReceived = ::onFrameReceived,
@@ -1140,6 +1141,15 @@ class MeshService : Service() {
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
     }
 
+    private fun onLanEndpointAvailable(hint: LanEndpointHint) {
+        val frame = encodeLanEndpointHint(hint)
+        for (route in MeshRouter.identifiedRoutes()) {
+            if (route.transport == MeshRouterState.Transport.LAN) continue
+            if (store.getContact(route.userId) == null) continue
+            MeshRouter.sendToAddress(route.address, frame)
+        }
+    }
+
     /** Sends our HELLO (DESIGN.md §5.2) as the first frame on a link that just became usable. */
     private fun sendHello(address: String) {
         val ownUserId = identity?.userId ?: return
@@ -1149,6 +1159,10 @@ class MeshService : Service() {
     private fun onFrameReceived(address: String, frame: ByteArray) {
         val identity = this.identity ?: run {
             Log.w(TAG, "Frame from $address arrived before identity was loaded; dropping")
+            return
+        }
+        if (frame.firstOrNull() == LAN_ENDPOINT_HINT_FRAME_TYPE) {
+            handleLanEndpointHint(address, frame)
             return
         }
         val parsed = try {
@@ -1162,6 +1176,31 @@ class MeshService : Service() {
             is Frame.Envelope -> handleEnvelope(address, parsed, identity)
             is Frame.Digest -> handleDigest(address, parsed.chatId, parsed.entries, parsed.recentMsgIds, identity)
         }
+    }
+
+    private fun handleLanEndpointHint(address: String, frame: ByteArray) {
+        if (MeshRouter.transportFor(address) == MeshRouterState.Transport.LAN) return
+        val peerUserId = MeshRouter.userIdFor(address) ?: run {
+            Log.w(TAG, "Dropping LAN endpoint hint before HELLO from $address")
+            return
+        }
+        if (store.getContact(peerUserId) == null) {
+            Log.i(TAG, "Ignoring LAN endpoint hint from an unrecognized peer")
+            return
+        }
+        if (
+            MeshRouter.identifiedRoutes().any {
+                it.transport == MeshRouterState.Transport.LAN &&
+                    it.userId.contentEquals(peerUserId)
+            }
+        ) {
+            return
+        }
+        val hint = decodeLanEndpointHint(frame) ?: run {
+            Log.w(TAG, "Dropping malformed LAN endpoint hint from $address")
+            return
+        }
+        lanTransport?.connectToHint(hint, peerUserId)
     }
 
     /**
@@ -1213,6 +1252,10 @@ class MeshService : Service() {
         val digestEntries = contact?.let { store.chatDigest(it.userId) } ?: emptyList()
         if (contact == null) {
             Log.i(TAG, "HELLO from unrecognized userId=${UserIdHex.encode(userId)}; sending carry-suppression digest only")
+        } else if (MeshRouter.transportFor(address) != MeshRouterState.Transport.LAN) {
+            lanTransport?.currentEndpointHint()?.let { hint ->
+                MeshRouter.sendToAddress(address, encodeLanEndpointHint(hint))
+            }
         }
         val digestFrame = encodeDigest(identity.userId, digestEntries, store.carriedMsgIds(DIGEST_CARRIED_MSG_IDS_LIMIT))
         MeshRouter.sendToAddress(address, digestFrame)
@@ -1916,7 +1959,13 @@ class MeshService : Service() {
                 msgId,
                 extendedBody.replyToMsgId,
             )
-            KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
+            KIND_RECEIPT -> handleIncomingReceipt(
+                address,
+                opened.senderUserId,
+                body,
+                identity,
+                arrival,
+            )
             KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, directBle, opened.senderUserId, body, identity)
             KIND_GROUP_INVITE -> handleIncomingGroupInvite(address, opened.senderUserId, body, identity)
             KIND_PROFILE_SYNC -> handleIncomingProfileSync(address, opened.senderUserId, body, identity)
@@ -2619,7 +2668,13 @@ class MeshService : Service() {
      * KDoc). This never sends anything back, so it cannot loop into another
      * receipt (see [handleIncomingText]'s KDoc for the full argument).
      */
-    private fun handleIncomingReceipt(address: String, envelopeSenderUserId: ByteArray, body: MessageBody, identity: Identity) {
+    private fun handleIncomingReceipt(
+        address: String,
+        envelopeSenderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+        arrival: MessageArrival,
+    ) {
         val receipt = try {
             decodeReceiptContent(body.content)
         } catch (e: CoreException) {
@@ -2651,6 +2706,15 @@ class MeshService : Service() {
             senderUserId = identity.userId, // whose messages this receipt is about: ours
             receiptType = receipt.receiptType,
             throughLamport = receipt.lamport,
+        )
+        // A receipt is sent immediately back on the exact link that delivered
+        // the message. Keep the first confirmation route on the acknowledged
+        // outgoing message so its Info pane can prove LAN/BLE/relay delivery.
+        store.recordMessageArrival(
+            envelopeSenderUserId,
+            identity.userId,
+            receipt.lamport,
+            arrival,
         )
         ChatEvents.notifyChatChanged(envelopeSenderUserId)
     }

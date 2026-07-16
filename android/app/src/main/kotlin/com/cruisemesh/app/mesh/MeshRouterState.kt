@@ -39,6 +39,12 @@ class MeshRouterState {
 
     private data class Peer(val transport: Transport, var userId: ByteArray?)
 
+    data class IdentifiedRoute(
+        val transport: Transport,
+        val address: String,
+        val userId: ByteArray,
+    )
+
     private val peersByAddress = mutableMapOf<String, Peer>()
 
     /** A link to [address] over [transport] just became usable (able to send/receive frames). */
@@ -90,6 +96,16 @@ class MeshRouterState {
     fun connectedRoutes(): List<Pair<Transport, String>> =
         synchronized(peersByAddress) {
             peersByAddress.map { (address, peer) -> peer.transport to address }
+        }
+
+    /** Snapshot of live routes that have completed their HELLO exchange. */
+    fun identifiedRoutes(): List<IdentifiedRoute> =
+        synchronized(peersByAddress) {
+            peersByAddress.mapNotNull { (address, peer) ->
+                peer.userId?.let { userId ->
+                    IdentifiedRoute(peer.transport, address, userId.copyOf())
+                }
+            }
         }
 
     /**

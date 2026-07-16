@@ -49,6 +49,7 @@ internal class LanTransport(
     context: Context,
     private val identity: Identity,
     private val trustedPeerForStaticKey: (ByteArray) -> ByteArray?,
+    private val onEndpointAvailable: (LanEndpointHint) -> Unit,
     private val onAuthenticated: (address: String, userId: ByteArray) -> Unit,
     private val onDisconnected: (address: String) -> Unit,
     private val onFrameReceived: (address: String, frame: ByteArray) -> Unit,
@@ -67,12 +68,16 @@ internal class LanTransport(
     private val connections = ConcurrentHashMap<String, LanConnection>()
     private val outboundServiceKeys = ConcurrentHashMap.newKeySet<String>()
     private val resolvedServices = ConcurrentHashMap<String, NsdServiceInfo>()
+    private val hintedPeers = ConcurrentHashMap<String, HintedPeer>()
 
     @Volatile
     private var started = false
 
     @Volatile
     private var wifiNetwork: Network? = null
+
+    @Volatile
+    private var endpointHint: LanEndpointHint? = null
 
     private var networkCallbackRegistered = false
     private var serverSocket: ServerSocket? = null
@@ -169,6 +174,30 @@ internal class LanTransport(
         }
     }
 
+    fun currentEndpointHint(): LanEndpointHint? = endpointHint
+
+    fun connectToHint(hint: LanEndpointHint, expectedUserId: ByteArray) {
+        mainHandler.post {
+            if (
+                !started ||
+                !shouldInitiateLanConnection(instanceToken, hint.instanceToken)
+            ) {
+                return@post
+            }
+            val network = wifiNetwork ?: return@post
+            hintedPeers[hint.instanceToken] = HintedPeer(hint, expectedUserId.copyOf())
+            Log.i(TAG, "BLE introduced LAN peer at ${hint.endpoint.display}")
+            connectToEndpoints(
+                network = network,
+                key = hint.instanceToken,
+                endpoints = listOf(
+                    InetSocketAddress(hint.endpoint.host, hint.endpoint.port),
+                ),
+                expectedUserId = expectedUserId,
+            )
+        }
+    }
+
     private fun restartNetworkSession(network: Network) {
         teardownNetworkSession()
         if (!started || wifiNetwork != network) return
@@ -221,8 +250,13 @@ internal class LanTransport(
         }
 
         val localEndpoint = localEndpoint(network, listener.localPort)
-        LanTransportDiagnostics.listening(localEndpoint)
-        Log.i(TAG, "LAN session ready on ${localEndpoint ?: "the selected Wi-Fi network"}")
+        endpointHint = localEndpoint?.let { LanEndpointHint(instanceToken, it) }
+        LanTransportDiagnostics.listening(localEndpoint?.display)
+        Log.i(
+            TAG,
+            "LAN session ready on ${localEndpoint?.display ?: "the selected Wi-Fi network"}",
+        )
+        endpointHint?.let(onEndpointAvailable)
     }
 
     private fun openListener(): ServerSocket? {
@@ -311,6 +345,7 @@ internal class LanTransport(
         network: Network,
         key: String,
         endpoints: List<InetSocketAddress>,
+        expectedUserId: ByteArray? = null,
     ) {
         if (!outboundServiceKeys.add(key)) return
         if (!tryAcquireSocketSlot()) {
@@ -349,7 +384,12 @@ internal class LanTransport(
                     scheduleReconnect(key)
                     return@execute
                 }
-                runConnection(socket, initiator = true, outboundServiceKey = key)
+                runConnection(
+                    socket,
+                    initiator = true,
+                    outboundServiceKey = key,
+                    expectedUserId = expectedUserId,
+                )
             }
         } catch (_: RuntimeException) {
             outboundServiceKeys.remove(key)
@@ -360,7 +400,7 @@ internal class LanTransport(
     private fun submitConnection(socket: Socket, initiator: Boolean, outboundServiceKey: String?) {
         try {
             connectionExecutor.execute {
-                runConnection(socket, initiator, outboundServiceKey)
+                runConnection(socket, initiator, outboundServiceKey, expectedUserId = null)
             }
         } catch (_: RuntimeException) {
             socket.closeQuietly()
@@ -373,6 +413,7 @@ internal class LanTransport(
         socket: Socket,
         initiator: Boolean,
         outboundServiceKey: String?,
+        expectedUserId: ByteArray?,
     ) {
         sockets += socket
         val peerEndpoint = socket.remoteSocketAddress?.toString()?.removePrefix("/") ?: "peer"
@@ -396,6 +437,12 @@ internal class LanTransport(
                     ?: throw IOException("LAN responder did not provide a static key")
                 val userId = trustedPeerForStaticKey(remoteStatic)
                     ?: throw IOException("LAN responder is not an accepted contact")
+                if (
+                    expectedUserId != null &&
+                    !userId.contentEquals(expectedUserId)
+                ) {
+                    throw IOException("LAN responder does not match the BLE endpoint hint")
+                }
                 writePacket(output, session.writeHandshakeMessage())
                 userId
             } else {
@@ -471,7 +518,14 @@ internal class LanTransport(
                 if (!started || wifiNetwork == null || outboundServiceKeys.contains(serviceKey)) {
                     return@postDelayed
                 }
-                resolvedServices[serviceKey]?.let(::connectToService)
+                val resolved = resolvedServices[serviceKey]
+                if (resolved != null) {
+                    connectToService(resolved)
+                    return@postDelayed
+                }
+                hintedPeers[serviceKey]?.let { hinted ->
+                    connectToHint(hinted.hint, hinted.expectedUserId)
+                }
             },
             RECONNECT_DELAY_MS,
         )
@@ -592,11 +646,13 @@ internal class LanTransport(
         requestedServiceName = null
         registeredServiceName = null
         resolvedServices.clear()
+        hintedPeers.clear()
         outboundServiceKeys.clear()
         serverSocket?.closeQuietly()
         serverSocket = null
         sockets.toList().forEach(Socket::closeQuietly)
         connections.clear()
+        endpointHint = null
         LanTransportDiagnostics.waitingForWifi()
     }
 
@@ -628,14 +684,14 @@ internal class LanTransport(
         activeSocketCount.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
     }
 
-    private fun localEndpoint(network: Network, port: Int): String? {
+    private fun localEndpoint(network: Network, port: Int): LanManualEndpoint? {
         val addresses = connectivityManager.getLinkProperties(network)
             ?.linkAddresses
             ?.map { it.address }
             ?.filterNot { it.isAnyLocalAddress || it.isLoopbackAddress }
             .orEmpty()
         val address = addresses.firstOrNull { it is Inet4Address } ?: addresses.firstOrNull()
-        return address?.let { endpointDisplay(InetSocketAddress(it, port)) }
+        return address?.hostAddress?.let { LanManualEndpoint(it, port) }
     }
 
     private fun isEligibleWifiNetwork(network: Network): Boolean {
@@ -727,6 +783,11 @@ internal class LanTransport(
             return ByteArray(size).also(input::readFully)
         }
     }
+
+    private data class HintedPeer(
+        val hint: LanEndpointHint,
+        val expectedUserId: ByteArray,
+    )
 }
 
 internal fun trustedLanPeerUserId(contacts: List<Contact>, remoteStaticKey: ByteArray): ByteArray? =

@@ -22,6 +22,16 @@ does not implement this transport remains fully compatible over BLE and relay.
 - TXT data: protocol version and a random self-suppression token only.
 - Discovery uses Android NSD or Apple Bonjour. CruiseMesh does not scan the
   subnet or enumerate addresses.
+- mDNS is link-local and may not cross routed client subnets even when TCP
+  does. Updated Android clients therefore also exchange their listener
+  address and random instance token over an existing BLE link after both
+  peers have completed HELLO and are accepted contacts. The token preserves
+  the same single-initiator election used by DNS-SD.
+- The BLE endpoint hint is reachability data, not authentication. A hinted
+  TCP responder must still present the agreement key of the same accepted
+  friend during the Noise handshake.
+- A manual `IP[:port]` field remains available for diagnosis when neither
+  DNS-SD nor BLE introduction is available.
 
 45892 is a provisional unassigned port in IANA's user-port range as of
 2026-07-16. Before treating it as a permanent public assignment, the project
