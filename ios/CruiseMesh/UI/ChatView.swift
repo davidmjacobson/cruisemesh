@@ -24,6 +24,8 @@ struct ChatView: View {
     @State private var cancellable: AnyCancellable?
     @State private var voiceRecorder = VoiceRecorder()
     @State private var voiceRecording = false
+    @State private var replyingTo: StoredMessage?
+    @State private var replyMetadata: [String: MessageReplyMetadata] = [:]
 
     private let store = AppStore.get()
     private var sender: RealMeshSender { RealMeshSender(store: store, identity: identity) }
@@ -34,6 +36,12 @@ struct ChatView: View {
 
     private var reactions: [String: [ReactionSummary]] {
         reactionSummariesByTarget(messages: messages, ownUserId: identity.userId)
+    }
+
+    private var replyingToPreview: QuotedMessagePreview? {
+        replyingTo.map { target in
+            quotedMessagePreview(target: target, senderLabelFor: senderLabel)
+        }
     }
 
     var body: some View {
@@ -67,6 +75,8 @@ struct ChatView: View {
                                         name: contact.name,
                                         displayId: formatUserId(userId: contact.userId)
                                     ).0,
+                                    quoted: replyMetadata[replyMessageKey(message)]?.quoted,
+                                    canReply: replyMetadata[replyMessageKey(message)]?.msgId != nil,
                                     reactions: reactions[MessageTarget(
                                         senderUserId: message.senderUserId,
                                         lamport: message.lamport,
@@ -76,6 +86,14 @@ struct ChatView: View {
                                     onStatus: { statusMessage = $0 },
                                     onReact: { emoji in
                                         sendReaction(to: message, emoji: emoji)
+                                    },
+                                    onReply: {
+                                        replyingTo = message
+                                    },
+                                    onQuotedTap: { target in
+                                        withAnimation {
+                                            proxy.scrollTo(target.stableRowId, anchor: .center)
+                                        }
                                     }
                                 )
                                 .id(message.stableRowId)
@@ -96,6 +114,11 @@ struct ChatView: View {
             }
 
             VStack(spacing: 8) {
+                if let replyingToPreview {
+                    ReplyComposerPreview(preview: replyingToPreview) {
+                        replyingTo = nil
+                    }
+                }
                 if let pendingPhoto {
                     PendingPhotoPreview(jpeg: pendingPhoto) {
                         self.pendingPhoto = nil
@@ -260,6 +283,7 @@ struct ChatView: View {
         .alert("Delete contact?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) {
                 try? store.deleteContact(userId: contact.userId)
+                FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
                 dismiss()
             }
             Button("Cancel", role: .cancel) {}
@@ -282,6 +306,7 @@ struct ChatView: View {
 
     private func sendCurrentDraft() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let replyToMsgId = replyingTo.flatMap { replyMetadata[replyMessageKey($0)]?.msgId }
         if let photo = pendingPhoto {
             sender.sendAttachment(
                 contact: contact,
@@ -291,23 +316,32 @@ struct ChatView: View {
                     durationMs: 0,
                     blob: photo,
                     caption: text
-                )
+                ),
+                replyToMsgId: replyToMsgId
             )
             pendingPhoto = nil
             draft = ""
+            replyingTo = nil
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             reload()
             return
         }
         guard !text.isEmpty else { return }
-        sender.sendText(contact: contact, text: text)
+        sender.sendText(contact: contact, text: text, replyToMsgId: replyToMsgId)
         draft = ""
+        replyingTo = nil
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         reload()
     }
 
     private func reload() {
-        messages = (try? store.messagesForChat(chatId: contact.userId)) ?? []
+        let loadedMessages = (try? store.messagesForChat(chatId: contact.userId)) ?? []
+        messages = loadedMessages
+        replyMetadata = loadMessageReplyMetadata(
+            store: store,
+            messages: loadedMessages.filter { isVisibleChatKind($0.kind) },
+            senderLabelFor: senderLabel
+        )
         avatarData = (try? store.contactAvatar(userId: contact.userId)) ?? nil
         deliveredThrough = (try? store.receiptThrough(
             chatId: contact.userId,
@@ -339,8 +373,10 @@ struct ChatView: View {
                 mimeType: "audio/mp4",
                 durationMs: min(durationMs, 60_000),
                 blob: data
-            )
+            ),
+            replyToMsgId: replyingTo.flatMap { replyMetadata[replyMessageKey($0)]?.msgId }
         )
+        replyingTo = nil
         reload()
     }
 
@@ -355,6 +391,14 @@ struct ChatView: View {
         } ?? false
         sender.sendReaction(contact: contact, target: target, emoji: existingOwn ? "" : emoji)
         reload()
+    }
+
+    private func senderLabel(_ message: StoredMessage) -> String {
+        if message.senderUserId == identity.userId { return "You" }
+        return ChatListLogic.displayNameOrId(
+            name: contact.name,
+            displayId: formatUserId(userId: contact.userId)
+        )
     }
 
     private func isNewDay(_ index: Int) -> Bool {
@@ -441,10 +485,14 @@ private struct MessageBubbleView: View {
     let isOwn: Bool
     let tick: TickStatus?
     let contactColor: Color
+    let quoted: QuotedMessagePreview?
+    let canReply: Bool
     let reactions: [ReactionSummary]
     let grouping: MessageGrouping
     var onStatus: (String) -> Void = { _ in }
     var onReact: (String) -> Void = { _ in }
+    var onReply: () -> Void = {}
+    var onQuotedTap: (StoredMessage) -> Void = { _ in }
     @State private var showLegend = false
     @State private var showInfo = false
 
@@ -453,6 +501,16 @@ private struct MessageBubbleView: View {
             if isOwn { Spacer(minLength: 40) }
             VStack(alignment: isOwn ? .trailing : .leading, spacing: 4) {
                 VStack(alignment: .leading, spacing: 6) {
+                    if let quoted {
+                        QuotedMessageBlock(
+                            preview: quoted,
+                            accentColor: isOwn ? .white : .accentColor,
+                            contentColor: isOwn ? .white : .primary,
+                            onTap: quoted.target.map { target in
+                                { onQuotedTap(target) }
+                            }
+                        )
+                    }
                     content
                     if let tick {
                         HStack {
@@ -473,6 +531,11 @@ private struct MessageBubbleView: View {
                     }
                 }
                 .contextMenu {
+                    if canReply {
+                        Button(action: onReply) {
+                            Label("Reply", systemImage: "arrowshape.turn.up.left")
+                        }
+                    }
                     ForEach(reactionChoices, id: \.self) { emoji in
                         Button(emoji) {
                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -526,7 +589,12 @@ private struct MessageBubbleView: View {
             if let attachment = AttachmentPayload.decode(message.payload) {
                 switch attachment.mediaType {
                 case .image:
-                    ChatImageView(jpeg: attachment.blob, onStatus: onStatus)
+                    ChatImageView(
+                        jpeg: attachment.blob,
+                        canReply: canReply,
+                        onReply: onReply,
+                        onStatus: onStatus
+                    )
                 case .audio:
                     VoiceMemoPlayerView(blob: attachment.blob, durationMs: attachment.durationMs)
                 }
@@ -685,6 +753,8 @@ private extension StoredMessage {
 /// Chat photo: keeps native aspect ratio and offers Save via long-press.
 private struct ChatImageView: View {
     let jpeg: Data
+    var canReply = false
+    var onReply: () -> Void = {}
     var onStatus: (String) -> Void = { _ in }
 
     var body: some View {
@@ -695,6 +765,11 @@ private struct ChatImageView: View {
                 .frame(maxWidth: 280, maxHeight: 360)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
                 .contextMenu {
+                    if canReply {
+                        Button(action: onReply) {
+                            Label("Reply", systemImage: "arrowshape.turn.up.left")
+                        }
+                    }
                     Button {
                         ImageGallery.saveJpeg(jpeg) { result in
                             switch result {

@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothA2dp
 import android.bluetooth.BluetoothAdapter
@@ -26,11 +27,15 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.AppStore
+import com.cruisemesh.app.MainActivity
 import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.friending.ProfileSyncSender
 import com.cruisemesh.app.friending.FriendImportEvents
+import com.cruisemesh.app.friending.FriendDirectorySender
+import com.cruisemesh.app.friending.FriendRequestSender
+import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.AttachmentPayload
@@ -46,11 +51,14 @@ import com.cruisemesh.app.relay.normalizeRelayUrl
 import com.cruisemesh.app.relay.RelayImport
 import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.ContactDiscoveryPolicy
+import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.DigestEntry
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
+import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OpenedMessage
@@ -59,7 +67,9 @@ import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.decodeGroupInviteContent
-import uniffi.cruisemesh_core.decodeMessageBody
+import uniffi.cruisemesh_core.decodeFriendDirectoryContent
+import uniffi.cruisemesh_core.decodeIntroducedFriendRequest
+import uniffi.cruisemesh_core.decodeExtendedMessageBody
 import uniffi.cruisemesh_core.decodeProfileSyncContent
 import uniffi.cruisemesh_core.decodeReceiptContent
 import uniffi.cruisemesh_core.defaultExpiry
@@ -75,10 +85,13 @@ import uniffi.cruisemesh_core.parseFriendCard
 import uniffi.cruisemesh_core.openMessage
 import uniffi.cruisemesh_core.parseFrame
 import uniffi.cruisemesh_core.sealMessage
+import uniffi.cruisemesh_core.verifyIntroductionTicket
 
 private const val TAG = "MeshService"
 private const val NOTIFICATION_CHANNEL_ID = "cruisemesh_mesh_status"
 private const val NOTIFICATION_ID = 1
+private const val OPEN_APP_REQUEST_CODE = 1001
+private const val STOP_SERVICE_REQUEST_CODE = 1002
 
 /** `kind` bytes from DESIGN.md §7.1. */
 private const val KIND_TEXT: UByte = 1u
@@ -86,6 +99,8 @@ private const val KIND_RECEIPT: UByte = 2u
 private const val KIND_FRIEND_REQUEST: UByte = 3u
 private const val KIND_GROUP_INVITE: UByte = 4u
 private const val KIND_PROFILE_SYNC: UByte = 5u
+private const val KIND_FRIEND_DIRECTORY: UByte = 6u
+private const val KIND_INTRODUCED_FRIEND_REQUEST: UByte = 7u
 
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
@@ -293,6 +308,18 @@ class MeshService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            Log.i(TAG, "Stopping mesh at the user's request")
+            MeshStartupPreferences.markExplicitlyStopped(this)
+            MeshRuntimeStatus.markStopped()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        // A manual/app start begins a new session. BootReceiver checks the
+        // explicit-stop bit before it ever reaches this path.
+        MeshStartupPreferences.clearExplicitStop(this)
         startForeground(NOTIFICATION_ID, buildNotification())
         // Debug builds: ensure log capture is running even if the process was
         // revived straight into the service without the UI (no-op in release
@@ -1518,7 +1545,15 @@ class MeshService : Service() {
             // still get a copy (mesh_sim group scenario).
             val groupOpened = tryOpenGroupMessage(envelope.recipientHint, envelope.sealed)
             if (groupOpened != null) {
-                deliverOpenedGroupEnvelope(sourceLabel, groupOpened.first, groupOpened.second, identity)
+                val arrival = messageArrival(sourceAddress, envelope.hopTtl, groupOpened.second.senderUserId)
+                deliverOpenedGroupEnvelope(
+                    sourceLabel,
+                    groupOpened.first,
+                    groupOpened.second,
+                    identity,
+                    arrival,
+                    envelope.msgId,
+                )
                 relayForeignEnvelope(sourceAddress, envelope)
                 if (sourceAddress == null) {
                     carryRelayEnvelope(envelope)
@@ -1539,8 +1574,24 @@ class MeshService : Service() {
             }
             return InboundDisposition.CARRIED
         }
-        deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity)
+        val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
+        deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
         return InboundDisposition.CONSUMED
+    }
+
+    private fun messageArrival(
+        sourceAddress: String?,
+        receivedHopTtl: UByte,
+        senderUserId: ByteArray,
+    ): MessageArrival {
+        val linkPeerMatchesSender = sourceAddress
+            ?.let(MeshRouter::userIdFor)
+            ?.contentEquals(senderUserId) == true
+        return MessageArrival(
+            transport = arrivalTransport(sourceAddress == null, linkPeerMatchesSender),
+            hopsTaken = arrivalHopsTaken(receivedHopTtl, DEFAULT_HOP_TTL),
+            receivedAt = System.currentTimeMillis(),
+        )
     }
 
     /**
@@ -1767,32 +1818,75 @@ class MeshService : Service() {
      * Reached only for envelopes addressed to us; foreign traffic never gets
      * here (see [handleEnvelope]).
      */
-    private fun deliverOpenedEnvelope(address: String, directBle: Boolean, opened: OpenedMessage, identity: Identity) {
-        val body = try {
-            decodeMessageBody(opened.payload)
+    private fun deliverOpenedEnvelope(
+        address: String,
+        directBle: Boolean,
+        opened: OpenedMessage,
+        identity: Identity,
+        arrival: MessageArrival,
+        msgId: ByteArray,
+    ) {
+        val extendedBody = try {
+            decodeExtendedMessageBody(opened.payload)
         } catch (e: CoreException) {
             Log.w(TAG, "Dropping envelope from $address: failed to decode body (${e.message})")
             return
         }
+        val body = MessageBody(
+            kind = extendedBody.kind,
+            chatId = extendedBody.chatId,
+            lamport = extendedBody.lamport,
+            timestamp = extendedBody.timestamp,
+            content = extendedBody.content,
+        )
         if (!body.chatId.contentEquals(opened.senderUserId)) {
             Log.w(TAG, "Dropping envelope from $address: chatId does not match the verified sender")
             return
         }
 
         when (body.kind) {
-            KIND_TEXT -> handleIncomingChatMessage(address, opened.senderUserId, body, identity, KIND_TEXT)
+            KIND_TEXT -> handleIncomingChatMessage(
+                address,
+                opened.senderUserId,
+                body,
+                identity,
+                KIND_TEXT,
+                arrival,
+                msgId,
+                extendedBody.replyToMsgId,
+            )
             KIND_ATTACHMENT_MANIFEST -> handleIncomingChatMessage(
                 address,
                 opened.senderUserId,
                 body,
                 identity,
                 KIND_ATTACHMENT_MANIFEST,
+                arrival,
+                msgId,
+                extendedBody.replyToMsgId,
             )
-            KIND_REACTION -> handleIncomingChatMessage(address, opened.senderUserId, body, identity, KIND_REACTION)
+            KIND_REACTION -> handleIncomingChatMessage(
+                address,
+                opened.senderUserId,
+                body,
+                identity,
+                KIND_REACTION,
+                arrival,
+                msgId,
+                extendedBody.replyToMsgId,
+            )
             KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
             KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, directBle, opened.senderUserId, body, identity)
             KIND_GROUP_INVITE -> handleIncomingGroupInvite(address, opened.senderUserId, body, identity)
             KIND_PROFILE_SYNC -> handleIncomingProfileSync(address, opened.senderUserId, body, identity)
+            KIND_FRIEND_DIRECTORY -> handleIncomingFriendDirectory(address, opened.senderUserId, body, identity)
+            KIND_INTRODUCED_FRIEND_REQUEST -> handleIncomingIntroducedFriendRequest(
+                address,
+                directBle,
+                opened.senderUserId,
+                body,
+                identity,
+            )
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
         }
     }
@@ -1808,6 +1902,8 @@ class MeshService : Service() {
         group: Group,
         opened: OpenedMessage,
         identity: Identity,
+        arrival: MessageArrival,
+        msgId: ByteArray,
     ) {
         if (!group.memberUserIds.any { it.contentEquals(opened.senderUserId) }) {
             Log.w(
@@ -1822,19 +1918,42 @@ class MeshService : Service() {
             return
         }
 
-        val body = try {
-            decodeMessageBody(opened.payload)
+        val extendedBody = try {
+            decodeExtendedMessageBody(opened.payload)
         } catch (e: CoreException) {
             Log.w(TAG, "Dropping group envelope from $address: failed to decode body (${e.message})")
             return
         }
+        val body = MessageBody(
+            kind = extendedBody.kind,
+            chatId = extendedBody.chatId,
+            lamport = extendedBody.lamport,
+            timestamp = extendedBody.timestamp,
+            content = extendedBody.content,
+        )
         if (!body.chatId.contentEquals(group.id)) {
             Log.w(TAG, "Dropping group envelope from $address: body.chatId does not match group id")
             return
         }
         when (body.kind) {
-            KIND_TEXT -> handleIncomingGroupChatMessage(address, group, opened.senderUserId, body)
-            KIND_REACTION -> handleIncomingGroupChatMessage(address, group, opened.senderUserId, body)
+            KIND_TEXT -> handleIncomingGroupChatMessage(
+                address,
+                group,
+                opened.senderUserId,
+                body,
+                arrival,
+                msgId,
+                extendedBody.replyToMsgId,
+            )
+            KIND_REACTION -> handleIncomingGroupChatMessage(
+                address,
+                group,
+                opened.senderUserId,
+                body,
+                arrival,
+                msgId,
+                extendedBody.replyToMsgId,
+            )
             else -> Log.i(TAG, "Dropping group envelope from $address: unhandled kind=${body.kind}")
         }
     }
@@ -1844,8 +1963,11 @@ class MeshService : Service() {
         group: Group,
         senderUserId: ByteArray,
         body: MessageBody,
+        arrival: MessageArrival,
+        msgId: ByteArray,
+        replyToMsgId: ByteArray?,
     ) {
-        val inserted = store.insertMessage(
+        val inserted = store.insertIncomingMessage(
             StoredMessage(
                 chatId = group.id,
                 senderUserId = senderUserId,
@@ -1854,6 +1976,8 @@ class MeshService : Service() {
                 kind = body.kind,
                 payload = body.content,
             ),
+            msgId,
+            replyToMsgId,
         )
         if (!inserted) {
             Log.i(
@@ -1863,6 +1987,7 @@ class MeshService : Service() {
             )
             return
         }
+        store.recordMessageArrival(group.id, senderUserId, body.lamport, arrival)
         Log.i(
             TAG,
             "Stored group kind=${body.kind} in ${group.name} from $address " +
@@ -1964,6 +2089,9 @@ class MeshService : Service() {
         body: MessageBody,
         identity: Identity,
     ) {
+        val pendingSuggestion = store.listFriendSuggestions(System.currentTimeMillis()).firstOrNull {
+            it.state == 1.toUByte() && it.candidate.userId.contentEquals(senderUserId)
+        }
         val card = try {
             parseFriendCard(body.content.toString(Charsets.UTF_8))
         } catch (e: CoreException) {
@@ -1989,6 +2117,15 @@ class MeshService : Service() {
             ),
         )
         store.upsertContact(contact)
+        store.upsertContactProvenance(
+            ContactProvenance(
+                userId = senderUserId,
+                source = if (pendingSuggestion == null) 0u else 1u,
+                introducerUserId = pendingSuggestion?.introducerUserId,
+                introducedAtMs = System.currentTimeMillis(),
+            ),
+        )
+        if (pendingSuggestion != null) store.removeFriendSuggestion(senderUserId)
         ProfileSyncSender.queueToContact(
             this,
             store,
@@ -2077,6 +2214,15 @@ class MeshService : Service() {
         )
         if (!inserted) return
 
+        val policyChanged = store.upsertContactDiscoveryPolicy(
+            ContactDiscoveryPolicy(
+                userId = senderUserId,
+                protocolVersion = content.friendsOfFriendsVersion,
+                enabled = content.friendsOfFriendsEnabled,
+                revision = content.friendsOfFriendsRevision,
+            ),
+        )
+
         val applied = store.setContactAvatar(
             senderUserId,
             content.avatar.takeIf { it.isNotEmpty() },
@@ -2116,6 +2262,174 @@ class MeshService : Service() {
         if (isVisible) {
             sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
         }
+        if (policyChanged) {
+            FriendDirectorySender.queueToAllContacts(this, store, identity)
+        }
+    }
+
+    private fun handleIncomingFriendDirectory(
+        address: String,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+    ) {
+        val contact = store.getContact(senderUserId) ?: run {
+            Log.i(TAG, "Dropping friend directory from $address: sender is not a contact")
+            return
+        }
+        val content = try {
+            decodeFriendDirectoryContent(body.content)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping friend directory from $address: ${e.message}")
+            return
+        }
+        val inserted = store.insertMessage(
+            StoredMessage(
+                chatId = senderUserId,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_FRIEND_DIRECTORY,
+                payload = body.content,
+            ),
+        )
+        if (!inserted) return
+        if (FriendsOfFriendsStore.isEnabled(this)) {
+            try {
+                if (store.applyFriendDirectory(senderUserId, identity.userId, content, System.currentTimeMillis())) {
+                    ChatEvents.notifyChatChanged(senderUserId)
+                }
+            } catch (e: CoreException) {
+                Log.w(TAG, "Rejecting friend directory from $address: ${e.message}")
+                return
+            }
+        }
+        acknowledgeHiddenMessage(address, senderUserId, identity, contact)
+    }
+
+    private fun handleIncomingIntroducedFriendRequest(
+        address: String,
+        directBle: Boolean,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+    ) {
+        if (!FriendsOfFriendsStore.isEnabled(this)) {
+            Log.i(TAG, "Ignoring introduced friend request while friends-of-friends is disabled")
+            return
+        }
+        val request = try {
+            decodeIntroducedFriendRequest(body.content)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping introduced friend request from $address: ${e.message}")
+            return
+        }
+        val card = try {
+            parseFriendCard(request.friendCardJson)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping introduced friend request with invalid card: ${e.message}")
+            return
+        }
+        if (!friendCardUserId(card).contentEquals(senderUserId)) {
+            Log.w(TAG, "Dropping introduced friend request: card does not match authenticated sender")
+            return
+        }
+        val introducer = store.getContact(request.ticket.introducerUserId) ?: run {
+            Log.w(TAG, "Dropping introduced friend request: introducer is no longer a contact")
+            return
+        }
+        val valid = try {
+            verifyIntroductionTicket(
+                request.ticket,
+                introducer.signPk,
+                identity.userId,
+                senderUserId,
+                FriendsOfFriendsStore.revision(this),
+                System.currentTimeMillis(),
+            )
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping introduced friend request: ${e.message}")
+            return
+        }
+        if (!valid) {
+            Log.w(TAG, "Dropping introduced friend request: ticket validation failed")
+            return
+        }
+
+        val wasKnown = store.getContact(senderUserId) != null
+        val contact = RelayImport.reconcileOnImport(
+            this,
+            store,
+            Contact(
+                userId = senderUserId,
+                name = card.name,
+                signPk = card.signPk,
+                agreePk = card.agreePk,
+                relayUrl = card.relayUrl,
+                relayToken = card.relayToken,
+            ),
+        )
+        store.upsertContact(contact)
+        store.upsertContactProvenance(
+            ContactProvenance(
+                userId = senderUserId,
+                source = 1u,
+                introducerUserId = introducer.userId,
+                introducedAtMs = System.currentTimeMillis(),
+            ),
+        )
+        store.removeFriendSuggestion(senderUserId)
+        store.insertMessage(
+            StoredMessage(
+                chatId = senderUserId,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_INTRODUCED_FRIEND_REQUEST,
+                payload = body.content,
+            ),
+        )
+        acknowledgeHiddenMessage(address, senderUserId, identity, contact)
+        FriendRequestSender.queueForScannedContact(this, store, identity, contact)
+        ProfileSyncSender.queueToContact(
+            this,
+            store,
+            identity,
+            contact,
+            ProfileStore.loadOwnAvatarEpoch(this),
+        )
+        if (!wasKnown) FriendDirectorySender.queueToAllContacts(this, store, identity)
+        ChatEvents.notifyChatChanged(senderUserId)
+        if (!wasKnown) {
+            FriendImportEvents.notifyImported(contact, directBle)
+            MessageNotifier.notifyFriendAdded(this, contact)
+        }
+    }
+
+    private fun acknowledgeHiddenMessage(
+        address: String,
+        senderUserId: ByteArray,
+        identity: Identity,
+        contact: Contact,
+    ) {
+        val throughLamport = store.highestLamport(senderUserId, senderUserId)
+        store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
+        val queued = queueOutgoingReceiptForRelay(
+            identity = identity,
+            contact = contact,
+            receiptType = RECEIPT_TYPE_DELIVERED,
+            ackedSenderUserId = senderUserId,
+            throughLamport = throughLamport,
+        )
+        if (queued) RelaySyncEvents.requestSync()
+        sendReceiptOnAddress(
+            identity,
+            contact,
+            address,
+            RECEIPT_TYPE_DELIVERED,
+            senderUserId,
+            throughLamport,
+        )
     }
 
     /**
@@ -2150,8 +2464,11 @@ class MeshService : Service() {
         body: MessageBody,
         identity: Identity,
         kind: UByte,
+        arrival: MessageArrival,
+        msgId: ByteArray,
+        replyToMsgId: ByteArray?,
     ) {
-        val inserted = store.insertMessage(
+        val inserted = store.insertIncomingMessage(
             StoredMessage(
                 chatId = senderUserId,
                 senderUserId = senderUserId,
@@ -2160,6 +2477,8 @@ class MeshService : Service() {
                 kind = kind,
                 payload = body.content,
             ),
+            msgId,
+            replyToMsgId,
         )
         if (!inserted) {
             Log.i(
@@ -2168,6 +2487,7 @@ class MeshService : Service() {
             )
             return
         }
+        store.recordMessageArrival(senderUserId, senderUserId, body.lamport, arrival)
         Log.i(
             TAG,
             "Stored kind=$kind from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
@@ -2554,6 +2874,20 @@ class MeshService : Service() {
             }
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
+        val contentIntent = PendingIntent.getActivity(
+            this,
+            OPEN_APP_REQUEST_CODE,
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val stopIntent = PendingIntent.getService(
+            this,
+            STOP_SERVICE_REQUEST_CODE,
+            Intent(this, MeshService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("CruiseMesh")
             .setContentText(
@@ -2565,6 +2899,12 @@ class MeshService : Service() {
             )
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setBadgeIconType(NotificationCompat.BADGE_ICON_NONE)
+            .setContentIntent(contentIntent)
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Stop CruiseMesh",
+                stopIntent,
+            )
             .setOngoing(true)
             .build()
     }
@@ -2574,6 +2914,8 @@ class MeshService : Service() {
     }
 
     companion object {
+        const val ACTION_STOP = "com.cruisemesh.app.action.STOP_MESH"
+
         /** Permissions MeshService needs before it will start its BLE roles. */
         fun requiredPermissions(): Array<String> {
             val base = mutableListOf<String>()

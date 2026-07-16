@@ -7,6 +7,8 @@ enum ProtocolKind {
     static let friendRequest: UInt8 = 3
     static let groupInvite: UInt8 = 4
     static let profileSync: UInt8 = 5
+    static let friendDirectory: UInt8 = 6
+    static let introducedFriendRequest: UInt8 = 7
     static let attachmentManifest: UInt8 = 16
     static let attachmentChunk: UInt8 = 17
     static let reaction: UInt8 = 18
@@ -38,6 +40,8 @@ func isAuthoredChatKind(_ kind: UInt8) -> Bool {
         || kind == ProtocolKind.friendRequest
         || kind == ProtocolKind.groupInvite
         || kind == ProtocolKind.profileSync
+        || kind == ProtocolKind.friendDirectory
+        || kind == ProtocolKind.introducedFriendRequest
         || kind == ProtocolKind.attachmentManifest
         || kind == ProtocolKind.reaction
 }

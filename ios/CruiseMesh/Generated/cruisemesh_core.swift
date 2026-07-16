@@ -549,6 +549,13 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 public protocol MessageStoreProtocol : AnyObject {
 
     /**
+     * Atomically replace all suggestions supplied by one introducer. The
+     * directory's tickets are checked here so both mobile shells share the
+     * same fail-closed behavior.
+     */
+    func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, content: FriendDirectoryContent, nowMs: Int64) throws  -> Bool
+
+    /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
      * The caller passes the set of hints a just-met peer could match --
@@ -590,6 +597,8 @@ public protocol MessageStoreProtocol : AnyObject {
      * digest (the recent-msg_id bloom filter is deferred).
      */
     func chatDigest(chatId: Data) throws  -> [DigestEntry]
+
+    func clearFriendSuggestions() throws
 
     /**
      * The canonical JPEG avatar bytes for a contact, if one has been synced.
@@ -705,6 +714,10 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func getContact(userId: Data) throws  -> Contact?
 
+    func getContactDiscoveryPolicy(userId: Data) throws  -> ContactDiscoveryPolicy?
+
+    func getContactProvenance(userId: Data) throws  -> ContactProvenance?
+
     /**
      * Look up one imported group by id, including its current member list.
      */
@@ -757,6 +770,12 @@ public protocol MessageStoreProtocol : AnyObject {
     func highestLamport(chatId: Data, senderUserId: Data) throws  -> UInt64
 
     /**
+     * Insert an opened incoming message together with the envelope id used
+     * for quoting it and an optional encrypted reply target.
+     */
+    func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgId: Data?) throws  -> Bool
+
+    /**
      * Insert a message from a remote sender's stream, distinguishing a true
      * duplicate from a *forked* stream instead of silently dropping both the
      * same way.
@@ -801,9 +820,18 @@ public protocol MessageStoreProtocol : AnyObject {
     func insertOutgoingMessage(message: StoredMessage, envelope: OutboundEnvelope, queuedAtMs: Int64) throws  -> Bool
 
     /**
+     * Atomically persist a locally authored reply and its stable sealed
+     * envelope. The target id remains local metadata as well as encrypted
+     * body metadata, so rendering never needs to reopen ciphertext.
+     */
+    func insertOutgoingReply(message: StoredMessage, envelope: OutboundEnvelope, replyToMsgId: Data, queuedAtMs: Int64) throws  -> Bool
+
+    /**
      * All contacts, alphabetical by name.
      */
     func listContacts() throws  -> [Contact]
+
+    func listFriendSuggestions(nowMs: Int64) throws  -> [FriendSuggestion]
 
     /**
      * All imported groups, alphabetical by name then id for stable ordering.
@@ -821,6 +849,24 @@ public protocol MessageStoreProtocol : AnyObject {
      * Returns `true` if a queued row was updated.
      */
     func markOutgoingReceiptEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64) throws  -> Bool
+
+    /**
+     * First-arrival diagnostics for one message, or `None` for locally
+     * authored/legacy rows that predate diagnostics.
+     */
+    func messageArrival(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> MessageArrival?
+
+    /**
+     * Resolve a quoted message by stable envelope id within one chat.
+     * Missing history is expected and returns `None`.
+     */
+    func messageByMsgId(chatId: Data, msgId: Data) throws  -> StoredMessage?
+
+    /**
+     * Stable id and optional reply target for one stored message. Returns
+     * `None` for legacy rows whose inbound envelope id was never recorded.
+     */
+    func messageReference(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> MessageReference?
 
     /**
      * Messages from `sender_user_id` in `chat_id` with `lamport >
@@ -907,6 +953,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func receiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8) throws  -> UInt64
 
     /**
+     * Attach first-arrival diagnostics to an already inserted incoming
+     * message. A redundant mesh/relay copy never overwrites the original
+     * route, hop count, or receive time.
+     */
+    func recordMessageArrival(chatId: Data, senderUserId: Data, lamport: UInt64, arrival: MessageArrival) throws  -> Bool
+
+    /**
      * Record that *this device* has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` -- the
      * cumulative receipt watermark to send back on the next peer sync
@@ -934,6 +987,8 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func removeCarriedEnvelope(msgId: Data) throws  -> Bool
 
+    func removeFriendSuggestion(candidateUserId: Data) throws
+
     /**
      * Apply a contact avatar update only if `epoch` is newer than the stored
      * avatar epoch. `None` or an empty blob clears the avatar but still
@@ -942,11 +997,23 @@ public protocol MessageStoreProtocol : AnyObject {
     func setContactAvatar(userId: Data, avatar: Data?, epoch: Int64) throws  -> Bool
 
     /**
+     * State values: 0 available, 1 requested, 2 hidden.
+     */
+    func setFriendSuggestionState(candidateUserId: Data, state: UInt8) throws
+
+    /**
      * Add or update a contact, keyed on `user_id` -- re-scanning the same
      * FriendCard (e.g. after they update their display name) replaces the
      * row rather than erroring or duplicating.
      */
     func upsertContact(contact: Contact) throws
+
+    /**
+     * Apply an authenticated contact's discovery policy if it is newer.
+     */
+    func upsertContactDiscoveryPolicy(policy: ContactDiscoveryPolicy) throws  -> Bool
+
+    func upsertContactProvenance(provenance: ContactProvenance) throws
 
     /**
      * Add or replace a group definition and its full membership. Updating an
@@ -1028,6 +1095,22 @@ public static func `open`(path: String)throws  -> MessageStore {
 
 
     /**
+     * Atomically replace all suggestions supplied by one introducer. The
+     * directory's tickets are checked here so both mobile shells share the
+     * same fail-closed behavior.
+     */
+open func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, content: FriendDirectoryContent, nowMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_apply_friend_directory(self.uniffiClonePointer(),
+        FfiConverterData.lower(introducerUserId),
+        FfiConverterData.lower(recipientUserId),
+        FfiConverterTypeFriendDirectoryContent.lower(content),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+    /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
      * The caller passes the set of hints a just-met peer could match --
@@ -1100,6 +1183,12 @@ open func chatDigest(chatId: Data)throws  -> [DigestEntry] {
         FfiConverterData.lower(chatId),$0
     )
 })
+}
+
+open func clearFriendSuggestions()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_friend_suggestions(self.uniffiClonePointer(),$0
+    )
+}
 }
 
     /**
@@ -1269,6 +1358,22 @@ open func getContact(userId: Data)throws  -> Contact? {
 })
 }
 
+open func getContactDiscoveryPolicy(userId: Data)throws  -> ContactDiscoveryPolicy? {
+    return try  FfiConverterOptionTypeContactDiscoveryPolicy.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_get_contact_discovery_policy(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
+    )
+})
+}
+
+open func getContactProvenance(userId: Data)throws  -> ContactProvenance? {
+    return try  FfiConverterOptionTypeContactProvenance.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_get_contact_provenance(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
+    )
+})
+}
+
     /**
      * Look up one imported group by id, including its current member list.
      */
@@ -1341,6 +1446,20 @@ open func highestLamport(chatId: Data, senderUserId: Data)throws  -> UInt64 {
 }
 
     /**
+     * Insert an opened incoming message together with the envelope id used
+     * for quoting it and an optional encrypted reply target.
+     */
+open func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgId: Data?)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_insert_incoming_message(self.uniffiClonePointer(),
+        FfiConverterTypeStoredMessage.lower(message),
+        FfiConverterData.lower(msgId),
+        FfiConverterOptionData.lower(replyToMsgId),$0
+    )
+})
+}
+
+    /**
      * Insert a message from a remote sender's stream, distinguishing a true
      * duplicate from a *forked* stream instead of silently dropping both the
      * same way.
@@ -1399,11 +1518,35 @@ open func insertOutgoingMessage(message: StoredMessage, envelope: OutboundEnvelo
 }
 
     /**
+     * Atomically persist a locally authored reply and its stable sealed
+     * envelope. The target id remains local metadata as well as encrypted
+     * body metadata, so rendering never needs to reopen ciphertext.
+     */
+open func insertOutgoingReply(message: StoredMessage, envelope: OutboundEnvelope, replyToMsgId: Data, queuedAtMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_insert_outgoing_reply(self.uniffiClonePointer(),
+        FfiConverterTypeStoredMessage.lower(message),
+        FfiConverterTypeOutboundEnvelope.lower(envelope),
+        FfiConverterData.lower(replyToMsgId),
+        FfiConverterInt64.lower(queuedAtMs),$0
+    )
+})
+}
+
+    /**
      * All contacts, alphabetical by name.
      */
 open func listContacts()throws  -> [Contact] {
     return try  FfiConverterSequenceTypeContact.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_list_contacts(self.uniffiClonePointer(),$0
+    )
+})
+}
+
+open func listFriendSuggestions(nowMs: Int64)throws  -> [FriendSuggestion] {
+    return try  FfiConverterSequenceTypeFriendSuggestion.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_list_friend_suggestions(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -1440,6 +1583,47 @@ open func markOutgoingReceiptEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64)
     uniffi_cruisemesh_core_fn_method_messagestore_mark_outgoing_receipt_envelope_relay_posted(self.uniffiClonePointer(),
         FfiConverterData.lower(msgId),
         FfiConverterInt64.lower(postedAtMs),$0
+    )
+})
+}
+
+    /**
+     * First-arrival diagnostics for one message, or `None` for locally
+     * authored/legacy rows that predate diagnostics.
+     */
+open func messageArrival(chatId: Data, senderUserId: Data, lamport: UInt64)throws  -> MessageArrival? {
+    return try  FfiConverterOptionTypeMessageArrival.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_message_arrival(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterUInt64.lower(lamport),$0
+    )
+})
+}
+
+    /**
+     * Resolve a quoted message by stable envelope id within one chat.
+     * Missing history is expected and returns `None`.
+     */
+open func messageByMsgId(chatId: Data, msgId: Data)throws  -> StoredMessage? {
+    return try  FfiConverterOptionTypeStoredMessage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_message_by_msg_id(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(msgId),$0
+    )
+})
+}
+
+    /**
+     * Stable id and optional reply target for one stored message. Returns
+     * `None` for legacy rows whose inbound envelope id was never recorded.
+     */
+open func messageReference(chatId: Data, senderUserId: Data, lamport: UInt64)throws  -> MessageReference? {
+    return try  FfiConverterOptionTypeMessageReference.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_message_reference(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterUInt64.lower(lamport),$0
     )
 })
 }
@@ -1607,6 +1791,22 @@ open func receiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8)th
 }
 
     /**
+     * Attach first-arrival diagnostics to an already inserted incoming
+     * message. A redundant mesh/relay copy never overwrites the original
+     * route, hop count, or receive time.
+     */
+open func recordMessageArrival(chatId: Data, senderUserId: Data, lamport: UInt64, arrival: MessageArrival)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_record_message_arrival(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterUInt64.lower(lamport),
+        FfiConverterTypeMessageArrival.lower(arrival),$0
+    )
+})
+}
+
+    /**
      * Record that *this device* has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` -- the
      * cumulative receipt watermark to send back on the next peer sync
@@ -1656,6 +1856,13 @@ open func removeCarriedEnvelope(msgId: Data)throws  -> Bool {
 })
 }
 
+open func removeFriendSuggestion(candidateUserId: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_remove_friend_suggestion(self.uniffiClonePointer(),
+        FfiConverterData.lower(candidateUserId),$0
+    )
+}
+}
+
     /**
      * Apply a contact avatar update only if `epoch` is newer than the stored
      * avatar epoch. `None` or an empty blob clears the avatar but still
@@ -1672,6 +1879,17 @@ open func setContactAvatar(userId: Data, avatar: Data?, epoch: Int64)throws  -> 
 }
 
     /**
+     * State values: 0 available, 1 requested, 2 hidden.
+     */
+open func setFriendSuggestionState(candidateUserId: Data, state: UInt8)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_set_friend_suggestion_state(self.uniffiClonePointer(),
+        FfiConverterData.lower(candidateUserId),
+        FfiConverterUInt8.lower(state),$0
+    )
+}
+}
+
+    /**
      * Add or update a contact, keyed on `user_id` -- re-scanning the same
      * FriendCard (e.g. after they update their display name) replaces the
      * row rather than erroring or duplicating.
@@ -1679,6 +1897,24 @@ open func setContactAvatar(userId: Data, avatar: Data?, epoch: Int64)throws  -> 
 open func upsertContact(contact: Contact)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_upsert_contact(self.uniffiClonePointer(),
         FfiConverterTypeContact.lower(contact),$0
+    )
+}
+}
+
+    /**
+     * Apply an authenticated contact's discovery policy if it is newer.
+     */
+open func upsertContactDiscoveryPolicy(policy: ContactDiscoveryPolicy)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_upsert_contact_discovery_policy(self.uniffiClonePointer(),
+        FfiConverterTypeContactDiscoveryPolicy.lower(policy),$0
+    )
+})
+}
+
+open func upsertContactProvenance(provenance: ContactProvenance)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_upsert_contact_provenance(self.uniffiClonePointer(),
+        FfiConverterTypeContactProvenance.lower(provenance),$0
     )
 }
 }
@@ -2164,6 +2400,182 @@ public func FfiConverterTypeContact_lower(_ value: Contact) -> RustBuffer {
 
 
 /**
+ * The last authenticated friends-of-friends policy advertised by a contact.
+ */
+public struct ContactDiscoveryPolicy {
+    public var userId: Data
+    public var protocolVersion: UInt8
+    public var enabled: Bool
+    public var revision: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(userId: Data, protocolVersion: UInt8, enabled: Bool, revision: UInt64) {
+        self.userId = userId
+        self.protocolVersion = protocolVersion
+        self.enabled = enabled
+        self.revision = revision
+    }
+}
+
+
+
+extension ContactDiscoveryPolicy: Equatable, Hashable {
+    public static func ==(lhs: ContactDiscoveryPolicy, rhs: ContactDiscoveryPolicy) -> Bool {
+        if lhs.userId != rhs.userId {
+            return false
+        }
+        if lhs.protocolVersion != rhs.protocolVersion {
+            return false
+        }
+        if lhs.enabled != rhs.enabled {
+            return false
+        }
+        if lhs.revision != rhs.revision {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(userId)
+        hasher.combine(protocolVersion)
+        hasher.combine(enabled)
+        hasher.combine(revision)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactDiscoveryPolicy: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactDiscoveryPolicy {
+        return
+            try ContactDiscoveryPolicy(
+                userId: FfiConverterData.read(from: &buf),
+                protocolVersion: FfiConverterUInt8.read(from: &buf),
+                enabled: FfiConverterBool.read(from: &buf),
+                revision: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ContactDiscoveryPolicy, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.userId, into: &buf)
+        FfiConverterUInt8.write(value.protocolVersion, into: &buf)
+        FfiConverterBool.write(value.enabled, into: &buf)
+        FfiConverterUInt64.write(value.revision, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactDiscoveryPolicy_lift(_ buf: RustBuffer) throws -> ContactDiscoveryPolicy {
+    return try FfiConverterTypeContactDiscoveryPolicy.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactDiscoveryPolicy_lower(_ value: ContactDiscoveryPolicy) -> RustBuffer {
+    return FfiConverterTypeContactDiscoveryPolicy.lower(value)
+}
+
+
+/**
+ * How an accepted contact first entered the local trust graph.
+ */
+public struct ContactProvenance {
+    public var userId: Data
+    /**
+     * 0 = direct QR/link, 1 = introduced by another accepted contact.
+     */
+    public var source: UInt8
+    public var introducerUserId: Data?
+    public var introducedAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(userId: Data,
+        /**
+         * 0 = direct QR/link, 1 = introduced by another accepted contact.
+         */source: UInt8, introducerUserId: Data?, introducedAtMs: Int64) {
+        self.userId = userId
+        self.source = source
+        self.introducerUserId = introducerUserId
+        self.introducedAtMs = introducedAtMs
+    }
+}
+
+
+
+extension ContactProvenance: Equatable, Hashable {
+    public static func ==(lhs: ContactProvenance, rhs: ContactProvenance) -> Bool {
+        if lhs.userId != rhs.userId {
+            return false
+        }
+        if lhs.source != rhs.source {
+            return false
+        }
+        if lhs.introducerUserId != rhs.introducerUserId {
+            return false
+        }
+        if lhs.introducedAtMs != rhs.introducedAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(userId)
+        hasher.combine(source)
+        hasher.combine(introducerUserId)
+        hasher.combine(introducedAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactProvenance: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactProvenance {
+        return
+            try ContactProvenance(
+                userId: FfiConverterData.read(from: &buf),
+                source: FfiConverterUInt8.read(from: &buf),
+                introducerUserId: FfiConverterOptionData.read(from: &buf),
+                introducedAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ContactProvenance, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.userId, into: &buf)
+        FfiConverterUInt8.write(value.source, into: &buf)
+        FfiConverterOptionData.write(value.introducerUserId, into: &buf)
+        FfiConverterInt64.write(value.introducedAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactProvenance_lift(_ buf: RustBuffer) throws -> ContactProvenance {
+    return try FfiConverterTypeContactProvenance.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactProvenance_lower(_ value: ContactProvenance) -> RustBuffer {
+    return FfiConverterTypeContactProvenance.lower(value)
+}
+
+
+/**
  * One entry of a per-chat sync digest (DESIGN.md §7.3): "I have `sender_user_id`'s
  * messages in this chat contiguously through `through_lamport`."
  */
@@ -2230,6 +2642,108 @@ public func FfiConverterTypeDigestEntry_lift(_ buf: RustBuffer) throws -> Digest
 #endif
 public func FfiConverterTypeDigestEntry_lower(_ value: DigestEntry) -> RustBuffer {
     return FfiConverterTypeDigestEntry.lower(value)
+}
+
+
+/**
+ * A decoded message body plus optional encrypted metadata appended after
+ * the legacy content field. Unknown extension types are skipped.
+ */
+public struct ExtendedMessageBody {
+    public var kind: UInt8
+    public var chatId: Data
+    public var lamport: UInt64
+    public var timestamp: Int64
+    public var content: Data
+    public var replyToMsgId: Data?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: UInt8, chatId: Data, lamport: UInt64, timestamp: Int64, content: Data, replyToMsgId: Data?) {
+        self.kind = kind
+        self.chatId = chatId
+        self.lamport = lamport
+        self.timestamp = timestamp
+        self.content = content
+        self.replyToMsgId = replyToMsgId
+    }
+}
+
+
+
+extension ExtendedMessageBody: Equatable, Hashable {
+    public static func ==(lhs: ExtendedMessageBody, rhs: ExtendedMessageBody) -> Bool {
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.chatId != rhs.chatId {
+            return false
+        }
+        if lhs.lamport != rhs.lamport {
+            return false
+        }
+        if lhs.timestamp != rhs.timestamp {
+            return false
+        }
+        if lhs.content != rhs.content {
+            return false
+        }
+        if lhs.replyToMsgId != rhs.replyToMsgId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(kind)
+        hasher.combine(chatId)
+        hasher.combine(lamport)
+        hasher.combine(timestamp)
+        hasher.combine(content)
+        hasher.combine(replyToMsgId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeExtendedMessageBody: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ExtendedMessageBody {
+        return
+            try ExtendedMessageBody(
+                kind: FfiConverterUInt8.read(from: &buf),
+                chatId: FfiConverterData.read(from: &buf),
+                lamport: FfiConverterUInt64.read(from: &buf),
+                timestamp: FfiConverterInt64.read(from: &buf),
+                content: FfiConverterData.read(from: &buf),
+                replyToMsgId: FfiConverterOptionData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ExtendedMessageBody, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.kind, into: &buf)
+        FfiConverterData.write(value.chatId, into: &buf)
+        FfiConverterUInt64.write(value.lamport, into: &buf)
+        FfiConverterInt64.write(value.timestamp, into: &buf)
+        FfiConverterData.write(value.content, into: &buf)
+        FfiConverterOptionData.write(value.replyToMsgId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeExtendedMessageBody_lift(_ buf: RustBuffer) throws -> ExtendedMessageBody {
+    return try FfiConverterTypeExtendedMessageBody.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeExtendedMessageBody_lower(_ value: ExtendedMessageBody) -> RustBuffer {
+    return FfiConverterTypeExtendedMessageBody.lower(value)
 }
 
 
@@ -2324,6 +2838,246 @@ public func FfiConverterTypeFriendCard_lift(_ buf: RustBuffer) throws -> FriendC
 #endif
 public func FfiConverterTypeFriendCard_lower(_ value: FriendCard) -> RustBuffer {
     return FfiConverterTypeFriendCard.lower(value)
+}
+
+
+public struct FriendDirectoryContent {
+    public var version: UInt8
+    public var revision: UInt64
+    public var entries: [FriendDirectoryEntry]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(version: UInt8, revision: UInt64, entries: [FriendDirectoryEntry]) {
+        self.version = version
+        self.revision = revision
+        self.entries = entries
+    }
+}
+
+
+
+extension FriendDirectoryContent: Equatable, Hashable {
+    public static func ==(lhs: FriendDirectoryContent, rhs: FriendDirectoryContent) -> Bool {
+        if lhs.version != rhs.version {
+            return false
+        }
+        if lhs.revision != rhs.revision {
+            return false
+        }
+        if lhs.entries != rhs.entries {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(version)
+        hasher.combine(revision)
+        hasher.combine(entries)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFriendDirectoryContent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendDirectoryContent {
+        return
+            try FriendDirectoryContent(
+                version: FfiConverterUInt8.read(from: &buf),
+                revision: FfiConverterUInt64.read(from: &buf),
+                entries: FfiConverterSequenceTypeFriendDirectoryEntry.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FriendDirectoryContent, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.version, into: &buf)
+        FfiConverterUInt64.write(value.revision, into: &buf)
+        FfiConverterSequenceTypeFriendDirectoryEntry.write(value.entries, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendDirectoryContent_lift(_ buf: RustBuffer) throws -> FriendDirectoryContent {
+    return try FfiConverterTypeFriendDirectoryContent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendDirectoryContent_lower(_ value: FriendDirectoryContent) -> RustBuffer {
+    return FfiConverterTypeFriendDirectoryContent.lower(value)
+}
+
+
+public struct FriendDirectoryEntry {
+    public var candidate: SuggestedFriendCard
+    public var candidatePolicyRevision: UInt64
+    public var ticket: IntroductionTicket
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(candidate: SuggestedFriendCard, candidatePolicyRevision: UInt64, ticket: IntroductionTicket) {
+        self.candidate = candidate
+        self.candidatePolicyRevision = candidatePolicyRevision
+        self.ticket = ticket
+    }
+}
+
+
+
+extension FriendDirectoryEntry: Equatable, Hashable {
+    public static func ==(lhs: FriendDirectoryEntry, rhs: FriendDirectoryEntry) -> Bool {
+        if lhs.candidate != rhs.candidate {
+            return false
+        }
+        if lhs.candidatePolicyRevision != rhs.candidatePolicyRevision {
+            return false
+        }
+        if lhs.ticket != rhs.ticket {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(candidate)
+        hasher.combine(candidatePolicyRevision)
+        hasher.combine(ticket)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFriendDirectoryEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendDirectoryEntry {
+        return
+            try FriendDirectoryEntry(
+                candidate: FfiConverterTypeSuggestedFriendCard.read(from: &buf),
+                candidatePolicyRevision: FfiConverterUInt64.read(from: &buf),
+                ticket: FfiConverterTypeIntroductionTicket.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FriendDirectoryEntry, into buf: inout [UInt8]) {
+        FfiConverterTypeSuggestedFriendCard.write(value.candidate, into: &buf)
+        FfiConverterUInt64.write(value.candidatePolicyRevision, into: &buf)
+        FfiConverterTypeIntroductionTicket.write(value.ticket, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendDirectoryEntry_lift(_ buf: RustBuffer) throws -> FriendDirectoryEntry {
+    return try FfiConverterTypeFriendDirectoryEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendDirectoryEntry_lower(_ value: FriendDirectoryEntry) -> RustBuffer {
+    return FfiConverterTypeFriendDirectoryEntry.lower(value)
+}
+
+
+/**
+ * One candidate/source pair. Callers group rows with the same candidate
+ * UserID to present all known mutual friends.
+ */
+public struct FriendSuggestion {
+    public var candidate: SuggestedFriendCard
+    public var introducerUserId: Data
+    public var ticket: IntroductionTicket
+    /**
+     * 0 = available, 1 = requested, 2 = hidden.
+     */
+    public var state: UInt8
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(candidate: SuggestedFriendCard, introducerUserId: Data, ticket: IntroductionTicket,
+        /**
+         * 0 = available, 1 = requested, 2 = hidden.
+         */state: UInt8) {
+        self.candidate = candidate
+        self.introducerUserId = introducerUserId
+        self.ticket = ticket
+        self.state = state
+    }
+}
+
+
+
+extension FriendSuggestion: Equatable, Hashable {
+    public static func ==(lhs: FriendSuggestion, rhs: FriendSuggestion) -> Bool {
+        if lhs.candidate != rhs.candidate {
+            return false
+        }
+        if lhs.introducerUserId != rhs.introducerUserId {
+            return false
+        }
+        if lhs.ticket != rhs.ticket {
+            return false
+        }
+        if lhs.state != rhs.state {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(candidate)
+        hasher.combine(introducerUserId)
+        hasher.combine(ticket)
+        hasher.combine(state)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFriendSuggestion: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendSuggestion {
+        return
+            try FriendSuggestion(
+                candidate: FfiConverterTypeSuggestedFriendCard.read(from: &buf),
+                introducerUserId: FfiConverterData.read(from: &buf),
+                ticket: FfiConverterTypeIntroductionTicket.read(from: &buf),
+                state: FfiConverterUInt8.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FriendSuggestion, into buf: inout [UInt8]) {
+        FfiConverterTypeSuggestedFriendCard.write(value.candidate, into: &buf)
+        FfiConverterData.write(value.introducerUserId, into: &buf)
+        FfiConverterTypeIntroductionTicket.write(value.ticket, into: &buf)
+        FfiConverterUInt8.write(value.state, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendSuggestion_lift(_ buf: RustBuffer) throws -> FriendSuggestion {
+    return try FfiConverterTypeFriendSuggestion.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendSuggestion_lower(_ value: FriendSuggestion) -> RustBuffer {
+    return FfiConverterTypeFriendSuggestion.lower(value)
 }
 
 
@@ -2509,6 +3263,284 @@ public func FfiConverterTypeIdentity_lower(_ value: Identity) -> RustBuffer {
 }
 
 
+public struct IntroducedFriendRequest {
+    public var version: UInt8
+    public var friendCardJson: String
+    public var ticket: IntroductionTicket
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(version: UInt8, friendCardJson: String, ticket: IntroductionTicket) {
+        self.version = version
+        self.friendCardJson = friendCardJson
+        self.ticket = ticket
+    }
+}
+
+
+
+extension IntroducedFriendRequest: Equatable, Hashable {
+    public static func ==(lhs: IntroducedFriendRequest, rhs: IntroducedFriendRequest) -> Bool {
+        if lhs.version != rhs.version {
+            return false
+        }
+        if lhs.friendCardJson != rhs.friendCardJson {
+            return false
+        }
+        if lhs.ticket != rhs.ticket {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(version)
+        hasher.combine(friendCardJson)
+        hasher.combine(ticket)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIntroducedFriendRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IntroducedFriendRequest {
+        return
+            try IntroducedFriendRequest(
+                version: FfiConverterUInt8.read(from: &buf),
+                friendCardJson: FfiConverterString.read(from: &buf),
+                ticket: FfiConverterTypeIntroductionTicket.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IntroducedFriendRequest, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.version, into: &buf)
+        FfiConverterString.write(value.friendCardJson, into: &buf)
+        FfiConverterTypeIntroductionTicket.write(value.ticket, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIntroducedFriendRequest_lift(_ buf: RustBuffer) throws -> IntroducedFriendRequest {
+    return try FfiConverterTypeIntroducedFriendRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIntroducedFriendRequest_lower(_ value: IntroducedFriendRequest) -> RustBuffer {
+    return FfiConverterTypeIntroducedFriendRequest.lower(value)
+}
+
+
+/**
+ * Transferable proof that an accepted contact introduced one exact invitee
+ * to one exact candidate under the candidate's current discovery revision.
+ */
+public struct IntroductionTicket {
+    public var version: UInt8
+    public var introducerUserId: Data
+    public var candidateUserId: Data
+    public var inviteeUserId: Data
+    public var candidatePolicyRevision: UInt64
+    public var issuedAtMs: Int64
+    public var expiresAtMs: Int64
+    public var offerId: Data
+    public var signature: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(version: UInt8, introducerUserId: Data, candidateUserId: Data, inviteeUserId: Data, candidatePolicyRevision: UInt64, issuedAtMs: Int64, expiresAtMs: Int64, offerId: Data, signature: Data) {
+        self.version = version
+        self.introducerUserId = introducerUserId
+        self.candidateUserId = candidateUserId
+        self.inviteeUserId = inviteeUserId
+        self.candidatePolicyRevision = candidatePolicyRevision
+        self.issuedAtMs = issuedAtMs
+        self.expiresAtMs = expiresAtMs
+        self.offerId = offerId
+        self.signature = signature
+    }
+}
+
+
+
+extension IntroductionTicket: Equatable, Hashable {
+    public static func ==(lhs: IntroductionTicket, rhs: IntroductionTicket) -> Bool {
+        if lhs.version != rhs.version {
+            return false
+        }
+        if lhs.introducerUserId != rhs.introducerUserId {
+            return false
+        }
+        if lhs.candidateUserId != rhs.candidateUserId {
+            return false
+        }
+        if lhs.inviteeUserId != rhs.inviteeUserId {
+            return false
+        }
+        if lhs.candidatePolicyRevision != rhs.candidatePolicyRevision {
+            return false
+        }
+        if lhs.issuedAtMs != rhs.issuedAtMs {
+            return false
+        }
+        if lhs.expiresAtMs != rhs.expiresAtMs {
+            return false
+        }
+        if lhs.offerId != rhs.offerId {
+            return false
+        }
+        if lhs.signature != rhs.signature {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(version)
+        hasher.combine(introducerUserId)
+        hasher.combine(candidateUserId)
+        hasher.combine(inviteeUserId)
+        hasher.combine(candidatePolicyRevision)
+        hasher.combine(issuedAtMs)
+        hasher.combine(expiresAtMs)
+        hasher.combine(offerId)
+        hasher.combine(signature)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIntroductionTicket: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IntroductionTicket {
+        return
+            try IntroductionTicket(
+                version: FfiConverterUInt8.read(from: &buf),
+                introducerUserId: FfiConverterData.read(from: &buf),
+                candidateUserId: FfiConverterData.read(from: &buf),
+                inviteeUserId: FfiConverterData.read(from: &buf),
+                candidatePolicyRevision: FfiConverterUInt64.read(from: &buf),
+                issuedAtMs: FfiConverterInt64.read(from: &buf),
+                expiresAtMs: FfiConverterInt64.read(from: &buf),
+                offerId: FfiConverterData.read(from: &buf),
+                signature: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IntroductionTicket, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.version, into: &buf)
+        FfiConverterData.write(value.introducerUserId, into: &buf)
+        FfiConverterData.write(value.candidateUserId, into: &buf)
+        FfiConverterData.write(value.inviteeUserId, into: &buf)
+        FfiConverterUInt64.write(value.candidatePolicyRevision, into: &buf)
+        FfiConverterInt64.write(value.issuedAtMs, into: &buf)
+        FfiConverterInt64.write(value.expiresAtMs, into: &buf)
+        FfiConverterData.write(value.offerId, into: &buf)
+        FfiConverterData.write(value.signature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIntroductionTicket_lift(_ buf: RustBuffer) throws -> IntroductionTicket {
+    return try FfiConverterTypeIntroductionTicket.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIntroductionTicket_lower(_ value: IntroductionTicket) -> RustBuffer {
+    return FfiConverterTypeIntroductionTicket.lower(value)
+}
+
+
+/**
+ * Local-only diagnostics for how an incoming message reached this device.
+ * `transport`: 0 = BLE direct, 1 = BLE through another device, 2 = relay.
+ */
+public struct MessageArrival {
+    public var transport: UInt8
+    public var hopsTaken: UInt8
+    public var receivedAt: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(transport: UInt8, hopsTaken: UInt8, receivedAt: Int64) {
+        self.transport = transport
+        self.hopsTaken = hopsTaken
+        self.receivedAt = receivedAt
+    }
+}
+
+
+
+extension MessageArrival: Equatable, Hashable {
+    public static func ==(lhs: MessageArrival, rhs: MessageArrival) -> Bool {
+        if lhs.transport != rhs.transport {
+            return false
+        }
+        if lhs.hopsTaken != rhs.hopsTaken {
+            return false
+        }
+        if lhs.receivedAt != rhs.receivedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(transport)
+        hasher.combine(hopsTaken)
+        hasher.combine(receivedAt)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageArrival: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageArrival {
+        return
+            try MessageArrival(
+                transport: FfiConverterUInt8.read(from: &buf),
+                hopsTaken: FfiConverterUInt8.read(from: &buf),
+                receivedAt: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MessageArrival, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.transport, into: &buf)
+        FfiConverterUInt8.write(value.hopsTaken, into: &buf)
+        FfiConverterInt64.write(value.receivedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageArrival_lift(_ buf: RustBuffer) throws -> MessageArrival {
+    return try FfiConverterTypeMessageArrival.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageArrival_lower(_ value: MessageArrival) -> RustBuffer {
+    return FfiConverterTypeMessageArrival.lower(value)
+}
+
+
 /**
  * The plaintext body that gets encoded, then handed as `payload` to
  * [`crate::seal_message`] (DESIGN.md §7.1). See the module docs for the
@@ -2601,6 +3633,76 @@ public func FfiConverterTypeMessageBody_lift(_ buf: RustBuffer) throws -> Messag
 #endif
 public func FfiConverterTypeMessageBody_lower(_ value: MessageBody) -> RustBuffer {
     return FfiConverterTypeMessageBody.lower(value)
+}
+
+
+/**
+ * Stable envelope identity for a stored message and, for replies, the
+ * encrypted id of the quoted message. Legacy rows may have no reference.
+ */
+public struct MessageReference {
+    public var msgId: Data
+    public var replyToMsgId: Data?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(msgId: Data, replyToMsgId: Data?) {
+        self.msgId = msgId
+        self.replyToMsgId = replyToMsgId
+    }
+}
+
+
+
+extension MessageReference: Equatable, Hashable {
+    public static func ==(lhs: MessageReference, rhs: MessageReference) -> Bool {
+        if lhs.msgId != rhs.msgId {
+            return false
+        }
+        if lhs.replyToMsgId != rhs.replyToMsgId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(msgId)
+        hasher.combine(replyToMsgId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageReference: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageReference {
+        return
+            try MessageReference(
+                msgId: FfiConverterData.read(from: &buf),
+                replyToMsgId: FfiConverterOptionData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MessageReference, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.msgId, into: &buf)
+        FfiConverterOptionData.write(value.replyToMsgId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageReference_lift(_ buf: RustBuffer) throws -> MessageReference {
+    return try FfiConverterTypeMessageReference.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageReference_lower(_ value: MessageReference) -> RustBuffer {
+    return FfiConverterTypeMessageReference.lower(value)
 }
 
 
@@ -2972,13 +4074,19 @@ public struct ProfileSyncContent {
     public var avatarEpoch: Int64
     public var name: String
     public var avatar: Data
+    public var friendsOfFriendsVersion: UInt8
+    public var friendsOfFriendsEnabled: Bool
+    public var friendsOfFriendsRevision: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(avatarEpoch: Int64, name: String, avatar: Data) {
+    public init(avatarEpoch: Int64, name: String, avatar: Data, friendsOfFriendsVersion: UInt8, friendsOfFriendsEnabled: Bool, friendsOfFriendsRevision: UInt64) {
         self.avatarEpoch = avatarEpoch
         self.name = name
         self.avatar = avatar
+        self.friendsOfFriendsVersion = friendsOfFriendsVersion
+        self.friendsOfFriendsEnabled = friendsOfFriendsEnabled
+        self.friendsOfFriendsRevision = friendsOfFriendsRevision
     }
 }
 
@@ -2995,6 +4103,15 @@ extension ProfileSyncContent: Equatable, Hashable {
         if lhs.avatar != rhs.avatar {
             return false
         }
+        if lhs.friendsOfFriendsVersion != rhs.friendsOfFriendsVersion {
+            return false
+        }
+        if lhs.friendsOfFriendsEnabled != rhs.friendsOfFriendsEnabled {
+            return false
+        }
+        if lhs.friendsOfFriendsRevision != rhs.friendsOfFriendsRevision {
+            return false
+        }
         return true
     }
 
@@ -3002,6 +4119,9 @@ extension ProfileSyncContent: Equatable, Hashable {
         hasher.combine(avatarEpoch)
         hasher.combine(name)
         hasher.combine(avatar)
+        hasher.combine(friendsOfFriendsVersion)
+        hasher.combine(friendsOfFriendsEnabled)
+        hasher.combine(friendsOfFriendsRevision)
     }
 }
 
@@ -3015,7 +4135,10 @@ public struct FfiConverterTypeProfileSyncContent: FfiConverterRustBuffer {
             try ProfileSyncContent(
                 avatarEpoch: FfiConverterInt64.read(from: &buf),
                 name: FfiConverterString.read(from: &buf),
-                avatar: FfiConverterData.read(from: &buf)
+                avatar: FfiConverterData.read(from: &buf),
+                friendsOfFriendsVersion: FfiConverterUInt8.read(from: &buf),
+                friendsOfFriendsEnabled: FfiConverterBool.read(from: &buf),
+                friendsOfFriendsRevision: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -3023,6 +4146,9 @@ public struct FfiConverterTypeProfileSyncContent: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.avatarEpoch, into: &buf)
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterData.write(value.avatar, into: &buf)
+        FfiConverterUInt8.write(value.friendsOfFriendsVersion, into: &buf)
+        FfiConverterBool.write(value.friendsOfFriendsEnabled, into: &buf)
+        FfiConverterUInt64.write(value.friendsOfFriendsRevision, into: &buf)
     }
 }
 
@@ -3229,6 +4355,92 @@ public func FfiConverterTypeStoredMessage_lift(_ buf: RustBuffer) throws -> Stor
 #endif
 public func FfiConverterTypeStoredMessage_lower(_ value: StoredMessage) -> RustBuffer {
     return FfiConverterTypeStoredMessage.lower(value)
+}
+
+
+/**
+ * Public identity forwarded by a mutual friend. Relay credentials and avatar
+ * bytes are deliberately absent.
+ */
+public struct SuggestedFriendCard {
+    public var name: String
+    public var userId: Data
+    public var signPk: Data
+    public var agreePk: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, userId: Data, signPk: Data, agreePk: Data) {
+        self.name = name
+        self.userId = userId
+        self.signPk = signPk
+        self.agreePk = agreePk
+    }
+}
+
+
+
+extension SuggestedFriendCard: Equatable, Hashable {
+    public static func ==(lhs: SuggestedFriendCard, rhs: SuggestedFriendCard) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.userId != rhs.userId {
+            return false
+        }
+        if lhs.signPk != rhs.signPk {
+            return false
+        }
+        if lhs.agreePk != rhs.agreePk {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(userId)
+        hasher.combine(signPk)
+        hasher.combine(agreePk)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSuggestedFriendCard: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SuggestedFriendCard {
+        return
+            try SuggestedFriendCard(
+                name: FfiConverterString.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf),
+                signPk: FfiConverterData.read(from: &buf),
+                agreePk: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SuggestedFriendCard, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterData.write(value.userId, into: &buf)
+        FfiConverterData.write(value.signPk, into: &buf)
+        FfiConverterData.write(value.agreePk, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSuggestedFriendCard_lift(_ buf: RustBuffer) throws -> SuggestedFriendCard {
+    return try FfiConverterTypeSuggestedFriendCard.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSuggestedFriendCard_lower(_ value: SuggestedFriendCard) -> RustBuffer {
+    return FfiConverterTypeSuggestedFriendCard.lower(value)
 }
 
 
@@ -3500,6 +4712,54 @@ fileprivate struct FfiConverterOptionTypeContact: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeContactDiscoveryPolicy: FfiConverterRustBuffer {
+    typealias SwiftType = ContactDiscoveryPolicy?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeContactDiscoveryPolicy.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeContactDiscoveryPolicy.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeContactProvenance: FfiConverterRustBuffer {
+    typealias SwiftType = ContactProvenance?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeContactProvenance.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeContactProvenance.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeGroup: FfiConverterRustBuffer {
     typealias SwiftType = Group?
 
@@ -3524,6 +4784,54 @@ fileprivate struct FfiConverterOptionTypeGroup: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeMessageArrival: FfiConverterRustBuffer {
+    typealias SwiftType = MessageArrival?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMessageArrival.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMessageArrival.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMessageReference: FfiConverterRustBuffer {
+    typealias SwiftType = MessageReference?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMessageReference.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMessageReference.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeOutgoingReceiptEnvelope: FfiConverterRustBuffer {
     typealias SwiftType = OutgoingReceiptEnvelope?
 
@@ -3540,6 +4848,30 @@ fileprivate struct FfiConverterOptionTypeOutgoingReceiptEnvelope: FfiConverterRu
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeOutgoingReceiptEnvelope.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeStoredMessage: FfiConverterRustBuffer {
+    typealias SwiftType = StoredMessage?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeStoredMessage.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeStoredMessage.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -3665,6 +4997,56 @@ fileprivate struct FfiConverterSequenceTypeDigestEntry: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeDigestEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFriendDirectoryEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [FriendDirectoryEntry]
+
+    public static func write(_ value: [FriendDirectoryEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFriendDirectoryEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FriendDirectoryEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FriendDirectoryEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFriendDirectoryEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFriendSuggestion: FfiConverterRustBuffer {
+    typealias SwiftType = [FriendSuggestion]
+
+    public static func write(_ value: [FriendSuggestion], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFriendSuggestion.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FriendSuggestion] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FriendSuggestion]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFriendSuggestion.read(from: &buf))
         }
         return seq
     }
@@ -3800,6 +5182,40 @@ public func createGroup(name: String, memberUserIds: [Data])throws  -> Group {
 })
 }
 /**
+ * Create a short-lived introduction ticket signed by the mutual friend.
+ */
+public func createIntroductionTicket(introducer: Identity, candidateUserId: Data, inviteeUserId: Data, candidatePolicyRevision: UInt64, issuedAtMs: Int64, expiresAtMs: Int64, offerId: Data)throws  -> IntroductionTicket {
+    return try  FfiConverterTypeIntroductionTicket.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_create_introduction_ticket(
+        FfiConverterTypeIdentity.lower(introducer),
+        FfiConverterData.lower(candidateUserId),
+        FfiConverterData.lower(inviteeUserId),
+        FfiConverterUInt64.lower(candidatePolicyRevision),
+        FfiConverterInt64.lower(issuedAtMs),
+        FfiConverterInt64.lower(expiresAtMs),
+        FfiConverterData.lower(offerId),$0
+    )
+})
+}
+/**
+ * Decode the legacy message fields and any known append-only extensions.
+ * Unknown well-formed TLVs are ignored for forward compatibility.
+ */
+public func decodeExtendedMessageBody(bytes: Data)throws  -> ExtendedMessageBody {
+    return try  FfiConverterTypeExtendedMessageBody.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_decode_extended_message_body(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+public func decodeFriendDirectoryContent(bytes: Data)throws  -> FriendDirectoryContent {
+    return try  FfiConverterTypeFriendDirectoryContent.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_decode_friend_directory_content(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
  * Decode a `kind=4` group-invite `content` payload.
  */
 public func decodeGroupInviteContent(bytes: Data)throws  -> Group {
@@ -3809,9 +5225,17 @@ public func decodeGroupInviteContent(bytes: Data)throws  -> Group {
     )
 })
 }
+public func decodeIntroducedFriendRequest(bytes: Data)throws  -> IntroducedFriendRequest {
+    return try  FfiConverterTypeIntroducedFriendRequest.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_decode_introduced_friend_request(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
 /**
  * Decode a [`MessageBody`] from its wire form. Rejects truncated input,
- * corrupt length prefixes, and unexpected trailing bytes.
+ * corrupt length prefixes, and malformed extension TLVs while ignoring
+ * well-formed extensions the legacy record does not surface.
  */
 public func decodeMessageBody(bytes: Data)throws  -> MessageBody {
     return try  FfiConverterTypeMessageBody.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -3890,6 +5314,13 @@ public func encodeEnvelopeFrame(msgId: Data, hopTtl: UInt8, expiry: Int64, recip
     )
 })
 }
+public func encodeFriendDirectoryContent(content: FriendDirectoryContent) -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_encode_friend_directory_content(
+        FfiConverterTypeFriendDirectoryContent.lower(content),$0
+    )
+})
+}
 /**
  * Encode the `content` of a `kind=4` group-invite body.
  *
@@ -3918,6 +5349,13 @@ public func encodeHello(userId: Data) -> Data {
     )
 })
 }
+public func encodeIntroducedFriendRequest(request: IntroducedFriendRequest) -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_encode_introduced_friend_request(
+        FfiConverterTypeIntroducedFriendRequest.lower(request),$0
+    )
+})
+}
 /**
  * Encode a [`MessageBody`] to its wire form (see module docs for layout).
  */
@@ -3925,6 +5363,19 @@ public func encodeMessageBody(body: MessageBody) -> Data {
     return try!  FfiConverterData.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_encode_message_body(
         FfiConverterTypeMessageBody.lower(body),$0
+    )
+})
+}
+/**
+ * Encode a message body with an encrypted reference to the message being
+ * replied to. The fixed-width id is the target envelope's public `msg_id`,
+ * but it remains private here because the extension is inside the seal.
+ */
+public func encodeMessageBodyWithReply(body: MessageBody, replyToMsgId: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_encode_message_body_with_reply(
+        FfiConverterTypeMessageBody.lower(body),
+        FfiConverterData.lower(replyToMsgId),$0
     )
 })
 }
@@ -4118,6 +5569,21 @@ public func sealMessage(sender: Identity, recipientAgreePk: Data, payload: Data)
     )
 })
 }
+/**
+ * Verify the ticket signature and all bindings needed by the candidate.
+ */
+public func verifyIntroductionTicket(ticket: IntroductionTicket, introducerSignPk: Data, expectedCandidateUserId: Data, expectedInviteeUserId: Data, expectedCandidatePolicyRevision: UInt64, nowMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_verify_introduction_ticket(
+        FfiConverterTypeIntroductionTicket.lower(ticket),
+        FfiConverterData.lower(introducerSignPk),
+        FfiConverterData.lower(expectedCandidateUserId),
+        FfiConverterData.lower(expectedInviteeUserId),
+        FfiConverterUInt64.lower(expectedCandidatePolicyRevision),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -4140,10 +5606,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_create_group() != 45726) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_create_introduction_ticket() != 2547) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_decode_extended_message_body() != 61344) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_decode_friend_directory_content() != 14721) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_decode_group_invite_content() != 49763) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_decode_message_body() != 59698) {
+    if (uniffi_cruisemesh_core_checksum_func_decode_introduced_friend_request() != 4415) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_decode_message_body() != 1469) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_decode_profile_sync_content() != 4329) {
@@ -4161,13 +5639,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_envelope_frame() != 1240) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_encode_friend_directory_content() != 63420) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_encode_group_invite_content() != 23463) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_hello() != 21775) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_encode_introduced_friend_request() != 7571) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_encode_message_body() != 28014) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_encode_message_body_with_reply() != 53763) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_profile_sync_content() != 26330) {
@@ -4221,6 +5708,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_seal_message() != 58379) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_verify_introduction_ticket() != 3092) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_friend_directory() != 32757) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints() != 43270) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4234,6 +5727,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_chat_digest() != 38268) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_friend_suggestions() != 35411) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_avatar() != 36175) {
@@ -4260,6 +5756,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_get_contact() != 44297) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_get_contact_discovery_policy() != 20792) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_get_contact_provenance() != 9723) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_get_group() != 20599) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4269,13 +5771,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 63032) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message() != 46727) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_message() != 64810) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_outgoing_message() != 32750) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_outgoing_reply() != 64676) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_list_contacts() != 40385) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_list_friend_suggestions() != 53318) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_list_groups() != 47601) {
@@ -4285,6 +5796,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_outgoing_receipt_envelope_relay_posted() != 16233) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_arrival() != 44635) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_by_msg_id() != 40731) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_reference() != 37519) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_messages_after() != 55946) {
@@ -4320,6 +5840,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_receipt_through() != 17794) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_message_arrival() != 42850) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_outgoing_receipt() != 8142) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4329,10 +5852,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_remove_carried_envelope() != 52788) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_remove_friend_suggestion() != 18035) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_set_contact_avatar() != 55497) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_set_friend_suggestion_state() != 34158) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_contact() != 23572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_contact_discovery_policy() != 58628) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_contact_provenance() != 31449) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_group() != 50441) {

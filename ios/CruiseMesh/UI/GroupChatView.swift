@@ -14,6 +14,8 @@ struct GroupChatView: View {
     @State private var showDetails = false
     @State private var confirmDelete = false
     @State private var cancellable: AnyCancellable?
+    @State private var replyingTo: StoredMessage?
+    @State private var replyMetadata: [String: MessageReplyMetadata] = [:]
 
     private let store = AppStore.get()
     private var sender: GroupSender { GroupSender(store: store, identity: identity) }
@@ -24,6 +26,14 @@ struct GroupChatView: View {
 
     private var reactions: [String: [ReactionSummary]] {
         reactionSummariesByTarget(messages: messages, ownUserId: identity.userId)
+    }
+
+    private var replyingToPreview: QuotedMessagePreview? {
+        replyingTo.map { target in
+            quotedMessagePreview(target: target) { message in
+                senderName(message.senderUserId)
+            }
+        }
     }
 
     var body: some View {
@@ -43,6 +53,8 @@ struct GroupChatView: View {
                                         name: senderName(message.senderUserId),
                                         displayId: formatUserId(userId: message.senderUserId)
                                     ).0,
+                                    quoted: replyMetadata[replyMessageKey(message)]?.quoted,
+                                    canReply: replyMetadata[replyMessageKey(message)]?.msgId != nil,
                                     reactions: reactions[MessageTarget(
                                         senderUserId: message.senderUserId,
                                         lamport: message.lamport,
@@ -50,6 +62,14 @@ struct GroupChatView: View {
                                     ).stableKey] ?? [],
                                     onReact: { emoji in
                                         sendReaction(to: message, emoji: emoji)
+                                    },
+                                    onReply: {
+                                        replyingTo = message
+                                    },
+                                    onQuotedTap: { target in
+                                        withAnimation {
+                                            proxy.scrollTo(messageId(target), anchor: .center)
+                                        }
                                     }
                                 )
                                 .id(messageId(message))
@@ -69,29 +89,40 @@ struct GroupChatView: View {
                 }
             }
 
-            HStack(alignment: .center, spacing: 8) {
-                TextField("Message", text: $draft, axis: .vertical)
-                    .lineLimit(1...4)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(
-                        Capsule(style: .continuous)
-                            .fill(Color(uiColor: .secondarySystemBackground))
-                    )
-
-                Button {
-                    let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !text.isEmpty else { return }
-                    sender.sendText(group: group, text: text)
-                    draft = ""
-                    reload()
-                } label: {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 32, weight: .semibold))
+            VStack(spacing: 8) {
+                if let replyingToPreview {
+                    ReplyComposerPreview(preview: replyingToPreview) {
+                        replyingTo = nil
+                    }
                 }
-                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .opacity(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.36 : 1)
-                .accessibilityLabel("Send")
+                HStack(alignment: .center, spacing: 8) {
+                    TextField("Message", text: $draft, axis: .vertical)
+                        .lineLimit(1...4)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color(uiColor: .secondarySystemBackground))
+                        )
+
+                    Button {
+                        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !text.isEmpty else { return }
+                        let replyToMsgId = replyingTo.flatMap {
+                            replyMetadata[replyMessageKey($0)]?.msgId
+                        }
+                        sender.sendText(group: group, text: text, replyToMsgId: replyToMsgId)
+                        draft = ""
+                        replyingTo = nil
+                        reload()
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 32, weight: .semibold))
+                    }
+                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .opacity(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.36 : 1)
+                    .accessibilityLabel("Send")
+                }
             }
             .padding(12)
             .background(.bar)
@@ -187,7 +218,14 @@ struct GroupChatView: View {
     }
 
     private func reload() {
-        messages = (try? store.messagesForChat(chatId: group.id)) ?? []
+        let loadedMessages = (try? store.messagesForChat(chatId: group.id)) ?? []
+        messages = loadedMessages
+        replyMetadata = loadMessageReplyMetadata(
+            store: store,
+            messages: loadedMessages.filter { isVisibleChatKind($0.kind) }
+        ) { message in
+            senderName(message.senderUserId)
+        }
         MeshController.shared.notifyChatViewed(chatId: group.id)
     }
 
@@ -211,8 +249,12 @@ private struct GroupMessageRow: View {
     let groupName: String
     let senderLabel: String?
     let contactColor: Color
+    let quoted: QuotedMessagePreview?
+    let canReply: Bool
     let reactions: [ReactionSummary]
     let onReact: (String) -> Void
+    let onReply: () -> Void
+    let onQuotedTap: (StoredMessage) -> Void
 
     var body: some View {
         if message.kind == ProtocolKind.groupInvite {
@@ -231,7 +273,19 @@ private struct GroupMessageRow: View {
                             .foregroundStyle(contactColor)
                             .padding(.leading, 6)
                     }
-                    Text(String(data: message.payload, encoding: .utf8) ?? "")
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let quoted {
+                            QuotedMessageBlock(
+                                preview: quoted,
+                                accentColor: isOwn ? .white : contactColor,
+                                contentColor: isOwn ? .white : .primary,
+                                onTap: quoted.target.map { target in
+                                    { onQuotedTap(target) }
+                                }
+                            )
+                        }
+                        Text(String(data: message.payload, encoding: .utf8) ?? "")
+                    }
                         .padding(10)
                         .background(
                             RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -239,6 +293,11 @@ private struct GroupMessageRow: View {
                         )
                         .foregroundStyle(isOwn ? Color.white : Color.primary)
                         .contextMenu {
+                            if canReply {
+                                Button(action: onReply) {
+                                    Label("Reply", systemImage: "arrowshape.turn.up.left")
+                                }
+                            }
                             ForEach(reactionChoices, id: \.self) { emoji in
                                 Button(emoji) { onReact(emoji) }
                             }

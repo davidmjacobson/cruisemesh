@@ -29,6 +29,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -39,6 +41,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -64,6 +67,7 @@ import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
+import kotlinx.coroutines.launch
 
 /**
  * Group chat thread (DESIGN.md §6.5). Local `chat_id` is the group id.
@@ -90,9 +94,18 @@ fun GroupChatScreen(
     var confirmDelete by remember { mutableStateOf(false) }
     var focused by remember(group.id) { mutableStateOf<FocusedMessage?>(null) }
     var infoMessage by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
+    var replyingTo by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
 
     fun reload() {
         messages = store.messagesForChat(group.id)
+    }
+
+    fun showSendFailure() {
+        coroutineScope.launch {
+            snackbarHostState.showSnackbar("Couldn't send. Your message is still here.")
+        }
     }
 
     fun senderName(userId: ByteArray): String {
@@ -111,7 +124,16 @@ fun GroupChatScreen(
     }
 
     val listState = rememberLazyListState()
+    val scrollScope = rememberCoroutineScope()
     val visibleMessages = remember(messages) { messages.filter { isVisibleChatKind(it.kind) } }
+    val replyMetadata = remember(messages, ownUserId, contactsByUserId) {
+        loadMessageReplyMetadata(store, visibleMessages) { message -> senderName(message.senderUserId) }
+    }
+    val replyingToPreview = remember(replyingTo, ownUserId, contactsByUserId) {
+        replyingTo?.let { target ->
+            quotedMessagePreview(target) { message -> senderName(message.senderUserId) }
+        }
+    }
     val reactions = remember(messages, ownUserId) { reactionSummariesByTarget(messages, ownUserId) }
     val grouping = remember(visibleMessages) {
         val meta = visibleMessages.map { ConversationMessageMeta(formatUserId(it.senderUserId), it.timestamp) }
@@ -125,6 +147,13 @@ fun GroupChatScreen(
         val existingOwn = reactions[target.stableKey].orEmpty().firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
         sender.sendReaction(group, target, if (existingOwn != null) "" else emoji)
         reload()
+    }
+
+    fun scrollToMessage(message: StoredMessage) {
+        val oldestFirstIndex = visibleMessages.indexOfFirst { messageStableKey(it) == messageStableKey(message) }
+        if (oldestFirstIndex < 0) return
+        val displayIndex = visibleMessages.lastIndex - oldestFirstIndex
+        scrollScope.launch { listState.animateScrollToItem(displayIndex) }
     }
 
     // The overlay takes over the full screen, so drop the keyboard while it's
@@ -166,6 +195,7 @@ fun GroupChatScreen(
                 onOpenDetails = { showDetails = true },
             )
         },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { innerPadding ->
         // This device uses adjustResize, so the viewport already excludes the
         // IME. Track its usable bottom edge rather than adding IME padding a
@@ -206,6 +236,8 @@ fun GroupChatScreen(
                         },
                         groupName = group.name,
                         grouping = grouping[index],
+                        quoted = replyMetadata[messageStableKey(message)]?.quoted,
+                        onQuotedClick = { target -> scrollToMessage(target) },
                         reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
                         onReact = { emoji ->
                             toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
@@ -213,6 +245,14 @@ fun GroupChatScreen(
                         onLongPress = { target, bounds -> openOverlay(target, bounds) },
                     )
                 }
+            }
+
+            if (replyingToPreview != null) {
+                ReplyComposerPreview(
+                    preview = replyingToPreview,
+                    onCancel = { replyingTo = null },
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
             }
 
             Row(
@@ -231,9 +271,16 @@ fun GroupChatScreen(
                     onClick = {
                         val text = draft.trim()
                         if (text.isNotEmpty()) {
-                            sender.sendText(group, text)
-                            draft = ""
-                            reload()
+                            val replyToMsgId = replyingTo?.let {
+                                replyMetadata[messageStableKey(it)]?.msgId
+                            }
+                            if (sender.sendText(group, text, replyToMsgId) == SendResult.STORED) {
+                                draft = ""
+                                replyingTo = null
+                                reload()
+                            } else {
+                                showSendFailure()
+                            }
                         }
                     },
                     modifier = Modifier
@@ -316,15 +363,21 @@ fun GroupChatScreen(
             val focusedCopyText = remember(focusedMessage.payload) { String(focusedMessage.payload, Charsets.UTF_8) }
             val focusedOwnReaction = focusedReactions.firstOrNull { it.reactedByOwnUser }?.emoji
             val focusedSenderLabel = if (!focusedIsOwn) senderName(focusedMessage.senderUserId) else null
+            val focusedReplyMetadata = replyMetadata[messageStableKey(focusedMessage)]
 
             MessageFocusOverlay(
                 focused = currentFocused,
                 isOwn = focusedIsOwn,
+                canReply = focusedReplyMetadata?.msgId != null,
                 canCopy = focusedCopyText.isNotBlank(),
                 ownReactionEmoji = focusedOwnReaction,
                 onDismiss = { closeOverlay() },
                 onReact = { emoji ->
                     toggleReaction(currentFocused.target, emoji)
+                    closeOverlay()
+                },
+                onReply = {
+                    replyingTo = focusedMessage
                     closeOverlay()
                 },
                 onCopy = {
@@ -350,6 +403,7 @@ fun GroupChatScreen(
                         toggleReaction(currentFocused.target, emoji)
                         closeOverlay()
                     },
+                    quoted = focusedReplyMetadata?.quoted,
                 )
             }
         }
@@ -358,10 +412,20 @@ fun GroupChatScreen(
 
     val currentInfoMessage = infoMessage
     if (currentInfoMessage != null) {
+        val infoIsOwn = currentInfoMessage.senderUserId.contentEquals(ownUserId)
+        val infoArrival = if (infoIsOwn) {
+            null
+        } else {
+            store.messageArrival(
+                currentInfoMessage.chatId,
+                currentInfoMessage.senderUserId,
+                currentInfoMessage.lamport,
+            )
+        }
         AlertDialog(
             onDismissRequest = { infoMessage = null },
             title = { Text("Message info") },
-            text = { Text(messageInfoText(currentInfoMessage, currentInfoMessage.senderUserId.contentEquals(ownUserId), null)) },
+            text = { Text(messageInfoText(currentInfoMessage, infoIsOwn, null, infoArrival)) },
             confirmButton = {
                 TextButton(onClick = { infoMessage = null }) { Text("OK") }
             },
@@ -435,6 +499,8 @@ private fun GroupMessageBubble(
     senderLabel: String?,
     groupName: String,
     grouping: BubbleGrouping,
+    quoted: QuotedMessagePreview? = null,
+    onQuotedClick: (StoredMessage) -> Unit = {},
     reactions: List<ReactionSummary> = emptyList(),
     onReact: (String) -> Unit = {},
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
@@ -477,6 +543,8 @@ private fun GroupMessageBubble(
             showTimestamp = grouping.showTimestamp,
             reactions = reactions,
             onReact = onReact,
+            quoted = quoted,
+            onQuotedClick = quoted?.target?.let { target -> { onQuotedClick(target) } },
             modifier = Modifier
                 .onGloballyPositioned { coords -> boundsInWindow = coords.boundsInWindow() }
                 .messageActions(
@@ -502,6 +570,8 @@ fun GroupMessageBubbleVisual(
     reactions: List<ReactionSummary>,
     onReact: (String) -> Unit,
     modifier: Modifier = Modifier,
+    quoted: QuotedMessagePreview? = null,
+    onQuotedClick: (() -> Unit)? = null,
 ) {
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
@@ -532,6 +602,15 @@ fun GroupMessageBubbleVisual(
             contentColor = contentColor,
         ) {
             Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                if (quoted != null) {
+                    QuotedMessageBlock(
+                        preview = quoted,
+                        accentColor = if (isOwn) contentColor else MaterialTheme.colorScheme.primary,
+                        contentColor = contentColor,
+                        onClick = onQuotedClick,
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
+                }
                 Text(
                     text = String(message.payload, Charsets.UTF_8),
                     style = MaterialTheme.typography.bodyLarge,

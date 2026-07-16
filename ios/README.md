@@ -10,6 +10,7 @@ SwiftUI + CoreBluetooth shell covering the current 1:1 messaging feature set:
 | Group creation, invites, text, unread state | ✓ |
 | Photos (library + camera) + voice memos | ✓ |
 | QR friending + mutual `kind=3` friend request | ✓ |
+| Friends-of-friends suggestions + introductions | ✓ |
 | BLE dual-role mesh (central + peripheral) | ✓ |
 | Digest sync, receipts, carry queue | ✓ |
 | Internet relay poll/upload | ✓ |
@@ -104,5 +105,7 @@ ios/
 
 - Local 1:1 `chat_id` = peer's UserID
 - Wire `MessageBody.chatId` = **sender's** UserID
-- Kinds: text=1, receipt=2, friend-request=3, group-invite=4, attachment-manifest=16
+- Kinds: text=1, receipt=2, friend-request=3, group-invite=4,
+  profile-sync=5, friend-directory=6, introduced-friend-request=7,
+  attachment-manifest=16
 - BLE service/characteristic UUIDs match Android `MeshConstants`

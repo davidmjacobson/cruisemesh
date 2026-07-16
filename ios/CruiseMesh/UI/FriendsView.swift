@@ -15,11 +15,66 @@ struct FriendsView: View {
     @State private var preview: FriendPreviewState?
     @State private var added: FriendAddedState?
     @State private var chatContact: Contact?
+    @State private var suggestions: [FriendSuggestion] = []
+    @State private var showAddAllConfirmation = false
+
+    private var groupedSuggestions: [(Data, [FriendSuggestion])] {
+        Dictionary(grouping: suggestions, by: { $0.candidate.userId })
+            .map { ($0.key, $0.value) }
+            .sorted { $0.1[0].candidate.name.localizedCaseInsensitiveCompare($1.1[0].candidate.name) == .orderedAscending }
+    }
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
+                    if !FriendsOfFriendsStore.isEnabled() {
+                        Text("Friends-of-friends introductions are off in Profile.")
+                            .foregroundStyle(.secondary)
+                    } else if groupedSuggestions.isEmpty {
+                        Text("Suggestions appear after your friends' phones sync.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        if groupedSuggestions.filter({ $0.1[0].state == 0 }).count > 1 {
+                            Button("Add all (\(groupedSuggestions.filter { $0.1[0].state == 0 }.count))") {
+                                showAddAllConfirmation = true
+                            }
+                        }
+                        ForEach(groupedSuggestions.indices, id: \.self) { index in
+                            let sources = groupedSuggestions[index].1
+                            let suggestion = sources[0]
+                            let mutualNames = sources.compactMap {
+                                (try? AppStore.get().getContact(userId: $0.introducerUserId))?.name
+                            }
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(suggestion.candidate.name)
+                                    Text("Through \(mutualNames.isEmpty ? "a mutual friend" : mutualNames.joined(separator: ", "))")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button(suggestion.state == 1 ? "Requested" : "Add") {
+                                    request(suggestion)
+                                }
+                                .disabled(suggestion.state != 0)
+                                Button(role: .destructive) {
+                                    try? AppStore.get().setFriendSuggestionState(
+                                        candidateUserId: suggestion.candidate.userId,
+                                        state: 2
+                                    )
+                                    reload()
+                                } label: {
+                                    Image(systemName: "xmark")
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Friends of friends")
+                }
+                Section("Add directly") {
                     Button { showScan = true } label: {
                         Label("Scan friend QR", systemImage: "qrcode.viewfinder")
                     }
@@ -114,6 +169,18 @@ struct FriendsView: View {
             } message: {
                 Text(error ?? "")
             }
+            .confirmationDialog(
+                "Add all suggested friends?",
+                isPresented: $showAddAllConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Add all") {
+                    groupedSuggestions.map { $0.1[0] }.filter { $0.state == 0 }.forEach(request)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("CruiseMesh will request each connection through the mutual friends shown in the list.")
+            }
             .onAppear {
                 reload()
                 if let initialToken, !initialToken.isEmpty {
@@ -121,12 +188,28 @@ struct FriendsView: View {
                     previewText(initialToken)
                 }
             }
+            .onReceive(ChatEvents.subject.receive(on: DispatchQueue.main)) { _ in reload() }
         }
     }
 
     private func reload() {
         contacts = ((try? AppStore.get().listContacts()) ?? [])
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        suggestions = FriendsOfFriendsStore.isEnabled()
+            ? ((try? AppStore.get().listFriendSuggestions(
+                nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+              )) ?? [])
+            : []
+    }
+
+    private func request(_ suggestion: FriendSuggestion) {
+        _ = FriendDirectorySender.requestSuggestedFriend(
+            store: AppStore.get(),
+            identity: identity,
+            displayName: appModel.displayName,
+            suggestion: suggestion
+        )
+        reload()
     }
 
     private func previewText(_ text: String) {
@@ -162,6 +245,13 @@ struct FriendsView: View {
     private func confirm(_ candidate: Contact) {
         do {
             try AppStore.get().upsertContact(contact: candidate)
+            try? AppStore.get().upsertContactProvenance(provenance: ContactProvenance(
+                userId: candidate.userId,
+                source: 0,
+                introducerUserId: nil,
+                introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            ))
+            try? AppStore.get().removeFriendSuggestion(candidateUserId: candidate.userId)
             if RelayConfigStore.load() == nil,
                let url = candidate.relayUrl,
                let token = candidate.relayToken {
@@ -180,6 +270,7 @@ struct FriendsView: View {
                 displayName: appModel.displayName,
                 epoch: ProfileStore.loadOwnAvatarEpoch()
             )
+            FriendDirectorySender.queueToAllContacts(store: AppStore.get(), identity: identity)
             reload()
             pasteText = ""
             preview = nil

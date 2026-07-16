@@ -17,6 +17,7 @@ struct ProfileView: View {
     @State private var meshOn = true
     @State private var avatarImage: UIImage?
     @State private var photoItem: PhotosPickerItem?
+    @State private var friendsOfFriends = true
 
     var body: some View {
         NavigationStack {
@@ -74,6 +75,12 @@ struct ProfileView: View {
                         }
                     LabeledContent("Status", value: runtime.pillText)
                 }
+                Section("Privacy") {
+                    Toggle("Friends of friends", isOn: $friendsOfFriends)
+                    Text("Let your CruiseMesh friends introduce you to people they know. Your messages and phone contacts are never shared.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Section("Legal") {
                     Button("Privacy policy") {
                         openURL(privacyPolicyURL)
@@ -95,6 +102,11 @@ struct ProfileView: View {
                         ProfileStore.saveDisplayName(trimmedName)
                         appModel.displayName = trimmedName
                         RelayConfigStore.save(relayUrl: relayUrl, relayToken: relayToken)
+                        let policyChanged = FriendsOfFriendsStore.isEnabled() != friendsOfFriends
+                        if policyChanged {
+                            FriendsOfFriendsStore.setEnabled(friendsOfFriends)
+                            if !friendsOfFriends { try? AppStore.get().clearFriendSuggestions() }
+                        }
                         if trimmedName != previousName {
                             let epoch = ProfileStore.bumpOwnAvatarEpoch()
                             ProfileSyncSender.queueToAllContacts(
@@ -102,6 +114,18 @@ struct ProfileView: View {
                                 identity: identity,
                                 displayName: trimmedName,
                                 epoch: epoch
+                            )
+                        }
+                        if policyChanged {
+                            ProfileSyncSender.queueToAllContacts(
+                                store: AppStore.get(),
+                                identity: identity,
+                                displayName: trimmedName,
+                                epoch: ProfileStore.loadOwnAvatarEpoch()
+                            )
+                            FriendDirectorySender.queueToAllContacts(
+                                store: AppStore.get(),
+                                identity: identity
                             )
                         }
                         dismiss()
@@ -116,6 +140,7 @@ struct ProfileView: View {
                 }
                 meshOn = appModel.meshEnabled
                 avatarImage = ProfilePhotoStore.loadAvatarImage()
+                friendsOfFriends = FriendsOfFriendsStore.isEnabled()
             }
             .onChange(of: photoItem) { item in
                 guard let item else { return }

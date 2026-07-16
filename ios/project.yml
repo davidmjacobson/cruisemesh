@@ -54,6 +54,9 @@ targets:
       path: CruiseMesh/Info.plist
       properties:
         CFBundleDisplayName: CruiseMesh
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        ITSAppUsesNonExemptEncryption: false
         UILaunchScreen: {}
         UIBackgroundModes:
           - bluetooth-central
@@ -66,6 +69,11 @@ targets:
         NSPhotoLibraryAddUsageDescription: Save a photo from a chat message to your photo library.
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        "UISupportedInterfaceOrientations~ipad":
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
 

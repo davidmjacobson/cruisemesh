@@ -72,11 +72,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.identity.ProfileStore
+import com.cruisemesh.app.chat.ChatEvents
+import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.ui.AvatarBadge
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
+import uniffi.cruisemesh_core.FriendSuggestion
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.makeFriendCard
@@ -431,6 +434,8 @@ fun AddFriendScreen(
     onScanClick: () -> Unit,
     onImportText: (String) -> ImportFriendResult,
     onConfirmContact: (Contact) -> FriendAddedOutcome,
+    onRequestSuggestion: (FriendSuggestion) -> Boolean,
+    onHideSuggestion: (FriendSuggestion) -> Unit,
     ownUserId: ByteArray,
     store: uniffi.cruisemesh_core.MessageStore,
     initialText: String = "",
@@ -442,7 +447,24 @@ fun AddFriendScreen(
     var error by remember { mutableStateOf<String?>(null) }
     var preview by remember { mutableStateOf<FriendPreview?>(null) }
     var added by remember { mutableStateOf<FriendAddedOutcome?>(null) }
+    var suggestions by remember { mutableStateOf(emptyList<FriendSuggestion>()) }
+    var confirmAddAll by remember { mutableStateOf(false) }
     val context = LocalContext.current
+
+    fun reloadSuggestions() {
+        suggestions = if (FriendsOfFriendsStore.isEnabled(context)) {
+            store.listFriendSuggestions(System.currentTimeMillis())
+        } else {
+            emptyList()
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        reloadSuggestions()
+        ChatEvents.changes.collect { reloadSuggestions() }
+    }
+
+    val groupedSuggestions = suggestions.groupBy { UserIdHex.encode(it.candidate.userId) }
 
     androidx.compose.runtime.LaunchedEffect(initialText) {
         if (initialText.isNotBlank()) {
@@ -466,9 +488,72 @@ fun AddFriendScreen(
         },
     ) { innerPadding ->
         Column(
-            modifier = Modifier.fillMaxSize().padding(innerPadding).padding(24.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .verticalScroll(rememberScrollState())
+                .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            Text("Friends of friends", style = MaterialTheme.typography.titleMedium)
+            if (!FriendsOfFriendsStore.isEnabled(context)) {
+                Text(
+                    "Friends-of-friends introductions are off in Profile & settings.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else if (groupedSuggestions.isEmpty()) {
+                Text(
+                    "Suggestions appear after your friends' phones sync.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                val available = groupedSuggestions.values.map { it.first() }.filter { it.state == 0.toUByte() }
+                if (available.size > 1) {
+                    TextButton(onClick = { confirmAddAll = true }, modifier = Modifier.align(Alignment.End)) {
+                        Text("Add all (${available.size})")
+                    }
+                }
+                groupedSuggestions.values.forEach { sources ->
+                    val suggestion = sources.first()
+                    val mutualNames = sources.mapNotNull { store.getContact(it.introducerUserId)?.name }.distinct()
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.46f),
+                        shape = RoundedCornerShape(16.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(suggestion.candidate.name, fontWeight = FontWeight.Medium)
+                                Text(
+                                    "Through ${mutualNames.ifEmpty { listOf("a mutual friend") }.joinToString()}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                TextButton(onClick = {
+                                    onHideSuggestion(suggestion)
+                                    reloadSuggestions()
+                                }) { Text("Hide") }
+                            }
+                            Button(
+                                onClick = {
+                                    onRequestSuggestion(suggestion)
+                                    reloadSuggestions()
+                                },
+                                enabled = suggestion.state == 0.toUByte(),
+                            ) {
+                                Text(if (suggestion.state == 1.toUByte()) "Requested" else "Add")
+                            }
+                        }
+                    }
+                }
+            }
+
+            Text("Add directly", style = MaterialTheme.typography.titleMedium)
             Button(onClick = onScanClick, modifier = Modifier.fillMaxWidth()) {
                 Text("Scan QR code")
             }
@@ -509,6 +594,25 @@ fun AddFriendScreen(
                 Text(it, color = MaterialTheme.colorScheme.error)
             }
         }
+    }
+
+    if (confirmAddAll) {
+        val available = groupedSuggestions.values.map { it.first() }.filter { it.state == 0.toUByte() }
+        AlertDialog(
+            onDismissRequest = { confirmAddAll = false },
+            title = { Text("Add ${available.size} friends?") },
+            text = { Text("CruiseMesh will request each connection through the mutual friends shown in the list.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    available.forEach { onRequestSuggestion(it) }
+                    confirmAddAll = false
+                    reloadSuggestions()
+                }) { Text("Add all") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmAddAll = false }) { Text("Cancel") }
+            },
+        )
     }
 
     preview?.let { current ->

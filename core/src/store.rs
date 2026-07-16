@@ -97,7 +97,12 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use crate::groups::{canonicalize_members, validate_group};
-use crate::{CoreError, Group};
+use crate::{
+    verify_introduction_ticket, CoreError, FriendDirectoryContent, Group, IntroductionTicket,
+    SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST,
+};
+
+const MESSAGE_ID_LEN: usize = 16;
 
 /// One stored message body (DESIGN.md §7.1). `timestamp` is milliseconds
 /// since the Unix epoch; `kind` matches the DESIGN.md §7.1 `kind` byte
@@ -112,6 +117,23 @@ pub struct StoredMessage {
     pub payload: Vec<u8>,
 }
 
+/// Local-only diagnostics for how an incoming message reached this device.
+/// `transport`: 0 = BLE direct, 1 = BLE through another device, 2 = relay.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct MessageArrival {
+    pub transport: u8,
+    pub hops_taken: u8,
+    pub received_at: i64,
+}
+
+/// Stable envelope identity for a stored message and, for replies, the
+/// encrypted id of the quoted message. Legacy rows may have no reference.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct MessageReference {
+    pub msg_id: Vec<u8>,
+    pub reply_to_msg_id: Option<Vec<u8>>,
+}
+
 /// An accepted friend (DESIGN.md §6.2): the public half of someone else's
 /// identity, imported from a scanned/pasted `FriendCard`. `user_id` is
 /// derived the same way as one's own (`friend_card_user_id`), so it's a
@@ -124,6 +146,36 @@ pub struct Contact {
     pub agree_pk: Vec<u8>,
     pub relay_url: Option<String>,
     pub relay_token: Option<String>,
+}
+
+/// The last authenticated friends-of-friends policy advertised by a contact.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct ContactDiscoveryPolicy {
+    pub user_id: Vec<u8>,
+    pub protocol_version: u8,
+    pub enabled: bool,
+    pub revision: u64,
+}
+
+/// One candidate/source pair. Callers group rows with the same candidate
+/// UserID to present all known mutual friends.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct FriendSuggestion {
+    pub candidate: SuggestedFriendCard,
+    pub introducer_user_id: Vec<u8>,
+    pub ticket: IntroductionTicket,
+    /// 0 = available, 1 = requested, 2 = hidden.
+    pub state: u8,
+}
+
+/// How an accepted contact first entered the local trust graph.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct ContactProvenance {
+    pub user_id: Vec<u8>,
+    /// 0 = direct QR/link, 1 = introduced by another accepted contact.
+    pub source: u8,
+    pub introducer_user_id: Option<Vec<u8>>,
+    pub introduced_at_ms: i64,
 }
 
 /// One entry of a per-chat sync digest (DESIGN.md §7.3): "I have `sender_user_id`'s
@@ -217,6 +269,41 @@ impl MessageStore {
             "from_relay",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(&conn, "messages", "arrival_transport", "INTEGER")?;
+        ensure_column(&conn, "messages", "hops_taken", "INTEGER")?;
+        ensure_column(&conn, "messages", "received_at", "INTEGER")?;
+        ensure_column(&conn, "messages", "msg_id", "BLOB")?;
+        ensure_column(&conn, "messages", "reply_to_msg_id", "BLOB")?;
+        // Older stores already have stable ids for locally authored rows in
+        // the outbound queue. Backfill those so they can be quoted after an
+        // upgrade; received legacy rows cannot be recovered retroactively.
+        conn.execute(
+            "UPDATE messages
+             SET msg_id = (
+                 SELECT outbound_envelopes.msg_id
+                 FROM outbound_envelopes
+                 WHERE outbound_envelopes.chat_id = messages.chat_id
+                   AND outbound_envelopes.sender_user_id = messages.sender_user_id
+                   AND outbound_envelopes.lamport = messages.lamport
+                 ORDER BY outbound_envelopes.queued_at ASC
+                 LIMIT 1
+             )
+             WHERE msg_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM outbound_envelopes
+                   WHERE outbound_envelopes.chat_id = messages.chat_id
+                     AND outbound_envelopes.sender_user_id = messages.sender_user_id
+                     AND outbound_envelopes.lamport = messages.lamport
+               )",
+            [],
+        )
+        .map_err(store_err)?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_chat_msg_id
+             ON messages(chat_id, msg_id)",
+            [],
+        )
+        .map_err(store_err)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -253,14 +340,43 @@ impl MessageStore {
     ///   this runs in one transaction so a crash mid-recovery can't leave the
     ///   stale tail and the new message coexisting.
     pub fn insert_message(&self, message: StoredMessage) -> Result<bool, CoreError> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        incoming_message_reference::insert(self, message, None, None)
+    }
+
+    /// Insert an opened incoming message together with the envelope id used
+    /// for quoting it and an optional encrypted reply target.
+    pub fn insert_incoming_message(
+        &self,
+        message: StoredMessage,
+        msg_id: Vec<u8>,
+        reply_to_msg_id: Option<Vec<u8>>,
+    ) -> Result<bool, CoreError> {
+        validate_msg_id("msg_id", &msg_id)?;
+        if let Some(reply_to_msg_id) = reply_to_msg_id.as_deref() {
+            validate_msg_id("reply_to_msg_id", reply_to_msg_id)?;
+        }
+        incoming_message_reference::insert(self, message, Some(msg_id), reply_to_msg_id)
+    }
+}
+
+mod incoming_message_reference {
+    use super::*;
+
+    pub(super) fn insert(
+        store: &MessageStore,
+        message: StoredMessage,
+        msg_id: Option<Vec<u8>>,
+        reply_to_msg_id: Option<Vec<u8>>,
+    ) -> Result<bool, CoreError> {
+        let mut conn = store.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
 
         let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO messages
-                    (chat_id, sender_user_id, lamport, timestamp, kind, payload)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (chat_id, sender_user_id, lamport, timestamp, kind, payload,
+                     msg_id, reply_to_msg_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     message.chat_id,
                     message.sender_user_id,
@@ -268,6 +384,8 @@ impl MessageStore {
                     message.timestamp,
                     message.kind as i64,
                     message.payload,
+                    msg_id,
+                    reply_to_msg_id,
                 ],
             )
             .map_err(store_err)?
@@ -280,25 +398,26 @@ impl MessageStore {
 
         // Conflict: a row already exists at this (chat_id, sender_user_id,
         // lamport). Figure out whether it's the same message or a fork.
-        let existing: Option<(i64, i64, Vec<u8>)> = tx
+        let existing: Option<(i64, i64, Vec<u8>, Option<Vec<u8>>)> = tx
             .query_row(
-                "SELECT timestamp, kind, payload FROM messages
+                "SELECT timestamp, kind, payload, reply_to_msg_id FROM messages
                  WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
                 params![
                     message.chat_id,
                     message.sender_user_id,
                     message.lamport as i64
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(store_err)?;
 
         let is_true_duplicate = match &existing {
-            Some((timestamp, kind, payload)) => {
+            Some((timestamp, kind, payload, existing_reply_to_msg_id)) => {
                 *timestamp == message.timestamp
                     && *kind == message.kind as i64
                     && *payload == message.payload
+                    && *existing_reply_to_msg_id == reply_to_msg_id
             }
             // Shouldn't happen (we just failed to insert on a conflict), but
             // if the row vanished under us, treat it as nothing to recover.
@@ -309,6 +428,19 @@ impl MessageStore {
         };
 
         if is_true_duplicate {
+            if msg_id.is_some() {
+                tx.execute(
+                    "UPDATE messages SET msg_id = COALESCE(msg_id, ?4)
+                     WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+                    params![
+                        message.chat_id,
+                        message.sender_user_id,
+                        message.lamport as i64,
+                        msg_id,
+                    ],
+                )
+                .map_err(store_err)?;
+            }
             tx.commit().map_err(store_err)?;
             return Ok(false);
         }
@@ -342,8 +474,9 @@ impl MessageStore {
         .map_err(store_err)?;
         tx.execute(
             "INSERT INTO messages
-                (chat_id, sender_user_id, lamport, timestamp, kind, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (chat_id, sender_user_id, lamport, timestamp, kind, payload,
+                 msg_id, reply_to_msg_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 message.chat_id,
                 message.sender_user_id,
@@ -351,6 +484,8 @@ impl MessageStore {
                 message.timestamp,
                 message.kind as i64,
                 message.payload,
+                msg_id,
+                reply_to_msg_id,
             ],
         )
         .map_err(store_err)?;
@@ -358,7 +493,10 @@ impl MessageStore {
         tx.commit().map_err(store_err)?;
         Ok(true)
     }
+}
 
+#[uniffi::export]
+impl MessageStore {
     /// Atomically persist one locally authored message and the exact sealed
     /// envelope that should be retried for it over BLE and relay. The message
     /// row stays idempotent on `(chat_id, sender_user_id, lamport)`; the
@@ -371,12 +509,48 @@ impl MessageStore {
         envelope: OutboundEnvelope,
         queued_at_ms: i64,
     ) -> Result<bool, CoreError> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        outgoing_message_reference::insert(self, message, envelope, None, queued_at_ms)
+    }
+
+    /// Atomically persist a locally authored reply and its stable sealed
+    /// envelope. The target id remains local metadata as well as encrypted
+    /// body metadata, so rendering never needs to reopen ciphertext.
+    pub fn insert_outgoing_reply(
+        &self,
+        message: StoredMessage,
+        envelope: OutboundEnvelope,
+        reply_to_msg_id: Vec<u8>,
+        queued_at_ms: i64,
+    ) -> Result<bool, CoreError> {
+        validate_msg_id("msg_id", &envelope.msg_id)?;
+        validate_msg_id("reply_to_msg_id", &reply_to_msg_id)?;
+        outgoing_message_reference::insert(
+            self,
+            message,
+            envelope,
+            Some(reply_to_msg_id),
+            queued_at_ms,
+        )
+    }
+}
+
+mod outgoing_message_reference {
+    use super::*;
+
+    pub(super) fn insert(
+        store: &MessageStore,
+        message: StoredMessage,
+        envelope: OutboundEnvelope,
+        reply_to_msg_id: Option<Vec<u8>>,
+        queued_at_ms: i64,
+    ) -> Result<bool, CoreError> {
+        let mut conn = store.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
         tx.execute(
             "INSERT OR IGNORE INTO messages
-                (chat_id, sender_user_id, lamport, timestamp, kind, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (chat_id, sender_user_id, lamport, timestamp, kind, payload,
+                 msg_id, reply_to_msg_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 message.chat_id,
                 message.sender_user_id,
@@ -384,6 +558,22 @@ impl MessageStore {
                 message.timestamp,
                 message.kind as i64,
                 message.payload,
+                envelope.msg_id,
+                reply_to_msg_id,
+            ],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "UPDATE messages
+             SET msg_id = COALESCE(msg_id, ?4),
+                 reply_to_msg_id = COALESCE(reply_to_msg_id, ?5)
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+            params![
+                message.chat_id,
+                message.sender_user_id,
+                message.lamport as i64,
+                envelope.msg_id,
+                reply_to_msg_id,
             ],
         )
         .map_err(store_err)?;
@@ -419,7 +609,10 @@ impl MessageStore {
         tx.commit().map_err(store_err)?;
         Ok(changed > 0)
     }
+}
 
+#[uniffi::export]
+impl MessageStore {
     /// All messages in a chat, oldest first by author timestamp.
     ///
     /// `lamport` is only comparable within one sender's stream
@@ -441,6 +634,115 @@ impl MessageStore {
             .query_map(params![chat_id], row_to_message)
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Stable id and optional reply target for one stored message. Returns
+    /// `None` for legacy rows whose inbound envelope id was never recorded.
+    pub fn message_reference(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        lamport: u64,
+    ) -> Result<Option<MessageReference>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT msg_id, reply_to_msg_id
+             FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
+               AND msg_id IS NOT NULL",
+            params![chat_id, sender_user_id, lamport as i64],
+            |row| {
+                Ok(MessageReference {
+                    msg_id: row.get(0)?,
+                    reply_to_msg_id: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    /// Resolve a quoted message by stable envelope id within one chat.
+    /// Missing history is expected and returns `None`.
+    pub fn message_by_msg_id(
+        &self,
+        chat_id: Vec<u8>,
+        msg_id: Vec<u8>,
+    ) -> Result<Option<StoredMessage>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+             FROM messages
+             WHERE chat_id = ?1 AND msg_id = ?2
+             ORDER BY id ASC
+             LIMIT 1",
+            params![chat_id, msg_id],
+            row_to_message,
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    /// Attach first-arrival diagnostics to an already inserted incoming
+    /// message. A redundant mesh/relay copy never overwrites the original
+    /// route, hop count, or receive time.
+    pub fn record_message_arrival(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        lamport: u64,
+        arrival: MessageArrival,
+    ) -> Result<bool, CoreError> {
+        if arrival.transport > 2 {
+            return Err(CoreError::Malformed(
+                "invalid message arrival transport".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn
+            .execute(
+                "UPDATE messages
+                 SET arrival_transport = ?4, hops_taken = ?5, received_at = ?6
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
+                   AND arrival_transport IS NULL",
+                params![
+                    chat_id,
+                    sender_user_id,
+                    lamport as i64,
+                    arrival.transport as i64,
+                    arrival.hops_taken as i64,
+                    arrival.received_at,
+                ],
+            )
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
+    /// First-arrival diagnostics for one message, or `None` for locally
+    /// authored/legacy rows that predate diagnostics.
+    pub fn message_arrival(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        lamport: u64,
+    ) -> Result<Option<MessageArrival>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT arrival_transport, hops_taken, received_at
+             FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
+               AND arrival_transport IS NOT NULL",
+            params![chat_id, sender_user_id, lamport as i64],
+            |row| {
+                Ok(MessageArrival {
+                    transport: row.get::<_, i64>(0)? as u8,
+                    hops_taken: row.get::<_, i64>(1)? as u8,
+                    received_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
     }
 
     /// The highest lamport value N such that every message `1..=N` from this
@@ -1053,6 +1355,32 @@ impl MessageStore {
             params![user_id],
         )
         .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM contact_discovery_policy WHERE user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM contact_provenance WHERE user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM friend_suggestions
+             WHERE candidate_user_id = ?1 OR introducer_user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM friend_suggestion_state WHERE candidate_user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM friend_directory_state WHERE introducer_user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
         tx.commit().map_err(store_err)?;
         Ok(removed > 0)
     }
@@ -1077,6 +1405,326 @@ impl MessageStore {
             .map_err(store_err)?;
         let rows = stmt.query_map([], row_to_contact).map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Apply an authenticated contact's discovery policy if it is newer.
+    pub fn upsert_contact_discovery_policy(
+        &self,
+        policy: ContactDiscoveryPolicy,
+    ) -> Result<bool, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn
+            .execute(
+                "INSERT INTO contact_discovery_policy
+                    (user_id, protocol_version, enabled, revision)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                    protocol_version = excluded.protocol_version,
+                    enabled = excluded.enabled,
+                    revision = excluded.revision
+                 WHERE excluded.revision > contact_discovery_policy.revision",
+                params![
+                    policy.user_id,
+                    policy.protocol_version as i64,
+                    i64::from(policy.enabled),
+                    policy.revision as i64,
+                ],
+            )
+            .map_err(store_err)?
+            > 0;
+        Ok(changed)
+    }
+
+    pub fn get_contact_discovery_policy(
+        &self,
+        user_id: Vec<u8>,
+    ) -> Result<Option<ContactDiscoveryPolicy>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT user_id, protocol_version, enabled, revision
+             FROM contact_discovery_policy WHERE user_id = ?1",
+            params![user_id],
+            |row| {
+                Ok(ContactDiscoveryPolicy {
+                    user_id: row.get(0)?,
+                    protocol_version: row.get::<_, i64>(1)? as u8,
+                    enabled: row.get::<_, i64>(2)? != 0,
+                    revision: row.get::<_, i64>(3)? as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    /// Atomically replace all suggestions supplied by one introducer. The
+    /// directory's tickets are checked here so both mobile shells share the
+    /// same fail-closed behavior.
+    pub fn apply_friend_directory(
+        &self,
+        introducer_user_id: Vec<u8>,
+        recipient_user_id: Vec<u8>,
+        content: FriendDirectoryContent,
+        now_ms: i64,
+    ) -> Result<bool, CoreError> {
+        if content.version != 1 || content.entries.len() > 64 {
+            return Err(CoreError::Malformed("invalid friend directory".to_string()));
+        }
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
+        let introducer_sign_pk: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT sign_pk FROM contacts WHERE user_id = ?1",
+                params![introducer_user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let Some(introducer_sign_pk) = introducer_sign_pk else {
+            return Err(CoreError::Malformed(
+                "friend directory sender is not a contact".to_string(),
+            ));
+        };
+        let applied: Option<i64> = tx
+            .query_row(
+                "SELECT applied_revision FROM friend_directory_state
+                 WHERE introducer_user_id = ?1",
+                params![introducer_user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        if applied.is_some_and(|revision| revision as u64 >= content.revision) {
+            tx.commit().map_err(store_err)?;
+            return Ok(false);
+        }
+
+        for entry in &content.entries {
+            if entry.ticket.introducer_user_id != introducer_user_id
+                || !verify_introduction_ticket(
+                    entry.ticket.clone(),
+                    introducer_sign_pk.clone(),
+                    entry.candidate.user_id.clone(),
+                    recipient_user_id.clone(),
+                    entry.candidate_policy_revision,
+                    now_ms,
+                )?
+            {
+                return Err(CoreError::Malformed(
+                    "friend directory contains an invalid introduction ticket".to_string(),
+                ));
+            }
+
+            // A requested suggestion becomes retryable once there is no
+            // longer an unexpired introduced-request envelope queued for it.
+            // Hidden suggestions remain suppressed across snapshots.
+            let request_still_pending: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM outbound_envelopes
+                         WHERE recipient_user_id = ?1 AND kind = ?2 AND expiry > ?3
+                     )",
+                    params![
+                        &entry.candidate.user_id,
+                        KIND_INTRODUCED_FRIEND_REQUEST as i64,
+                        now_ms,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(store_err)?;
+            if !request_still_pending {
+                tx.execute(
+                    "DELETE FROM friend_suggestion_state
+                     WHERE candidate_user_id = ?1 AND state = 1",
+                    params![&entry.candidate.user_id],
+                )
+                .map_err(store_err)?;
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO friend_directory_state (introducer_user_id, applied_revision)
+             VALUES (?1, ?2)
+             ON CONFLICT(introducer_user_id) DO UPDATE SET
+                applied_revision = excluded.applied_revision",
+            params![introducer_user_id, content.revision as i64],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM friend_suggestions WHERE introducer_user_id = ?1",
+            params![introducer_user_id],
+        )
+        .map_err(store_err)?;
+        for entry in content.entries {
+            let ticket =
+                serde_json::to_vec(&entry.ticket).map_err(|e| CoreError::Store(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO friend_suggestions
+                    (candidate_user_id, introducer_user_id, name, sign_pk, agree_pk,
+                     candidate_policy_revision, ticket, expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    entry.candidate.user_id,
+                    introducer_user_id,
+                    entry.candidate.name,
+                    entry.candidate.sign_pk,
+                    entry.candidate.agree_pk,
+                    entry.candidate_policy_revision as i64,
+                    ticket,
+                    entry.ticket.expires_at_ms,
+                ],
+            )
+            .map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(true)
+    }
+
+    pub fn list_friend_suggestions(&self, now_ms: i64) -> Result<Vec<FriendSuggestion>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.candidate_user_id, s.name, s.sign_pk, s.agree_pk,
+                        s.introducer_user_id, s.ticket,
+                        COALESCE(x.state, 0)
+                 FROM friend_suggestions s
+                 LEFT JOIN friend_suggestion_state x
+                    ON x.candidate_user_id = s.candidate_user_id
+                 LEFT JOIN contacts c ON c.user_id = s.candidate_user_id
+                 WHERE c.user_id IS NULL AND s.expires_at_ms >= ?1
+                       AND COALESCE(x.state, 0) != 2
+                 ORDER BY lower(s.name), s.introducer_user_id",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![now_ms], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, i64>(6)? as u8,
+                ))
+            })
+            .map_err(store_err)?;
+        let mut suggestions = Vec::new();
+        for row in rows {
+            let (user_id, name, sign_pk, agree_pk, introducer_user_id, ticket_json, state) =
+                row.map_err(store_err)?;
+            let ticket: IntroductionTicket = serde_json::from_slice(&ticket_json)
+                .map_err(|e| CoreError::Store(e.to_string()))?;
+            suggestions.push(FriendSuggestion {
+                candidate: SuggestedFriendCard {
+                    name,
+                    user_id,
+                    sign_pk,
+                    agree_pk,
+                },
+                introducer_user_id,
+                ticket,
+                state,
+            });
+        }
+        Ok(suggestions)
+    }
+
+    /// State values: 0 available, 1 requested, 2 hidden.
+    pub fn set_friend_suggestion_state(
+        &self,
+        candidate_user_id: Vec<u8>,
+        state: u8,
+    ) -> Result<(), CoreError> {
+        if state > 2 {
+            return Err(CoreError::Malformed("invalid suggestion state".to_string()));
+        }
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "INSERT INTO friend_suggestion_state (candidate_user_id, state)
+             VALUES (?1, ?2)
+             ON CONFLICT(candidate_user_id) DO UPDATE SET state = excluded.state",
+            params![candidate_user_id, state as i64],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn remove_friend_suggestion(&self, candidate_user_id: Vec<u8>) -> Result<(), CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "DELETE FROM friend_suggestions WHERE candidate_user_id = ?1",
+            params![candidate_user_id],
+        )
+        .map_err(store_err)?;
+        conn.execute(
+            "DELETE FROM friend_suggestion_state WHERE candidate_user_id = ?1",
+            params![candidate_user_id],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn clear_friend_suggestions(&self) -> Result<(), CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute_batch(
+            "DELETE FROM friend_suggestions;
+             DELETE FROM friend_directory_state;",
+        )
+        .map_err(store_err)
+    }
+
+    pub fn upsert_contact_provenance(
+        &self,
+        provenance: ContactProvenance,
+    ) -> Result<(), CoreError> {
+        if provenance.source > 1 {
+            return Err(CoreError::Malformed(
+                "invalid contact provenance".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "INSERT INTO contact_provenance
+                (user_id, source, introducer_user_id, introduced_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id) DO UPDATE SET
+                source = CASE WHEN contact_provenance.source = 0 THEN 0 ELSE excluded.source END,
+                introducer_user_id = CASE WHEN contact_provenance.source = 0
+                    THEN contact_provenance.introducer_user_id ELSE excluded.introducer_user_id END,
+                introduced_at_ms = CASE WHEN contact_provenance.source = 0
+                    THEN contact_provenance.introduced_at_ms ELSE excluded.introduced_at_ms END",
+            params![
+                provenance.user_id,
+                provenance.source as i64,
+                provenance.introducer_user_id,
+                provenance.introduced_at_ms,
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn get_contact_provenance(
+        &self,
+        user_id: Vec<u8>,
+    ) -> Result<Option<ContactProvenance>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT user_id, source, introducer_user_id, introduced_at_ms
+             FROM contact_provenance WHERE user_id = ?1",
+            params![user_id],
+            |row| {
+                Ok(ContactProvenance {
+                    user_id: row.get(0)?,
+                    source: row.get::<_, i64>(1)? as u8,
+                    introducer_user_id: row.get(2)?,
+                    introduced_at_ms: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
     }
 
     /// Add or replace a group definition and its full membership. Updating an
@@ -1611,6 +2259,15 @@ fn store_err(e: rusqlite::Error) -> CoreError {
     CoreError::Store(e.to_string())
 }
 
+fn validate_msg_id(field: &str, msg_id: &[u8]) -> Result<(), CoreError> {
+    if msg_id.len() != MESSAGE_ID_LEN {
+        return Err(CoreError::Malformed(format!(
+            "{field} must be exactly {MESSAGE_ID_LEN} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn outbound_message_dedupe_key(
     chat_id: &[u8],
     sender_user_id: &[u8],
@@ -1692,6 +2349,11 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp      INTEGER NOT NULL,
     kind           INTEGER NOT NULL,
     payload        BLOB NOT NULL,
+    arrival_transport INTEGER,
+    hops_taken     INTEGER,
+    received_at    INTEGER,
+    msg_id         BLOB,
+    reply_to_msg_id BLOB,
     UNIQUE(chat_id, sender_user_id, lamport)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_lamport ON messages(chat_id, lamport);
@@ -1706,6 +2368,44 @@ CREATE TABLE IF NOT EXISTS contacts (
     relay_token TEXT,
     avatar BLOB,
     avatar_epoch INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS contact_discovery_policy (
+    user_id BLOB PRIMARY KEY,
+    protocol_version INTEGER NOT NULL,
+    enabled INTEGER NOT NULL,
+    revision INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friend_directory_state (
+    introducer_user_id BLOB PRIMARY KEY,
+    applied_revision INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friend_suggestions (
+    candidate_user_id BLOB NOT NULL,
+    introducer_user_id BLOB NOT NULL,
+    name TEXT NOT NULL,
+    sign_pk BLOB NOT NULL,
+    agree_pk BLOB NOT NULL,
+    candidate_policy_revision INTEGER NOT NULL,
+    ticket BLOB NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(candidate_user_id, introducer_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_friend_suggestions_introducer
+    ON friend_suggestions(introducer_user_id);
+
+CREATE TABLE IF NOT EXISTS friend_suggestion_state (
+    candidate_user_id BLOB PRIMARY KEY,
+    state INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS contact_provenance (
+    user_id BLOB PRIMARY KEY,
+    source INTEGER NOT NULL,
+    introducer_user_id BLOB,
+    introduced_at_ms INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS groups (
@@ -1798,7 +2498,10 @@ CREATE INDEX IF NOT EXISTS idx_carried_expiry ON carried_envelopes(expiry);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Group, KIND_GROUP_INVITE, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ};
+    use crate::{
+        create_introduction_ticket, generate_identity, FriendDirectoryEntry, Group,
+        KIND_GROUP_INVITE, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
+    };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1881,6 +2584,280 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].payload, b"hi");
         assert_eq!(messages[1].payload, b"there");
+    }
+
+    #[test]
+    fn incoming_message_reference_round_trips_and_resolves_quote_target() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let original = msg(b"chat-a", b"alice", 1, "first");
+        let original_id = vec![1; MESSAGE_ID_LEN];
+        assert!(store
+            .insert_incoming_message(original.clone(), original_id.clone(), None)
+            .unwrap());
+
+        let reply = msg(b"chat-a", b"alice", 2, "second");
+        let reply_id = vec![2; MESSAGE_ID_LEN];
+        assert!(store
+            .insert_incoming_message(reply.clone(), reply_id.clone(), Some(original_id.clone()),)
+            .unwrap());
+        assert_eq!(
+            store
+                .message_reference(
+                    reply.chat_id.clone(),
+                    reply.sender_user_id.clone(),
+                    reply.lamport,
+                )
+                .unwrap(),
+            Some(MessageReference {
+                msg_id: reply_id,
+                reply_to_msg_id: Some(original_id.clone()),
+            }),
+        );
+        assert_eq!(
+            store
+                .message_by_msg_id(reply.chat_id.clone(), original_id)
+                .unwrap(),
+            Some(original),
+        );
+
+        // A redundant copy cannot replace the first stable envelope id.
+        assert!(!store
+            .insert_incoming_message(
+                reply.clone(),
+                vec![3; MESSAGE_ID_LEN],
+                Some(vec![1; MESSAGE_ID_LEN]),
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .message_reference(reply.chat_id, reply.sender_user_id, reply.lamport)
+                .unwrap()
+                .unwrap()
+                .msg_id,
+            vec![2; MESSAGE_ID_LEN],
+        );
+    }
+
+    #[test]
+    fn outgoing_reply_persists_reference_atomically() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let message = msg(b"chat-a", b"self", 1, "reply");
+        let envelope = outbound_for(&message, b"recipient", &[4; MESSAGE_ID_LEN]);
+        let reply_to = vec![5; MESSAGE_ID_LEN];
+        assert!(store
+            .insert_outgoing_reply(message.clone(), envelope, reply_to.clone(), 1_000)
+            .unwrap());
+        assert_eq!(
+            store
+                .message_reference(message.chat_id, message.sender_user_id, message.lamport)
+                .unwrap(),
+            Some(MessageReference {
+                msg_id: vec![4; MESSAGE_ID_LEN],
+                reply_to_msg_id: Some(reply_to),
+            }),
+        );
+    }
+
+    #[test]
+    fn open_backfills_authored_message_ids_from_the_outbound_queue() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cruisemesh-store-message-reference-backfill-{unique}.sqlite"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let message = msg(b"chat-a", b"self", 1, "sent before upgrade");
+        let msg_id = vec![6; MESSAGE_ID_LEN];
+
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        store
+            .insert_outgoing_message(
+                message.clone(),
+                outbound_for(&message, b"recipient", &msg_id),
+                1_000,
+            )
+            .unwrap();
+        drop(store);
+
+        // Model the old schema's message row after the columns are added but
+        // before open() performs its outbound-queue backfill.
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute("UPDATE messages SET msg_id = NULL", [])
+            .unwrap();
+        drop(conn);
+
+        let reopened = MessageStore::open(path_str).unwrap();
+        assert_eq!(
+            reopened
+                .message_reference(message.chat_id, message.sender_user_id, message.lamport)
+                .unwrap(),
+            Some(MessageReference {
+                msg_id,
+                reply_to_msg_id: None,
+            }),
+        );
+
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn incoming_references_require_fixed_width_ids() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(matches!(
+            store.insert_incoming_message(
+                msg(b"chat-a", b"alice", 1, "hi"),
+                vec![1; MESSAGE_ID_LEN - 1],
+                None,
+            ),
+            Err(CoreError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn message_arrival_records_first_route_without_changing_message_shape() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let message = msg(b"chat-a", b"alice", 1, "hi");
+        store.insert_message(message.clone()).unwrap();
+        let first = MessageArrival {
+            transport: 1,
+            hops_taken: 2,
+            received_at: 1_700_000_000_500,
+        };
+        assert!(store
+            .record_message_arrival(
+                message.chat_id.clone(),
+                message.sender_user_id.clone(),
+                message.lamport,
+                first.clone(),
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .message_arrival(
+                    message.chat_id.clone(),
+                    message.sender_user_id.clone(),
+                    message.lamport,
+                )
+                .unwrap(),
+            Some(first),
+        );
+
+        assert!(!store
+            .record_message_arrival(
+                message.chat_id.clone(),
+                message.sender_user_id.clone(),
+                message.lamport,
+                MessageArrival {
+                    transport: 2,
+                    hops_taken: 7,
+                    received_at: 1_700_000_999_999,
+                },
+            )
+            .unwrap());
+        assert_eq!(
+            store.messages_for_chat(message.chat_id.clone()).unwrap(),
+            vec![message],
+        );
+    }
+
+    #[test]
+    fn message_arrival_is_absent_for_legacy_or_outgoing_rows() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let message = msg(b"chat-a", b"alice", 1, "hi");
+        store.insert_message(message.clone()).unwrap();
+        assert_eq!(
+            store
+                .message_arrival(
+                    message.chat_id.clone(),
+                    message.sender_user_id.clone(),
+                    message.lamport,
+                )
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            store
+                .message_reference(message.chat_id, message.sender_user_id, message.lamport)
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn open_migrates_old_messages_table_to_add_arrival_and_reference_columns() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cruisemesh-store-migration-message-arrival-{unique}.sqlite"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE messages (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id        BLOB NOT NULL,
+                sender_user_id BLOB NOT NULL,
+                lamport        INTEGER NOT NULL,
+                timestamp      INTEGER NOT NULL,
+                kind           INTEGER NOT NULL,
+                payload        BLOB NOT NULL,
+                UNIQUE(chat_id, sender_user_id, lamport)
+            );
+            INSERT INTO messages
+                (chat_id, sender_user_id, lamport, timestamp, kind, payload)
+            VALUES
+                (x'636861742D61', x'616C696365', 1, 1700000000000, 0, x'6869');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = MessageStore::open(path_str).unwrap();
+        let arrival = MessageArrival {
+            transport: 2,
+            hops_taken: 3,
+            received_at: 1_700_000_000_500,
+        };
+        assert!(store
+            .record_message_arrival(b"chat-a".to_vec(), b"alice".to_vec(), 1, arrival.clone(),)
+            .unwrap());
+        assert_eq!(
+            store
+                .message_arrival(b"chat-a".to_vec(), b"alice".to_vec(), 1)
+                .unwrap(),
+            Some(arrival),
+        );
+
+        let legacy = StoredMessage {
+            chat_id: b"chat-a".to_vec(),
+            sender_user_id: b"alice".to_vec(),
+            lamport: 1,
+            timestamp: 1_700_000_000_000,
+            kind: 0,
+            payload: b"hi".to_vec(),
+        };
+        let legacy_id = vec![9; MESSAGE_ID_LEN];
+        assert!(!store
+            .insert_incoming_message(legacy, legacy_id.clone(), None)
+            .unwrap());
+        assert_eq!(
+            store
+                .message_reference(b"chat-a".to_vec(), b"alice".to_vec(), 1)
+                .unwrap(),
+            Some(MessageReference {
+                msg_id: legacy_id,
+                reply_to_msg_id: None,
+            }),
+        );
+
+        drop(store);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2562,6 +3539,168 @@ mod tests {
             relay_url: None,
             relay_token: None,
         }
+    }
+
+    #[test]
+    fn contact_discovery_policy_only_moves_forward() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let id = vec![1; 16];
+        assert!(store
+            .upsert_contact_discovery_policy(ContactDiscoveryPolicy {
+                user_id: id.clone(),
+                protocol_version: 1,
+                enabled: true,
+                revision: 5,
+            })
+            .unwrap());
+        assert!(!store
+            .upsert_contact_discovery_policy(ContactDiscoveryPolicy {
+                user_id: id.clone(),
+                protocol_version: 1,
+                enabled: false,
+                revision: 4,
+            })
+            .unwrap());
+        let policy = store.get_contact_discovery_policy(id).unwrap().unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.revision, 5);
+    }
+
+    #[test]
+    fn friend_directory_replaces_one_source_and_honors_suppression() {
+        let alice = generate_identity();
+        let bob = generate_identity();
+        let carol = generate_identity();
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .upsert_contact(Contact {
+                user_id: alice.user_id.clone(),
+                name: "Alice".to_string(),
+                sign_pk: alice.sign_pk.clone(),
+                agree_pk: alice.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+            })
+            .unwrap();
+        let ticket = create_introduction_ticket(
+            alice.clone(),
+            carol.user_id.clone(),
+            bob.user_id.clone(),
+            3,
+            1_000,
+            100_000,
+            vec![9; 16],
+        )
+        .unwrap();
+        let directory = FriendDirectoryContent {
+            version: 1,
+            revision: 1,
+            entries: vec![FriendDirectoryEntry {
+                candidate: SuggestedFriendCard {
+                    name: "Carol".to_string(),
+                    user_id: carol.user_id.clone(),
+                    sign_pk: carol.sign_pk.clone(),
+                    agree_pk: carol.agree_pk.clone(),
+                },
+                candidate_policy_revision: 3,
+                ticket,
+            }],
+        };
+        assert!(store
+            .apply_friend_directory(
+                alice.user_id.clone(),
+                bob.user_id.clone(),
+                directory.clone(),
+                2_000,
+            )
+            .unwrap());
+        assert!(!store
+            .apply_friend_directory(alice.user_id.clone(), vec![2; 16], directory, 2_000,)
+            .unwrap());
+        let suggestions = store.list_friend_suggestions(2_000).unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].candidate.name, "Carol");
+
+        store
+            .set_friend_suggestion_state(suggestions[0].candidate.user_id.clone(), 1)
+            .unwrap();
+        let newer_ticket = create_introduction_ticket(
+            alice.clone(),
+            carol.user_id.clone(),
+            bob.user_id.clone(),
+            3,
+            2_000,
+            101_000,
+            vec![10; 16],
+        )
+        .unwrap();
+        assert!(store
+            .apply_friend_directory(
+                alice.user_id.clone(),
+                bob.user_id,
+                FriendDirectoryContent {
+                    version: 1,
+                    revision: 2,
+                    entries: vec![FriendDirectoryEntry {
+                        candidate: SuggestedFriendCard {
+                            name: "Carol".to_string(),
+                            user_id: carol.user_id,
+                            sign_pk: carol.sign_pk,
+                            agree_pk: carol.agree_pk,
+                        },
+                        candidate_policy_revision: 3,
+                        ticket: newer_ticket,
+                    }],
+                },
+                2_000,
+            )
+            .unwrap());
+        let suggestions = store.list_friend_suggestions(2_000).unwrap();
+        assert_eq!(suggestions[0].state, 0);
+
+        store
+            .set_friend_suggestion_state(suggestions[0].candidate.user_id.clone(), 2)
+            .unwrap();
+        assert!(store.list_friend_suggestions(2_000).unwrap().is_empty());
+
+        assert!(store
+            .apply_friend_directory(
+                alice.user_id,
+                vec![2; 16],
+                FriendDirectoryContent {
+                    version: 1,
+                    revision: 3,
+                    entries: Vec::new(),
+                },
+                2_000,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn direct_provenance_cannot_be_downgraded() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let user_id = vec![3; 16];
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: user_id.clone(),
+                source: 0,
+                introducer_user_id: None,
+                introduced_at_ms: 10,
+            })
+            .unwrap();
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: user_id.clone(),
+                source: 1,
+                introducer_user_id: Some(vec![4; 16]),
+                introduced_at_ms: 20,
+            })
+            .unwrap();
+        let provenance = store.get_contact_provenance(user_id).unwrap().unwrap();
+        assert_eq!(provenance.source, 0);
+        assert!(provenance.introducer_user_id.is_none());
+        assert_eq!(provenance.introduced_at_ms, 10);
     }
 
     #[test]

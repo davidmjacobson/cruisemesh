@@ -40,6 +40,10 @@
 //! 11+N    8     timestamp       (i64 BE; ms since Unix epoch)
 //! 19+N    4     content_len     (u32 BE)
 //! 23+N    M     content         (M = content_len bytes)
+//! then, zero or more private extensions:
+//!         1     extension_type  (u8; 1 = reply-to msg_id)
+//!         2     extension_len   (u16 BE)
+//!         X     extension_value (X = extension_len bytes)
 //! ```
 //!
 //! `chat_id` uses a 16-bit length prefix (not 32-bit) because chat ids are
@@ -51,7 +55,12 @@
 //! `content`), rather than failing, on the theory that a BLE text-messaging
 //! app never legitimately produces such a value. Decoding is fully checked
 //! and never panics on attacker-controlled input; malformed or truncated
-//! bytes return [`CoreError::Malformed`].
+//! bytes return [`CoreError::Malformed`]. Unknown well-formed extensions are
+//! skipped so adding future encrypted metadata does not make the base message
+//! unreadable. [`decode_message_body`] intentionally returns only the legacy
+//! fields; [`decode_extended_message_body`] also surfaces known extensions.
+//! The reply-to extension is a 16-byte envelope `msg_id` inside the signed
+//! and sealed payload, so public headers reveal no conversation linkage.
 //!
 //! ## Receipts (DESIGN.md §7.2)
 //!
@@ -221,10 +230,14 @@
 
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
+use ed25519_dalek::{Signature, Signer, Verifier};
 use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 
+use crate::crypto::{signing_key_from_bytes, verifying_key_from_bytes};
+use crate::identity::derive_user_id;
 use crate::store::DigestEntry;
-use crate::CoreError;
+use crate::{CoreError, Identity};
 
 /// `MessageBody.kind` value for an ordinary text message (DESIGN.md §7.1).
 pub const KIND_TEXT: u8 = 1;
@@ -240,6 +253,12 @@ pub const KIND_GROUP_INVITE: u8 = 4;
 /// `MessageBody.kind` value for a profile-sync: durable contact metadata
 /// (display name + avatar), newest epoch wins.
 pub const KIND_PROFILE_SYNC: u8 = 5;
+/// A replaceable, pairwise-sealed snapshot of friends the sender may
+/// introduce to the recipient. Hidden from chat history.
+pub const KIND_FRIEND_DIRECTORY: u8 = 6;
+/// A friend request authorized by a mutual friend's transferable ticket.
+/// Hidden from chat history.
+pub const KIND_INTRODUCED_FRIEND_REQUEST: u8 = 7;
 /// `MessageBody.kind` value for an attachment manifest (DESIGN.md §7.1
 /// reserved, §8). Android currently embeds the media blob inline in the
 /// manifest payload for BLE/relay-friendly sizes; `KIND_ATTACHMENT_CHUNK`
@@ -270,9 +289,16 @@ const FRAME_TYPE_DIGEST: u8 = 0x03;
 
 const MSG_ID_LEN: usize = 16;
 const RECIPIENT_HINT_LEN: usize = 8;
+const MESSAGE_EXTENSION_REPLY_TO_MSG_ID: u8 = 1;
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
-const PROFILE_SYNC_VERSION: u8 = 1;
+const PROFILE_SYNC_VERSION: u8 = 2;
 const PROFILE_SYNC_MAX_AVATAR_BYTES: usize = 64 * 1024;
+const FRIEND_DIRECTORY_VERSION: u8 = 1;
+const INTRODUCED_FRIEND_REQUEST_VERSION: u8 = 1;
+const FRIEND_DIRECTORY_MAX_BYTES: usize = 64 * 1024;
+const FRIEND_DIRECTORY_MAX_ENTRIES: usize = 64;
+const INTRODUCTION_MAX_LIFETIME_MS: i64 = 30 * MS_PER_DAY;
+const INTRODUCTION_CLOCK_SKEW_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// The plaintext body that gets encoded, then handed as `payload` to
 /// [`crate::seal_message`] (DESIGN.md §7.1). See the module docs for the
@@ -284,6 +310,18 @@ pub struct MessageBody {
     pub lamport: u64,
     pub timestamp: i64,
     pub content: Vec<u8>,
+}
+
+/// A decoded message body plus optional encrypted metadata appended after
+/// the legacy content field. Unknown extension types are skipped.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct ExtendedMessageBody {
+    pub kind: u8,
+    pub chat_id: Vec<u8>,
+    pub lamport: u64,
+    pub timestamp: i64,
+    pub content: Vec<u8>,
+    pub reply_to_msg_id: Option<Vec<u8>>,
 }
 
 /// Encode a [`MessageBody`] to its wire form (see module docs for layout).
@@ -298,23 +336,77 @@ pub fn encode_message_body(body: MessageBody) -> Vec<u8> {
     out
 }
 
+/// Encode a message body with an encrypted reference to the message being
+/// replied to. The fixed-width id is the target envelope's public `msg_id`,
+/// but it remains private here because the extension is inside the seal.
+#[uniffi::export]
+pub fn encode_message_body_with_reply(
+    body: MessageBody,
+    reply_to_msg_id: Vec<u8>,
+) -> Result<Vec<u8>, CoreError> {
+    if reply_to_msg_id.len() != MSG_ID_LEN {
+        return Err(CoreError::Malformed(format!(
+            "reply_to_msg_id must be exactly {MSG_ID_LEN} bytes"
+        )));
+    }
+    let mut out = encode_message_body(body);
+    out.push(MESSAGE_EXTENSION_REPLY_TO_MSG_ID);
+    out.extend_from_slice(&(MSG_ID_LEN as u16).to_be_bytes());
+    out.extend_from_slice(&reply_to_msg_id);
+    Ok(out)
+}
+
 /// Decode a [`MessageBody`] from its wire form. Rejects truncated input,
-/// corrupt length prefixes, and unexpected trailing bytes.
+/// corrupt length prefixes, and malformed extension TLVs while ignoring
+/// well-formed extensions the legacy record does not surface.
 #[uniffi::export]
 pub fn decode_message_body(bytes: Vec<u8>) -> Result<MessageBody, CoreError> {
+    let extended = decode_extended_message_body(bytes)?;
+    Ok(MessageBody {
+        kind: extended.kind,
+        chat_id: extended.chat_id,
+        lamport: extended.lamport,
+        timestamp: extended.timestamp,
+        content: extended.content,
+    })
+}
+
+/// Decode the legacy message fields and any known append-only extensions.
+/// Unknown well-formed TLVs are ignored for forward compatibility.
+#[uniffi::export]
+pub fn decode_extended_message_body(bytes: Vec<u8>) -> Result<ExtendedMessageBody, CoreError> {
     let mut cursor = Cursor::new(&bytes);
     let kind = cursor.take_u8()?;
     let chat_id = cursor.take_bytes16()?;
     let lamport = cursor.take_u64()?;
     let timestamp = cursor.take_i64()?;
     let content = cursor.take_bytes32()?;
-    cursor.finish()?;
-    Ok(MessageBody {
+    let mut reply_to_msg_id = None;
+    while !cursor.is_finished() {
+        let extension_type = cursor.take_u8()?;
+        let extension_len = cursor.take_u16()? as usize;
+        let value = cursor.take(extension_len)?;
+        if extension_type == MESSAGE_EXTENSION_REPLY_TO_MSG_ID {
+            if extension_len != MSG_ID_LEN {
+                return Err(CoreError::Malformed(format!(
+                    "reply-to extension must be exactly {MSG_ID_LEN} bytes"
+                )));
+            }
+            if reply_to_msg_id.is_some() {
+                return Err(CoreError::Malformed(
+                    "duplicate reply-to extension".to_string(),
+                ));
+            }
+            reply_to_msg_id = Some(value.to_vec());
+        }
+    }
+    Ok(ExtendedMessageBody {
         kind,
         chat_id,
         lamport,
         timestamp,
         content,
+        reply_to_msg_id,
     })
 }
 
@@ -337,6 +429,55 @@ pub struct ProfileSyncContent {
     pub avatar_epoch: i64,
     pub name: String,
     pub avatar: Vec<u8>,
+    pub friends_of_friends_version: u8,
+    pub friends_of_friends_enabled: bool,
+    pub friends_of_friends_revision: u64,
+}
+
+/// Public identity forwarded by a mutual friend. Relay credentials and avatar
+/// bytes are deliberately absent.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SuggestedFriendCard {
+    pub name: String,
+    pub user_id: Vec<u8>,
+    pub sign_pk: Vec<u8>,
+    pub agree_pk: Vec<u8>,
+}
+
+/// Transferable proof that an accepted contact introduced one exact invitee
+/// to one exact candidate under the candidate's current discovery revision.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IntroductionTicket {
+    pub version: u8,
+    pub introducer_user_id: Vec<u8>,
+    pub candidate_user_id: Vec<u8>,
+    pub invitee_user_id: Vec<u8>,
+    pub candidate_policy_revision: u64,
+    pub issued_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub offer_id: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FriendDirectoryEntry {
+    pub candidate: SuggestedFriendCard,
+    pub candidate_policy_revision: u64,
+    pub ticket: IntroductionTicket,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FriendDirectoryContent {
+    pub version: u8,
+    pub revision: u64,
+    pub entries: Vec<FriendDirectoryEntry>,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IntroducedFriendRequest {
+    pub version: u8,
+    pub friend_card_json: String,
+    pub ticket: IntroductionTicket,
 }
 
 /// Encode a [`ReceiptContent`] to its wire form (see module docs for layout).
@@ -373,11 +514,14 @@ pub fn decode_receipt_content(bytes: Vec<u8>) -> Result<ReceiptContent, CoreErro
 #[uniffi::export]
 pub fn encode_profile_sync_content(content: ProfileSyncContent) -> Vec<u8> {
     let name = content.name.as_bytes();
-    let mut out = Vec::with_capacity(1 + 8 + 2 + name.len() + 4 + content.avatar.len());
+    let mut out = Vec::with_capacity(1 + 8 + 2 + name.len() + 4 + content.avatar.len() + 10);
     out.push(PROFILE_SYNC_VERSION);
     out.extend_from_slice(&content.avatar_epoch.to_be_bytes());
     write_bytes16(&mut out, name);
     write_bytes32(&mut out, &content.avatar);
+    out.push(content.friends_of_friends_version);
+    out.push(u8::from(content.friends_of_friends_enabled));
+    out.extend_from_slice(&content.friends_of_friends_revision.to_be_bytes());
     out
 }
 
@@ -386,7 +530,7 @@ pub fn encode_profile_sync_content(content: ProfileSyncContent) -> Vec<u8> {
 pub fn decode_profile_sync_content(bytes: Vec<u8>) -> Result<ProfileSyncContent, CoreError> {
     let mut cursor = Cursor::new(&bytes);
     let version = cursor.take_u8()?;
-    if version != PROFILE_SYNC_VERSION {
+    if version != 1 && version != PROFILE_SYNC_VERSION {
         return Err(CoreError::Malformed(format!(
             "unknown profile-sync version: {version}"
         )));
@@ -401,12 +545,252 @@ pub fn decode_profile_sync_content(bytes: Vec<u8>) -> Result<ProfileSyncContent,
         )));
     }
     let avatar = cursor.take(avatar_len)?.to_vec();
+    let (friends_of_friends_version, friends_of_friends_enabled, friends_of_friends_revision) =
+        if version >= 2 {
+            let protocol_version = cursor.take_u8()?;
+            let enabled = match cursor.take_u8()? {
+                0 => false,
+                1 => true,
+                value => {
+                    return Err(CoreError::Malformed(format!(
+                        "invalid friends-of-friends enabled value: {value}"
+                    )))
+                }
+            };
+            let revision = cursor.take_u64()?;
+            (protocol_version, enabled, revision)
+        } else {
+            (0, false, 0)
+        };
     cursor.finish()?;
     Ok(ProfileSyncContent {
         avatar_epoch,
         name,
         avatar,
+        friends_of_friends_version,
+        friends_of_friends_enabled,
+        friends_of_friends_revision,
     })
+}
+
+/// Create a short-lived introduction ticket signed by the mutual friend.
+#[uniffi::export]
+pub fn create_introduction_ticket(
+    introducer: Identity,
+    candidate_user_id: Vec<u8>,
+    invitee_user_id: Vec<u8>,
+    candidate_policy_revision: u64,
+    issued_at_ms: i64,
+    expires_at_ms: i64,
+    offer_id: Vec<u8>,
+) -> Result<IntroductionTicket, CoreError> {
+    validate_id(&candidate_user_id, "candidate UserID")?;
+    validate_id(&invitee_user_id, "invitee UserID")?;
+    validate_id(&introducer.user_id, "introducer UserID")?;
+    validate_id(&offer_id, "offer ID")?;
+    if expires_at_ms <= issued_at_ms
+        || expires_at_ms.saturating_sub(issued_at_ms) > INTRODUCTION_MAX_LIFETIME_MS
+    {
+        return Err(CoreError::Malformed(
+            "introduction ticket validity window must be between 1 ms and 30 days".to_string(),
+        ));
+    }
+    let mut ticket = IntroductionTicket {
+        version: 1,
+        introducer_user_id: introducer.user_id.clone(),
+        candidate_user_id,
+        invitee_user_id,
+        candidate_policy_revision,
+        issued_at_ms,
+        expires_at_ms,
+        offer_id,
+        signature: Vec::new(),
+    };
+    let signing_key = signing_key_from_bytes(&introducer.sign_sk)?;
+    ticket.signature = signing_key
+        .sign(&introduction_ticket_bytes(&ticket)?)
+        .to_bytes()
+        .to_vec();
+    Ok(ticket)
+}
+
+/// Verify the ticket signature and all bindings needed by the candidate.
+#[uniffi::export]
+pub fn verify_introduction_ticket(
+    ticket: IntroductionTicket,
+    introducer_sign_pk: Vec<u8>,
+    expected_candidate_user_id: Vec<u8>,
+    expected_invitee_user_id: Vec<u8>,
+    expected_candidate_policy_revision: u64,
+    now_ms: i64,
+) -> Result<bool, CoreError> {
+    validate_ticket_shape(&ticket)?;
+    if ticket.candidate_user_id != expected_candidate_user_id
+        || ticket.invitee_user_id != expected_invitee_user_id
+        || ticket.candidate_policy_revision != expected_candidate_policy_revision
+        || derive_user_id(&introducer_sign_pk).to_vec() != ticket.introducer_user_id
+        || now_ms
+            < ticket
+                .issued_at_ms
+                .saturating_sub(INTRODUCTION_CLOCK_SKEW_MS)
+        || now_ms
+            > ticket
+                .expires_at_ms
+                .saturating_add(INTRODUCTION_CLOCK_SKEW_MS)
+    {
+        return Ok(false);
+    }
+    let verifying_key = verifying_key_from_bytes(&introducer_sign_pk)?;
+    let signature_bytes: [u8; 64] = ticket
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| CoreError::Malformed("invalid ticket signature length".to_string()))?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    Ok(verifying_key
+        .verify(&introduction_ticket_bytes(&ticket)?, &signature)
+        .is_ok())
+}
+
+#[uniffi::export]
+pub fn encode_friend_directory_content(content: FriendDirectoryContent) -> Vec<u8> {
+    serde_json::to_vec(&content).expect("FriendDirectoryContent always serializes")
+}
+
+#[uniffi::export]
+pub fn decode_friend_directory_content(
+    bytes: Vec<u8>,
+) -> Result<FriendDirectoryContent, CoreError> {
+    if bytes.len() > FRIEND_DIRECTORY_MAX_BYTES {
+        return Err(CoreError::Malformed(
+            "friend directory is too large".to_string(),
+        ));
+    }
+    let content: FriendDirectoryContent = serde_json::from_slice(&bytes)
+        .map_err(|e| CoreError::Malformed(format!("invalid friend directory: {e}")))?;
+    validate_friend_directory(&content)?;
+    Ok(content)
+}
+
+#[uniffi::export]
+pub fn encode_introduced_friend_request(request: IntroducedFriendRequest) -> Vec<u8> {
+    serde_json::to_vec(&request).expect("IntroducedFriendRequest always serializes")
+}
+
+#[uniffi::export]
+pub fn decode_introduced_friend_request(
+    bytes: Vec<u8>,
+) -> Result<IntroducedFriendRequest, CoreError> {
+    if bytes.len() > 16 * 1024 {
+        return Err(CoreError::Malformed(
+            "introduced friend request is too large".to_string(),
+        ));
+    }
+    let request: IntroducedFriendRequest = serde_json::from_slice(&bytes)
+        .map_err(|e| CoreError::Malformed(format!("invalid introduced friend request: {e}")))?;
+    if request.version != INTRODUCED_FRIEND_REQUEST_VERSION {
+        return Err(CoreError::Malformed(format!(
+            "unknown introduced friend request version: {}",
+            request.version
+        )));
+    }
+    validate_ticket_shape(&request.ticket)?;
+    crate::identity::parse_friend_card(request.friend_card_json.clone())?;
+    Ok(request)
+}
+
+fn validate_friend_directory(content: &FriendDirectoryContent) -> Result<(), CoreError> {
+    if content.version != FRIEND_DIRECTORY_VERSION {
+        return Err(CoreError::Malformed(format!(
+            "unknown friend directory version: {}",
+            content.version
+        )));
+    }
+    if content.entries.len() > FRIEND_DIRECTORY_MAX_ENTRIES {
+        return Err(CoreError::Malformed(
+            "too many friend directory entries".to_string(),
+        ));
+    }
+    for entry in &content.entries {
+        validate_id(&entry.candidate.user_id, "candidate UserID")?;
+        if entry.candidate.name.as_bytes().len() > 256 {
+            return Err(CoreError::Malformed(
+                "candidate name is too long".to_string(),
+            ));
+        }
+        if entry.candidate.sign_pk.len() != 32 || entry.candidate.agree_pk.len() != 32 {
+            return Err(CoreError::Malformed(
+                "candidate key has invalid length".to_string(),
+            ));
+        }
+        if derive_user_id(&entry.candidate.sign_pk).to_vec() != entry.candidate.user_id {
+            return Err(CoreError::Malformed(
+                "candidate UserID does not match signing key".to_string(),
+            ));
+        }
+        validate_ticket_shape(&entry.ticket)?;
+        if entry.ticket.candidate_user_id != entry.candidate.user_id
+            || entry.ticket.candidate_policy_revision != entry.candidate_policy_revision
+        {
+            return Err(CoreError::Malformed(
+                "directory entry does not match introduction ticket".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_ticket_shape(ticket: &IntroductionTicket) -> Result<(), CoreError> {
+    if ticket.version != 1 {
+        return Err(CoreError::Malformed(format!(
+            "unknown introduction ticket version: {}",
+            ticket.version
+        )));
+    }
+    validate_id(&ticket.introducer_user_id, "introducer UserID")?;
+    validate_id(&ticket.candidate_user_id, "candidate UserID")?;
+    validate_id(&ticket.invitee_user_id, "invitee UserID")?;
+    validate_id(&ticket.offer_id, "offer ID")?;
+    if ticket.signature.len() != 64 {
+        return Err(CoreError::Malformed(
+            "invalid ticket signature length".to_string(),
+        ));
+    }
+    if ticket.expires_at_ms <= ticket.issued_at_ms
+        || ticket.expires_at_ms.saturating_sub(ticket.issued_at_ms) > INTRODUCTION_MAX_LIFETIME_MS
+    {
+        return Err(CoreError::Malformed(
+            "invalid ticket validity window".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_id(bytes: &[u8], label: &str) -> Result<(), CoreError> {
+    if bytes.len() != 16 {
+        return Err(CoreError::Malformed(format!(
+            "invalid {label} length: expected 16, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+fn introduction_ticket_bytes(ticket: &IntroductionTicket) -> Result<Vec<u8>, CoreError> {
+    validate_id(&ticket.introducer_user_id, "introducer UserID")?;
+    validate_id(&ticket.candidate_user_id, "candidate UserID")?;
+    validate_id(&ticket.invitee_user_id, "invitee UserID")?;
+    validate_id(&ticket.offer_id, "offer ID")?;
+    let mut out = b"CruiseMesh introduction ticket v1\0".to_vec();
+    out.push(ticket.version);
+    out.extend_from_slice(&ticket.introducer_user_id);
+    out.extend_from_slice(&ticket.candidate_user_id);
+    out.extend_from_slice(&ticket.invitee_user_id);
+    out.extend_from_slice(&ticket.candidate_policy_revision.to_be_bytes());
+    out.extend_from_slice(&ticket.issued_at_ms.to_be_bytes());
+    out.extend_from_slice(&ticket.expires_at_ms.to_be_bytes());
+    out.extend_from_slice(&ticket.offer_id);
+    Ok(out)
 }
 
 /// A parsed BLE frame: an unauthenticated HELLO (see module docs for why
@@ -704,6 +1088,10 @@ impl<'a> Cursor<'a> {
         Ok(self.take(len)?.to_vec())
     }
 
+    fn is_finished(&self) -> bool {
+        self.pos == self.data.len()
+    }
+
     /// Consumes and returns every remaining byte (no length prefix -- used
     /// where, like the envelope frame's `sealed` tail, the field's length is
     /// implicitly "whatever's left").
@@ -775,6 +1163,53 @@ mod tests {
     }
 
     #[test]
+    fn reply_extension_round_trips_without_changing_legacy_body() {
+        let body = sample_body();
+        let reply_to = vec![7; MSG_ID_LEN];
+        let encoded = encode_message_body_with_reply(body.clone(), reply_to.clone()).unwrap();
+
+        let extended = decode_extended_message_body(encoded.clone()).unwrap();
+        assert_eq!(extended.kind, body.kind);
+        assert_eq!(extended.chat_id, body.chat_id);
+        assert_eq!(extended.lamport, body.lamport);
+        assert_eq!(extended.timestamp, body.timestamp);
+        assert_eq!(extended.content, body.content);
+        assert_eq!(extended.reply_to_msg_id, Some(reply_to));
+
+        // Compatibility bridge: code that only understands the original
+        // fields can still render the reply's text and ignores the quote.
+        assert_eq!(decode_message_body(encoded).unwrap(), body);
+    }
+
+    #[test]
+    fn unknown_message_extensions_are_skipped() {
+        let body = sample_body();
+        let mut encoded = encode_message_body(body.clone());
+        encoded.push(99);
+        encoded.extend_from_slice(&3u16.to_be_bytes());
+        encoded.extend_from_slice(b"new");
+
+        let extended = decode_extended_message_body(encoded).unwrap();
+        assert_eq!(extended.reply_to_msg_id, None);
+        assert_eq!(extended.content, body.content);
+    }
+
+    #[test]
+    fn reply_extension_requires_one_msg_id() {
+        let error =
+            encode_message_body_with_reply(sample_body(), vec![1; MSG_ID_LEN - 1]).unwrap_err();
+        assert!(matches!(error, CoreError::Malformed(_)));
+
+        let mut duplicated =
+            encode_message_body_with_reply(sample_body(), vec![1; MSG_ID_LEN]).unwrap();
+        duplicated.push(MESSAGE_EXTENSION_REPLY_TO_MSG_ID);
+        duplicated.extend_from_slice(&(MSG_ID_LEN as u16).to_be_bytes());
+        duplicated.extend_from_slice(&vec![2; MSG_ID_LEN]);
+        let error = decode_extended_message_body(duplicated).unwrap_err();
+        assert!(matches!(error, CoreError::Malformed(_)));
+    }
+
+    #[test]
     fn message_body_decode_rejects_empty_input() {
         let err = decode_message_body(Vec::new()).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
@@ -819,6 +1254,9 @@ mod tests {
             avatar_epoch: 1_700_000_123_456,
             name: "Alice".to_string(),
             avatar: vec![0xFF, 0xD8, 0x11, 0x22, 0xFF, 0xD9],
+            friends_of_friends_version: 1,
+            friends_of_friends_enabled: true,
+            friends_of_friends_revision: 7,
         }
     }
 
@@ -836,6 +1274,9 @@ mod tests {
             avatar_epoch: 0,
             name: String::new(),
             avatar: Vec::new(),
+            friends_of_friends_version: 1,
+            friends_of_friends_enabled: false,
+            friends_of_friends_revision: 8,
         };
         let encoded = encode_profile_sync_content(content.clone());
         let decoded = decode_profile_sync_content(encoded).expect("decodes");
@@ -862,9 +1303,190 @@ mod tests {
     #[test]
     fn profile_sync_content_decode_rejects_unknown_version() {
         let mut encoded = encode_profile_sync_content(sample_profile_sync());
-        encoded[0] = 2;
+        encoded[0] = 3;
         let err = decode_profile_sync_content(encoded).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn profile_sync_v1_decodes_with_unknown_discovery_policy() {
+        let content = sample_profile_sync();
+        let mut encoded = Vec::new();
+        encoded.push(1);
+        encoded.extend_from_slice(&content.avatar_epoch.to_be_bytes());
+        write_bytes16(&mut encoded, content.name.as_bytes());
+        write_bytes32(&mut encoded, &content.avatar);
+        let decoded = decode_profile_sync_content(encoded).expect("v1 decodes");
+        assert_eq!(decoded.friends_of_friends_version, 0);
+        assert!(!decoded.friends_of_friends_enabled);
+        assert_eq!(decoded.friends_of_friends_revision, 0);
+    }
+
+    fn sample_directory() -> (Identity, Identity, Identity, FriendDirectoryContent) {
+        let alice = crate::generate_identity();
+        let bob = crate::generate_identity();
+        let carol = crate::generate_identity();
+        let ticket = create_introduction_ticket(
+            alice.clone(),
+            carol.user_id.clone(),
+            bob.user_id.clone(),
+            9,
+            1_700_000_000_000,
+            1_702_000_000_000,
+            vec![4; 16],
+        )
+        .expect("ticket");
+        let directory = FriendDirectoryContent {
+            version: 1,
+            revision: 3,
+            entries: vec![FriendDirectoryEntry {
+                candidate: SuggestedFriendCard {
+                    name: "Carol".to_string(),
+                    user_id: carol.user_id.clone(),
+                    sign_pk: carol.sign_pk.clone(),
+                    agree_pk: carol.agree_pk.clone(),
+                },
+                candidate_policy_revision: 9,
+                ticket,
+            }],
+        };
+        (alice, bob, carol, directory)
+    }
+
+    #[test]
+    fn friend_directory_and_ticket_round_trip() {
+        let (alice, bob, carol, directory) = sample_directory();
+        let decoded =
+            decode_friend_directory_content(encode_friend_directory_content(directory.clone()))
+                .expect("directory decodes");
+        assert_eq!(decoded, directory);
+        assert!(verify_introduction_ticket(
+            decoded.entries[0].ticket.clone(),
+            alice.sign_pk,
+            carol.user_id,
+            bob.user_id,
+            9,
+            1_701_000_000_000,
+        )
+        .expect("ticket verifies"));
+    }
+
+    #[test]
+    fn introduction_ticket_is_bound_to_invitee_and_policy() {
+        let (alice, bob, carol, directory) = sample_directory();
+        let ticket = directory.entries[0].ticket.clone();
+        assert!(!verify_introduction_ticket(
+            ticket.clone(),
+            alice.sign_pk.clone(),
+            carol.user_id.clone(),
+            vec![8; 16],
+            9,
+            1_701_000_000_000,
+        )
+        .unwrap());
+        assert!(!verify_introduction_ticket(
+            ticket,
+            alice.sign_pk,
+            carol.user_id,
+            bob.user_id,
+            10,
+            1_701_000_000_000,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn introduction_ticket_fails_closed_for_tampering_and_time_bounds() {
+        let (alice, bob, carol, directory) = sample_directory();
+        let ticket = directory.entries[0].ticket.clone();
+
+        let mut forged = ticket.clone();
+        forged.signature[0] ^= 0x80;
+        assert!(!verify_introduction_ticket(
+            forged,
+            alice.sign_pk.clone(),
+            carol.user_id.clone(),
+            bob.user_id.clone(),
+            9,
+            1_701_000_000_000,
+        )
+        .unwrap());
+
+        assert!(!verify_introduction_ticket(
+            ticket.clone(),
+            alice.sign_pk.clone(),
+            carol.user_id.clone(),
+            bob.user_id.clone(),
+            9,
+            ticket.issued_at_ms - INTRODUCTION_CLOCK_SKEW_MS - 1,
+        )
+        .unwrap());
+        assert!(!verify_introduction_ticket(
+            ticket.clone(),
+            alice.sign_pk.clone(),
+            carol.user_id.clone(),
+            bob.user_id.clone(),
+            9,
+            ticket.expires_at_ms + INTRODUCTION_CLOCK_SKEW_MS + 1,
+        )
+        .unwrap());
+
+        let mut malformed = ticket.clone();
+        malformed.offer_id.pop();
+        assert!(verify_introduction_ticket(
+            malformed,
+            alice.sign_pk.clone(),
+            carol.user_id.clone(),
+            bob.user_id.clone(),
+            9,
+            1_701_000_000_000,
+        )
+        .is_err());
+
+        let mut unknown = ticket;
+        unknown.version = 2;
+        assert!(verify_introduction_ticket(
+            unknown,
+            alice.sign_pk,
+            carol.user_id,
+            bob.user_id,
+            9,
+            1_701_000_000_000,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn introduction_ticket_rejects_more_than_thirty_days() {
+        let alice = crate::generate_identity();
+        let bob = crate::generate_identity();
+        let carol = crate::generate_identity();
+        let result = create_introduction_ticket(
+            alice,
+            carol.user_id,
+            bob.user_id,
+            1,
+            1_700_000_000_000,
+            1_700_000_000_000 + INTRODUCTION_MAX_LIFETIME_MS + 1,
+            vec![4; 16],
+        );
+        assert!(matches!(result, Err(CoreError::Malformed(_))));
+    }
+
+    #[test]
+    fn introduced_friend_request_round_trips() {
+        let (alice, bob, _carol, directory) = sample_directory();
+        let card = crate::make_friend_card("Bob".to_string(), bob, None, None);
+        let request = IntroducedFriendRequest {
+            version: 1,
+            friend_card_json: card,
+            ticket: directory.entries[0].ticket.clone(),
+        };
+        let decoded =
+            decode_introduced_friend_request(encode_introduced_friend_request(request.clone()))
+                .expect("request decodes");
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.ticket.introducer_user_id, alice.user_id);
     }
 
     #[test]
@@ -1198,6 +1820,21 @@ mod tests {
 
         let decoded = decode_message_body(opened.payload).expect("decodes");
         assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn reply_reference_survives_inside_the_sealed_payload() {
+        let sender = generate_identity();
+        let recipient = generate_identity();
+        let reply_to = vec![8; MSG_ID_LEN];
+        let payload =
+            encode_message_body_with_reply(sample_body(), reply_to.clone()).expect("encodes");
+
+        let sealed = seal_message(sender, recipient.agree_pk.clone(), payload).expect("seals");
+        let opened = open_message(recipient, sealed).expect("opens");
+        let decoded = decode_extended_message_body(opened.payload).expect("decodes");
+
+        assert_eq!(decoded.reply_to_msg_id, Some(reply_to));
     }
 
     #[test]

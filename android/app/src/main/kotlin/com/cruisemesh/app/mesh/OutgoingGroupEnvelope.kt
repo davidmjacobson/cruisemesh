@@ -11,6 +11,7 @@ import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.defaultExpiry
 import uniffi.cruisemesh_core.encodeMessageBody
+import uniffi.cruisemesh_core.encodeMessageBodyWithReply
 import uniffi.cruisemesh_core.generateMsgId
 import uniffi.cruisemesh_core.sealGroupMessage
 
@@ -39,6 +40,7 @@ fun buildOutboundGroupEnvelope(
     identity: Identity,
     group: Group,
     message: StoredMessage,
+    replyToMsgId: ByteArray? = null,
 ): OutboundEnvelope? {
     if (!isAuthoredGroupKind(message.kind)) {
         Log.w(TAG, "Refusing to queue unsupported group message kind=${message.kind}")
@@ -59,6 +61,11 @@ fun buildOutboundGroupEnvelope(
     )
     return try {
         val msgId = generateMsgId()
+        val encodedBody = if (replyToMsgId == null) {
+            encodeMessageBody(body)
+        } else {
+            encodeMessageBodyWithReply(body, replyToMsgId)
+        }
         GossipState.seenIds.record(msgId)
         OutboundEnvelope(
             msgId = msgId,
@@ -71,7 +78,7 @@ fun buildOutboundGroupEnvelope(
             hopTtl = DEFAULT_HOP_TTL,
             expiry = defaultExpiry(message.timestamp),
             recipientHint = computeRecipientHint(group.id, message.timestamp),
-            sealed = sealGroupMessage(identity, group, encodeMessageBody(body)),
+            sealed = sealGroupMessage(identity, group, encodedBody),
         )
     } catch (e: CoreException) {
         Log.w(TAG, "Failed to seal group message for ${group.name}: ${e.message}")

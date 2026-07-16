@@ -51,12 +51,18 @@ final class GroupSender {
     }
 
     /// Sends `text` into `group`'s chat stream, sealed with the group key.
-    func sendText(group: Group, text: String) {
+    func sendText(group: Group, text: String, replyToMsgId: Data? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let payload = Data(trimmed.utf8)
         guard !payload.isEmpty, group.memberUserIds.contains(identity.userId) else { return }
 
-        enqueueGroupMessage(group: group, kind: ProtocolKind.text, payload: payload, label: "sendText")
+        enqueueGroupMessage(
+            group: group,
+            kind: ProtocolKind.text,
+            payload: payload,
+            label: "sendText",
+            replyToMsgId: replyToMsgId
+        )
     }
 
     func sendReaction(group: Group, target: MessageTarget, emoji: String) {
@@ -69,7 +75,13 @@ final class GroupSender {
         )
     }
 
-    private func enqueueGroupMessage(group: Group, kind: UInt8, payload: Data, label: String) {
+    private func enqueueGroupMessage(
+        group: Group,
+        kind: UInt8,
+        payload: Data,
+        label: String,
+        replyToMsgId: Data? = nil
+    ) {
         let chatId = group.id
         let lamport = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
@@ -81,10 +93,24 @@ final class GroupSender {
             kind: kind,
             payload: payload
         )
-        guard let outbound = buildOutboundGroupEnvelope(identity: identity, group: group, message: message) else {
+        guard let outbound = buildOutboundGroupEnvelope(
+            identity: identity,
+            group: group,
+            message: message,
+            replyToMsgId: replyToMsgId
+        ) else {
             return
         }
-        _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
+        if let replyToMsgId {
+            _ = try? store.insertOutgoingReply(
+                message: message,
+                envelope: outbound,
+                replyToMsgId: replyToMsgId,
+                queuedAtMs: timestamp
+            )
+        } else {
+            _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
+        }
         ChatEvents.notifyChatChanged(chatId)
         RelaySyncEvents.requestSync()
 
