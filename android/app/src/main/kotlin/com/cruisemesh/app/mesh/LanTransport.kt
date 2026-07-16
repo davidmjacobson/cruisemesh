@@ -11,6 +11,7 @@ import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.ext.SdkExtensions
 import android.util.Log
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -187,7 +188,7 @@ internal class LanTransport(
             port = listener.localPort
             setAttribute(TXT_VERSION, "1")
             setAttribute(TXT_INSTANCE, instanceToken)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (supportsNetworkScopedNsd()) {
                 setNetwork(network)
             }
         }
@@ -202,7 +203,7 @@ internal class LanTransport(
         val discovery = makeDiscoveryListener()
         discoveryListener = discovery
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (supportsNetworkScopedNsd()) {
                 val request = DiscoveryRequest.Builder(lanServiceType())
                     .setNetwork(network)
                     .build()
@@ -266,7 +267,7 @@ internal class LanTransport(
     private fun connectToService(serviceInfo: NsdServiceInfo) {
         val network = wifiNetwork ?: return
         if (
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            supportsNetworkScopedNsd() &&
             serviceInfo.network != null &&
             serviceInfo.network != network
         ) {
@@ -557,7 +558,7 @@ internal class LanTransport(
                         version == "1" &&
                         serviceInfo.port in 1..65_535 &&
                         (
-                            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                            !supportsNetworkScopedNsd() ||
                                 serviceInfo.network == null ||
                                 serviceInfo.network == wifiNetwork
                             )
@@ -662,6 +663,14 @@ internal class LanTransport(
     private fun endpointDisplay(endpoint: InetSocketAddress): String {
         val host = endpoint.address?.hostAddress ?: endpoint.hostString
         return if (host.contains(':')) "[$host]:${endpoint.port}" else "$host:${endpoint.port}"
+    }
+
+    private fun supportsNetworkScopedNsd(): Boolean {
+        return when {
+            Build.VERSION.SDK_INT > Build.VERSION_CODES.TIRAMISU -> true
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU -> false
+            else -> SdkExtensions.getExtensionVersion(Build.VERSION_CODES.TIRAMISU) >= 3
+        }
     }
 
     private inner class LanConnection(
