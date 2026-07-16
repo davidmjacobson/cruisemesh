@@ -115,6 +115,15 @@ pub struct StoredMessage {
     pub payload: Vec<u8>,
 }
 
+/// Local-only diagnostics for how an incoming message reached this device.
+/// `transport`: 0 = BLE direct, 1 = BLE through another device, 2 = relay.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct MessageArrival {
+    pub transport: u8,
+    pub hops_taken: u8,
+    pub received_at: i64,
+}
+
 /// An accepted friend (DESIGN.md §6.2): the public half of someone else's
 /// identity, imported from a scanned/pasted `FriendCard`. `user_id` is
 /// derived the same way as one's own (`friend_card_user_id`), so it's a
@@ -250,6 +259,9 @@ impl MessageStore {
             "from_relay",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(&conn, "messages", "arrival_transport", "INTEGER")?;
+        ensure_column(&conn, "messages", "hops_taken", "INTEGER")?;
+        ensure_column(&conn, "messages", "received_at", "INTEGER")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -474,6 +486,68 @@ impl MessageStore {
             .query_map(params![chat_id], row_to_message)
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Attach first-arrival diagnostics to an already inserted incoming
+    /// message. A redundant mesh/relay copy never overwrites the original
+    /// route, hop count, or receive time.
+    pub fn record_message_arrival(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        lamport: u64,
+        arrival: MessageArrival,
+    ) -> Result<bool, CoreError> {
+        if arrival.transport > 2 {
+            return Err(CoreError::Malformed(
+                "invalid message arrival transport".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn
+            .execute(
+                "UPDATE messages
+                 SET arrival_transport = ?4, hops_taken = ?5, received_at = ?6
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
+                   AND arrival_transport IS NULL",
+                params![
+                    chat_id,
+                    sender_user_id,
+                    lamport as i64,
+                    arrival.transport as i64,
+                    arrival.hops_taken as i64,
+                    arrival.received_at,
+                ],
+            )
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
+    /// First-arrival diagnostics for one message, or `None` for locally
+    /// authored/legacy rows that predate diagnostics.
+    pub fn message_arrival(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        lamport: u64,
+    ) -> Result<Option<MessageArrival>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT arrival_transport, hops_taken, received_at
+             FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
+               AND arrival_transport IS NOT NULL",
+            params![chat_id, sender_user_id, lamport as i64],
+            |row| {
+                Ok(MessageArrival {
+                    transport: row.get::<_, i64>(0)? as u8,
+                    hops_taken: row.get::<_, i64>(1)? as u8,
+                    received_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
     }
 
     /// The highest lamport value N such that every message `1..=N` from this
@@ -2071,6 +2145,9 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp      INTEGER NOT NULL,
     kind           INTEGER NOT NULL,
     payload        BLOB NOT NULL,
+    arrival_transport INTEGER,
+    hops_taken     INTEGER,
+    received_at    INTEGER,
     UNIQUE(chat_id, sender_user_id, lamport)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_lamport ON messages(chat_id, lamport);
@@ -2301,6 +2378,118 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].payload, b"hi");
         assert_eq!(messages[1].payload, b"there");
+    }
+
+    #[test]
+    fn message_arrival_records_first_route_without_changing_message_shape() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let message = msg(b"chat-a", b"alice", 1, "hi");
+        store.insert_message(message.clone()).unwrap();
+        let first = MessageArrival {
+            transport: 1,
+            hops_taken: 2,
+            received_at: 1_700_000_000_500,
+        };
+        assert!(store
+            .record_message_arrival(
+                message.chat_id.clone(),
+                message.sender_user_id.clone(),
+                message.lamport,
+                first.clone(),
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .message_arrival(
+                    message.chat_id.clone(),
+                    message.sender_user_id.clone(),
+                    message.lamport,
+                )
+                .unwrap(),
+            Some(first),
+        );
+
+        assert!(!store
+            .record_message_arrival(
+                message.chat_id.clone(),
+                message.sender_user_id.clone(),
+                message.lamport,
+                MessageArrival {
+                    transport: 2,
+                    hops_taken: 7,
+                    received_at: 1_700_000_999_999,
+                },
+            )
+            .unwrap());
+        assert_eq!(
+            store.messages_for_chat(message.chat_id.clone()).unwrap(),
+            vec![message],
+        );
+    }
+
+    #[test]
+    fn message_arrival_is_absent_for_legacy_or_outgoing_rows() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let message = msg(b"chat-a", b"alice", 1, "hi");
+        store.insert_message(message.clone()).unwrap();
+        assert_eq!(
+            store
+                .message_arrival(message.chat_id, message.sender_user_id, message.lamport)
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn open_migrates_old_messages_table_to_add_arrival_columns() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cruisemesh-store-migration-message-arrival-{unique}.sqlite"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE messages (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id        BLOB NOT NULL,
+                sender_user_id BLOB NOT NULL,
+                lamport        INTEGER NOT NULL,
+                timestamp      INTEGER NOT NULL,
+                kind           INTEGER NOT NULL,
+                payload        BLOB NOT NULL,
+                UNIQUE(chat_id, sender_user_id, lamport)
+            );
+            INSERT INTO messages
+                (chat_id, sender_user_id, lamport, timestamp, kind, payload)
+            VALUES
+                (x'636861742D61', x'616C696365', 1, 1700000000000, 0, x'6869');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = MessageStore::open(path_str).unwrap();
+        let arrival = MessageArrival {
+            transport: 2,
+            hops_taken: 3,
+            received_at: 1_700_000_000_500,
+        };
+        assert!(store
+            .record_message_arrival(b"chat-a".to_vec(), b"alice".to_vec(), 1, arrival.clone(),)
+            .unwrap());
+        assert_eq!(
+            store
+                .message_arrival(b"chat-a".to_vec(), b"alice".to_vec(), 1)
+                .unwrap(),
+            Some(arrival),
+        );
+
+        drop(store);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

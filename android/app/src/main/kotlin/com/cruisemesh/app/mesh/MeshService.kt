@@ -58,6 +58,7 @@ import uniffi.cruisemesh_core.DigestEntry
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
+import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OpenedMessage
@@ -1544,7 +1545,14 @@ class MeshService : Service() {
             // still get a copy (mesh_sim group scenario).
             val groupOpened = tryOpenGroupMessage(envelope.recipientHint, envelope.sealed)
             if (groupOpened != null) {
-                deliverOpenedGroupEnvelope(sourceLabel, groupOpened.first, groupOpened.second, identity)
+                val arrival = messageArrival(sourceAddress, envelope.hopTtl, groupOpened.second.senderUserId)
+                deliverOpenedGroupEnvelope(
+                    sourceLabel,
+                    groupOpened.first,
+                    groupOpened.second,
+                    identity,
+                    arrival,
+                )
                 relayForeignEnvelope(sourceAddress, envelope)
                 if (sourceAddress == null) {
                     carryRelayEnvelope(envelope)
@@ -1565,8 +1573,24 @@ class MeshService : Service() {
             }
             return InboundDisposition.CARRIED
         }
-        deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity)
+        val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
+        deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival)
         return InboundDisposition.CONSUMED
+    }
+
+    private fun messageArrival(
+        sourceAddress: String?,
+        receivedHopTtl: UByte,
+        senderUserId: ByteArray,
+    ): MessageArrival {
+        val linkPeerMatchesSender = sourceAddress
+            ?.let(MeshRouter::userIdFor)
+            ?.contentEquals(senderUserId) == true
+        return MessageArrival(
+            transport = arrivalTransport(sourceAddress == null, linkPeerMatchesSender),
+            hopsTaken = arrivalHopsTaken(receivedHopTtl, DEFAULT_HOP_TTL),
+            receivedAt = System.currentTimeMillis(),
+        )
     }
 
     /**
@@ -1793,7 +1817,13 @@ class MeshService : Service() {
      * Reached only for envelopes addressed to us; foreign traffic never gets
      * here (see [handleEnvelope]).
      */
-    private fun deliverOpenedEnvelope(address: String, directBle: Boolean, opened: OpenedMessage, identity: Identity) {
+    private fun deliverOpenedEnvelope(
+        address: String,
+        directBle: Boolean,
+        opened: OpenedMessage,
+        identity: Identity,
+        arrival: MessageArrival,
+    ) {
         val body = try {
             decodeMessageBody(opened.payload)
         } catch (e: CoreException) {
@@ -1806,15 +1836,23 @@ class MeshService : Service() {
         }
 
         when (body.kind) {
-            KIND_TEXT -> handleIncomingChatMessage(address, opened.senderUserId, body, identity, KIND_TEXT)
+            KIND_TEXT -> handleIncomingChatMessage(address, opened.senderUserId, body, identity, KIND_TEXT, arrival)
             KIND_ATTACHMENT_MANIFEST -> handleIncomingChatMessage(
                 address,
                 opened.senderUserId,
                 body,
                 identity,
                 KIND_ATTACHMENT_MANIFEST,
+                arrival,
             )
-            KIND_REACTION -> handleIncomingChatMessage(address, opened.senderUserId, body, identity, KIND_REACTION)
+            KIND_REACTION -> handleIncomingChatMessage(
+                address,
+                opened.senderUserId,
+                body,
+                identity,
+                KIND_REACTION,
+                arrival,
+            )
             KIND_RECEIPT -> handleIncomingReceipt(address, opened.senderUserId, body, identity)
             KIND_FRIEND_REQUEST -> handleIncomingFriendRequest(address, directBle, opened.senderUserId, body, identity)
             KIND_GROUP_INVITE -> handleIncomingGroupInvite(address, opened.senderUserId, body, identity)
@@ -1842,6 +1880,7 @@ class MeshService : Service() {
         group: Group,
         opened: OpenedMessage,
         identity: Identity,
+        arrival: MessageArrival,
     ) {
         if (!group.memberUserIds.any { it.contentEquals(opened.senderUserId) }) {
             Log.w(
@@ -1867,8 +1906,8 @@ class MeshService : Service() {
             return
         }
         when (body.kind) {
-            KIND_TEXT -> handleIncomingGroupChatMessage(address, group, opened.senderUserId, body)
-            KIND_REACTION -> handleIncomingGroupChatMessage(address, group, opened.senderUserId, body)
+            KIND_TEXT -> handleIncomingGroupChatMessage(address, group, opened.senderUserId, body, arrival)
+            KIND_REACTION -> handleIncomingGroupChatMessage(address, group, opened.senderUserId, body, arrival)
             else -> Log.i(TAG, "Dropping group envelope from $address: unhandled kind=${body.kind}")
         }
     }
@@ -1878,6 +1917,7 @@ class MeshService : Service() {
         group: Group,
         senderUserId: ByteArray,
         body: MessageBody,
+        arrival: MessageArrival,
     ) {
         val inserted = store.insertMessage(
             StoredMessage(
@@ -1897,6 +1937,7 @@ class MeshService : Service() {
             )
             return
         }
+        store.recordMessageArrival(group.id, senderUserId, body.lamport, arrival)
         Log.i(
             TAG,
             "Stored group kind=${body.kind} in ${group.name} from $address " +
@@ -2373,6 +2414,7 @@ class MeshService : Service() {
         body: MessageBody,
         identity: Identity,
         kind: UByte,
+        arrival: MessageArrival,
     ) {
         val inserted = store.insertMessage(
             StoredMessage(
@@ -2391,6 +2433,7 @@ class MeshService : Service() {
             )
             return
         }
+        store.recordMessageArrival(senderUserId, senderUserId, body.lamport, arrival)
         Log.i(
             TAG,
             "Stored kind=$kind from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
