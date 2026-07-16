@@ -108,7 +108,10 @@ func lanNetworkId(ipv4Address: String?) -> String? {
     guard octets.count == 4, octets.allSatisfy({ UInt8($0) != nil }) else { return nil }
     let prefix = "\(octets[0]).\(octets[1]).\(octets[2]).0/24"
     let input = Data("CruiseMesh LAN network v1\u{0}ipv4:\(prefix)".utf8)
-    return Data(SHA256.hash(data: input).prefix(16)).base64URLEncoded
+    return Data(SHA256.hash(data: input).prefix(16))
+        .base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
 }
 
 func subnet24Hosts(localAddress: String) -> [String] {

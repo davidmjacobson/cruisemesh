@@ -71,6 +71,17 @@ final class LanTransportTests: XCTestCase {
         XCTAssertFalse(hosts.contains("10.154.188.1"))
     }
 
+    func testNetworkFingerprintMatchesAndroidEncoding() {
+        XCTAssertEqual(
+            lanNetworkId(ipv4Address: "10.154.189.58"),
+            "NcJ68sf-sL-VO63PUTnngg=="
+        )
+        XCTAssertEqual(
+            lanNetworkId(ipv4Address: "10.154.189.201"),
+            "NcJ68sf-sL-VO63PUTnngg=="
+        )
+    }
+
     func testTransportSendPlanRacesSmallFramesButNotLargeOnes() {
         let routes: [(MeshRouterState.Transport, String)] = [
             (.lan, "LAN"),
