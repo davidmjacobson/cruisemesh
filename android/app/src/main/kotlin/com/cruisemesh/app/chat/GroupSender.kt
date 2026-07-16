@@ -75,11 +75,11 @@ class GroupSender(
     }
 
     /** Sends [text] into [group]'s chat stream, sealed with the group key. */
-    fun sendText(group: Group, text: String): SendResult {
+    fun sendText(group: Group, text: String, replyToMsgId: ByteArray? = null): SendResult {
         val payload = text.toByteArray(Charsets.UTF_8)
         if (payload.isEmpty()) return SendResult.FAILED
 
-        return enqueueGroupMessage(group, KIND_TEXT, payload, "sendText")
+        return enqueueGroupMessage(group, KIND_TEXT, payload, "sendText", replyToMsgId)
     }
 
     /** Sends or clears this user's emoji reaction to [target] in [group]. */
@@ -98,6 +98,7 @@ class GroupSender(
         kind: UByte,
         payload: ByteArray,
         logLabel: String,
+        replyToMsgId: ByteArray? = null,
     ): SendResult {
         val queued = try {
             val chatId = group.id
@@ -122,12 +123,16 @@ class GroupSender(
                 kind = kind,
                 payload = payload,
             )
-            val outbound = buildOutboundGroupEnvelope(identity, group, message)
+            val outbound = buildOutboundGroupEnvelope(identity, group, message, replyToMsgId)
             if (outbound == null) {
                 Log.e(TAG, "$logLabel: could not build the durable group envelope for ${group.name}")
                 return SendResult.FAILED
             }
-            store.insertOutgoingMessage(message, outbound, timestamp)
+            if (replyToMsgId == null) {
+                store.insertOutgoingMessage(message, outbound, timestamp)
+            } else {
+                store.insertOutgoingReply(message, outbound, replyToMsgId, timestamp)
+            }
             chatId to outbound
         } catch (e: Exception) {
             Log.e(TAG, "$logLabel: group message was not stored for ${group.name}", e)

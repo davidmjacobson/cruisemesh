@@ -54,13 +54,17 @@ fun nextAuthoredLamport(ownContiguous: ULong, ackedDelivered: ULong, ackedRead: 
  */
 interface MeshSender {
     /** Sends `text` as a `kind=1` message to `contact`'s chat. */
-    fun sendText(contact: Contact, text: String): SendResult
+    fun sendText(contact: Contact, text: String, replyToMsgId: ByteArray? = null): SendResult
 
     /**
      * Sends an inline attachment as a `kind=16` chat-stream message
      * (attachment manifest with embedded blob; DESIGN.md §8).
      */
-    fun sendAttachment(contact: Contact, attachment: AttachmentPayload): SendResult
+    fun sendAttachment(
+        contact: Contact,
+        attachment: AttachmentPayload,
+        replyToMsgId: ByteArray? = null,
+    ): SendResult
 
     /** Sends or clears this user's emoji reaction to [target]. */
     fun sendReaction(contact: Contact, target: MessageTarget, emoji: String): SendResult
@@ -102,15 +106,20 @@ class RealMeshSender(
     private val store: MessageStore,
     private val identity: Identity,
 ) : MeshSender {
-    override fun sendText(contact: Contact, text: String): SendResult =
+    override fun sendText(contact: Contact, text: String, replyToMsgId: ByteArray?): SendResult =
         enqueueAuthored(
             contact = contact,
             kind = KIND_TEXT,
             payload = text.toByteArray(Charsets.UTF_8),
             logLabel = "sendText",
+            replyToMsgId = replyToMsgId,
         )
 
-    override fun sendAttachment(contact: Contact, attachment: AttachmentPayload): SendResult {
+    override fun sendAttachment(
+        contact: Contact,
+        attachment: AttachmentPayload,
+        replyToMsgId: ByteArray?,
+    ): SendResult {
         if (attachment.blob.size > AttachmentPayload.MAX_BLOB_BYTES) {
             Log.w(TAG, "Refusing attachment larger than ${AttachmentPayload.MAX_BLOB_BYTES} bytes")
             return SendResult.FAILED
@@ -126,6 +135,7 @@ class RealMeshSender(
             kind = KIND_ATTACHMENT_MANIFEST,
             payload = payload,
             logLabel = "sendAttachment",
+            replyToMsgId = replyToMsgId,
         )
     }
 
@@ -149,6 +159,7 @@ class RealMeshSender(
         kind: UByte,
         payload: ByteArray,
         logLabel: String,
+        replyToMsgId: ByteArray? = null,
     ): SendResult {
         val queued = try {
             val chatId = contact.userId
@@ -167,12 +178,16 @@ class RealMeshSender(
                 kind = kind,
                 payload = payload,
             )
-            val outbound = buildOutboundAuthoredEnvelope(identity, contact, message)
+            val outbound = buildOutboundAuthoredEnvelope(identity, contact, message, replyToMsgId)
             if (outbound == null) {
                 Log.e(TAG, "$logLabel: could not build the durable outbound envelope for ${contact.name}")
                 return SendResult.FAILED
             }
-            store.insertOutgoingMessage(message, outbound, timestamp)
+            if (replyToMsgId == null) {
+                store.insertOutgoingMessage(message, outbound, timestamp)
+            } else {
+                store.insertOutgoingReply(message, outbound, replyToMsgId, timestamp)
+            }
             chatId to ackedDelivered
         } catch (e: Exception) {
             Log.e(TAG, "$logLabel: message was not stored for ${contact.name}", e)

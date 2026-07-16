@@ -6,6 +6,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Test
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.createGroup
+import uniffi.cruisemesh_core.decodeExtendedMessageBody
 import uniffi.cruisemesh_core.decodeMessageBody
 import uniffi.cruisemesh_core.generateIdentity
 import uniffi.cruisemesh_core.openGroupMessage
@@ -105,5 +106,29 @@ class OutgoingGroupEnvelopeTest {
         val body = decodeMessageBody(opened.payload)
         assertArrayEquals(group.id, body.chatId)
         assertEquals("dinner at 7", body.content.toString(Charsets.UTF_8))
+    }
+
+    @Test
+    fun groupReplyReferenceRoundTripsInsideSharedCiphertext() {
+        val alice = generateIdentity()
+        val bob = generateIdentity()
+        val group = createGroup("Bridge Crew", listOf(alice.userId, bob.userId))
+        val replyToMsgId = ByteArray(16) { (it + 1).toByte() }
+        val message = StoredMessage(
+            chatId = group.id,
+            senderUserId = alice.userId,
+            lamport = 2uL,
+            timestamp = 1_700_000_001_000L,
+            kind = 1u,
+            payload = "sounds good".toByteArray(),
+        )
+
+        val outbound = buildOutboundGroupEnvelope(alice, group, message, replyToMsgId)
+        assertNotNull(outbound)
+
+        val opened = openGroupMessage(group, outbound!!.sealed)
+        val body = decodeExtendedMessageBody(opened.payload)
+        assertEquals("sounds good", body.content.toString(Charsets.UTF_8))
+        assertArrayEquals(replyToMsgId, body.replyToMsgId)
     }
 }

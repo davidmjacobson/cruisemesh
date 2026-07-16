@@ -181,6 +181,7 @@ fun ChatScreen(
         mutableStateOf(store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_READ))
     }
     var draft by remember { mutableStateOf("") }
+    var replyingTo by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
     // A photo picked but not yet sent: shown as a preview card above the composer
     // so a caption can ride along with it in a single attachment (see [onSend]).
@@ -188,6 +189,9 @@ fun ChatScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
     val voiceRecorder = remember { VoiceRecorder(context) }
+
+    fun replyTargetId(message: StoredMessage): ByteArray? =
+        store.messageReference(message.chatId, message.senderUserId, message.lamport)?.msgId
 
     fun reload() {
         currentContact = store.getContact(contact.userId) ?: currentContact
@@ -234,8 +238,10 @@ fun ChatScreen(
                 durationMs = durationMs.coerceAtMost(MAX_VOICE_MS),
                 blob = bytes,
             ),
+            replyingTo?.let(::replyTargetId),
         )
         if (result == SendResult.STORED) {
+            replyingTo = null
             reload()
         } else {
             // The recording file is already gone, so the generic "still here"
@@ -301,9 +307,12 @@ fun ChatScreen(
         contact = currentContact,
         ownUserId = ownUserId,
         messages = messages,
+        store = store,
         contactAvatar = contactAvatar,
         deliveredThrough = deliveredThrough,
         readThrough = readThrough,
+        replyingTo = replyingTo,
+        onReplyingToChange = { replyingTo = it },
         arrivalFor = { message ->
             store.messageArrival(message.chatId, message.senderUserId, message.lamport)
         },
@@ -315,6 +324,7 @@ fun ChatScreen(
         onSend = {
             val text = draft.trim()
             val photo = pendingPhoto
+            val replyToMsgId = replyingTo?.let(::replyTargetId)
             if (photo != null) {
                 val result = sender.sendAttachment(
                     currentContact,
@@ -325,17 +335,20 @@ fun ChatScreen(
                         blob = photo,
                         caption = text,
                     ),
+                    replyToMsgId,
                 )
                 if (result == SendResult.STORED) {
                     pendingPhoto = null
                     draft = ""
+                    replyingTo = null
                     reload()
                 } else {
                     showSendFailure()
                 }
             } else if (text.isNotEmpty()) {
-                if (sender.sendText(currentContact, text) == SendResult.STORED) {
+                if (sender.sendText(currentContact, text, replyToMsgId) == SendResult.STORED) {
                     draft = ""
+                    replyingTo = null
                     reload()
                 } else {
                     showSendFailure()
@@ -397,9 +410,12 @@ private fun ConversationScreen(
     contact: Contact,
     ownUserId: ByteArray,
     messages: List<StoredMessage>,
+    store: MessageStore? = null,
     contactAvatar: ByteArray? = null,
     deliveredThrough: ULong,
     readThrough: ULong,
+    replyingTo: StoredMessage? = null,
+    onReplyingToChange: (StoredMessage?) -> Unit = {},
     arrivalFor: (StoredMessage) -> MessageArrival? = { null },
     snackbarHostState: SnackbarHostState,
     draft: String,
@@ -424,6 +440,7 @@ private fun ConversationScreen(
     val density = LocalDensity.current
     val keyboardFreeze = rememberOverlayKeyboardFreeze()
     val listState = rememberLazyListState()
+    val scrollScope = rememberCoroutineScope()
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
     val displayName = remember(contact.name, displayId) {
         ChatListLogic.displayNameOrId(contact.name, displayId)
@@ -432,6 +449,22 @@ private fun ConversationScreen(
         ChatListLogic.avatarHueAndInitials(contact.userId, contact.name, displayId)
     }
     val visibleMessages = remember(messages) { messages.filter { isVisibleChatKind(it.kind) } }
+    val replyMetadata = remember(messages, ownUserId, displayName, store) {
+        if (store == null) {
+            emptyMap()
+        } else {
+            loadMessageReplyMetadata(store, visibleMessages) { message ->
+                if (message.senderUserId.contentEquals(ownUserId)) "You" else displayName
+            }
+        }
+    }
+    val replyingToPreview = remember(replyingTo, ownUserId, displayName) {
+        replyingTo?.let { target ->
+            quotedMessagePreview(target) { message ->
+                if (message.senderUserId.contentEquals(ownUserId)) "You" else displayName
+            }
+        }
+    }
     val gaps = remember(messages, visibleMessages) { visibleGapIndices(messages, visibleMessages) }
     val reactions = remember(messages, ownUserId) { reactionSummariesByTarget(messages, ownUserId) }
     val grouping = remember(visibleMessages) {
@@ -449,6 +482,13 @@ private fun ConversationScreen(
     fun toggleReaction(target: MessageTarget, emoji: String) {
         val existingOwn = reactions[target.stableKey].orEmpty().firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
         onReact(target, if (existingOwn != null) "" else emoji)
+    }
+
+    fun scrollToMessage(message: StoredMessage) {
+        val oldestFirstIndex = visibleMessages.indexOfFirst { messageStableKey(it) == messageStableKey(message) }
+        if (oldestFirstIndex < 0) return
+        val displayIndex = visibleMessages.lastIndex - oldestFirstIndex
+        scrollScope.launch { listState.animateScrollToItem(displayIndex) }
     }
 
     // The overlay takes over the full screen, so drop the keyboard while it's
@@ -540,6 +580,8 @@ private fun ConversationScreen(
                         tick = if (isOwn) tickStatusFor(message.lamport, deliveredThrough, readThrough) else null,
                         contactColor = if (isOwn) null else contactColor,
                         grouping = grouping[index],
+                        quoted = replyMetadata[messageStableKey(message)]?.quoted,
+                        onQuotedClick = { target -> scrollToMessage(target) },
                         reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
                         onReact = { emoji ->
                             toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
@@ -551,6 +593,14 @@ private fun ConversationScreen(
 
             if (pendingPhoto != null) {
                 PendingPhotoCard(bytes = pendingPhoto, onRemove = onClearPendingPhoto)
+            }
+
+            if (replyingToPreview != null) {
+                ReplyComposerPreview(
+                    preview = replyingToPreview,
+                    onCancel = { onReplyingToChange(null) },
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
             }
 
             MessageComposer(
@@ -620,15 +670,21 @@ private fun ConversationScreen(
             val focusedReactions = reactions[currentFocused.target.stableKey].orEmpty()
             val focusedCopyText = remember(focusedMessage.payload, focusedMessage.kind) { messageCopyText(focusedMessage) }
             val focusedOwnReaction = focusedReactions.firstOrNull { it.reactedByOwnUser }?.emoji
+            val focusedReplyMetadata = replyMetadata[messageStableKey(focusedMessage)]
 
             MessageFocusOverlay(
                 focused = currentFocused,
                 isOwn = focusedIsOwn,
+                canReply = focusedReplyMetadata?.msgId != null,
                 canCopy = focusedCopyText.isNotBlank(),
                 ownReactionEmoji = focusedOwnReaction,
                 onDismiss = { closeOverlay() },
                 onReact = { emoji ->
                     toggleReaction(currentFocused.target, emoji)
+                    closeOverlay()
+                },
+                onReply = {
+                    onReplyingToChange(focusedMessage)
                     closeOverlay()
                 },
                 onCopy = {
@@ -654,6 +710,7 @@ private fun ConversationScreen(
                         toggleReaction(currentFocused.target, emoji)
                         closeOverlay()
                     },
+                    quoted = focusedReplyMetadata?.quoted,
                 )
             }
         }
@@ -1020,6 +1077,8 @@ private fun MessageBubble(
     tick: TickStatus?,
     contactColor: Color?,
     grouping: BubbleGrouping,
+    quoted: QuotedMessagePreview? = null,
+    onQuotedClick: (StoredMessage) -> Unit = {},
     reactions: List<ReactionSummary> = emptyList(),
     onReact: (String) -> Unit = {},
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
@@ -1048,6 +1107,8 @@ private fun MessageBubble(
                 shape = shape,
                 reactions = reactions,
                 onReact = onReact,
+                quoted = quoted,
+                onQuotedClick = quoted?.target?.let { target -> { onQuotedClick(target) } },
                 modifier = Modifier
                     .onGloballyPositioned { coords -> boundsInWindow = coords.boundsInWindow() }
                     .messageActions(
@@ -1096,6 +1157,8 @@ fun MessageBubbleVisual(
     reactions: List<ReactionSummary>,
     onReact: (String) -> Unit,
     modifier: Modifier = Modifier,
+    quoted: QuotedMessagePreview? = null,
+    onQuotedClick: (() -> Unit)? = null,
 ) {
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
@@ -1115,6 +1178,15 @@ fun MessageBubbleVisual(
             shape = shape,
         ) {
             Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                if (quoted != null) {
+                    QuotedMessageBlock(
+                        preview = quoted,
+                        accentColor = if (isOwn) contentColor else MaterialTheme.colorScheme.primary,
+                        contentColor = contentColor,
+                        onClick = onQuotedClick,
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
+                }
                 when (message.kind) {
                     KIND_ATTACHMENT_MANIFEST -> {
                         val attachment = remember(message.payload) {

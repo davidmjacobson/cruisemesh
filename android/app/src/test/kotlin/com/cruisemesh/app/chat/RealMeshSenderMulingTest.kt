@@ -6,12 +6,15 @@ import com.cruisemesh.app.mesh.encodeOutboundEnvelopeFrame
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Test
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.decodeExtendedMessageBody
 import uniffi.cruisemesh_core.generateIdentity
+import uniffi.cruisemesh_core.openMessage
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -262,5 +265,41 @@ class RealMeshSenderMulingTest {
         assertEquals(SendResult.STORED, result)
         assertEquals(1, store.messagesForChat(bobContact.userId).size)
         assertEquals(1, store.outboundEnvelopesAfter(bobContact.userId, alice.userId, 0uL).size)
+    }
+
+    @Test
+    fun `reply target stays encrypted and resolves from local message metadata`() {
+        val alice = generateIdentity()
+        val bob = generateIdentity()
+        val bobContact = contactFor(bob, "Bob")
+        val store = MessageStore.open(":memory:")
+        val sender = RealMeshSender(store, alice)
+
+        sender.sendText(bobContact, "original")
+        val originalEnvelope = store
+            .outboundEnvelopesAfter(bob.userId, alice.userId, 0uL)
+            .single()
+
+        sender.sendText(bobContact, "reply", originalEnvelope.msgId)
+
+        val messages = store.messagesForChat(bob.userId)
+        val reply = messages.single { it.lamport == 2uL }
+        val reference = store.messageReference(reply.chatId, reply.senderUserId, reply.lamport)
+        assertNotNull(reference)
+        assertArrayEquals(originalEnvelope.msgId, reference!!.replyToMsgId)
+
+        val replyEnvelope = store
+            .outboundEnvelopesAfter(bob.userId, alice.userId, 0uL)
+            .single { it.lamport == 2uL }
+        val opened = openMessage(bob, replyEnvelope.sealed)
+        val decoded = decodeExtendedMessageBody(opened.payload)
+        assertArrayEquals(originalEnvelope.msgId, decoded.replyToMsgId)
+
+        val metadata = loadMessageReplyMetadata(store, messages) { "You" }
+        val quoted = metadata[messageStableKey(reply)]?.quoted
+        assertNotNull(quoted)
+        assertEquals("original", quoted!!.text)
+        assertEquals("You", quoted.senderLabel)
+        assertEquals(1uL, quoted.target?.lamport)
     }
 }
