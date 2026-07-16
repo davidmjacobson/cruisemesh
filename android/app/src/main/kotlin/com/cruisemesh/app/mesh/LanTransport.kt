@@ -264,6 +264,7 @@ internal class LanTransport(
     }
 
     fun currentEndpointHint(): Frame.LanEndpoint? = endpointHint
+    fun currentNetworkId(): String? = currentNetworkId
 
     fun connectToHint(hint: Frame.LanEndpoint, expectedUserId: ByteArray) {
         mainHandler.post {

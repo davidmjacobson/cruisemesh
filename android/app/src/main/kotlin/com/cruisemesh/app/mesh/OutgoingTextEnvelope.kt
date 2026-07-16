@@ -26,6 +26,7 @@ private const val KIND_GROUP_INVITE: UByte = 4u
 private const val KIND_PROFILE_SYNC: UByte = 5u
 private const val KIND_FRIEND_DIRECTORY: UByte = 6u
 private const val KIND_INTRODUCED_FRIEND_REQUEST: UByte = 7u
+private const val KIND_LAN_ENDPOINT_HINT: UByte = 8u
 
 /** Mirrors core's `DEFAULT_HOP_TTL` for freshly authored outbound messages. */
 private const val DEFAULT_HOP_TTL: UByte = 7u
@@ -37,6 +38,7 @@ private fun isAuthoredChatKind(kind: UByte): Boolean =
         kind == KIND_PROFILE_SYNC ||
         kind == KIND_FRIEND_DIRECTORY ||
         kind == KIND_INTRODUCED_FRIEND_REQUEST ||
+        kind == KIND_LAN_ENDPOINT_HINT ||
         kind == KIND_ATTACHMENT_MANIFEST ||
         kind == KIND_REACTION
 

@@ -70,6 +70,7 @@ import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.decodeGroupInviteContent
 import uniffi.cruisemesh_core.decodeFriendDirectoryContent
 import uniffi.cruisemesh_core.decodeIntroducedFriendRequest
+import uniffi.cruisemesh_core.decodeLanEndpointContent
 import uniffi.cruisemesh_core.decodeExtendedMessageBody
 import uniffi.cruisemesh_core.decodeProfileSyncContent
 import uniffi.cruisemesh_core.decodeReceiptContent
@@ -105,6 +106,7 @@ private const val KIND_GROUP_INVITE: UByte = 4u
 private const val KIND_PROFILE_SYNC: UByte = 5u
 private const val KIND_FRIEND_DIRECTORY: UByte = 6u
 private const val KIND_INTRODUCED_FRIEND_REQUEST: UByte = 7u
+private const val KIND_LAN_ENDPOINT_HINT: UByte = 8u
 
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
@@ -1190,6 +1192,16 @@ class MeshService : Service() {
                 lanTransport?.connectCached(endpoint, contact.userId)
             }
         }
+        val ownIdentity = identity
+        if (ownIdentity != null) {
+            LanEndpointSender.queueToAllCapableContacts(
+                this,
+                store,
+                ownIdentity,
+                hint,
+                networkId,
+            )
+        }
     }
 
     private fun encodeLanEndpointFrame(hint: Frame.LanEndpoint): ByteArray? =
@@ -1248,6 +1260,26 @@ class MeshService : Service() {
         if (store.getContact(peerUserId) == null) {
             Log.i(TAG, "Ignoring LAN endpoint hint from an unrecognized peer")
             return
+        }
+        LanCapabilityStore.markSupported(this, peerUserId)
+        val localHint = lanTransport?.currentEndpointHint()
+        val networkId = lanTransport?.currentNetworkId()
+        val ownIdentity = identity
+        val contact = store.getContact(peerUserId)
+        if (
+            localHint != null &&
+            networkId != null &&
+            ownIdentity != null &&
+            contact != null
+        ) {
+            LanEndpointSender.queueToContact(
+                this,
+                store,
+                ownIdentity,
+                contact,
+                localHint,
+                networkId,
+            )
         }
         if (
             MeshRouter.identifiedRoutes().any {
@@ -2092,8 +2124,60 @@ class MeshService : Service() {
                 body,
                 identity,
             )
+            KIND_LAN_ENDPOINT_HINT -> handleIncomingLanEndpointHint(
+                address,
+                opened.senderUserId,
+                body,
+                identity,
+            )
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
         }
+    }
+
+    private fun handleIncomingLanEndpointHint(
+        address: String,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+    ) {
+        val contact = store.getContact(senderUserId) ?: return
+        val content = try {
+            decodeLanEndpointContent(body.content)
+        } catch (error: CoreException) {
+            Log.w(TAG, "Dropping sealed LAN endpoint hint: ${error.message}")
+            return
+        }
+        val inserted = store.insertMessage(
+            StoredMessage(
+                chatId = senderUserId,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_LAN_ENDPOINT_HINT,
+                payload = body.content,
+            ),
+        )
+        if (!inserted) return
+
+        val hintedNetworkId = content.networkId.toString(Charsets.UTF_8)
+        val endpoint = LanManualEndpoint(content.host, content.port.toInt())
+        lanEndpointCache.save(hintedNetworkId, senderUserId, endpoint)
+        LanCapabilityStore.markSupported(this, senderUserId)
+        val now = System.currentTimeMillis()
+        if (
+            content.expiresAtMs > now &&
+            hintedNetworkId == lanTransport?.currentNetworkId()
+        ) {
+            lanTransport?.connectToHint(
+                Frame.LanEndpoint(
+                    instanceToken = content.instanceToken,
+                    host = content.host,
+                    port = content.port,
+                ),
+                senderUserId,
+            )
+        }
+        acknowledgeHiddenMessage(address, senderUserId, identity, contact)
     }
 
     /**
