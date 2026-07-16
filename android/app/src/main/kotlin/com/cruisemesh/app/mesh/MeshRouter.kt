@@ -8,7 +8,7 @@ private const val TAG = "MeshRouter"
  * Process-wide singleton (same lazy/eager-object pattern as
  * [com.cruisemesh.app.AppStore]) that owns the live "send a frame to this
  * peer" operation for the whole app, backed by the pure [MeshRouterState]
- * mapping. [MeshService] registers its two transports' send functions on
+ * mapping. [MeshService] registers the BLE-role and LAN send functions on
  * start and unregisters them on stop; [com.cruisemesh.app.chat.MeshSender]
  * implementations call [sendToUserId] without ever needing to know a BLE
  * address, a role, or whether MeshService is even running.
@@ -28,6 +28,7 @@ object MeshRouter {
 
     @Volatile private var centralSend: ((String, ByteArray) -> Unit)? = null
     @Volatile private var peripheralSend: ((String, ByteArray) -> Unit)? = null
+    @Volatile private var lanSend: ((String, ByteArray) -> Unit)? = null
 
     /** [MeshService] calls these when its BLE roles start. */
     fun registerCentral(send: (String, ByteArray) -> Unit) {
@@ -47,6 +48,14 @@ object MeshRouter {
         peripheralSend = null
     }
 
+    fun registerLan(send: (String, ByteArray) -> Unit) {
+        lanSend = send
+    }
+
+    fun unregisterLan() {
+        lanSend = null
+    }
+
     /**
      * Drops all address mappings. [MeshService] calls this on stop: its BLE
      * roles' stop() paths tear down connections without firing per-address
@@ -58,6 +67,16 @@ object MeshRouter {
         state.clear()
     }
 
+    /** BLE teardown must not discard authenticated same-LAN routes. */
+    fun resetBle() {
+        state.clearTransports(
+            setOf(
+                MeshRouterState.Transport.CENTRAL,
+                MeshRouterState.Transport.PERIPHERAL,
+            ),
+        )
+    }
+
     /** A link to [address] over [transport] just became usable; see [MeshRouterState]. */
     fun onConnected(address: String, transport: MeshRouterState.Transport) = state.onConnected(address, transport)
 
@@ -65,10 +84,13 @@ object MeshRouter {
     fun onDisconnected(address: String) = state.onDisconnected(address)
 
     /** [address] identified itself as [userId] via a HELLO frame. */
-    fun onHello(address: String, userId: ByteArray) = state.onHello(address, userId)
+    fun onHello(address: String, userId: ByteArray): Boolean = state.onHello(address, userId)
 
     /** The userId [address] identified as, if known. */
     fun userIdFor(address: String): ByteArray? = state.userIdFor(address)
+
+    /** The live transport backing [address], if it is still connected. */
+    fun transportFor(address: String): MeshRouterState.Transport? = state.transportFor(address)
 
     /** Distinct HELLO'd peer userIds, hex-encoded; see [MeshRouterState.helloedUserIds]. */
     fun helloedUserIds(): Set<String> = state.helloedUserIds()
@@ -128,6 +150,7 @@ object MeshRouter {
         val send = when (transport) {
             MeshRouterState.Transport.CENTRAL -> centralSend
             MeshRouterState.Transport.PERIPHERAL -> peripheralSend
+            MeshRouterState.Transport.LAN -> lanSend
         }
         if (send == null) {
             Log.w(TAG, "dispatch: no live $transport transport registered; dropping send to $address")

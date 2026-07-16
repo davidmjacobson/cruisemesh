@@ -2,6 +2,7 @@ package com.cruisemesh.app.mesh
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MeshRouterStateTest {
@@ -66,6 +67,50 @@ class MeshRouterStateTest {
         // Dropping one link leaves the other still routable to the same userId.
         state.onDisconnected("CENTRAL-LINK")
         assertEquals(MeshRouterState.Transport.PERIPHERAL to "PERIPHERAL-LINK", state.routeFor(alice))
+    }
+
+    @Test
+    fun `LAN is preferred when the same peer is also reachable over BLE`() {
+        val state = MeshRouterState()
+        val alice = userId(1)
+        state.onConnected("BLE", MeshRouterState.Transport.CENTRAL)
+        state.onHello("BLE", alice)
+        state.onConnected("LAN", MeshRouterState.Transport.LAN)
+        state.onHello("LAN", alice)
+
+        assertEquals(MeshRouterState.Transport.LAN to "LAN", state.routeFor(alice))
+
+        state.onDisconnected("LAN")
+        assertEquals(MeshRouterState.Transport.CENTRAL to "BLE", state.routeFor(alice))
+    }
+
+    @Test
+    fun `authenticated mapping cannot be replaced by a conflicting HELLO`() {
+        val state = MeshRouterState()
+        val alice = userId(1)
+        val mallory = userId(9)
+        state.onConnected("LAN", MeshRouterState.Transport.LAN)
+
+        assertTrue(state.onHello("LAN", alice))
+        assertTrue(!state.onHello("LAN", mallory))
+        assertEquals(alice.toList(), state.userIdFor("LAN")!!.toList())
+    }
+
+    @Test
+    fun `clearing BLE transports preserves a live LAN route`() {
+        val state = MeshRouterState()
+        state.onConnected("BLE", MeshRouterState.Transport.CENTRAL)
+        state.onConnected("LAN", MeshRouterState.Transport.LAN)
+
+        state.clearTransports(
+            setOf(
+                MeshRouterState.Transport.CENTRAL,
+                MeshRouterState.Transport.PERIPHERAL,
+            ),
+        )
+
+        assertNull(state.transportFor("BLE"))
+        assertEquals(MeshRouterState.Transport.LAN, state.transportFor("LAN"))
     }
 
     @Test

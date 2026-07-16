@@ -29,8 +29,13 @@ import com.cruisemesh.app.chat.UserIdHex
  * map. The operations are all tiny (no I/O under the lock).
  */
 class MeshRouterState {
-    /** Which local BLE role a given remote address is talking to. */
-    enum class Transport { CENTRAL, PERIPHERAL }
+    /** Live link type for a remote address. BLE roles remain distinct because
+     * they have different platform send functions; LAN is a full transport. */
+    enum class Transport(val routePriority: Int) {
+        CENTRAL(0),
+        PERIPHERAL(0),
+        LAN(10),
+    }
 
     private data class Peer(val transport: Transport, var userId: ByteArray?)
 
@@ -50,10 +55,18 @@ class MeshRouterState {
         }
     }
 
-    /** Record that the still-connected [address] identified itself as [userId] via a HELLO frame. */
-    fun onHello(address: String, userId: ByteArray) {
+    /**
+     * Record the identity for [address]. Returns false when an already
+     * authenticated link later claims a different UserID; callers must drop
+     * that frame rather than replacing the trusted mapping.
+     */
+    fun onHello(address: String, userId: ByteArray): Boolean {
         synchronized(peersByAddress) {
-            peersByAddress[address]?.userId = userId
+            val peer = peersByAddress[address] ?: return false
+            val existing = peer.userId
+            if (existing != null && !existing.contentEquals(userId)) return false
+            peer.userId = userId.copyOf()
+            return true
         }
     }
 
@@ -85,11 +98,15 @@ class MeshRouterState {
      */
     fun routeFor(userId: ByteArray): Pair<Transport, String>? {
         synchronized(peersByAddress) {
+            var best: Pair<Transport, String>? = null
             for ((address, peer) in peersByAddress) {
                 val known = peer.userId ?: continue
-                if (known.contentEquals(userId)) return peer.transport to address
+                if (!known.contentEquals(userId)) continue
+                if (best == null || peer.transport.routePriority > best.first.routePriority) {
+                    best = peer.transport to address
+                }
             }
-            return null
+            return best
         }
     }
 
@@ -104,6 +121,13 @@ class MeshRouterState {
         synchronized(peersByAddress) {
             peersByAddress.values.mapNotNullTo(mutableSetOf()) { peer -> peer.userId?.let { UserIdHex.encode(it) } }
         }
+
+    /** Remove selected link types while preserving every other live route. */
+    fun clearTransports(transports: Set<Transport>) {
+        synchronized(peersByAddress) {
+            peersByAddress.entries.removeAll { entry -> entry.value.transport in transports }
+        }
+    }
 
     /** Forget every connection, e.g. when the mesh service stops and all links die with it. */
     fun clear() {

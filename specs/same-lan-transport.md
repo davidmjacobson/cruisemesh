@@ -83,8 +83,9 @@ parser and mesh sync path exactly as if BLE had reassembled it.
 - Discovery starts only while a Wi-Fi network is available.
 - Accept, connect, handshake, and idle operations use short timeouts.
 - Concurrent accepted/connecting sockets are bounded.
-- Duplicate simultaneous connections are safe. `msg_id` deduplication and
-  per-peer sync digests already make repeated delivery idempotent.
+- The random discovery tokens are compared lexicographically so exactly one
+  side initiates for each device pair. Duplicate connections remain safe:
+  `msg_id` deduplication and per-peer sync digests make delivery idempotent.
 - Socket writes are serialized per connection so Noise record nonces and frame
   chunks remain ordered.
 - Network loss closes every connection and restarts discovery when Wi-Fi

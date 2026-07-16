@@ -118,7 +118,8 @@ pub struct StoredMessage {
 }
 
 /// Local-only diagnostics for how an incoming message reached this device.
-/// `transport`: 0 = BLE direct, 1 = BLE through another device, 2 = relay.
+/// `transport`: 0 = BLE direct, 1 = BLE through another device, 2 = relay,
+/// 3 = same-LAN direct, 4 = same-LAN through another device.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct MessageArrival {
     pub transport: u8,

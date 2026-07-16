@@ -1328,6 +1328,8 @@ private fun messageArrivalText(arrival: MessageArrival): String {
         0 -> "direct BLE"
         1 -> "another device over BLE"
         2 -> "relay"
+        3 -> "local Wi-Fi"
+        4 -> "another device over local Wi-Fi"
         else -> "unknown route"
     }
     // hopsTaken is inferred from the default hop TTL, so a sender that

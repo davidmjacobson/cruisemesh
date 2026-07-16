@@ -211,6 +211,7 @@ class MeshService : Service() {
     private var bluetoothAudioReceiverRegistered = false
     private var bluetoothStateReceiverRegistered = false
     private var relayNetworkCallbackRegistered = false
+    private var lanTransport: LanTransport? = null
     /**
      * The network relay traffic is pinned to: the best network with validated
      * internet, as granted by [ConnectivityManager.requestNetwork]. The system
@@ -363,8 +364,20 @@ class MeshService : Service() {
         store = AppStore.get(this)
         seedSeenIdsFromOwnHistory(loadedIdentity)
 
+        val lan = LanTransport(
+            context = applicationContext,
+            identity = loadedIdentity,
+            trustedPeerForStaticKey = { remoteStaticKey ->
+                trustedLanPeerUserId(store.listContacts(), remoteStaticKey)
+            },
+            onAuthenticated = ::onLanPeerAuthenticated,
+            onDisconnected = ::onLanPeerDisconnected,
+            onFrameReceived = ::onFrameReceived,
+        )
+        lanTransport = lan
         MeshRouter.registerCentral(central::sendFrame)
         MeshRouter.registerPeripheral(peripheral::sendFrame)
+        MeshRouter.registerLan(lan::sendFrame)
         ChatViewEvents.register(::handleChatViewed)
         RelaySyncEvents.register { requestRelaySync("queue changed") }
 
@@ -374,6 +387,7 @@ class MeshService : Service() {
         registerBluetoothStateReceiver()
         registerRelayNetworkCallback()
         scheduleRelayPolling()
+        lan.start()
         // The mesh runs regardless of Bluetooth audio now (see
         // refreshBluetoothAudioStatus); start the roles unconditionally rather
         // than gating them on an audio-clear check. (startMeshRoles is a no-op
@@ -391,6 +405,8 @@ class MeshService : Service() {
 
     override fun onDestroy() {
         running = false
+        lanTransport?.stop()
+        lanTransport = null
         MeshRuntimeStatus.markStopped()
         unregisterBluetoothAudioReceiver()
         unregisterBluetoothStateReceiver()
@@ -400,6 +416,7 @@ class MeshService : Service() {
         stopMeshRoles()
         MeshRouter.unregisterCentral()
         MeshRouter.unregisterPeripheral()
+        MeshRouter.unregisterLan()
         ChatViewEvents.unregister()
         // stop() above tears down connections without per-address disconnect
         // callbacks, so clear the router's mappings wholesale.
@@ -455,9 +472,10 @@ class MeshService : Service() {
         peripheral.stop()
         central.stop()
         meshRolesRunning = false
-        // stop() tears links down without per-address disconnect callbacks.
-        MeshRouter.reset()
-        MeshConnectivityStatus.setNearbyPeers(emptySet())
+        // BLE stop tears links down without per-address disconnect callbacks.
+        // Preserve authenticated LAN routes, which remain usable.
+        MeshRouter.resetBle()
+        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
         refreshRuntimeState()
         refreshForegroundNotification()
     }
@@ -1103,6 +1121,21 @@ class MeshService : Service() {
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
     }
 
+    private fun onLanPeerAuthenticated(address: String, userId: ByteArray) {
+        MeshRouter.onConnected(address, MeshRouterState.Transport.LAN)
+        if (!MeshRouter.onHello(address, userId)) {
+            Log.w(TAG, "Authenticated LAN link could not be registered")
+            return
+        }
+        sendHello(address)
+        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+    }
+
+    private fun onLanPeerDisconnected(address: String) {
+        MeshRouter.onDisconnected(address)
+        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+    }
+
     /** Sends our HELLO (DESIGN.md §5.2) as the first frame on a link that just became usable. */
     private fun sendHello(address: String) {
         val ownUserId = identity?.userId ?: return
@@ -1158,7 +1191,10 @@ class MeshService : Service() {
         // binder thread, can otherwise reach handleDigest's
         // MeshRouter.userIdFor(address) lookup before this registration is
         // visible.
-        MeshRouter.onHello(address, userId)
+        if (!MeshRouter.onHello(address, userId)) {
+            Log.w(TAG, "Dropping HELLO that conflicts with the authenticated identity for $address")
+            return
+        }
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
         MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(userId), System.currentTimeMillis())
         Log.i(TAG, "HELLO from $address: userId=${UserIdHex.encode(userId)}")
@@ -1512,8 +1548,8 @@ class MeshService : Service() {
     /**
      * [sourceAddress] doubles as the source discriminant relay proxy-polling
      * needs: `null` means this envelope came FROM the relay
-     * ([handleRelayEnvelope]), non-null means it arrived over a live BLE link
-     * ([handleEnvelope]). The two foreign-carry branches below use that to
+     * ([handleRelayEnvelope]), non-null means it arrived over a live BLE or
+     * authenticated same-LAN link ([handleEnvelope]). The two foreign-carry branches below use that to
      * pick [carryRelayEnvelope] (durable, never re-uploaded -- it's already on
      * the relay) vs. the existing [carryForeignEnvelope] (durable-if-family,
      * uploaded to the relay so an internet phone can proxy it onward) for
@@ -1587,8 +1623,9 @@ class MeshService : Service() {
         val linkPeerMatchesSender = sourceAddress
             ?.let(MeshRouter::userIdFor)
             ?.contentEquals(senderUserId) == true
+        val linkTransport = sourceAddress?.let(MeshRouter::transportFor)
         return MessageArrival(
-            transport = arrivalTransport(sourceAddress == null, linkPeerMatchesSender),
+            transport = arrivalTransport(sourceAddress == null, linkPeerMatchesSender, linkTransport),
             hopsTaken = arrivalHopsTaken(receivedHopTtl, DEFAULT_HOP_TTL),
             receivedAt = System.currentTimeMillis(),
         )
