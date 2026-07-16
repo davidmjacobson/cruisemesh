@@ -78,6 +78,7 @@ import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
 import com.cruisemesh.app.mesh.MeshService
+import com.cruisemesh.app.mesh.MeshStartupPreferences
 import com.cruisemesh.app.mesh.ReachabilityLevel
 import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.notify.ChatVisibility
@@ -122,6 +123,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        MeshStartupPreferences.clearExplicitStop(this)
         enableEdgeToEdge()
         // Debug builds: start capturing this process's log to a file so it can
         // be shared without adb (no-op in release). Idempotent with MeshService.
@@ -141,6 +143,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        MeshStartupPreferences.clearExplicitStop(this)
         pendingDeepLink.value = deepLinkFromIntent(intent)
     }
 

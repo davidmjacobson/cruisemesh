@@ -49,6 +49,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -63,6 +65,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -116,6 +119,7 @@ import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
 import java.io.File
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
 private const val KIND_TEXT: kotlin.UByte = 1u
@@ -177,11 +181,17 @@ fun ChatScreen(
         mutableStateOf(store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_READ))
     }
     var draft by remember { mutableStateOf("") }
+    var replyingTo by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
     // A photo picked but not yet sent: shown as a preview card above the composer
     // so a caption can ride along with it in a single attachment (see [onSend]).
     var pendingPhoto by remember { mutableStateOf<ByteArray?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
     val voiceRecorder = remember { VoiceRecorder(context) }
+
+    fun replyTargetId(message: StoredMessage): ByteArray? =
+        store.messageReference(message.chatId, message.senderUserId, message.lamport)?.msgId
 
     fun reload() {
         currentContact = store.getContact(contact.userId) ?: currentContact
@@ -199,6 +209,12 @@ fun ChatScreen(
         pendingPhoto = jpeg
     }
 
+    fun showSendFailure(message: String = "Couldn't send. Your message is still here.") {
+        coroutineScope.launch {
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+
     fun sendVoiceFile(file: File, durationMs: Int) {
         val bytes = try {
             file.readBytes()
@@ -214,7 +230,7 @@ fun ChatScreen(
             Toast.makeText(context, "Voice memo is too large to send over the mesh", Toast.LENGTH_SHORT).show()
             return
         }
-        sender.sendAttachment(
+        val result = sender.sendAttachment(
             currentContact,
             AttachmentPayload(
                 mediaType = AttachmentPayload.MediaType.AUDIO,
@@ -222,8 +238,16 @@ fun ChatScreen(
                 durationMs = durationMs.coerceAtMost(MAX_VOICE_MS),
                 blob = bytes,
             ),
+            replyingTo?.let(::replyTargetId),
         )
-        reload()
+        if (result == SendResult.STORED) {
+            replyingTo = null
+            reload()
+        } else {
+            // The recording file is already gone, so the generic "still here"
+            // copy would be wrong for a voice memo.
+            showSendFailure("Couldn't send the voice memo. Try recording it again.")
+        }
     }
 
     val galleryLauncher = rememberLauncherForActivityResult(
@@ -283,12 +307,16 @@ fun ChatScreen(
         contact = currentContact,
         ownUserId = ownUserId,
         messages = messages,
+        store = store,
         contactAvatar = contactAvatar,
         deliveredThrough = deliveredThrough,
         readThrough = readThrough,
+        replyingTo = replyingTo,
+        onReplyingToChange = { replyingTo = it },
         arrivalFor = { message ->
             store.messageArrival(message.chatId, message.senderUserId, message.lamport)
         },
+        snackbarHostState = snackbarHostState,
         draft = draft,
         onDraftChange = { draft = it },
         pendingPhoto = pendingPhoto,
@@ -296,8 +324,9 @@ fun ChatScreen(
         onSend = {
             val text = draft.trim()
             val photo = pendingPhoto
+            val replyToMsgId = replyingTo?.let(::replyTargetId)
             if (photo != null) {
-                sender.sendAttachment(
+                val result = sender.sendAttachment(
                     currentContact,
                     AttachmentPayload(
                         mediaType = AttachmentPayload.MediaType.IMAGE,
@@ -306,14 +335,24 @@ fun ChatScreen(
                         blob = photo,
                         caption = text,
                     ),
+                    replyToMsgId,
                 )
-                pendingPhoto = null
-                draft = ""
-                reload()
+                if (result == SendResult.STORED) {
+                    pendingPhoto = null
+                    draft = ""
+                    replyingTo = null
+                    reload()
+                } else {
+                    showSendFailure()
+                }
             } else if (text.isNotEmpty()) {
-                sender.sendText(currentContact, text)
-                draft = ""
-                reload()
+                if (sender.sendText(currentContact, text, replyToMsgId) == SendResult.STORED) {
+                    draft = ""
+                    replyingTo = null
+                    reload()
+                } else {
+                    showSendFailure()
+                }
             }
         },
         onReact = { target, emoji ->
@@ -371,10 +410,14 @@ private fun ConversationScreen(
     contact: Contact,
     ownUserId: ByteArray,
     messages: List<StoredMessage>,
+    store: MessageStore? = null,
     contactAvatar: ByteArray? = null,
     deliveredThrough: ULong,
     readThrough: ULong,
+    replyingTo: StoredMessage? = null,
+    onReplyingToChange: (StoredMessage?) -> Unit = {},
     arrivalFor: (StoredMessage) -> MessageArrival? = { null },
+    snackbarHostState: SnackbarHostState,
     draft: String,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
@@ -397,6 +440,7 @@ private fun ConversationScreen(
     val density = LocalDensity.current
     val keyboardFreeze = rememberOverlayKeyboardFreeze()
     val listState = rememberLazyListState()
+    val scrollScope = rememberCoroutineScope()
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
     val displayName = remember(contact.name, displayId) {
         ChatListLogic.displayNameOrId(contact.name, displayId)
@@ -405,6 +449,22 @@ private fun ConversationScreen(
         ChatListLogic.avatarHueAndInitials(contact.userId, contact.name, displayId)
     }
     val visibleMessages = remember(messages) { messages.filter { isVisibleChatKind(it.kind) } }
+    val replyMetadata = remember(messages, ownUserId, displayName, store) {
+        if (store == null) {
+            emptyMap()
+        } else {
+            loadMessageReplyMetadata(store, visibleMessages) { message ->
+                if (message.senderUserId.contentEquals(ownUserId)) "You" else displayName
+            }
+        }
+    }
+    val replyingToPreview = remember(replyingTo, ownUserId, displayName) {
+        replyingTo?.let { target ->
+            quotedMessagePreview(target) { message ->
+                if (message.senderUserId.contentEquals(ownUserId)) "You" else displayName
+            }
+        }
+    }
     val gaps = remember(messages, visibleMessages) { visibleGapIndices(messages, visibleMessages) }
     val reactions = remember(messages, ownUserId) { reactionSummariesByTarget(messages, ownUserId) }
     val grouping = remember(visibleMessages) {
@@ -422,6 +482,13 @@ private fun ConversationScreen(
     fun toggleReaction(target: MessageTarget, emoji: String) {
         val existingOwn = reactions[target.stableKey].orEmpty().firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
         onReact(target, if (existingOwn != null) "" else emoji)
+    }
+
+    fun scrollToMessage(message: StoredMessage) {
+        val oldestFirstIndex = visibleMessages.indexOfFirst { messageStableKey(it) == messageStableKey(message) }
+        if (oldestFirstIndex < 0) return
+        val displayIndex = visibleMessages.lastIndex - oldestFirstIndex
+        scrollScope.launch { listState.animateScrollToItem(displayIndex) }
     }
 
     // The overlay takes over the full screen, so drop the keyboard while it's
@@ -465,7 +532,8 @@ private fun ConversationScreen(
                 onBack = onBack,
                 onOpenDetails = { showContactDetails = true },
             )
-        }
+        },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { innerPadding ->
         // This device uses adjustResize, so the viewport already excludes the
         // IME. Track its usable bottom edge rather than adding IME padding a
@@ -512,6 +580,8 @@ private fun ConversationScreen(
                         tick = if (isOwn) tickStatusFor(message.lamport, deliveredThrough, readThrough) else null,
                         contactColor = if (isOwn) null else contactColor,
                         grouping = grouping[index],
+                        quoted = replyMetadata[messageStableKey(message)]?.quoted,
+                        onQuotedClick = { target -> scrollToMessage(target) },
                         reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
                         onReact = { emoji ->
                             toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
@@ -523,6 +593,14 @@ private fun ConversationScreen(
 
             if (pendingPhoto != null) {
                 PendingPhotoCard(bytes = pendingPhoto, onRemove = onClearPendingPhoto)
+            }
+
+            if (replyingToPreview != null) {
+                ReplyComposerPreview(
+                    preview = replyingToPreview,
+                    onCancel = { onReplyingToChange(null) },
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
             }
 
             MessageComposer(
@@ -592,15 +670,21 @@ private fun ConversationScreen(
             val focusedReactions = reactions[currentFocused.target.stableKey].orEmpty()
             val focusedCopyText = remember(focusedMessage.payload, focusedMessage.kind) { messageCopyText(focusedMessage) }
             val focusedOwnReaction = focusedReactions.firstOrNull { it.reactedByOwnUser }?.emoji
+            val focusedReplyMetadata = replyMetadata[messageStableKey(focusedMessage)]
 
             MessageFocusOverlay(
                 focused = currentFocused,
                 isOwn = focusedIsOwn,
+                canReply = focusedReplyMetadata?.msgId != null,
                 canCopy = focusedCopyText.isNotBlank(),
                 ownReactionEmoji = focusedOwnReaction,
                 onDismiss = { closeOverlay() },
                 onReact = { emoji ->
                     toggleReaction(currentFocused.target, emoji)
+                    closeOverlay()
+                },
+                onReply = {
+                    onReplyingToChange(focusedMessage)
                     closeOverlay()
                 },
                 onCopy = {
@@ -626,6 +710,7 @@ private fun ConversationScreen(
                         toggleReaction(currentFocused.target, emoji)
                         closeOverlay()
                     },
+                    quoted = focusedReplyMetadata?.quoted,
                 )
             }
         }
@@ -992,6 +1077,8 @@ private fun MessageBubble(
     tick: TickStatus?,
     contactColor: Color?,
     grouping: BubbleGrouping,
+    quoted: QuotedMessagePreview? = null,
+    onQuotedClick: (StoredMessage) -> Unit = {},
     reactions: List<ReactionSummary> = emptyList(),
     onReact: (String) -> Unit = {},
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
@@ -1020,6 +1107,8 @@ private fun MessageBubble(
                 shape = shape,
                 reactions = reactions,
                 onReact = onReact,
+                quoted = quoted,
+                onQuotedClick = quoted?.target?.let { target -> { onQuotedClick(target) } },
                 modifier = Modifier
                     .onGloballyPositioned { coords -> boundsInWindow = coords.boundsInWindow() }
                     .messageActions(
@@ -1068,6 +1157,8 @@ fun MessageBubbleVisual(
     reactions: List<ReactionSummary>,
     onReact: (String) -> Unit,
     modifier: Modifier = Modifier,
+    quoted: QuotedMessagePreview? = null,
+    onQuotedClick: (() -> Unit)? = null,
 ) {
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
@@ -1087,6 +1178,15 @@ fun MessageBubbleVisual(
             shape = shape,
         ) {
             Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                if (quoted != null) {
+                    QuotedMessageBlock(
+                        preview = quoted,
+                        accentColor = if (isOwn) contentColor else MaterialTheme.colorScheme.primary,
+                        contentColor = contentColor,
+                        onClick = onQuotedClick,
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
+                }
                 when (message.kind) {
                     KIND_ATTACHMENT_MANIFEST -> {
                         val attachment = remember(message.payload) {
@@ -1208,8 +1308,10 @@ private fun messageArrivalText(arrival: MessageArrival): String {
         2 -> "relay"
         else -> "unknown route"
     }
+    // hopsTaken is inferred from the default hop TTL, so a sender that
+    // authored with a non-default TTL skews it — present it as an estimate.
     val hops = arrival.hopsTaken.toInt()
-    val hopLabel = "$hops ${if (hops == 1) "hop" else "hops"}"
+    val hopLabel = "~$hops ${if (hops == 1) "hop" else "hops"}"
     val receivedAt = java.text.SimpleDateFormat(
         "h:mm a",
         java.util.Locale.getDefault(),
@@ -1422,6 +1524,7 @@ private fun ConversationScreenPreview() {
             ),
             deliveredThrough = 4uL,
             readThrough = 3uL,
+            snackbarHostState = remember { SnackbarHostState() },
             draft = "",
             onDraftChange = {},
             onSend = {},

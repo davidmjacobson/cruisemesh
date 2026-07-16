@@ -44,7 +44,7 @@ class MessageInfoTextTest {
 
         val info = messageInfoText(message, isOwn = false, tick = null, arrival = arrival)
 
-        assertTrue(info.contains("Arrived via relay · 2 hops ·"))
+        assertTrue(info.contains("Arrived via relay · ~2 hops ·"))
     }
 
     @Test
@@ -65,6 +65,6 @@ class MessageInfoTextTest {
 
         val info = messageInfoText(message, isOwn = false, tick = null, arrival = arrival)
 
-        assertTrue(info.contains("Arrived via another device over BLE · 1 hop ·"))
+        assertTrue(info.contains("Arrived via another device over BLE · ~1 hop ·"))
     }
 }
