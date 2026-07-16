@@ -11,6 +11,7 @@ final class MeshController: ObservableObject {
 
     private let log = Logger(subsystem: "com.cruisemesh", category: "MeshController")
     private let transport = BleTransport()
+    private var lanTransport: LanTransport?
     private let store = AppStore.get()
     private let bluetoothAudioBackoff = BluetoothAudioBackoff()
     private var identity: Identity!
@@ -49,6 +50,42 @@ final class MeshController: ObservableObject {
         MeshRouter.registerPeripheral { [weak self] address, frame in
             self?.transport.sendAsPeripheral(address: address, frame: frame)
         }
+        let lan = LanTransport(
+            identity: identity,
+            trustedPeerForStaticKey: { [store = self.store] remoteStaticKey in
+                trustedLanPeerUserId(
+                    contacts: (try? store.listContacts()) ?? [],
+                    remoteStaticKey: remoteStaticKey
+                )
+            }
+        )
+        lanTransport = lan
+        MeshRouter.registerLan { [weak lan] address, frame in
+            lan?.sendFrame(address: address, frame: frame)
+        }
+        lan.onAuthenticated = { [weak self] address, userId in
+            Task { @MainActor in
+                guard let self, self.isRunning else { return }
+                MeshRouter.onConnected(address: address, transport: .lan)
+                guard MeshRouter.onHello(address: address, userId: userId) else { return }
+                self.sendHello(address: address)
+                self.refreshNearby()
+            }
+        }
+        lan.onDisconnected = { [weak self] address in
+            Task { @MainActor in
+                guard let self, self.isRunning else { return }
+                MeshRouter.onDisconnected(address: address)
+                self.refreshNearby()
+            }
+        }
+        lan.onFrame = { [weak self] address, frame in
+            Task { @MainActor in
+                guard let self, self.isRunning else { return }
+                self.onFrameReceived(address: address, frame: frame)
+            }
+        }
+        lan.start()
 
         transport.onFrame = { [weak self] address, frame in
             Task { @MainActor in self?.onFrameReceived(address: address, frame: frame) }
@@ -88,9 +125,12 @@ final class MeshController: ObservableObject {
         pausedForBluetoothAudio = false
         bluetoothAudioBackoff.reset()
         unregisterBluetoothAudioObserver()
+        lanTransport?.stop()
+        lanTransport = nil
         stopMeshRoles()
         MeshRouter.unregisterCentral()
         MeshRouter.unregisterPeripheral()
+        MeshRouter.unregisterLan()
         MeshRouter.reset()
         relayTimer?.invalidate()
         relayTimer = nil
@@ -166,7 +206,7 @@ final class MeshController: ObservableObject {
         guard meshRolesRunning else { return }
         transport.stop()
         meshRolesRunning = false
-        MeshRouter.reset()
+        MeshRouter.resetBle()
     }
 
     func notifyChatViewed(chatId: Data) {
@@ -260,7 +300,10 @@ final class MeshController: ObservableObject {
     }
 
     private func handleHello(address: String, userId: Data, identity: Identity) {
-        MeshRouter.onHello(address: address, userId: userId)
+        guard MeshRouter.onHello(address: address, userId: userId) else {
+            log.warning("Dropping HELLO that conflicts with the authenticated link identity")
+            return
+        }
         log.info("HELLO from \(address, privacy: .public) \(UserIdHex.encode(userId), privacy: .public)")
         drainCarriedEnvelopesTo(address: address, peerUserId: userId)
         let entries: [DigestEntry]

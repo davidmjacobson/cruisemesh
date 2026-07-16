@@ -25,7 +25,7 @@ final class MeshRouterStateTests: XCTestCase {
 
     func testHelloForNeverConnectedAddressIsNoOp() {
         let state = MeshRouterState()
-        state.onHello(address: "AA:BB", userId: userId(1))
+        XCTAssertFalse(state.onHello(address: "AA:BB", userId: userId(1)))
         XCTAssertNil(state.userIdFor(address: "AA:BB"))
     }
 
@@ -75,6 +75,42 @@ final class MeshRouterStateTests: XCTestCase {
 
         XCTAssertEqual(state.routeFor(userId: alice)?.1, "AA:BB")
         XCTAssertEqual(state.routeFor(userId: bob)?.1, "CC:DD")
+    }
+
+    func testLanRouteIsPreferredWhileBleRemainsAsFallback() {
+        let state = MeshRouterState()
+        let alice = userId(1)
+        state.onConnected(address: "BLE", transport: .central)
+        state.onHello(address: "BLE", userId: alice)
+        state.onConnected(address: "LAN", transport: .lan)
+        state.onHello(address: "LAN", userId: alice)
+
+        XCTAssertEqual(state.routeFor(userId: alice)?.0, .lan)
+        XCTAssertEqual(state.routeFor(userId: alice)?.1, "LAN")
+
+        state.onDisconnected(address: "LAN")
+        XCTAssertEqual(state.routeFor(userId: alice)?.0, .central)
+    }
+
+    func testAuthenticatedIdentityCannotBeReplacedByHello() {
+        let state = MeshRouterState()
+        let alice = userId(1)
+        state.onConnected(address: "LAN", transport: .lan)
+
+        XCTAssertTrue(state.onHello(address: "LAN", userId: alice))
+        XCTAssertFalse(state.onHello(address: "LAN", userId: userId(9)))
+        XCTAssertEqual(state.userIdFor(address: "LAN"), alice)
+    }
+
+    func testClearingBleRoutesLeavesLanConnected() {
+        let state = MeshRouterState()
+        state.onConnected(address: "BLE", transport: .central)
+        state.onConnected(address: "LAN", transport: .lan)
+
+        state.clear(transports: [.central, .peripheral])
+
+        XCTAssertNil(state.transportFor(address: "BLE"))
+        XCTAssertEqual(state.transportFor(address: "LAN"), .lan)
     }
 
     func testTransportForReflectsRoleBeforeHello() {

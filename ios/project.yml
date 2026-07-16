@@ -37,6 +37,7 @@ targets:
       - sdk: UserNotifications.framework
       - sdk: PhotosUI.framework
       - sdk: Photos.framework
+      - sdk: Network.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cruisemesh.app
@@ -67,6 +68,9 @@ targets:
         NSMicrophoneUsageDescription: Record a short voice memo to send in chat.
         NSPhotoLibraryUsageDescription: Choose a photo from your library to send in chat.
         NSPhotoLibraryAddUsageDescription: Save a photo from a chat message to your photo library.
+        NSLocalNetworkUsageDescription: CruiseMesh uses your local Wi-Fi network to find and securely exchange messages with accepted contacts nearby.
+        NSBonjourServices:
+          - _cruisemesh._tcp
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

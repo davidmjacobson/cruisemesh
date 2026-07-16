@@ -30,6 +30,12 @@
 	<string>Take a photo to send in chat, or scan a friend QR code.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Record a short voice memo to send in chat.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>CruiseMesh uses your local Wi-Fi network to find and securely exchange messages with accepted contacts nearby.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_cruisemesh._tcp</string>
+	</array>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Choose a photo from your library to send in chat.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

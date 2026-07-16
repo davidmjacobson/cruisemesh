@@ -4,6 +4,11 @@ final class MeshRouterState {
     enum Transport: String {
         case central
         case peripheral
+        case lan
+
+        var routePriority: Int {
+            self == .lan ? 10 : 0
+        }
     }
 
     private struct Peer {
@@ -24,9 +29,14 @@ final class MeshRouterState {
         peersByAddress.removeValue(forKey: address)
     }
 
-    func onHello(address: String, userId: Data) {
+    @discardableResult
+    func onHello(address: String, userId: Data) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        peersByAddress[address]?.userId = userId
+        guard var peer = peersByAddress[address] else { return false }
+        if let existing = peer.userId, existing != userId { return false }
+        peer.userId = userId
+        peersByAddress[address] = peer
+        return true
     }
 
     func userIdFor(address: String) -> Data? {
@@ -55,11 +65,19 @@ final class MeshRouterState {
 
     func routeFor(userId: Data) -> (Transport, String)? {
         lock.lock(); defer { lock.unlock() }
+        var best: (Transport, String)?
         for (address, peer) in peersByAddress {
             guard let known = peer.userId, known == userId else { continue }
-            return (peer.transport, address)
+            if best == nil || peer.transport.routePriority > best!.0.routePriority {
+                best = (peer.transport, address)
+            }
         }
-        return nil
+        return best
+    }
+
+    func clear(transports: Set<Transport>) {
+        lock.lock(); defer { lock.unlock() }
+        peersByAddress = peersByAddress.filter { !transports.contains($0.value.transport) }
     }
 
     func clear() {
