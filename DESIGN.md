@@ -100,8 +100,8 @@ latency, out-of-order arrival, and duplicate delivery.
 │  ────────────────────────────────   │
 │  Transports (pluggable)             │
 │   • BLE GATT (primary)              │──── BLE ────  other phones
+│   • Same-LAN Bonjour/NSD + TCP      │──── Wi-Fi ──  other phones
 │   • Internet relay client (HTTPS/WS)│──── TLS ────┐
-│   • [future] ship-LAN mDNS/TCP      │             │
 └─────────────────────────────────────┘             │
                                           ┌─────────▼──────────┐
                                           │ cruisemesh-relayd   │
@@ -112,8 +112,9 @@ latency, out-of-order arrival, and duplicate delivery.
 ```
 
 Everything above the transport line is transport-agnostic: the sync engine hands
-sealed envelopes to whatever links are up. That's the seam that lets us add ship-LAN
-or Wi-Fi Aware transports later without touching crypto or storage.
+sealed envelopes to whatever links are up. Same-LAN TCP uses that seam without
+changing crypto, storage, receipts, deduplication, or mule behavior; future transports
+such as Wi-Fi Aware can do the same.
 
 ---
 
@@ -128,10 +129,12 @@ or Wi-Fi Aware transports later without touching crypto or storage.
 - **Wi-Fi Direct / Wi-Fi Aware**: Android-only in practice; cross-OS pairing is a
   known tarpit (Berty maintains three separate transports because of this). Revisit
   only as a media-transfer fast path (§8).
-- **Ship Wi-Fi LAN (no internet package)**: many ships let you associate with the AP
-  for free (captive portal / ship app). If client isolation is off, phones could sync
-  over local TCP at Wi-Fi speeds. Ships likely isolate clients, but this is a cheap
-  experiment — worth a probe in the field-test milestone, not a dependency.
+- **Ship Wi-Fi LAN (no internet package)**: some ship networks allow associated
+  clients to communicate locally without paid internet. CruiseMesh discovers peers
+  with Bonjour/NSD, authenticates accepted contacts with Noise XX, and carries the
+  existing mesh frames over TCP. Client-isolated networks simply leave this path
+  unavailable; BLE and relay continue normally. See
+  [`specs/same-lan-transport.md`](specs/same-lan-transport.md).
 
 ### 5.2 BLE roles and link protocol
 
