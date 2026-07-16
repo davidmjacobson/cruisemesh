@@ -213,6 +213,9 @@ struct ChatListView: View {
                 }
                 bluetoothAudioWarningDismissed = false
             }
+            .onChange(of: appModel.pendingFriendToken) { token in
+                if token != nil { showFriends = true }
+            }
         }
     }
 
@@ -378,9 +381,6 @@ private struct MeshStatusSheet: View {
                 } else {
                     appModel.stopMesh()
                 }
-            }
-            .onChange(of: appModel.pendingFriendToken) { token in
-                if token != nil { showFriends = true }
             }
         )
     }

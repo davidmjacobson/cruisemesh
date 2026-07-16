@@ -29,6 +29,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -93,9 +95,17 @@ fun GroupChatScreen(
     var focused by remember(group.id) { mutableStateOf<FocusedMessage?>(null) }
     var infoMessage by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
     var replyingTo by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
 
     fun reload() {
         messages = store.messagesForChat(group.id)
+    }
+
+    fun showSendFailure() {
+        coroutineScope.launch {
+            snackbarHostState.showSnackbar("Couldn't send. Your message is still here.")
+        }
     }
 
     fun senderName(userId: ByteArray): String {
@@ -185,6 +195,7 @@ fun GroupChatScreen(
                 onOpenDetails = { showDetails = true },
             )
         },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { innerPadding ->
         // This device uses adjustResize, so the viewport already excludes the
         // IME. Track its usable bottom edge rather than adding IME padding a
@@ -263,10 +274,13 @@ fun GroupChatScreen(
                             val replyToMsgId = replyingTo?.let {
                                 replyMetadata[messageStableKey(it)]?.msgId
                             }
-                            sender.sendText(group, text, replyToMsgId)
-                            draft = ""
-                            replyingTo = null
-                            reload()
+                            if (sender.sendText(group, text, replyToMsgId) == SendResult.STORED) {
+                                draft = ""
+                                replyingTo = null
+                                reload()
+                            } else {
+                                showSendFailure()
+                            }
                         }
                     },
                     modifier = Modifier
