@@ -49,6 +49,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -63,6 +65,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -116,6 +119,7 @@ import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
 import java.io.File
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
 private const val KIND_TEXT: kotlin.UByte = 1u
@@ -181,6 +185,8 @@ fun ChatScreen(
     // A photo picked but not yet sent: shown as a preview card above the composer
     // so a caption can ride along with it in a single attachment (see [onSend]).
     var pendingPhoto by remember { mutableStateOf<ByteArray?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
     val voiceRecorder = remember { VoiceRecorder(context) }
 
     fun reload() {
@@ -199,6 +205,12 @@ fun ChatScreen(
         pendingPhoto = jpeg
     }
 
+    fun showSendFailure(message: String = "Couldn't send. Your message is still here.") {
+        coroutineScope.launch {
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+
     fun sendVoiceFile(file: File, durationMs: Int) {
         val bytes = try {
             file.readBytes()
@@ -214,7 +226,7 @@ fun ChatScreen(
             Toast.makeText(context, "Voice memo is too large to send over the mesh", Toast.LENGTH_SHORT).show()
             return
         }
-        sender.sendAttachment(
+        val result = sender.sendAttachment(
             currentContact,
             AttachmentPayload(
                 mediaType = AttachmentPayload.MediaType.AUDIO,
@@ -223,7 +235,13 @@ fun ChatScreen(
                 blob = bytes,
             ),
         )
-        reload()
+        if (result == SendResult.STORED) {
+            reload()
+        } else {
+            // The recording file is already gone, so the generic "still here"
+            // copy would be wrong for a voice memo.
+            showSendFailure("Couldn't send the voice memo. Try recording it again.")
+        }
     }
 
     val galleryLauncher = rememberLauncherForActivityResult(
@@ -289,6 +307,7 @@ fun ChatScreen(
         arrivalFor = { message ->
             store.messageArrival(message.chatId, message.senderUserId, message.lamport)
         },
+        snackbarHostState = snackbarHostState,
         draft = draft,
         onDraftChange = { draft = it },
         pendingPhoto = pendingPhoto,
@@ -297,7 +316,7 @@ fun ChatScreen(
             val text = draft.trim()
             val photo = pendingPhoto
             if (photo != null) {
-                sender.sendAttachment(
+                val result = sender.sendAttachment(
                     currentContact,
                     AttachmentPayload(
                         mediaType = AttachmentPayload.MediaType.IMAGE,
@@ -307,13 +326,20 @@ fun ChatScreen(
                         caption = text,
                     ),
                 )
-                pendingPhoto = null
-                draft = ""
-                reload()
+                if (result == SendResult.STORED) {
+                    pendingPhoto = null
+                    draft = ""
+                    reload()
+                } else {
+                    showSendFailure()
+                }
             } else if (text.isNotEmpty()) {
-                sender.sendText(currentContact, text)
-                draft = ""
-                reload()
+                if (sender.sendText(currentContact, text) == SendResult.STORED) {
+                    draft = ""
+                    reload()
+                } else {
+                    showSendFailure()
+                }
             }
         },
         onReact = { target, emoji ->
@@ -375,6 +401,7 @@ private fun ConversationScreen(
     deliveredThrough: ULong,
     readThrough: ULong,
     arrivalFor: (StoredMessage) -> MessageArrival? = { null },
+    snackbarHostState: SnackbarHostState,
     draft: String,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
@@ -465,7 +492,8 @@ private fun ConversationScreen(
                 onBack = onBack,
                 onOpenDetails = { showContactDetails = true },
             )
-        }
+        },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { innerPadding ->
         // This device uses adjustResize, so the viewport already excludes the
         // IME. Track its usable bottom edge rather than adding IME padding a
@@ -1208,8 +1236,10 @@ private fun messageArrivalText(arrival: MessageArrival): String {
         2 -> "relay"
         else -> "unknown route"
     }
+    // hopsTaken is inferred from the default hop TTL, so a sender that
+    // authored with a non-default TTL skews it — present it as an estimate.
     val hops = arrival.hopsTaken.toInt()
-    val hopLabel = "$hops ${if (hops == 1) "hop" else "hops"}"
+    val hopLabel = "~$hops ${if (hops == 1) "hop" else "hops"}"
     val receivedAt = java.text.SimpleDateFormat(
         "h:mm a",
         java.util.Locale.getDefault(),
@@ -1422,6 +1452,7 @@ private fun ConversationScreenPreview() {
             ),
             deliveredThrough = 4uL,
             readThrough = 3uL,
+            snackbarHostState = remember { SnackbarHostState() },
             draft = "",
             onDraftChange = {},
             onSend = {},
