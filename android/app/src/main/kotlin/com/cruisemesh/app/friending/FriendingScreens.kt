@@ -54,6 +54,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -98,6 +99,7 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
     var relayToken by remember { mutableStateOf(savedRelay?.relayToken.orEmpty()) }
     var showAdvanced by remember { mutableStateOf(false) }
     var connectedFriend by remember { mutableStateOf<FriendAddedOutcome?>(null) }
+    val pendingImports by FriendImportEvents.pendingImports.collectAsState()
     val fingerprint = remember(identity.userId) { fingerprintWords(identity.userId) }
     val friendLink = remember(name, relayUrl, relayToken, identity) {
         val cardJson =
@@ -112,15 +114,17 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
     val appLink = remember(friendLink) { "https://cruisemesh.app/f#$friendLink" }
     val qrBitmap = remember(appLink) { encodeQrBitmap(appLink) }
 
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        FriendImportEvents.imports.collect { event ->
-            if (event.directBle) {
-                connectedFriend = FriendAddedOutcome(
-                    contact = event.contact,
-                    delivery = FriendRequestDelivery(reachedDirectly = true, lamport = 0uL),
-                    relayConfigured = RelayConfigStore.load(context) != null,
-                )
-            }
+    androidx.compose.runtime.LaunchedEffect(pendingImports, connectedFriend) {
+        if (connectedFriend != null) return@LaunchedEffect
+        val pending = pendingImports.firstOrNull() ?: return@LaunchedEffect
+        FriendImportEvents.consume(pending.id)
+        val event = pending.value
+        if (event.directBle) {
+            connectedFriend = FriendAddedOutcome(
+                contact = event.contact,
+                delivery = FriendRequestDelivery(reachedDirectly = true, lamport = 0uL),
+                relayConfigured = RelayConfigStore.load(context) != null,
+            )
         }
     }
 
