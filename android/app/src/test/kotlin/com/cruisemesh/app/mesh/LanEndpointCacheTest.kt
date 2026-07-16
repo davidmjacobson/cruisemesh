@@ -20,7 +20,11 @@ class LanEndpointCacheTest {
     @Test
     fun networkFingerprintUsesTheSharedIpv4Slash24() {
         assertEquals(
+            "NcJ68sf-sL-VO63PUTnngg==",
             lanNetworkIdForIpv4("10.154.189.58"),
+        )
+        assertEquals(
+            "NcJ68sf-sL-VO63PUTnngg==",
             lanNetworkIdForIpv4("10.154.189.201"),
         )
         assertNull(lanNetworkIdForIpv4("not-an-ip"))

@@ -95,7 +95,7 @@ internal fun lanNetworkId(
     val digest = MessageDigest.getInstance("SHA-256")
         .digest(("CruiseMesh LAN network v1\u0000" + topology.joinToString("|")).toByteArray())
         .copyOf(16)
-    return Base64.encodeToString(digest, Base64.NO_WRAP or Base64.URL_SAFE)
+    return java.util.Base64.getUrlEncoder().encodeToString(digest)
 }
 
 internal fun lanNetworkIdForIpv4(address: String): String? {
@@ -105,5 +105,5 @@ internal fun lanNetworkIdForIpv4(address: String): String? {
     val digest = MessageDigest.getInstance("SHA-256")
         .digest("CruiseMesh LAN network v1\u0000ipv4:$prefix".toByteArray())
         .copyOf(16)
-    return Base64.encodeToString(digest, Base64.NO_WRAP or Base64.URL_SAFE)
+    return java.util.Base64.getUrlEncoder().encodeToString(digest)
 }
