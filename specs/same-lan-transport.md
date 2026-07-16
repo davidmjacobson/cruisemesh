@@ -1,6 +1,6 @@
 # Same-LAN TCP transport
 
-Status: implementation design, version 1.
+Status: implemented, version 1.
 
 ## Goal
 
@@ -20,18 +20,29 @@ does not implement this transport remains fully compatible over BLE and relay.
 - Service instance name: random per process; it contains no user or device
   identity.
 - TXT data: protocol version and a random self-suppression token only.
-- Discovery uses Android NSD or Apple Bonjour. CruiseMesh does not scan the
-  subnet or enumerate addresses.
+- Primary discovery uses Android NSD or Apple Bonjour.
 - mDNS is link-local and may not cross routed client subnets even when TCP
-  does. Updated Android clients therefore also exchange their listener
-  address and random instance token over an existing BLE link after both
-  peers have completed HELLO and are accepted contacts. The token preserves
-  the same single-initiator election used by DNS-SD.
-- The BLE endpoint hint is reachability data, not authentication. A hinted
-  TCP responder must still present the agreement key of the same accepted
-  friend during the Noise handshake.
-- A manual `IP[:port]` field remains available for diagnosis when neither
-  DNS-SD nor BLE introduction is available.
+  does. Updated clients therefore exchange a `LAN_ENDPOINT` link-control frame
+  after HELLO on any existing updated link. It contains the listener address,
+  port, and random instance token; the token preserves the same
+  single-initiator election used by DNS-SD.
+- A successful endpoint is cached for seven days under a hash of the local
+  IPv4 `/24` and the accepted contact's UserID. The raw network name and raw
+  subnet are not persisted.
+- A peer that has demonstrated `LAN_ENDPOINT` support may receive a short-lived
+  endpoint hint through its existing end-to-end-encrypted relay mailbox. The
+  hint expires after 15 minutes and is used only when both devices derive the
+  same network fingerprint. This allows two accepted contacts on the same LAN
+  to find each other before BLE or mDNS succeeds.
+- A manual `IP[:port]` field and endpoint QR are available for diagnosis when
+  automatic discovery is unavailable.
+- The user may explicitly search the phone's current IPv4 `/24`. The search is
+  bounded to 253 candidate hosts, eight concurrent TCP attempts, and a
+  350-millisecond attempt timeout. CruiseMesh never silently expands this to a
+  `/16` or broader scan.
+- Every endpoint mechanism is reachability data, not authentication. A TCP
+  responder must still present the agreement key of an accepted friend during
+  the Noise handshake.
 
 45892 is a provisional unassigned port in IANA's user-port range as of
 2026-07-16. Before treating it as a permanent public assignment, the project
@@ -98,6 +109,9 @@ parser and mesh sync path exactly as if BLE had reassembled it.
   `msg_id` deduplication and per-peer sync digests make delivery idempotent.
 - Socket writes are serialized per connection so Noise record nonces and frame
   chunks remain ordered.
+- Reconnect attempts use exponential backoff. Authenticated links exchange
+  encrypted `TRANSPORT_PROBE` request/response frames; three consecutive probe
+  timeouts close the stale socket so discovery can establish a fresh link.
 - Network loss closes every connection and restarts discovery when Wi-Fi
   returns.
 
@@ -117,13 +131,25 @@ and relay continue to work.
 
 ## Delivery policy
 
-LAN links are preferred over BLE for large frames and may race BLE for small
-messages. Relay upload remains useful whenever internet is available because it
-provides durable delivery after the local encounter ends.
+LAN links are preferred over BLE for large frames. Small control and text
+frames race over LAN plus one BLE route so one unhealthy path does not add a
+full retry delay. Message IDs keep the duplicate arrival harmless. Relay upload
+remains useful whenever internet is available because it provides durable
+delivery after the local encounter ends.
 
-The first implementation reuses existing digest synchronization and
-deduplication. A later transport scheduler may use measured bandwidth, battery,
-and message class when choosing among multiple live links.
+The transport reuses existing digest synchronization and deduplication. The
+profile screen exposes listener/peer endpoints, authenticated peer names,
+encrypted-frame counters, probe latency, scan progress, and the most recent
+error. Message Info stores whether an incoming message or outgoing delivery
+confirmation used direct LAN or a LAN mule, alongside the existing hop estimate
+and receive time.
+
+## Compatibility
+
+The endpoint and probe frames are optional link-control extensions. Older
+clients reject or ignore an unknown frame without altering the BLE or relay
+network. Sealed endpoint messages are capability-gated, so they are never
+queued for a contact until that peer has sent a supported endpoint frame.
 
 ## Validation gates
 
