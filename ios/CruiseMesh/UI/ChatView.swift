@@ -587,7 +587,16 @@ private struct MessageBubbleView: View {
         .alert("Message info", isPresented: $showInfo) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text(messageInfoText(message: message, isOwn: isOwn, tick: tick))
+            Text(messageInfoText(
+                message: message,
+                isOwn: isOwn,
+                tick: tick,
+                arrival: try? AppStore.get().messageArrival(
+                    chatId: message.chatId,
+                    senderUserId: message.senderUserId,
+                    lamport: message.lamport
+                )
+            ))
         }
     }
 
@@ -742,14 +751,50 @@ private func messageCopyText(_ message: StoredMessage) -> String {
     return String(data: message.payload, encoding: .utf8) ?? ""
 }
 
-private func messageInfoText(message: StoredMessage, isOwn: Bool, tick: TickStatus?) -> String {
+func messageInfoText(
+    message: StoredMessage,
+    isOwn: Bool,
+    tick: TickStatus?,
+    arrival: MessageArrival? = nil
+) -> String {
     let f = DateFormatter()
     f.dateFormat = "MMMM d, yyyy h:mm a"
     f.locale = .current
     let sentAt = f.string(from: Date(timeIntervalSince1970: TimeInterval(message.timestamp) / 1000))
     let direction = isOwn ? "Sent by you" : "Received"
     let status = tick.map { "\nStatus: \(tickLegendText($0))" } ?? ""
-    return "\(direction)\nTime: \(sentAt)\(status)"
+    let arrivalLine = arrival.map {
+        isOwn ? "\n\(messageDeliveryConfirmationText($0))" : "\n\(messageArrivalText($0))"
+    } ?? ""
+    return "\(direction)\nTime: \(sentAt)\(status)\(arrivalLine)"
+}
+
+private func messageRouteText(_ arrival: MessageArrival) -> String {
+    switch arrival.transport {
+    case 0: return "direct BLE"
+    case 1: return "another device over BLE"
+    case 2: return "relay"
+    case 3: return "local Wi-Fi"
+    case 4: return "another device over local Wi-Fi"
+    default: return "unknown route"
+    }
+}
+
+private func messageArrivalText(_ arrival: MessageArrival) -> String {
+    let hops = Int(arrival.hopsTaken)
+    let hopLabel = "~\(hops) \(hops == 1 ? "hop" : "hops")"
+    return "Arrived via \(messageRouteText(arrival)) · \(hopLabel) · \(arrivalTime(arrival.receivedAt))"
+}
+
+private func messageDeliveryConfirmationText(_ arrival: MessageArrival) -> String {
+    "Delivery confirmed via \(messageRouteText(arrival)) · \(arrivalTime(arrival.receivedAt))"
+}
+
+private func arrivalTime(_ timestampMs: Int64) -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "h:mm a"
+    formatter.locale = .current
+    return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1_000))
 }
 
 private extension StoredMessage {

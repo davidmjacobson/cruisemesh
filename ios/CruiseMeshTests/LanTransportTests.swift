@@ -97,6 +97,29 @@ final class LanTransportTests: XCTestCase {
             ["LAN"]
         )
     }
+
+    func testMessageInfoShowsLanArrivalAndDeliveryConfirmation() {
+        let timestamp: Int64 = 1_700_000_000_000
+        let message = StoredMessage(
+            chatId: Data(repeating: 1, count: 16),
+            senderUserId: Data(repeating: 2, count: 16),
+            lamport: 4,
+            timestamp: timestamp,
+            kind: ProtocolKind.text,
+            payload: Data("hello".utf8)
+        )
+        let direct = MessageArrival(transport: 3, hopsTaken: 0, receivedAt: timestamp)
+        let muled = MessageArrival(transport: 4, hopsTaken: 2, receivedAt: timestamp)
+
+        XCTAssertTrue(
+            messageInfoText(message: message, isOwn: false, tick: nil, arrival: direct)
+                .contains("Arrived via local Wi-Fi · ~0 hops")
+        )
+        XCTAssertTrue(
+            messageInfoText(message: message, isOwn: true, tick: nil, arrival: muled)
+                .contains("Delivery confirmed via another device over local Wi-Fi")
+        )
+    }
 }
 
 final class LanHealthTrackerTests: XCTestCase {
