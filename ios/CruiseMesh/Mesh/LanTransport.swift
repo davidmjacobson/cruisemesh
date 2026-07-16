@@ -7,6 +7,7 @@ import os.log
 final class LanTransport {
     typealias TrustedPeerLookup = (Data) -> Data?
 
+    var onNetworkReady: ((LanManualEndpoint, Data, String?) -> Void)?
     var onAuthenticated: ((String, Data) -> Void)?
     var onDisconnected: ((String) -> Void)?
     var onFrame: ((String, Data) -> Void)?
@@ -15,24 +16,29 @@ final class LanTransport {
     private let queue = DispatchQueue(label: "com.cruisemesh.lan", qos: .utility)
     private let identity: Identity
     private let trustedPeerForStaticKey: TrustedPeerLookup
-    private let instanceToken: String
+    private let diagnostics = LanTransportDiagnostics.shared
+    private let instanceToken: Data
+    private let instanceTokenString: String
 
     private var started = false
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var connections: [String: LanConnection] = [:]
     private var discoveredEndpoints: [String: NWEndpoint] = [:]
+    private var bonjourServiceKeys = Set<String>()
     private var outboundAddresses: [String: String] = [:]
+    private var reconnectAttempts: [String: Int] = [:]
+    private var scanGeneration: UUID?
+    private var scanCandidates: [String] = []
+    private var scanConnections: [UUID: NWConnection] = [:]
 
     init(identity: Identity, trustedPeerForStaticKey: @escaping TrustedPeerLookup) {
         self.identity = identity
         self.trustedPeerForStaticKey = trustedPeerForStaticKey
-        instanceToken = String(
-            UUID().uuidString
-                .replacingOccurrences(of: "-", with: "")
-                .lowercased()
-                .prefix(16)
-        )
+        var uuid = UUID().uuid
+        let token = withUnsafeBytes(of: &uuid) { Data($0.prefix(8)) }
+        instanceToken = token
+        instanceTokenString = token.map { String(format: "%02x", $0) }.joined()
     }
 
     func start() {
@@ -54,11 +60,18 @@ final class LanTransport {
             browser = nil
             listener?.cancel()
             listener = nil
+            scanGeneration = nil
+            scanCandidates.removeAll()
+            scanConnections.values.forEach { $0.cancel() }
+            scanConnections.removeAll()
             discoveredEndpoints.removeAll()
+            bonjourServiceKeys.removeAll()
             outboundAddresses.removeAll()
+            reconnectAttempts.removeAll()
             let active = Array(connections.values)
             connections.removeAll()
             active.forEach { $0.close(notifyOwner: false) }
+            diagnostics.waitingForWifi()
         }
     }
 
@@ -66,7 +79,56 @@ final class LanTransport {
         queue.async { [weak self] in
             guard let link = self?.connections[address] else { return }
             link.sendFrame(frame)
+            self?.diagnostics.frameSent()
         }
+    }
+
+    func connect(_ endpoint: LanManualEndpoint, remoteInstanceToken: Data? = nil, manual: Bool = false) {
+        queue.async { [weak self] in
+            guard let self, started else { return }
+            if let remoteInstanceToken,
+               !shouldInitiateLanConnection(
+                    localToken: instanceTokenString,
+                    remoteToken: remoteInstanceToken.map { String(format: "%02x", $0) }.joined()
+               ) {
+                return
+            }
+            let key = "endpoint:\(endpoint.display)"
+            let networkEndpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(endpoint.host),
+                port: NWEndpoint.Port(rawValue: endpoint.port) ?? .any
+            )
+            discoveredEndpoints[key] = networkEndpoint
+            if manual { reconnectAttempts[key] = 0 }
+            diagnostics.discovered(endpoint.display)
+            connect(to: networkEndpoint, serviceKey: key)
+        }
+    }
+
+    func closeConnection(address: String) {
+        queue.async { [weak self] in
+            self?.connections[address]?.close()
+        }
+    }
+
+    func startSubnetScan() -> String? {
+        guard let localAddress = localWifiIPv4Address() else {
+            return "Connect this phone to Wi-Fi before searching the local subnet"
+        }
+        let candidates = subnet24Hosts(localAddress: localAddress)
+        guard !candidates.isEmpty else { return "CruiseMesh could not determine the local /24 network" }
+        queue.async { [weak self] in
+            guard let self, started else { return }
+            scanGeneration = UUID()
+            scanCandidates = candidates
+            scanConnections.values.forEach { $0.cancel() }
+            scanConnections.removeAll()
+            diagnostics.scanStarted(total: candidates.count)
+            for _ in 0..<Self.scanConcurrency {
+                startNextScanCandidate(generation: scanGeneration!)
+            }
+        }
+        return nil
     }
 
     private func startListener(preferDefaultPort: Bool) {
@@ -80,10 +142,10 @@ final class LanTransport {
             listener = newListener
             let txt = NetService.data(fromTXTRecord: [
                 "v": Data("1".utf8),
-                "i": Data(instanceToken.utf8),
+                "i": Data(instanceTokenString.utf8),
             ])
             var service = NWListener.Service(
-                name: instanceToken,
+                name: instanceTokenString,
                 type: appleLanServiceType(),
                 domain: nil,
                 txtRecord: txt
@@ -125,6 +187,13 @@ final class LanTransport {
         case .ready:
             if let port = failedListener.port {
                 log.info("Listening for CruiseMesh LAN peers on TCP \(port.rawValue)")
+                let endpoint = localWifiIPv4Address().map {
+                    LanManualEndpoint(host: $0, port: port.rawValue)
+                }
+                diagnostics.listening(localEndpoint: endpoint?.display)
+                if let endpoint {
+                    onNetworkReady?(endpoint, instanceToken, lanNetworkId(ipv4Address: endpoint.host))
+                }
             }
         case .failed(let error):
             failedListener.cancel()
@@ -170,22 +239,30 @@ final class LanTransport {
         var current: [String: NWEndpoint] = [:]
         for result in results {
             guard case let .service(name, _, _, _) = result.endpoint else { continue }
-            guard shouldInitiateLanConnection(localToken: instanceToken, remoteToken: name) else {
+            guard shouldInitiateLanConnection(localToken: instanceTokenString, remoteToken: name) else {
                 continue
             }
             let key = serviceKey(result.endpoint)
             current[key] = result.endpoint
             if discoveredEndpoints[key] == nil {
+                diagnostics.discovered(String(describing: result.endpoint))
                 connect(to: result.endpoint, serviceKey: key)
             }
         }
-        discoveredEndpoints = current
+        for removed in bonjourServiceKeys.subtracting(Set(current.keys)) {
+            discoveredEndpoints.removeValue(forKey: removed)
+        }
+        bonjourServiceKeys = Set(current.keys)
+        for (key, endpoint) in current {
+            discoveredEndpoints[key] = endpoint
+        }
     }
 
     private func connect(to endpoint: NWEndpoint, serviceKey: String) {
         guard started,
               connections.count < Self.maxConnections,
               outboundAddresses[serviceKey] == nil else { return }
+        diagnostics.connecting(String(describing: endpoint))
         let connection = NWConnection(to: endpoint, using: lanParameters())
         addConnection(connection, initiator: true, serviceKey: serviceKey)
     }
@@ -234,11 +311,15 @@ final class LanTransport {
             return
         }
         log.info("Authenticated CruiseMesh peer over local Wi-Fi")
+        if let serviceKey = link.serviceKey {
+            reconnectAttempts[serviceKey] = 0
+        }
         onAuthenticated?(link.address, userId)
     }
 
     fileprivate func connectionReceivedFrame(_ link: LanConnection, frame: Data) {
         guard started, connections[link.address] === link else { return }
+        diagnostics.frameReceived()
         onFrame?(link.address, frame)
     }
 
@@ -247,7 +328,16 @@ final class LanTransport {
         connections.removeValue(forKey: link.address)
         if let serviceKey = link.serviceKey {
             outboundAddresses.removeValue(forKey: serviceKey)
-            queue.asyncAfter(deadline: .now() + Self.reconnectDelay) { [weak self] in
+            let attempt = reconnectAttempts[serviceKey, default: 0]
+            reconnectAttempts[serviceKey] = min(attempt + 1, Self.reconnectDelays.count - 1)
+            let delay = Self.reconnectDelays[min(attempt, Self.reconnectDelays.count - 1)]
+            if !link.wasAuthenticated {
+                diagnostics.connectionFailed(
+                    discoveredEndpoints[serviceKey].map { String(describing: $0) } ?? serviceKey,
+                    reason: "Secure connection failed; CruiseMesh will retry"
+                )
+            }
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self,
                       started,
                       outboundAddresses[serviceKey] == nil,
@@ -260,6 +350,52 @@ final class LanTransport {
         }
     }
 
+    private func startNextScanCandidate(generation: UUID) {
+        guard started, scanGeneration == generation, !scanCandidates.isEmpty else { return }
+        let host = scanCandidates.removeFirst()
+        guard let port = NWEndpoint.Port(rawValue: lanDefaultTcpPort()) else { return }
+        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: port)
+        let connection = NWConnection(to: endpoint, using: lanParameters())
+        let id = UUID()
+        scanConnections[id] = connection
+        var completed = false
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
+            queue.async {
+                guard !completed, scanGeneration == generation else { return }
+                switch state {
+                case .ready:
+                    completed = true
+                    connection.cancel()
+                    scanConnections.removeValue(forKey: id)
+                    diagnostics.discovered("\(host):\(lanDefaultTcpPort())")
+                    let key = "scan:\(host):\(lanDefaultTcpPort())"
+                    discoveredEndpoints[key] = endpoint
+                    connect(to: endpoint, serviceKey: key)
+                    diagnostics.scanAdvanced()
+                    startNextScanCandidate(generation: generation)
+                case .failed, .cancelled:
+                    completed = true
+                    connection.cancel()
+                    scanConnections.removeValue(forKey: id)
+                    diagnostics.scanAdvanced()
+                    startNextScanCandidate(generation: generation)
+                default:
+                    break
+                }
+            }
+        }
+        connection.start(queue: queue)
+        queue.asyncAfter(deadline: .now() + Self.scanTimeout) { [weak self, weak connection] in
+            guard let self, let connection, !completed, scanGeneration == generation else { return }
+            completed = true
+            connection.cancel()
+            scanConnections.removeValue(forKey: id)
+            diagnostics.scanAdvanced()
+            startNextScanCandidate(generation: generation)
+        }
+    }
+
     private func lanParameters() -> NWParameters {
         let parameters = NWParameters.tcp
         parameters.requiredInterfaceType = .wifi
@@ -268,7 +404,11 @@ final class LanTransport {
     }
 
     private static let maxConnections = 8
-    private static let reconnectDelay: DispatchTimeInterval = .seconds(30)
+    private static let reconnectDelays: [DispatchTimeInterval] = [
+        .seconds(2), .seconds(5), .seconds(15), .seconds(30), .seconds(60), .seconds(300),
+    ]
+    private static let scanConcurrency = 8
+    private static let scanTimeout: DispatchTimeInterval = .milliseconds(350)
 }
 
 private final class LanConnection {

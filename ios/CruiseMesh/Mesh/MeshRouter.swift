@@ -67,10 +67,22 @@ enum MeshRouter {
         state.connectedUserCount()
     }
 
+    static func transportFor(address: String) -> MeshRouterState.Transport? {
+        state.transportFor(address: address)
+    }
+
+    static func identifiedRoutes() -> [MeshRouterState.IdentifiedRoute] {
+        state.identifiedRoutes()
+    }
+
     @discardableResult
     static func sendToUserId(userId: Data, frame: Data) -> Bool {
-        guard let (transport, address) = state.routeFor(userId: userId) else { return false }
-        return dispatch(transport: transport, address: address, frame: frame)
+        let plan = transportSendPlan(routes: state.routesFor(userId: userId), frameSize: frame.count)
+        var sent = false
+        for (transport, address) in plan {
+            sent = dispatch(transport: transport, address: address, frame: frame) || sent
+        }
+        return sent
     }
 
     @discardableResult

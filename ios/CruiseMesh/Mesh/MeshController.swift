@@ -12,6 +12,7 @@ final class MeshController: ObservableObject {
     private let log = Logger(subsystem: "com.cruisemesh", category: "MeshController")
     private let transport = BleTransport()
     private var lanTransport: LanTransport?
+    private let lanHealth = LanHealthTracker()
     private let store = AppStore.get()
     private let bluetoothAudioBackoff = BluetoothAudioBackoff()
     private var identity: Identity!
@@ -21,9 +22,13 @@ final class MeshController: ObservableObject {
     private var meshRolesRunning = false
     private var pausedForBluetoothAudio = false
     private var relayCancellable: AnyCancellable?
+    private var lanHealthTimer: Timer?
     private var audioRouteObserver: NSObjectProtocol?
     private var relaySyncInFlight = false
     private var relaySyncPending = false
+    private var currentLanEndpoint: LanManualEndpoint?
+    private var currentLanInstanceToken: Data?
+    private var currentLanNetworkId: String?
 
     private init() {}
 
@@ -60,21 +65,62 @@ final class MeshController: ObservableObject {
             }
         )
         lanTransport = lan
+        LanTransportDiagnostics.shared.register(
+            manualConnector: { [weak lan] endpoint in
+                lan?.connect(endpoint, manual: true)
+            },
+            probeRequester: { [weak self] in
+                self?.requestLanProbe()
+            },
+            scanRequester: { [weak lan] in
+                lan?.startSubnetScan() ?? "Start the mesh before searching the local subnet"
+            }
+        )
         MeshRouter.registerLan { [weak lan] address, frame in
             lan?.sendFrame(address: address, frame: frame)
+        }
+        lan.onNetworkReady = { [weak self, weak lan] endpoint, instanceToken, networkId in
+            Task { @MainActor in
+                guard let self, let lan, self.isRunning else { return }
+                self.currentLanEndpoint = endpoint
+                self.currentLanInstanceToken = instanceToken
+                self.currentLanNetworkId = networkId
+                for contact in (try? self.store.listContacts()) ?? [] {
+                    if let cached = LanEndpointCache.load(networkId: networkId, userId: contact.userId) {
+                        lan.connect(cached)
+                    }
+                }
+                LanEndpointSender.queueToAllCapableContacts(
+                    store: self.store,
+                    identity: self.identity,
+                    endpoint: endpoint,
+                    instanceToken: instanceToken,
+                    networkId: networkId
+                )
+                for route in MeshRouter.identifiedRoutes() {
+                    self.sendLanEndpointHint(address: route.address)
+                }
+            }
         }
         lan.onAuthenticated = { [weak self] address, userId in
             Task { @MainActor in
                 guard let self, self.isRunning else { return }
                 MeshRouter.onConnected(address: address, transport: .lan)
                 guard MeshRouter.onHello(address: address, userId: userId) else { return }
+                let name = (try? self.store.getContact(userId: userId))?.name
+                    ?? String(UserIdHex.encode(userId).prefix(8))
+                LanTransportDiagnostics.shared.authenticated(address: address, peerName: name)
                 self.sendHello(address: address)
+                self.sendLanEndpointHint(address: address)
+                self.queueCurrentLanEndpoint(to: userId)
                 self.refreshNearby()
             }
         }
         lan.onDisconnected = { [weak self] address in
             Task { @MainActor in
                 guard let self, self.isRunning else { return }
+                self.lanHealth.remove(address: address)
+                LanTransportDiagnostics.shared.disconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 self.refreshNearby()
             }
@@ -86,6 +132,7 @@ final class MeshController: ObservableObject {
             }
         }
         lan.start()
+        startLanHealthLoop()
 
         transport.onFrame = { [weak self] address, frame in
             Task { @MainActor in self?.onFrameReceived(address: address, frame: frame) }
@@ -127,6 +174,13 @@ final class MeshController: ObservableObject {
         unregisterBluetoothAudioObserver()
         lanTransport?.stop()
         lanTransport = nil
+        LanTransportDiagnostics.shared.unregister()
+        lanHealthTimer?.invalidate()
+        lanHealthTimer = nil
+        lanHealth.clear()
+        currentLanEndpoint = nil
+        currentLanInstanceToken = nil
+        currentLanNetworkId = nil
         stopMeshRoles()
         MeshRouter.unregisterCentral()
         MeshRouter.unregisterPeripheral()
@@ -296,7 +350,117 @@ final class MeshController: ObservableObject {
                 recentMsgIds: recentMsgIds,
                 identity: identity
             )
+        case .lanEndpoint(let instanceToken, let host, let port):
+            handleLanEndpointHint(
+                address: address,
+                instanceToken: instanceToken,
+                endpoint: LanManualEndpoint(host: host, port: port)
+            )
+        case .transportProbe(let nonce, let response):
+            handleTransportProbe(address: address, nonce: nonce, response: response)
         }
+    }
+
+    private func sendLanEndpointHint(address: String) {
+        guard let endpoint = currentLanEndpoint,
+              let instanceToken = currentLanInstanceToken,
+              let frame = try? encodeLanEndpoint(
+                instanceToken: instanceToken,
+                host: endpoint.host,
+                port: endpoint.port
+              ) else { return }
+        _ = MeshRouter.sendToAddress(address: address, frame: frame)
+    }
+
+    private func queueCurrentLanEndpoint(to userId: Data) {
+        guard let identity,
+              let endpoint = currentLanEndpoint,
+              let instanceToken = currentLanInstanceToken,
+              let networkId = currentLanNetworkId,
+              LanCapabilityStore.isSupported(userId: userId),
+              let contact = try? store.getContact(userId: userId) else { return }
+        LanEndpointSender.queueToContact(
+            store: store,
+            identity: identity,
+            contact: contact,
+            endpoint: endpoint,
+            instanceToken: instanceToken,
+            networkId: networkId
+        )
+    }
+
+    private func handleLanEndpointHint(
+        address: String,
+        instanceToken: Data,
+        endpoint: LanManualEndpoint
+    ) {
+        guard let userId = MeshRouter.userIdFor(address: address),
+              (try? store.getContact(userId: userId)) != nil else { return }
+        LanCapabilityStore.markSupported(userId: userId)
+        LanEndpointCache.save(
+            networkId: currentLanNetworkId,
+            userId: userId,
+            endpoint: endpoint
+        )
+        queueCurrentLanEndpoint(to: userId)
+        guard MeshRouter.transportFor(address: address) != .lan else { return }
+        lanTransport?.connect(endpoint, remoteInstanceToken: instanceToken)
+    }
+
+    private func handleTransportProbe(address: String, nonce: UInt64, response: Bool) {
+        guard MeshRouter.transportFor(address: address) == .lan else { return }
+        if response {
+            let now = Int64(Date().timeIntervalSince1970 * 1_000)
+            if let latency = lanHealth.response(address: address, nonce: nonce, nowMs: now) {
+                LanTransportDiagnostics.shared.probeSucceeded(latencyMs: latency)
+            }
+        } else {
+            _ = MeshRouter.sendToAddress(
+                address: address,
+                frame: encodeTransportProbe(nonce: nonce, response: true)
+            )
+        }
+    }
+
+    private func startLanHealthLoop() {
+        lanHealthTimer?.invalidate()
+        lanHealthTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                _ = self?.probeLanLinks(manual: false)
+            }
+        }
+    }
+
+    private func requestLanProbe() -> String? {
+        probeLanLinks(manual: true)
+    }
+
+    private func probeLanLinks(manual: Bool) -> String? {
+        let routes = MeshRouter.identifiedRoutes().filter { $0.transport == .lan }
+        guard !routes.isEmpty else { return "No secure local Wi-Fi link is active yet" }
+        if manual { LanTransportDiagnostics.shared.probeStarted() }
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        for route in routes {
+            switch lanHealth.next(
+                address: route.address,
+                nowMs: now,
+                nonce: UInt64.random(in: 1...UInt64.max)
+            ) {
+            case .send(let nonce):
+                _ = MeshRouter.sendToAddress(
+                    address: route.address,
+                    frame: encodeTransportProbe(nonce: nonce, response: false)
+                )
+            case .wait:
+                break
+            case .close:
+                lanTransport?.closeConnection(address: route.address)
+                LanTransportDiagnostics.shared.probeFailed(
+                    "The encrypted LAN link stopped responding and was reconnected"
+                )
+            }
+        }
+        return nil
     }
 
     private func handleHello(address: String, userId: Data, identity: Identity) {
@@ -305,6 +469,8 @@ final class MeshController: ObservableObject {
             return
         }
         log.info("HELLO from \(address, privacy: .public) \(UserIdHex.encode(userId), privacy: .public)")
+        sendLanEndpointHint(address: address)
+        queueCurrentLanEndpoint(to: userId)
         drainCarriedEnvelopesTo(address: address, peerUserId: userId)
         let entries: [DigestEntry]
         if let contact = try? store.getContact(userId: userId) {
@@ -375,12 +541,18 @@ final class MeshController: ObservableObject {
         }
         do {
             let opened = try openMessage(recipient: identity, sealed: sealed)
+            let arrival = messageArrival(
+                sourceAddress: sourceAddress,
+                senderUserId: opened.senderUserId,
+                receivedHopTtl: hopTtl
+            )
             deliverOpened(
                 sourceLabel: sourceLabel,
                 sourceAddress: sourceAddress,
                 opened: opened,
                 identity: identity,
-                msgId: msgId
+                msgId: msgId,
+                arrival: arrival
             )
         } catch {
             // Pairwise open failed: either foreign 1:1 traffic, or a group
@@ -394,7 +566,12 @@ final class MeshController: ObservableObject {
                     group: group,
                     opened: opened,
                     identity: identity,
-                    msgId: msgId
+                    msgId: msgId,
+                    arrival: messageArrival(
+                        sourceAddress: sourceAddress,
+                        senderUserId: opened.senderUserId,
+                        receivedHopTtl: hopTtl
+                    )
                 )
                 relayForeign(
                     sourceAddress: sourceAddress,
@@ -426,6 +603,32 @@ final class MeshController: ObservableObject {
         }
     }
 
+    private func messageArrival(
+        sourceAddress: String?,
+        senderUserId: Data,
+        receivedHopTtl: UInt8
+    ) -> MessageArrival {
+        let transport: UInt8
+        if let sourceAddress {
+            let linkPeerMatchesSender = MeshRouter.userIdFor(address: sourceAddress) == senderUserId
+            if MeshRouter.transportFor(address: sourceAddress) == .lan {
+                transport = linkPeerMatchesSender ? 3 : 4
+            } else {
+                transport = linkPeerMatchesSender ? 0 : 1
+            }
+        } else {
+            transport = 2
+        }
+        let hopsTaken = MeshDefaults.hopTtl >= receivedHopTtl
+            ? MeshDefaults.hopTtl - receivedHopTtl
+            : 0
+        return MessageArrival(
+            transport: transport,
+            hopsTaken: hopsTaken,
+            receivedAt: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
+    }
+
     /// Opens `sealed` with any imported group whose recent-day `recipient_hint`
     /// matches `recipientHint`. Returns the matching group and opened payload,
     /// or nil. `openGroupMessage` does not check membership of the signer;
@@ -446,7 +649,8 @@ final class MeshController: ObservableObject {
         sourceAddress: String?,
         opened: OpenedMessage,
         identity: Identity,
-        msgId: Data
+        msgId: Data,
+        arrival: MessageArrival
     ) {
         let extendedBody: ExtendedMessageBody
         do {
@@ -472,14 +676,16 @@ final class MeshController: ObservableObject {
                 identity: identity,
                 kind: body.kind,
                 msgId: msgId,
-                replyToMsgId: extendedBody.replyToMsgId
+                replyToMsgId: extendedBody.replyToMsgId,
+                arrival: arrival
             )
         case ProtocolKind.receipt:
             handleIncomingReceipt(
                 sourceAddress: sourceAddress,
                 envelopeSender: opened.senderUserId,
                 body: body,
-                identity: identity
+                identity: identity,
+                arrival: arrival
             )
         case ProtocolKind.friendRequest:
             handleIncomingFriendRequest(
@@ -509,6 +715,13 @@ final class MeshController: ObservableObject {
                 body: body,
                 identity: identity
             )
+        case ProtocolKind.lanEndpointHint:
+            handleIncomingLanEndpointHint(
+                sourceAddress: sourceAddress,
+                senderUserId: opened.senderUserId,
+                body: body,
+                identity: identity
+            )
         case ProtocolKind.groupInvite:
             handleIncomingGroupInvite(
                 sourceLabel: sourceLabel,
@@ -530,7 +743,8 @@ final class MeshController: ObservableObject {
         group: Group,
         opened: OpenedMessage,
         identity: Identity,
-        msgId: Data
+        msgId: Data,
+        arrival: MessageArrival?
     ) {
         guard group.memberUserIds.contains(opened.senderUserId) else {
             log.warning("Dropping group envelope from \(sourceLabel, privacy: .public): signer is not a member of \(group.name, privacy: .public)")
@@ -564,7 +778,8 @@ final class MeshController: ObservableObject {
                 senderUserId: opened.senderUserId,
                 body: body,
                 msgId: msgId,
-                replyToMsgId: extendedBody.replyToMsgId
+                replyToMsgId: extendedBody.replyToMsgId,
+                arrival: arrival
             )
         default:
             log.info("Dropping group envelope from \(sourceLabel, privacy: .public): unhandled kind=\(body.kind)")
@@ -576,7 +791,8 @@ final class MeshController: ObservableObject {
         senderUserId: Data,
         body: MessageBody,
         msgId: Data,
-        replyToMsgId: Data?
+        replyToMsgId: Data?,
+        arrival: MessageArrival?
     ) {
         let inserted = (try? store.insertIncomingMessage(
             message: StoredMessage(
@@ -591,6 +807,14 @@ final class MeshController: ObservableObject {
             replyToMsgId: replyToMsgId
         )) ?? false
         guard inserted else { return }
+        if let arrival {
+            _ = try? store.recordMessageArrival(
+                chatId: group.id,
+                senderUserId: senderUserId,
+                lamport: body.lamport,
+                arrival: arrival
+            )
+        }
         ChatEvents.notifyChatChanged(group.id)
 
         // Local read watermark only (group wire receipts are deferred).
@@ -679,7 +903,8 @@ final class MeshController: ObservableObject {
         identity: Identity,
         kind: UInt8,
         msgId: Data,
-        replyToMsgId: Data?
+        replyToMsgId: Data?,
+        arrival: MessageArrival
     ) {
         let inserted = (try? store.insertIncomingMessage(
             message: StoredMessage(
@@ -694,6 +919,12 @@ final class MeshController: ObservableObject {
             replyToMsgId: replyToMsgId
         )) ?? false
         guard inserted else { return }
+        _ = try? store.recordMessageArrival(
+            chatId: senderUserId,
+            senderUserId: senderUserId,
+            lamport: body.lamport,
+            arrival: arrival
+        )
         ChatEvents.notifyChatChanged(senderUserId)
 
         let through = (try? store.highestContiguousLamport(chatId: senderUserId, senderUserId: senderUserId)) ?? 0
@@ -782,7 +1013,8 @@ final class MeshController: ObservableObject {
         sourceAddress: String?,
         envelopeSender: Data,
         body: MessageBody,
-        identity: Identity
+        identity: Identity,
+        arrival: MessageArrival
     ) {
         guard let receipt = try? decodeReceiptContent(bytes: body.content) else { return }
         guard receipt.senderUserId == identity.userId else { return }
@@ -792,6 +1024,12 @@ final class MeshController: ObservableObject {
             senderUserId: identity.userId,
             receiptType: receipt.receiptType,
             throughLamport: receipt.lamport
+        )
+        _ = try? store.recordMessageArrival(
+            chatId: envelopeSender,
+            senderUserId: identity.userId,
+            lamport: receipt.lamport,
+            arrival: arrival
         )
         ChatEvents.notifyChatChanged(envelopeSender)
     }
@@ -818,6 +1056,9 @@ final class MeshController: ObservableObject {
             relayToken: card.relayToken
         )
         try? store.upsertContact(contact: contact)
+        if let sourceAddress {
+            sendLanEndpointHint(address: sourceAddress)
+        }
         try? store.upsertContactProvenance(provenance: ContactProvenance(
             userId: senderUserId,
             source: pending == nil ? 0 : 1,
@@ -865,6 +1106,46 @@ final class MeshController: ObservableObject {
             MessageNotifier.notifyFriendAdded(contact: contact)
         }
         log.info("Imported contact \(contact.name, privacy: .public) from friend request")
+    }
+
+    private func handleIncomingLanEndpointHint(
+        sourceAddress: String?,
+        senderUserId: Data,
+        body: MessageBody,
+        identity: Identity
+    ) {
+        guard let contact = try? store.getContact(userId: senderUserId),
+              let hint = try? decodeLanEndpointContent(bytes: body.content),
+              let networkId = String(data: hint.networkId, encoding: .utf8) else { return }
+        let endpoint = LanManualEndpoint(host: hint.host, port: hint.port)
+        LanCapabilityStore.markSupported(userId: senderUserId)
+        LanEndpointCache.save(networkId: networkId, userId: senderUserId, endpoint: endpoint)
+        queueCurrentLanEndpoint(to: senderUserId)
+        if let sourceAddress {
+            sendLanEndpointHint(address: sourceAddress)
+        }
+
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        if hint.expiresAtMs > now, currentLanNetworkId == networkId {
+            lanTransport?.connect(endpoint, remoteInstanceToken: hint.instanceToken)
+        }
+
+        let inserted = (try? store.insertMessage(message: StoredMessage(
+            chatId: senderUserId,
+            senderUserId: senderUserId,
+            lamport: body.lamport,
+            timestamp: body.timestamp,
+            kind: ProtocolKind.lanEndpointHint,
+            payload: body.content
+        ))) ?? false
+        if inserted {
+            acknowledgeHiddenMessage(
+                sourceAddress: sourceAddress,
+                senderUserId: senderUserId,
+                identity: identity,
+                contact: contact
+            )
+        }
     }
 
     private func handleIncomingProfileSync(
@@ -1005,6 +1286,9 @@ final class MeshController: ObservableObject {
             relayToken: card.relayToken
         )
         try? store.upsertContact(contact: contact)
+        if let sourceAddress {
+            sendLanEndpointHint(address: sourceAddress)
+        }
         try? store.upsertContactProvenance(provenance: ContactProvenance(
             userId: senderUserId,
             source: 1,
@@ -1106,7 +1390,8 @@ final class MeshController: ObservableObject {
                 group: group,
                 opened: opened,
                 identity: identity,
-                msgId: envelope.msgId
+                msgId: envelope.msgId,
+                arrival: nil
             )
         }
     }

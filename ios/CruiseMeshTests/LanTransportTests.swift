@@ -42,4 +42,62 @@ final class LanTransportTests: XCTestCase {
             )
         )
     }
+
+    func testManualEndpointParserAndLinkRoundTrip() {
+        XCTAssertEqual(
+            parseLanManualEndpoint("10.12.3.4"),
+            LanManualEndpoint(host: "10.12.3.4", port: 45_892)
+        )
+        XCTAssertEqual(
+            parseLanManualEndpoint("[fe80::1]:5555"),
+            LanManualEndpoint(host: "fe80::1", port: 5_555)
+        )
+        XCTAssertNil(parseLanManualEndpoint("host name"))
+
+        let endpoint = LanManualEndpoint(host: "10.12.3.4", port: 45_892)
+        let link = lanEndpointLink(endpoint)
+        XCTAssertEqual(
+            parseLanEndpointLink(URL(string: link)?.fragment),
+            endpoint
+        )
+    }
+
+    func testSubnetCandidatesAreBoundedToOneSlash24() {
+        let hosts = subnet24Hosts(localAddress: "10.154.189.58")
+        XCTAssertEqual(hosts.count, 253)
+        XCTAssertFalse(hosts.contains("10.154.189.58"))
+        XCTAssertTrue(hosts.contains("10.154.189.1"))
+        XCTAssertTrue(hosts.contains("10.154.189.254"))
+        XCTAssertFalse(hosts.contains("10.154.188.1"))
+    }
+
+    func testTransportSendPlanRacesSmallFramesButNotLargeOnes() {
+        let routes: [(MeshRouterState.Transport, String)] = [
+            (.lan, "LAN"),
+            (.central, "BLE-1"),
+            (.peripheral, "BLE-2"),
+        ]
+        XCTAssertEqual(
+            transportSendPlan(routes: routes, frameSize: 512).map(\.1),
+            ["LAN", "BLE-1"]
+        )
+        XCTAssertEqual(
+            transportSendPlan(routes: routes, frameSize: 64 * 1_024).map(\.1),
+            ["LAN"]
+        )
+    }
+}
+
+final class LanHealthTrackerTests: XCTestCase {
+    func testProbeTimeoutsEventuallyCloseLinkAndResponseResetsFailures() {
+        let tracker = LanHealthTracker(timeoutMs: 10, maxConsecutiveTimeouts: 3)
+        XCTAssertEqual(tracker.next(address: "LAN", nowMs: 0, nonce: 1), .send(1))
+        XCTAssertEqual(tracker.next(address: "LAN", nowMs: 5, nonce: 2), .wait)
+        XCTAssertEqual(tracker.next(address: "LAN", nowMs: 10, nonce: 2), .send(2))
+        XCTAssertEqual(tracker.response(address: "LAN", nonce: 2, nowMs: 14), 4)
+        XCTAssertEqual(tracker.next(address: "LAN", nowMs: 20, nonce: 3), .send(3))
+        XCTAssertEqual(tracker.next(address: "LAN", nowMs: 30, nonce: 4), .send(4))
+        XCTAssertEqual(tracker.next(address: "LAN", nowMs: 40, nonce: 5), .send(5))
+        XCTAssertEqual(tracker.next(address: "LAN", nowMs: 50, nonce: 6), .close)
+    }
 }

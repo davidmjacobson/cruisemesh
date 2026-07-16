@@ -8,6 +8,7 @@ struct ProfileView: View {
     let identity: Identity
     @ObservedObject var appModel: AppModel
     @ObservedObject private var runtime = MeshRuntimeStatus.shared
+    @ObservedObject private var lanDiagnostics = LanTransportDiagnostics.shared
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
 
@@ -18,6 +19,10 @@ struct ProfileView: View {
     @State private var avatarImage: UIImage?
     @State private var photoItem: PhotosPickerItem?
     @State private var friendsOfFriends = true
+    @State private var lanAddress = ""
+    @State private var lanError: String?
+    @State private var showLanQR = false
+    @State private var showLanScanner = false
 
     var body: some View {
         NavigationStack {
@@ -74,6 +79,73 @@ struct ProfileView: View {
                             if on { appModel.startMesh() } else { appModel.stopMesh() }
                         }
                     LabeledContent("Status", value: runtime.pillText)
+                }
+                Section("Local Wi-Fi (experimental)") {
+                    Text(lanDiagnostics.snapshot.state)
+                    if let endpoint = lanDiagnostics.snapshot.localEndpoint {
+                        LabeledContent("This phone", value: endpoint)
+                            .font(.footnote.monospaced())
+                        Button("Copy this phone's address") {
+                            UIPasteboard.general.string = endpoint
+                        }
+                        HStack {
+                            Button("Show address QR") { showLanQR = true }
+                            Spacer()
+                            Button("Scan address QR") { showLanScanner = true }
+                        }
+                    }
+                    if !lanDiagnostics.snapshot.activePeerNames.isEmpty {
+                        Text("Secure link: \(lanDiagnostics.snapshot.activePeerNames.joined(separator: ", "))")
+                            .foregroundStyle(.tint)
+                    }
+                    if let endpoint = lanDiagnostics.snapshot.lastPeerEndpoint {
+                        LabeledContent("Last peer", value: endpoint)
+                            .font(.caption)
+                    }
+                    TextField("Friend IP address", text: $lanAddress)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.numbersAndPunctuation)
+                    Text("The port is optional. Manual connection still requires an accepted friend and CruiseMesh's encrypted identity check.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Connect securely") {
+                        if !appModel.meshEnabled {
+                            appModel.startMesh()
+                            meshOn = true
+                        }
+                        lanError = lanDiagnostics.requestManualConnection(lanAddress)
+                    }
+                    Button("Test encrypted LAN link") {
+                        lanError = lanDiagnostics.requestConnectionTest()
+                    }
+                    Button("Search this /24 network") {
+                        lanError = lanDiagnostics.requestSubnetScan()
+                    }
+                    if let total = lanDiagnostics.snapshot.scanTotal {
+                        ProgressView(
+                            value: Double(lanDiagnostics.snapshot.scanProgress ?? 0),
+                            total: Double(total)
+                        ) {
+                            Text("Checked \(lanDiagnostics.snapshot.scanProgress ?? 0) of \(total) addresses")
+                                .font(.caption)
+                        }
+                    }
+                    if let probe = lanDiagnostics.snapshot.probeStatus {
+                        Text(probe)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(
+                        "Encrypted frames: \(lanDiagnostics.snapshot.sentFrames) sent · \(lanDiagnostics.snapshot.receivedFrames) received"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    if let error = lanError ?? lanDiagnostics.snapshot.lastError {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
                 }
                 Section("Privacy") {
                     Toggle("Friends of friends", isOn: $friendsOfFriends)
@@ -158,6 +230,69 @@ struct ProfileView: View {
                             epoch: epoch
                         )
                     }
+                }
+            }
+            .sheet(isPresented: $showLanQR) {
+                if let endpointText = lanDiagnostics.snapshot.localEndpoint,
+                   let endpoint = parseLanManualEndpoint(endpointText) {
+                    LanEndpointQRView(endpoint: endpoint)
+                }
+            }
+            .sheet(isPresented: $showLanScanner) {
+                QRScannerView { code in
+                    let fragment = URL(string: code)?.fragment ?? code
+                    guard let endpoint = parseLanEndpointLink(fragment) else {
+                        lanError = "That QR code is not a CruiseMesh LAN address"
+                        return
+                    }
+                    showLanScanner = false
+                    if !appModel.meshEnabled {
+                        appModel.startMesh()
+                        meshOn = true
+                    }
+                    LanTransportDiagnostics.shared.queueManualConnection(endpoint)
+                    lanAddress = endpoint.display
+                    lanError = nil
+                }
+            }
+        }
+    }
+}
+
+private struct LanEndpointQRView: View {
+    let endpoint: LanManualEndpoint
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 18) {
+                let link = lanEndpointLink(endpoint)
+                if let image = QRCodeGenerator.image(from: link, size: 260) {
+                    Image(uiImage: image)
+                        .interpolation(.none)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 260, height: 260)
+                        .padding()
+                        .background(RoundedRectangle(cornerRadius: 16).fill(Color.white))
+                }
+                Text(endpoint.display)
+                    .font(.body.monospaced())
+                Text("Your friend must already be accepted. The QR only supplies a local network address; the encrypted identity check still applies.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+                ShareLink(item: link) {
+                    Label("Share address", systemImage: "square.and.arrow.up")
+                }
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Local Wi-Fi address")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
                 }
             }
         }
