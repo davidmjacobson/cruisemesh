@@ -102,6 +102,8 @@ use crate::{
     SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST,
 };
 
+const MESSAGE_ID_LEN: usize = 16;
+
 /// One stored message body (DESIGN.md §7.1). `timestamp` is milliseconds
 /// since the Unix epoch; `kind` matches the DESIGN.md §7.1 `kind` byte
 /// (text=1, receipt=2, friend-request=3, group-invite=4, ...).
@@ -122,6 +124,14 @@ pub struct MessageArrival {
     pub transport: u8,
     pub hops_taken: u8,
     pub received_at: i64,
+}
+
+/// Stable envelope identity for a stored message and, for replies, the
+/// encrypted id of the quoted message. Legacy rows may have no reference.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct MessageReference {
+    pub msg_id: Vec<u8>,
+    pub reply_to_msg_id: Option<Vec<u8>>,
 }
 
 /// An accepted friend (DESIGN.md §6.2): the public half of someone else's
@@ -262,6 +272,38 @@ impl MessageStore {
         ensure_column(&conn, "messages", "arrival_transport", "INTEGER")?;
         ensure_column(&conn, "messages", "hops_taken", "INTEGER")?;
         ensure_column(&conn, "messages", "received_at", "INTEGER")?;
+        ensure_column(&conn, "messages", "msg_id", "BLOB")?;
+        ensure_column(&conn, "messages", "reply_to_msg_id", "BLOB")?;
+        // Older stores already have stable ids for locally authored rows in
+        // the outbound queue. Backfill those so they can be quoted after an
+        // upgrade; received legacy rows cannot be recovered retroactively.
+        conn.execute(
+            "UPDATE messages
+             SET msg_id = (
+                 SELECT outbound_envelopes.msg_id
+                 FROM outbound_envelopes
+                 WHERE outbound_envelopes.chat_id = messages.chat_id
+                   AND outbound_envelopes.sender_user_id = messages.sender_user_id
+                   AND outbound_envelopes.lamport = messages.lamport
+                 ORDER BY outbound_envelopes.queued_at ASC
+                 LIMIT 1
+             )
+             WHERE msg_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM outbound_envelopes
+                   WHERE outbound_envelopes.chat_id = messages.chat_id
+                     AND outbound_envelopes.sender_user_id = messages.sender_user_id
+                     AND outbound_envelopes.lamport = messages.lamport
+               )",
+            [],
+        )
+        .map_err(store_err)?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_chat_msg_id
+             ON messages(chat_id, msg_id)",
+            [],
+        )
+        .map_err(store_err)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -298,14 +340,43 @@ impl MessageStore {
     ///   this runs in one transaction so a crash mid-recovery can't leave the
     ///   stale tail and the new message coexisting.
     pub fn insert_message(&self, message: StoredMessage) -> Result<bool, CoreError> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        incoming_message_reference::insert(self, message, None, None)
+    }
+
+    /// Insert an opened incoming message together with the envelope id used
+    /// for quoting it and an optional encrypted reply target.
+    pub fn insert_incoming_message(
+        &self,
+        message: StoredMessage,
+        msg_id: Vec<u8>,
+        reply_to_msg_id: Option<Vec<u8>>,
+    ) -> Result<bool, CoreError> {
+        validate_msg_id("msg_id", &msg_id)?;
+        if let Some(reply_to_msg_id) = reply_to_msg_id.as_deref() {
+            validate_msg_id("reply_to_msg_id", reply_to_msg_id)?;
+        }
+        incoming_message_reference::insert(self, message, Some(msg_id), reply_to_msg_id)
+    }
+}
+
+mod incoming_message_reference {
+    use super::*;
+
+    pub(super) fn insert(
+        store: &MessageStore,
+        message: StoredMessage,
+        msg_id: Option<Vec<u8>>,
+        reply_to_msg_id: Option<Vec<u8>>,
+    ) -> Result<bool, CoreError> {
+        let mut conn = store.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
 
         let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO messages
-                    (chat_id, sender_user_id, lamport, timestamp, kind, payload)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (chat_id, sender_user_id, lamport, timestamp, kind, payload,
+                     msg_id, reply_to_msg_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     message.chat_id,
                     message.sender_user_id,
@@ -313,6 +384,8 @@ impl MessageStore {
                     message.timestamp,
                     message.kind as i64,
                     message.payload,
+                    msg_id,
+                    reply_to_msg_id,
                 ],
             )
             .map_err(store_err)?
@@ -325,25 +398,26 @@ impl MessageStore {
 
         // Conflict: a row already exists at this (chat_id, sender_user_id,
         // lamport). Figure out whether it's the same message or a fork.
-        let existing: Option<(i64, i64, Vec<u8>)> = tx
+        let existing: Option<(i64, i64, Vec<u8>, Option<Vec<u8>>)> = tx
             .query_row(
-                "SELECT timestamp, kind, payload FROM messages
+                "SELECT timestamp, kind, payload, reply_to_msg_id FROM messages
                  WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
                 params![
                     message.chat_id,
                     message.sender_user_id,
                     message.lamport as i64
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(store_err)?;
 
         let is_true_duplicate = match &existing {
-            Some((timestamp, kind, payload)) => {
+            Some((timestamp, kind, payload, existing_reply_to_msg_id)) => {
                 *timestamp == message.timestamp
                     && *kind == message.kind as i64
                     && *payload == message.payload
+                    && *existing_reply_to_msg_id == reply_to_msg_id
             }
             // Shouldn't happen (we just failed to insert on a conflict), but
             // if the row vanished under us, treat it as nothing to recover.
@@ -354,6 +428,19 @@ impl MessageStore {
         };
 
         if is_true_duplicate {
+            if msg_id.is_some() {
+                tx.execute(
+                    "UPDATE messages SET msg_id = COALESCE(msg_id, ?4)
+                     WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+                    params![
+                        message.chat_id,
+                        message.sender_user_id,
+                        message.lamport as i64,
+                        msg_id,
+                    ],
+                )
+                .map_err(store_err)?;
+            }
             tx.commit().map_err(store_err)?;
             return Ok(false);
         }
@@ -387,8 +474,9 @@ impl MessageStore {
         .map_err(store_err)?;
         tx.execute(
             "INSERT INTO messages
-                (chat_id, sender_user_id, lamport, timestamp, kind, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (chat_id, sender_user_id, lamport, timestamp, kind, payload,
+                 msg_id, reply_to_msg_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 message.chat_id,
                 message.sender_user_id,
@@ -396,6 +484,8 @@ impl MessageStore {
                 message.timestamp,
                 message.kind as i64,
                 message.payload,
+                msg_id,
+                reply_to_msg_id,
             ],
         )
         .map_err(store_err)?;
@@ -403,7 +493,10 @@ impl MessageStore {
         tx.commit().map_err(store_err)?;
         Ok(true)
     }
+}
 
+#[uniffi::export]
+impl MessageStore {
     /// Atomically persist one locally authored message and the exact sealed
     /// envelope that should be retried for it over BLE and relay. The message
     /// row stays idempotent on `(chat_id, sender_user_id, lamport)`; the
@@ -416,12 +509,48 @@ impl MessageStore {
         envelope: OutboundEnvelope,
         queued_at_ms: i64,
     ) -> Result<bool, CoreError> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        outgoing_message_reference::insert(self, message, envelope, None, queued_at_ms)
+    }
+
+    /// Atomically persist a locally authored reply and its stable sealed
+    /// envelope. The target id remains local metadata as well as encrypted
+    /// body metadata, so rendering never needs to reopen ciphertext.
+    pub fn insert_outgoing_reply(
+        &self,
+        message: StoredMessage,
+        envelope: OutboundEnvelope,
+        reply_to_msg_id: Vec<u8>,
+        queued_at_ms: i64,
+    ) -> Result<bool, CoreError> {
+        validate_msg_id("msg_id", &envelope.msg_id)?;
+        validate_msg_id("reply_to_msg_id", &reply_to_msg_id)?;
+        outgoing_message_reference::insert(
+            self,
+            message,
+            envelope,
+            Some(reply_to_msg_id),
+            queued_at_ms,
+        )
+    }
+}
+
+mod outgoing_message_reference {
+    use super::*;
+
+    pub(super) fn insert(
+        store: &MessageStore,
+        message: StoredMessage,
+        envelope: OutboundEnvelope,
+        reply_to_msg_id: Option<Vec<u8>>,
+        queued_at_ms: i64,
+    ) -> Result<bool, CoreError> {
+        let mut conn = store.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
         tx.execute(
             "INSERT OR IGNORE INTO messages
-                (chat_id, sender_user_id, lamport, timestamp, kind, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (chat_id, sender_user_id, lamport, timestamp, kind, payload,
+                 msg_id, reply_to_msg_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 message.chat_id,
                 message.sender_user_id,
@@ -429,6 +558,22 @@ impl MessageStore {
                 message.timestamp,
                 message.kind as i64,
                 message.payload,
+                envelope.msg_id,
+                reply_to_msg_id,
+            ],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "UPDATE messages
+             SET msg_id = COALESCE(msg_id, ?4),
+                 reply_to_msg_id = COALESCE(reply_to_msg_id, ?5)
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+            params![
+                message.chat_id,
+                message.sender_user_id,
+                message.lamport as i64,
+                envelope.msg_id,
+                reply_to_msg_id,
             ],
         )
         .map_err(store_err)?;
@@ -464,7 +609,10 @@ impl MessageStore {
         tx.commit().map_err(store_err)?;
         Ok(changed > 0)
     }
+}
 
+#[uniffi::export]
+impl MessageStore {
     /// All messages in a chat, oldest first by author timestamp.
     ///
     /// `lamport` is only comparable within one sender's stream
@@ -486,6 +634,53 @@ impl MessageStore {
             .query_map(params![chat_id], row_to_message)
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Stable id and optional reply target for one stored message. Returns
+    /// `None` for legacy rows whose inbound envelope id was never recorded.
+    pub fn message_reference(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        lamport: u64,
+    ) -> Result<Option<MessageReference>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT msg_id, reply_to_msg_id
+             FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
+               AND msg_id IS NOT NULL",
+            params![chat_id, sender_user_id, lamport as i64],
+            |row| {
+                Ok(MessageReference {
+                    msg_id: row.get(0)?,
+                    reply_to_msg_id: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    /// Resolve a quoted message by stable envelope id within one chat.
+    /// Missing history is expected and returns `None`.
+    pub fn message_by_msg_id(
+        &self,
+        chat_id: Vec<u8>,
+        msg_id: Vec<u8>,
+    ) -> Result<Option<StoredMessage>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+             FROM messages
+             WHERE chat_id = ?1 AND msg_id = ?2
+             ORDER BY id ASC
+             LIMIT 1",
+            params![chat_id, msg_id],
+            row_to_message,
+        )
+        .optional()
+        .map_err(store_err)
     }
 
     /// Attach first-arrival diagnostics to an already inserted incoming
@@ -2064,6 +2259,15 @@ fn store_err(e: rusqlite::Error) -> CoreError {
     CoreError::Store(e.to_string())
 }
 
+fn validate_msg_id(field: &str, msg_id: &[u8]) -> Result<(), CoreError> {
+    if msg_id.len() != MESSAGE_ID_LEN {
+        return Err(CoreError::Malformed(format!(
+            "{field} must be exactly {MESSAGE_ID_LEN} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn outbound_message_dedupe_key(
     chat_id: &[u8],
     sender_user_id: &[u8],
@@ -2148,6 +2352,8 @@ CREATE TABLE IF NOT EXISTS messages (
     arrival_transport INTEGER,
     hops_taken     INTEGER,
     received_at    INTEGER,
+    msg_id         BLOB,
+    reply_to_msg_id BLOB,
     UNIQUE(chat_id, sender_user_id, lamport)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_lamport ON messages(chat_id, lamport);
@@ -2381,6 +2587,136 @@ mod tests {
     }
 
     #[test]
+    fn incoming_message_reference_round_trips_and_resolves_quote_target() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let original = msg(b"chat-a", b"alice", 1, "first");
+        let original_id = vec![1; MESSAGE_ID_LEN];
+        assert!(store
+            .insert_incoming_message(original.clone(), original_id.clone(), None)
+            .unwrap());
+
+        let reply = msg(b"chat-a", b"alice", 2, "second");
+        let reply_id = vec![2; MESSAGE_ID_LEN];
+        assert!(store
+            .insert_incoming_message(reply.clone(), reply_id.clone(), Some(original_id.clone()),)
+            .unwrap());
+        assert_eq!(
+            store
+                .message_reference(
+                    reply.chat_id.clone(),
+                    reply.sender_user_id.clone(),
+                    reply.lamport,
+                )
+                .unwrap(),
+            Some(MessageReference {
+                msg_id: reply_id,
+                reply_to_msg_id: Some(original_id.clone()),
+            }),
+        );
+        assert_eq!(
+            store
+                .message_by_msg_id(reply.chat_id.clone(), original_id)
+                .unwrap(),
+            Some(original),
+        );
+
+        // A redundant copy cannot replace the first stable envelope id.
+        assert!(!store
+            .insert_incoming_message(
+                reply.clone(),
+                vec![3; MESSAGE_ID_LEN],
+                Some(vec![1; MESSAGE_ID_LEN]),
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .message_reference(reply.chat_id, reply.sender_user_id, reply.lamport)
+                .unwrap()
+                .unwrap()
+                .msg_id,
+            vec![2; MESSAGE_ID_LEN],
+        );
+    }
+
+    #[test]
+    fn outgoing_reply_persists_reference_atomically() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let message = msg(b"chat-a", b"self", 1, "reply");
+        let envelope = outbound_for(&message, b"recipient", &[4; MESSAGE_ID_LEN]);
+        let reply_to = vec![5; MESSAGE_ID_LEN];
+        assert!(store
+            .insert_outgoing_reply(message.clone(), envelope, reply_to.clone(), 1_000)
+            .unwrap());
+        assert_eq!(
+            store
+                .message_reference(message.chat_id, message.sender_user_id, message.lamport)
+                .unwrap(),
+            Some(MessageReference {
+                msg_id: vec![4; MESSAGE_ID_LEN],
+                reply_to_msg_id: Some(reply_to),
+            }),
+        );
+    }
+
+    #[test]
+    fn open_backfills_authored_message_ids_from_the_outbound_queue() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cruisemesh-store-message-reference-backfill-{unique}.sqlite"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let message = msg(b"chat-a", b"self", 1, "sent before upgrade");
+        let msg_id = vec![6; MESSAGE_ID_LEN];
+
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        store
+            .insert_outgoing_message(
+                message.clone(),
+                outbound_for(&message, b"recipient", &msg_id),
+                1_000,
+            )
+            .unwrap();
+        drop(store);
+
+        // Model the old schema's message row after the columns are added but
+        // before open() performs its outbound-queue backfill.
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute("UPDATE messages SET msg_id = NULL", [])
+            .unwrap();
+        drop(conn);
+
+        let reopened = MessageStore::open(path_str).unwrap();
+        assert_eq!(
+            reopened
+                .message_reference(message.chat_id, message.sender_user_id, message.lamport)
+                .unwrap(),
+            Some(MessageReference {
+                msg_id,
+                reply_to_msg_id: None,
+            }),
+        );
+
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn incoming_references_require_fixed_width_ids() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(matches!(
+            store.insert_incoming_message(
+                msg(b"chat-a", b"alice", 1, "hi"),
+                vec![1; MESSAGE_ID_LEN - 1],
+                None,
+            ),
+            Err(CoreError::Malformed(_))
+        ));
+    }
+
+    #[test]
     fn message_arrival_records_first_route_without_changing_message_shape() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let message = msg(b"chat-a", b"alice", 1, "hi");
@@ -2434,14 +2770,24 @@ mod tests {
         store.insert_message(message.clone()).unwrap();
         assert_eq!(
             store
-                .message_arrival(message.chat_id, message.sender_user_id, message.lamport)
+                .message_arrival(
+                    message.chat_id.clone(),
+                    message.sender_user_id.clone(),
+                    message.lamport,
+                )
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            store
+                .message_reference(message.chat_id, message.sender_user_id, message.lamport)
                 .unwrap(),
             None,
         );
     }
 
     #[test]
-    fn open_migrates_old_messages_table_to_add_arrival_columns() {
+    fn open_migrates_old_messages_table_to_add_arrival_and_reference_columns() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2486,6 +2832,28 @@ mod tests {
                 .message_arrival(b"chat-a".to_vec(), b"alice".to_vec(), 1)
                 .unwrap(),
             Some(arrival),
+        );
+
+        let legacy = StoredMessage {
+            chat_id: b"chat-a".to_vec(),
+            sender_user_id: b"alice".to_vec(),
+            lamport: 1,
+            timestamp: 1_700_000_000_000,
+            kind: 0,
+            payload: b"hi".to_vec(),
+        };
+        let legacy_id = vec![9; MESSAGE_ID_LEN];
+        assert!(!store
+            .insert_incoming_message(legacy, legacy_id.clone(), None)
+            .unwrap());
+        assert_eq!(
+            store
+                .message_reference(b"chat-a".to_vec(), b"alice".to_vec(), 1)
+                .unwrap(),
+            Some(MessageReference {
+                msg_id: legacy_id,
+                reply_to_msg_id: None,
+            }),
         );
 
         drop(store);

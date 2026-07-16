@@ -770,6 +770,12 @@ public protocol MessageStoreProtocol : AnyObject {
     func highestLamport(chatId: Data, senderUserId: Data) throws  -> UInt64
 
     /**
+     * Insert an opened incoming message together with the envelope id used
+     * for quoting it and an optional encrypted reply target.
+     */
+    func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgId: Data?) throws  -> Bool
+
+    /**
      * Insert a message from a remote sender's stream, distinguishing a true
      * duplicate from a *forked* stream instead of silently dropping both the
      * same way.
@@ -814,6 +820,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func insertOutgoingMessage(message: StoredMessage, envelope: OutboundEnvelope, queuedAtMs: Int64) throws  -> Bool
 
     /**
+     * Atomically persist a locally authored reply and its stable sealed
+     * envelope. The target id remains local metadata as well as encrypted
+     * body metadata, so rendering never needs to reopen ciphertext.
+     */
+    func insertOutgoingReply(message: StoredMessage, envelope: OutboundEnvelope, replyToMsgId: Data, queuedAtMs: Int64) throws  -> Bool
+
+    /**
      * All contacts, alphabetical by name.
      */
     func listContacts() throws  -> [Contact]
@@ -842,6 +855,18 @@ public protocol MessageStoreProtocol : AnyObject {
      * authored/legacy rows that predate diagnostics.
      */
     func messageArrival(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> MessageArrival?
+
+    /**
+     * Resolve a quoted message by stable envelope id within one chat.
+     * Missing history is expected and returns `None`.
+     */
+    func messageByMsgId(chatId: Data, msgId: Data) throws  -> StoredMessage?
+
+    /**
+     * Stable id and optional reply target for one stored message. Returns
+     * `None` for legacy rows whose inbound envelope id was never recorded.
+     */
+    func messageReference(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> MessageReference?
 
     /**
      * Messages from `sender_user_id` in `chat_id` with `lamport >
@@ -1421,6 +1446,20 @@ open func highestLamport(chatId: Data, senderUserId: Data)throws  -> UInt64 {
 }
 
     /**
+     * Insert an opened incoming message together with the envelope id used
+     * for quoting it and an optional encrypted reply target.
+     */
+open func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgId: Data?)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_insert_incoming_message(self.uniffiClonePointer(),
+        FfiConverterTypeStoredMessage.lower(message),
+        FfiConverterData.lower(msgId),
+        FfiConverterOptionData.lower(replyToMsgId),$0
+    )
+})
+}
+
+    /**
      * Insert a message from a remote sender's stream, distinguishing a true
      * duplicate from a *forked* stream instead of silently dropping both the
      * same way.
@@ -1473,6 +1512,22 @@ open func insertOutgoingMessage(message: StoredMessage, envelope: OutboundEnvelo
     uniffi_cruisemesh_core_fn_method_messagestore_insert_outgoing_message(self.uniffiClonePointer(),
         FfiConverterTypeStoredMessage.lower(message),
         FfiConverterTypeOutboundEnvelope.lower(envelope),
+        FfiConverterInt64.lower(queuedAtMs),$0
+    )
+})
+}
+
+    /**
+     * Atomically persist a locally authored reply and its stable sealed
+     * envelope. The target id remains local metadata as well as encrypted
+     * body metadata, so rendering never needs to reopen ciphertext.
+     */
+open func insertOutgoingReply(message: StoredMessage, envelope: OutboundEnvelope, replyToMsgId: Data, queuedAtMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_insert_outgoing_reply(self.uniffiClonePointer(),
+        FfiConverterTypeStoredMessage.lower(message),
+        FfiConverterTypeOutboundEnvelope.lower(envelope),
+        FfiConverterData.lower(replyToMsgId),
         FfiConverterInt64.lower(queuedAtMs),$0
     )
 })
@@ -1539,6 +1594,33 @@ open func markOutgoingReceiptEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64)
 open func messageArrival(chatId: Data, senderUserId: Data, lamport: UInt64)throws  -> MessageArrival? {
     return try  FfiConverterOptionTypeMessageArrival.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_message_arrival(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterUInt64.lower(lamport),$0
+    )
+})
+}
+
+    /**
+     * Resolve a quoted message by stable envelope id within one chat.
+     * Missing history is expected and returns `None`.
+     */
+open func messageByMsgId(chatId: Data, msgId: Data)throws  -> StoredMessage? {
+    return try  FfiConverterOptionTypeStoredMessage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_message_by_msg_id(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(msgId),$0
+    )
+})
+}
+
+    /**
+     * Stable id and optional reply target for one stored message. Returns
+     * `None` for legacy rows whose inbound envelope id was never recorded.
+     */
+open func messageReference(chatId: Data, senderUserId: Data, lamport: UInt64)throws  -> MessageReference? {
+    return try  FfiConverterOptionTypeMessageReference.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_message_reference(self.uniffiClonePointer(),
         FfiConverterData.lower(chatId),
         FfiConverterData.lower(senderUserId),
         FfiConverterUInt64.lower(lamport),$0
@@ -2564,6 +2646,108 @@ public func FfiConverterTypeDigestEntry_lower(_ value: DigestEntry) -> RustBuffe
 
 
 /**
+ * A decoded message body plus optional encrypted metadata appended after
+ * the legacy content field. Unknown extension types are skipped.
+ */
+public struct ExtendedMessageBody {
+    public var kind: UInt8
+    public var chatId: Data
+    public var lamport: UInt64
+    public var timestamp: Int64
+    public var content: Data
+    public var replyToMsgId: Data?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: UInt8, chatId: Data, lamport: UInt64, timestamp: Int64, content: Data, replyToMsgId: Data?) {
+        self.kind = kind
+        self.chatId = chatId
+        self.lamport = lamport
+        self.timestamp = timestamp
+        self.content = content
+        self.replyToMsgId = replyToMsgId
+    }
+}
+
+
+
+extension ExtendedMessageBody: Equatable, Hashable {
+    public static func ==(lhs: ExtendedMessageBody, rhs: ExtendedMessageBody) -> Bool {
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.chatId != rhs.chatId {
+            return false
+        }
+        if lhs.lamport != rhs.lamport {
+            return false
+        }
+        if lhs.timestamp != rhs.timestamp {
+            return false
+        }
+        if lhs.content != rhs.content {
+            return false
+        }
+        if lhs.replyToMsgId != rhs.replyToMsgId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(kind)
+        hasher.combine(chatId)
+        hasher.combine(lamport)
+        hasher.combine(timestamp)
+        hasher.combine(content)
+        hasher.combine(replyToMsgId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeExtendedMessageBody: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ExtendedMessageBody {
+        return
+            try ExtendedMessageBody(
+                kind: FfiConverterUInt8.read(from: &buf),
+                chatId: FfiConverterData.read(from: &buf),
+                lamport: FfiConverterUInt64.read(from: &buf),
+                timestamp: FfiConverterInt64.read(from: &buf),
+                content: FfiConverterData.read(from: &buf),
+                replyToMsgId: FfiConverterOptionData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ExtendedMessageBody, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.kind, into: &buf)
+        FfiConverterData.write(value.chatId, into: &buf)
+        FfiConverterUInt64.write(value.lamport, into: &buf)
+        FfiConverterInt64.write(value.timestamp, into: &buf)
+        FfiConverterData.write(value.content, into: &buf)
+        FfiConverterOptionData.write(value.replyToMsgId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeExtendedMessageBody_lift(_ buf: RustBuffer) throws -> ExtendedMessageBody {
+    return try FfiConverterTypeExtendedMessageBody.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeExtendedMessageBody_lower(_ value: ExtendedMessageBody) -> RustBuffer {
+    return FfiConverterTypeExtendedMessageBody.lower(value)
+}
+
+
+/**
  * The public, shareable half of an identity — what a QR code / friend-request
  * string actually carries. No secret material.
  */
@@ -3449,6 +3633,76 @@ public func FfiConverterTypeMessageBody_lift(_ buf: RustBuffer) throws -> Messag
 #endif
 public func FfiConverterTypeMessageBody_lower(_ value: MessageBody) -> RustBuffer {
     return FfiConverterTypeMessageBody.lower(value)
+}
+
+
+/**
+ * Stable envelope identity for a stored message and, for replies, the
+ * encrypted id of the quoted message. Legacy rows may have no reference.
+ */
+public struct MessageReference {
+    public var msgId: Data
+    public var replyToMsgId: Data?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(msgId: Data, replyToMsgId: Data?) {
+        self.msgId = msgId
+        self.replyToMsgId = replyToMsgId
+    }
+}
+
+
+
+extension MessageReference: Equatable, Hashable {
+    public static func ==(lhs: MessageReference, rhs: MessageReference) -> Bool {
+        if lhs.msgId != rhs.msgId {
+            return false
+        }
+        if lhs.replyToMsgId != rhs.replyToMsgId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(msgId)
+        hasher.combine(replyToMsgId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageReference: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageReference {
+        return
+            try MessageReference(
+                msgId: FfiConverterData.read(from: &buf),
+                replyToMsgId: FfiConverterOptionData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MessageReference, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.msgId, into: &buf)
+        FfiConverterOptionData.write(value.replyToMsgId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageReference_lift(_ buf: RustBuffer) throws -> MessageReference {
+    return try FfiConverterTypeMessageReference.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageReference_lower(_ value: MessageReference) -> RustBuffer {
+    return FfiConverterTypeMessageReference.lower(value)
 }
 
 
@@ -4554,6 +4808,30 @@ fileprivate struct FfiConverterOptionTypeMessageArrival: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeMessageReference: FfiConverterRustBuffer {
+    typealias SwiftType = MessageReference?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMessageReference.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMessageReference.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeOutgoingReceiptEnvelope: FfiConverterRustBuffer {
     typealias SwiftType = OutgoingReceiptEnvelope?
 
@@ -4570,6 +4848,30 @@ fileprivate struct FfiConverterOptionTypeOutgoingReceiptEnvelope: FfiConverterRu
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeOutgoingReceiptEnvelope.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeStoredMessage: FfiConverterRustBuffer {
+    typealias SwiftType = StoredMessage?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeStoredMessage.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeStoredMessage.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -4895,6 +5197,17 @@ public func createIntroductionTicket(introducer: Identity, candidateUserId: Data
     )
 })
 }
+/**
+ * Decode the legacy message fields and any known append-only extensions.
+ * Unknown well-formed TLVs are ignored for forward compatibility.
+ */
+public func decodeExtendedMessageBody(bytes: Data)throws  -> ExtendedMessageBody {
+    return try  FfiConverterTypeExtendedMessageBody.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_decode_extended_message_body(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
 public func decodeFriendDirectoryContent(bytes: Data)throws  -> FriendDirectoryContent {
     return try  FfiConverterTypeFriendDirectoryContent.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_decode_friend_directory_content(
@@ -4921,7 +5234,8 @@ public func decodeIntroducedFriendRequest(bytes: Data)throws  -> IntroducedFrien
 }
 /**
  * Decode a [`MessageBody`] from its wire form. Rejects truncated input,
- * corrupt length prefixes, and unexpected trailing bytes.
+ * corrupt length prefixes, and malformed extension TLVs while ignoring
+ * well-formed extensions the legacy record does not surface.
  */
 public func decodeMessageBody(bytes: Data)throws  -> MessageBody {
     return try  FfiConverterTypeMessageBody.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -5049,6 +5363,19 @@ public func encodeMessageBody(body: MessageBody) -> Data {
     return try!  FfiConverterData.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_encode_message_body(
         FfiConverterTypeMessageBody.lower(body),$0
+    )
+})
+}
+/**
+ * Encode a message body with an encrypted reference to the message being
+ * replied to. The fixed-width id is the target envelope's public `msg_id`,
+ * but it remains private here because the extension is inside the seal.
+ */
+public func encodeMessageBodyWithReply(body: MessageBody, replyToMsgId: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_encode_message_body_with_reply(
+        FfiConverterTypeMessageBody.lower(body),
+        FfiConverterData.lower(replyToMsgId),$0
     )
 })
 }
@@ -5282,6 +5609,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_create_introduction_ticket() != 2547) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_decode_extended_message_body() != 61344) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_decode_friend_directory_content() != 14721) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5291,7 +5621,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_decode_introduced_friend_request() != 4415) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_decode_message_body() != 59698) {
+    if (uniffi_cruisemesh_core_checksum_func_decode_message_body() != 1469) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_decode_profile_sync_content() != 4329) {
@@ -5322,6 +5652,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_message_body() != 28014) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_encode_message_body_with_reply() != 53763) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_profile_sync_content() != 26330) {
@@ -5438,10 +5771,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 63032) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message() != 46727) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_message() != 64810) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_outgoing_message() != 32750) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_outgoing_reply() != 64676) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_list_contacts() != 40385) {
@@ -5460,6 +5799,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_message_arrival() != 44635) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_by_msg_id() != 40731) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_reference() != 37519) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_messages_after() != 55946) {
