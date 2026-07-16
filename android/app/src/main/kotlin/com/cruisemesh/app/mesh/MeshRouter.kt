@@ -105,8 +105,14 @@ object MeshRouter {
      * (DESIGN.md §7.3) delivers it once the peer is next seen and HELLOs in.
      */
     fun sendToUserId(userId: ByteArray, frame: ByteArray): Boolean {
-        val (transport, address) = state.routeFor(userId) ?: return false
-        return dispatch(transport, address, frame)
+        val routes = state.routesFor(userId)
+        if (routes.isEmpty()) return false
+        val selected = transportSendPlan(routes, frame.size)
+        var sent = false
+        for ((transport, address) in selected) {
+            sent = dispatch(transport, address, frame) || sent
+        }
+        return sent
     }
 
     /**
@@ -162,4 +168,22 @@ object MeshRouter {
         send(address, frame)
         return true
     }
+}
+
+private const val SMALL_FRAME_RACE_MAX_BYTES = 8 * 1024
+
+/**
+ * Small control/text frames race over LAN plus one BLE route; large payloads
+ * use only the highest-priority route so photos do not duplicate over BLE.
+ */
+internal fun transportSendPlan(
+    routes: List<Pair<MeshRouterState.Transport, String>>,
+    frameSize: Int,
+): List<Pair<MeshRouterState.Transport, String>> {
+    if (routes.isEmpty()) return emptyList()
+    val lan = routes.firstOrNull { it.first == MeshRouterState.Transport.LAN }
+        ?: return listOf(routes.first())
+    if (frameSize > SMALL_FRAME_RACE_MAX_BYTES) return listOf(lan)
+    val ble = routes.firstOrNull { it.first != MeshRouterState.Transport.LAN }
+    return if (ble == null) listOf(lan) else listOf(lan, ble)
 }

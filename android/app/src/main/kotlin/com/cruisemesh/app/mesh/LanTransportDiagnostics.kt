@@ -12,6 +12,13 @@ data class LanTransportSnapshot(
     val lastPeerEndpoint: String? = null,
     val activePeerNames: List<String> = emptyList(),
     val lastError: String? = null,
+    val lastProbeLatencyMs: Long? = null,
+    val probeStatus: String? = null,
+    val sentFrames: Long = 0,
+    val receivedFrames: Long = 0,
+    val lastActivityAtMs: Long? = null,
+    val scanProgress: Int? = null,
+    val scanTotal: Int? = null,
 )
 
 internal data class LanManualEndpoint(val host: String, val port: Int) {
@@ -62,6 +69,9 @@ object LanTransportDiagnostics {
 
     private val manualConnector =
         AtomicReference<((LanManualEndpoint) -> Unit)?>(null)
+    private val pendingManualEndpoint = AtomicReference<LanManualEndpoint?>(null)
+    private val probeRequester = AtomicReference<(() -> String?)?>(null)
+    private val scanRequester = AtomicReference<(() -> String?)?>(null)
     private val activePeers = mutableMapOf<String, String>()
 
     fun requestManualConnection(text: String, defaultPort: Int): String? {
@@ -73,12 +83,50 @@ object LanTransportDiagnostics {
         return null
     }
 
+    fun requestConnectionTest(): String? {
+        val requester = probeRequester.get()
+            ?: return "Start the mesh before testing local Wi-Fi"
+        return requester()
+    }
+
+    fun requestSubnetScan(): String? {
+        val requester = scanRequester.get()
+            ?: return "Start the mesh before searching the local subnet"
+        return requester()
+    }
+
     internal fun registerManualConnector(connector: (LanManualEndpoint) -> Unit) {
         manualConnector.set(connector)
+        pendingManualEndpoint.getAndSet(null)?.let(connector)
     }
 
     internal fun unregisterManualConnector() {
         manualConnector.set(null)
+    }
+
+    internal fun queueManualConnection(endpoint: LanManualEndpoint) {
+        val connector = manualConnector.get()
+        if (connector != null) {
+            connector(endpoint)
+        } else {
+            pendingManualEndpoint.set(endpoint)
+        }
+    }
+
+    internal fun registerProbeRequester(requester: () -> String?) {
+        probeRequester.set(requester)
+    }
+
+    internal fun unregisterProbeRequester() {
+        probeRequester.set(null)
+    }
+
+    internal fun registerScanRequester(requester: () -> String?) {
+        scanRequester.set(requester)
+    }
+
+    internal fun unregisterScanRequester() {
+        scanRequester.set(null)
     }
 
     internal fun waitingForWifi() {
@@ -92,6 +140,7 @@ object LanTransportDiagnostics {
                 state = "Listening for CruiseMesh friends",
                 localEndpoint = localEndpoint,
                 lastError = null,
+                probeStatus = null,
             )
         }
     }
@@ -102,6 +151,7 @@ object LanTransportDiagnostics {
                 state = "Found a CruiseMesh device",
                 lastPeerEndpoint = endpoint,
                 lastError = null,
+                probeStatus = null,
             )
         }
     }
@@ -112,6 +162,7 @@ object LanTransportDiagnostics {
                 state = "Connecting securely",
                 lastPeerEndpoint = endpoint,
                 lastError = null,
+                probeStatus = null,
             )
         }
     }
@@ -123,6 +174,7 @@ object LanTransportDiagnostics {
                 else "Secure local Wi-Fi link active",
                 lastPeerEndpoint = endpoint,
                 lastError = reason,
+                probeStatus = null,
             )
         }
     }
@@ -137,6 +189,7 @@ object LanTransportDiagnostics {
                 state = "Secure local Wi-Fi link active",
                 activePeerNames = names,
                 lastError = null,
+                probeStatus = null,
             )
         }
     }
@@ -151,6 +204,75 @@ object LanTransportDiagnostics {
                 state = if (names.isEmpty()) "Listening for CruiseMesh friends"
                 else "Secure local Wi-Fi link active",
                 activePeerNames = names,
+            )
+        }
+    }
+
+    internal fun probeStarted() {
+        mutableState.update {
+            it.copy(
+                probeStatus = "Testing encrypted LAN link…",
+                lastError = null,
+            )
+        }
+    }
+
+    internal fun probeSucceeded(latencyMs: Long) {
+        mutableState.update {
+            it.copy(
+                probeStatus = "Encrypted round trip: ${latencyMs} ms",
+                lastProbeLatencyMs = latencyMs,
+                lastError = null,
+                lastActivityAtMs = System.currentTimeMillis(),
+            )
+        }
+    }
+
+    internal fun probeFailed(reason: String) {
+        mutableState.update {
+            it.copy(
+                probeStatus = null,
+                lastError = reason,
+            )
+        }
+    }
+
+    internal fun frameSent() {
+        mutableState.update {
+            it.copy(
+                sentFrames = it.sentFrames + 1,
+                lastActivityAtMs = System.currentTimeMillis(),
+            )
+        }
+    }
+
+    internal fun frameReceived() {
+        mutableState.update {
+            it.copy(
+                receivedFrames = it.receivedFrames + 1,
+                lastActivityAtMs = System.currentTimeMillis(),
+            )
+        }
+    }
+
+    internal fun scanStarted(total: Int) {
+        mutableState.update {
+            it.copy(
+                scanProgress = 0,
+                scanTotal = total,
+                lastError = null,
+            )
+        }
+    }
+
+    internal fun scanAdvanced() {
+        mutableState.update {
+            val total = it.scanTotal ?: return@update it
+            val progress = ((it.scanProgress ?: 0) + 1).coerceAtMost(total)
+            it.copy(
+                scanProgress = if (progress == total) null else progress,
+                scanTotal = if (progress == total) null else total,
+                probeStatus = if (progress == total) "Local /24 search finished" else it.probeStatus,
             )
         }
     }

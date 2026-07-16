@@ -85,6 +85,27 @@ class MeshRouterStateTest {
     }
 
     @Test
+    fun `small frames race over LAN and one BLE route while large frames prefer LAN`() {
+        val routes = listOf(
+            MeshRouterState.Transport.LAN to "LAN",
+            MeshRouterState.Transport.CENTRAL to "BLE-1",
+            MeshRouterState.Transport.PERIPHERAL to "BLE-2",
+        )
+
+        assertEquals(
+            listOf(
+                MeshRouterState.Transport.LAN to "LAN",
+                MeshRouterState.Transport.CENTRAL to "BLE-1",
+            ),
+            transportSendPlan(routes, frameSize = 512),
+        )
+        assertEquals(
+            listOf(MeshRouterState.Transport.LAN to "LAN"),
+            transportSendPlan(routes, frameSize = 64 * 1024),
+        )
+    }
+
+    @Test
     fun `authenticated mapping cannot be replaced by a conflicting HELLO`() {
         val state = MeshRouterState()
         val alice = userId(1)

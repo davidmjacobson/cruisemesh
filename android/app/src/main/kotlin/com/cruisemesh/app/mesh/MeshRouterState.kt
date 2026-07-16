@@ -113,18 +113,18 @@ class MeshRouterState {
      * no connected link has identified itself as that user yet.
      */
     fun routeFor(userId: ByteArray): Pair<Transport, String>? {
-        synchronized(peersByAddress) {
-            var best: Pair<Transport, String>? = null
-            for ((address, peer) in peersByAddress) {
-                val known = peer.userId ?: continue
-                if (!known.contentEquals(userId)) continue
-                if (best == null || peer.transport.routePriority > best.first.routePriority) {
-                    best = peer.transport to address
-                }
-            }
-            return best
-        }
+        return routesFor(userId).firstOrNull()
     }
+
+    /** Every live route to one peer, highest-priority transport first. */
+    fun routesFor(userId: ByteArray): List<Pair<Transport, String>> =
+        synchronized(peersByAddress) {
+            peersByAddress.mapNotNull { (address, peer) ->
+                val known = peer.userId ?: return@mapNotNull null
+                if (!known.contentEquals(userId)) return@mapNotNull null
+                peer.transport to address
+            }.sortedByDescending { it.first.routePriority }
+        }
 
     /**
      * Distinct HELLO'd peer userIds, hex-encoded (CONNECTIVITY_INDICATOR.md
