@@ -1,6 +1,8 @@
 package com.cruisemesh.app.mesh
 
 import uniffi.cruisemesh_core.DigestEntry
+import uniffi.cruisemesh_core.digestIsExpectedChatId
+import uniffi.cruisemesh_core.digestThroughLamportForSender
 
 /**
  * Pure logic for interpreting an incoming per-chat DIGEST frame (DESIGN.md
@@ -21,7 +23,7 @@ object DigestSync {
      * DIGEST arriving before it out of order by construction.
      */
     fun isExpectedChatId(digestChatId: ByteArray, helloUserId: ByteArray?): Boolean =
-        helloUserId != null && digestChatId.contentEquals(helloUserId)
+        digestIsExpectedChatId(digestChatId, helloUserId)
 
     /**
      * The lamport a peer's digest [entries] reports having contiguously for
@@ -33,7 +35,7 @@ object DigestSync {
      * inferred or summed across entries.
      */
     fun throughLamportForSender(entries: List<DigestEntry>, senderUserId: ByteArray): ULong =
-        entries.firstOrNull { it.senderUserId.contentEquals(senderUserId) }?.throughLamport ?: 0uL
+        digestThroughLamportForSender(entries, senderUserId)
 
     /**
      * Convenience wrapper for the common "what does the peer already have of

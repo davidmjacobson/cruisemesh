@@ -6,7 +6,6 @@ import Security
 enum IdentityStore {
     private static let service = "com.cruisemesh.app.identity"
     private static let account = "device-identity"
-    private static let fieldSizes = [16, 32, 32, 32, 32]
 
     static func load() -> Identity? {
         let query: [String: Any] = [
@@ -44,30 +43,10 @@ enum IdentityStore {
     }
 
     static func encodeIdentity(_ identity: Identity) -> Data {
-        var data = Data()
-        data.append(contentsOf: identity.userId)
-        data.append(contentsOf: identity.signPk)
-        data.append(contentsOf: identity.signSk)
-        data.append(contentsOf: identity.agreePk)
-        data.append(contentsOf: identity.agreeSk)
-        return data
+        Data(encodeIdentityBytes(identity: identity))
     }
 
     static func decodeIdentity(_ data: Data) -> Identity? {
-        let expected = fieldSizes.reduce(0, +)
-        guard data.count == expected else { return nil }
-        var offset = 0
-        func take(_ n: Int) -> Data {
-            let slice = data.subdata(in: offset..<offset + n)
-            offset += n
-            return slice
-        }
-        return Identity(
-            userId: take(16),
-            signPk: take(32),
-            signSk: take(32),
-            agreePk: take(32),
-            agreeSk: take(32)
-        )
+        try? decodeIdentityBytes(bytes: data)
     }
 }

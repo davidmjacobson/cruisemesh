@@ -269,3 +269,26 @@ Wave 3 (after T3 lands; parallel with T7): T10
    messages + pending receipt envelopes, under the existing per-exchange
    byte budgets.
 5. **Friend import:** re-import preserves existing relay details.
+
+## 6. Implementation status
+
+Implemented in this branch:
+
+- **T1-T6 and T8-T10:** complete. Their protocol framing, transactional
+  authoring, codecs, LAN utilities, relay wire format, backup crypto,
+  transport policy, friend import/text parsing, and semantic queries now
+  live in `cruisemesh-core`. Android and iOS retain thin adapters plus
+  platform storage, UI, and transport execution.
+- **T7a/T7b:** complete. Rust now makes inbound disposition/relay-ack
+  decisions and builds the complete digest spray plan (carried envelopes,
+  locally authored messages, and receipt envelopes). HELLO identity checks
+  also use the same core rule on both platforms.
+- **T7c:** deliberately partial. Opened-content dispatch, OS lifecycle,
+  BLE/CoreBluetooth, sockets/HTTP, notifications, and other side effects
+  remain in `MeshService`/`MeshController`. Moving the remaining content
+  dispatch into a full event-to-effect interpreter is a separate structural
+  refactor; it is no longer needed to eliminate the duplicated protocol and
+  policy implementations identified by this audit.
+
+Validation at implementation time: all Rust core tests and mesh simulations,
+Android JVM unit tests, and the iOS simulator test suite pass.

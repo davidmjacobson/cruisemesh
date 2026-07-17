@@ -24,10 +24,8 @@ struct CruiseMeshApp: App {
             .onOpenURL { url in
                 guard url.host == "cruisemesh.app", let fragment = url.fragment else { return }
                 if url.path == "/f" || url.path == "/f/" {
-                    let token = extractFriendToken(fragment)
-                    if token.hasPrefix("CMFRIEND1:") {
-                        appModel.pendingFriendToken = token
-                    }
+                    guard (try? parseFriendText(text: fragment)) != nil else { return }
+                    appModel.pendingFriendToken = fragment
                 } else if url.path == "/lan" || url.path == "/lan/" {
                     guard let endpoint = parseLanEndpointLink(fragment) else { return }
                     LanTransportDiagnostics.shared.queueManualConnection(endpoint)

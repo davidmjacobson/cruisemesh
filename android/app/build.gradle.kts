@@ -1,5 +1,6 @@
 import java.io.FileInputStream
 import java.util.Properties
+import org.gradle.api.tasks.testing.Test
 
 plugins {
     alias(libs.plugins.android.application)
@@ -114,4 +115,18 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.mockwebserver)
     testImplementation(libs.jna)
+}
+
+// Pure JVM tests now exercise portable logic through UniFFI. Point JNA at the
+// host library produced by the documented pre-test `cargo build` step.
+tasks.withType<Test>().configureEach {
+    val libraryName = when {
+        System.getProperty("os.name").startsWith("Windows", ignoreCase = true) -> "cruisemesh_core.dll"
+        System.getProperty("os.name").startsWith("Mac", ignoreCase = true) -> "libcruisemesh_core.dylib"
+        else -> "libcruisemesh_core.so"
+    }
+    val hostLibrary = rootProject.projectDir.parentFile.resolve("target/debug/$libraryName")
+    if (hostLibrary.isFile) {
+        systemProperty("uniffi.component.cruisemesh_core.libraryOverride", hostLibrary.absolutePath)
+    }
 }

@@ -105,17 +105,14 @@ class ReceiptRelayRoundTripTest {
         aliceStore.upsertContact(aliceContact)
         bobStore.upsertContact(bobContact)
 
-        val text = StoredMessage(
-            chatId = bob.userId,
-            senderUserId = alice.userId,
-            lamport = 1uL,
-            timestamp = 1_700_000_000_000L,
-            kind = 1u,
-            payload = "relay-text".toByteArray(),
-        )
-        val textEnvelope = buildOutboundAuthoredEnvelope(alice, aliceContact, text)
-        assertNotNull(textEnvelope)
-        aliceStore.insertOutgoingMessage(text, textEnvelope!!, 1_700_000_000_000L)
+        val textEnvelope = aliceStore.authorPairwiseMessage(
+            alice,
+            aliceContact,
+            1u,
+            "relay-text".toByteArray(),
+            null,
+            1_700_000_000_000L,
+        ).envelope
 
         val openedText = openMessage(bob, textEnvelope.sealed)
         val decodedText = decodeMessageBody(openedText.payload)
@@ -135,26 +132,22 @@ class ReceiptRelayRoundTripTest {
         bobStore.recordOutgoingReceipt(alice.userId, alice.userId, 1u, through)
         bobStore.recordOutgoingReceipt(alice.userId, alice.userId, 2u, through)
 
-        val deliveredEnvelope = buildOutgoingReceiptEnvelope(
-            identity = bob,
-            contact = bobContact,
-            receiptType = 1u,
-            ackedSenderUserId = alice.userId,
-            throughLamport = through,
-            timestamp = 1_700_000_000_100L,
-        )
-        val readEnvelope = buildOutgoingReceiptEnvelope(
-            identity = bob,
-            contact = bobContact,
-            receiptType = 2u,
-            ackedSenderUserId = alice.userId,
-            throughLamport = through,
-            timestamp = 1_700_000_000_200L,
-        )
-        assertNotNull(deliveredEnvelope)
-        assertNotNull(readEnvelope)
-        bobStore.upsertOutgoingReceiptEnvelope(deliveredEnvelope!!, 1_700_000_000_100L)
-        bobStore.upsertOutgoingReceiptEnvelope(readEnvelope!!, 1_700_000_000_200L)
+        val deliveredEnvelope = bobStore.ensureAuthoredReceipt(
+            bob,
+            bobContact,
+            alice.userId,
+            1u,
+            through,
+            1_700_000_000_100L,
+        ).envelope
+        val readEnvelope = bobStore.ensureAuthoredReceipt(
+            bob,
+            bobContact,
+            alice.userId,
+            2u,
+            through,
+            1_700_000_000_200L,
+        ).envelope
 
         assertEquals(
             1,

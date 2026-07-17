@@ -6,12 +6,10 @@ import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import com.cruisemesh.app.media.KIND_REACTION
 import com.cruisemesh.app.mesh.MeshRouter
 import com.cruisemesh.app.mesh.RelaySyncEvents
-import com.cruisemesh.app.mesh.buildOutboundAuthoredEnvelope
 import com.cruisemesh.app.mesh.encodeOutboundEnvelopeFrame
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
-import uniffi.cruisemesh_core.StoredMessage
 
 private const val TAG = "MeshSender"
 
@@ -20,32 +18,6 @@ private const val KIND_TEXT: kotlin.UByte = 1u
 
 /** Cumulative-receipt type bytes (DESIGN.md §7.2), mirroring the private
  * copies already established in MainActivity.kt / ChatScreen.kt / MeshService.kt. */
-private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
-private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
-
-/**
- * Pure lamport-assignment logic for a locally authored message, split out so
- * the ratchet-against-receipts behavior is unit-testable without a native
- * [MessageStore] (mirrors [com.cruisemesh.app.relay.RelayImport.decide]).
- *
- * Picks one past the highest of: our own contiguous history, and whatever
- * cumulative "delivered through N" / "read through N" watermark the peer has
- * ever acked for our stream. The receipt watermarks matter because they are
- * replayed from the peer's persisted state on every reconnect and relay
- * sync (DESIGN.md §7.2/§7.3): if this chat was deleted and the contact
- * re-added, [ownContiguous] resets to 0 because our own history was wiped,
- * but the peer may still hold rows -- and a read watermark -- from the old
- * stream. Assigning a lamport at or below that watermark would land on a row
- * the peer already has: silently dropped by their `UNIQUE(chat_id,
- * sender_user_id, lamport)` dedup (core/src/store.rs), while their replayed
- * "read through N" receipt paints the new message ✓✓ (read) instantly, even
- * though it never arrived. Ratcheting past both watermarks keeps every
- * newly authored lamport strictly above anything the peer could already be
- * holding.
- */
-fun nextAuthoredLamport(ownContiguous: ULong, ackedDelivered: ULong, ackedRead: ULong): ULong =
-    maxOf(ownContiguous, ackedDelivered, ackedRead) + 1UL
-
 /**
  * Sends an outgoing text or media message into a contact's 1:1 chat
  * (DESIGN.md §7.1 / §8). [ChatScreen] depends only on this interface -- never
@@ -88,15 +60,8 @@ enum class SendResult {
  *
  * 1:1 chats use the peer's UserID as the *local* `chat_id` (DESIGN.md §7.1),
  * so the outgoing message is stored under `contact.userId` even though
- * `identity.userId` is the sender. Lamports come from [nextAuthoredLamport],
- * which is `highestContiguousLamport(...) + 1` in the common case -- safe
- * because our own outgoing stream is authored locally and therefore has no
- * gaps (DESIGN.md §7.1, §7.3), unlike a received stream, which needs the
- * real gap-aware sync logic instead (see `MeshService.handleIncomingText`)
- * -- but also ratchets past the peer's acked delivered/read watermarks, so a
- * chat that was deleted and its contact re-added (which wipes our own
- * history and resets our contiguous count) can't reissue a lamport the peer
- * still holds from before the wipe. See [nextAuthoredLamport]'s doc comment.
+ * `identity.userId` is the sender. Rust atomically assigns Lamports and
+ * ratchets past the peer's delivered/read watermarks.
  *
  * On the *wire*, `MessageBody.chatId` is set to `identity.userId` (our own),
  * not `contact.userId` -- see `MeshService`'s class KDoc for the full
@@ -162,33 +127,9 @@ class RealMeshSender(
         replyToMsgId: ByteArray? = null,
     ): SendResult {
         val queued = try {
-            val chatId = contact.userId
-            val ackedDelivered = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_DELIVERED)
-            val lamport = nextAuthoredLamport(
-                ownContiguous = store.highestContiguousLamport(chatId, identity.userId),
-                ackedDelivered = ackedDelivered,
-                ackedRead = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_READ),
-            )
             val timestamp = System.currentTimeMillis()
-            val message = StoredMessage(
-                chatId = chatId,
-                senderUserId = identity.userId,
-                lamport = lamport,
-                timestamp = timestamp,
-                kind = kind,
-                payload = payload,
-            )
-            val outbound = buildOutboundAuthoredEnvelope(identity, contact, message, replyToMsgId)
-            if (outbound == null) {
-                Log.e(TAG, "$logLabel: could not build the durable outbound envelope for ${contact.name}")
-                return SendResult.FAILED
-            }
-            if (replyToMsgId == null) {
-                store.insertOutgoingMessage(message, outbound, timestamp)
-            } else {
-                store.insertOutgoingReply(message, outbound, replyToMsgId, timestamp)
-            }
-            chatId to ackedDelivered
+            val authored = store.authorPairwiseMessage(identity, contact, kind, payload, replyToMsgId, timestamp)
+            authored.message.chatId to authored.acknowledgedDelivered
         } catch (e: Exception) {
             Log.e(TAG, "$logLabel: message was not stored for ${contact.name}", e)
             return SendResult.FAILED

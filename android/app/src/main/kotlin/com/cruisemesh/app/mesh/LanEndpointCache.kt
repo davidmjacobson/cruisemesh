@@ -7,7 +7,9 @@ import android.net.wifi.WifiInfo
 import android.util.Base64
 import com.cruisemesh.app.chat.UserIdHex
 import java.net.Inet4Address
-import java.security.MessageDigest
+import uniffi.cruisemesh_core.coreLanNetworkIdForComponents
+import uniffi.cruisemesh_core.coreLanNetworkIdForIpv4
+import uniffi.cruisemesh_core.lanEndpointCacheIsFresh
 
 internal class LanEndpointCache(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences(
@@ -41,7 +43,7 @@ internal class LanEndpointCache(context: Context) {
         val parts = value.split('|')
         if (parts.size != 3) return null
         val savedAt = parts[2].toLongOrNull() ?: return null
-        if (nowMs - savedAt > MAX_AGE_MS) {
+        if (!lanEndpointCacheIsFresh(savedAt, nowMs)) {
             prefs.edit().remove(key(networkId, userId)).apply()
             return null
         }
@@ -57,10 +59,6 @@ internal class LanEndpointCache(context: Context) {
 
     private fun key(networkId: String, userId: ByteArray): String =
         "$networkId:${UserIdHex.encode(userId)}"
-
-    companion object {
-        private const val MAX_AGE_MS = 7L * 24 * 60 * 60 * 1_000
-    }
 }
 
 /**
@@ -92,18 +90,9 @@ internal fun lanNetworkId(
         link?.domains?.takeIf(String::isNotBlank)?.let { add("domains:$it") }
     }
     if (topology.isEmpty()) return null
-    val digest = MessageDigest.getInstance("SHA-256")
-        .digest(("CruiseMesh LAN network v1\u0000" + topology.joinToString("|")).toByteArray())
-        .copyOf(16)
-    return java.util.Base64.getUrlEncoder().encodeToString(digest)
+    return coreLanNetworkIdForComponents(topology)
 }
 
 internal fun lanNetworkIdForIpv4(address: String): String? {
-    val octets = address.split('.').mapNotNull { it.toIntOrNull() }
-    if (octets.size != 4 || octets.any { it !in 0..255 }) return null
-    val prefix = "${octets[0]}.${octets[1]}.${octets[2]}.0/24"
-    val digest = MessageDigest.getInstance("SHA-256")
-        .digest("CruiseMesh LAN network v1\u0000ipv4:$prefix".toByteArray())
-        .copyOf(16)
-    return java.util.Base64.getUrlEncoder().encodeToString(digest)
+    return coreLanNetworkIdForIpv4(address)
 }

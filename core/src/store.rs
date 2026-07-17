@@ -246,7 +246,7 @@ pub struct OutgoingReceiptEnvelope {
 
 #[derive(uniffi::Object)]
 pub struct MessageStore {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
 }
 
 #[uniffi::export]
@@ -766,7 +766,7 @@ impl MessageStore {
     ///
     /// This is deliberately a *different* primitive from
     /// [`MessageStore::highest_contiguous_lamport`], and the split matters:
-    /// the lamport ratchet (`nextAuthoredLamport`, see the Kotlin side)
+    /// the transactional authoring Lamport ratchet
     /// lets a sender's stream legitimately start above 1 after a chat
     /// history wipe, because lamports below the new base never existed for
     /// anyone -- there is nothing to be "contiguous from 1" with. A
@@ -1250,6 +1250,63 @@ impl MessageStore {
         )
         .map_err(store_err)?;
         Ok(())
+    }
+
+    /// Import a friend card without allowing an older/blank card to erase a
+    /// complete relay configuration already known for that contact.
+    pub fn upsert_imported_contact(&self, mut contact: Contact) -> Result<Contact, CoreError> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
+        let incoming_has_relay = contact
+            .relay_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && contact
+                .relay_token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+        if !incoming_has_relay {
+            let existing: Option<(Option<String>, Option<String>)> = tx
+                .query_row(
+                    "SELECT relay_url, relay_token FROM contacts WHERE user_id = ?1",
+                    params![contact.user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(store_err)?;
+            if let Some((url, token)) = existing {
+                let existing_has_relay =
+                    url.as_deref().is_some_and(|value| !value.trim().is_empty())
+                        && token
+                            .as_deref()
+                            .is_some_and(|value| !value.trim().is_empty());
+                if existing_has_relay {
+                    contact.relay_url = url;
+                    contact.relay_token = token;
+                }
+            }
+        }
+        tx.execute(
+            "INSERT INTO contacts (user_id, name, sign_pk, agree_pk, relay_url, relay_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(user_id) DO UPDATE SET
+                name = excluded.name,
+                sign_pk = excluded.sign_pk,
+                agree_pk = excluded.agree_pk,
+                relay_url = excluded.relay_url,
+                relay_token = excluded.relay_token",
+            params![
+                contact.user_id,
+                contact.name,
+                contact.sign_pk,
+                contact.agree_pk,
+                contact.relay_url,
+                contact.relay_token,
+            ],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(contact)
     }
 
     /// Apply a contact avatar update only if `epoch` is newer than the stored
@@ -2181,7 +2238,7 @@ fn row_to_carried(row: &rusqlite::Row) -> rusqlite::Result<CarriedEnvelope> {
     })
 }
 
-fn row_to_outbound(row: &rusqlite::Row) -> rusqlite::Result<OutboundEnvelope> {
+pub(crate) fn row_to_outbound(row: &rusqlite::Row) -> rusqlite::Result<OutboundEnvelope> {
     Ok(OutboundEnvelope {
         msg_id: row.get(0)?,
         recipient_user_id: row.get(1)?,
@@ -2197,7 +2254,9 @@ fn row_to_outbound(row: &rusqlite::Row) -> rusqlite::Result<OutboundEnvelope> {
     })
 }
 
-fn row_to_outgoing_receipt(row: &rusqlite::Row) -> rusqlite::Result<OutgoingReceiptEnvelope> {
+pub(crate) fn row_to_outgoing_receipt(
+    row: &rusqlite::Row,
+) -> rusqlite::Result<OutgoingReceiptEnvelope> {
     Ok(OutgoingReceiptEnvelope {
         msg_id: row.get(0)?,
         recipient_user_id: row.get(1)?,
@@ -2257,7 +2316,7 @@ fn load_group_members(conn: &Connection, group_id: &[u8]) -> Result<Vec<Vec<u8>>
     rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
 }
 
-fn store_err(e: rusqlite::Error) -> CoreError {
+pub(crate) fn store_err(e: rusqlite::Error) -> CoreError {
     CoreError::Store(e.to_string())
 }
 
@@ -2270,7 +2329,7 @@ fn validate_msg_id(field: &str, msg_id: &[u8]) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn outbound_message_dedupe_key(
+pub(crate) fn outbound_message_dedupe_key(
     chat_id: &[u8],
     sender_user_id: &[u8],
     kind: u8,
@@ -3899,6 +3958,41 @@ mod tests {
             store.contact_avatar_epoch(b"alice-id".to_vec()).unwrap(),
             123
         );
+    }
+
+    #[test]
+    fn imported_blank_card_preserves_existing_relay_details() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut original = contact(b"alice-id", "Alice");
+        original.relay_url = Some("https://relay.example".to_string());
+        original.relay_token = Some("family-token".to_string());
+        store.upsert_contact(original).unwrap();
+
+        let imported = store
+            .upsert_imported_contact(contact(b"alice-id", "Alice Renamed"))
+            .unwrap();
+        assert_eq!(imported.relay_url.as_deref(), Some("https://relay.example"));
+        assert_eq!(imported.relay_token.as_deref(), Some("family-token"));
+        assert_eq!(
+            store.get_contact(b"alice-id".to_vec()).unwrap(),
+            Some(imported)
+        );
+    }
+
+    #[test]
+    fn imported_complete_relay_replaces_existing_details() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut original = contact(b"alice-id", "Alice");
+        original.relay_url = Some("https://old.example".to_string());
+        original.relay_token = Some("old".to_string());
+        store.upsert_contact(original).unwrap();
+
+        let mut incoming = contact(b"alice-id", "Alice");
+        incoming.relay_url = Some("https://new.example".to_string());
+        incoming.relay_token = Some("new".to_string());
+        let imported = store.upsert_imported_contact(incoming).unwrap();
+        assert_eq!(imported.relay_url.as_deref(), Some("https://new.example"));
+        assert_eq!(imported.relay_token.as_deref(), Some("new"));
     }
 
     #[test]

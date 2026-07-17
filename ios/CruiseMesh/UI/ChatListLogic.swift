@@ -45,11 +45,7 @@ enum ChatListLogic {
     }
 
     static func computeUnread(messages: [StoredMessage], ownUserId: Data, readThrough: UInt64) -> Int {
-        messages.filter {
-            isVisibleChatKind($0.kind)
-                && $0.senderUserId != ownUserId
-                && $0.lamport > readThrough
-        }.count
+        Int(coreUnreadCount(messages: messages, ownUserId: ownUserId, readThrough: readThrough))
     }
 
     /**
@@ -69,7 +65,11 @@ enum ChatListLogic {
     }
 
     static func lastVisibleMessage(_ messages: [StoredMessage]) -> StoredMessage? {
-        messages.filter { isVisibleChatKind($0.kind) }.max(by: { $0.timestamp < $1.timestamp })
+        guard let selected = coreLastVisibleMessage(messages: messages) else { return nil }
+        return messages.first {
+            $0.chatId == selected.chatId && $0.senderUserId == selected.senderUserId
+                && $0.lamport == selected.lamport && $0.kind == selected.kind
+        }
     }
 
     static func previewText(_ message: StoredMessage, groupName: String? = nil) -> String {

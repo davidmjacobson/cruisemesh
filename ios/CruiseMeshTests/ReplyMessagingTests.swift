@@ -66,21 +66,16 @@ final class ReplyMessagingTests: XCTestCase {
         let bob = generateIdentity()
         let group = try createGroup(name: "Family", memberUserIds: [alice.userId, bob.userId])
         let replyToMsgId = Data((1...16).map { UInt8($0) })
-        let message = StoredMessage(
-            chatId: group.id,
-            senderUserId: alice.userId,
-            lamport: 2,
-            timestamp: 1_700_000_001_000,
-            kind: ProtocolKind.text,
-            payload: Data("sounds good".utf8)
-        )
-
-        let envelope = try XCTUnwrap(buildOutboundGroupEnvelope(
+        let store = try MessageStore.open(path: ":memory:")
+        let authored = try store.authorGroupMessage(
             identity: alice,
             group: group,
-            message: message,
-            replyToMsgId: replyToMsgId
-        ))
+            kind: ProtocolKind.text,
+            payload: Data("sounds good".utf8),
+            replyToMsgId: replyToMsgId,
+            timestampMs: 1_700_000_001_000
+        )
+        let envelope = authored.envelope
         let opened = try openGroupMessage(group: group, sealed: envelope.sealed)
         let decoded = try decodeExtendedMessageBody(bytes: opened.payload)
 

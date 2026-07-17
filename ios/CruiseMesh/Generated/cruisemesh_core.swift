@@ -447,6 +447,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
+    typealias FfiType = Int32
+    typealias SwiftType = Int32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int32, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -557,6 +573,741 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
         writeInt(&buf, len)
         writeBytes(&buf, value)
     }
+}
+
+
+
+
+/**
+ * Ordered, single-frame-at-a-time BLE fragment reassembler.
+ */
+public protocol BleFrameReassemblerProtocol : AnyObject {
+    
+    /**
+     * Feed one fragment, returning the full frame only after its last ordered
+     * fragment. Malformed or desynchronized input drops the partial frame.
+     */
+    func accept(fragment: Data)  -> Data?
+    
+}
+
+/**
+ * Ordered, single-frame-at-a-time BLE fragment reassembler.
+ */
+open class BleFrameReassembler:
+    BleFrameReassemblerProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_bleframereassembler(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_bleframereassembler_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_bleframereassembler(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * Feed one fragment, returning the full frame only after its last ordered
+     * fragment. Malformed or desynchronized input drops the partial frame.
+     */
+open func accept(fragment: Data) -> Data? {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_bleframereassembler_accept(self.uniffiClonePointer(),
+        FfiConverterData.lower(fragment),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBleFrameReassembler: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = BleFrameReassembler
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> BleFrameReassembler {
+        return BleFrameReassembler(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: BleFrameReassembler) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BleFrameReassembler {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: BleFrameReassembler, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBleFrameReassembler_lift(_ pointer: UnsafeMutableRawPointer) throws -> BleFrameReassembler {
+    return try FfiConverterTypeBleFrameReassembler.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBleFrameReassembler_lower(_ value: BleFrameReassembler) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeBleFrameReassembler.lower(value)
+}
+
+
+
+
+public protocol CoreLanHealthTrackerProtocol : AnyObject {
+    
+    func clear() 
+    
+    func next(address: String, nowMs: Int64, nonce: UInt64)  -> CoreLanHealthDecision
+    
+    func remove(address: String) 
+    
+    func response(address: String, nonce: UInt64, nowMs: Int64)  -> Int64?
+    
+}
+
+open class CoreLanHealthTracker:
+    CoreLanHealthTrackerProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_corelanhealthtracker(self.pointer, $0) }
+    }
+public convenience init(timeoutMs: Int64, maxTimeouts: UInt32) {
+    let pointer =
+        try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_corelanhealthtracker_new(
+        FfiConverterInt64.lower(timeoutMs),
+        FfiConverterUInt32.lower(maxTimeouts),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_corelanhealthtracker(pointer, $0) }
+    }
+
+    
+
+    
+open func clear() {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelanhealthtracker_clear(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func next(address: String, nowMs: Int64, nonce: UInt64) -> CoreLanHealthDecision {
+    return try!  FfiConverterTypeCoreLanHealthDecision.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelanhealthtracker_next(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterUInt64.lower(nonce),$0
+    )
+})
+}
+    
+open func remove(address: String) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelanhealthtracker_remove(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),$0
+    )
+}
+}
+    
+open func response(address: String, nonce: UInt64, nowMs: Int64) -> Int64? {
+    return try!  FfiConverterOptionInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelanhealthtracker_response(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterUInt64.lower(nonce),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLanHealthTracker: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CoreLanHealthTracker
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreLanHealthTracker {
+        return CoreLanHealthTracker(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CoreLanHealthTracker) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLanHealthTracker {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CoreLanHealthTracker, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanHealthTracker_lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreLanHealthTracker {
+    return try FfiConverterTypeCoreLanHealthTracker.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanHealthTracker_lower(_ value: CoreLanHealthTracker) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCoreLanHealthTracker.lower(value)
+}
+
+
+
+
+public protocol CoreMeshRouterStateProtocol : AnyObject {
+    
+    func clear() 
+    
+    func clearTransports(transports: [CoreTransport]) 
+    
+    func connectedRoutes()  -> [CoreTransportRoute]
+    
+    func connectedUserCount()  -> UInt32
+    
+    func helloedUserIds()  -> [Data]
+    
+    func identifiedRoutes()  -> [CoreIdentifiedRoute]
+    
+    func onConnected(address: String, transport: CoreTransport) 
+    
+    func onDisconnected(address: String) 
+    
+    func onHello(address: String, userId: Data)  -> Bool
+    
+    func routeFor(userId: Data)  -> CoreTransportRoute?
+    
+    func routesFor(userId: Data)  -> [CoreTransportRoute]
+    
+    func transportFor(address: String)  -> CoreTransport?
+    
+    func userIdFor(address: String)  -> Data?
+    
+}
+
+open class CoreMeshRouterState:
+    CoreMeshRouterStateProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_coremeshrouterstate(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_coremeshrouterstate_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_coremeshrouterstate(pointer, $0) }
+    }
+
+    
+
+    
+open func clear() {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_clear(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func clearTransports(transports: [CoreTransport]) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_clear_transports(self.uniffiClonePointer(),
+        FfiConverterSequenceTypeCoreTransport.lower(transports),$0
+    )
+}
+}
+    
+open func connectedRoutes() -> [CoreTransportRoute] {
+    return try!  FfiConverterSequenceTypeCoreTransportRoute.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_connected_routes(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func connectedUserCount() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_connected_user_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func helloedUserIds() -> [Data] {
+    return try!  FfiConverterSequenceData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_helloed_user_ids(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func identifiedRoutes() -> [CoreIdentifiedRoute] {
+    return try!  FfiConverterSequenceTypeCoreIdentifiedRoute.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_identified_routes(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func onConnected(address: String, transport: CoreTransport) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_on_connected(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterTypeCoreTransport.lower(transport),$0
+    )
+}
+}
+    
+open func onDisconnected(address: String) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_on_disconnected(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),$0
+    )
+}
+}
+    
+open func onHello(address: String, userId: Data) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_on_hello(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterData.lower(userId),$0
+    )
+})
+}
+    
+open func routeFor(userId: Data) -> CoreTransportRoute? {
+    return try!  FfiConverterOptionTypeCoreTransportRoute.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_route_for(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
+    )
+})
+}
+    
+open func routesFor(userId: Data) -> [CoreTransportRoute] {
+    return try!  FfiConverterSequenceTypeCoreTransportRoute.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_routes_for(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
+    )
+})
+}
+    
+open func transportFor(address: String) -> CoreTransport? {
+    return try!  FfiConverterOptionTypeCoreTransport.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_transport_for(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),$0
+    )
+})
+}
+    
+open func userIdFor(address: String) -> Data? {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_user_id_for(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreMeshRouterState: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CoreMeshRouterState
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreMeshRouterState {
+        return CoreMeshRouterState(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CoreMeshRouterState) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreMeshRouterState {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CoreMeshRouterState, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMeshRouterState_lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreMeshRouterState {
+    return try FfiConverterTypeCoreMeshRouterState.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMeshRouterState_lower(_ value: CoreMeshRouterState) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCoreMeshRouterState.lower(value)
+}
+
+
+
+
+public protocol CoreReconnectBackoffTrackerProtocol : AnyObject {
+    
+    func canAttempt(address: String, nowMs: Int64)  -> Bool
+    
+    func clear() 
+    
+    func failureCount(address: String)  -> UInt32
+    
+    func isGivenUp(address: String)  -> Bool
+    
+    func recordFailure(address: String, nowMs: Int64)  -> UInt32
+    
+    func recordSuccess(address: String) 
+    
+    func retryDelayMs(address: String, nowMs: Int64)  -> Int64?
+    
+}
+
+open class CoreReconnectBackoffTracker:
+    CoreReconnectBackoffTrackerProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_corereconnectbackofftracker(self.pointer, $0) }
+    }
+public convenience init(initialBackoffMs: Int64, maxBackoffMs: Int64, maxFailures: UInt32) {
+    let pointer =
+        try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_corereconnectbackofftracker_new(
+        FfiConverterInt64.lower(initialBackoffMs),
+        FfiConverterInt64.lower(maxBackoffMs),
+        FfiConverterUInt32.lower(maxFailures),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_corereconnectbackofftracker(pointer, $0) }
+    }
+
+    
+
+    
+open func canAttempt(address: String, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corereconnectbackofftracker_can_attempt(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+open func clear() {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corereconnectbackofftracker_clear(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func failureCount(address: String) -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corereconnectbackofftracker_failure_count(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),$0
+    )
+})
+}
+    
+open func isGivenUp(address: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corereconnectbackofftracker_is_given_up(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),$0
+    )
+})
+}
+    
+open func recordFailure(address: String, nowMs: Int64) -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corereconnectbackofftracker_record_failure(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+open func recordSuccess(address: String) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corereconnectbackofftracker_record_success(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),$0
+    )
+}
+}
+    
+open func retryDelayMs(address: String, nowMs: Int64) -> Int64? {
+    return try!  FfiConverterOptionInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corereconnectbackofftracker_retry_delay_ms(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreReconnectBackoffTracker: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CoreReconnectBackoffTracker
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreReconnectBackoffTracker {
+        return CoreReconnectBackoffTracker(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CoreReconnectBackoffTracker) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreReconnectBackoffTracker {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CoreReconnectBackoffTracker, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreReconnectBackoffTracker_lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreReconnectBackoffTracker {
+    return try FfiConverterTypeCoreReconnectBackoffTracker.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreReconnectBackoffTracker_lower(_ value: CoreReconnectBackoffTracker) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCoreReconnectBackoffTracker.lower(value)
 }
 
 
@@ -801,6 +1552,32 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, content: FriendDirectoryContent, nowMs: Int64) throws  -> Bool
     
+    func authorFriendRequest(identity: Identity, contact: Contact, friendCardJson: String, timestampMs: Int64) throws  -> AuthoredEnvelope
+    
+    /**
+     * Assign, group-seal, and durably queue one shared group envelope.
+     */
+    func authorGroupMessage(identity: Identity, group: Group, kind: UInt8, payload: Data, replyToMsgId: Data?, timestampMs: Int64) throws  -> AuthoredEnvelope
+    
+    /**
+     * Assign, seal, and durably queue a pairwise chat-stream message in one
+     * store transaction. The counter ratchets past both receipt watermarks.
+     */
+    func authorPairwiseMessage(identity: Identity, contact: Contact, kind: UInt8, payload: Data, replyToMsgId: Data?, timestampMs: Int64) throws  -> AuthoredEnvelope
+    
+    /**
+     * Advance a cumulative outgoing receipt and its sealed retry envelope in
+     * one transaction. A stale/equal watermark returns `None` unchanged.
+     */
+    func authorReceipt(identity: Identity, contact: Contact, ackedSenderUserId: Data, receiptType: UInt8, throughLamport: UInt64, timestampMs: Int64) throws  -> AuthoredReceipt?
+    
+    /**
+     * Seal and persist an envelope for a legacy authored message that was
+     * stored before the outbound queue existed. Repeated calls return the
+     * already-persisted envelope instead of generating a new msg id.
+     */
+    func backfillPairwiseEnvelope(identity: Identity, contact: Contact, message: StoredMessage, replyToMsgId: Data?) throws  -> AuthoredEnvelope
+    
     /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
@@ -855,6 +1632,15 @@ public protocol MessageStoreProtocol : AnyObject {
      * The newest avatar/display-name profile-sync epoch applied for a contact.
      */
     func contactAvatarEpoch(userId: Data) throws  -> Int64
+    
+    /**
+     * Build the complete digest-time mule spray in one place.
+     *
+     * This deliberately includes all three canonical classes: foreign
+     * carried traffic, this device's pending pairwise traffic to other
+     * contacts, and pending receipts owed to other contacts.
+     */
+    func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64) throws  -> CoreDigestSprayPlan
     
     /**
      * Delete a contact and, with it, the entire 1:1 chat: the contact row,
@@ -942,6 +1728,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * pass is a no-op. Returns whether a new row was inserted.
      */
     func enqueueRelayCarriedEnvelope(envelope: CarriedEnvelope, nowMs: Int64) throws  -> Bool
+    
+    /**
+     * Return a durably queued sealed receipt for at least the requested
+     * watermark. Existing equal/newer envelopes are reused byte-for-byte;
+     * a missing or stale envelope is advanced atomically with the local
+     * outgoing receipt watermark.
+     */
+    func ensureAuthoredReceipt(identity: Identity, contact: Contact, ackedSenderUserId: Data, receiptType: UInt8, throughLamport: UInt64, timestampMs: Int64) throws  -> AuthoredReceipt
     
     /**
      * Unexpired carried envelopes that were classified as family traffic
@@ -1192,6 +1986,12 @@ public protocol MessageStoreProtocol : AnyObject {
     func pruneExpiredOutgoingReceiptEnvelopes(nowMs: Int64) throws  -> UInt64
     
     /**
+     * Queue one pairwise-sealed group invite for every non-self member while
+     * storing the logical invite message exactly once.
+     */
+    func queueGroupInvites(identity: Identity, group: Group, members: [Contact], timestampMs: Int64) throws  -> [AuthoredEnvelope]
+    
+    /**
      * The cumulative lamport a receipt of `receipt_type` covers for
      * `sender_user_id`'s messages in `chat_id` (DESIGN.md §7.2). Returns 0
      * if no such receipt has been recorded.
@@ -1236,6 +2036,17 @@ public protocol MessageStoreProtocol : AnyObject {
     func removeFriendSuggestion(candidateUserId: Data) throws 
     
     /**
+     * Resolve all stable ids and reply targets for a timeline under one lock.
+     */
+    func replyMetadata(messages: [StoredMessage]) throws  -> [CoreReplyMetadata]
+    
+    /**
+     * Unread visible messages across every non-self sender stream in a chat,
+     * using each stream's persisted local READ watermark.
+     */
+    func semanticUnreadCount(chatId: Data, ownUserId: Data) throws  -> UInt32
+    
+    /**
      * Apply a contact avatar update only if `epoch` is newer than the stored
      * avatar epoch. `None` or an empty blob clears the avatar but still
      * records the newer epoch.
@@ -1267,6 +2078,12 @@ public protocol MessageStoreProtocol : AnyObject {
      * which is the v1 rotation path for membership changes.
      */
     func upsertGroup(group: Group) throws 
+    
+    /**
+     * Import a friend card without allowing an older/blank card to erase a
+     * complete relay configuration already known for that contact.
+     */
+    func upsertImportedContact(contact: Contact) throws  -> Contact
     
     /**
      * Persist or advance the exact sealed receipt envelope to relay-upload
@@ -1352,6 +2169,83 @@ open func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, co
         FfiConverterData.lower(recipientUserId),
         FfiConverterTypeFriendDirectoryContent.lower(content),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+open func authorFriendRequest(identity: Identity, contact: Contact, friendCardJson: String, timestampMs: Int64)throws  -> AuthoredEnvelope {
+    return try  FfiConverterTypeAuthoredEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_author_friend_request(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeContact.lower(contact),
+        FfiConverterString.lower(friendCardJson),
+        FfiConverterInt64.lower(timestampMs),$0
+    )
+})
+}
+    
+    /**
+     * Assign, group-seal, and durably queue one shared group envelope.
+     */
+open func authorGroupMessage(identity: Identity, group: Group, kind: UInt8, payload: Data, replyToMsgId: Data?, timestampMs: Int64)throws  -> AuthoredEnvelope {
+    return try  FfiConverterTypeAuthoredEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_author_group_message(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeGroup.lower(group),
+        FfiConverterUInt8.lower(kind),
+        FfiConverterData.lower(payload),
+        FfiConverterOptionData.lower(replyToMsgId),
+        FfiConverterInt64.lower(timestampMs),$0
+    )
+})
+}
+    
+    /**
+     * Assign, seal, and durably queue a pairwise chat-stream message in one
+     * store transaction. The counter ratchets past both receipt watermarks.
+     */
+open func authorPairwiseMessage(identity: Identity, contact: Contact, kind: UInt8, payload: Data, replyToMsgId: Data?, timestampMs: Int64)throws  -> AuthoredEnvelope {
+    return try  FfiConverterTypeAuthoredEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_author_pairwise_message(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeContact.lower(contact),
+        FfiConverterUInt8.lower(kind),
+        FfiConverterData.lower(payload),
+        FfiConverterOptionData.lower(replyToMsgId),
+        FfiConverterInt64.lower(timestampMs),$0
+    )
+})
+}
+    
+    /**
+     * Advance a cumulative outgoing receipt and its sealed retry envelope in
+     * one transaction. A stale/equal watermark returns `None` unchanged.
+     */
+open func authorReceipt(identity: Identity, contact: Contact, ackedSenderUserId: Data, receiptType: UInt8, throughLamport: UInt64, timestampMs: Int64)throws  -> AuthoredReceipt? {
+    return try  FfiConverterOptionTypeAuthoredReceipt.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_author_receipt(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeContact.lower(contact),
+        FfiConverterData.lower(ackedSenderUserId),
+        FfiConverterUInt8.lower(receiptType),
+        FfiConverterUInt64.lower(throughLamport),
+        FfiConverterInt64.lower(timestampMs),$0
+    )
+})
+}
+    
+    /**
+     * Seal and persist an envelope for a legacy authored message that was
+     * stored before the outbound queue existed. Repeated calls return the
+     * already-persisted envelope instead of generating a new msg id.
+     */
+open func backfillPairwiseEnvelope(identity: Identity, contact: Contact, message: StoredMessage, replyToMsgId: Data?)throws  -> AuthoredEnvelope {
+    return try  FfiConverterTypeAuthoredEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_backfill_pairwise_envelope(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeContact.lower(contact),
+        FfiConverterTypeStoredMessage.lower(message),
+        FfiConverterOptionData.lower(replyToMsgId),$0
     )
 })
 }
@@ -1455,6 +2349,28 @@ open func contactAvatarEpoch(userId: Data)throws  -> Int64 {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_contact_avatar_epoch(self.uniffiClonePointer(),
         FfiConverterData.lower(userId),$0
+    )
+})
+}
+    
+    /**
+     * Build the complete digest-time mule spray in one place.
+     *
+     * This deliberately includes all three canonical classes: foreign
+     * carried traffic, this device's pending pairwise traffic to other
+     * contacts, and pending receipts owed to other contacts.
+     */
+open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64)throws  -> CoreDigestSprayPlan {
+    return try  FfiConverterTypeCoreDigestSprayPlan.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_digest_spray_plan(self.uniffiClonePointer(),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterData.lower(peerUserId),
+        FfiConverterSequenceData.lower(peerHints),
+        FfiConverterSequenceData.lower(peerKnownMsgIds),
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterUInt64.lower(ownOutboundBudgetBytes),
+        FfiConverterUInt64.lower(ownReceiptBudgetBytes),
+        FfiConverterUInt64.lower(receiptQueryLimit),$0
     )
 })
 }
@@ -1570,6 +2486,25 @@ open func enqueueRelayCarriedEnvelope(envelope: CarriedEnvelope, nowMs: Int64)th
     uniffi_cruisemesh_core_fn_method_messagestore_enqueue_relay_carried_envelope(self.uniffiClonePointer(),
         FfiConverterTypeCarriedEnvelope.lower(envelope),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Return a durably queued sealed receipt for at least the requested
+     * watermark. Existing equal/newer envelopes are reused byte-for-byte;
+     * a missing or stale envelope is advanced atomically with the local
+     * outgoing receipt watermark.
+     */
+open func ensureAuthoredReceipt(identity: Identity, contact: Contact, ackedSenderUserId: Data, receiptType: UInt8, throughLamport: UInt64, timestampMs: Int64)throws  -> AuthoredReceipt {
+    return try  FfiConverterTypeAuthoredReceipt.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_ensure_authored_receipt(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeContact.lower(contact),
+        FfiConverterData.lower(ackedSenderUserId),
+        FfiConverterUInt8.lower(receiptType),
+        FfiConverterUInt64.lower(throughLamport),
+        FfiConverterInt64.lower(timestampMs),$0
     )
 })
 }
@@ -2022,6 +2957,21 @@ open func pruneExpiredOutgoingReceiptEnvelopes(nowMs: Int64)throws  -> UInt64 {
 }
     
     /**
+     * Queue one pairwise-sealed group invite for every non-self member while
+     * storing the logical invite message exactly once.
+     */
+open func queueGroupInvites(identity: Identity, group: Group, members: [Contact], timestampMs: Int64)throws  -> [AuthoredEnvelope] {
+    return try  FfiConverterSequenceTypeAuthoredEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_queue_group_invites(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeGroup.lower(group),
+        FfiConverterSequenceTypeContact.lower(members),
+        FfiConverterInt64.lower(timestampMs),$0
+    )
+})
+}
+    
+    /**
      * The cumulative lamport a receipt of `receipt_type` covers for
      * `sender_user_id`'s messages in `chat_id` (DESIGN.md §7.2). Returns 0
      * if no such receipt has been recorded.
@@ -2110,6 +3060,30 @@ open func removeFriendSuggestion(candidateUserId: Data)throws  {try rustCallWith
 }
     
     /**
+     * Resolve all stable ids and reply targets for a timeline under one lock.
+     */
+open func replyMetadata(messages: [StoredMessage])throws  -> [CoreReplyMetadata] {
+    return try  FfiConverterSequenceTypeCoreReplyMetadata.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_reply_metadata(self.uniffiClonePointer(),
+        FfiConverterSequenceTypeStoredMessage.lower(messages),$0
+    )
+})
+}
+    
+    /**
+     * Unread visible messages across every non-self sender stream in a chat,
+     * using each stream's persisted local READ watermark.
+     */
+open func semanticUnreadCount(chatId: Data, ownUserId: Data)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_semantic_unread_count(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(ownUserId),$0
+    )
+})
+}
+    
+    /**
      * Apply a contact avatar update only if `epoch` is newer than the stored
      * avatar epoch. `None` or an empty blob clears the avatar but still
      * records the newer epoch.
@@ -2175,6 +3149,18 @@ open func upsertGroup(group: Group)throws  {try rustCallWithError(FfiConverterTy
         FfiConverterTypeGroup.lower(group),$0
     )
 }
+}
+    
+    /**
+     * Import a friend card without allowing an older/blank card to erase a
+     * complete relay configuration already known for that contact.
+     */
+open func upsertImportedContact(contact: Contact)throws  -> Contact {
+    return try  FfiConverterTypeContact.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_upsert_imported_contact(self.uniffiClonePointer(),
+        FfiConverterTypeContact.lower(contact),$0
+    )
+})
 }
     
     /**
@@ -2437,6 +3423,154 @@ public func FfiConverterTypeSeenIds_lift(_ pointer: UnsafeMutableRawPointer) thr
 #endif
 public func FfiConverterTypeSeenIds_lower(_ value: SeenIds) -> UnsafeMutableRawPointer {
     return FfiConverterTypeSeenIds.lower(value)
+}
+
+
+public struct AuthoredEnvelope {
+    public var message: StoredMessage
+    public var envelope: OutboundEnvelope
+    public var frame: Data
+    public var acknowledgedDelivered: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(message: StoredMessage, envelope: OutboundEnvelope, frame: Data, acknowledgedDelivered: UInt64) {
+        self.message = message
+        self.envelope = envelope
+        self.frame = frame
+        self.acknowledgedDelivered = acknowledgedDelivered
+    }
+}
+
+
+
+extension AuthoredEnvelope: Equatable, Hashable {
+    public static func ==(lhs: AuthoredEnvelope, rhs: AuthoredEnvelope) -> Bool {
+        if lhs.message != rhs.message {
+            return false
+        }
+        if lhs.envelope != rhs.envelope {
+            return false
+        }
+        if lhs.frame != rhs.frame {
+            return false
+        }
+        if lhs.acknowledgedDelivered != rhs.acknowledgedDelivered {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(message)
+        hasher.combine(envelope)
+        hasher.combine(frame)
+        hasher.combine(acknowledgedDelivered)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAuthoredEnvelope: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AuthoredEnvelope {
+        return
+            try AuthoredEnvelope(
+                message: FfiConverterTypeStoredMessage.read(from: &buf), 
+                envelope: FfiConverterTypeOutboundEnvelope.read(from: &buf), 
+                frame: FfiConverterData.read(from: &buf), 
+                acknowledgedDelivered: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AuthoredEnvelope, into buf: inout [UInt8]) {
+        FfiConverterTypeStoredMessage.write(value.message, into: &buf)
+        FfiConverterTypeOutboundEnvelope.write(value.envelope, into: &buf)
+        FfiConverterData.write(value.frame, into: &buf)
+        FfiConverterUInt64.write(value.acknowledgedDelivered, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAuthoredEnvelope_lift(_ buf: RustBuffer) throws -> AuthoredEnvelope {
+    return try FfiConverterTypeAuthoredEnvelope.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAuthoredEnvelope_lower(_ value: AuthoredEnvelope) -> RustBuffer {
+    return FfiConverterTypeAuthoredEnvelope.lower(value)
+}
+
+
+public struct AuthoredReceipt {
+    public var envelope: OutgoingReceiptEnvelope
+    public var frame: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(envelope: OutgoingReceiptEnvelope, frame: Data) {
+        self.envelope = envelope
+        self.frame = frame
+    }
+}
+
+
+
+extension AuthoredReceipt: Equatable, Hashable {
+    public static func ==(lhs: AuthoredReceipt, rhs: AuthoredReceipt) -> Bool {
+        if lhs.envelope != rhs.envelope {
+            return false
+        }
+        if lhs.frame != rhs.frame {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(envelope)
+        hasher.combine(frame)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAuthoredReceipt: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AuthoredReceipt {
+        return
+            try AuthoredReceipt(
+                envelope: FfiConverterTypeOutgoingReceiptEnvelope.read(from: &buf), 
+                frame: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AuthoredReceipt, into buf: inout [UInt8]) {
+        FfiConverterTypeOutgoingReceiptEnvelope.write(value.envelope, into: &buf)
+        FfiConverterData.write(value.frame, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAuthoredReceipt_lift(_ buf: RustBuffer) throws -> AuthoredReceipt {
+    return try FfiConverterTypeAuthoredReceipt.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAuthoredReceipt_lower(_ value: AuthoredReceipt) -> RustBuffer {
+    return FfiConverterTypeAuthoredReceipt.lower(value)
 }
 
 
@@ -2818,6 +3952,1302 @@ public func FfiConverterTypeContactProvenance_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeContactProvenance_lower(_ value: ContactProvenance) -> RustBuffer {
     return FfiConverterTypeContactProvenance.lower(value)
+}
+
+
+public struct CoreAttachmentPayload {
+    public var mediaType: AttachmentMediaType
+    public var mimeType: String
+    public var durationMs: Int64
+    public var blob: Data
+    public var caption: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(mediaType: AttachmentMediaType, mimeType: String, durationMs: Int64, blob: Data, caption: String) {
+        self.mediaType = mediaType
+        self.mimeType = mimeType
+        self.durationMs = durationMs
+        self.blob = blob
+        self.caption = caption
+    }
+}
+
+
+
+extension CoreAttachmentPayload: Equatable, Hashable {
+    public static func ==(lhs: CoreAttachmentPayload, rhs: CoreAttachmentPayload) -> Bool {
+        if lhs.mediaType != rhs.mediaType {
+            return false
+        }
+        if lhs.mimeType != rhs.mimeType {
+            return false
+        }
+        if lhs.durationMs != rhs.durationMs {
+            return false
+        }
+        if lhs.blob != rhs.blob {
+            return false
+        }
+        if lhs.caption != rhs.caption {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(mediaType)
+        hasher.combine(mimeType)
+        hasher.combine(durationMs)
+        hasher.combine(blob)
+        hasher.combine(caption)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreAttachmentPayload: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreAttachmentPayload {
+        return
+            try CoreAttachmentPayload(
+                mediaType: FfiConverterTypeAttachmentMediaType.read(from: &buf), 
+                mimeType: FfiConverterString.read(from: &buf), 
+                durationMs: FfiConverterInt64.read(from: &buf), 
+                blob: FfiConverterData.read(from: &buf), 
+                caption: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreAttachmentPayload, into buf: inout [UInt8]) {
+        FfiConverterTypeAttachmentMediaType.write(value.mediaType, into: &buf)
+        FfiConverterString.write(value.mimeType, into: &buf)
+        FfiConverterInt64.write(value.durationMs, into: &buf)
+        FfiConverterData.write(value.blob, into: &buf)
+        FfiConverterString.write(value.caption, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreAttachmentPayload_lift(_ buf: RustBuffer) throws -> CoreAttachmentPayload {
+    return try FfiConverterTypeCoreAttachmentPayload.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreAttachmentPayload_lower(_ value: CoreAttachmentPayload) -> RustBuffer {
+    return FfiConverterTypeCoreAttachmentPayload.lower(value)
+}
+
+
+public struct CoreBackupPayload {
+    public var identity: Data
+    public var sqlite: Data
+    public var srcVersionCode: Int32
+    public var createdAtMs: Int64
+    public var displayName: String?
+    public var ownAvatar: Data
+    public var ownAvatarEpoch: Int64
+    public var relayUrl: String?
+    public var relayToken: String?
+    public var shareOnline: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(identity: Data, sqlite: Data, srcVersionCode: Int32, createdAtMs: Int64, displayName: String?, ownAvatar: Data, ownAvatarEpoch: Int64, relayUrl: String?, relayToken: String?, shareOnline: Bool) {
+        self.identity = identity
+        self.sqlite = sqlite
+        self.srcVersionCode = srcVersionCode
+        self.createdAtMs = createdAtMs
+        self.displayName = displayName
+        self.ownAvatar = ownAvatar
+        self.ownAvatarEpoch = ownAvatarEpoch
+        self.relayUrl = relayUrl
+        self.relayToken = relayToken
+        self.shareOnline = shareOnline
+    }
+}
+
+
+
+extension CoreBackupPayload: Equatable, Hashable {
+    public static func ==(lhs: CoreBackupPayload, rhs: CoreBackupPayload) -> Bool {
+        if lhs.identity != rhs.identity {
+            return false
+        }
+        if lhs.sqlite != rhs.sqlite {
+            return false
+        }
+        if lhs.srcVersionCode != rhs.srcVersionCode {
+            return false
+        }
+        if lhs.createdAtMs != rhs.createdAtMs {
+            return false
+        }
+        if lhs.displayName != rhs.displayName {
+            return false
+        }
+        if lhs.ownAvatar != rhs.ownAvatar {
+            return false
+        }
+        if lhs.ownAvatarEpoch != rhs.ownAvatarEpoch {
+            return false
+        }
+        if lhs.relayUrl != rhs.relayUrl {
+            return false
+        }
+        if lhs.relayToken != rhs.relayToken {
+            return false
+        }
+        if lhs.shareOnline != rhs.shareOnline {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(identity)
+        hasher.combine(sqlite)
+        hasher.combine(srcVersionCode)
+        hasher.combine(createdAtMs)
+        hasher.combine(displayName)
+        hasher.combine(ownAvatar)
+        hasher.combine(ownAvatarEpoch)
+        hasher.combine(relayUrl)
+        hasher.combine(relayToken)
+        hasher.combine(shareOnline)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreBackupPayload: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreBackupPayload {
+        return
+            try CoreBackupPayload(
+                identity: FfiConverterData.read(from: &buf), 
+                sqlite: FfiConverterData.read(from: &buf), 
+                srcVersionCode: FfiConverterInt32.read(from: &buf), 
+                createdAtMs: FfiConverterInt64.read(from: &buf), 
+                displayName: FfiConverterOptionString.read(from: &buf), 
+                ownAvatar: FfiConverterData.read(from: &buf), 
+                ownAvatarEpoch: FfiConverterInt64.read(from: &buf), 
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
+                relayToken: FfiConverterOptionString.read(from: &buf), 
+                shareOnline: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreBackupPayload, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.identity, into: &buf)
+        FfiConverterData.write(value.sqlite, into: &buf)
+        FfiConverterInt32.write(value.srcVersionCode, into: &buf)
+        FfiConverterInt64.write(value.createdAtMs, into: &buf)
+        FfiConverterOptionString.write(value.displayName, into: &buf)
+        FfiConverterData.write(value.ownAvatar, into: &buf)
+        FfiConverterInt64.write(value.ownAvatarEpoch, into: &buf)
+        FfiConverterOptionString.write(value.relayUrl, into: &buf)
+        FfiConverterOptionString.write(value.relayToken, into: &buf)
+        FfiConverterBool.write(value.shareOnline, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreBackupPayload_lift(_ buf: RustBuffer) throws -> CoreBackupPayload {
+    return try FfiConverterTypeCoreBackupPayload.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreBackupPayload_lower(_ value: CoreBackupPayload) -> RustBuffer {
+    return FfiConverterTypeCoreBackupPayload.lower(value)
+}
+
+
+/**
+ * Exact frames to emit after accepting a peer's DIGEST.
+ *
+ * The three lists remain separate for diagnostics, but are selected by one
+ * core operation so neither platform can accidentally omit a traffic class.
+ */
+public struct CoreDigestSprayPlan {
+    public var carriedFrames: [Data]
+    public var ownOutboundFrames: [Data]
+    public var ownReceiptFrames: [Data]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(carriedFrames: [Data], ownOutboundFrames: [Data], ownReceiptFrames: [Data]) {
+        self.carriedFrames = carriedFrames
+        self.ownOutboundFrames = ownOutboundFrames
+        self.ownReceiptFrames = ownReceiptFrames
+    }
+}
+
+
+
+extension CoreDigestSprayPlan: Equatable, Hashable {
+    public static func ==(lhs: CoreDigestSprayPlan, rhs: CoreDigestSprayPlan) -> Bool {
+        if lhs.carriedFrames != rhs.carriedFrames {
+            return false
+        }
+        if lhs.ownOutboundFrames != rhs.ownOutboundFrames {
+            return false
+        }
+        if lhs.ownReceiptFrames != rhs.ownReceiptFrames {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(carriedFrames)
+        hasher.combine(ownOutboundFrames)
+        hasher.combine(ownReceiptFrames)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDigestSprayPlan: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDigestSprayPlan {
+        return
+            try CoreDigestSprayPlan(
+                carriedFrames: FfiConverterSequenceData.read(from: &buf), 
+                ownOutboundFrames: FfiConverterSequenceData.read(from: &buf), 
+                ownReceiptFrames: FfiConverterSequenceData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreDigestSprayPlan, into buf: inout [UInt8]) {
+        FfiConverterSequenceData.write(value.carriedFrames, into: &buf)
+        FfiConverterSequenceData.write(value.ownOutboundFrames, into: &buf)
+        FfiConverterSequenceData.write(value.ownReceiptFrames, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDigestSprayPlan_lift(_ buf: RustBuffer) throws -> CoreDigestSprayPlan {
+    return try FfiConverterTypeCoreDigestSprayPlan.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDigestSprayPlan_lower(_ value: CoreDigestSprayPlan) -> RustBuffer {
+    return FfiConverterTypeCoreDigestSprayPlan.lower(value)
+}
+
+
+public struct CoreIdentifiedRoute {
+    public var transport: CoreTransport
+    public var address: String
+    public var userId: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(transport: CoreTransport, address: String, userId: Data) {
+        self.transport = transport
+        self.address = address
+        self.userId = userId
+    }
+}
+
+
+
+extension CoreIdentifiedRoute: Equatable, Hashable {
+    public static func ==(lhs: CoreIdentifiedRoute, rhs: CoreIdentifiedRoute) -> Bool {
+        if lhs.transport != rhs.transport {
+            return false
+        }
+        if lhs.address != rhs.address {
+            return false
+        }
+        if lhs.userId != rhs.userId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(transport)
+        hasher.combine(address)
+        hasher.combine(userId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreIdentifiedRoute: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreIdentifiedRoute {
+        return
+            try CoreIdentifiedRoute(
+                transport: FfiConverterTypeCoreTransport.read(from: &buf), 
+                address: FfiConverterString.read(from: &buf), 
+                userId: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreIdentifiedRoute, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreTransport.write(value.transport, into: &buf)
+        FfiConverterString.write(value.address, into: &buf)
+        FfiConverterData.write(value.userId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreIdentifiedRoute_lift(_ buf: RustBuffer) throws -> CoreIdentifiedRoute {
+    return try FfiConverterTypeCoreIdentifiedRoute.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreIdentifiedRoute_lower(_ value: CoreIdentifiedRoute) -> RustBuffer {
+    return FfiConverterTypeCoreIdentifiedRoute.lower(value)
+}
+
+
+public struct CoreLanEndpoint {
+    public var host: String
+    public var port: UInt16
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(host: String, port: UInt16) {
+        self.host = host
+        self.port = port
+    }
+}
+
+
+
+extension CoreLanEndpoint: Equatable, Hashable {
+    public static func ==(lhs: CoreLanEndpoint, rhs: CoreLanEndpoint) -> Bool {
+        if lhs.host != rhs.host {
+            return false
+        }
+        if lhs.port != rhs.port {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(host)
+        hasher.combine(port)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLanEndpoint: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLanEndpoint {
+        return
+            try CoreLanEndpoint(
+                host: FfiConverterString.read(from: &buf), 
+                port: FfiConverterUInt16.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreLanEndpoint, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.host, into: &buf)
+        FfiConverterUInt16.write(value.port, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanEndpoint_lift(_ buf: RustBuffer) throws -> CoreLanEndpoint {
+    return try FfiConverterTypeCoreLanEndpoint.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanEndpoint_lower(_ value: CoreLanEndpoint) -> RustBuffer {
+    return FfiConverterTypeCoreLanEndpoint.lower(value)
+}
+
+
+public struct CoreLanHealthDecision {
+    public var action: CoreLanHealthAction
+    public var nonce: UInt64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(action: CoreLanHealthAction, nonce: UInt64?) {
+        self.action = action
+        self.nonce = nonce
+    }
+}
+
+
+
+extension CoreLanHealthDecision: Equatable, Hashable {
+    public static func ==(lhs: CoreLanHealthDecision, rhs: CoreLanHealthDecision) -> Bool {
+        if lhs.action != rhs.action {
+            return false
+        }
+        if lhs.nonce != rhs.nonce {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(action)
+        hasher.combine(nonce)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLanHealthDecision: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLanHealthDecision {
+        return
+            try CoreLanHealthDecision(
+                action: FfiConverterTypeCoreLanHealthAction.read(from: &buf), 
+                nonce: FfiConverterOptionUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreLanHealthDecision, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreLanHealthAction.write(value.action, into: &buf)
+        FfiConverterOptionUInt64.write(value.nonce, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanHealthDecision_lift(_ buf: RustBuffer) throws -> CoreLanHealthDecision {
+    return try FfiConverterTypeCoreLanHealthDecision.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanHealthDecision_lower(_ value: CoreLanHealthDecision) -> RustBuffer {
+    return FfiConverterTypeCoreLanHealthDecision.lower(value)
+}
+
+
+public struct CoreMessageTarget {
+    public var senderUserId: Data
+    public var lamport: UInt64
+    public var kind: UInt8
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(senderUserId: Data, lamport: UInt64, kind: UInt8) {
+        self.senderUserId = senderUserId
+        self.lamport = lamport
+        self.kind = kind
+    }
+}
+
+
+
+extension CoreMessageTarget: Equatable, Hashable {
+    public static func ==(lhs: CoreMessageTarget, rhs: CoreMessageTarget) -> Bool {
+        if lhs.senderUserId != rhs.senderUserId {
+            return false
+        }
+        if lhs.lamport != rhs.lamport {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(senderUserId)
+        hasher.combine(lamport)
+        hasher.combine(kind)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreMessageTarget: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreMessageTarget {
+        return
+            try CoreMessageTarget(
+                senderUserId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
+                kind: FfiConverterUInt8.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreMessageTarget, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.senderUserId, into: &buf)
+        FfiConverterUInt64.write(value.lamport, into: &buf)
+        FfiConverterUInt8.write(value.kind, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMessageTarget_lift(_ buf: RustBuffer) throws -> CoreMessageTarget {
+    return try FfiConverterTypeCoreMessageTarget.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMessageTarget_lower(_ value: CoreMessageTarget) -> RustBuffer {
+    return FfiConverterTypeCoreMessageTarget.lower(value)
+}
+
+
+public struct CoreReactionPayload {
+    public var target: CoreMessageTarget
+    public var emoji: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(target: CoreMessageTarget, emoji: String) {
+        self.target = target
+        self.emoji = emoji
+    }
+}
+
+
+
+extension CoreReactionPayload: Equatable, Hashable {
+    public static func ==(lhs: CoreReactionPayload, rhs: CoreReactionPayload) -> Bool {
+        if lhs.target != rhs.target {
+            return false
+        }
+        if lhs.emoji != rhs.emoji {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(target)
+        hasher.combine(emoji)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreReactionPayload: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreReactionPayload {
+        return
+            try CoreReactionPayload(
+                target: FfiConverterTypeCoreMessageTarget.read(from: &buf), 
+                emoji: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreReactionPayload, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreMessageTarget.write(value.target, into: &buf)
+        FfiConverterString.write(value.emoji, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreReactionPayload_lift(_ buf: RustBuffer) throws -> CoreReactionPayload {
+    return try FfiConverterTypeCoreReactionPayload.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreReactionPayload_lower(_ value: CoreReactionPayload) -> RustBuffer {
+    return FfiConverterTypeCoreReactionPayload.lower(value)
+}
+
+
+public struct CoreReactionSummary {
+    public var emoji: String
+    public var count: UInt32
+    public var reactedByOwnUser: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(emoji: String, count: UInt32, reactedByOwnUser: Bool) {
+        self.emoji = emoji
+        self.count = count
+        self.reactedByOwnUser = reactedByOwnUser
+    }
+}
+
+
+
+extension CoreReactionSummary: Equatable, Hashable {
+    public static func ==(lhs: CoreReactionSummary, rhs: CoreReactionSummary) -> Bool {
+        if lhs.emoji != rhs.emoji {
+            return false
+        }
+        if lhs.count != rhs.count {
+            return false
+        }
+        if lhs.reactedByOwnUser != rhs.reactedByOwnUser {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(emoji)
+        hasher.combine(count)
+        hasher.combine(reactedByOwnUser)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreReactionSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreReactionSummary {
+        return
+            try CoreReactionSummary(
+                emoji: FfiConverterString.read(from: &buf), 
+                count: FfiConverterUInt32.read(from: &buf), 
+                reactedByOwnUser: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreReactionSummary, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.emoji, into: &buf)
+        FfiConverterUInt32.write(value.count, into: &buf)
+        FfiConverterBool.write(value.reactedByOwnUser, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreReactionSummary_lift(_ buf: RustBuffer) throws -> CoreReactionSummary {
+    return try FfiConverterTypeCoreReactionSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreReactionSummary_lower(_ value: CoreReactionSummary) -> RustBuffer {
+    return FfiConverterTypeCoreReactionSummary.lower(value)
+}
+
+
+public struct CoreReactionTargetSummary {
+    public var target: CoreMessageTarget
+    public var reactions: [CoreReactionSummary]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(target: CoreMessageTarget, reactions: [CoreReactionSummary]) {
+        self.target = target
+        self.reactions = reactions
+    }
+}
+
+
+
+extension CoreReactionTargetSummary: Equatable, Hashable {
+    public static func ==(lhs: CoreReactionTargetSummary, rhs: CoreReactionTargetSummary) -> Bool {
+        if lhs.target != rhs.target {
+            return false
+        }
+        if lhs.reactions != rhs.reactions {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(target)
+        hasher.combine(reactions)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreReactionTargetSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreReactionTargetSummary {
+        return
+            try CoreReactionTargetSummary(
+                target: FfiConverterTypeCoreMessageTarget.read(from: &buf), 
+                reactions: FfiConverterSequenceTypeCoreReactionSummary.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreReactionTargetSummary, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreMessageTarget.write(value.target, into: &buf)
+        FfiConverterSequenceTypeCoreReactionSummary.write(value.reactions, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreReactionTargetSummary_lift(_ buf: RustBuffer) throws -> CoreReactionTargetSummary {
+    return try FfiConverterTypeCoreReactionTargetSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreReactionTargetSummary_lower(_ value: CoreReactionTargetSummary) -> RustBuffer {
+    return FfiConverterTypeCoreReactionTargetSummary.lower(value)
+}
+
+
+public struct CoreRelayEnvelopeDisposition {
+    public var relayId: Int64
+    public var disposition: CoreInboundDisposition
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(relayId: Int64, disposition: CoreInboundDisposition) {
+        self.relayId = relayId
+        self.disposition = disposition
+    }
+}
+
+
+
+extension CoreRelayEnvelopeDisposition: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayEnvelopeDisposition, rhs: CoreRelayEnvelopeDisposition) -> Bool {
+        if lhs.relayId != rhs.relayId {
+            return false
+        }
+        if lhs.disposition != rhs.disposition {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(relayId)
+        hasher.combine(disposition)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayEnvelopeDisposition: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayEnvelopeDisposition {
+        return
+            try CoreRelayEnvelopeDisposition(
+                relayId: FfiConverterInt64.read(from: &buf), 
+                disposition: FfiConverterTypeCoreInboundDisposition.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayEnvelopeDisposition, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.relayId, into: &buf)
+        FfiConverterTypeCoreInboundDisposition.write(value.disposition, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayEnvelopeDisposition_lift(_ buf: RustBuffer) throws -> CoreRelayEnvelopeDisposition {
+    return try FfiConverterTypeCoreRelayEnvelopeDisposition.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayEnvelopeDisposition_lower(_ value: CoreRelayEnvelopeDisposition) -> RustBuffer {
+    return FfiConverterTypeCoreRelayEnvelopeDisposition.lower(value)
+}
+
+
+public struct CoreRelayFetchPage {
+    public var envelopes: [CoreRelayFetchedEnvelope]
+    public var nextCursor: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(envelopes: [CoreRelayFetchedEnvelope], nextCursor: Int64) {
+        self.envelopes = envelopes
+        self.nextCursor = nextCursor
+    }
+}
+
+
+
+extension CoreRelayFetchPage: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayFetchPage, rhs: CoreRelayFetchPage) -> Bool {
+        if lhs.envelopes != rhs.envelopes {
+            return false
+        }
+        if lhs.nextCursor != rhs.nextCursor {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(envelopes)
+        hasher.combine(nextCursor)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayFetchPage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayFetchPage {
+        return
+            try CoreRelayFetchPage(
+                envelopes: FfiConverterSequenceTypeCoreRelayFetchedEnvelope.read(from: &buf), 
+                nextCursor: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayFetchPage, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeCoreRelayFetchedEnvelope.write(value.envelopes, into: &buf)
+        FfiConverterInt64.write(value.nextCursor, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFetchPage_lift(_ buf: RustBuffer) throws -> CoreRelayFetchPage {
+    return try FfiConverterTypeCoreRelayFetchPage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFetchPage_lower(_ value: CoreRelayFetchPage) -> RustBuffer {
+    return FfiConverterTypeCoreRelayFetchPage.lower(value)
+}
+
+
+public struct CoreRelayFetchedEnvelope {
+    public var id: Int64
+    public var msgId: Data
+    public var hopTtl: UInt8
+    public var recipientHint: Data
+    public var sealed: Data
+    public var expiryMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, msgId: Data, hopTtl: UInt8, recipientHint: Data, sealed: Data, expiryMs: Int64) {
+        self.id = id
+        self.msgId = msgId
+        self.hopTtl = hopTtl
+        self.recipientHint = recipientHint
+        self.sealed = sealed
+        self.expiryMs = expiryMs
+    }
+}
+
+
+
+extension CoreRelayFetchedEnvelope: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayFetchedEnvelope, rhs: CoreRelayFetchedEnvelope) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.msgId != rhs.msgId {
+            return false
+        }
+        if lhs.hopTtl != rhs.hopTtl {
+            return false
+        }
+        if lhs.recipientHint != rhs.recipientHint {
+            return false
+        }
+        if lhs.sealed != rhs.sealed {
+            return false
+        }
+        if lhs.expiryMs != rhs.expiryMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(msgId)
+        hasher.combine(hopTtl)
+        hasher.combine(recipientHint)
+        hasher.combine(sealed)
+        hasher.combine(expiryMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayFetchedEnvelope: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayFetchedEnvelope {
+        return
+            try CoreRelayFetchedEnvelope(
+                id: FfiConverterInt64.read(from: &buf), 
+                msgId: FfiConverterData.read(from: &buf), 
+                hopTtl: FfiConverterUInt8.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf), 
+                sealed: FfiConverterData.read(from: &buf), 
+                expiryMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayFetchedEnvelope, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterData.write(value.msgId, into: &buf)
+        FfiConverterUInt8.write(value.hopTtl, into: &buf)
+        FfiConverterData.write(value.recipientHint, into: &buf)
+        FfiConverterData.write(value.sealed, into: &buf)
+        FfiConverterInt64.write(value.expiryMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFetchedEnvelope_lift(_ buf: RustBuffer) throws -> CoreRelayFetchedEnvelope {
+    return try FfiConverterTypeCoreRelayFetchedEnvelope.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFetchedEnvelope_lower(_ value: CoreRelayFetchedEnvelope) -> RustBuffer {
+    return FfiConverterTypeCoreRelayFetchedEnvelope.lower(value)
+}
+
+
+public struct CoreRelayPresence {
+    public var hint: Data
+    public var lastSeenMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hint: Data, lastSeenMs: Int64) {
+        self.hint = hint
+        self.lastSeenMs = lastSeenMs
+    }
+}
+
+
+
+extension CoreRelayPresence: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayPresence, rhs: CoreRelayPresence) -> Bool {
+        if lhs.hint != rhs.hint {
+            return false
+        }
+        if lhs.lastSeenMs != rhs.lastSeenMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hint)
+        hasher.combine(lastSeenMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayPresence: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayPresence {
+        return
+            try CoreRelayPresence(
+                hint: FfiConverterData.read(from: &buf), 
+                lastSeenMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayPresence, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.hint, into: &buf)
+        FfiConverterInt64.write(value.lastSeenMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPresence_lift(_ buf: RustBuffer) throws -> CoreRelayPresence {
+    return try FfiConverterTypeCoreRelayPresence.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPresence_lower(_ value: CoreRelayPresence) -> RustBuffer {
+    return FfiConverterTypeCoreRelayPresence.lower(value)
+}
+
+
+public struct CoreRelayPresencePage {
+    public var nowMs: Int64
+    public var presence: [CoreRelayPresence]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(nowMs: Int64, presence: [CoreRelayPresence]) {
+        self.nowMs = nowMs
+        self.presence = presence
+    }
+}
+
+
+
+extension CoreRelayPresencePage: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayPresencePage, rhs: CoreRelayPresencePage) -> Bool {
+        if lhs.nowMs != rhs.nowMs {
+            return false
+        }
+        if lhs.presence != rhs.presence {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(nowMs)
+        hasher.combine(presence)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayPresencePage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayPresencePage {
+        return
+            try CoreRelayPresencePage(
+                nowMs: FfiConverterInt64.read(from: &buf), 
+                presence: FfiConverterSequenceTypeCoreRelayPresence.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayPresencePage, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.nowMs, into: &buf)
+        FfiConverterSequenceTypeCoreRelayPresence.write(value.presence, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPresencePage_lift(_ buf: RustBuffer) throws -> CoreRelayPresencePage {
+    return try FfiConverterTypeCoreRelayPresencePage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPresencePage_lower(_ value: CoreRelayPresencePage) -> RustBuffer {
+    return FfiConverterTypeCoreRelayPresencePage.lower(value)
+}
+
+
+public struct CoreReplyMetadata {
+    public var message: CoreMessageTarget
+    public var msgId: Data?
+    public var replyToMsgId: Data?
+    public var target: StoredMessage?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(message: CoreMessageTarget, msgId: Data?, replyToMsgId: Data?, target: StoredMessage?) {
+        self.message = message
+        self.msgId = msgId
+        self.replyToMsgId = replyToMsgId
+        self.target = target
+    }
+}
+
+
+
+extension CoreReplyMetadata: Equatable, Hashable {
+    public static func ==(lhs: CoreReplyMetadata, rhs: CoreReplyMetadata) -> Bool {
+        if lhs.message != rhs.message {
+            return false
+        }
+        if lhs.msgId != rhs.msgId {
+            return false
+        }
+        if lhs.replyToMsgId != rhs.replyToMsgId {
+            return false
+        }
+        if lhs.target != rhs.target {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(message)
+        hasher.combine(msgId)
+        hasher.combine(replyToMsgId)
+        hasher.combine(target)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreReplyMetadata: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreReplyMetadata {
+        return
+            try CoreReplyMetadata(
+                message: FfiConverterTypeCoreMessageTarget.read(from: &buf), 
+                msgId: FfiConverterOptionData.read(from: &buf), 
+                replyToMsgId: FfiConverterOptionData.read(from: &buf), 
+                target: FfiConverterOptionTypeStoredMessage.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreReplyMetadata, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreMessageTarget.write(value.message, into: &buf)
+        FfiConverterOptionData.write(value.msgId, into: &buf)
+        FfiConverterOptionData.write(value.replyToMsgId, into: &buf)
+        FfiConverterOptionTypeStoredMessage.write(value.target, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreReplyMetadata_lift(_ buf: RustBuffer) throws -> CoreReplyMetadata {
+    return try FfiConverterTypeCoreReplyMetadata.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreReplyMetadata_lower(_ value: CoreReplyMetadata) -> RustBuffer {
+    return FfiConverterTypeCoreReplyMetadata.lower(value)
+}
+
+
+public struct CoreTransportRoute {
+    public var transport: CoreTransport
+    public var address: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(transport: CoreTransport, address: String) {
+        self.transport = transport
+        self.address = address
+    }
+}
+
+
+
+extension CoreTransportRoute: Equatable, Hashable {
+    public static func ==(lhs: CoreTransportRoute, rhs: CoreTransportRoute) -> Bool {
+        if lhs.transport != rhs.transport {
+            return false
+        }
+        if lhs.address != rhs.address {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(transport)
+        hasher.combine(address)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreTransportRoute: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreTransportRoute {
+        return
+            try CoreTransportRoute(
+                transport: FfiConverterTypeCoreTransport.read(from: &buf), 
+                address: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreTransportRoute, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreTransport.write(value.transport, into: &buf)
+        FfiConverterString.write(value.address, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreTransportRoute_lift(_ buf: RustBuffer) throws -> CoreTransportRoute {
+    return try FfiConverterTypeCoreTransportRoute.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreTransportRoute_lower(_ value: CoreTransportRoute) -> RustBuffer {
+    return FfiConverterTypeCoreTransportRoute.lower(value)
 }
 
 
@@ -3805,7 +6235,8 @@ public func FfiConverterTypeLanEndpointContent_lower(_ value: LanEndpointContent
 
 /**
  * Local-only diagnostics for how an incoming message reached this device.
- * `transport`: 0 = BLE direct, 1 = BLE through another device, 2 = relay.
+ * `transport`: 0 = BLE direct, 1 = BLE through another device, 2 = relay,
+ * 3 = same-LAN direct, 4 = same-LAN through another device.
  */
 public struct MessageArrival {
     public var transport: UInt8
@@ -4783,6 +7214,241 @@ public func FfiConverterTypeSuggestedFriendCard_lower(_ value: SuggestedFriendCa
     return FfiConverterTypeSuggestedFriendCard.lower(value)
 }
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum AttachmentMediaType {
+    
+    case image
+    case audio
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAttachmentMediaType: FfiConverterRustBuffer {
+    typealias SwiftType = AttachmentMediaType
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AttachmentMediaType {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .image
+        
+        case 2: return .audio
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: AttachmentMediaType, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .image:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .audio:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAttachmentMediaType_lift(_ buf: RustBuffer) throws -> AttachmentMediaType {
+    return try FfiConverterTypeAttachmentMediaType.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAttachmentMediaType_lower(_ value: AttachmentMediaType) -> RustBuffer {
+    return FfiConverterTypeAttachmentMediaType.lower(value)
+}
+
+
+
+extension AttachmentMediaType: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum BackupPassphraseStrength {
+    
+    case tooShort
+    case weak
+    case fair
+    case strong
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBackupPassphraseStrength: FfiConverterRustBuffer {
+    typealias SwiftType = BackupPassphraseStrength
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackupPassphraseStrength {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .tooShort
+        
+        case 2: return .weak
+        
+        case 3: return .fair
+        
+        case 4: return .strong
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: BackupPassphraseStrength, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .tooShort:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .weak:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .fair:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .strong:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupPassphraseStrength_lift(_ buf: RustBuffer) throws -> BackupPassphraseStrength {
+    return try FfiConverterTypeBackupPassphraseStrength.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupPassphraseStrength_lower(_ value: BackupPassphraseStrength) -> RustBuffer {
+    return FfiConverterTypeBackupPassphraseStrength.lower(value)
+}
+
+
+
+extension BackupPassphraseStrength: Equatable, Hashable {}
+
+
+
+
+public enum CoreBackupError {
+
+    
+    
+    case BadMagic
+    case UnsupportedVersion(version: UInt8
+    )
+    case UnsupportedKdf(kdfId: UInt8
+    )
+    case Truncated
+    case WrongPassphraseOrCorrupt
+    case InvalidPayload(reason: String
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreBackupError: FfiConverterRustBuffer {
+    typealias SwiftType = CoreBackupError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreBackupError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .BadMagic
+        case 2: return .UnsupportedVersion(
+            version: try FfiConverterUInt8.read(from: &buf)
+            )
+        case 3: return .UnsupportedKdf(
+            kdfId: try FfiConverterUInt8.read(from: &buf)
+            )
+        case 4: return .Truncated
+        case 5: return .WrongPassphraseOrCorrupt
+        case 6: return .InvalidPayload(
+            reason: try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreBackupError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case .BadMagic:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .UnsupportedVersion(version):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt8.write(version, into: &buf)
+            
+        
+        case let .UnsupportedKdf(kdfId):
+            writeInt(&buf, Int32(3))
+            FfiConverterUInt8.write(kdfId, into: &buf)
+            
+        
+        case .Truncated:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .WrongPassphraseOrCorrupt:
+            writeInt(&buf, Int32(5))
+        
+        
+        case let .InvalidPayload(reason):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(reason, into: &buf)
+            
+        }
+    }
+}
+
+
+extension CoreBackupError: Equatable, Hashable {}
+
+extension CoreBackupError: Foundation.LocalizedError {
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+}
+
 
 public enum CoreError {
 
@@ -4885,6 +7551,368 @@ extension CoreError: Foundation.LocalizedError {
         String(reflecting: self)
     }
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum CoreInboundDisposition {
+    
+    case consumed
+    case carried
+    case expired
+    case seen
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreInboundDisposition: FfiConverterRustBuffer {
+    typealias SwiftType = CoreInboundDisposition
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreInboundDisposition {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .consumed
+        
+        case 2: return .carried
+        
+        case 3: return .expired
+        
+        case 4: return .seen
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreInboundDisposition, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .consumed:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .carried:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .expired:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .seen:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundDisposition_lift(_ buf: RustBuffer) throws -> CoreInboundDisposition {
+    return try FfiConverterTypeCoreInboundDisposition.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundDisposition_lower(_ value: CoreInboundDisposition) -> RustBuffer {
+    return FfiConverterTypeCoreInboundDisposition.lower(value)
+}
+
+
+
+extension CoreInboundDisposition: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum CoreInboundGate {
+    
+    case dispatch
+    case seen
+    case expired
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreInboundGate: FfiConverterRustBuffer {
+    typealias SwiftType = CoreInboundGate
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreInboundGate {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .dispatch
+        
+        case 2: return .seen
+        
+        case 3: return .expired
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreInboundGate, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .dispatch:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .seen:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .expired:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundGate_lift(_ buf: RustBuffer) throws -> CoreInboundGate {
+    return try FfiConverterTypeCoreInboundGate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundGate_lower(_ value: CoreInboundGate) -> RustBuffer {
+    return FfiConverterTypeCoreInboundGate.lower(value)
+}
+
+
+
+extension CoreInboundGate: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum CoreLanHealthAction {
+    
+    case send
+    case wait
+    case close
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLanHealthAction: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLanHealthAction
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLanHealthAction {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .send
+        
+        case 2: return .wait
+        
+        case 3: return .close
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLanHealthAction, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .send:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .wait:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .close:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanHealthAction_lift(_ buf: RustBuffer) throws -> CoreLanHealthAction {
+    return try FfiConverterTypeCoreLanHealthAction.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanHealthAction_lower(_ value: CoreLanHealthAction) -> RustBuffer {
+    return FfiConverterTypeCoreLanHealthAction.lower(value)
+}
+
+
+
+extension CoreLanHealthAction: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum CoreTickStatus {
+    
+    case sent
+    case delivered
+    case read
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreTickStatus: FfiConverterRustBuffer {
+    typealias SwiftType = CoreTickStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreTickStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sent
+        
+        case 2: return .delivered
+        
+        case 3: return .read
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreTickStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .sent:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .delivered:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .read:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreTickStatus_lift(_ buf: RustBuffer) throws -> CoreTickStatus {
+    return try FfiConverterTypeCoreTickStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreTickStatus_lower(_ value: CoreTickStatus) -> RustBuffer {
+    return FfiConverterTypeCoreTickStatus.lower(value)
+}
+
+
+
+extension CoreTickStatus: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum CoreTransport {
+    
+    case central
+    case peripheral
+    case lan
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreTransport: FfiConverterRustBuffer {
+    typealias SwiftType = CoreTransport
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreTransport {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .central
+        
+        case 2: return .peripheral
+        
+        case 3: return .lan
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreTransport, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .central:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .peripheral:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .lan:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreTransport_lift(_ buf: RustBuffer) throws -> CoreTransport {
+    return try FfiConverterTypeCoreTransport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreTransport_lower(_ value: CoreTransport) -> RustBuffer {
+    return FfiConverterTypeCoreTransport.lower(value)
+}
+
+
+
+extension CoreTransport: Equatable, Hashable {}
+
+
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
@@ -5002,6 +8030,78 @@ extension Frame: Equatable, Hashable {}
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = UInt32?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt32.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     typealias SwiftType = String?
 
@@ -5042,6 +8142,30 @@ fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterData.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeAuthoredReceipt: FfiConverterRustBuffer {
+    typealias SwiftType = AuthoredReceipt?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeAuthoredReceipt.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeAuthoredReceipt.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -5114,6 +8238,102 @@ fileprivate struct FfiConverterOptionTypeContactProvenance: FfiConverterRustBuff
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeContactProvenance.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCoreAttachmentPayload: FfiConverterRustBuffer {
+    typealias SwiftType = CoreAttachmentPayload?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreAttachmentPayload.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreAttachmentPayload.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCoreLanEndpoint: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLanEndpoint?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreLanEndpoint.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreLanEndpoint.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCoreReactionPayload: FfiConverterRustBuffer {
+    typealias SwiftType = CoreReactionPayload?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreReactionPayload.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreReactionPayload.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCoreTransportRoute: FfiConverterRustBuffer {
+    typealias SwiftType = CoreTransportRoute?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreTransportRoute.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreTransportRoute.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -5242,6 +8462,104 @@ fileprivate struct FfiConverterOptionTypeStoredMessage: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreTransport: FfiConverterRustBuffer {
+    typealias SwiftType = CoreTransport?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreTransport.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreTransport.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceData: FfiConverterRustBuffer {
+    typealias SwiftType = [Data]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceData.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt32]
+
+    public static func write(_ value: [UInt32], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterUInt32.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt32]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterUInt32.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceInt64: FfiConverterRustBuffer {
+    typealias SwiftType = [Int64]
+
+    public static func write(_ value: [Int64], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterInt64.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Int64] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Int64]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterInt64.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -5292,6 +8610,31 @@ fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeAuthoredEnvelope: FfiConverterRustBuffer {
+    typealias SwiftType = [AuthoredEnvelope]
+
+    public static func write(_ value: [AuthoredEnvelope], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeAuthoredEnvelope.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [AuthoredEnvelope] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [AuthoredEnvelope]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeAuthoredEnvelope.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCarriedEnvelope: FfiConverterRustBuffer {
     typealias SwiftType = [CarriedEnvelope]
 
@@ -5334,6 +8677,206 @@ fileprivate struct FfiConverterSequenceTypeContact: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeContact.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreIdentifiedRoute: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreIdentifiedRoute]
+
+    public static func write(_ value: [CoreIdentifiedRoute], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreIdentifiedRoute.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreIdentifiedRoute] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreIdentifiedRoute]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreIdentifiedRoute.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreReactionSummary: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreReactionSummary]
+
+    public static func write(_ value: [CoreReactionSummary], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreReactionSummary.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreReactionSummary] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreReactionSummary]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreReactionSummary.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreReactionTargetSummary: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreReactionTargetSummary]
+
+    public static func write(_ value: [CoreReactionTargetSummary], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreReactionTargetSummary.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreReactionTargetSummary] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreReactionTargetSummary]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreReactionTargetSummary.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreRelayEnvelopeDisposition: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRelayEnvelopeDisposition]
+
+    public static func write(_ value: [CoreRelayEnvelopeDisposition], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRelayEnvelopeDisposition.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRelayEnvelopeDisposition] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRelayEnvelopeDisposition]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRelayEnvelopeDisposition.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreRelayFetchedEnvelope: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRelayFetchedEnvelope]
+
+    public static func write(_ value: [CoreRelayFetchedEnvelope], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRelayFetchedEnvelope.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRelayFetchedEnvelope] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRelayFetchedEnvelope]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRelayFetchedEnvelope.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreRelayPresence: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRelayPresence]
+
+    public static func write(_ value: [CoreRelayPresence], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRelayPresence.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRelayPresence] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRelayPresence]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRelayPresence.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreReplyMetadata: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreReplyMetadata]
+
+    public static func write(_ value: [CoreReplyMetadata], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreReplyMetadata.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreReplyMetadata] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreReplyMetadata]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreReplyMetadata.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreTransportRoute: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreTransportRoute]
+
+    public static func write(_ value: [CoreTransportRoute], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreTransportRoute.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreTransportRoute] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreTransportRoute]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreTransportRoute.read(from: &buf))
         }
         return seq
     }
@@ -5513,6 +9056,68 @@ fileprivate struct FfiConverterSequenceTypeStoredMessage: FfiConverterRustBuffer
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreTransport: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreTransport]
+
+    public static func write(_ value: [CoreTransport], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreTransport.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreTransport] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreTransport]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreTransport.read(from: &buf))
+        }
+        return seq
+    }
+}
+public func attachmentMaxBlobBytes() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_attachment_max_blob_bytes($0
+    )
+})
+}
+public func backupMinPassphraseLength() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_backup_min_passphrase_length($0
+    )
+})
+}
+public func backupPassphraseStrength(passphrase: String) -> BackupPassphraseStrength {
+    return try!  FfiConverterTypeBackupPassphraseStrength.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_backup_passphrase_strength(
+        FfiConverterString.lower(passphrase),$0
+    )
+})
+}
+public func bleAttHeaderOverhead() -> UInt16 {
+    return try!  FfiConverterUInt16.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_ble_att_header_overhead($0
+    )
+})
+}
+public func bleDefaultAttMtu() -> UInt16 {
+    return try!  FfiConverterUInt16.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_ble_default_att_mtu($0
+    )
+})
+}
+public func bleMaxAttValueLen() -> UInt16 {
+    return try!  FfiConverterUInt16.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_ble_max_att_value_len($0
+    )
+})
+}
 /**
  * `recipient_hint` for an envelope's §6.4 header: `BLAKE2b-8(recipient
  * UserID || day number)`, where the day number is `timestamp_ms` divided
@@ -5528,6 +9133,153 @@ public func computeRecipientHint(recipientUserId: Data, timestampMs: Int64) -> D
     uniffi_cruisemesh_core_fn_func_compute_recipient_hint(
         FfiConverterData.lower(recipientUserId),
         FfiConverterInt64.lower(timestampMs),$0
+    )
+})
+}
+public func coreFormatLanEndpoint(endpoint: CoreLanEndpoint) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_format_lan_endpoint(
+        FfiConverterTypeCoreLanEndpoint.lower(endpoint),$0
+    )
+})
+}
+/**
+ * A link may establish its identity once. Repeating the same HELLO is
+ * harmless; changing identity on an authenticated link is rejected.
+ */
+public func coreHelloIdentityMatches(currentUserId: Data?, helloUserId: Data) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_hello_identity_matches(
+        FfiConverterOptionData.lower(currentUserId),
+        FfiConverterData.lower(helloUserId),$0
+    )
+})
+}
+public func coreInboundGate(isNewMsgId: Bool, expiryMs: Int64, nowMs: Int64) -> CoreInboundGate {
+    return try!  FfiConverterTypeCoreInboundGate.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_inbound_gate(
+        FfiConverterBool.lower(isNewMsgId),
+        FfiConverterInt64.lower(expiryMs),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+public func coreIsVisibleChatKind(kind: UInt8) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_is_visible_chat_kind(
+        FfiConverterUInt8.lower(kind),$0
+    )
+})
+}
+public func coreLanNetworkIdForComponents(components: [String]) -> String? {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_lan_network_id_for_components(
+        FfiConverterSequenceString.lower(components),$0
+    )
+})
+}
+public func coreLanNetworkIdForIpv4(address: String) -> String? {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_lan_network_id_for_ipv4(
+        FfiConverterString.lower(address),$0
+    )
+})
+}
+public func coreLastVisibleMessage(messages: [StoredMessage]) -> StoredMessage? {
+    return try!  FfiConverterOptionTypeStoredMessage.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_last_visible_message(
+        FfiConverterSequenceTypeStoredMessage.lower(messages),$0
+    )
+})
+}
+public func coreMakeLanEndpointLink(endpoint: CoreLanEndpoint) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_make_lan_endpoint_link(
+        FfiConverterTypeCoreLanEndpoint.lower(endpoint),$0
+    )
+})
+}
+public func coreParseLanEndpoint(text: String, defaultPort: UInt16) -> CoreLanEndpoint? {
+    return try!  FfiConverterOptionTypeCoreLanEndpoint.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_parse_lan_endpoint(
+        FfiConverterString.lower(text),
+        FfiConverterUInt16.lower(defaultPort),$0
+    )
+})
+}
+public func coreParseLanEndpointLink(fragment: String?) -> CoreLanEndpoint? {
+    return try!  FfiConverterOptionTypeCoreLanEndpoint.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_parse_lan_endpoint_link(
+        FfiConverterOptionString.lower(fragment),$0
+    )
+})
+}
+public func coreReactionSummariesByTarget(messages: [StoredMessage], ownUserId: Data) -> [CoreReactionTargetSummary] {
+    return try!  FfiConverterSequenceTypeCoreReactionTargetSummary.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_reaction_summaries_by_target(
+        FfiConverterSequenceTypeStoredMessage.lower(messages),
+        FfiConverterData.lower(ownUserId),$0
+    )
+})
+}
+public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
+    return try!  FfiConverterSequenceInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_ack_ids(
+        FfiConverterSequenceTypeCoreRelayEnvelopeDisposition.lower(items),$0
+    )
+})
+}
+public func coreShouldAckInbound(disposition: CoreInboundDisposition) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_should_ack_inbound(
+        FfiConverterTypeCoreInboundDisposition.lower(disposition),$0
+    )
+})
+}
+public func coreSubnet24Hosts(address: String) -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_subnet_24_hosts(
+        FfiConverterString.lower(address),$0
+    )
+})
+}
+public func coreTickStatusFor(lamport: UInt64, deliveredThrough: UInt64, readThrough: UInt64) -> CoreTickStatus {
+    return try!  FfiConverterTypeCoreTickStatus.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_tick_status_for(
+        FfiConverterUInt64.lower(lamport),
+        FfiConverterUInt64.lower(deliveredThrough),
+        FfiConverterUInt64.lower(readThrough),$0
+    )
+})
+}
+public func coreTransportSendPlan(routes: [CoreTransportRoute], frameSize: UInt32) -> [CoreTransportRoute] {
+    return try!  FfiConverterSequenceTypeCoreTransportRoute.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_transport_send_plan(
+        FfiConverterSequenceTypeCoreTransportRoute.lower(routes),
+        FfiConverterUInt32.lower(frameSize),$0
+    )
+})
+}
+public func coreUnreadCount(messages: [StoredMessage], ownUserId: Data, readThrough: UInt64) -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_unread_count(
+        FfiConverterSequenceTypeStoredMessage.lower(messages),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterUInt64.lower(readThrough),$0
+    )
+})
+}
+public func coreVisibleChatMessages(messages: [StoredMessage]) -> [StoredMessage] {
+    return try!  FfiConverterSequenceTypeStoredMessage.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_visible_chat_messages(
+        FfiConverterSequenceTypeStoredMessage.lower(messages),$0
+    )
+})
+}
+public func coreVisibleGapIndices(messages: [StoredMessage]) -> [UInt32] {
+    return try!  FfiConverterSequenceUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_visible_gap_indices(
+        FfiConverterSequenceTypeStoredMessage.lower(messages),$0
     )
 })
 }
@@ -5559,6 +9311,13 @@ public func createIntroductionTicket(introducer: Identity, candidateUserId: Data
     )
 })
 }
+public func decodeAttachmentPayload(bytes: Data) -> CoreAttachmentPayload? {
+    return try!  FfiConverterOptionTypeCoreAttachmentPayload.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_decode_attachment_payload(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
 /**
  * Decode the legacy message fields and any known append-only extensions.
  * Unknown well-formed TLVs are ignored for forward compatibility.
@@ -5583,6 +9342,13 @@ public func decodeFriendDirectoryContent(bytes: Data)throws  -> FriendDirectoryC
 public func decodeGroupInviteContent(bytes: Data)throws  -> Group {
     return try  FfiConverterTypeGroup.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_decode_group_invite_content(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+public func decodeIdentityBytes(bytes: Data)throws  -> Identity {
+    return try  FfiConverterTypeIdentity.lift(try rustCallWithError(FfiConverterTypeCoreBackupError.lift) {
+    uniffi_cruisemesh_core_fn_func_decode_identity_bytes(
         FfiConverterData.lower(bytes),$0
     )
 })
@@ -5623,6 +9389,13 @@ public func decodeProfileSyncContent(bytes: Data)throws  -> ProfileSyncContent {
     )
 })
 }
+public func decodeReactionPayload(bytes: Data) -> CoreReactionPayload? {
+    return try!  FfiConverterOptionTypeCoreReactionPayload.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_decode_reaction_payload(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
 /**
  * Decode a [`ReceiptContent`] from its wire form. Rejects truncated input,
  * corrupt length prefixes, and unexpected trailing bytes.
@@ -5643,6 +9416,29 @@ public func defaultExpiry(timestampMs: Int64) -> Int64 {
     return try!  FfiConverterInt64.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_default_expiry(
         FfiConverterInt64.lower(timestampMs),$0
+    )
+})
+}
+public func digestIsExpectedChatId(digestChatId: Data, helloUserId: Data?) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_digest_is_expected_chat_id(
+        FfiConverterData.lower(digestChatId),
+        FfiConverterOptionData.lower(helloUserId),$0
+    )
+})
+}
+public func digestThroughLamportForSender(entries: [DigestEntry], senderUserId: Data) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_digest_through_lamport_for_sender(
+        FfiConverterSequenceTypeDigestEntry.lower(entries),
+        FfiConverterData.lower(senderUserId),$0
+    )
+})
+}
+public func encodeAttachmentPayload(payload: CoreAttachmentPayload)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_encode_attachment_payload(
+        FfiConverterTypeCoreAttachmentPayload.lower(payload),$0
     )
 })
 }
@@ -5718,6 +9514,13 @@ public func encodeHello(userId: Data) -> Data {
     )
 })
 }
+public func encodeIdentityBytes(identity: Identity) -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_encode_identity_bytes(
+        FfiConverterTypeIdentity.lower(identity),$0
+    )
+})
+}
 public func encodeIntroducedFriendRequest(request: IntroducedFriendRequest) -> Data {
     return try!  FfiConverterData.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_encode_introduced_friend_request(
@@ -5781,6 +9584,13 @@ public func encodeProfileSyncContent(content: ProfileSyncContent) -> Data {
     )
 })
 }
+public func encodeReactionPayload(payload: CoreReactionPayload)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_encode_reaction_payload(
+        FfiConverterTypeCoreReactionPayload.lower(payload),$0
+    )
+})
+}
 /**
  * Encode a [`ReceiptContent`] to its wire form (see module docs for layout).
  */
@@ -5826,6 +9636,19 @@ public func formatUserId(userId: Data) -> String {
 })
 }
 /**
+ * Split a frame into canonical BLE fragments. Returns `None` when the input
+ * cannot be represented by the 16-bit fragment count rather than unwinding a
+ * platform GATT callback with an exception.
+ */
+public func fragmentBleFrame(frame: Data, mtuPayloadSize: UInt32) -> [Data]? {
+    return try!  FfiConverterOptionSequenceData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_fragment_ble_frame(
+        FfiConverterData.lower(frame),
+        FfiConverterUInt32.lower(mtuPayloadSize),$0
+    )
+})
+}
+/**
  * Derive the UserID that a FriendCard corresponds to (from its signing key).
  */
 public func friendCardUserId(card: FriendCard) -> Data {
@@ -5857,6 +9680,14 @@ public func generateMsgId() -> Data {
 public func lanDefaultTcpPort() -> UInt16 {
     return try!  FfiConverterUInt16.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_lan_default_tcp_port($0
+    )
+})
+}
+public func lanEndpointCacheIsFresh(savedAtMs: Int64, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_is_fresh(
+        FfiConverterInt64.lower(savedAtMs),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -5892,6 +9723,21 @@ public func makeFriendLink(cardJson: String) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_make_friend_link(
         FfiConverterString.lower(cardJson),$0
+    )
+})
+}
+public func normalizeRelayUrl(value: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_normalize_relay_url(
+        FfiConverterString.lower(value),$0
+    )
+})
+}
+public func openBackup(passphrase: String, file: Data)throws  -> CoreBackupPayload {
+    return try  FfiConverterTypeCoreBackupPayload.lift(try rustCallWithError(FfiConverterTypeCoreBackupError.lift) {
+    uniffi_cruisemesh_core_fn_func_open_backup(
+        FfiConverterString.lower(passphrase),
+        FfiConverterData.lower(file),$0
     )
 })
 }
@@ -5951,6 +9797,62 @@ public func parseFriendText(text: String)throws  -> FriendCard {
     )
 })
 }
+public func relayBuildFetchPath(hints: [Data], afterId: Int64, limit: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_relay_build_fetch_path(
+        FfiConverterSequenceData.lower(hints),
+        FfiConverterInt64.lower(afterId),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+public func relayDecodeFetchPage(body: Data)throws  -> CoreRelayFetchPage {
+    return try  FfiConverterTypeCoreRelayFetchPage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_relay_decode_fetch_page(
+        FfiConverterData.lower(body),$0
+    )
+})
+}
+public func relayDecodePostResponse(body: Data)throws  -> Int64 {
+    return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_relay_decode_post_response(
+        FfiConverterData.lower(body),$0
+    )
+})
+}
+public func relayDecodePresencePage(body: Data)throws  -> CoreRelayPresencePage {
+    return try  FfiConverterTypeCoreRelayPresencePage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_relay_decode_presence_page(
+        FfiConverterData.lower(body),$0
+    )
+})
+}
+public func relayEncodeAckRequest(ids: [Int64])throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_relay_encode_ack_request(
+        FfiConverterSequenceInt64.lower(ids),$0
+    )
+})
+}
+public func relayEncodePostEnvelope(msgId: Data, hopTtl: UInt8, recipientHint: Data, sealed: Data, expiryMs: Int64)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_relay_encode_post_envelope(
+        FfiConverterData.lower(msgId),
+        FfiConverterUInt8.lower(hopTtl),
+        FfiConverterData.lower(recipientHint),
+        FfiConverterData.lower(sealed),
+        FfiConverterInt64.lower(expiryMs),$0
+    )
+})
+}
+public func relayEncodePresenceRequest(announce: [Data], query: [Data])throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_relay_encode_presence_request(
+        FfiConverterSequenceData.lower(announce),
+        FfiConverterSequenceData.lower(query),$0
+    )
+})
+}
 /**
  * Rotate a group's symmetric key and replace its member list, keeping the
  * stable group id/name. This is the v1 membership-change mechanism from
@@ -5961,6 +9863,15 @@ public func rotateGroup(group: Group, memberUserIds: [Data])throws  -> Group {
     uniffi_cruisemesh_core_fn_func_rotate_group(
         FfiConverterTypeGroup.lower(group),
         FfiConverterSequenceData.lower(memberUserIds),$0
+    )
+})
+}
+public func sealBackup(passphrase: String, payload: CoreBackupPayload, iterations: UInt32?)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreBackupError.lift) {
+    uniffi_cruisemesh_core_fn_func_seal_backup(
+        FfiConverterString.lower(passphrase),
+        FfiConverterTypeCoreBackupPayload.lower(payload),
+        FfiConverterOptionUInt32.lower(iterations),$0
     )
 })
 }
@@ -5989,6 +9900,16 @@ public func sealMessage(sender: Identity, recipientAgreePk: Data, payload: Data)
         FfiConverterTypeIdentity.lower(sender),
         FfiConverterData.lower(recipientAgreePk),
         FfiConverterData.lower(payload),$0
+    )
+})
+}
+public func shouldResendLanEndpoint(previousSignature: String?, previousSentAtMs: Int64?, currentSignature: String, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_should_resend_lan_endpoint(
+        FfiConverterOptionString.lower(previousSignature),
+        FfiConverterOptionInt64.lower(previousSentAtMs),
+        FfiConverterString.lower(currentSignature),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -6023,13 +9944,91 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_attachment_max_blob_bytes() != 21631) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_backup_min_passphrase_length() != 54885) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_backup_passphrase_strength() != 33273) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_ble_att_header_overhead() != 25376) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_ble_default_att_mtu() != 22794) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_ble_max_att_value_len() != 51624) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_compute_recipient_hint() != 63461) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_format_lan_endpoint() != 59419) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_hello_identity_matches() != 7419) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_inbound_gate() != 33371) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_is_visible_chat_kind() != 47018) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_lan_network_id_for_components() != 6078) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_lan_network_id_for_ipv4() != 24186) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_last_visible_message() != 29515) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_make_lan_endpoint_link() != 27969) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_parse_lan_endpoint() != 56400) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_parse_lan_endpoint_link() != 63195) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_reaction_summaries_by_target() != 52182) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 15537) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 48329) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_subnet_24_hosts() != 3135) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_tick_status_for() != 17631) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_transport_send_plan() != 40925) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_unread_count() != 27709) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_visible_chat_messages() != 48182) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_visible_gap_indices() != 61862) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_create_group() != 45726) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_create_introduction_ticket() != 2547) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_decode_attachment_payload() != 15495) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_decode_extended_message_body() != 61344) {
@@ -6039,6 +10038,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_decode_group_invite_content() != 49763) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_decode_identity_bytes() != 3390) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_decode_introduced_friend_request() != 4415) {
@@ -6053,10 +10055,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_decode_profile_sync_content() != 4329) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_decode_reaction_payload() != 38350) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_decode_receipt_content() != 40419) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_default_expiry() != 43648) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_digest_is_expected_chat_id() != 2744) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_digest_through_lamport_for_sender() != 47244) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_encode_attachment_payload() != 6055) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_digest() != 65002) {
@@ -6072,6 +10086,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_hello() != 21775) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_encode_identity_bytes() != 19325) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_introduced_friend_request() != 7571) {
@@ -6092,6 +10109,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_profile_sync_content() != 26330) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_encode_reaction_payload() != 17821) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_encode_receipt_content() != 55046) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6102,6 +10122,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_format_user_id() != 35242) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_fragment_ble_frame() != 30680) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_friend_card_user_id() != 30116) {
@@ -6116,6 +10139,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_lan_default_tcp_port() != 33372) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_is_fresh() != 25415) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_lan_max_frame_size() != 29933) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6126,6 +10152,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 24162) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 27474) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_open_backup() != 7338) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_open_group_message() != 52148) {
@@ -6143,7 +10175,31 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_parse_friend_text() != 17133) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_build_fetch_path() != 4249) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_decode_fetch_page() != 49617) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_decode_post_response() != 54288) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_decode_presence_page() != 6708) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_encode_ack_request() != 23747) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_encode_post_envelope() != 29984) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_encode_presence_request() != 64701) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_rotate_group() != 56003) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_seal_backup() != 5887) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_seal_group_message() != 36896) {
@@ -6152,7 +10208,85 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_seal_message() != 58379) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_should_resend_lan_endpoint() != 5099) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_verify_introduction_ticket() != 3092) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_bleframereassembler_accept() != 35445) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelanhealthtracker_clear() != 47217) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelanhealthtracker_next() != 62456) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelanhealthtracker_remove() != 7233) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelanhealthtracker_response() != 52501) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_clear() != 9925) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_clear_transports() != 61560) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_connected_routes() != 780) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_connected_user_count() != 12471) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_helloed_user_ids() != 10863) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_identified_routes() != 51137) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_connected() != 62233) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_disconnected() != 10293) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_hello() != 46445) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_route_for() != 36259) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_routes_for() != 5491) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_transport_for() != 23195) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_user_id_for() != 22278) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_can_attempt() != 26325) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_clear() != 15832) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_failure_count() != 57862) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_is_given_up() != 6632) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_record_failure() != 50820) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_record_success() != 9573) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_retry_delay_ms() != 40354) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_decrypt_record() != 12115) {
@@ -6174,6 +10308,21 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_friend_directory() != 32757) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_author_friend_request() != 47501) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_author_group_message() != 44512) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_author_pairwise_message() != 25955) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_author_receipt() != 8018) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_envelope() != 41114) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints() != 43270) {
@@ -6200,6 +10349,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_avatar_epoch() != 49788) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 56337) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 22558) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6210,6 +10362,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_relay_carried_envelope() != 65235) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_ensure_authored_receipt() != 16297) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_family_carried_envelopes() != 49773) {
@@ -6299,6 +10454,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_outgoing_receipt_envelopes() != 28322) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_queue_group_invites() != 18379) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_receipt_through() != 17794) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6315,6 +10473,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_remove_friend_suggestion() != 18035) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_reply_metadata() != 61728) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_semantic_unread_count() != 2210) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_set_contact_avatar() != 55497) {
@@ -6335,6 +10499,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_group() != 50441) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_imported_contact() != 52091) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_outgoing_receipt_envelope() != 65307) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6345,6 +10512,18 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_seenids_record() != 24410) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_bleframereassembler_new() != 1261) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corelanhealthtracker_new() != 56458) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_coremeshrouterstate_new() != 20926) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corereconnectbackofftracker_new() != 24962) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_lannoisesession_new() != 19269) {

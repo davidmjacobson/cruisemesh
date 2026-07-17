@@ -214,7 +214,7 @@ struct FriendsView: View {
 
     private func previewText(_ text: String) {
         do {
-            let card = try parseFriendText(text: extractFriendToken(text))
+            let card = try parseFriendText(text: text)
             let userId = friendCardUserId(card: card)
             guard userId != identity.userId else {
                 error = "That is your own card"
@@ -244,29 +244,29 @@ struct FriendsView: View {
 
     private func confirm(_ candidate: Contact) {
         do {
-            try AppStore.get().upsertContact(contact: candidate)
+            let contact = try AppStore.get().upsertImportedContact(contact: candidate)
             try? AppStore.get().upsertContactProvenance(provenance: ContactProvenance(
-                userId: candidate.userId,
+                userId: contact.userId,
                 source: 0,
                 introducerUserId: nil,
                 introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
             ))
-            try? AppStore.get().removeFriendSuggestion(candidateUserId: candidate.userId)
+            try? AppStore.get().removeFriendSuggestion(candidateUserId: contact.userId)
             if RelayConfigStore.load() == nil,
-               let url = candidate.relayUrl,
-               let token = candidate.relayToken {
+               let url = contact.relayUrl,
+               let token = contact.relayToken {
                 RelayConfigStore.save(relayUrl: url, relayToken: token)
             }
             let delivery = FriendRequestSender.sendMutualFriendRequest(
                 store: AppStore.get(),
                 identity: identity,
-                contact: candidate,
+                contact: contact,
                 displayName: appModel.displayName
             )
             ProfileSyncSender.queueToContact(
                 store: AppStore.get(),
                 identity: identity,
-                contact: candidate,
+                contact: contact,
                 displayName: appModel.displayName,
                 epoch: ProfileStore.loadOwnAvatarEpoch()
             )
@@ -276,7 +276,7 @@ struct FriendsView: View {
             preview = nil
             DispatchQueue.main.async {
                 added = FriendAddedState(
-                    contact: candidate,
+                    contact: contact,
                     delivery: delivery,
                     relayConfigured: RelayConfigStore.load() != nil
                 )

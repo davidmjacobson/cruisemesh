@@ -82,40 +82,18 @@ final class GroupSender {
         label: String,
         replyToMsgId: Data? = nil
     ) {
-        let chatId = group.id
-        let lamport = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-        let message = StoredMessage(
-            chatId: chatId,
-            senderUserId: identity.userId,
-            lamport: lamport + 1,
-            timestamp: timestamp,
-            kind: kind,
-            payload: payload
-        )
-        guard let outbound = buildOutboundGroupEnvelope(
-            identity: identity,
-            group: group,
-            message: message,
-            replyToMsgId: replyToMsgId
+        guard let authored = try? store.authorGroupMessage(
+            identity: identity, group: group, kind: kind, payload: payload,
+            replyToMsgId: replyToMsgId, timestampMs: timestamp
         ) else {
             return
         }
-        if let replyToMsgId {
-            _ = try? store.insertOutgoingReply(
-                message: message,
-                envelope: outbound,
-                replyToMsgId: replyToMsgId,
-                queuedAtMs: timestamp
-            )
-        } else {
-            _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
-        }
+        let chatId = authored.message.chatId
         ChatEvents.notifyChatChanged(chatId)
         RelaySyncEvents.requestSync()
 
-        let frame = encodeOutboundEnvelopeFrame(outbound)
-        let fanout = MeshRouter.relayToAll(frame: frame)
+        let fanout = MeshRouter.relayToAll(frame: authored.frame)
         if fanout == 0 {
             log.info("\(label, privacy: .public): no live links; group message stays local for carry/digest/relay")
         } else {
@@ -127,38 +105,16 @@ final class GroupSender {
     /// single `kind=4` row under `chat_id = group.id`; the outbound queue holds
     /// N sealed envelopes keyed by recipient.
     private func queueInvites(group: Group, members: [Contact]) {
-        let inviteContent: Data
-        do {
-            inviteContent = try encodeGroupInviteContent(group: group)
-        } catch {
-            log.warning("encodeGroupInviteContent failed: \(error.localizedDescription, privacy: .public)")
-            return
-        }
-        let lamport = (try? store.highestContiguousLamport(chatId: group.id, senderUserId: identity.userId)) ?? 0
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-        let message = StoredMessage(
-            chatId: group.id,
-            senderUserId: identity.userId,
-            lamport: lamport + 1,
-            timestamp: timestamp,
-            kind: ProtocolKind.groupInvite,
-            payload: inviteContent
-        )
-
-        var anyQueued = false
-        for member in members where member.userId != identity.userId {
-            guard let outbound = buildOutboundAuthoredEnvelope(
-                identity: identity,
-                contact: member,
-                message: message
-            ) else { continue }
-            _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
-            anyQueued = true
-            if !MeshRouter.sendToUserId(userId: member.userId, frame: encodeOutboundEnvelopeFrame(outbound)) {
-                log.info("Queued group invite for \(member.name, privacy: .public); peer not currently connected")
+        guard let authored = try? store.queueGroupInvites(
+            identity: identity, group: group, members: members, timestampMs: timestamp
+        ) else { return }
+        for invite in authored {
+            if !MeshRouter.sendToUserId(userId: invite.envelope.recipientUserId, frame: invite.frame) {
+                log.info("Queued group invite; peer not currently connected")
             }
         }
-        if anyQueued {
+        if !authored.isEmpty {
             ChatEvents.notifyChatChanged(group.id)
         }
     }

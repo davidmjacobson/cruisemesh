@@ -289,7 +289,7 @@ fun ScanScreen(
                             QrAnalyzer { decoded ->
                                 if (added != null) return@QrAnalyzer
                                 try {
-                                    val card = parseFriendText(extractFriendToken(decoded))
+                                    val card = parseFriendText(decoded)
                                     val userId = friendCardUserId(card)
                                     if (userId.contentEquals(ownUserId)) {
                                         status = "That's your own card"

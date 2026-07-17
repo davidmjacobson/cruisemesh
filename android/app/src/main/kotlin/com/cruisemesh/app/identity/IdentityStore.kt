@@ -12,6 +12,9 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import uniffi.cruisemesh_core.Identity
+import uniffi.cruisemesh_core.CoreBackupException
+import uniffi.cruisemesh_core.decodeIdentityBytes
+import uniffi.cruisemesh_core.encodeIdentityBytes
 
 private const val PREFS_NAME = "cruisemesh_identity"
 private const val PREF_CIPHERTEXT = "identity_ciphertext"
@@ -20,9 +23,6 @@ private const val KEYSTORE_ALIAS = "cruisemesh_identity_key"
 private const val ANDROID_KEYSTORE = "AndroidKeyStore"
 private const val TRANSFORMATION = "AES/GCM/NoPadding"
 private const val GCM_TAG_LENGTH_BITS = 128
-
-/** Fixed field sizes in [Identity]: userId, signPk, signSk, agreePk, agreeSk. */
-private val IDENTITY_FIELD_SIZES = listOf(16, 32, 32, 32, 32)
 
 /**
  * Persists the on-device [Identity] (Ed25519 + X25519 secret key material)
@@ -90,21 +90,12 @@ object IdentityStore {
 }
 
 internal fun encodeIdentity(identity: Identity): ByteArray =
-    identity.userId + identity.signPk + identity.signSk + identity.agreePk + identity.agreeSk
+    encodeIdentityBytes(identity)
 
 internal fun decodeIdentity(bytes: ByteArray): Identity {
-    require(bytes.size == IDENTITY_FIELD_SIZES.sum()) {
-        "corrupt stored identity: expected ${IDENTITY_FIELD_SIZES.sum()} bytes, got ${bytes.size}"
+    return try {
+        decodeIdentityBytes(bytes)
+    } catch (error: CoreBackupException) {
+        throw IllegalArgumentException("corrupt stored identity", error)
     }
-    var offset = 0
-    val fields = IDENTITY_FIELD_SIZES.map { size ->
-        bytes.copyOfRange(offset, offset + size).also { offset += size }
-    }
-    return Identity(
-        userId = fields[0],
-        signPk = fields[1],
-        signSk = fields[2],
-        agreePk = fields[3],
-        agreeSk = fields[4],
-    )
 }

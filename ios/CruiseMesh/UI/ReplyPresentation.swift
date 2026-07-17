@@ -26,20 +26,19 @@ func loadMessageReplyMetadata(
     senderLabelFor: (StoredMessage) -> String
 ) -> [String: MessageReplyMetadata] {
     var result: [String: MessageReplyMetadata] = [:]
-    for message in messages {
-        let reference = try? store.messageReference(
-            chatId: message.chatId,
-            senderUserId: message.senderUserId,
-            lamport: message.lamport
-        )
-        let quoted = reference?.replyToMsgId.map { replyToMsgId in
+    for metadata in (try? store.replyMetadata(messages: messages)) ?? [] {
+        let message = messages.first {
+            $0.senderUserId == metadata.message.senderUserId && $0.lamport == metadata.message.lamport
+                && $0.kind == metadata.message.kind
+        }!
+        let quoted = metadata.replyToMsgId.map { _ in
             quotedMessagePreview(
-                target: try? store.messageByMsgId(chatId: message.chatId, msgId: replyToMsgId),
+                target: metadata.target,
                 senderLabelFor: senderLabelFor
             )
         }
         result[replyMessageKey(message)] = MessageReplyMetadata(
-            msgId: reference?.msgId,
+            msgId: metadata.msgId,
             quoted: quoted
         )
     }

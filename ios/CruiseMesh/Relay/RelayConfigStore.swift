@@ -6,10 +6,7 @@ struct RelayConfig: Equatable {
 }
 
 func normalizeRelayUrl(_ value: String) -> String {
-    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-    guard !trimmed.isEmpty else { return "" }
-    return trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+    normalizeRelayUrl(value: value)
 }
 
 enum RelayConfigStore {

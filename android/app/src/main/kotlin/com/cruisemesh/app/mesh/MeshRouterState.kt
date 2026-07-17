@@ -1,154 +1,38 @@
 package com.cruisemesh.app.mesh
 
 import com.cruisemesh.app.chat.UserIdHex
+import uniffi.cruisemesh_core.CoreMeshRouterState
+import uniffi.cruisemesh_core.CoreTransport
 
-/**
- * Pure address<->userId mapping backing [MeshRouter] (DESIGN.md §5.2 dual
- * BLE roles, §7.3 interim sync). Kept as a plain class with no Android
- * framework dependencies, following the pattern set by
- * [ReconnectBackoffTracker] and [FrameFraming], so the mapping logic is
- * unit-testable without a device -- see MeshRouterStateTest.
- *
- * A BLE link only becomes "usable" (able to carry a HELLO) at a specific
- * point per role -- see [MeshRouter] -- so [onConnected] and [onDisconnected]
- * are driven by those lifecycle events, and [onHello] is driven by the first
- * frame actually received on that link. Until a HELLO arrives, an address is
- * connected but its userId is unknown (`userIdFor` returns null).
- *
- * Dual-role note: because every phone runs both BLE roles at once, the same
- * physical peer can end up connected under two entries here (one where we
- * dialed them as a central, one where they dialed us as a peripheral). Both
- * entries independently learn the same userId via their own HELLO, and
- * [routeFor] is deliberately indifferent to which one it returns -- either
- * link reaches the same peer, so picking the first match found is correct.
- * When one of the two links drops, [onDisconnected] removes only that
- * entry; the peer stays reachable over the other.
- *
- * Thread-safety: mutators arrive on BLE binder threads while [routeFor] is
- * called from the UI thread's send path, so every method synchronizes on the
- * map. The operations are all tiny (no I/O under the lock).
- */
+/** Android-shaped adapter around the shared, thread-safe Rust route state. */
 class MeshRouterState {
-    /** Live link type for a remote address. BLE roles remain distinct because
-     * they have different platform send functions; LAN is a full transport. */
-    enum class Transport(val routePriority: Int) {
-        CENTRAL(0),
-        PERIPHERAL(0),
-        LAN(10),
-    }
+    enum class Transport(val routePriority: Int) { CENTRAL(0), PERIPHERAL(0), LAN(10) }
+    data class IdentifiedRoute(val transport: Transport, val address: String, val userId: ByteArray)
 
-    private data class Peer(val transport: Transport, var userId: ByteArray?)
+    private val core = CoreMeshRouterState()
 
-    data class IdentifiedRoute(
-        val transport: Transport,
-        val address: String,
-        val userId: ByteArray,
-    )
+    fun onConnected(address: String, transport: Transport) = core.onConnected(address, transport.toCore())
+    fun onDisconnected(address: String) = core.onDisconnected(address)
+    fun onHello(address: String, userId: ByteArray): Boolean = core.onHello(address, userId)
+    fun userIdFor(address: String): ByteArray? = core.userIdFor(address)
+    fun transportFor(address: String): Transport? = core.transportFor(address)?.toPlatform()
+    fun connectedRoutes(): List<Pair<Transport, String>> = core.connectedRoutes().map { it.transport.toPlatform() to it.address }
+    fun identifiedRoutes(): List<IdentifiedRoute> = core.identifiedRoutes().map { IdentifiedRoute(it.transport.toPlatform(), it.address, it.userId) }
+    fun routeFor(userId: ByteArray): Pair<Transport, String>? = core.routeFor(userId)?.let { it.transport.toPlatform() to it.address }
+    fun routesFor(userId: ByteArray): List<Pair<Transport, String>> = core.routesFor(userId).map { it.transport.toPlatform() to it.address }
+    fun helloedUserIds(): Set<String> = core.helloedUserIds().mapTo(mutableSetOf(), UserIdHex::encode)
+    fun clearTransports(transports: Set<Transport>) = core.clearTransports(transports.map(Transport::toCore))
+    fun clear() = core.clear()
+}
 
-    private val peersByAddress = mutableMapOf<String, Peer>()
+internal fun MeshRouterState.Transport.toCore(): CoreTransport = when (this) {
+    MeshRouterState.Transport.CENTRAL -> CoreTransport.CENTRAL
+    MeshRouterState.Transport.PERIPHERAL -> CoreTransport.PERIPHERAL
+    MeshRouterState.Transport.LAN -> CoreTransport.LAN
+}
 
-    /** A link to [address] over [transport] just became usable (able to send/receive frames). */
-    fun onConnected(address: String, transport: Transport) {
-        synchronized(peersByAddress) {
-            peersByAddress[address] = Peer(transport, userId = null)
-        }
-    }
-
-    /** [address] is no longer connected; forget it so sends never target a dead link. */
-    fun onDisconnected(address: String) {
-        synchronized(peersByAddress) {
-            peersByAddress.remove(address)
-        }
-    }
-
-    /**
-     * Record the identity for [address]. Returns false when an already
-     * authenticated link later claims a different UserID; callers must drop
-     * that frame rather than replacing the trusted mapping.
-     */
-    fun onHello(address: String, userId: ByteArray): Boolean {
-        synchronized(peersByAddress) {
-            val peer = peersByAddress[address] ?: return false
-            val existing = peer.userId
-            if (existing != null && !existing.contentEquals(userId)) return false
-            peer.userId = userId.copyOf()
-            return true
-        }
-    }
-
-    /** The userId [address] identified as, if it has sent a HELLO and is still connected. */
-    fun userIdFor(address: String): ByteArray? =
-        synchronized(peersByAddress) { peersByAddress[address]?.userId }
-
-    /** Which local role [address] is connected under, or null if it isn't currently connected. */
-    fun transportFor(address: String): Transport? =
-        synchronized(peersByAddress) { peersByAddress[address]?.transport }
-
-    /**
-     * A snapshot of every currently connected link as (transport, address)
-     * pairs, regardless of whether its userId is known yet. Used by the
-     * gossip flood path (DESIGN.md §5.3): a foreign envelope is relayed to
-     * every link *except* the one it arrived on, and relaying doesn't need to
-     * know who's on the far end -- an unopenable envelope is forwarded blindly
-     * and the true recipient (or the next relay) sorts it out. Returns a copy
-     * so the caller can iterate without holding the lock.
-     */
-    fun connectedRoutes(): List<Pair<Transport, String>> =
-        synchronized(peersByAddress) {
-            peersByAddress.map { (address, peer) -> peer.transport to address }
-        }
-
-    /** Snapshot of live routes that have completed their HELLO exchange. */
-    fun identifiedRoutes(): List<IdentifiedRoute> =
-        synchronized(peersByAddress) {
-            peersByAddress.mapNotNull { (address, peer) ->
-                peer.userId?.let { userId ->
-                    IdentifiedRoute(peer.transport, address, userId.copyOf())
-                }
-            }
-        }
-
-    /**
-     * The transport + address currently usable to reach [userId], or null if
-     * no connected link has identified itself as that user yet.
-     */
-    fun routeFor(userId: ByteArray): Pair<Transport, String>? {
-        return routesFor(userId).firstOrNull()
-    }
-
-    /** Every live route to one peer, highest-priority transport first. */
-    fun routesFor(userId: ByteArray): List<Pair<Transport, String>> =
-        synchronized(peersByAddress) {
-            peersByAddress.mapNotNull { (address, peer) ->
-                val known = peer.userId ?: return@mapNotNull null
-                if (!known.contentEquals(userId)) return@mapNotNull null
-                peer.transport to address
-            }.sortedByDescending { it.first.routePriority }
-        }
-
-    /**
-     * Distinct HELLO'd peer userIds, hex-encoded (CONNECTIVITY_INDICATOR.md
-     * §5.1) -- every phone runs dual BLE roles at once, so the same peer can
-     * hold two entries here; hex-encoding before collecting into a [Set]
-     * collapses those duplicates since [ByteArray] has no structural
-     * equality of its own.
-     */
-    fun helloedUserIds(): Set<String> =
-        synchronized(peersByAddress) {
-            peersByAddress.values.mapNotNullTo(mutableSetOf()) { peer -> peer.userId?.let { UserIdHex.encode(it) } }
-        }
-
-    /** Remove selected link types while preserving every other live route. */
-    fun clearTransports(transports: Set<Transport>) {
-        synchronized(peersByAddress) {
-            peersByAddress.entries.removeAll { entry -> entry.value.transport in transports }
-        }
-    }
-
-    /** Forget every connection, e.g. when the mesh service stops and all links die with it. */
-    fun clear() {
-        synchronized(peersByAddress) {
-            peersByAddress.clear()
-        }
-    }
+internal fun CoreTransport.toPlatform(): MeshRouterState.Transport = when (this) {
+    CoreTransport.CENTRAL -> MeshRouterState.Transport.CENTRAL
+    CoreTransport.PERIPHERAL -> MeshRouterState.Transport.PERIPHERAL
+    CoreTransport.LAN -> MeshRouterState.Transport.LAN
 }

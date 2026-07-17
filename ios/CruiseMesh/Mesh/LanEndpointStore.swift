@@ -7,7 +7,6 @@ private struct CachedLanEndpoint: Codable {
 
 enum LanEndpointCache {
     private static let prefix = "cruisemesh.lan.endpoint."
-    private static let maxAgeMs: Int64 = 7 * 24 * 60 * 60 * 1_000
 
     static func save(
         networkId: String?,
@@ -33,7 +32,7 @@ enum LanEndpointCache {
               let cached = try? JSONDecoder().decode(CachedLanEndpoint.self, from: data) else {
             return nil
         }
-        guard nowMs - cached.savedAtMs <= maxAgeMs else {
+        guard lanEndpointCacheIsFresh(savedAtMs: cached.savedAtMs, nowMs: nowMs) else {
             UserDefaults.standard.removeObject(forKey: storageKey)
             return nil
         }
@@ -48,7 +47,6 @@ enum LanEndpointCache {
 enum LanCapabilityStore {
     private static let supportedPrefix = "cruisemesh.lan.supported."
     private static let sentPrefix = "cruisemesh.lan.sent."
-    private static let resendIntervalMs: Int64 = 5 * 60 * 1_000
 
     static func markSupported(userId: Data) {
         UserDefaults.standard.set(true, forKey: supportedPrefix + UserIdHex.encode(userId))
@@ -67,10 +65,15 @@ enum LanCapabilityStore {
     ) -> Bool {
         let key = sentPrefix + UserIdHex.encode(userId)
         let signature = "\(networkId)|\(endpoint.host)|\(endpoint.port)|\(instanceToken.base64EncodedString())"
-        if let previous = UserDefaults.standard.dictionary(forKey: key),
-           previous["signature"] as? String == signature,
-           let sentAt = (previous["sentAt"] as? NSNumber)?.int64Value,
-           nowMs - sentAt < resendIntervalMs {
+        let previous = UserDefaults.standard.dictionary(forKey: key)
+        let previousSignature = previous?["signature"] as? String
+        let sentAt = (previous?["sentAt"] as? NSNumber)?.int64Value
+        if !shouldResendLanEndpoint(
+            previousSignature: previousSignature,
+            previousSentAtMs: sentAt,
+            currentSignature: signature,
+            nowMs: nowMs
+        ) {
             return false
         }
         UserDefaults.standard.set(

@@ -180,20 +180,12 @@ class RealMeshSenderMulingTest {
         val bobContact = contactFor(bob, "Bob")
         val store = MessageStore.open(":memory:")
 
-        val friendRequest = StoredMessage(
-            chatId = bob.userId,
-            senderUserId = alice.userId,
-            lamport = 1uL,
-            timestamp = 1L,
-            kind = 3u,
-            payload = "friend-card".toByteArray(),
-        )
-        val friendEnvelope = com.cruisemesh.app.mesh.buildOutboundAuthoredEnvelope(
+        store.authorFriendRequest(
             alice,
             bobContact,
-            friendRequest,
-        )!!
-        store.insertOutgoingMessage(friendRequest, friendEnvelope, 1L)
+            "friend-card",
+            1L,
+        )
 
         val sentFrames = mutableListOf<ByteArray>()
         MeshRouter.registerCentral { _, frame -> sentFrames += frame }

@@ -55,6 +55,8 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.ContactDiscoveryPolicy
 import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.CoreException
+import uniffi.cruisemesh_core.CoreInboundDisposition
+import uniffi.cruisemesh_core.CoreInboundGate
 import uniffi.cruisemesh_core.DigestEntry
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Group
@@ -67,6 +69,8 @@ import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
+import uniffi.cruisemesh_core.coreInboundGate
+import uniffi.cruisemesh_core.coreShouldAckInbound
 import uniffi.cruisemesh_core.decodeGroupInviteContent
 import uniffi.cruisemesh_core.decodeFriendDirectoryContent
 import uniffi.cruisemesh_core.decodeIntroducedFriendRequest
@@ -882,7 +886,7 @@ class MeshService : Service() {
     }
 
     /**
-     * Fetches this config's relay mailbox and, per [InboundDisposition],
+     * Fetches this config's relay mailbox and, per [CoreInboundDisposition],
      * either consumes each envelope for good or leaves it be.
      *
      * The fetch itself covers two disjoint concerns, combined into one hint
@@ -894,7 +898,7 @@ class MeshService : Service() {
      * across BLE clusters"). Every fetched envelope still goes through
      * [handleRelayEnvelope] -> [processInboundEnvelope] exactly as before;
      * what's new is that the ack decision now follows the returned
-     * [InboundDisposition] ([shouldAck]) instead of unconditionally acking
+     * [CoreInboundDisposition] ([coreShouldAckInbound]) instead of unconditionally acking
      * everything the fetch returned. A proxied envelope comes back as
      * CARRIED, not CONSUMED, so it is deliberately left on the relay --
      * [MeshService.carryRelayEnvelope] already queued it for BLE delivery to
@@ -941,7 +945,7 @@ class MeshService : Service() {
             val ackIds = ArrayList<Long>(page.envelopes.size)
             for (envelope in page.envelopes) {
                 val disposition = handleRelayEnvelope(envelope, identity)
-                if (shouldAck(disposition)) {
+                if (coreShouldAckInbound(disposition)) {
                     ackIds += envelope.id
                 }
             }
@@ -1481,27 +1485,14 @@ class MeshService : Service() {
             // groups this peer is in; their insert is idempotent.
             resendGroupOutboundToPeer(address, resolvedPeerUserId, identity)
         }
-        sprayCarriedEnvelopesTo(address, resolvedPeerUserId, recentMsgIds)
-        sprayOwnPendingOutboundTo(address, resolvedPeerUserId, recentMsgIds, identity)
-        sprayOwnPendingReceiptsTo(address, resolvedPeerUserId, recentMsgIds)
+        sprayDigestPlanTo(address, resolvedPeerUserId, recentMsgIds, identity)
         if (contact == null) {
             Log.i(TAG, "DIGEST from unrecognized userId=${UserIdHex.encode(resolvedPeerUserId)}; sprayed carry queue only")
         }
     }
 
-    /**
-     * BLE_1TO1_MULING.md Hook B: offers this digest peer -- whether or not
-     * they're a contact -- our own still-undelivered 1:1 outbound envelopes
-     * addressed to OTHER contacts, so a message authored while nobody was
-     * around still leaves this phone the next time any peer reconnects, not
-     * just the message's own recipient. [handleDigest]'s own-chat resend
-     * above already covers [peerUserId]'s own chat via the direct digest
-     * watermark, so it's excluded here to avoid a redundant second pass over
-     * the same envelopes. Group-addressed outbound envelopes are excluded
-     * too: [resendGroupOutboundToPeer] already floods those at send time and
-     * on every reconnect.
-     */
-    private fun sprayOwnPendingOutboundTo(
+    /** Executes Rust's complete digest-time mule plan. */
+    private fun sprayDigestPlanTo(
         address: String,
         peerUserId: ByteArray,
         peerKnownMsgIds: List<ByteArray>,
@@ -1509,81 +1500,25 @@ class MeshService : Service() {
     ) {
         val now = System.currentTimeMillis()
         try {
-            val peerKnownHex = peerKnownMsgIds.mapTo(mutableSetOf()) { UserIdHex.encode(it) }
-            val pendingByContact = store.listContacts()
-                .filter { !it.userId.contentEquals(peerUserId) }
-                .map { contact ->
-                    val deliveredThrough = store.receiptThrough(contact.userId, identity.userId, RECEIPT_TYPE_DELIVERED)
-                    store.outboundEnvelopesAfter(contact.userId, identity.userId, deliveredThrough)
-                }
-            val toSpray = OwnOutboundSpraySelector.select(
-                pendingByContact,
-                peerKnownHex,
-                now,
-                OWN_OUTBOUND_SPRAY_BUDGET_BYTES,
+            val plan = store.coreDigestSprayPlan(
+                ownUserId = identity.userId,
+                peerUserId = peerUserId,
+                peerHints = recentHintsFor(peerUserId, now),
+                peerKnownMsgIds = peerKnownMsgIds,
+                nowMs = now,
+                ownOutboundBudgetBytes = OWN_OUTBOUND_SPRAY_BUDGET_BYTES.toULong(),
+                ownReceiptBudgetBytes = OWN_RECEIPT_SPRAY_BUDGET_BYTES.toULong(),
+                receiptQueryLimit = RELAY_BATCH_LIMIT,
             )
-            if (toSpray.isEmpty()) return
-            var sprayed = 0
-            for (envelope in toSpray) {
-                if (MeshRouter.sendToAddress(address, encodeOutboundEnvelopeFrame(envelope))) {
-                    sprayed++
-                }
-            }
-            if (sprayed > 0) {
-                Log.i(TAG, "Sprayed $sprayed own pending outbound envelope(s) to mule $address")
-            }
-        } catch (e: CoreException) {
-            Log.w(TAG, "Failed to spray own pending outbound to $address: ${e.message}")
-        }
-    }
-
-    /**
-     * BLE_1TO1_MULING.md §6 follow-up: offers this digest peer our own
-     * still-undelivered outgoing receipt envelopes -- the DELIVERED/READ acks
-     * we owe the original *senders* of messages we've received -- so a mule
-     * can carry them back toward those senders. Without this, a message
-     * delivered over a pure-offline A -> mule -> C hop lands on C but C's
-     * receipt only reaches A via relay upload or a direct A<->C link, so A's
-     * tick can stay "sent" indefinitely even though C got and read it.
-     *
-     * The receipt envelopes are already sealed to the sender with a
-     * recipient-keyed hint (see [buildOutgoingReceiptEnvelope]), so a mule
-     * that isn't the sender treats them exactly like any other foreign
-     * envelope: it can't open them, floods and family-carries them onward via
-     * the shipped [processInboundEnvelope] -> [carryForeignEnvelope] path, and
-     * hands them off when it meets the sender -- no protocol or core change,
-     * mirroring how Hook B reuses that same downstream pipeline for messages.
-     *
-     * Receipts owed to [peerUserId] itself are excluded: [syncReceiptsFirst]
-     * already delivered those directly on this same digest exchange.
-     */
-    private fun sprayOwnPendingReceiptsTo(
-        address: String,
-        peerUserId: ByteArray,
-        peerKnownMsgIds: List<ByteArray>,
-    ) {
-        val now = System.currentTimeMillis()
-        try {
-            val peerKnownHex = peerKnownMsgIds.mapTo(mutableSetOf()) { UserIdHex.encode(it) }
-            val toSpray = OwnReceiptSpraySelector.select(
-                store.pendingRelayOutgoingReceiptEnvelopes(RELAY_BATCH_LIMIT, now),
-                peerUserId,
-                peerKnownHex,
-                now,
-                OWN_RECEIPT_SPRAY_BUDGET_BYTES,
+            val frames = plan.carriedFrames + plan.ownOutboundFrames + plan.ownReceiptFrames
+            val sprayed = frames.count { MeshRouter.sendToAddress(address, it) }
+            Log.i(
+                TAG,
+                "Digest spray to $address sent $sprayed/${frames.size} frame(s) " +
+                    "(carried=${plan.carriedFrames.size}, authored=${plan.ownOutboundFrames.size}, receipts=${plan.ownReceiptFrames.size})",
             )
-            if (toSpray.isEmpty()) return
-            var sprayed = 0
-            for (envelope in toSpray) {
-                if (MeshRouter.sendToAddress(address, encodeOutgoingReceiptEnvelopeFrame(envelope))) {
-                    sprayed++
-                }
-            }
-            if (sprayed > 0) {
-                Log.i(TAG, "Sprayed $sprayed own pending receipt envelope(s) to mule $address")
-            }
         } catch (e: CoreException) {
-            Log.w(TAG, "Failed to spray own pending receipts to $address: ${e.message}")
+            Log.w(TAG, "Failed to build digest spray plan for $address: ${e.message}")
         }
     }
 
@@ -1650,35 +1585,6 @@ class MeshService : Service() {
     }
 
     /**
-     * DESIGN.md §5.3 carry follow-up: spray carried foreign envelopes onward
-     * to a non-recipient mule on reconnect, excluding anything actually
-     * destined for that peer (the targeted drain already handled those) and
-     * anything the peer's digest says it already knows by `msg_id`.
-     *
-     * Unlike [drainCarriedEnvelopesTo], this keeps the local copy: a mule
-     * stays a mule until the true recipient eventually opens it.
-     */
-    private fun sprayCarriedEnvelopesTo(address: String, peerUserId: ByteArray, peerKnownMsgIds: List<ByteArray>) {
-        val now = System.currentTimeMillis()
-        try {
-            store.pruneExpiredCarried(now)
-            val peerHints = recentHintsFor(peerUserId, now)
-            val toSpray = store.carriedEnvelopesForPeerSync(peerHints, peerKnownMsgIds, now)
-            if (toSpray.isEmpty()) return
-            var sprayed = 0
-            for (env in toSpray) {
-                val frame = encodeEnvelopeFrame(env.msgId, env.hopTtl, env.expiry, env.recipientHint, env.sealed)
-                if (MeshRouter.sendToAddress(address, frame)) {
-                    sprayed++
-                }
-            }
-            Log.i(TAG, "Sprayed $sprayed carried envelope(s) to mule $address")
-        } catch (e: CoreException) {
-            Log.w(TAG, "Failed to spray carried envelopes to $address: ${e.message}")
-        }
-    }
-
-    /**
      * Envelope handling with §5.3 gossip in front of §6.3 delivery.
      *
      * Every inbound `0x02` frame carries the §6.4 public header, so before
@@ -1709,7 +1615,7 @@ class MeshService : Service() {
      * check explained in this class's KDoc, kind dispatch) is unchanged --
      * see [deliverOpenedEnvelope].
      *
-     * [processInboundEnvelope] now returns an [InboundDisposition] so
+     * [processInboundEnvelope] now returns a [CoreInboundDisposition] so
      * [pollRelayMailbox] (the relay path) can decide whether it's safe to ack
      * the envelope; this BLE path has no such concept (a link frame isn't
      * "acked"), so it just ignores the return value.
@@ -1721,7 +1627,7 @@ class MeshService : Service() {
     private fun handleRelayEnvelope(
         envelope: com.cruisemesh.app.relay.RelayFetchedEnvelope,
         identity: Identity,
-    ): InboundDisposition {
+    ): CoreInboundDisposition {
         Log.i(
             TAG,
             "Handling relay envelope id=${envelope.id} msgId=${UserIdHex.encode(envelope.msgId)} hopTtl=${envelope.hopTtl}",
@@ -1747,22 +1653,28 @@ class MeshService : Service() {
      * pick [carryRelayEnvelope] (durable, never re-uploaded -- it's already on
      * the relay) vs. the existing [carryForeignEnvelope] (durable-if-family,
      * uploaded to the relay so an internet phone can proxy it onward) for
-     * envelopes we can't open ourselves. See [InboundDisposition] for what
+     * envelopes we can't open ourselves. See [CoreInboundDisposition] for what
      * each return value means to the caller.
      */
     private fun processInboundEnvelope(
         sourceAddress: String?,
         envelope: Frame.Envelope,
         identity: Identity,
-    ): InboundDisposition {
+    ): CoreInboundDisposition {
         val sourceLabel = sourceAddress ?: "relay"
-        if (!GossipState.seenIds.checkAndRecord(envelope.msgId)) {
-            // Already handled this msg_id; a redundant copy from the flood.
-            return InboundDisposition.SEEN
-        }
-        if (envelope.expiry <= System.currentTimeMillis()) {
-            Log.i(TAG, "Dropping expired envelope from $sourceLabel (expiry=${envelope.expiry})")
-            return InboundDisposition.EXPIRED
+        when (
+            coreInboundGate(
+                GossipState.seenIds.checkAndRecord(envelope.msgId),
+                envelope.expiry,
+                System.currentTimeMillis(),
+            )
+        ) {
+            CoreInboundGate.SEEN -> return CoreInboundDisposition.SEEN
+            CoreInboundGate.EXPIRED -> {
+                Log.i(TAG, "Dropping expired envelope from $sourceLabel (expiry=${envelope.expiry})")
+                return CoreInboundDisposition.EXPIRED
+            }
+            CoreInboundGate.DISPATCH -> Unit
         }
 
         val opened = try {
@@ -1790,7 +1702,7 @@ class MeshService : Service() {
                 } else {
                     carryForeignEnvelope(envelope, forceFamily = true)
                 }
-                return InboundDisposition.CONSUMED
+                return CoreInboundDisposition.CONSUMED
             }
             // Not for us (or unopenable) -> foreign traffic. Two jobs, both
             // best-effort (DESIGN.md §5.3): flood it to whoever's connected
@@ -1802,11 +1714,11 @@ class MeshService : Service() {
             } else {
                 carryForeignEnvelope(envelope)
             }
-            return InboundDisposition.CARRIED
+            return CoreInboundDisposition.CARRIED
         }
         val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
         deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
-        return InboundDisposition.CONSUMED
+        return CoreInboundDisposition.CONSUMED
     }
 
     private fun messageArrival(
@@ -2405,7 +2317,6 @@ class MeshService : Service() {
                 relayToken = card.relayToken,
             ),
         )
-        store.upsertContact(contact)
         store.upsertContactProvenance(
             ContactProvenance(
                 userId = senderUserId,
@@ -2659,7 +2570,6 @@ class MeshService : Service() {
                 relayToken = card.relayToken,
             ),
         )
-        store.upsertContact(contact)
         store.upsertContactProvenance(
             ContactProvenance(
                 userId = senderUserId,
@@ -2936,18 +2846,16 @@ class MeshService : Service() {
     ): Boolean {
         if (throughLamport == 0uL) return false
         val existing = store.outgoingReceiptEnvelope(contact.userId, ackedSenderUserId, receiptType)
-        if (existing != null && existing.throughLamport >= throughLamport) {
-            return false
-        }
-        val envelope = buildOutgoingReceiptEnvelope(
-            identity = identity,
-            contact = contact,
-            receiptType = receiptType,
-            ackedSenderUserId = ackedSenderUserId,
-            throughLamport = throughLamport,
-            timestamp = timestamp,
-        ) ?: return false
-        return store.upsertOutgoingReceiptEnvelope(envelope, timestamp)
+        val authored = store.ensureAuthoredReceipt(
+            identity,
+            contact,
+            ackedSenderUserId,
+            receiptType,
+            throughLamport,
+            timestamp,
+        )
+        GossipState.seenIds.record(authored.envelope.msgId)
+        return existing == null || existing.throughLamport < authored.envelope.throughLamport
     }
 
     /**
@@ -3004,28 +2912,16 @@ class MeshService : Service() {
         ackedSenderUserId: ByteArray,
         throughLamport: ULong,
     ) {
-        sendSealedEnvelope(
-            identity = identity,
-            recipientUserId = contact.userId,
-            recipientAgreePk = contact.agreePk,
-            address = address,
-            kind = KIND_RECEIPT,
-            // Receipts are not part of a chat's lamport stream (that's for
-            // messages, DESIGN.md §7.1) and are never persisted on either
-            // side -- lamport=0 here is deliberate filler, not a real
-            // sequence number. The actual cumulative "delivered/read through
-            // N" value lives in ReceiptContent.lamport below.
-            lamport = 0uL,
-            timestamp = System.currentTimeMillis(),
-            content = encodeReceiptContent(
-                ReceiptContent(
-                    chatId = identity.userId, // wire convention: chatId = this envelope's sender, i.e. us -- see class KDoc
-                    senderUserId = ackedSenderUserId, // whose messages are being acknowledged
-                    lamport = throughLamport,
-                    receiptType = receiptType,
-                ),
-            ),
+        val authored = store.ensureAuthoredReceipt(
+            identity,
+            contact,
+            ackedSenderUserId,
+            receiptType,
+            throughLamport,
+            System.currentTimeMillis(),
         )
+        GossipState.seenIds.record(authored.envelope.msgId)
+        MeshRouter.sendToAddress(address, authored.frame)
     }
 
     /** Builds a [ReceiptContent] and sends it to whichever live link currently reaches [contact], if any -- see [handleChatViewed]. */
@@ -3036,21 +2932,18 @@ class MeshService : Service() {
         ackedSenderUserId: ByteArray,
         throughLamport: ULong,
     ) {
-        sendSealedEnvelopeToContact(
-            identity = identity,
-            contact = contact,
-            kind = KIND_RECEIPT,
-            lamport = 0uL, // see sendReceiptOnAddress's comment: deliberate filler, not a sequence number
-            timestamp = System.currentTimeMillis(),
-            content = encodeReceiptContent(
-                ReceiptContent(
-                    chatId = identity.userId,
-                    senderUserId = ackedSenderUserId,
-                    lamport = throughLamport,
-                    receiptType = receiptType,
-                ),
-            ),
+        val authored = store.ensureAuthoredReceipt(
+            identity,
+            contact,
+            ackedSenderUserId,
+            receiptType,
+            throughLamport,
+            System.currentTimeMillis(),
         )
+        GossipState.seenIds.record(authored.envelope.msgId)
+        if (!MeshRouter.sendToUserId(contact.userId, authored.frame)) {
+            Log.i(TAG, "Receipt to ${UserIdHex.encode(contact.userId)} queued; not currently connected")
+        }
     }
 
     /**
@@ -3063,95 +2956,19 @@ class MeshService : Service() {
         contact: Contact,
         message: StoredMessage,
     ): OutboundEnvelope? {
-        val outbound = buildOutboundAuthoredEnvelope(identity, contact, message) ?: return null
-        store.insertOutgoingMessage(message, outbound, message.timestamp)
-        return outbound
+        val authored = try {
+            store.backfillPairwiseEnvelope(identity, contact, message, null)
+        } catch (error: CoreException) {
+            Log.w(TAG, "Unable to backfill legacy authored envelope", error)
+            return null
+        }
+        GossipState.seenIds.record(authored.envelope.msgId)
+        return authored.envelope
     }
 
     /** Sends one previously persisted outbound envelope on the exact link [address]. */
     private fun sendStoredOutboundEnvelope(address: String, envelope: OutboundEnvelope) {
         MeshRouter.sendToAddress(address, encodeOutboundEnvelopeFrame(envelope))
-    }
-
-    /**
-     * Seals one [MessageBody] into an envelope frame, or null (logged) if
-     * sealing fails. Wraps the sealed bytes in the §6.4 public header: a
-     * fresh random `msgId`, `DEFAULT_HOP_TTL`, an expiry `DEFAULT_EXPIRY_MS`
-     * out from now, and a `recipientHint` for [recipientUserId] as of now.
-     * This helper remains for auto-generated receipts; authored text now uses
-     * the persistent outbound-envelope queue instead so reconnect retries and
-     * relay upload preserve one stable `msg_id` and ciphertext per message.
-     */
-    private fun sealEnvelopeFrame(
-        identity: Identity,
-        recipientUserId: ByteArray,
-        recipientAgreePk: ByteArray,
-        kind: UByte,
-        lamport: ULong,
-        timestamp: Long,
-        content: ByteArray,
-    ): ByteArray? {
-        val body = MessageBody(
-            kind = kind,
-            chatId = identity.userId,
-            lamport = lamport,
-            timestamp = timestamp,
-            content = content,
-        )
-        return try {
-            val now = System.currentTimeMillis()
-            val msgId = generateMsgId()
-            // Remember our own msg_id so that if a relay floods this envelope
-            // back to us we recognise it as a duplicate rather than "foreign"
-            // (we can't open our own sealed box) and re-relay it (DESIGN.md §5.3).
-            GossipState.seenIds.record(msgId)
-            encodeEnvelopeFrame(
-                msgId,
-                DEFAULT_HOP_TTL,
-                defaultExpiry(now),
-                computeRecipientHint(recipientUserId, now),
-                sealMessage(identity, recipientAgreePk, encodeMessageBody(body)),
-            )
-        } catch (e: CoreException) {
-            Log.w(TAG, "Failed to seal outgoing kind=$kind frame: ${e.message}")
-            null
-        }
-    }
-
-    /** Builds, seals, and sends one [MessageBody] as an envelope frame on the exact link [address]. */
-    private fun sendSealedEnvelope(
-        identity: Identity,
-        recipientUserId: ByteArray,
-        recipientAgreePk: ByteArray,
-        address: String,
-        kind: UByte,
-        lamport: ULong,
-        timestamp: Long,
-        content: ByteArray,
-    ) {
-        val frame = sealEnvelopeFrame(identity, recipientUserId, recipientAgreePk, kind, lamport, timestamp, content) ?: return
-        MeshRouter.sendToAddress(address, frame)
-    }
-
-    /**
-     * Builds, seals, and sends one [MessageBody] as an envelope frame to
-     * whichever live link [MeshRouter] currently has for [contact], if any
-     * (unlike [sendSealedEnvelope], which targets a specific already-known
-     * address). Used where the caller has a contact but not a triggering
-     * frame/address, e.g. [handleChatViewed]'s read-on-view receipt.
-     */
-    private fun sendSealedEnvelopeToContact(
-        identity: Identity,
-        contact: Contact,
-        kind: UByte,
-        lamport: ULong,
-        timestamp: Long,
-        content: ByteArray,
-    ) {
-        val frame = sealEnvelopeFrame(identity, contact.userId, contact.agreePk, kind, lamport, timestamp, content) ?: return
-        if (!MeshRouter.sendToUserId(contact.userId, frame)) {
-            Log.i(TAG, "kind=$kind message to ${UserIdHex.encode(contact.userId)} stays local; not currently connected")
-        }
     }
 
     private fun hasRequiredPermissions(): Boolean {

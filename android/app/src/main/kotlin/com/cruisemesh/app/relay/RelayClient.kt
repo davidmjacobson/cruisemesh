@@ -1,17 +1,20 @@
 package com.cruisemesh.app.relay
 
 import android.net.Network
-import com.google.gson.Gson
-import com.google.gson.annotations.SerializedName
 import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.OutgoingReceiptEnvelope
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
-import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
-import java.util.Base64
+import uniffi.cruisemesh_core.relayBuildFetchPath
+import uniffi.cruisemesh_core.relayDecodeFetchPage
+import uniffi.cruisemesh_core.relayDecodePostResponse
+import uniffi.cruisemesh_core.relayDecodePresencePage
+import uniffi.cruisemesh_core.relayEncodeAckRequest
+import uniffi.cruisemesh_core.relayEncodePostEnvelope
+import uniffi.cruisemesh_core.relayEncodePresenceRequest
 
 private const val CONNECT_TIMEOUT_MS = 10_000
 private const val READ_TIMEOUT_MS = 10_000
@@ -48,8 +51,6 @@ data class RelayPresencePage(
  * never crosses this boundary.
  */
 object RelayClient {
-    private val gson = Gson()
-
     fun postOutboundEnvelope(config: RelayConfig, envelope: OutboundEnvelope, network: Network? = null): Long =
         postEnvelope(
             config,
@@ -90,19 +91,18 @@ object RelayClient {
         limit: Int,
         network: Network? = null,
     ): RelayFetchPage {
-        val encodedHints = hints.joinToString(",") { urlEncode(base64Url(it)) }
-        val url = buildUrl(config.relayUrl, "/envelopes?hints=$encodedHints&after=$afterId&limit=$limit")
+        val url = buildUrl(config.relayUrl, relayBuildFetchPath(hints, afterId, limit.toUInt()))
         val connection = openConnection(url, "GET", config, network)
         return connection.useJsonResponse { body ->
-            val response = gson.fromJson(body, GetEnvelopesResponse::class.java)
+            val response = relayDecodeFetchPage(body.toByteArray(StandardCharsets.UTF_8))
             RelayFetchPage(
                 envelopes = response.envelopes.map { item ->
                     RelayFetchedEnvelope(
                         id = item.id,
-                        msgId = base64UrlDecode(item.msgId),
-                        hopTtl = item.hopTtl.toUByte(),
-                        recipientHint = base64UrlDecode(item.recipientHint),
-                        sealed = base64UrlDecode(item.sealed),
+                        msgId = item.msgId,
+                        hopTtl = item.hopTtl,
+                        recipientHint = item.recipientHint,
+                        sealed = item.sealed,
                         expiryMs = item.expiryMs,
                     )
                 },
@@ -113,9 +113,9 @@ object RelayClient {
 
     fun ackEnvelopes(config: RelayConfig, ids: List<Long>, network: Network? = null) {
         if (ids.isEmpty()) return
-        val body = gson.toJson(AckRequest(ids))
+        val body = relayEncodeAckRequest(ids)
         val connection = openConnection(buildUrl(config.relayUrl, "/envelopes/ack"), "POST", config, network)
-        connection.writeJson(body)
+        connection.writeJson(String(body, StandardCharsets.UTF_8))
         connection.useJsonResponse { }
     }
 
@@ -125,21 +125,16 @@ object RelayClient {
         query: List<ByteArray>,
         network: Network? = null,
     ): RelayPresencePage {
-        val body = gson.toJson(
-            PresenceRequest(
-                announce = announce.map(::base64Url),
-                query = query.map(::base64Url),
-            ),
-        )
+        val body = relayEncodePresenceRequest(announce, query)
         val connection = openConnection(buildUrl(config.relayUrl, "/presence"), "POST", config, network)
-        connection.writeJson(body)
+        connection.writeJson(String(body, StandardCharsets.UTF_8))
         return connection.useJsonResponse { responseBody ->
-            val response = gson.fromJson(responseBody, PresenceResponse::class.java)
+            val response = relayDecodePresencePage(responseBody.toByteArray(StandardCharsets.UTF_8))
             RelayPresencePage(
                 nowMs = response.nowMs,
                 presence = response.presence.map { item ->
                     RelayPresence(
-                        hint = base64UrlDecode(item.hint),
+                        hint = item.hint,
                         lastSeenMs = item.lastSeenMs,
                     )
                 },
@@ -156,18 +151,10 @@ object RelayClient {
         expiryMs: Long,
         network: Network?,
     ): Long {
-        val body = gson.toJson(
-            PostEnvelopeRequest(
-                msgId = base64Url(msgId),
-                hopTtl = hopTtl.toInt(),
-                recipientHint = base64Url(recipientHint),
-                sealed = base64Url(sealed),
-                expiryMs = expiryMs,
-            ),
-        )
+        val body = relayEncodePostEnvelope(msgId, hopTtl, recipientHint, sealed, expiryMs)
         val connection = openConnection(buildUrl(config.relayUrl, "/envelopes"), "POST", config, network)
-        connection.writeJson(body)
-        return connection.useJsonResponse { gson.fromJson(it, PostEnvelopeResponse::class.java).id }
+        connection.writeJson(String(body, StandardCharsets.UTF_8))
+        return connection.useJsonResponse { relayDecodePostResponse(it.toByteArray(StandardCharsets.UTF_8)) }
     }
 
     /**
@@ -214,57 +201,4 @@ object RelayClient {
         return "${normalizeRelayUrl(baseUrl)}$pathAndQuery"
     }
 
-    private fun base64Url(bytes: ByteArray): String =
-        Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
-
-    private fun base64UrlDecode(value: String): ByteArray =
-        Base64.getUrlDecoder().decode(value)
-
-    private fun urlEncode(value: String): String =
-        URLEncoder.encode(value, StandardCharsets.UTF_8)
-
-    private data class PostEnvelopeRequest(
-        @SerializedName("msg_id") val msgId: String,
-        @SerializedName("hop_ttl") val hopTtl: Int,
-        @SerializedName("recipient_hint") val recipientHint: String,
-        @SerializedName("sealed") val sealed: String,
-        @SerializedName("expiry_ms") val expiryMs: Long,
-    )
-
-    private data class PostEnvelopeResponse(
-        @SerializedName("id") val id: Long,
-    )
-
-    private data class AckRequest(
-        @SerializedName("ids") val ids: List<Long>,
-    )
-
-    private data class PresenceRequest(
-        @SerializedName("announce") val announce: List<String>,
-        @SerializedName("query") val query: List<String>,
-    )
-
-    private data class PresenceResponse(
-        @SerializedName("now_ms") val nowMs: Long,
-        @SerializedName("presence") val presence: List<PresencePayload>,
-    )
-
-    private data class PresencePayload(
-        @SerializedName("hint") val hint: String,
-        @SerializedName("last_seen_ms") val lastSeenMs: Long,
-    )
-
-    private data class GetEnvelopesResponse(
-        @SerializedName("envelopes") val envelopes: List<EnvelopePayload>,
-        @SerializedName("next_cursor") val nextCursor: Long,
-    )
-
-    private data class EnvelopePayload(
-        @SerializedName("id") val id: Long,
-        @SerializedName("msg_id") val msgId: String,
-        @SerializedName("hop_ttl") val hopTtl: Int,
-        @SerializedName("recipient_hint") val recipientHint: String,
-        @SerializedName("sealed") val sealed: String,
-        @SerializedName("expiry_ms") val expiryMs: Long,
-    )
 }

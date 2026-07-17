@@ -59,18 +59,19 @@ fun loadMessageReplyMetadata(
     messages: List<StoredMessage>,
     senderLabelFor: (StoredMessage) -> String,
 ): Map<String, MessageReplyMetadata> = buildMap {
-    for (message in messages) {
-        val reference = store.messageReference(message.chatId, message.senderUserId, message.lamport)
-        val quoted = reference?.replyToMsgId?.let { replyToMsgId ->
+    for (metadata in store.replyMetadata(messages)) {
+        val message = messages.first { it.senderUserId.contentEquals(metadata.message.senderUserId) &&
+            it.lamport == metadata.message.lamport && it.kind == metadata.message.kind }
+        val quoted = metadata.replyToMsgId?.let {
             quotedMessagePreview(
-                target = store.messageByMsgId(message.chatId, replyToMsgId),
+                target = metadata.target,
                 senderLabelFor = senderLabelFor,
             )
         }
         put(
             messageStableKey(message),
             MessageReplyMetadata(
-                msgId = reference?.msgId,
+                msgId = metadata.msgId,
                 quoted = quoted,
             ),
         )
