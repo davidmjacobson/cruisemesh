@@ -49,19 +49,6 @@ enum ProfileSyncSender {
         epoch: Int64,
         avatar: Data
     ) {
-        let chatId = contact.userId
-        let own = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0
-        let delivered = (try? store.receiptThrough(
-            chatId: chatId,
-            senderUserId: identity.userId,
-            receiptType: ReceiptType.delivered
-        )) ?? 0
-        let read = (try? store.receiptThrough(
-            chatId: chatId,
-            senderUserId: identity.userId,
-            receiptType: ReceiptType.read
-        )) ?? 0
-        let lamport = max(own, delivered, read) + 1
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
         let payload = encodeProfileSyncContent(content: ProfileSyncContent(
             avatarEpoch: epoch,
@@ -71,20 +58,17 @@ enum ProfileSyncSender {
             friendsOfFriendsEnabled: FriendsOfFriendsStore.isEnabled(),
             friendsOfFriendsRevision: FriendsOfFriendsStore.revision()
         ))
-        let message = StoredMessage(
-            chatId: chatId,
-            senderUserId: identity.userId,
-            lamport: lamport,
-            timestamp: timestamp,
+        guard let authored = try? store.authorPairwiseMessage(
+            identity: identity,
+            contact: contact,
             kind: ProtocolKind.profileSync,
-            payload: payload
-        )
-        guard let outbound = buildOutboundAuthoredEnvelope(identity: identity, contact: contact, message: message) else {
-            return
-        }
-        _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
+            payload: payload,
+            replyToMsgId: nil,
+            timestampMs: timestamp
+        ) else { return }
+        GossipState.seenIds.record(msgId: authored.envelope.msgId)
         RelaySyncEvents.requestSync()
-        if !MeshRouter.sendToUserId(userId: contact.userId, frame: encodeOutboundEnvelopeFrame(outbound)) {
+        if !MeshRouter.sendToUserId(userId: contact.userId, frame: authored.frame) {
             log.info("Profile sync queued for later delivery to \(contact.name, privacy: .public)")
         }
     }

@@ -100,34 +100,17 @@ enum FriendDirectorySender {
         payload: Data,
         timestamp: Int64
     ) -> Bool {
-        let chatId = recipient.userId
-        let own = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0
-        let delivered = (try? store.receiptThrough(
-            chatId: chatId,
-            senderUserId: identity.userId,
-            receiptType: ReceiptType.delivered
-        )) ?? 0
-        let read = (try? store.receiptThrough(
-            chatId: chatId,
-            senderUserId: identity.userId,
-            receiptType: ReceiptType.read
-        )) ?? 0
-        let message = StoredMessage(
-            chatId: chatId,
-            senderUserId: identity.userId,
-            lamport: max(own, delivered, read) + 1,
-            timestamp: timestamp,
-            kind: kind,
-            payload: payload
-        )
-        guard let outbound = buildOutboundAuthoredEnvelope(
+        guard let authored = try? store.authorPairwiseMessage(
             identity: identity,
             contact: recipient,
-            message: message
+            kind: kind,
+            payload: payload,
+            replyToMsgId: nil,
+            timestampMs: timestamp
         ) else { return false }
-        _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
+        GossipState.seenIds.record(msgId: authored.envelope.msgId)
         RelaySyncEvents.requestSync()
-        let frame = encodeOutboundEnvelopeFrame(outbound)
+        let frame = authored.frame
         if !MeshRouter.sendToUserId(userId: recipient.userId, frame: frame) {
             let muled = MeshRouter.relayToAll(frame: frame)
             log.info("Queued hidden friend data for (recipient.name, privacy: .public); sprayed to (muled) mule(s)")

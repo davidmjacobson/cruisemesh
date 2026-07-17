@@ -3,19 +3,15 @@ package com.cruisemesh.app.mesh
 import android.content.Context
 import android.util.Log
 import com.cruisemesh.app.chat.UserIdHex
-import com.cruisemesh.app.chat.nextAuthoredLamport
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.LanEndpointContent
 import uniffi.cruisemesh_core.MessageStore
-import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.encodeLanEndpointContent
 
 private const val TAG = "LanEndpointSender"
 private const val KIND_LAN_ENDPOINT_HINT: UByte = 8u
-private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
-private const val RECEIPT_TYPE_READ: UByte = 2u
 private const val HINT_LIFETIME_MS = 15 * 60 * 1_000L
 
 internal object LanEndpointSender {
@@ -53,19 +49,6 @@ internal object LanEndpointSender {
         ) {
             return
         }
-        val lamport = nextAuthoredLamport(
-            ownContiguous = store.highestContiguousLamport(contact.userId, identity.userId),
-            ackedDelivered = store.receiptThrough(
-                contact.userId,
-                identity.userId,
-                RECEIPT_TYPE_DELIVERED,
-            ),
-            ackedRead = store.receiptThrough(
-                contact.userId,
-                identity.userId,
-                RECEIPT_TYPE_READ,
-            ),
-        )
         val timestamp = System.currentTimeMillis()
         val payload = try {
             encodeLanEndpointContent(
@@ -81,18 +64,17 @@ internal object LanEndpointSender {
             Log.w(TAG, "Unable to encode sealed LAN endpoint hint", error)
             return
         }
-        val message = StoredMessage(
-            chatId = contact.userId,
-            senderUserId = identity.userId,
-            lamport = lamport,
-            timestamp = timestamp,
-            kind = KIND_LAN_ENDPOINT_HINT,
-            payload = payload,
+        val authored = store.authorPairwiseMessage(
+            identity,
+            contact,
+            KIND_LAN_ENDPOINT_HINT,
+            payload,
+            null,
+            timestamp,
         )
-        val outbound = buildOutboundAuthoredEnvelope(identity, contact, message) ?: return
-        store.insertOutgoingMessage(message, outbound, timestamp)
+        GossipState.seenIds.record(authored.envelope.msgId)
         RelaySyncEvents.requestSync()
-        if (!MeshRouter.sendToUserId(contact.userId, encodeOutboundEnvelopeFrame(outbound))) {
+        if (!MeshRouter.sendToUserId(contact.userId, authored.frame)) {
             Log.i(
                 TAG,
                 "Queued sealed LAN endpoint for ${UserIdHex.encode(contact.userId)}",

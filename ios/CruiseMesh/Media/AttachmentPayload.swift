@@ -8,8 +8,7 @@ struct AttachmentPayload: Equatable {
         case audio = 2
     }
 
-    static let wireVersion: UInt8 = 1
-    static let maxBlobBytes = 180 * 1024
+    static var maxBlobBytes: Int { Int(attachmentMaxBlobBytes()) }
 
     var mediaType: MediaType
     var mimeType: String
@@ -26,43 +25,24 @@ struct AttachmentPayload: Equatable {
     }
 
     func encode() -> Data {
-        var out = Data()
-        out.append(Self.wireVersion)
-        out.append(mediaType.rawValue)
-        Self.writeUtf16(&out, mimeType)
-        out.append(contentsOf: withUnsafeBytes(of: durationMs.bigEndian, Array.init))
-        let blobLen = UInt32(blob.count).bigEndian
-        out.append(contentsOf: withUnsafeBytes(of: blobLen, Array.init))
-        out.append(blob)
-        Self.writeUtf16(&out, caption)
-        return out
+        try! encodeAttachmentPayload(payload: CoreAttachmentPayload(
+            mediaType: mediaType == .image ? .image : .audio,
+            mimeType: mimeType,
+            durationMs: Int64(durationMs),
+            blob: blob,
+            caption: caption
+        ))
     }
 
     static func decode(_ bytes: Data) -> AttachmentPayload? {
-        guard !bytes.isEmpty else { return nil }
-        var offset = 0
-        func need(_ n: Int) -> Bool { offset + n <= bytes.count }
-
-        guard need(1), bytes[offset] == wireVersion else { return nil }
-        offset += 1
-        guard need(1), let mediaType = MediaType(rawValue: bytes[offset]) else { return nil }
-        offset += 1
-        guard let mime = readUtf16(bytes, &offset) else { return nil }
-        guard let durationBits = readUInt32(bytes, &offset) else { return nil }
-        let duration = Int32(bitPattern: durationBits)
-        guard duration >= 0 else { return nil }
-        guard let blobLengthBits = readUInt32(bytes, &offset) else { return nil }
-        let blobLen = Int(blobLengthBits)
-        guard blobLen >= 0, blobLen <= maxBlobBytes * 2, need(blobLen) else { return nil }
-        let blob = bytes.subdata(in: offset..<offset+blobLen)
-        offset += blobLen
-        guard let caption = readUtf16(bytes, &offset) else { return nil }
+        guard let decoded = decodeAttachmentPayload(bytes: bytes),
+              let duration = Int32(exactly: decoded.durationMs) else { return nil }
         return AttachmentPayload(
-            mediaType: mediaType,
-            mimeType: mime,
+            mediaType: decoded.mediaType == .image ? .image : .audio,
+            mimeType: decoded.mimeType,
             durationMs: duration,
-            blob: blob,
-            caption: caption
+            blob: decoded.blob,
+            caption: decoded.caption
         )
     }
 
@@ -77,37 +57,4 @@ struct AttachmentPayload: Equatable {
         }
     }
 
-    private static func writeUtf16(_ out: inout Data, _ value: String) {
-        let encoded = Data(value.utf8)
-        precondition(encoded.count <= 0xFFFF)
-        let len = UInt16(encoded.count).bigEndian
-        out.append(contentsOf: withUnsafeBytes(of: len, Array.init))
-        out.append(encoded)
-    }
-
-    private static func readUtf16(_ bytes: Data, _ offset: inout Int) -> String? {
-        guard let length = readUInt16(bytes, &offset) else { return nil }
-        let len = Int(length)
-        guard offset + len <= bytes.count else { return nil }
-        let slice = bytes.subdata(in: offset..<offset+len)
-        offset += len
-        return String(data: slice, encoding: .utf8)
-    }
-
-    private static func readUInt16(_ bytes: Data, _ offset: inout Int) -> UInt16? {
-        guard offset + 2 <= bytes.count else { return nil }
-        let value = (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
-        offset += 2
-        return value
-    }
-
-    private static func readUInt32(_ bytes: Data, _ offset: inout Int) -> UInt32? {
-        guard offset + 4 <= bytes.count else { return nil }
-        let value = (UInt32(bytes[offset]) << 24)
-            | (UInt32(bytes[offset + 1]) << 16)
-            | (UInt32(bytes[offset + 2]) << 8)
-            | UInt32(bytes[offset + 3])
-        offset += 4
-        return value
-    }
 }

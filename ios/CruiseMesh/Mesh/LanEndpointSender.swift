@@ -41,20 +41,6 @@ enum LanEndpointSender {
             instanceToken: instanceToken
         ) else { return }
 
-        let own = (try? store.highestContiguousLamport(
-            chatId: contact.userId,
-            senderUserId: identity.userId
-        )) ?? 0
-        let delivered = (try? store.receiptThrough(
-            chatId: contact.userId,
-            senderUserId: identity.userId,
-            receiptType: ReceiptType.delivered
-        )) ?? 0
-        let read = (try? store.receiptThrough(
-            chatId: contact.userId,
-            senderUserId: identity.userId,
-            receiptType: ReceiptType.read
-        )) ?? 0
         let timestamp = Int64(Date().timeIntervalSince1970 * 1_000)
         let payload: Data
         do {
@@ -69,21 +55,16 @@ enum LanEndpointSender {
             log.warning("Unable to encode sealed LAN endpoint hint")
             return
         }
-        let message = StoredMessage(
-            chatId: contact.userId,
-            senderUserId: identity.userId,
-            lamport: max(max(own, delivered), read) + 1,
-            timestamp: timestamp,
-            kind: ProtocolKind.lanEndpointHint,
-            payload: payload
-        )
-        guard let outbound = buildOutboundAuthoredEnvelope(
+        guard let authored = try? store.authorPairwiseMessage(
             identity: identity,
             contact: contact,
-            message: message
+            kind: ProtocolKind.lanEndpointHint,
+            payload: payload,
+            replyToMsgId: nil,
+            timestampMs: timestamp
         ) else { return }
-        _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
+        GossipState.seenIds.record(msgId: authored.envelope.msgId)
         RelaySyncEvents.requestSync()
-        _ = MeshRouter.sendToUserId(userId: contact.userId, frame: encodeOutboundEnvelopeFrame(outbound))
+        _ = MeshRouter.sendToUserId(userId: contact.userId, frame: authored.frame)
     }
 }

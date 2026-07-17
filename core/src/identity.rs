@@ -170,7 +170,22 @@ pub fn parse_friend_card(json: String) -> Result<FriendCard, CoreError> {
 #[uniffi::export]
 pub fn parse_friend_text(text: String) -> Result<FriendCard, CoreError> {
     let trimmed = text.trim();
-    if let Some(encoded) = trimmed.strip_prefix(FRIEND_LINK_PREFIX) {
+    let extracted;
+    let candidate = if trimmed.starts_with(FRIEND_LINK_PREFIX) {
+        trimmed
+    } else if let Some(start) = trimmed.find(FRIEND_LINK_PREFIX) {
+        let tail = &trimmed[start..];
+        let end = tail
+            .char_indices()
+            .skip(FRIEND_LINK_PREFIX.chars().count())
+            .find(|(_, ch)| !ch.is_ascii_alphanumeric() && *ch != '_' && *ch != '-')
+            .map_or(tail.len(), |(index, _)| index);
+        extracted = tail[..end].to_string();
+        extracted.as_str()
+    } else {
+        trimmed
+    };
+    if let Some(encoded) = candidate.strip_prefix(FRIEND_LINK_PREFIX) {
         let compact: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
         let json = BASE64URL_NOPAD
             .decode(compact.as_bytes())
@@ -179,7 +194,7 @@ pub fn parse_friend_text(text: String) -> Result<FriendCard, CoreError> {
             String::from_utf8(json).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
         return parse_friend_card(json);
     }
-    parse_friend_card(trimmed.to_string())
+    parse_friend_card(candidate.to_string())
         .map_err(|_| CoreError::InvalidFriendCard("not a CruiseMesh friend card".to_string()))
 }
 
@@ -316,6 +331,16 @@ mod tests {
         assert_eq!(friend_card_user_id(card.clone()), id.user_id);
         assert_eq!(card.relay_url, Some("https://relay.example".to_string()));
         assert_eq!(card.relay_token, Some("token".to_string()));
+    }
+
+    #[test]
+    fn parse_friend_text_extracts_link_from_shared_prose() {
+        let identity = generate_identity();
+        let json = make_friend_card("Alice".to_string(), identity, None, None);
+        let link = make_friend_link(json);
+        let card = parse_friend_text(format!("Add me on CruiseMesh: {link}. Thanks!"))
+            .expect("embedded link");
+        assert_eq!(card.name, "Alice");
     }
 
     #[test]

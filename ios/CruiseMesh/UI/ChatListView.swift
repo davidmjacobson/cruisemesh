@@ -248,11 +248,9 @@ struct ChatListView: View {
                 senderUserId: identity.userId,
                 receiptType: ReceiptType.delivered
             )) ?? 0
-            // Unread uses our local read watermark of the peer's stream.
-            let localReadThrough = (try? store.outgoingReceiptThrough(
+            let unread = (try? store.semanticUnreadCount(
                 chatId: c.userId,
-                senderUserId: c.userId,
-                receiptType: ReceiptType.read
+                ownUserId: identity.userId
             )) ?? 0
             return ChatSummary(
                 chatId: c.userId,
@@ -261,11 +259,7 @@ struct ChatListView: View {
                 contact: c,
                 group: nil,
                 lastMessage: ChatListLogic.lastVisibleMessage(messages),
-                unreadCount: ChatListLogic.computeUnread(
-                    messages: messages,
-                    ownUserId: identity.userId,
-                    readThrough: localReadThrough
-                ),
+                unreadCount: Int(unread),
                 ownDeliveredThrough: deliveredThrough,
                 ownReadThrough: readThrough,
                 avatarData: (try? store.contactAvatar(userId: c.userId)) ?? nil
@@ -274,16 +268,10 @@ struct ChatListView: View {
         let groups = (try? store.listGroups()) ?? []
         let groupSummaries: [ChatSummary] = groups.map { g in
             let messages = (try? store.messagesForChat(chatId: g.id)) ?? []
-            let unread = ChatListLogic.computeGroupUnread(
-                messages: messages,
+            let unread = (try? store.semanticUnreadCount(
+                chatId: g.id,
                 ownUserId: identity.userId
-            ) { senderId in
-                (try? store.outgoingReceiptThrough(
-                    chatId: g.id,
-                    senderUserId: senderId,
-                    receiptType: ReceiptType.read
-                )) ?? 0
-            }
+            )) ?? 0
             return ChatSummary(
                 chatId: g.id,
                 title: g.name,
@@ -291,7 +279,7 @@ struct ChatListView: View {
                 contact: nil,
                 group: g,
                 lastMessage: ChatListLogic.lastVisibleMessage(messages),
-                unreadCount: unread,
+                unreadCount: Int(unread),
                 ownDeliveredThrough: 0,
                 ownReadThrough: 0,
                 avatarData: nil

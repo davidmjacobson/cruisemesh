@@ -56,39 +56,21 @@ enum RelayClient {
     }
 
     static func fetchEnvelopes(config: RelayConfig, hints: [Data], afterId: Int64, limit: Int) throws -> RelayFetchPage {
-        let encodedHints = hints.map { base64Url($0).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "" }
-            .joined(separator: ",")
-        let url = try buildURL(config.relayUrl, path: "/envelopes?hints=\(encodedHints)&after=\(afterId)&limit=\(limit)")
+        let path = try relayBuildFetchPath(hints: hints, afterId: afterId, limit: UInt32(limit))
+        let url = try buildURL(config.relayUrl, path: path)
         var request = URLRequest(url: url, timeoutInterval: connectTimeout)
         request.httpMethod = "GET"
         applyAuth(&request, config: config)
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        guard let items = json["envelopes"] as? [[String: Any]],
-              let nextCursor = (json["next_cursor"] as? NSNumber)?.int64Value else {
-            throw malformedResponse("missing relay page fields")
-        }
-        let envelopes: [RelayFetchedEnvelope] = try items.map { item in
-            guard let id = (item["id"] as? NSNumber)?.int64Value,
-                  let msgId = item["msg_id"] as? String,
-                  let hopTtlValue = (item["hop_ttl"] as? NSNumber)?.intValue,
-                  let hopTtl = UInt8(exactly: hopTtlValue),
-                  let recipientHint = item["recipient_hint"] as? String,
-                  let sealed = item["sealed"] as? String,
-                  let expiryMs = (item["expiry_ms"] as? NSNumber)?.int64Value else {
-                throw malformedResponse("invalid relay envelope")
-            }
+        let page = try relayDecodeFetchPage(body: data)
+        let envelopes: [RelayFetchedEnvelope] = page.envelopes.map { item in
             return RelayFetchedEnvelope(
-                id: id,
-                msgId: try base64UrlDecode(msgId),
-                hopTtl: hopTtl,
-                recipientHint: try base64UrlDecode(recipientHint),
-                sealed: try base64UrlDecode(sealed),
-                expiryMs: expiryMs
+                id: item.id, msgId: item.msgId, hopTtl: item.hopTtl,
+                recipientHint: item.recipientHint, sealed: item.sealed, expiryMs: item.expiryMs
             )
         }
-        return RelayFetchPage(envelopes: envelopes, nextCursor: nextCursor)
+        return RelayFetchPage(envelopes: envelopes, nextCursor: page.nextCursor)
     }
 
     static func ackEnvelopes(config: RelayConfig, ids: [Int64]) throws {
@@ -98,8 +80,7 @@ enum RelayClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         applyAuth(&request, config: config)
-        let body: [String: Any] = ["ids": ids]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.httpBody = try relayEncodeAckRequest(ids: ids)
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
     }
@@ -117,21 +98,13 @@ enum RelayClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         applyAuth(&request, config: config)
-        let body: [String: Any] = [
-            "msg_id": base64Url(msgId),
-            "hop_ttl": Int(hopTtl),
-            "recipient_hint": base64Url(recipientHint),
-            "sealed": base64Url(sealed),
-            "expiry_ms": expiryMs,
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.httpBody = try relayEncodePostEnvelope(
+            msgId: msgId, hopTtl: hopTtl, recipientHint: recipientHint,
+            sealed: sealed, expiryMs: expiryMs
+        )
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        guard let id = (json["id"] as? NSNumber)?.int64Value else {
-            throw malformedResponse("missing posted envelope id")
-        }
-        return id
+        return try relayDecodePostResponse(body: data)
     }
 
     private static func applyAuth(_ request: inout URLRequest, config: RelayConfig) {
@@ -183,23 +156,6 @@ enum RelayClient {
                 userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode): \(body)"]
             )
         }
-    }
-
-    private static func base64Url(_ data: Data) -> String {
-        data.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-    }
-
-    private static func base64UrlDecode(_ s: String) throws -> Data {
-        var str = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
-        let pad = (4 - str.count % 4) % 4
-        str += String(repeating: "=", count: pad)
-        guard let data = Data(base64Encoded: str) else {
-            throw NSError(domain: "RelayClient", code: 3, userInfo: [NSLocalizedDescriptionKey: "bad base64"])
-        }
-        return data
     }
 
     private static func malformedResponse(_ message: String) -> NSError {

@@ -27,13 +27,13 @@ enum MeshDefaults {
     static let msPerDay: Int64 = 24 * 60 * 60 * 1000
     static let digestCarriedMsgIdsLimit: UInt64 = 512
     static let relayBatchLimit: UInt64 = 128
+    static let ownOutboundSprayBudgetBytes: UInt64 = 256 * 1024
+    static let ownReceiptSprayBudgetBytes: UInt64 = 64 * 1024
     static let relayPollIntervalNs: UInt64 = 60_000_000_000
 }
 
 func isVisibleChatKind(_ kind: UInt8) -> Bool {
-    kind == ProtocolKind.text
-        || kind == ProtocolKind.attachmentManifest
-        || kind == ProtocolKind.groupInvite
+    coreIsVisibleChatKind(kind: kind)
 }
 
 func isAuthoredChatKind(_ kind: UInt8) -> Bool {

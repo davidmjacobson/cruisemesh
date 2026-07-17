@@ -3,6 +3,7 @@ package com.cruisemesh.app.mesh
 import android.content.Context
 import com.cruisemesh.app.chat.UserIdHex
 import java.util.Base64
+import uniffi.cruisemesh_core.shouldResendLanEndpoint
 
 internal object LanCapabilityStore {
     private const val PREFS = "cruisemesh_lan_capabilities"
@@ -36,12 +37,10 @@ internal object LanCapabilityStore {
         ).joinToString("|")
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val previous = prefs.getString(key, null)?.split('\n', limit = 2)
-        val sameSignature = previous?.getOrNull(0) == signature
-        val sentAt = previous?.getOrNull(1)?.toLongOrNull() ?: 0
-        if (sameSignature && nowMs - sentAt < RESEND_INTERVAL_MS) return false
+        val previousSignature = previous?.getOrNull(0)
+        val sentAt = previous?.getOrNull(1)?.toLongOrNull()
+        if (!shouldResendLanEndpoint(previousSignature, sentAt, signature, nowMs)) return false
         prefs.edit().putString(key, "$signature\n$nowMs").apply()
         return true
     }
-
-    private const val RESEND_INTERVAL_MS = 5 * 60 * 1_000L
 }

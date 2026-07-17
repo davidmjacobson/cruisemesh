@@ -3,12 +3,10 @@ package com.cruisemesh.app.friending
 import android.content.Context
 import android.util.Log
 import com.cruisemesh.app.chat.UserIdHex
-import com.cruisemesh.app.chat.nextAuthoredLamport
 import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.mesh.MeshRouter
 import com.cruisemesh.app.mesh.RelaySyncEvents
-import com.cruisemesh.app.mesh.buildOutboundAuthoredEnvelope
-import com.cruisemesh.app.mesh.encodeOutboundEnvelopeFrame
+import com.cruisemesh.app.mesh.GossipState
 import com.cruisemesh.app.relay.RelayConfigStore
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.FriendDirectoryContent
@@ -17,7 +15,6 @@ import uniffi.cruisemesh_core.FriendSuggestion
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.IntroducedFriendRequest
 import uniffi.cruisemesh_core.MessageStore
-import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.SuggestedFriendCard
 import uniffi.cruisemesh_core.createIntroductionTicket
 import uniffi.cruisemesh_core.encodeFriendDirectoryContent
@@ -28,8 +25,6 @@ import uniffi.cruisemesh_core.makeFriendCard
 private const val TAG = "FriendDirectory"
 private const val KIND_FRIEND_DIRECTORY: UByte = 6u
 private const val KIND_INTRODUCED_FRIEND_REQUEST: UByte = 7u
-private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
-private const val RECEIPT_TYPE_READ: UByte = 2u
 private const val TICKET_LIFETIME_MS = 30L * 24 * 60 * 60 * 1000
 
 /** Publishes personalized, replaceable contact suggestions to accepted contacts. */
@@ -88,16 +83,14 @@ object FriendDirectorySender {
         entries: List<FriendDirectoryEntry>,
         timestamp: Long,
     ) {
-        val lamport = nextLamport(store, identity, recipient.userId)
-        val message = StoredMessage(
-            chatId = recipient.userId,
-            senderUserId = identity.userId,
-            lamport = lamport,
-            timestamp = timestamp,
-            kind = KIND_FRIEND_DIRECTORY,
-            payload = encodeFriendDirectoryContent(FriendDirectoryContent(1u, revision, entries)),
+        queue(
+            store,
+            identity,
+            recipient,
+            KIND_FRIEND_DIRECTORY,
+            encodeFriendDirectoryContent(FriendDirectoryContent(1u, revision, entries)),
+            timestamp,
         )
-        queue(store, identity, recipient, message)
     }
 
     fun requestSuggestedFriend(
@@ -123,38 +116,32 @@ object FriendDirectorySender {
             relay?.relayToken,
         )
         val timestamp = System.currentTimeMillis()
-        val message = StoredMessage(
-            chatId = candidate.userId,
-            senderUserId = identity.userId,
-            lamport = nextLamport(store, identity, candidate.userId),
-            timestamp = timestamp,
-            kind = KIND_INTRODUCED_FRIEND_REQUEST,
-            payload = encodeIntroducedFriendRequest(
+        val queued = queue(
+            store,
+            identity,
+            candidate,
+            KIND_INTRODUCED_FRIEND_REQUEST,
+            encodeIntroducedFriendRequest(
                 IntroducedFriendRequest(1u, ownCard, suggestion.ticket),
             ),
+            timestamp,
         )
-        val queued = queue(store, identity, candidate, message)
         if (queued) store.setFriendSuggestionState(candidate.userId, 1u)
         return queued
     }
-
-    private fun nextLamport(store: MessageStore, identity: Identity, chatId: ByteArray): ULong =
-        nextAuthoredLamport(
-            ownContiguous = store.highestContiguousLamport(chatId, identity.userId),
-            ackedDelivered = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_DELIVERED),
-            ackedRead = store.receiptThrough(chatId, identity.userId, RECEIPT_TYPE_READ),
-        )
 
     private fun queue(
         store: MessageStore,
         identity: Identity,
         recipient: Contact,
-        message: StoredMessage,
+        kind: UByte,
+        payload: ByteArray,
+        timestamp: Long,
     ): Boolean {
-        val outbound = buildOutboundAuthoredEnvelope(identity, recipient, message) ?: return false
-        store.insertOutgoingMessage(message, outbound, message.timestamp)
+        val authored = store.authorPairwiseMessage(identity, recipient, kind, payload, null, timestamp)
+        GossipState.seenIds.record(authored.envelope.msgId)
         RelaySyncEvents.requestSync()
-        val frame = encodeOutboundEnvelopeFrame(outbound)
+        val frame = authored.frame
         if (!MeshRouter.sendToUserId(recipient.userId, frame)) {
             val muled = MeshRouter.relayToAll(frame)
             Log.i(TAG, "Queued hidden friend data for ${UserIdHex.encode(recipient.userId)}; sprayed to $muled mule(s)")

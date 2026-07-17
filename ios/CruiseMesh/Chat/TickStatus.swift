@@ -7,9 +7,11 @@ enum TickStatus {
 }
 
 func tickStatusFor(lamport: UInt64, deliveredThrough: UInt64, readThrough: UInt64) -> TickStatus {
-    if lamport <= readThrough { return .read }
-    if lamport <= deliveredThrough { return .delivered }
-    return .sent
+    switch coreTickStatusFor(lamport: lamport, deliveredThrough: deliveredThrough, readThrough: readThrough) {
+    case .sent: return .sent
+    case .delivered: return .delivered
+    case .read: return .read
+    }
 }
 
 func tickLegendText(_ status: TickStatus) -> String {

@@ -1,10 +1,10 @@
 package com.cruisemesh.app.media
 
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
-import java.io.DataInputStream
-import java.io.DataOutputStream
-import java.nio.charset.StandardCharsets
+import uniffi.cruisemesh_core.AttachmentMediaType
+import uniffi.cruisemesh_core.CoreAttachmentPayload
+import uniffi.cruisemesh_core.attachmentMaxBlobBytes
+import uniffi.cruisemesh_core.decodeAttachmentPayload
+import uniffi.cruisemesh_core.encodeAttachmentPayload
 
 /**
  * Wire `content` for a `kind=16` attachment-manifest chat message
@@ -43,19 +43,18 @@ data class AttachmentPayload(
         }
     }
 
-    fun encode(): ByteArray {
-        val out = ByteArrayOutputStream()
-        DataOutputStream(out).use { data ->
-            data.writeByte(WIRE_VERSION)
-            data.writeByte(mediaType.wire)
-            writeUtf16(data, mimeType)
-            data.writeInt(durationMs.coerceAtLeast(0))
-            data.writeInt(blob.size)
-            data.write(blob)
-            writeUtf16(data, caption)
-        }
-        return out.toByteArray()
-    }
+    fun encode(): ByteArray = encodeAttachmentPayload(
+        CoreAttachmentPayload(
+            mediaType = when (mediaType) {
+                MediaType.IMAGE -> AttachmentMediaType.IMAGE
+                MediaType.AUDIO -> AttachmentMediaType.AUDIO
+            },
+            mimeType = mimeType,
+            durationMs = durationMs.toLong().coerceAtLeast(0),
+            blob = blob,
+            caption = caption,
+        ),
+    )
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -77,38 +76,21 @@ data class AttachmentPayload(
     }
 
     companion object {
-        const val WIRE_VERSION: Int = 1
-
         /** Soft cap for inline blobs (BLE-friendly; DESIGN.md §5.2 / §8). */
-        const val MAX_BLOB_BYTES: Int = 180 * 1024
+        val MAX_BLOB_BYTES: Int get() = attachmentMaxBlobBytes().toInt()
 
         fun decode(bytes: ByteArray): AttachmentPayload? {
-            if (bytes.isEmpty()) return null
-            return try {
-                DataInputStream(ByteArrayInputStream(bytes)).use { data ->
-                    val version = data.readUnsignedByte()
-                    if (version != WIRE_VERSION) return null
-                    val mediaType = MediaType.fromWire(data.readUnsignedByte()) ?: return null
-                    val mime = readUtf16(data) ?: return null
-                    val durationMs = data.readInt()
-                    if (durationMs < 0) return null
-                    val blobLen = data.readInt()
-                    if (blobLen < 0 || blobLen > MAX_BLOB_BYTES * 2) return null
-                    val blob = ByteArray(blobLen)
-                    data.readFully(blob)
-                    val caption = readUtf16(data) ?: return null
-                    // Trailing bytes are ignored so minor future extensions stay forward-compatible.
-                    AttachmentPayload(
-                        mediaType = mediaType,
-                        mimeType = mime,
-                        durationMs = durationMs,
-                        blob = blob,
-                        caption = caption,
-                    )
-                }
-            } catch (_: Exception) {
-                null
-            }
+            val decoded = decodeAttachmentPayload(bytes) ?: return null
+            return AttachmentPayload(
+                mediaType = when (decoded.mediaType) {
+                    AttachmentMediaType.IMAGE -> MediaType.IMAGE
+                    AttachmentMediaType.AUDIO -> MediaType.AUDIO
+                },
+                mimeType = decoded.mimeType,
+                durationMs = decoded.durationMs.toInt(),
+                blob = decoded.blob,
+                caption = decoded.caption,
+            )
         }
 
         fun previewLabel(payload: AttachmentPayload?): String = when (payload?.mediaType) {
@@ -125,19 +107,6 @@ data class AttachmentPayload(
             return previewLabel(decode(payload))
         }
 
-        private fun writeUtf16(data: DataOutputStream, value: String) {
-            val encoded = value.toByteArray(StandardCharsets.UTF_8)
-            require(encoded.size <= 0xFFFF) { "string too long" }
-            data.writeShort(encoded.size)
-            data.write(encoded)
-        }
-
-        private fun readUtf16(data: DataInputStream): String? {
-            val len = data.readUnsignedShort()
-            val buf = ByteArray(len)
-            data.readFully(buf)
-            return String(buf, StandardCharsets.UTF_8)
-        }
     }
 }
 
@@ -155,4 +124,4 @@ const val KIND_GROUP_INVITE: UByte = 4u
 
 /** Kinds rendered in the conversation timeline. */
 fun isVisibleChatKind(kind: UByte): Boolean =
-    kind == 1u.toUByte() || kind == KIND_ATTACHMENT_MANIFEST || kind == KIND_GROUP_INVITE
+    uniffi.cruisemesh_core.coreIsVisibleChatKind(kind)

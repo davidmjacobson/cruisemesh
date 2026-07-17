@@ -31,8 +31,10 @@ enum class TickStatus {
  * `readThrough` at or above a `deliveredThrough` that lags behind, and
  * "read" is the more informative status to show in that case.
  */
-fun tickStatusFor(lamport: ULong, deliveredThrough: ULong, readThrough: ULong): TickStatus = when {
-    lamport <= readThrough -> TickStatus.READ
-    lamport <= deliveredThrough -> TickStatus.DELIVERED
-    else -> TickStatus.SENT
+fun tickStatusFor(lamport: ULong, deliveredThrough: ULong, readThrough: ULong): TickStatus = when (
+    uniffi.cruisemesh_core.coreTickStatusFor(lamport, deliveredThrough, readThrough)
+) {
+    uniffi.cruisemesh_core.CoreTickStatus.READ -> TickStatus.READ
+    uniffi.cruisemesh_core.CoreTickStatus.DELIVERED -> TickStatus.DELIVERED
+    uniffi.cruisemesh_core.CoreTickStatus.SENT -> TickStatus.SENT
 }

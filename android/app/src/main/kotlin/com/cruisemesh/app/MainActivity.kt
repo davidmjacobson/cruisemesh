@@ -64,7 +64,6 @@ import com.cruisemesh.app.friending.ProfileSyncSender
 import com.cruisemesh.app.friending.FriendDirectorySender
 import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.friending.ScanScreen
-import com.cruisemesh.app.friending.extractFriendToken
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.OnboardingStore
 import com.cruisemesh.app.identity.backup.BackupExportScreen
@@ -163,7 +162,7 @@ class MainActivity : ComponentActivity() {
             uri.host == "cruisemesh.app" &&
             (uri.path == "/f" || uri.path == "/f/")
         ) {
-            val token = uri.fragment?.let(::extractFriendToken)?.takeIf { it.startsWith("CMFRIEND1:") }
+            val token = uri.fragment?.takeIf { runCatching { parseFriendText(it) }.isSuccess }
             if (token != null) return PendingDeepLink(friendToken = token)
         }
         if (
@@ -637,9 +636,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             val messages = store.messagesForChat(c.userId)
             val readThrough = store.receiptThrough(c.userId, identity.userId, RECEIPT_TYPE_READ)
             val deliveredThrough = store.receiptThrough(c.userId, identity.userId, RECEIPT_TYPE_DELIVERED)
-            // Unread uses our local read watermark of the peer's stream.
-            val localReadThrough = store.outgoingReceiptThrough(c.userId, c.userId, RECEIPT_TYPE_READ)
-            val unreadCount = ChatListLogic.computeUnread(messages, identity.userId, localReadThrough)
+            val unreadCount = store.semanticUnreadCount(c.userId, identity.userId).toInt()
             ChatSummary(
                 chatId = c.userId,
                 title = c.name,
@@ -654,9 +651,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         }
         val groups = store.listGroups().map { g ->
             val messages = store.messagesForChat(g.id)
-            val unreadCount = ChatListLogic.computeGroupUnread(messages, identity.userId) { senderId ->
-                store.outgoingReceiptThrough(g.id, senderId, RECEIPT_TYPE_READ)
-            }
+            val unreadCount = store.semanticUnreadCount(g.id, identity.userId).toInt()
             ChatSummary(
                 chatId = g.id,
                 title = g.name,
@@ -891,7 +886,6 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
             store = store,
             onContactAdded = { scanned ->
                 val contact = RelayImport.reconcileOnImport(context, store, scanned)
-                store.upsertContact(contact)
                 store.upsertContactProvenance(
                     ContactProvenance(contact.userId, 0u, null, System.currentTimeMillis()),
                 )
@@ -936,7 +930,7 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
         onScanClick = { navController.navigate("scan") },
         onImportText = { text ->
             try {
-                val card = parseFriendText(extractFriendToken(text))
+                val card = parseFriendText(text)
                 val userId = friendCardUserId(card)
                 if (userId.contentEquals(identity.userId)) {
                     ImportFriendResult.Error("That's your own card")
@@ -968,7 +962,6 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
         },
         onConfirmContact = { candidate ->
             val contact = RelayImport.reconcileOnImport(context, store, candidate)
-            store.upsertContact(contact)
             store.upsertContactProvenance(
                 ContactProvenance(contact.userId, 0u, null, System.currentTimeMillis()),
             )

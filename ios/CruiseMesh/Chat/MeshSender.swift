@@ -65,46 +65,15 @@ final class RealMeshSender: MeshSender {
         label: String,
         replyToMsgId: Data? = nil
     ) {
-        let chatId = contact.userId
-        let own = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0
-        let delivered = (try? store.receiptThrough(
-            chatId: chatId,
-            senderUserId: identity.userId,
-            receiptType: ReceiptType.delivered
-        )) ?? 0
-        let read = (try? store.receiptThrough(
-            chatId: chatId,
-            senderUserId: identity.userId,
-            receiptType: ReceiptType.read
-        )) ?? 0
-        let next = max(max(own, delivered), read) + 1
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-        let message = StoredMessage(
-            chatId: chatId,
-            senderUserId: identity.userId,
-            lamport: next,
-            timestamp: timestamp,
-            kind: kind,
-            payload: payload
-        )
-        guard let outbound = buildOutboundAuthoredEnvelope(
-            identity: identity,
-            contact: contact,
-            message: message,
-            replyToMsgId: replyToMsgId
+        guard let authored = try? store.authorPairwiseMessage(
+            identity: identity, contact: contact, kind: kind, payload: payload,
+            replyToMsgId: replyToMsgId, timestampMs: timestamp
         ) else {
             return
         }
-        if let replyToMsgId {
-            _ = try? store.insertOutgoingReply(
-                message: message,
-                envelope: outbound,
-                replyToMsgId: replyToMsgId,
-                queuedAtMs: timestamp
-            )
-        } else {
-            _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
-        }
+        let chatId = authored.message.chatId
+        let delivered = authored.acknowledgedDelivered
         ChatEvents.notifyChatChanged(chatId)
         RelaySyncEvents.requestSync()
         // A pending kind-3 friend card must reach the peer before the first

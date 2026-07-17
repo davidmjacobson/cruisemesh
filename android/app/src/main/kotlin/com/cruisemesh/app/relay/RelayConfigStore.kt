@@ -14,9 +14,7 @@ data class RelayConfig(
 
 /** Canonical relay base URL used for persisted settings and imported cards. */
 fun normalizeRelayUrl(value: String): String {
-    val trimmed = value.trim().trimEnd('/')
-    if (trimmed.isEmpty()) return ""
-    return if (trimmed.contains("://")) trimmed else "https://$trimmed"
+    return uniffi.cruisemesh_core.normalizeRelayUrl(value)
 }
 
 /** Persists the optional family relay configuration used for QR sharing and fallback sync. */

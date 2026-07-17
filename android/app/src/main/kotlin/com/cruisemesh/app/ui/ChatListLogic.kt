@@ -60,11 +60,7 @@ object ChatListLogic {
     }
 
     fun computeUnread(messages: List<StoredMessage>, ownUserId: ByteArray, readThrough: ULong): Int {
-        return messages.count {
-            isVisibleChatKind(it.kind) &&
-                !it.senderUserId.contentEquals(ownUserId) &&
-                it.lamport > readThrough
-        }
+        return uniffi.cruisemesh_core.coreUnreadCount(messages, ownUserId, readThrough).toInt()
     }
 
     /**
@@ -86,7 +82,10 @@ object ChatListLogic {
 
     /** Last message shown in the conversation list (hides friend-request noise). */
     fun lastVisibleMessage(messages: List<StoredMessage>): StoredMessage? =
-        messages.filter { isVisibleChatKind(it.kind) }.maxByOrNull { it.timestamp }
+        uniffi.cruisemesh_core.coreLastVisibleMessage(messages)?.let { selected ->
+            messages.firstOrNull { it.senderUserId.contentEquals(selected.senderUserId) &&
+                it.chatId.contentEquals(selected.chatId) && it.lamport == selected.lamport && it.kind == selected.kind }
+        }
 
     fun previewText(message: StoredMessage, groupName: String? = null): String {
         return when (message.kind) {

@@ -9,24 +9,20 @@ final class GroupMessagingTests: XCTestCase {
             name: "Family",
             memberUserIds: [alice.userId, bob.userId]
         )
-        let message = StoredMessage(
-            chatId: group.id,
-            senderUserId: alice.userId,
-            lamport: 1,
-            timestamp: 1_700_000_000_000,
-            kind: ProtocolKind.text,
-            payload: Data("hello group".utf8)
-        )
-
-        let envelope = try XCTUnwrap(buildOutboundGroupEnvelope(
+        let store = try MessageStore.open(path: ":memory:")
+        let authored = try store.authorGroupMessage(
             identity: alice,
             group: group,
-            message: message
-        ))
+            kind: ProtocolKind.text,
+            payload: Data("hello group".utf8),
+            replyToMsgId: nil,
+            timestampMs: 1_700_000_000_000
+        )
+        let envelope = authored.envelope
         XCTAssertEqual(envelope.recipientUserId, group.id)
         XCTAssertEqual(envelope.recipientHint, computeRecipientHint(
             recipientUserId: group.id,
-            timestampMs: message.timestamp
+            timestampMs: authored.message.timestamp
         ))
 
         let opened = try openGroupMessage(group: group, sealed: envelope.sealed)
@@ -40,16 +36,15 @@ final class GroupMessagingTests: XCTestCase {
         let alice = generateIdentity()
         let outsider = generateIdentity()
         let group = try createGroup(name: "Family", memberUserIds: [alice.userId])
-        let message = StoredMessage(
-            chatId: group.id,
-            senderUserId: outsider.userId,
-            lamport: 1,
-            timestamp: 1,
+        let store = try MessageStore.open(path: ":memory:")
+        XCTAssertThrowsError(try store.authorGroupMessage(
+            identity: outsider,
+            group: group,
             kind: ProtocolKind.text,
-            payload: Data("nope".utf8)
-        )
-
-        XCTAssertNil(buildOutboundGroupEnvelope(identity: outsider, group: group, message: message))
+            payload: Data("nope".utf8),
+            replyToMsgId: nil,
+            timestampMs: 1
+        ))
     }
 
     func testCreateAndInvitePersistsGroupAndPairwiseInvite() throws {

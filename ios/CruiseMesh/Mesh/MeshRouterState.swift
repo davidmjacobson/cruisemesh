@@ -1,19 +1,13 @@
 import Foundation
 
+/// iOS-shaped adapter around the shared, thread-safe Rust route state.
 final class MeshRouterState {
     enum Transport: String {
         case central
         case peripheral
         case lan
 
-        var routePriority: Int {
-            self == .lan ? 10 : 0
-        }
-    }
-
-    private struct Peer {
-        var transport: Transport
-        var userId: Data?
+        var routePriority: Int { self == .lan ? 10 : 0 }
     }
 
     struct IdentifiedRoute: Equatable {
@@ -22,96 +16,62 @@ final class MeshRouterState {
         let userId: Data
     }
 
-    private var peersByAddress: [String: Peer] = [:]
-    private let lock = NSLock()
+    private let core = CoreMeshRouterState()
 
     func onConnected(address: String, transport: Transport) {
-        lock.lock(); defer { lock.unlock() }
-        peersByAddress[address] = Peer(transport: transport, userId: nil)
+        core.onConnected(address: address, transport: transport.core)
     }
 
-    func onDisconnected(address: String) {
-        lock.lock(); defer { lock.unlock() }
-        peersByAddress.removeValue(forKey: address)
-    }
+    func onDisconnected(address: String) { core.onDisconnected(address: address) }
 
     @discardableResult
     func onHello(address: String, userId: Data) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        guard var peer = peersByAddress[address] else { return false }
-        if let existing = peer.userId, existing != userId { return false }
-        peer.userId = userId
-        peersByAddress[address] = peer
-        return true
+        core.onHello(address: address, userId: userId)
     }
 
-    func userIdFor(address: String) -> Data? {
-        lock.lock(); defer { lock.unlock() }
-        return peersByAddress[address]?.userId
-    }
-
-    func transportFor(address: String) -> Transport? {
-        lock.lock(); defer { lock.unlock() }
-        return peersByAddress[address]?.transport
-    }
-
-    func connectedRoutes() -> [(Transport, String)] {
-        lock.lock(); defer { lock.unlock() }
-        return peersByAddress.map { ($0.value.transport, $0.key) }
-    }
-
+    func userIdFor(address: String) -> Data? { core.userIdFor(address: address) }
+    func transportFor(address: String) -> Transport? { core.transportFor(address: address)?.platform }
+    func connectedRoutes() -> [(Transport, String)] { core.connectedRoutes().map { ($0.transport.platform, $0.address) } }
     func identifiedRoutes() -> [IdentifiedRoute] {
-        lock.lock(); defer { lock.unlock() }
-        return peersByAddress.compactMap { address, peer in
-            guard let userId = peer.userId else { return nil }
-            return IdentifiedRoute(transport: peer.transport, address: address, userId: userId)
-        }
+        core.identifiedRoutes().map { IdentifiedRoute(transport: $0.transport.platform, address: $0.address, userId: $0.userId) }
     }
-
-    func connectedUserCount() -> Int {
-        lock.lock(); defer { lock.unlock() }
-        var seen = Set<Data>()
-        for peer in peersByAddress.values {
-            if let id = peer.userId { seen.insert(id) }
-        }
-        return seen.count
-    }
-
+    func connectedUserCount() -> Int { Int(core.connectedUserCount()) }
     func routeFor(userId: Data) -> (Transport, String)? {
-        routesFor(userId: userId).first
+        core.routeFor(userId: userId).map { ($0.transport.platform, $0.address) }
     }
-
     func routesFor(userId: Data) -> [(Transport, String)] {
-        lock.lock(); defer { lock.unlock() }
-        return peersByAddress.compactMap { address, peer in
-            guard peer.userId == userId else { return nil }
-            return (peer.transport, address)
-        }.sorted { $0.0.routePriority > $1.0.routePriority }
+        core.routesFor(userId: userId).map { ($0.transport.platform, $0.address) }
     }
+    func clear(transports: Set<Transport>) { core.clearTransports(transports: transports.map(\.core)) }
+    func clear() { core.clear() }
+}
 
-    func clear(transports: Set<Transport>) {
-        lock.lock(); defer { lock.unlock() }
-        peersByAddress = peersByAddress.filter { !transports.contains($0.value.transport) }
-    }
-
-    func clear() {
-        lock.lock(); defer { lock.unlock() }
-        peersByAddress.removeAll()
+private extension MeshRouterState.Transport {
+    var core: CoreTransport {
+        switch self {
+        case .central: return .central
+        case .peripheral: return .peripheral
+        case .lan: return .lan
+        }
     }
 }
 
-/// Small control/text frames race over LAN and one BLE path. Larger frames use
-/// LAN only when it is available, avoiding expensive duplicate attachment data.
+private extension CoreTransport {
+    var platform: MeshRouterState.Transport {
+        switch self {
+        case .central: return .central
+        case .peripheral: return .peripheral
+        case .lan: return .lan
+        }
+    }
+}
+
 func transportSendPlan(
     routes: [(MeshRouterState.Transport, String)],
     frameSize: Int
 ) -> [(MeshRouterState.Transport, String)] {
-    guard let lan = routes.first(where: { $0.0 == .lan }) else {
-        return Array(routes.prefix(1))
-    }
-    guard frameSize <= 8 * 1_024,
-          let ble = routes.first(where: { $0.0 != .lan }) else {
-        return [lan]
-    }
-    return [lan, ble]
+    coreTransportSendPlan(
+        routes: routes.map { CoreTransportRoute(transport: $0.0.core, address: $0.1) },
+        frameSize: UInt32(frameSize)
+    ).map { ($0.transport.platform, $0.address) }
 }

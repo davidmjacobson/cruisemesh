@@ -17,30 +17,20 @@ enum FriendRequestSender {
             relayUrl: RelayConfigStore.load()?.relayUrl,
             relayToken: RelayConfigStore.load()?.relayToken
         )
-        let chatId = contact.userId
-        let lamport = ((try? store.highestContiguousLamport(chatId: chatId, senderUserId: identity.userId)) ?? 0) + 1
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-        let message = StoredMessage(
-            chatId: chatId,
-            senderUserId: identity.userId,
-            lamport: lamport,
-            timestamp: timestamp,
-            kind: ProtocolKind.friendRequest,
-            payload: Data(cardJson.utf8)
-        )
-        guard let outbound = buildOutboundAuthoredEnvelope(identity: identity, contact: contact, message: message) else {
-            return FriendRequestDelivery(reachedDirectly: false, lamport: lamport)
+        guard let authored = try? store.authorFriendRequest(
+            identity: identity, contact: contact, friendCardJson: cardJson, timestampMs: timestamp
+        ) else {
+            return FriendRequestDelivery(reachedDirectly: false, lamport: 0)
         }
-        _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: timestamp)
-        ChatEvents.notifyChatChanged(chatId)
+        ChatEvents.notifyChatChanged(authored.message.chatId)
         RelaySyncEvents.requestSync()
-        let frame = encodeOutboundEnvelopeFrame(outbound)
-        let reachedDirectly = MeshRouter.sendToUserId(userId: contact.userId, frame: frame)
+        let reachedDirectly = MeshRouter.sendToUserId(userId: contact.userId, frame: authored.frame)
         if !reachedDirectly {
-            let muled = MeshRouter.relayToAll(frame: frame)
+            let muled = MeshRouter.relayToAll(frame: authored.frame)
             log.info("Friend request queued for later delivery to \(contact.name, privacy: .public); sprayed to \(muled) mule link(s)")
         }
-        return FriendRequestDelivery(reachedDirectly: reachedDirectly, lamport: lamport)
+        return FriendRequestDelivery(reachedDirectly: reachedDirectly, lamport: authored.message.lamport)
     }
 }
 

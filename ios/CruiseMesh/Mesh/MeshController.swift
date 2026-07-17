@@ -520,7 +520,12 @@ final class MeshController: ObservableObject {
             }
         }
         resendGroupOutboundToPeer(address: address, peerUserId: peerUserId, identity: identity)
-        sprayCarriedEnvelopesTo(address: address, peerUserId: peerUserId, peerKnownIds: Set(recentMsgIds))
+        sprayDigestPlanTo(
+            address: address,
+            peerUserId: peerUserId,
+            peerKnownIds: recentMsgIds,
+            identity: identity
+        )
     }
 
     func processInboundEnvelope(
@@ -531,13 +536,21 @@ final class MeshController: ObservableObject {
         recipientHint: Data,
         sealed: Data,
         identity: Identity
-    ) {
+    ) -> CoreInboundDisposition {
         let sourceLabel = sourceAddress ?? "relay"
-        guard GossipState.seenIds.checkAndRecord(msgId: msgId) else { return }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        if expiry <= now {
+        switch coreInboundGate(
+            isNewMsgId: GossipState.seenIds.checkAndRecord(msgId: msgId),
+            expiryMs: expiry,
+            nowMs: now
+        ) {
+        case .seen:
+            return .seen
+        case .expired:
             log.info("Dropping expired envelope from \(sourceLabel, privacy: .public)")
-            return
+            return .expired
+        case .dispatch:
+            break
         }
         do {
             let opened = try openMessage(recipient: identity, sealed: sealed)
@@ -554,6 +567,7 @@ final class MeshController: ObservableObject {
                 msgId: msgId,
                 arrival: arrival
             )
+            return .consumed
         } catch {
             // Pairwise open failed: either foreign 1:1 traffic, or a group
             // envelope sealed with a shared key (DESIGN.md §6.5). Try groups
@@ -589,7 +603,7 @@ final class MeshController: ObservableObject {
                     sealed: sealed,
                     forceFamily: true
                 )
-                return
+                return .consumed
             }
             relayForeign(
                 sourceAddress: sourceAddress,
@@ -600,6 +614,7 @@ final class MeshController: ObservableObject {
                 sealed: sealed
             )
             carryForeign(msgId: msgId, hopTtl: hopTtl, expiry: expiry, recipientHint: recipientHint, sealed: sealed)
+            return .carried
         }
     }
 
@@ -1055,7 +1070,7 @@ final class MeshController: ObservableObject {
             relayUrl: card.relayUrl,
             relayToken: card.relayToken
         )
-        try? store.upsertContact(contact: contact)
+        _ = try? store.upsertImportedContact(contact: contact)
         if let sourceAddress {
             sendLanEndpointHint(address: sourceAddress)
         }
@@ -1285,7 +1300,7 @@ final class MeshController: ObservableObject {
             relayUrl: card.relayUrl,
             relayToken: card.relayToken
         )
-        try? store.upsertContact(contact: contact)
+        _ = try? store.upsertImportedContact(contact: contact)
         if let sourceAddress {
             sendLanEndpointHint(address: sourceAddress)
         }
@@ -1478,14 +1493,16 @@ final class MeshController: ObservableObject {
         ackedSenderUserId: Data,
         throughLamport: UInt64
     ) {
-        guard let frame = buildReceiptFrame(
+        guard let authored = try? store.ensureAuthoredReceipt(
             identity: identity,
             contact: contact,
-            receiptType: receiptType,
             ackedSenderUserId: ackedSenderUserId,
-            throughLamport: throughLamport
+            receiptType: receiptType,
+            throughLamport: throughLamport,
+            timestampMs: Int64(Date().timeIntervalSince1970 * 1_000)
         ) else { return }
-        MeshRouter.sendToAddress(address: address, frame: frame)
+        GossipState.seenIds.record(msgId: authored.envelope.msgId)
+        MeshRouter.sendToAddress(address: address, frame: authored.frame)
     }
 
     private func sendReceiptToContact(
@@ -1495,55 +1512,16 @@ final class MeshController: ObservableObject {
         ackedSenderUserId: Data,
         throughLamport: UInt64
     ) {
-        guard let frame = buildReceiptFrame(
+        guard let authored = try? store.ensureAuthoredReceipt(
             identity: identity,
             contact: contact,
-            receiptType: receiptType,
             ackedSenderUserId: ackedSenderUserId,
-            throughLamport: throughLamport
+            receiptType: receiptType,
+            throughLamport: throughLamport,
+            timestampMs: Int64(Date().timeIntervalSince1970 * 1_000)
         ) else { return }
-        _ = MeshRouter.sendToUserId(userId: contact.userId, frame: frame)
-    }
-
-    private func buildReceiptFrame(
-        identity: Identity,
-        contact: Contact,
-        receiptType: UInt8,
-        ackedSenderUserId: Data,
-        throughLamport: UInt64
-    ) -> Data? {
-        let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-        let content = encodeReceiptContent(content: ReceiptContent(
-            chatId: identity.userId,
-            senderUserId: ackedSenderUserId,
-            lamport: throughLamport,
-            receiptType: receiptType
-        ))
-        let body = MessageBody(
-            kind: ProtocolKind.receipt,
-            chatId: identity.userId,
-            lamport: 0,
-            timestamp: timestamp,
-            content: content
-        )
-        do {
-            let sealed = try sealMessage(
-                sender: identity,
-                recipientAgreePk: contact.agreePk,
-                payload: encodeMessageBody(body: body)
-            )
-            let msgId = generateMsgId()
-            GossipState.seenIds.record(msgId: msgId)
-            return encodeEnvelopeFrame(
-                msgId: msgId,
-                hopTtl: MeshDefaults.hopTtl,
-                expiry: defaultExpiry(timestampMs: timestamp),
-                recipientHint: computeRecipientHint(recipientUserId: contact.userId, timestampMs: timestamp),
-                sealed: sealed
-            )
-        } catch {
-            return nil
-        }
+        GossipState.seenIds.record(msgId: authored.envelope.msgId)
+        _ = MeshRouter.sendToUserId(userId: contact.userId, frame: authored.frame)
     }
 
     @discardableResult
@@ -1555,52 +1533,32 @@ final class MeshController: ObservableObject {
         throughLamport: UInt64
     ) -> Bool {
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-        let content = encodeReceiptContent(content: ReceiptContent(
-            chatId: identity.userId,
+        let existing = try? store.outgoingReceiptEnvelope(
+            chatId: contact.userId,
             senderUserId: ackedSenderUserId,
-            lamport: throughLamport,
             receiptType: receiptType
-        ))
-        let body = MessageBody(
-            kind: ProtocolKind.receipt,
-            chatId: identity.userId,
-            lamport: 0,
-            timestamp: timestamp,
-            content: content
         )
-        do {
-            let sealed = try sealMessage(
-                sender: identity,
-                recipientAgreePk: contact.agreePk,
-                payload: encodeMessageBody(body: body)
-            )
-            let msgId = generateMsgId()
-            GossipState.seenIds.record(msgId: msgId)
-            let envelope = OutgoingReceiptEnvelope(
-                msgId: msgId,
-                recipientUserId: contact.userId,
-                chatId: contact.userId,
-                senderUserId: ackedSenderUserId,
-                receiptType: receiptType,
-                throughLamport: throughLamport,
-                timestamp: timestamp,
-                hopTtl: MeshDefaults.hopTtl,
-                expiry: defaultExpiry(timestampMs: timestamp),
-                recipientHint: computeRecipientHint(recipientUserId: contact.userId, timestampMs: timestamp),
-                sealed: sealed
-            )
-            return (try? store.upsertOutgoingReceiptEnvelope(envelope: envelope, queuedAtMs: timestamp)) ?? false
-        } catch {
-            return false
-        }
+        guard let authored = try? store.ensureAuthoredReceipt(
+            identity: identity,
+            contact: contact,
+            ackedSenderUserId: ackedSenderUserId,
+            receiptType: receiptType,
+            throughLamport: throughLamport,
+            timestampMs: timestamp
+        ) else { return false }
+        GossipState.seenIds.record(msgId: authored.envelope.msgId)
+        return existing == nil || existing!.throughLamport < authored.envelope.throughLamport
     }
 
     private func backfillOutbound(identity: Identity, contact: Contact, message: StoredMessage) -> OutboundEnvelope? {
-        guard let outbound = buildOutboundAuthoredEnvelope(identity: identity, contact: contact, message: message) else {
-            return nil
-        }
-        _ = try? store.insertOutgoingMessage(message: message, envelope: outbound, queuedAtMs: message.timestamp)
-        return outbound
+        guard let authored = try? store.backfillPairwiseEnvelope(
+            identity: identity,
+            contact: contact,
+            message: message,
+            replyToMsgId: nil
+        ) else { return nil }
+        GossipState.seenIds.record(msgId: authored.envelope.msgId)
+        return authored.envelope
     }
 
     private func carryForeign(
@@ -1673,22 +1631,28 @@ final class MeshController: ObservableObject {
         }
     }
 
-    private func sprayCarriedEnvelopesTo(address: String, peerUserId: Data, peerKnownIds: Set<Data>) {
+    private func sprayDigestPlanTo(
+        address: String,
+        peerUserId: Data,
+        peerKnownIds: [Data],
+        identity: Identity
+    ) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let peerHints = recentHintsFor(userId: peerUserId, now: now)
-        let candidates = (try? store.carriedEnvelopesForPeerSync(
-            peerHints: peerHints,
-            peerKnownMsgIds: Array(peerKnownIds),
-            nowMs: now
-        )) ?? []
-        for env in candidates.prefix(32) {
-            let frame = encodeEnvelopeFrame(
-                msgId: env.msgId,
-                hopTtl: env.hopTtl,
-                expiry: env.expiry,
-                recipientHint: env.recipientHint,
-                sealed: env.sealed
-            )
+        guard let plan = try? store.coreDigestSprayPlan(
+            ownUserId: identity.userId,
+            peerUserId: peerUserId,
+            peerHints: recentHintsFor(userId: peerUserId, now: now),
+            peerKnownMsgIds: peerKnownIds,
+            nowMs: now,
+            ownOutboundBudgetBytes: MeshDefaults.ownOutboundSprayBudgetBytes,
+            ownReceiptBudgetBytes: MeshDefaults.ownReceiptSprayBudgetBytes,
+            receiptQueryLimit: MeshDefaults.relayBatchLimit
+        ) else {
+            log.warning("Failed to build digest spray plan for \(address, privacy: .public)")
+            return
+        }
+        let frames = plan.carriedFrames + plan.ownOutboundFrames + plan.ownReceiptFrames
+        for frame in frames {
             _ = MeshRouter.sendToAddress(address: address, frame: frame)
         }
     }
@@ -1856,9 +1820,9 @@ final class MeshController: ObservableObject {
                     limit: Int(MeshDefaults.relayBatchLimit)
                 )
                 guard !page.envelopes.isEmpty else { break }
-                var acks: [Int64] = []
+                var dispositions: [CoreRelayEnvelopeDisposition] = []
                 for env in page.envelopes {
-                    await MainActor.run {
+                    let disposition = await MainActor.run {
                         MeshController.shared.processInboundEnvelope(
                             sourceAddress: nil,
                             msgId: env.msgId,
@@ -1869,9 +1833,15 @@ final class MeshController: ObservableObject {
                             identity: identity
                         )
                     }
-                    acks.append(env.id)
+                    dispositions.append(CoreRelayEnvelopeDisposition(
+                        relayId: env.id,
+                        disposition: disposition
+                    ))
                 }
-                try RelayClient.ackEnvelopes(config: config, ids: acks)
+                let acks = coreRelayAckIds(items: dispositions)
+                if !acks.isEmpty {
+                    try RelayClient.ackEnvelopes(config: config, ids: acks)
+                }
                 afterId = page.nextCursor
                 if page.envelopes.count < Int(MeshDefaults.relayBatchLimit) { break }
             }
