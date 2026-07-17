@@ -48,6 +48,7 @@ import com.cruisemesh.app.notify.MessageNotifier
 import com.cruisemesh.app.relay.RelayClient
 import com.cruisemesh.app.relay.RelayConfig
 import com.cruisemesh.app.relay.RelayConfigStore
+import com.cruisemesh.app.relay.RelayPushClient
 import com.cruisemesh.app.relay.normalizeRelayUrl
 import com.cruisemesh.app.relay.RelayImport
 import uniffi.cruisemesh_core.CarriedEnvelope
@@ -243,6 +244,19 @@ class MeshService : Service() {
     private val lanEndpointCache by lazy { LanEndpointCache(this) }
     private val a2dpAudioBackoff = A2dpAudioBackoff()
 
+    /**
+     * DTN audit finding F1: the 60s [RELAY_POLL_INTERVAL_MS] poll is
+     * correctness-authoritative but slow. When validated internet is up,
+     * this opens relayd's `GET /ws` push socket (relayd/src/lib.rs) and, on
+     * every pushed envelope, calls [requestRelaySync] immediately instead of
+     * waiting for the next poll tick -- see [updateRelayPushSubscription].
+     * It never processes envelope content itself; see [RelayPushClient]'s
+     * class doc.
+     */
+    private val relayPushClient by lazy {
+        RelayPushClient(relayMainHandler) { requestRelaySync("relay push") }
+    }
+
     private val peripheral by lazy {
         BlePeripheral(this, ::onFrameReceived, ::onPeripheralCentralSubscribed, ::onPeripheralCentralDisconnected)
     }
@@ -299,6 +313,7 @@ class MeshService : Service() {
             } else if (relayBindNetwork == network) {
                 relayBindNetwork = null
             }
+            updateRelayPushSubscription()
         }
 
         override fun onLost(network: Network) {
@@ -306,6 +321,7 @@ class MeshService : Service() {
             if (!hasValidatedInternet()) {
                 MeshConnectivityStatus.setRelayHealth(RelayHealth.NoInternet)
             }
+            updateRelayPushSubscription()
         }
     }
     private val relayPollRunnable = object : Runnable {
@@ -421,6 +437,7 @@ class MeshService : Service() {
         refreshRuntimeState()
         refreshBluetoothAudioStatus("service start")
         requestRelaySync("service start")
+        updateRelayPushSubscription()
         return START_STICKY
     }
 
@@ -433,6 +450,7 @@ class MeshService : Service() {
         unregisterBluetoothStateReceiver()
         unregisterRelayNetworkCallback()
         cancelRelayPolling()
+        relayPushClient.stop()
         cancelLanHealth()
         LanTransportDiagnostics.unregisterProbeRequester()
         lanHealthTracker.clear()
@@ -667,6 +685,47 @@ class MeshService : Service() {
 
     private fun cancelRelayPolling() {
         relayMainHandler.removeCallbacks(relayPollRunnable)
+    }
+
+    /**
+     * Starts [relayPushClient] against our own relay config once validated
+     * internet and an identity exist, or stops it otherwise (no config, no
+     * identity yet, or the network went away). Called on service start and
+     * on every relay network capability change, mirroring how
+     * [requestRelaySync] is triggered from the same places -- the push
+     * socket should be up in exactly the situations the poll would already
+     * succeed in.
+     *
+     * The hint set passed to [RelayPushClient.start] is recomputed on every
+     * (re)connect from [relayHintsForConfig] (mail addressed to us) and
+     * [relayProxyHints] (mail addressed to a contact we can proxy-fetch for,
+     * same as [pollRelayMailbox]'s doc) so a newly added contact or group is
+     * picked up the next reconnect without this needing its own
+     * change-tracking; until then the 60s poll already covers it.
+     */
+    private fun updateRelayPushSubscription() {
+        val identity = this.identity
+        val config = RelayConfigStore.load(this)
+        if (identity == null || config == null || !hasValidatedInternet()) {
+            relayPushClient.stop()
+            return
+        }
+        relayPushClient.start(config) {
+            val now = System.currentTimeMillis()
+            try {
+                dedupeHints(
+                    relayHintsForConfig(identity.userId, now),
+                    relayProxyHints(store.listContacts(), identity.userId, now),
+                )
+            } catch (e: CoreException) {
+                // Called on RelayPushClient's connect/reconnect path (main
+                // thread), not inside performRelaySyncPass's own try/catch --
+                // an uncaught exception here would crash the app instead of
+                // just failing this one (re)connect attempt.
+                Log.w(TAG, "Failed to compute relay push hints: ${e.message}")
+                emptyList()
+            }
+        }
     }
 
     private fun scheduleLanHealth() {
