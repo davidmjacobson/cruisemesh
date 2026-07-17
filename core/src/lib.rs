@@ -65,13 +65,13 @@ pub use protocol::{
     encode_digest, encode_envelope_frame, encode_friend_directory_content, encode_hello,
     encode_introduced_friend_request, encode_lan_endpoint, encode_lan_endpoint_content,
     encode_message_body, encode_message_body_with_reply, encode_profile_sync_content,
-    encode_receipt_content, encode_transport_probe, generate_msg_id, parse_frame,
+    encode_receipt_content, encode_transport_probe, fanout_msg_id, generate_msg_id, parse_frame,
     verify_introduction_ticket, ExtendedMessageBody, Frame, FriendDirectoryContent,
     FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket, LanEndpointContent,
     MessageBody, ProfileSyncContent, ReceiptContent, SuggestedFriendCard, DEFAULT_EXPIRY_MS,
     DEFAULT_HOP_TTL, KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY,
     KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT,
-    KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_TEXT, RECEIPT_TYPE_DELIVERED,
+    KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
     RECEIPT_TYPE_READ,
 };
 pub use relay_wire::{
@@ -87,8 +87,8 @@ pub use semantic::{
 };
 pub use store::{
     CarriedEnvelope, Contact, ContactDiscoveryPolicy, ContactProvenance, DigestEntry,
-    FriendSuggestion, MessageArrival, MessageReference, MessageStore, OutboundEnvelope,
-    OutgoingReceiptEnvelope, StoredMessage,
+    FriendSuggestion, MessageArrival, MessageOrigin, MessageReference, MessageStore,
+    OutboundEnvelope, OutgoingReceiptEnvelope, StoredMessage,
 };
 pub use transport_policy::{
     core_transport_send_plan, digest_is_expected_chat_id, digest_through_lamport_for_sender,
