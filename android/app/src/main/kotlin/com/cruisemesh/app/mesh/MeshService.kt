@@ -57,6 +57,7 @@ import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.CoreInboundDisposition
 import uniffi.cruisemesh_core.CoreInboundGate
+import uniffi.cruisemesh_core.CoreRelayEnvelopeDisposition
 import uniffi.cruisemesh_core.DigestEntry
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Group
@@ -70,7 +71,6 @@ import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.coreInboundGate
-import uniffi.cruisemesh_core.coreShouldAckInbound
 import uniffi.cruisemesh_core.decodeGroupInviteContent
 import uniffi.cruisemesh_core.decodeFriendDirectoryContent
 import uniffi.cruisemesh_core.decodeIntroducedFriendRequest
@@ -898,12 +898,16 @@ class MeshService : Service() {
      * across BLE clusters"). Every fetched envelope still goes through
      * [handleRelayEnvelope] -> [processInboundEnvelope] exactly as before;
      * what's new is that the ack decision now follows the returned
-     * [CoreInboundDisposition] ([coreShouldAckInbound]) instead of unconditionally acking
-     * everything the fetch returned. A proxied envelope comes back as
-     * CARRIED, not CONSUMED, so it is deliberately left on the relay --
-     * [MeshService.carryRelayEnvelope] already queued it for BLE delivery to
-     * its real recipient, and the relay copy remains the durable fallback
-     * until they (or another proxy) fetch and consume it, or it expires.
+     * [CoreInboundDisposition] via [MessageStore.coreRelayAckIdsWithConsumed]
+     * instead of unconditionally acking everything the fetch returned. A
+     * proxied envelope comes back as CARRIED, not CONSUMED, so it is
+     * deliberately left on the relay -- [MeshService.carryRelayEnvelope]
+     * already queued it for BLE delivery to its real recipient, and the
+     * relay copy remains the durable fallback until they (or another proxy)
+     * fetch and consume it, or it expires. A SEEN envelope this device
+     * already consumed as a 1:1 message over BLE/LAN is now also acked
+     * (DTN_TODOS.md §3.1) instead of being re-fetched on every pass until
+     * expiry -- see [CoreRelayEnvelopeDisposition]'s KDoc for the exact rule.
      *
      * The un-acked proxy envelopes DO still advance the cursor within this
      * pass (`after = page.nextCursor` is unconditional), so the inner loop
@@ -942,13 +946,20 @@ class MeshService : Service() {
                 "Fetched ${page.envelopes.size} relay envelope(s) from ${config.relayUrl} after=$after next=${page.nextCursor}",
             )
             if (page.envelopes.isEmpty()) return
-            val ackIds = ArrayList<Long>(page.envelopes.size)
+            val dispositions = ArrayList<CoreRelayEnvelopeDisposition>(page.envelopes.size)
             for (envelope in page.envelopes) {
                 val disposition = handleRelayEnvelope(envelope, identity)
-                if (coreShouldAckInbound(disposition)) {
-                    ackIds += envelope.id
-                }
+                dispositions += CoreRelayEnvelopeDisposition(
+                    relayId = envelope.id,
+                    msgId = envelope.msgId,
+                    disposition = disposition,
+                )
             }
+            // Consumed/Expired ack unconditionally; a SEEN envelope is
+            // acked only if this device durably consumed it as a 1:1
+            // message from someone else (DTN_TODOS.md §3.1) -- see
+            // CoreRelayEnvelopeDisposition's KDoc.
+            val ackIds = store.coreRelayAckIdsWithConsumed(dispositions, identity.userId)
             if (ackIds.isNotEmpty()) {
                 Log.i(TAG, "Acking ${ackIds.size} relay envelope(s) on ${config.relayUrl}: $ackIds")
                 RelayClient.ackEnvelopes(config, ackIds, network)

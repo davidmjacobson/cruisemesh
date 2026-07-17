@@ -87,8 +87,8 @@ pub use semantic::{
 };
 pub use store::{
     CarriedEnvelope, Contact, ContactDiscoveryPolicy, ContactProvenance, DigestEntry,
-    FriendSuggestion, MessageArrival, MessageReference, MessageStore, OutboundEnvelope,
-    OutgoingReceiptEnvelope, StoredMessage,
+    FriendSuggestion, MessageArrival, MessageOrigin, MessageReference, MessageStore,
+    OutboundEnvelope, OutgoingReceiptEnvelope, StoredMessage,
 };
 pub use transport_policy::{
     core_transport_send_plan, digest_is_expected_chat_id, digest_through_lamport_for_sender,
