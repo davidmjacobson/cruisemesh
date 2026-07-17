@@ -1720,13 +1720,20 @@ public protocol MessageStoreProtocol : AnyObject {
      * relay copy unless THIS device was the envelope's sole true endpoint
      * consumer; when in doubt, don't ack."
      *
-     * Note: this only extends the SEEN path. The pre-existing CONSUMED-path
-     * group ack (DTN_TODOS.md N1 -- the first member to fetch+consume a
-     * group envelope over the relay acks it away from every other member,
-     * since the family shares one relay mailbox per family token) is out
-     * of scope here and deliberately unchanged.
+     * **Legacy group-row rule** (`specs/group-relay-durability.md` §5.2,
+     * closing DTN_TODOS.md N1): an item whose `recipient_hint` matches one
+     * of this device's imported groups' recent-day hints names a legacy
+     * shared-mailbox row that EVERY member fetches -- so it is never acked
+     * (not even on `Consumed`: this device is only one of several endpoint
+     * consumers), except when `Expired`, which is dead weight for every
+     * member alike. New-style group mail never trips this rule: per-member
+     * fan-out rows ([`core_group_fanout_rows`]) are addressed to a member's
+     * OWN hint, indistinguishable from 1:1 mail, and their `Consumed` ack
+     * is correct precisely because each row has exactly one reader. Legacy
+     * rows simply age out within their normal expiry; the rule is
+     * unconditional per the approved spec (§7.3, no escape hatch).
      */
-    func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], ownUserId: Data) throws  -> [Int64]
+    func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], ownUserId: Data, nowMs: Int64) throws  -> [Int64]
     
     /**
      * Delete a contact and, with it, the entire 1:1 chat: the contact row,
@@ -2621,17 +2628,25 @@ open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Dat
      * relay copy unless THIS device was the envelope's sole true endpoint
      * consumer; when in doubt, don't ack."
      *
-     * Note: this only extends the SEEN path. The pre-existing CONSUMED-path
-     * group ack (DTN_TODOS.md N1 -- the first member to fetch+consume a
-     * group envelope over the relay acks it away from every other member,
-     * since the family shares one relay mailbox per family token) is out
-     * of scope here and deliberately unchanged.
+     * **Legacy group-row rule** (`specs/group-relay-durability.md` §5.2,
+     * closing DTN_TODOS.md N1): an item whose `recipient_hint` matches one
+     * of this device's imported groups' recent-day hints names a legacy
+     * shared-mailbox row that EVERY member fetches -- so it is never acked
+     * (not even on `Consumed`: this device is only one of several endpoint
+     * consumers), except when `Expired`, which is dead weight for every
+     * member alike. New-style group mail never trips this rule: per-member
+     * fan-out rows ([`core_group_fanout_rows`]) are addressed to a member's
+     * OWN hint, indistinguishable from 1:1 mail, and their `Consumed` ack
+     * is correct precisely because each row has exactly one reader. Legacy
+     * rows simply age out within their normal expiry; the rule is
+     * unconditional per the approved spec (§7.3, no escape hatch).
      */
-open func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], ownUserId: Data)throws  -> [Int64] {
+open func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], ownUserId: Data, nowMs: Int64)throws  -> [Int64] {
     return try  FfiConverterSequenceInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_core_relay_ack_ids_with_consumed(self.uniffiClonePointer(),
         FfiConverterSequenceTypeCoreRelayEnvelopeDisposition.lower(items),
-        FfiConverterData.lower(ownUserId),$0
+        FfiConverterData.lower(ownUserId),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -4665,6 +4680,105 @@ public func FfiConverterTypeCoreDigestSprayPlan_lower(_ value: CoreDigestSprayPl
 }
 
 
+/**
+ * One relay-post row of a group message's per-member fan-out
+ * (`specs/group-relay-durability.md` §4, DTN_TODOS.md N1). Deliberately
+ * NOT [`CarriedEnvelope`], even though the fields coincide -- a fan-out row
+ * is a relay-upload payload only; it is never enqueued into the local carry
+ * queue. Every field here is copied onto the wire verbatim by
+ * [`encode_envelope_frame`]/the relay POST body; see
+ * [`core_group_fanout_rows`] for how each field is derived.
+ */
+public struct CoreGroupFanoutRow {
+    public var msgId: Data
+    public var hopTtl: UInt8
+    public var expiry: Int64
+    public var recipientHint: Data
+    public var sealed: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(msgId: Data, hopTtl: UInt8, expiry: Int64, recipientHint: Data, sealed: Data) {
+        self.msgId = msgId
+        self.hopTtl = hopTtl
+        self.expiry = expiry
+        self.recipientHint = recipientHint
+        self.sealed = sealed
+    }
+}
+
+
+
+extension CoreGroupFanoutRow: Equatable, Hashable {
+    public static func ==(lhs: CoreGroupFanoutRow, rhs: CoreGroupFanoutRow) -> Bool {
+        if lhs.msgId != rhs.msgId {
+            return false
+        }
+        if lhs.hopTtl != rhs.hopTtl {
+            return false
+        }
+        if lhs.expiry != rhs.expiry {
+            return false
+        }
+        if lhs.recipientHint != rhs.recipientHint {
+            return false
+        }
+        if lhs.sealed != rhs.sealed {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(msgId)
+        hasher.combine(hopTtl)
+        hasher.combine(expiry)
+        hasher.combine(recipientHint)
+        hasher.combine(sealed)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreGroupFanoutRow: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreGroupFanoutRow {
+        return
+            try CoreGroupFanoutRow(
+                msgId: FfiConverterData.read(from: &buf), 
+                hopTtl: FfiConverterUInt8.read(from: &buf), 
+                expiry: FfiConverterInt64.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf), 
+                sealed: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreGroupFanoutRow, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.msgId, into: &buf)
+        FfiConverterUInt8.write(value.hopTtl, into: &buf)
+        FfiConverterInt64.write(value.expiry, into: &buf)
+        FfiConverterData.write(value.recipientHint, into: &buf)
+        FfiConverterData.write(value.sealed, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreGroupFanoutRow_lift(_ buf: RustBuffer) throws -> CoreGroupFanoutRow {
+    return try FfiConverterTypeCoreGroupFanoutRow.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreGroupFanoutRow_lower(_ value: CoreGroupFanoutRow) -> RustBuffer {
+    return FfiConverterTypeCoreGroupFanoutRow.lower(value)
+}
+
+
 public struct CoreIdentifiedRoute {
     public var transport: CoreTransport
     public var address: String
@@ -5160,6 +5274,17 @@ public struct CoreRelayEnvelopeDisposition {
      */
     public var msgId: Data
     public var disposition: CoreInboundDisposition
+    /**
+     * This fetched envelope's `recipient_hint` off the §6.4 header --
+     * whichever hint the fetch actually matched. Used by
+     * [`MessageStore::core_relay_ack_ids_with_consumed`] to recognize a
+     * legacy shared-mailbox group row (`specs/group-relay-durability.md`
+     * §5.2): a hint that matches one of THIS device's imported groups'
+     * recent-day hints, as opposed to a per-member fan-out row (addressed
+     * to a member's own hint, indistinguishable on the wire from ordinary
+     * 1:1 mail).
+     */
+    public var recipientHint: Data
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -5168,10 +5293,21 @@ public struct CoreRelayEnvelopeDisposition {
          * Stable envelope id. Only consulted for [`CoreInboundDisposition::Seen`]
          * items, to look up whether THIS device durably consumed this exact
          * envelope -- see [`MessageStore::core_relay_ack_ids_with_consumed`].
-         */msgId: Data, disposition: CoreInboundDisposition) {
+         */msgId: Data, disposition: CoreInboundDisposition, 
+        /**
+         * This fetched envelope's `recipient_hint` off the §6.4 header --
+         * whichever hint the fetch actually matched. Used by
+         * [`MessageStore::core_relay_ack_ids_with_consumed`] to recognize a
+         * legacy shared-mailbox group row (`specs/group-relay-durability.md`
+         * §5.2): a hint that matches one of THIS device's imported groups'
+         * recent-day hints, as opposed to a per-member fan-out row (addressed
+         * to a member's own hint, indistinguishable on the wire from ordinary
+         * 1:1 mail).
+         */recipientHint: Data) {
         self.relayId = relayId
         self.msgId = msgId
         self.disposition = disposition
+        self.recipientHint = recipientHint
     }
 }
 
@@ -5188,6 +5324,9 @@ extension CoreRelayEnvelopeDisposition: Equatable, Hashable {
         if lhs.disposition != rhs.disposition {
             return false
         }
+        if lhs.recipientHint != rhs.recipientHint {
+            return false
+        }
         return true
     }
 
@@ -5195,6 +5334,7 @@ extension CoreRelayEnvelopeDisposition: Equatable, Hashable {
         hasher.combine(relayId)
         hasher.combine(msgId)
         hasher.combine(disposition)
+        hasher.combine(recipientHint)
     }
 }
 
@@ -5208,7 +5348,8 @@ public struct FfiConverterTypeCoreRelayEnvelopeDisposition: FfiConverterRustBuff
             try CoreRelayEnvelopeDisposition(
                 relayId: FfiConverterInt64.read(from: &buf), 
                 msgId: FfiConverterData.read(from: &buf), 
-                disposition: FfiConverterTypeCoreInboundDisposition.read(from: &buf)
+                disposition: FfiConverterTypeCoreInboundDisposition.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf)
         )
     }
 
@@ -5216,6 +5357,7 @@ public struct FfiConverterTypeCoreRelayEnvelopeDisposition: FfiConverterRustBuff
         FfiConverterInt64.write(value.relayId, into: &buf)
         FfiConverterData.write(value.msgId, into: &buf)
         FfiConverterTypeCoreInboundDisposition.write(value.disposition, into: &buf)
+        FfiConverterData.write(value.recipientHint, into: &buf)
     }
 }
 
@@ -9212,6 +9354,31 @@ fileprivate struct FfiConverterSequenceTypeContact: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCoreGroupFanoutRow: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreGroupFanoutRow]
+
+    public static func write(_ value: [CoreGroupFanoutRow], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreGroupFanoutRow.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreGroupFanoutRow] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreGroupFanoutRow]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreGroupFanoutRow.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCoreIdentifiedRoute: FfiConverterRustBuffer {
     typealias SwiftType = [CoreIdentifiedRoute]
 
@@ -9695,19 +9862,22 @@ public func computeRecipientHint(recipientUserId: Data, timestampMs: Int64) -> D
  * always dedupes as Seen): that relay copy exists *for the recipient*,
  * and deleting it would silently drop their only remaining way to fetch
  * the message.
- * - `chat_id != sender_user_id` -> a GROUP row -> NOT ackable. The family
- * shares one relay mailbox per family token, and a group envelope on it
- * is a single copy that every member fetches. We consumed *our* read of
- * it, but other members -- in particular one with internet-only
- * connectivity and no BLE path to the rest of the family -- still need
- * the relay copy; acking here would delete their message permanently.
- * For group envelopes this device is only ONE of several endpoint
- * consumers, never "the" consumer, so the invariant forbids the ack.
- * (The pre-existing CONSUMED-path ack in
- * [`MessageStore::core_relay_ack_ids_with_consumed`] already acks a
- * group envelope on first relay fetch -- DTN_TODOS.md N1 -- which has
- * the same shared-mailbox problem; that is a separate, deliberately
- * out-of-scope issue this check does not widen.)
+ * - `chat_id != sender_user_id` -> a GROUP row -> NOT ackable. This SEEN
+ * copy means we already durably consumed a copy of this exact `msg_id`
+ * as a group message -- almost always over BLE first, with the relay
+ * fetch re-presenting the SAME `msg_id` a moment later and deduping to
+ * SEEN. The relay copy in that shape is always the per-member fan-out row
+ * this device's own self-hint addresses (`specs/group-relay-durability.md`
+ * §4.3), which SHOULD be acked -- but it already was, on the ORIGINAL
+ * fetch that produced the CONSUMED disposition and the `messages` row
+ * this function is now looking up; there is no second ack to grant here.
+ * Left `false` for the same "when in doubt, don't ack" reason as the
+ * other un-ackable shapes above: this function has no way to tell a
+ * fan-out row's SEEN re-presentation (already acked once, nothing left
+ * to do) apart from a legacy shared group-hint row's SEEN
+ * re-presentation (must never be acked -- other members still need it,
+ * per [`MessageStore::core_relay_ack_ids_with_consumed`]'s legacy-row
+ * rule), and returning `false` is safe for both.
  * - Otherwise (row exists, sender is someone else, `chat_id ==
  * sender_user_id`) -> a 1:1 message sealed to us that we stored -> this
  * device was the envelope's sole true endpoint consumer -> ackable.
@@ -9728,6 +9898,67 @@ public func coreFormatLanEndpoint(endpoint: CoreLanEndpoint) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_format_lan_endpoint(
         FfiConverterTypeCoreLanEndpoint.lower(endpoint),$0
+    )
+})
+}
+/**
+ * Build the per-member relay-post row set for a group-addressed envelope
+ * (`specs/group-relay-durability.md` §4.1/§4.2, approved 2026-07-17 in §7):
+ * one row per entry of `member_user_ids`, **including the uploader itself**
+ * (§7.2 -- multi-device readiness; today's cost is one small row the
+ * uploader consumes and acks on its own next poll pass). Each row gets:
+ *
+ * - `msg_id`: [`fanout_msg_id`] of `(original_msg_id, member_user_id)` --
+ * distinct per member, deterministic across repeated calls so retries
+ * (author re-upload, a different member's mule) converge on the same N
+ * ids and dedupe server-side with no relay change.
+ * - `recipient_hint`: [`compute_recipient_hint`] of `(member_user_id,
+ * envelope_timestamp_ms)` -- the same daily-rotating hint 1:1 mail
+ * already uses, so the member finds this row with the self-hints they
+ * already poll/subscribe with. `envelope_timestamp_ms` should be the
+ * ORIGINAL envelope's authored timestamp (not "now"), mirroring how a
+ * 1:1 [`OutboundEnvelope`]'s own `recipient_hint` is computed at
+ * authoring time -- callers with only an envelope's `expiry` in hand
+ * (e.g. a [`CarriedEnvelope`], which carries no `timestamp` field on the
+ * wire) can reconstruct it as `expiry - DEFAULT_EXPIRY_MS`, since every
+ * envelope this codebase authors uses [`crate::default_expiry`].
+ * - `hop_ttl`, `expiry`, `sealed`: copied from the original envelope
+ * unchanged -- fan-out changes addressing only, never crypto or hop
+ * budget.
+ *
+ * Caller supplies `member_user_ids` (typically [`crate::Group::member_user_ids`],
+ * which is already deduplicated by [`crate::create_group`]/[`crate::rotate_group`]);
+ * this function does not deduplicate or otherwise validate the list, and
+ * does not touch the store -- it is a pure function so it stays trivially
+ * unit-testable and re-callable without side effects.
+ */
+public func coreGroupFanoutRows(originalMsgId: Data, memberUserIds: [Data], hopTtl: UInt8, expiry: Int64, sealed: Data, envelopeTimestampMs: Int64) -> [CoreGroupFanoutRow] {
+    return try!  FfiConverterSequenceTypeCoreGroupFanoutRow.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_group_fanout_rows(
+        FfiConverterData.lower(originalMsgId),
+        FfiConverterSequenceData.lower(memberUserIds),
+        FfiConverterUInt8.lower(hopTtl),
+        FfiConverterInt64.lower(expiry),
+        FfiConverterData.lower(sealed),
+        FfiConverterInt64.lower(envelopeTimestampMs),$0
+    )
+})
+}
+/**
+ * [`core_group_fanout_rows`] for a carried envelope, which has no
+ * `timestamp` field on the wire: reconstructs the authoring timestamp as
+ * `expiry - DEFAULT_EXPIRY_MS`, valid because every envelope this codebase
+ * authors uses [`crate::default_expiry`] (see the sibling's doc). Kept in
+ * core so neither shell hand-rolls the reconstruction.
+ */
+public func coreGroupFanoutRowsForCarried(originalMsgId: Data, memberUserIds: [Data], hopTtl: UInt8, expiry: Int64, sealed: Data) -> [CoreGroupFanoutRow] {
+    return try!  FfiConverterSequenceTypeCoreGroupFanoutRow.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_group_fanout_rows_for_carried(
+        FfiConverterData.lower(originalMsgId),
+        FfiConverterSequenceData.lower(memberUserIds),
+        FfiConverterUInt8.lower(hopTtl),
+        FfiConverterInt64.lower(expiry),
+        FfiConverterData.lower(sealed),$0
     )
 })
 }
@@ -9760,6 +9991,28 @@ public func coreInboundGate(isNewMsgId: Bool, expiryMs: Int64, nowMs: Int64) -> 
     uniffi_cruisemesh_core_fn_func_core_inbound_gate(
         FfiConverterBool.lower(isNewMsgId),
         FfiConverterInt64.lower(expiryMs),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * No-gossip-reinjection classifier for relay-sourced group mail
+ * (`specs/group-relay-durability.md` §4.3): returns whether
+ * `recipient_hint` is one of THIS device's own recent-day hints -- i.e.
+ * the fetched row is a per-member fan-out copy addressed to us. A group
+ * message consumed from such a row must NOT be re-flooded into gossip or
+ * force-carried: the relay fan-out already addresses every member durably,
+ * and re-injecting it under the fan-out `msg_id` would give the same
+ * content a second flood identity (the mesh flood of the ORIGINAL id still
+ * happens from the author's BLE side, unchanged). Legacy group-hint rows
+ * return `false` here and keep today's flood+carry behavior. Same
+ * [`CARRY_HINT_DAY_WINDOW_DAYS`] window as every other hint check.
+ */
+public func coreIsOwnFanoutHint(recipientHint: Data, ownUserId: Data, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_is_own_fanout_hint(
+        FfiConverterData.lower(recipientHint),
+        FfiConverterData.lower(ownUserId),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -9856,6 +10109,17 @@ public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
  * [`MessageStore::core_relay_ack_ids_with_consumed`] for the narrow,
  * independently store-verified case where a Seen copy is still safe to
  * ack -- this function alone can't tell, since it has no store access.
+ *
+ * A `Consumed` group envelope was historically ackable here even though
+ * this device is only ONE of several endpoint consumers of the family's
+ * shared relay mailbox (DTN_TODOS.md N1). That hole is now CLOSED, but not
+ * by this function: per-member fan-out (`specs/group-relay-durability.md`)
+ * makes a `Consumed` group fetch correct to ack again, by giving every
+ * member their own row -- and [`MessageStore::core_relay_ack_ids_with_consumed`]
+ * additionally withholds the ack for the narrow legacy case (a `Consumed`
+ * fetch under a group's own shared hint, not a per-member fan-out hint).
+ * This function alone has no store access and so cannot make that
+ * distinction; it is unchanged.
  *
  * Safety invariant (applies to this function and
  * [`consumed_seen_is_ackable`] alike): never ack a relay copy unless THIS
@@ -10248,6 +10512,37 @@ public func encodeTransportProbe(nonce: UInt64, response: Bool) -> Data {
 })
 }
 /**
+ * Deterministic per-member relay-post id for group fan-out
+ * (`specs/group-relay-durability.md` §4.1, DTN_TODOS.md N1):
+ * `BLAKE2b-16(prologue || original_msg_id || member_user_id)`, where
+ * `prologue` is the fixed ASCII string `"cruisemesh group fanout v1"`. Two
+ * properties matter here, mirroring why [`compute_recipient_hint`] is
+ * keyed the way it is:
+ *
+ * - **Distinct per member**: hashing in `member_user_id` gives every
+ * member of the group their own relay row id for the same logical
+ * message, so the shared-mailbox dedupe key `(family_token, msg_id)`
+ * naturally becomes one row per member instead of one row for everyone.
+ * - **Deterministic across calls**: the same `(original_msg_id,
+ * member_user_id)` pair always yields the same id, so re-uploading the
+ * same group message (the author retrying, or a different member's
+ * phone muling it) re-derives the identical N ids and the relay's
+ * existing `ON CONFLICT` dedupe on `msg_id` absorbs the retry with no
+ * server-side change.
+ *
+ * The versioned prologue is a domain separator: it keeps this id space
+ * disjoint from [`generate_msg_id`]'s random 16-byte ids and from any
+ * future derived-id scheme that might hash different fields together.
+ */
+public func fanoutMsgId(originalMsgId: Data, memberUserId: Data) -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_fanout_msg_id(
+        FfiConverterData.lower(originalMsgId),
+        FfiConverterData.lower(memberUserId),$0
+    )
+})
+}
+/**
  * Short verbal-verification phrase for a UserID (Signal-safety-number style),
  * not a security boundary by itself — a convenience for "read this out loud".
  */
@@ -10598,16 +10893,25 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_compute_recipient_hint() != 63461) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable() != 47254) {
+    if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable() != 8907) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_format_lan_endpoint() != 59419) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_group_fanout_rows() != 44083) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_group_fanout_rows_for_carried() != 44863) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_hello_identity_matches() != 7419) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_inbound_gate() != 7195) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_is_own_fanout_hint() != 52117) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_is_visible_chat_kind() != 47018) {
@@ -10637,7 +10941,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 13964) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 173) {
+    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 1610) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_subnet_24_hosts() != 3135) {
@@ -10752,6 +11056,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_transport_probe() != 39450) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_fanout_msg_id() != 44547) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_fingerprint_words() != 59656) {
@@ -10994,7 +11301,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 56337) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 54880) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 62249) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 22558) {
