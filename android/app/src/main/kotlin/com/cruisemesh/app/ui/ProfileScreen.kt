@@ -1,8 +1,6 @@
 package com.cruisemesh.app.ui
 
 import android.Manifest
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,7 +9,6 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -24,7 +21,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -32,14 +28,12 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -51,23 +45,20 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import com.cruisemesh.app.debug.DebugFileLog
+import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
-import com.cruisemesh.app.friending.FriendsOfFriendsStore
-import com.cruisemesh.app.friending.encodeQrBitmap
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.mesh.MeshStartupPreferences
-import com.cruisemesh.app.mesh.LanTransportDiagnostics
-import com.cruisemesh.app.mesh.lanEndpointLink
-import com.cruisemesh.app.mesh.parseLanManualEndpoint
 import com.cruisemesh.app.relay.RelayConfigStore
-import android.widget.Toast
-import uniffi.cruisemesh_core.lanDefaultTcpPort
 
 /** Hosted privacy policy (Play Console + in-app link). */
 const val PRIVACY_POLICY_URL = "https://cruisemesh.app/privacy"
 
+/**
+ * Family-facing settings surface. Technical relay, LAN, and diagnostic controls
+ * deliberately live in [AdvancedSettingsScreen].
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(
@@ -78,9 +69,10 @@ fun ProfileScreen(
     onStartMesh: (() -> Unit)?,
     onShowMyQr: () -> Unit,
     onBackUp: () -> Unit,
+    onOpenAdvanced: () -> Unit,
     onProfileChanged: (Long) -> Unit = {},
     onFriendsOfFriendsChanged: (Boolean) -> Unit = {},
-    onBack: () -> Unit
+    onBack: () -> Unit,
 ) {
     val context = LocalContext.current
     var displayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
@@ -89,12 +81,18 @@ fun ProfileScreen(
     var shareOnline by remember { mutableStateOf(RelayConfigStore.shareOnline(context)) }
     var friendsOfFriends by remember { mutableStateOf(FriendsOfFriendsStore.isEnabled(context)) }
     var startAutomatically by remember { mutableStateOf(MeshStartupPreferences.isAutoStartEnabled(context)) }
-    var friendLanAddress by remember { mutableStateOf("") }
-    var showLanQrEndpoint by remember { mutableStateOf<com.cruisemesh.app.mesh.LanManualEndpoint?>(null) }
-    val lanStatus by LanTransportDiagnostics.state.collectAsState()
+
     fun bumpAndSync() {
         onProfileChanged(ProfileStore.bumpOwnAvatarEpoch(context))
     }
+
+    fun finish() {
+        if (displayName.trim() != initialDisplayName.trim()) {
+            bumpAndSync()
+        }
+        onBack()
+    }
+
     val pickPhotoLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia(),
     ) { uri ->
@@ -135,17 +133,12 @@ fun ProfileScreen(
             TopAppBar(
                 title = { Text("Profile & settings") },
                 navigationIcon = {
-                    IconButton(onClick = {
-                        if (displayName.trim() != initialDisplayName.trim()) {
-                            bumpAndSync()
-                        }
-                        onBack()
-                    }) {
+                    IconButton(onClick = ::finish) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
-                }
+                },
             )
-        }
+        },
     ) { innerPadding ->
         Column(
             modifier = Modifier
@@ -153,52 +146,77 @@ fun ProfileScreen(
                 .padding(innerPadding)
                 .verticalScroll(rememberScrollState())
                 .padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            LocalProfileEditor(
-                userId = profileUserId,
-                displayId = displayId,
-                displayName = displayName,
-                avatarPath = avatarPath,
-                onDisplayNameChange = {
-                    displayName = it
-                    ProfileStore.saveDisplayName(context, it)
-                },
-                onTakePhoto = {
-                    val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
-                        PackageManager.PERMISSION_GRANTED
-                    if (granted) {
-                        val uri = createCameraCaptureUri(context)
-                        pendingCameraUri = uri
-                        takePhotoLauncher.launch(uri)
-                    } else {
-                        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
-                    }
-                },
-                onChoosePhoto = {
-                    pickPhotoLauncher.launch(
-                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
-                    )
-                },
-                onRemovePhoto = {
-                    ProfilePhotoStore.clear(context)
-                    avatarPath = null
-                    bumpAndSync()
-                },
-                helperText = "Your profile photo is shared with friends.",
-            )
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            Button(onClick = onShowMyQr, modifier = Modifier.fillMaxWidth()) {
-                Text("Show my friend card")
+            ProfileSection(title = "You") {
+                LocalProfileEditor(
+                    userId = profileUserId,
+                    displayId = displayId,
+                    displayName = displayName,
+                    avatarPath = avatarPath,
+                    onDisplayNameChange = {
+                        displayName = it
+                        ProfileStore.saveDisplayName(context, it)
+                    },
+                    onTakePhoto = {
+                        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                            PackageManager.PERMISSION_GRANTED
+                        if (granted) {
+                            val uri = createCameraCaptureUri(context)
+                            pendingCameraUri = uri
+                            takePhotoLauncher.launch(uri)
+                        } else {
+                            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                        }
+                    },
+                    onChoosePhoto = {
+                        pickPhotoLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                        )
+                    },
+                    onRemovePhoto = {
+                        ProfilePhotoStore.clear(context)
+                        avatarPath = null
+                        bumpAndSync()
+                    },
+                    helperText = "Your profile photo is shared with friends.",
+                )
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(16.dp))
 
-            ProfileSection(title = "Account backup") {
+            ProfileSection(title = "My friend card") {
                 Text(
-                    "Save your identity and messages to an encrypted file so you can restore them if you reinstall or switch phones. Restore is offered on first launch.",
+                    displayId,
+                    style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Text(
+                    fingerprint.joinToString(" "),
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                Text(
+                    "Read these aloud to verify.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Button(
+                    onClick = onShowMyQr,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 12.dp),
+                ) {
+                    Text("Show my friend card")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            ProfileSection(title = "Backup") {
+                Text(
+                    "Save your identity and messages to an encrypted file so you can restore them if you reinstall or switch phones.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 4.dp),
@@ -215,265 +233,68 @@ fun ProfileScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            ProfileSection(title = "Device identity") {
-                Text(
-                    displayId,
-                    style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
-                    modifier = Modifier.padding(top = 4.dp)
-                )
-
-                Text(
-                    fingerprint.joinToString(" "),
-                    style = MaterialTheme.typography.bodyLarge,
-                    modifier = Modifier.padding(top = 8.dp)
-                )
-
-                Text(
-                    "Read these aloud to verify.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 4.dp)
-                )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            ProfileSection(title = "Mesh status") {
+            ProfileSection(title = "Mesh") {
                 Text(meshStatus, modifier = Modifier.padding(top = 4.dp))
-
                 if (onStartMesh != null) {
-                    Button(onClick = onStartMesh, modifier = Modifier.padding(top = 16.dp)) {
+                    Button(
+                        onClick = onStartMesh,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 12.dp),
+                    ) {
                         Text("Start mesh")
                     }
                 }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            ProfileSection(title = "Local Wi-Fi (experimental)") {
-                Text(
-                    lanStatus.state,
-                    modifier = Modifier.padding(top = 4.dp),
-                )
-                lanStatus.localEndpoint?.let { endpoint ->
-                    Text(
-                        "This phone: $endpoint",
-                        style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
-                        modifier = Modifier.padding(top = 8.dp),
-                    )
-                    TextButton(
-                        onClick = {
-                            val clipboard =
-                                context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            clipboard.setPrimaryClip(
-                                ClipData.newPlainText("CruiseMesh LAN address", endpoint),
-                            )
-                            Toast.makeText(context, "Local address copied", Toast.LENGTH_SHORT).show()
-                        },
-                    ) {
-                        Text("Copy this phone's address")
-                    }
-                    TextButton(
-                        onClick = {
-                            showLanQrEndpoint = parseLanManualEndpoint(
-                                endpoint,
-                                lanDefaultTcpPort().toInt(),
-                            )
-                        },
-                    ) {
-                        Text("Show address QR")
-                    }
-                }
-                if (lanStatus.activePeerNames.isNotEmpty()) {
-                    Text(
-                        "Secure link: ${lanStatus.activePeerNames.joinToString()}",
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(top = 4.dp),
-                    )
-                    Button(
-                        onClick = {
-                            val error = LanTransportDiagnostics.requestConnectionTest()
-                            if (error != null) {
-                                Toast.makeText(context, error, Toast.LENGTH_LONG).show()
-                            }
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 8.dp),
-                    ) {
-                        Text("Test encrypted LAN link")
-                    }
-                }
-                lanStatus.probeStatus?.let {
-                    Text(
-                        it,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(top = 4.dp),
-                    )
-                }
-                if (lanStatus.sentFrames > 0 || lanStatus.receivedFrames > 0) {
-                    Text(
-                        "LAN frames: ${lanStatus.sentFrames} sent · ${lanStatus.receivedFrames} received",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 4.dp),
-                    )
-                }
-                lanStatus.lastPeerEndpoint?.let {
-                    Text(
-                        "Last peer: $it",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 4.dp),
-                    )
-                }
-                lanStatus.lastError?.let {
-                    Text(
-                        it,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.padding(top = 4.dp),
-                    )
-                }
-                OutlinedTextField(
-                    value = friendLanAddress,
-                    onValueChange = { friendLanAddress = it },
-                    label = { Text("Friend IP address") },
-                    placeholder = { Text("10.0.0.42:45892") },
-                    supportingText = { Text("The port is optional.") },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 8.dp),
-                )
-                Button(
-                    onClick = {
-                        val error = LanTransportDiagnostics.requestManualConnection(
-                            friendLanAddress,
-                            lanDefaultTcpPort().toInt(),
-                        )
-                        if (error != null) {
-                            Toast.makeText(context, error, Toast.LENGTH_LONG).show()
-                        }
+                SettingsToggleRow(
+                    title = "Start automatically",
+                    detail = "Run the mesh after this phone restarts.",
+                    checked = startAutomatically,
+                    onCheckedChange = {
+                        startAutomatically = it
+                        MeshStartupPreferences.setAutoStartEnabled(context, it)
                     },
-                    enabled = friendLanAddress.isNotBlank(),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("Connect securely")
-                }
-                Text(
-                    "Manual connection only opens a TCP path. The other phone must already be an accepted friend and pass CruiseMesh's encrypted identity check.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 4.dp),
                 )
-                Button(
-                    onClick = {
-                        val error = LanTransportDiagnostics.requestSubnetScan()
-                        if (error != null) {
-                            Toast.makeText(context, error, Toast.LENGTH_LONG).show()
-                        }
+                SettingsToggleRow(
+                    title = "Share when I'm online",
+                    detail = "Help family messages move through the relay when this phone has internet.",
+                    checked = shareOnline,
+                    onCheckedChange = {
+                        shareOnline = it
+                        RelayConfigStore.setShareOnline(context, it)
                     },
-                    enabled = lanStatus.scanTotal == null,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 8.dp),
-                ) {
-                    Text("Search this /24 network")
-                }
-                if (lanStatus.scanTotal != null) {
-                    Text(
-                        "Checked ${lanStatus.scanProgress ?: 0} of ${lanStatus.scanTotal} addresses",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 4.dp),
-                    )
-                }
-                Text(
-                    "Subnet search is user-triggered, probes only TCP 45892 with low concurrency, and never expands to a /16.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 4.dp),
                 )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            ProfileSection(title = "Startup") {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Start CruiseMesh automatically")
-                        Text(
-                            "Run the mesh after this phone restarts.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(top = 2.dp),
-                        )
-                    }
-                    Switch(
-                        checked = startAutomatically,
-                        onCheckedChange = {
-                            startAutomatically = it
-                            MeshStartupPreferences.setAutoStartEnabled(context, it)
-                        },
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            ProfileSection(title = "Relay presence") {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "Share when I'm online",
-                        modifier = Modifier.weight(1f),
-                    )
-                    Switch(
-                        checked = shareOnline,
-                        onCheckedChange = {
-                            shareOnline = it
-                            RelayConfigStore.setShareOnline(context, it)
-                        },
-                    )
-                }
             }
 
             Spacer(modifier = Modifier.height(16.dp))
 
             ProfileSection(title = "Privacy") {
-                Row(
+                SettingsToggleRow(
+                    title = "Friends of friends",
+                    detail = "Let friends introduce you to people they know. Your messages and phone contacts are never shared.",
+                    checked = friendsOfFriends,
+                    onCheckedChange = {
+                        friendsOfFriends = it
+                        onFriendsOfFriendsChanged(it)
+                    },
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            ProfileSection(title = "Advanced") {
+                Text(
+                    "Relay setup, local Wi-Fi tools, and diagnostics.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Button(
+                    onClick = onOpenAdvanced,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                        .padding(top = 12.dp),
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Friends of friends")
-                        Text(
-                            "Let friends introduce you to people they know. Your messages and phone contacts are never shared.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(top = 4.dp),
-                        )
-                    }
-                    Switch(
-                        checked = friendsOfFriends,
-                        onCheckedChange = {
-                            friendsOfFriends = it
-                            onFriendsOfFriendsChanged(it)
-                        },
-                    )
+                    Text("Open advanced settings")
                 }
             }
 
@@ -486,81 +307,54 @@ fun ProfileScreen(
                             Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL)),
                         )
                     },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 4.dp),
+                    modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text("Privacy policy")
                 }
             }
-
-            if (DebugFileLog.isEnabled(context)) {
-                Spacer(modifier = Modifier.height(16.dp))
-
-                ProfileSection(title = "Debug") {
-                    Text(
-                        "On-device log capture is on. Share it to send diagnostics.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 4.dp),
-                    )
-                    Button(
-                        onClick = {
-                            val intent = DebugFileLog.shareIntent(context)
-                            if (intent != null) {
-                                context.startActivity(Intent.createChooser(intent, "Share debug log"))
-                            } else {
-                                Toast.makeText(context, "No log captured yet", Toast.LENGTH_SHORT).show()
-                            }
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 8.dp),
-                    ) {
-                        Text("Share debug log")
-                    }
-                }
-            }
         }
     }
+}
 
-    showLanQrEndpoint?.let { endpoint ->
-        val link = remember(endpoint) { lanEndpointLink(endpoint) }
-        val qr = remember(link) { encodeQrBitmap(link) }
-        AlertDialog(
-            onDismissRequest = { showLanQrEndpoint = null },
-            title = { Text("CruiseMesh LAN address") },
-            text = {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Image(
-                        bitmap = qr,
-                        contentDescription = "CruiseMesh LAN address QR code",
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    Text(
-                        "Scan with the other phone's camera to open CruiseMesh and connect securely.",
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(top = 8.dp),
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showLanQrEndpoint = null }) {
-                    Text("Done")
-                }
-            },
+@Composable
+private fun SettingsToggleRow(
+    title: String,
+    detail: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title)
+            Text(
+                detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
         )
     }
 }
 
 @Composable
-private fun ProfileSection(
+internal fun ProfileSection(
     title: String,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.46f)),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.46f),
+        ),
     ) {
         Column(
             modifier = Modifier
@@ -577,7 +371,7 @@ private fun ProfileSection(
 @Preview(showBackground = true)
 @Preview(
     showBackground = true,
-    name = "Profile Dark",
+    name = "Profile dark",
     uiMode = Configuration.UI_MODE_NIGHT_YES,
 )
 @Composable
@@ -591,7 +385,8 @@ fun ProfileScreenPreview() {
             onStartMesh = {},
             onShowMyQr = {},
             onBackUp = {},
-            onBack = {}
+            onOpenAdvanced = {},
+            onBack = {},
         )
     }
 }
