@@ -55,7 +55,7 @@ targets:
       properties:
         CFBundleDisplayName: CruiseMesh
         CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "1784229068"
+        CFBundleVersion: "1784327880"
         ITSAppUsesNonExemptEncryption: false
         UILaunchScreen: {}
         UIBackgroundModes:
