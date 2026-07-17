@@ -1,7 +1,6 @@
 package com.cruisemesh.app.ui
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -69,12 +68,17 @@ fun ProfileScreen(
     onStartMesh: (() -> Unit)?,
     onShowMyQr: () -> Unit,
     onBackUp: () -> Unit,
-    onOpenAdvanced: () -> Unit,
     onProfileChanged: (Long) -> Unit = {},
     onFriendsOfFriendsChanged: (Boolean) -> Unit = {},
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
+    var showAdvanced by remember { mutableStateOf(false) }
+    if (showAdvanced) {
+        AdvancedSettingsScreen(onBack = { showAdvanced = false })
+        return
+    }
+
     var displayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     val initialDisplayName = remember { ProfileStore.loadDisplayName(context) }
     var avatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
@@ -289,7 +293,7 @@ fun ProfileScreen(
                     modifier = Modifier.padding(top = 4.dp),
                 )
                 Button(
-                    onClick = onOpenAdvanced,
+                    onClick = { showAdvanced = true },
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 12.dp),
@@ -385,7 +389,6 @@ fun ProfileScreenPreview() {
             onStartMesh = {},
             onShowMyQr = {},
             onBackUp = {},
-            onOpenAdvanced = {},
             onBack = {},
         )
     }
