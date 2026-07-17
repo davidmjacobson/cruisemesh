@@ -1626,6 +1626,17 @@ class MeshService : Service() {
      * check explained in this class's KDoc, kind dispatch) is unchanged --
      * see [deliverOpenedEnvelope].
      *
+     * DTN D4 (seen-set poisoning ordering): [GossipState.seenIds] is checked
+     * with the non-mutating [uniffi.cruisemesh_core.SeenIds.contains], never
+     * [uniffi.cruisemesh_core.SeenIds.checkAndRecord], and only recorded once
+     * this envelope reaches a **terminal handled state** -- consumed,
+     * carried, or expired-drop -- at each `return` below. Invariant: an
+     * envelope whose durable handling failed must be re-presentable; an
+     * envelope that was handled (even by deliberate drop) must be deduped.
+     * Before this, `checkAndRecord` ran up front, so a later store failure
+     * (e.g. disk-full out of [carryForeignEnvelope]) permanently poisoned the
+     * `msg_id` even though it was never actually carried or delivered.
+     *
      * [processInboundEnvelope] now returns a [CoreInboundDisposition] so
      * [pollRelayMailbox] (the relay path) can decide whether it's safe to ack
      * the envelope; this BLE path has no such concept (a link frame isn't
@@ -1673,9 +1684,13 @@ class MeshService : Service() {
         identity: Identity,
     ): CoreInboundDisposition {
         val sourceLabel = sourceAddress ?: "relay"
+        // DTN D4: a non-mutating check, not checkAndRecord -- see the KDoc
+        // above. `record` is only called once handling below actually
+        // reaches a terminal state, so a failure partway through leaves this
+        // msg_id re-presentable on the next copy instead of poisoned forever.
         when (
             coreInboundGate(
-                GossipState.seenIds.checkAndRecord(envelope.msgId),
+                !GossipState.seenIds.contains(envelope.msgId),
                 envelope.expiry,
                 System.currentTimeMillis(),
             )
@@ -1683,6 +1698,8 @@ class MeshService : Service() {
             CoreInboundGate.SEEN -> return CoreInboundDisposition.SEEN
             CoreInboundGate.EXPIRED -> {
                 Log.i(TAG, "Dropping expired envelope from $sourceLabel (expiry=${envelope.expiry})")
+                // A deliberate drop is still a terminal handled state.
+                GossipState.seenIds.record(envelope.msgId)
                 return CoreInboundDisposition.EXPIRED
             }
             CoreInboundGate.DISPATCH -> Unit
@@ -1713,6 +1730,12 @@ class MeshService : Service() {
                 } else {
                     carryForeignEnvelope(envelope, forceFamily = true)
                 }
+                // DTN D4: [deliverOpenedGroupEnvelope] durably stores our own
+                // copy and throws (rather than returning) on a store
+                // failure, so reaching this line means we already have it --
+                // record regardless of whether the best-effort mule copy for
+                // absent members above was stored.
+                GossipState.seenIds.record(envelope.msgId)
                 return CoreInboundDisposition.CONSUMED
             }
             // Not for us (or unopenable) -> foreign traffic. Two jobs, both
@@ -1720,15 +1743,30 @@ class MeshService : Service() {
             // right now, and carry it so we can hand it to its recipient the
             // next time we meet them, even if that's hours from now.
             relayForeignEnvelope(sourceAddress, envelope)
-            if (sourceAddress == null) {
+            val carried = if (sourceAddress == null) {
                 carryRelayEnvelope(envelope)
             } else {
                 carryForeignEnvelope(envelope)
+            }
+            // DTN D4: only record once the durable carry actually succeeded.
+            // [carryForeignEnvelope]/[carryRelayEnvelope] catch their own
+            // store exceptions and report failure via their Boolean return
+            // instead of throwing, so a disk-full failure here leaves this
+            // msg_id unrecorded: the next copy of this envelope on any link
+            // re-gates as Dispatch and gets another chance to carry it,
+            // instead of being silently dropped as Seen for the rest of the
+            // process lifetime.
+            if (carried) {
+                GossipState.seenIds.record(envelope.msgId)
             }
             return CoreInboundDisposition.CARRIED
         }
         val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
         deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
+        // DTN D4: [deliverOpenedEnvelope] does not swallow store exceptions
+        // (see [handleIncomingChatMessage] etc.), so reaching this line means
+        // the message was durably stored -- safe, and required, to record.
+        GossipState.seenIds.record(envelope.msgId)
         return CoreInboundDisposition.CONSUMED
     }
 
@@ -1779,10 +1817,16 @@ class MeshService : Service() {
      * Idempotent on `msg_id`, so re-seeing an envelope we already carry is a
      * no-op. Reached only after [handleEnvelope]'s dedupe + expiry gates, so
      * we never carry a stale duplicate or an already-expired envelope.
+     *
+     * Returns `true` if the store operation completed (whether it newly
+     * queued the envelope or found it already carried) and `false` if the
+     * store call itself failed. DTN D4: [processInboundEnvelope] uses this
+     * return value to decide whether it's safe to mark the envelope's
+     * `msg_id` seen -- see its KDoc.
      */
-    private fun carryForeignEnvelope(envelope: Frame.Envelope, forceFamily: Boolean = false) {
+    private fun carryForeignEnvelope(envelope: Frame.Envelope, forceFamily: Boolean = false): Boolean {
         val now = System.currentTimeMillis()
-        try {
+        return try {
             val isFamily = forceFamily || hintMatchesKnownTarget(envelope.recipientHint, now)
             val stored = store.enqueueCarriedEnvelope(
                 CarriedEnvelope(
@@ -1802,8 +1846,10 @@ class MeshService : Service() {
                     requestRelaySync("family carry queued")
                 }
             }
+            true
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to enqueue carried envelope: ${e.message}")
+            false
         }
     }
 
@@ -1819,10 +1865,14 @@ class MeshService : Service() {
      * side too (`from_relay = 1` is excluded from the upload query), so this
      * is belt-and-suspenders, but skipping the call here avoids scheduling a
      * pointless relay-sync pass. Idempotent on `msg_id` like its sibling.
+     *
+     * Returns `true`/`false` on store success/failure -- see
+     * [carryForeignEnvelope]'s KDoc for why [processInboundEnvelope] needs
+     * this (DTN D4).
      */
-    private fun carryRelayEnvelope(envelope: Frame.Envelope) {
+    private fun carryRelayEnvelope(envelope: Frame.Envelope): Boolean {
         val now = System.currentTimeMillis()
-        try {
+        return try {
             val stored = store.enqueueRelayCarriedEnvelope(
                 CarriedEnvelope(
                     msgId = envelope.msgId,
@@ -1836,8 +1886,10 @@ class MeshService : Service() {
             if (stored) {
                 Log.i(TAG, "Carrying relay-sourced envelope (proxy) for later BLE delivery")
             }
+            true
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to enqueue relay-carried envelope: ${e.message}")
+            false
         }
     }
 
@@ -1935,8 +1987,24 @@ class MeshService : Service() {
      * carrier's copy and stops here. The `msg_id`, `expiry`, `recipient_hint`,
      * and sealed bytes are all preserved verbatim -- only `hop_ttl` changes --
      * so every carrier along the way computes the same dedupe key. The
-     * arriving link is excluded from the flood to avoid the trivial echo; the
-     * seen-ID set (already updated by [handleEnvelope]) stops longer loops.
+     * arriving link is excluded from the flood to avoid the trivial echo;
+     * the mesh's other seen-ID sets stop longer loops once the recipients
+     * record this `msg_id` themselves.
+     *
+     * DTN D4 loop-hazard note: since [processInboundEnvelope] moved to
+     * check-then-record, [GossipState.seenIds] is *not yet* updated for this
+     * `msg_id` at the moment this call happens (it's recorded after this
+     * function returns, once the whole terminal branch succeeds -- see
+     * [processInboundEnvelope]'s KDoc). That's still safe against
+     * self-re-ingestion: the arriving link is excluded from the fanout above
+     * (so this node can't hand the relayed frame straight back to itself),
+     * and [processInboundEnvelope] runs synchronously per received frame, so
+     * there is no way for this same `msg_id` to re-enter [processInboundEnvelope]
+     * on *this* node before the terminal `record` call a few lines below this
+     * one completes. A frame this node relays could only loop back from a
+     * third node's rebroadcast, which takes at least one more hop and one
+     * more link round-trip -- by then this node's record has long since
+     * happened.
      */
     private fun relayForeignEnvelope(address: String?, envelope: Frame.Envelope) {
         val remainingHops = envelope.hopTtl.toInt()
