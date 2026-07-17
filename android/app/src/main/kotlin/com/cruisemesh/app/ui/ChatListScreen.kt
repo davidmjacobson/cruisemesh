@@ -71,6 +71,8 @@ data class ChatSummary(
     val ownReadThrough: ULong,
     val reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
     val avatarBytes: ByteArray? = null,
+    val draft: String = "",
+    val isMuted: Boolean = false,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -83,6 +85,8 @@ data class ChatSummary(
             ownDeliveredThrough == other.ownDeliveredThrough &&
             ownReadThrough == other.ownReadThrough &&
             reachability == other.reachability &&
+            draft == other.draft &&
+            isMuted == other.isMuted &&
             ((avatarBytes == null && other.avatarBytes == null) ||
                 (avatarBytes != null && other.avatarBytes != null && avatarBytes.contentEquals(other.avatarBytes)))
     }
@@ -98,6 +102,7 @@ fun ChatListScreen(
     ownAvatarPath: String?,
     onChatClick: (ChatSummary) -> Unit,
     onDeleteSummary: (ChatSummary) -> Unit,
+    onMarkRead: (ChatSummary) -> Unit,
     onNewChatClick: () -> Unit,
     onProfileClick: () -> Unit,
     onMeshStatusClick: () -> Unit,
@@ -219,7 +224,7 @@ fun ChatListScreen(
                             )
                         }
 
-                        Box {
+                        Box(modifier = Modifier.animateItem()) {
                             ChatRow(
                                 summary = summary,
                                 ownUserId = ownUserId,
@@ -230,6 +235,15 @@ fun ChatListScreen(
                                 expanded = showRowMenu,
                                 onDismissRequest = { showRowMenu = false },
                             ) {
+                                if (summary.unreadCount > 0) {
+                                    DropdownMenuItem(
+                                        text = { Text("Mark as read") },
+                                        onClick = {
+                                            showRowMenu = false
+                                            onMarkRead(summary)
+                                        },
+                                    )
+                                }
                                 DropdownMenuItem(
                                     text = { Text("Delete") },
                                     onClick = {
@@ -298,6 +312,13 @@ fun ChatRow(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
+                if (summary.isMuted) {
+                    Text(
+                        "🔕",
+                        modifier = Modifier.padding(start = 6.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
                 
                 if (summary.lastMessage != null) {
                     Text(
@@ -313,7 +334,16 @@ fun ChatRow(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                if (summary.lastMessage != null) {
+                if (summary.draft.isNotBlank()) {
+                    Text(
+                        text = "Draft: ${summary.draft}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                } else if (summary.lastMessage != null) {
                     val isOwn = summary.lastMessage.senderUserId.contentEquals(ownUserId)
                     val prefix = if (isOwn) "You: " else ""
                     val content = ChatListLogic.previewText(
@@ -389,6 +419,7 @@ private fun ChatListScreenEmptyPreview() {
             ownAvatarPath = null,
             onChatClick = {},
             onDeleteSummary = {},
+            onMarkRead = {},
             onNewChatClick = {},
             onProfileClick = {},
             onMeshStatusClick = {},
@@ -440,6 +471,7 @@ private fun ChatListScreenPreview() {
             ownAvatarPath = null,
             onChatClick = {},
             onDeleteSummary = {},
+            onMarkRead = {},
             onNewChatClick = {},
             onProfileClick = {},
             onMeshStatusClick = {},

@@ -40,6 +40,19 @@ enum ProfilePhotoStore {
         return encodeWireAvatar(image)
     }
 
+    static func loadBackupBytes() -> Data {
+        (try? Data(contentsOf: avatarURL)) ?? Data()
+    }
+
+    static func restoreBackupBytes(_ data: Data) {
+        guard !data.isEmpty else { clear(); return }
+        try? FileManager.default.createDirectory(
+            at: avatarURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: avatarURL, options: .atomic)
+    }
+
     static func encodeWireAvatar(_ image: UIImage) -> Data {
         let normalized = image.centerCropped(to: wireEdge)
         for quality in [0.85, 0.70, 0.55, 0.40] {

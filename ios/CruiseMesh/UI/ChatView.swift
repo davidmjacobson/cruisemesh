@@ -7,6 +7,8 @@ import UIKit
 struct ChatView: View {
     let contact: Contact
     let identity: Identity
+    @ObservedObject private var connectivity = MeshConnectivityStatus.shared
+    @ObservedObject private var connectivityClock = ConnectivityClock.shared
 
     @Environment(\.dismiss) private var dismiss
     @State private var messages: [StoredMessage] = []
@@ -27,9 +29,22 @@ struct ChatView: View {
     @State private var replyingTo: StoredMessage?
     @State private var replyMetadata: [String: MessageReplyMetadata] = [:]
     @State private var viewedPhoto: ViewedPhoto?
+    @State private var isMuted = false
 
     private let store = AppStore.get()
     private var sender: RealMeshSender { RealMeshSender(store: store, identity: identity) }
+
+    private var reachability: ReachabilityLevel {
+        connectivity.level(for: contact.userId, nowMs: connectivityClock.nowMs)
+    }
+
+    private var reachabilityText: String {
+        ContactReachability.chatHeaderCopy(
+            reachability,
+            peerLastSeenMs: connectivity.contactLastSeen[contact.userId],
+            nowMs: connectivityClock.nowMs
+        )
+    }
 
     private var visible: [StoredMessage] {
         messages.filter { isVisibleChatKind($0.kind) }
@@ -154,15 +169,22 @@ struct ChatView: View {
                                 .fill(Color(uiColor: .secondarySystemBackground))
                         )
 
-                    Button {
-                        sendCurrentDraft()
-                    } label: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 32, weight: .semibold))
+                    if canSend {
+                        Button {
+                            sendCurrentDraft()
+                        } label: {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.system(size: 32, weight: .semibold))
+                        }
+                        .accessibilityLabel("Send")
+                    } else {
+                        HoldToRecordButton(
+                            recorder: voiceRecorder,
+                            onFinished: sendVoice,
+                            onError: { statusMessage = $0 },
+                            onAccessibilityFallback: { showVoice = true }
+                        )
                     }
-                    .disabled(!canSend)
-                    .opacity(canSend ? 1 : 0.36)
-                    .accessibilityLabel("Send")
                 }
             }
             .padding(12)
@@ -181,7 +203,8 @@ struct ChatView: View {
                             userId: contact.userId,
                             name: contact.name,
                             size: 32,
-                            photo: avatarData.flatMap { UIImage(data: $0) }
+                            photo: avatarData.flatMap { UIImage(data: $0) },
+                            reachability: reachability
                         )
                         VStack(alignment: .leading) {
                             Text(ChatListLogic.displayNameOrId(
@@ -189,7 +212,7 @@ struct ChatView: View {
                                 displayId: formatUserId(userId: contact.userId)
                             ))
                             .font(.headline)
-                            Text("Contact details")
+                            Text(reachabilityText)
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -199,6 +222,8 @@ struct ChatView: View {
             }
         }
         .onAppear {
+            draft = DraftStore.load(chatId: contact.userId)
+            isMuted = ChatMuteStore.isMuted(contact.userId)
             ChatVisibility.setVisible(contact.userId)
             MeshController.shared.notifyChatViewed(chatId: contact.userId)
             reload()
@@ -222,6 +247,7 @@ struct ChatView: View {
                 photoItem = nil
             }
         }
+        .onChange(of: draft) { DraftStore.save(chatId: contact.userId, text: $0) }
         .sheet(isPresented: $showCamera) {
             CameraPicker { image in
                 if let jpeg = MediaCompressor.compress(image: image) {
@@ -279,7 +305,23 @@ struct ChatView: View {
             }
         }
         .sheet(isPresented: $showDetails) {
-            ContactDetailsSheet(contact: contact, avatarData: avatarData) {
+            ContactDetailsSheet(
+                contact: contact,
+                avatarData: avatarData,
+                reachability: reachability,
+                connectivityText: ContactReachability.contactDetailsCopy(
+                    reachability,
+                    peerLastSeenMs: connectivity.contactLastSeen[contact.userId],
+                    presenceLastSeenMs: connectivity.presenceLastSeen[contact.userId],
+                    nowMs: connectivityClock.nowMs
+                ),
+                isMuted: isMuted,
+                onMutedChange: {
+                    isMuted = $0
+                    ChatMuteStore.setMuted($0, chatId: contact.userId)
+                    ChatEvents.notifyChatChanged(contact.userId)
+                }
+            ) {
                 showDetails = false
                 confirmDelete = true
             }
@@ -505,6 +547,14 @@ private struct MessageBubbleView: View {
     @State private var showInfo = false
 
     var body: some View {
+        let outboundExpiry = isOwn
+            ? ((try? AppStore.get().outboundMessageExpiry(
+                chatId: message.chatId,
+                senderUserId: message.senderUserId,
+                lamport: message.lamport
+            )) ?? nil)
+            : nil
+
         HStack {
             if isOwn { Spacer(minLength: 40) }
             VStack(alignment: isOwn ? .trailing : .leading, spacing: 4) {
@@ -569,6 +619,14 @@ private struct MessageBubbleView: View {
                     ReactionPillRow(reactions: reactions, isOwn: isOwn, onReact: onReact)
                 }
 
+                if tick == .sent,
+                   let expiry = outboundExpiry,
+                   expiry <= Int64(Date().timeIntervalSince1970 * 1_000) {
+                    Text("Not delivered")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
+
                 if grouping.showTimestamp {
                     Text(timeLabel(message.timestamp))
                         .font(.caption2)
@@ -579,15 +637,23 @@ private struct MessageBubbleView: View {
         }
         .padding(.top, grouping.joinsPrevious ? 1 : 8)
         .padding(.bottom, grouping.joinsNext ? 1 : 4)
-        .alert("Message status", isPresented: $showLegend) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            if let tick { Text(tickLegendText(tick)) }
+        .overlay(alignment: .bottom) {
+            if showLegend, let tick {
+                Text(tickLegendText(tick))
+                    .font(.caption)
+                    .padding(12)
+                    .background(.regularMaterial, in: Capsule())
+                    .shadow(radius: 4)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .task {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        withAnimation { showLegend = false }
+                    }
+            }
         }
-        .alert("Message info", isPresented: $showInfo) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(messageInfoText(
+        .animation(.easeInOut(duration: 0.2), value: showLegend)
+        .sheet(isPresented: $showInfo) {
+            MessageInfoSheet(text: messageInfoText(
                 message: message,
                 isOwn: isOwn,
                 tick: tick,
@@ -595,7 +661,8 @@ private struct MessageBubbleView: View {
                     chatId: message.chatId,
                     senderUserId: message.senderUserId,
                     lamport: message.lamport
-                )
+                ),
+                outboundExpiryMs: outboundExpiry
             ))
         }
     }
@@ -644,7 +711,7 @@ private struct MessageBubbleView: View {
     }
 }
 
-private struct PendingPhotoPreview: View {
+struct PendingPhotoPreview: View {
     let jpeg: Data
     let onRemove: () -> Void
 
@@ -755,18 +822,36 @@ func messageInfoText(
     message: StoredMessage,
     isOwn: Bool,
     tick: TickStatus?,
-    arrival: MessageArrival? = nil
+    arrival: MessageArrival? = nil,
+    outboundExpiryMs: Int64? = nil,
+    nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
 ) -> String {
     let f = DateFormatter()
     f.dateFormat = "MMMM d, yyyy h:mm a"
     f.locale = .current
     let sentAt = f.string(from: Date(timeIntervalSince1970: TimeInterval(message.timestamp) / 1000))
     let direction = isOwn ? "Sent by you" : "Received"
-    let status = tick.map { "\nStatus: \(tickLegendText($0))" } ?? ""
+    let status: String
+    if isOwn, tick == .sent, let expiry = outboundExpiryMs, expiry <= nowMs {
+        status = "\nStatus: Not delivered — expired"
+    } else if isOwn, tick == .sent, let expiry = outboundExpiryMs {
+        status = "\nStatus: Still trying — expires in \(expiryRemainingText(expiry - nowMs))"
+    } else {
+        status = tick.map { "\nStatus: \(tickLegendText($0))" } ?? ""
+    }
     let arrivalLine = arrival.map {
         isOwn ? "\n\(messageDeliveryConfirmationText($0))" : "\n\(messageArrivalText($0))"
     } ?? ""
     return "\(direction)\nTime: \(sentAt)\(status)\(arrivalLine)"
+}
+
+private func expiryRemainingText(_ remainingMs: Int64) -> String {
+    let minutes = (max(0, remainingMs) + 59_999) / 60_000
+    if minutes >= 2 * 24 * 60 { return "\((minutes + 1_439) / 1_440) days" }
+    if minutes >= 24 * 60 { return "1 day" }
+    if minutes >= 120 { return "\((minutes + 59) / 60) hours" }
+    if minutes >= 60 { return "1 hour" }
+    return "\(minutes) minutes"
 }
 
 private func messageRouteText(_ arrival: MessageArrival) -> String {
@@ -804,13 +889,40 @@ private extension StoredMessage {
     }
 }
 
-private struct ViewedPhoto: Identifiable {
+struct ViewedPhoto: Identifiable {
     let id = UUID()
     let jpeg: Data
 }
 
+struct MessageInfoSheet: View {
+    let text: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List(Array(text.split(separator: "\n").enumerated()), id: \.offset) { entry in
+                let line = entry.element
+                let parts = line.split(separator: ":", maxSplits: 1).map(String.init)
+                if parts.count == 2 {
+                    LabeledContent(parts[0], value: parts[1].trimmingCharacters(in: .whitespaces))
+                } else {
+                    Text(String(line))
+                }
+            }
+            .navigationTitle("Message info")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+}
+
 /// Chat photo: keeps native aspect ratio and offers Save via long-press.
-private struct ChatImageView: View {
+struct ChatImageView: View {
     let jpeg: Data
     var canReply = false
     var onReply: () -> Void = {}
@@ -856,7 +968,7 @@ private struct ChatImageView: View {
     }
 }
 
-private struct VoiceMemoPlayerView: View {
+struct VoiceMemoPlayerView: View {
     let blob: Data
     let durationMs: Int32
     @State private var player: AVAudioPlayer?
@@ -894,7 +1006,7 @@ private struct VoiceMemoPlayerView: View {
     }
 }
 
-private struct CameraPicker: UIViewControllerRepresentable {
+struct CameraPicker: UIViewControllerRepresentable {
     var onImage: (UIImage) -> Void
     @Environment(\.dismiss) private var dismiss
 

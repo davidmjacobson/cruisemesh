@@ -118,6 +118,10 @@ final class MeshController: ObservableObject {
                 guard let self, self.isRunning else { return }
                 MeshRouter.onConnected(address: address, transport: .lan)
                 guard MeshRouter.onHello(address: address, userId: userId) else { return }
+                MeshConnectivityStatus.shared.mergeLastSeen(
+                    userId: userId,
+                    seenAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                )
                 let name = (try? self.store.getContact(userId: userId))?.name
                     ?? String(UserIdHex.encode(userId).prefix(8))
                 LanTransportDiagnostics.shared.authenticated(address: address, peerName: name)
@@ -197,6 +201,7 @@ final class MeshController: ObservableObject {
         MeshRouter.unregisterPeripheral()
         MeshRouter.unregisterLan()
         MeshRouter.reset()
+        MeshConnectivityStatus.shared.clear()
         relayTimer?.invalidate()
         relayTimer = nil
         pathMonitor?.cancel()
@@ -480,6 +485,10 @@ final class MeshController: ObservableObject {
             log.warning("Dropping HELLO that conflicts with the authenticated link identity")
             return
         }
+        MeshConnectivityStatus.shared.mergeLastSeen(
+            userId: userId,
+            seenAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
         log.info("HELLO from \(address, privacy: .public) \(UserIdHex.encode(userId), privacy: .public)")
         sendLanEndpointHint(address: address)
         queueCurrentLanEndpoint(to: userId)
@@ -1886,7 +1895,15 @@ final class MeshController: ObservableObject {
     }
 
     private func runRelaySync() {
-        guard isRunning, let identity, let config = RelayConfigStore.load() else { return }
+        guard isRunning, let identity else { return }
+        guard let config = RelayConfigStore.load() else {
+            MeshConnectivityStatus.shared.setRelayHealth(.noConfig)
+            return
+        }
+        guard pathMonitor?.currentPath.status == .satisfied else {
+            MeshConnectivityStatus.shared.setRelayHealth(.noInternet)
+            return
+        }
         if relaySyncInFlight {
             relaySyncPending = true
             return
@@ -2027,6 +2044,41 @@ final class MeshController: ObservableObject {
                 _ = try RelayClient.postCarriedEnvelope(config: config, envelope: env)
             }
 
+            let contacts = try store.listContacts()
+            let presenceHints: (Data, Int64) -> [Data] = { userId, timestamp in
+                (0...3).map { daysAgo in
+                    computeRecipientHint(
+                        recipientUserId: userId,
+                        timestampMs: timestamp - Int64(daysAgo) * MeshDefaults.msPerDay
+                    )
+                }
+            }
+            let announce = RelayConfigStore.shareOnline()
+                ? presenceHints(identity.userId, now)
+                : []
+            let query = Array(Set(contacts.flatMap { presenceHints($0.userId, now) }))
+            if !announce.isEmpty || !query.isEmpty {
+                let contactByHint = Dictionary(uniqueKeysWithValues: contacts.flatMap { contact in
+                    presenceHints(contact.userId, now).map { ($0, contact.userId) }
+                })
+                let page = try RelayClient.syncPresence(
+                    config: config,
+                    announce: announce,
+                    query: query
+                )
+                let localNow = Int64(Date().timeIntervalSince1970 * 1_000)
+                await MainActor.run {
+                    for item in page.presence {
+                        guard let userId = contactByHint[item.hint] else { continue }
+                        let localSeenAt = localNow - max(0, page.nowMs - item.lastSeenMs)
+                        MeshConnectivityStatus.shared.mergePresenceLastSeen(
+                            userId: userId,
+                            seenAtMs: localSeenAt
+                        )
+                    }
+                }
+            }
+
             var hints: [Data] = [computeRecipientHint(
                 recipientUserId: identity.userId,
                 timestampMs: Int64(Date().timeIntervalSince1970 * 1000)
@@ -2092,9 +2144,17 @@ final class MeshController: ObservableObject {
                 afterId = page.nextCursor
                 if page.envelopes.count < Int(MeshDefaults.relayBatchLimit) { break }
             }
+            await MainActor.run {
+                MeshConnectivityStatus.shared.setRelayHealth(.ok(
+                    lastSyncMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                ))
+            }
         } catch {
             let message = error.localizedDescription
             await MainActor.run {
+                MeshConnectivityStatus.shared.setRelayHealth(.failing(
+                    lastAttemptMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                ))
                 log.warning("Relay sync failed: \(message, privacy: .public)")
             }
         }
@@ -2102,6 +2162,7 @@ final class MeshController: ObservableObject {
 
     private func refreshNearby() {
         guard isRunning else { return }
+        MeshConnectivityStatus.shared.refreshNearbyRoutes()
         if pausedForBluetoothAudio {
             MeshRuntimeStatus.shared.markPausedForBluetoothAudio()
         } else {

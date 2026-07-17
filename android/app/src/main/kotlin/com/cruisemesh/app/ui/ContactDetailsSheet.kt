@@ -11,11 +11,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -36,6 +38,8 @@ fun ContactDetailsSheet(
     onDeleteContact: () -> Unit,
     onDismiss: () -> Unit,
     connectivityText: String? = null,
+    isMuted: Boolean = false,
+    onMutedChange: (Boolean) -> Unit = {},
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         ContactDetailsSheetContent(
@@ -43,6 +47,8 @@ fun ContactDetailsSheet(
             avatarBytes = avatarBytes,
             onDeleteContact = onDeleteContact,
             connectivityText = connectivityText,
+            isMuted = isMuted,
+            onMutedChange = onMutedChange,
             modifier = Modifier.padding(bottom = 24.dp),
         )
     }
@@ -55,6 +61,8 @@ fun ContactDetailsSheetContent(
     onDeleteContact: () -> Unit,
     modifier: Modifier = Modifier,
     connectivityText: String? = null,
+    isMuted: Boolean = false,
+    onMutedChange: (Boolean) -> Unit = {},
 ) {
     val displayId = formatUserId(contact.userId)
     val displayName = ChatListLogic.displayNameOrId(contact.name, displayId)
@@ -145,8 +153,20 @@ fun ContactDetailsSheetContent(
             }
         }
 
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Mute notifications", modifier = Modifier.weight(1f))
+            Switch(checked = isMuted, onCheckedChange = onMutedChange)
+        }
+
         Button(
             onClick = onDeleteContact,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.error,
+                contentColor = MaterialTheme.colorScheme.onError,
+            ),
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 24.dp)

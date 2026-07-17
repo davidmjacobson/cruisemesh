@@ -299,6 +299,7 @@ impl MessageStore {
         ensure_column(&conn, "messages", "received_at", "INTEGER")?;
         ensure_column(&conn, "messages", "msg_id", "BLOB")?;
         ensure_column(&conn, "messages", "reply_to_msg_id", "BLOB")?;
+        ensure_column(&conn, "messages", "outbound_expiry", "INTEGER")?;
         // Older stores already have stable ids for locally authored rows in
         // the outbound queue. Backfill those so they can be quoted after an
         // upgrade; received legacy rows cannot be recovered retroactively.
@@ -341,6 +342,19 @@ impl MessageStore {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Writes a transactionally consistent standalone SQLite snapshot.
+    /// The destination must not already exist; callers should use a unique
+    /// temporary path and remove it after reading the backup bytes.
+    pub fn backup_to(&self, destination: String) -> Result<(), CoreError> {
+        if destination.trim().is_empty() {
+            return Err(CoreError::Store("backup destination is empty".into()));
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute("VACUUM INTO ?1", params![destination])
+            .map_err(store_err)?;
+        Ok(())
     }
 
     /// Insert a message from a remote sender's stream, distinguishing a true
@@ -583,8 +597,8 @@ mod outgoing_message_reference {
         tx.execute(
             "INSERT OR IGNORE INTO messages
                 (chat_id, sender_user_id, lamport, timestamp, kind, payload,
-                 msg_id, reply_to_msg_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 msg_id, reply_to_msg_id, outbound_expiry)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 message.chat_id,
                 message.sender_user_id,
@@ -594,13 +608,15 @@ mod outgoing_message_reference {
                 message.payload,
                 envelope.msg_id,
                 reply_to_msg_id,
+                envelope.expiry,
             ],
         )
         .map_err(store_err)?;
         tx.execute(
             "UPDATE messages
              SET msg_id = COALESCE(msg_id, ?4),
-                 reply_to_msg_id = COALESCE(reply_to_msg_id, ?5)
+                 reply_to_msg_id = COALESCE(reply_to_msg_id, ?5),
+                 outbound_expiry = COALESCE(outbound_expiry, ?6)
              WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
             params![
                 message.chat_id,
@@ -608,6 +624,7 @@ mod outgoing_message_reference {
                 message.lamport as i64,
                 envelope.msg_id,
                 reply_to_msg_id,
+                envelope.expiry,
             ],
         )
         .map_err(store_err)?;
@@ -694,6 +711,26 @@ impl MessageStore {
         )
         .optional()
         .map_err(store_err)
+    }
+
+    /// Expiry of a locally-authored message's durable outbound envelope.
+    /// This remains available after the retry queue prunes expired ciphertext.
+    pub fn outbound_message_expiry(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        lamport: u64,
+    ) -> Result<Option<i64>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT outbound_expiry FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+            params![chat_id, sender_user_id, lamport as i64],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(store_err)
+        .map(|value| value.flatten())
     }
 
     /// Resolve a quoted message by stable envelope id within one chat.
@@ -2545,6 +2582,7 @@ CREATE TABLE IF NOT EXISTS messages (
     received_at    INTEGER,
     msg_id         BLOB,
     reply_to_msg_id BLOB,
+    outbound_expiry INTEGER,
     UNIQUE(chat_id, sender_user_id, lamport)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_lamport ON messages(chat_id, lamport);
@@ -5639,6 +5677,21 @@ mod tests {
         assert_eq!(found, vec![env]);
 
         drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn backup_to_writes_a_consistent_reopenable_snapshot() {
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        store.insert_message(msg(b"chat", b"sender", 1, "backed up")).unwrap();
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("cruisemesh-backup-{unique}.sqlite"));
+
+        store.backup_to(path.to_string_lossy().to_string()).unwrap();
+        let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(restored.messages_for_chat(b"chat".to_vec()).unwrap().len(), 1);
+
+        drop(restored);
         fs::remove_file(path).unwrap();
     }
 }

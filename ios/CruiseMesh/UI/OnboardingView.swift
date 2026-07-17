@@ -11,7 +11,7 @@ struct OnboardingView: View {
     @State private var displayName = ProfileStore.loadDisplayName()
     @State private var avatarImage = ProfilePhotoStore.loadAvatarImage()
     @State private var photoItem: PhotosPickerItem?
-    @State private var showRestoreUnavailable = false
+    @State private var showRestore = false
 
     private var defaultName: String {
         UIDevice.current.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -71,7 +71,7 @@ struct OnboardingView: View {
                         }
                     }
                     Button("Restore from backup") {
-                        showRestoreUnavailable = true
+                        showRestore = true
                     }
                     .buttonStyle(.borderless)
                     Spacer()
@@ -100,10 +100,10 @@ struct OnboardingView: View {
                 }
             }
         }
-        .alert("Restore is not available on iOS yet", isPresented: $showRestoreUnavailable) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("This app can create and restore local backups on Android today. The iOS backup service still needs to be implemented before restore can run here.")
+        .sheet(isPresented: $showRestore) {
+            BackupRestoreView {
+                OnboardingStore.markCompleted()
+            }
         }
     }
 

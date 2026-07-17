@@ -1579,6 +1579,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func backfillPairwiseEnvelope(identity: Identity, contact: Contact, message: StoredMessage, replyToMsgId: Data?) throws  -> AuthoredEnvelope
     
     /**
+     * Writes a transactionally consistent standalone SQLite snapshot.
+     * The destination must not already exist; callers should use a unique
+     * temporary path and remove it after reading the backup bytes.
+     */
+    func backupTo(destination: String) throws
+
+    /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
      * The caller passes the set of hints a just-met peer could match --
@@ -2063,6 +2070,12 @@ public protocol MessageStoreProtocol : AnyObject {
     func outboundEnvelopesAfter(chatId: Data, senderUserId: Data, afterLamport: UInt64) throws  -> [OutboundEnvelope]
     
     /**
+     * Expiry of a locally-authored message's durable outbound envelope.
+     * This remains available after the retry queue prunes expired ciphertext.
+     */
+    func outboundMessageExpiry(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> Int64?
+
+    /**
      * The latest relay-uploadable receipt envelope persisted for this
      * cumulative outgoing receipt watermark, if any.
      */
@@ -2316,7 +2329,7 @@ public static func `open`(path: String)throws  -> MessageStore {
     )
 })
 }
-    
+
 
     
     /**
@@ -2334,7 +2347,7 @@ open func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, co
     )
 })
 }
-    
+
 open func authorFriendRequest(identity: Identity, contact: Contact, friendCardJson: String, timestampMs: Int64)throws  -> AuthoredEnvelope {
     return try  FfiConverterTypeAuthoredEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_author_friend_request(self.uniffiClonePointer(),
@@ -2412,6 +2425,18 @@ open func backfillPairwiseEnvelope(identity: Identity, contact: Contact, message
 })
 }
     
+    /**
+     * Writes a transactionally consistent standalone SQLite snapshot.
+     * The destination must not already exist; callers should use a unique
+     * temporary path and remove it after reading the backup bytes.
+     */
+open func backupTo(destination: String)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_backup_to(self.uniffiClonePointer(),
+        FfiConverterString.lower(destination),$0
+    )
+}
+}
+
     /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
@@ -3174,6 +3199,20 @@ open func outboundEnvelopesAfter(chatId: Data, senderUserId: Data, afterLamport:
 })
 }
     
+    /**
+     * Expiry of a locally-authored message's durable outbound envelope.
+     * This remains available after the retry queue prunes expired ciphertext.
+     */
+open func outboundMessageExpiry(chatId: Data, senderUserId: Data, lamport: UInt64)throws  -> Int64? {
+    return try  FfiConverterOptionInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_outbound_message_expiry(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterUInt64.lower(lamport),$0
+    )
+})
+}
+
     /**
      * The latest relay-uploadable receipt envelope persisted for this
      * cumulative outgoing receipt watermark, if any.
@@ -11268,6 +11307,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_envelope() != 41114) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to() != 11698) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints() != 43270) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11386,6 +11428,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_outbound_envelopes_after() != 35551) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_outbound_message_expiry() != 65173) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_outgoing_receipt_envelope() != 31920) {

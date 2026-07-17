@@ -82,6 +82,10 @@
             </intent-filter>
         </receiver>
 
+        <receiver
+            android:name=".notify.NotificationActionReceiver"
+            android:exported="false" />
+
         <!-- Camera capture target for in-chat photos (TakePicture contract). -->
         <provider
             android:name="androidx.core.content.FileProvider"

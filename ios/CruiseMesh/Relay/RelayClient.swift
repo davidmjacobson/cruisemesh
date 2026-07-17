@@ -14,6 +14,11 @@ struct RelayFetchPage {
     let nextCursor: Int64
 }
 
+struct RelayPresencePage {
+    let nowMs: Int64
+    let presence: [CoreRelayPresence]
+}
+
 /// HTTPS client for `cruisemesh-relayd` (DESIGN.md §9). Mirrors Android `RelayClient`.
 enum RelayClient {
     private static let connectTimeout: TimeInterval = 10
@@ -99,6 +104,23 @@ enum RelayClient {
         request.httpBody = try relayEncodeAckRequest(ids: ids)
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
+    }
+
+    static func syncPresence(
+        config: RelayConfig,
+        announce: [Data],
+        query: [Data]
+    ) throws -> RelayPresencePage {
+        let url = try buildURL(config.relayUrl, path: "/presence")
+        var request = URLRequest(url: url, timeoutInterval: connectTimeout)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(&request, config: config)
+        request.httpBody = try relayEncodePresenceRequest(announce: announce, query: query)
+        let (data, response) = try syncRequest(request)
+        try ensureOK(response, data: data)
+        let page = try relayDecodePresencePage(body: data)
+        return RelayPresencePage(nowMs: page.nowMs, presence: page.presence)
     }
 
     private static func postEnvelope(

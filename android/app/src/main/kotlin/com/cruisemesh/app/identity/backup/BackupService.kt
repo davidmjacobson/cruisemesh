@@ -9,6 +9,7 @@ import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.identity.decodeIdentity
 import com.cruisemesh.app.identity.encodeIdentity
 import com.cruisemesh.app.relay.RelayConfigStore
+import com.cruisemesh.app.AppStore
 
 /**
  * Android glue for account backup/restore (LOCAL_BACKUP_RESTORE.md §6/§7):
@@ -31,8 +32,14 @@ object BackupService {
     fun buildBackup(context: Context, passphrase: CharArray): ByteArray {
         val identity = IdentityStore.load(context)
             ?: throw IllegalStateException("No identity on this device to back up")
-        val sqliteFile = context.filesDir.resolve(STORE_FILENAME)
-        val sqliteBytes = if (sqliteFile.exists()) sqliteFile.readBytes() else ByteArray(0)
+        val snapshotFile = java.io.File.createTempFile("cruisemesh-backup-", ".sqlite", context.cacheDir)
+        snapshotFile.delete()
+        val sqliteBytes = try {
+            AppStore.get(context).backupTo(snapshotFile.absolutePath)
+            snapshotFile.readBytes()
+        } finally {
+            snapshotFile.delete()
+        }
         val relay = RelayConfigStore.load(context)
 
         val payload = BackupPayload(

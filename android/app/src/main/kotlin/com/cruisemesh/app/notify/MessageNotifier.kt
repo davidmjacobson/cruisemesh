@@ -10,6 +10,8 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.Person
+import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.MainActivity
 import com.cruisemesh.app.chat.UserIdHex
@@ -60,6 +62,9 @@ object MessageNotifier {
      * the group chat route rather than a 1:1 contact chat.
      */
     const val EXTRA_CHAT_IS_GROUP = "com.cruisemesh.app.extra.CHAT_IS_GROUP"
+    const val ACTION_REPLY = "com.cruisemesh.app.action.REPLY"
+    const val ACTION_MARK_READ = "com.cruisemesh.app.action.MARK_READ"
+    const val REMOTE_INPUT_REPLY = "com.cruisemesh.app.input.REPLY"
 
     /**
      * Posts (or updates -- one notification per chat, keyed by a stable id
@@ -134,6 +139,7 @@ object MessageNotifier {
         deepLinkHex: String,
         isGroup: Boolean,
     ) {
+        if (ChatMuteStore.isMuted(context, chatId)) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
@@ -166,14 +172,47 @@ object MessageNotifier {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
+        fun actionIntent(action: String, mutable: Boolean): PendingIntent {
+            val intent = Intent(context, NotificationActionReceiver::class.java).apply {
+                this.action = action
+                putExtra(EXTRA_CHAT_USER_ID_HEX, deepLinkHex)
+                putExtra(EXTRA_CHAT_IS_GROUP, isGroup)
+            }
+            return PendingIntent.getBroadcast(
+                context,
+                notificationId xor action.hashCode(),
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or if (mutable) PendingIntent.FLAG_MUTABLE else PendingIntent.FLAG_IMMUTABLE,
+            )
+        }
+        val sender = Person.Builder().setName(title).build()
+        val replyInput = RemoteInput.Builder(REMOTE_INPUT_REPLY).setLabel("Reply").build()
+        val replyAction = NotificationCompat.Action.Builder(
+            android.R.drawable.ic_menu_send,
+            "Reply",
+            actionIntent(ACTION_REPLY, true),
+        ).addRemoteInput(replyInput).build()
+        val readAction = NotificationCompat.Action.Builder(
+            android.R.drawable.ic_menu_view,
+            "Mark as read",
+            actionIntent(ACTION_MARK_READ, false),
+        ).build()
+
         val notification = NotificationCompat.Builder(context, MESSAGE_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setContentTitle(title)
             .setContentText(text)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setStyle(
+                NotificationCompat.MessagingStyle(Person.Builder().setName("You").build())
+                    .setConversationTitle(if (isGroup) title else null)
+                    .addMessage(text, System.currentTimeMillis(), sender),
+            )
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setContentIntent(contentIntent)
             .setAutoCancel(true)
+            .addAction(replyAction)
+            .addAction(readAction)
+            .setGroup("cruisemesh_conversations")
             .build()
 
         manager.notify(notificationId, notification)
