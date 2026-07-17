@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -147,6 +148,10 @@ fun ContactDetailsSheetContent(
 
         Button(
             onClick = onDeleteContact,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.error,
+                contentColor = MaterialTheme.colorScheme.onError,
+            ),
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 24.dp)
@@ -157,10 +162,10 @@ fun ContactDetailsSheetContent(
     }
 }
 
-@Preview(showBackground = true, name = "Contact Sheet")
+@Preview(showBackground = true, name = "Contact sheet")
 @Preview(
     showBackground = true,
-    name = "Contact Sheet Dark",
+    name = "Contact sheet dark",
     uiMode = Configuration.UI_MODE_NIGHT_YES,
 )
 @Composable
