@@ -111,6 +111,12 @@ dependencies {
     implementation(libs.camerax.view)
     implementation(libs.gson)
     implementation(libs.exifinterface)
+    // Relay WS push (RelayPushClient): java.net has no WebSocket client, and
+    // hand-rolling the handshake/framing/TLS is a lot of surface for what is
+    // strictly a latency optimization over the existing poll/fetch path.
+    // okhttp's version is already pinned in the catalog (mockwebserver pulls
+    // it in transitively for tests); this just also exposes it to main code.
+    implementation(libs.okhttp)
     debugImplementation(libs.compose.ui.tooling)
     testImplementation(libs.junit)
     testImplementation(libs.mockwebserver)
