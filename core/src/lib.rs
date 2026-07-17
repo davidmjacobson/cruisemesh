@@ -65,7 +65,7 @@ pub use protocol::{
     encode_digest, encode_envelope_frame, encode_friend_directory_content, encode_hello,
     encode_introduced_friend_request, encode_lan_endpoint, encode_lan_endpoint_content,
     encode_message_body, encode_message_body_with_reply, encode_profile_sync_content,
-    encode_receipt_content, encode_transport_probe, generate_msg_id, parse_frame,
+    encode_receipt_content, encode_transport_probe, fanout_msg_id, generate_msg_id, parse_frame,
     verify_introduction_ticket, ExtendedMessageBody, Frame, FriendDirectoryContent,
     FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket, LanEndpointContent,
     MessageBody, ProfileSyncContent, ReceiptContent, SuggestedFriendCard, DEFAULT_EXPIRY_MS,

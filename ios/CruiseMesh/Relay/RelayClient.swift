@@ -44,6 +44,22 @@ enum RelayClient {
         )
     }
 
+    /// Posts one per-member fan-out row of a group message
+    /// (specs/group-relay-durability.md §4; built by the core's
+    /// `coreGroupFanoutRows`/`coreGroupFanoutRowsForCarried`). Same wire
+    /// shape as every other envelope post -- fan-out changes addressing,
+    /// not format. Mirrors Android `RelayClient.postFanoutRow`.
+    static func postFanoutRow(config: RelayConfig, row: CoreGroupFanoutRow) throws -> Int64 {
+        try postEnvelope(
+            config: config,
+            msgId: Data(row.msgId),
+            hopTtl: row.hopTtl,
+            recipientHint: Data(row.recipientHint),
+            sealed: Data(row.sealed),
+            expiryMs: row.expiry
+        )
+    }
+
     static func postReceiptEnvelope(config: RelayConfig, envelope: OutgoingReceiptEnvelope) throws -> Int64 {
         try postEnvelope(
             config: config,

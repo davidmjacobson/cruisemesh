@@ -5387,6 +5387,37 @@ mod tests {
         assert_eq!(ids, vec![vec![2; MESSAGE_ID_LEN]]);
     }
 
+    /// specs/group-relay-durability.md §4.3 / §6 scenario (2): the same
+    /// logical group message can arrive under two envelope identities -- the
+    /// ORIGINAL msg_id over BLE and a per-member fan-out msg_id from the
+    /// relay. The `UNIQUE(chat_id, sender_user_id, lamport)` dedup renders
+    /// it once regardless; the second insert is a silent no-op.
+    #[test]
+    fn same_message_under_two_envelope_ids_renders_once() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let ble_first = store
+            .insert_incoming_message(
+                msg(b"group-g", b"alice", 5, "meet at the buffet"),
+                vec![0x11; MESSAGE_ID_LEN], // original envelope id (BLE flood)
+                None,
+            )
+            .unwrap();
+        let relay_second = store
+            .insert_incoming_message(
+                msg(b"group-g", b"alice", 5, "meet at the buffet"),
+                vec![0x22; MESSAGE_ID_LEN], // fan-out id (relay fetch)
+                None,
+            )
+            .unwrap();
+        assert!(ble_first);
+        assert!(!relay_second, "duplicate must be a silent no-op");
+        assert_eq!(
+            store.messages_for_chat(b"group-g".to_vec()).unwrap().len(),
+            1,
+            "one rendered row despite two envelope identities"
+        );
+    }
+
     #[test]
     fn recent_consumed_msg_ids_includes_own_authored_messages() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();

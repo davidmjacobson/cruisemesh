@@ -626,22 +626,38 @@ final class MeshController: ObservableObject {
                         receivedHopTtl: hopTtl
                     )
                 )
-                relayForeign(
-                    sourceAddress: sourceAddress,
-                    msgId: msgId,
-                    hopTtl: hopTtl,
-                    expiry: expiry,
-                    recipientHint: recipientHint,
-                    sealed: sealed
-                )
-                _ = carryForeign(
-                    msgId: msgId,
-                    hopTtl: hopTtl,
-                    expiry: expiry,
-                    recipientHint: recipientHint,
-                    sealed: sealed,
-                    forceFamily: true
-                )
+                // specs/group-relay-durability.md §4.3 no-reinjection rule:
+                // a relay-fetched group message addressed to OUR OWN hint is
+                // a per-member fan-out copy -- the relay fan-out already
+                // reaches every member durably, so re-flooding/carrying it
+                // would give the same content a second flood identity under
+                // the fan-out msgId. Legacy group-hint relay rows and every
+                // BLE/LAN-sourced group frame keep the flood+carry behavior.
+                // Mirrors MeshService.kt.
+                let ownFanoutCopy = sourceAddress == nil &&
+                    coreIsOwnFanoutHint(
+                        recipientHint: recipientHint,
+                        ownUserId: identity.userId,
+                        nowMs: now
+                    )
+                if !ownFanoutCopy {
+                    relayForeign(
+                        sourceAddress: sourceAddress,
+                        msgId: msgId,
+                        hopTtl: hopTtl,
+                        expiry: expiry,
+                        recipientHint: recipientHint,
+                        sealed: sealed
+                    )
+                    _ = carryForeign(
+                        msgId: msgId,
+                        hopTtl: hopTtl,
+                        expiry: expiry,
+                        recipientHint: recipientHint,
+                        sealed: sealed,
+                        forceFamily: true
+                    )
+                }
                 // DTN D4: we already durably delivered our own copy above
                 // (`deliverOpenedGroupEnvelope`), so record regardless of
                 // whether the best-effort mule copy for absent members
@@ -1939,7 +1955,49 @@ final class MeshController: ObservableObject {
                 limit: MeshDefaults.relayBatchLimit,
                 nowMs: now
             )
+            let importedGroups = try store.listGroups()
+            let groupsById = Dictionary(
+                uniqueKeysWithValues: importedGroups.map { ($0.id, $0) }
+            )
+            // Recent-day hints per imported group, for recognizing
+            // group-hinted carried envelopes below (same window every other
+            // hint check uses).
+            let groupHintSets: [(group: Group, hints: Set<Data>)] = importedGroups.map { group in
+                let hints = (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
+                    computeRecipientHint(
+                        recipientUserId: group.id,
+                        timestampMs: now - daysAgo * MeshDefaults.msPerDay
+                    )
+                }
+                return (group, Set(hints))
+            }
             for env in outbound {
+                if let group = groupsById[env.recipientUserId] {
+                    // Group-addressed: per-member fan-out instead of one
+                    // shared group-hint row (specs/group-relay-durability.md
+                    // §4.2). Mark relay-posted only after ALL member rows
+                    // post; a partial failure retries the whole set next
+                    // pass, and the deterministic fan-out msg_ids dedupe
+                    // server-side. Mirrors MeshService.kt.
+                    let rows = coreGroupFanoutRows(
+                        originalMsgId: env.msgId,
+                        memberUserIds: group.memberUserIds,
+                        hopTtl: env.hopTtl,
+                        expiry: env.expiry,
+                        sealed: env.sealed,
+                        envelopeTimestampMs: env.timestamp
+                    )
+                    var posted = 0
+                    for row in rows {
+                        if (try? RelayClient.postFanoutRow(config: config, row: row)) != nil {
+                            posted += 1
+                        }
+                    }
+                    if posted == rows.count {
+                        _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                    }
+                    continue
+                }
                 _ = try RelayClient.postOutboundEnvelope(config: config, envelope: env)
                 _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
             }
@@ -1948,6 +2006,24 @@ final class MeshController: ObservableObject {
                 nowMs: now
             )
             for env in family {
+                // Group-hinted carried envelopes decompose into per-member
+                // fan-out rows so a member mule's uplink serves the whole
+                // group (specs/group-relay-durability.md §4.2); re-posts on
+                // later passes dedupe server-side via the deterministic ids.
+                // Everything else posts unchanged.
+                if let match = groupHintSets.first(where: { $0.hints.contains(env.recipientHint) }) {
+                    let rows = coreGroupFanoutRowsForCarried(
+                        originalMsgId: env.msgId,
+                        memberUserIds: match.group.memberUserIds,
+                        hopTtl: env.hopTtl,
+                        expiry: env.expiry,
+                        sealed: env.sealed
+                    )
+                    for row in rows {
+                        _ = try? RelayClient.postFanoutRow(config: config, row: row)
+                    }
+                    continue
+                }
                 _ = try RelayClient.postCarriedEnvelope(config: config, envelope: env)
             }
 
@@ -1995,16 +2071,20 @@ final class MeshController: ObservableObject {
                     dispositions.append(CoreRelayEnvelopeDisposition(
                         relayId: env.id,
                         msgId: env.msgId,
-                        disposition: disposition
+                        disposition: disposition,
+                        recipientHint: env.recipientHint
                     ))
                 }
                 // Consumed/Expired ack unconditionally; a SEEN envelope is
                 // acked only if this device durably consumed it as a 1:1
-                // message from someone else (DTN_TODOS.md §3.1) -- see
+                // message from someone else (DTN_TODOS.md §3.1); a legacy
+                // shared-mailbox group-hint row is never acked at all
+                // (specs/group-relay-durability.md §5.2) -- see
                 // CoreRelayEnvelopeDisposition's doc comment in engine.rs.
                 let acks = try store.coreRelayAckIdsWithConsumed(
                     items: dispositions,
-                    ownUserId: identity.userId
+                    ownUserId: identity.userId,
+                    nowMs: now
                 )
                 if !acks.isEmpty {
                     try RelayClient.ackEnvelopes(config: config, ids: acks)

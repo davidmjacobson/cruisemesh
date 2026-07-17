@@ -976,6 +976,41 @@ pub fn compute_recipient_hint(recipient_user_id: Vec<u8>, timestamp_ms: i64) -> 
     out
 }
 
+/// Deterministic per-member relay-post id for group fan-out
+/// (`specs/group-relay-durability.md` §4.1, DTN_TODOS.md N1):
+/// `BLAKE2b-16(prologue || original_msg_id || member_user_id)`, where
+/// `prologue` is the fixed ASCII string `"cruisemesh group fanout v1"`. Two
+/// properties matter here, mirroring why [`compute_recipient_hint`] is
+/// keyed the way it is:
+///
+/// - **Distinct per member**: hashing in `member_user_id` gives every
+///   member of the group their own relay row id for the same logical
+///   message, so the shared-mailbox dedupe key `(family_token, msg_id)`
+///   naturally becomes one row per member instead of one row for everyone.
+/// - **Deterministic across calls**: the same `(original_msg_id,
+///   member_user_id)` pair always yields the same id, so re-uploading the
+///   same group message (the author retrying, or a different member's
+///   phone muling it) re-derives the identical N ids and the relay's
+///   existing `ON CONFLICT` dedupe on `msg_id` absorbs the retry with no
+///   server-side change.
+///
+/// The versioned prologue is a domain separator: it keeps this id space
+/// disjoint from [`generate_msg_id`]'s random 16-byte ids and from any
+/// future derived-id scheme that might hash different fields together.
+#[uniffi::export]
+pub fn fanout_msg_id(original_msg_id: Vec<u8>, member_user_id: Vec<u8>) -> Vec<u8> {
+    const FANOUT_PROLOGUE: &[u8] = b"cruisemesh group fanout v1";
+    let mut hasher = Blake2bVar::new(MSG_ID_LEN).expect("valid blake2b output length");
+    hasher.update(FANOUT_PROLOGUE);
+    hasher.update(&original_msg_id);
+    hasher.update(&member_user_id);
+    let mut out = vec![0u8; MSG_ID_LEN];
+    hasher
+        .finalize_variable(&mut out)
+        .expect("output buffer matches configured length");
+    out
+}
+
 /// `expiry` for a freshly authored envelope's §6.4 header:
 /// `timestamp_ms + DEFAULT_EXPIRY_MS` (7 days, DESIGN.md §5.3), saturating
 /// rather than overflowing for pathological inputs.
@@ -1856,6 +1891,36 @@ mod tests {
     fn compute_recipient_hint_differs_per_recipient() {
         let a = compute_recipient_hint(vec![0x01; 16], 1_700_000_000_000);
         let b = compute_recipient_hint(vec![0x02; 16], 1_700_000_000_000);
+        assert_ne!(a, b);
+    }
+
+    // -- fanout_msg_id (specs/group-relay-durability.md §4.1) ---------------
+
+    #[test]
+    fn fanout_msg_id_is_deterministic_and_16_bytes() {
+        let original = vec![0x11; 16];
+        let member = vec![0x22; 16];
+        let a = fanout_msg_id(original.clone(), member.clone());
+        let b = fanout_msg_id(original, member);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), MSG_ID_LEN);
+    }
+
+    #[test]
+    fn fanout_msg_id_differs_across_members_for_the_same_message() {
+        let original = vec![0x11; 16];
+        let member_a = vec![0x01; 16];
+        let member_b = vec![0x02; 16];
+        let a = fanout_msg_id(original.clone(), member_a);
+        let b = fanout_msg_id(original, member_b);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fanout_msg_id_differs_across_original_messages_for_the_same_member() {
+        let member = vec![0x22; 16];
+        let a = fanout_msg_id(vec![0x01; 16], member.clone());
+        let b = fanout_msg_id(vec![0x02; 16], member);
         assert_ne!(a, b);
     }
 

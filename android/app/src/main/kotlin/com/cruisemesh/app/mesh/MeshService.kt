@@ -71,7 +71,10 @@ import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
+import uniffi.cruisemesh_core.coreGroupFanoutRows
+import uniffi.cruisemesh_core.coreGroupFanoutRowsForCarried
 import uniffi.cruisemesh_core.coreInboundGate
+import uniffi.cruisemesh_core.coreIsOwnFanoutHint
 import uniffi.cruisemesh_core.decodeGroupInviteContent
 import uniffi.cruisemesh_core.decodeFriendDirectoryContent
 import uniffi.cruisemesh_core.decodeIntroducedFriendRequest
@@ -897,11 +900,54 @@ class MeshService : Service() {
             // text uses recipientUserId = group.id and rides the family's
             // fallback (or any member's) relay config.
             val contact = contactsByUserId[UserIdHex.encode(envelope.recipientUserId)]
-            val config = if (contact != null) {
-                resolvedRelayConfig(contact, fallbackConfig)
-            } else {
-                relayConfigForGroupRecipient(envelope.recipientUserId, contacts, fallbackConfig)
-            } ?: continue
+            if (contact == null) {
+                // Group-addressed: per-member fan-out instead of one shared
+                // group-hint row (specs/group-relay-durability.md §4.2).
+                val group = store.getGroup(envelope.recipientUserId)
+                val config = relayConfigForGroupRecipient(envelope.recipientUserId, contacts, fallbackConfig)
+                    ?: continue
+                if (group == null) {
+                    // Recipient is neither contact nor imported group (e.g. a
+                    // group deleted mid-queue); keep the legacy single post so
+                    // the envelope isn't stranded.
+                    try {
+                        RelayClient.postOutboundEnvelope(config, envelope, network)
+                        store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to upload outbound envelope to relay ${config.relayUrl}: ${e.message}")
+                    }
+                    continue
+                }
+                val rows = coreGroupFanoutRows(
+                    envelope.msgId,
+                    group.memberUserIds,
+                    envelope.hopTtl,
+                    envelope.expiry,
+                    envelope.sealed,
+                    envelope.timestamp,
+                )
+                // Spec §4.2: mark relay-posted only after ALL member rows
+                // post. A partial failure retries the whole set next pass;
+                // the deterministic fan-out msg_ids dedupe server-side.
+                var posted = 0
+                for (row in rows) {
+                    try {
+                        RelayClient.postFanoutRow(config, row, network)
+                        posted++
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to upload fan-out row to relay ${config.relayUrl}: ${e.message}")
+                    }
+                }
+                if (posted == rows.size) {
+                    store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
+                    Log.i(
+                        TAG,
+                        "Uploaded group envelope ${UserIdHex.encode(envelope.msgId)} as $posted fan-out row(s) to relay ${config.relayUrl}",
+                    )
+                }
+                continue
+            }
+            val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
                 val relayId = RelayClient.postOutboundEnvelope(config, envelope, network)
                 store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
@@ -936,7 +982,34 @@ class MeshService : Service() {
         network: Network?,
     ) {
         for (envelope in store.familyCarriedEnvelopes(RELAY_BATCH_LIMIT, now)) {
-            val contact = contactMatchingHint(contacts, envelope.recipientHint, now) ?: continue
+            val contact = contactMatchingHint(contacts, envelope.recipientHint, now)
+            if (contact == null) {
+                // Group-hinted carried envelope: previously skipped entirely
+                // (no contact match). A member mule can now decompose it into
+                // per-member fan-out rows (specs/group-relay-durability.md
+                // §4.2) so the group's mail reaches internet-only members
+                // through this phone's uplink too. No mark-posted concept for
+                // carried rows -- re-posts every pass dedupe server-side via
+                // the deterministic fan-out ids. Non-member mules still can't
+                // recognize the hint and still skip, unchanged.
+                val group = groupMatchingHint(envelope.recipientHint, now) ?: continue
+                val config = relayConfigForGroupRecipient(group.id, contacts, fallbackConfig) ?: continue
+                val rows = coreGroupFanoutRowsForCarried(
+                    envelope.msgId,
+                    group.memberUserIds,
+                    envelope.hopTtl,
+                    envelope.expiry,
+                    envelope.sealed,
+                )
+                for (row in rows) {
+                    try {
+                        RelayClient.postFanoutRow(config, row, network)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to upload carried fan-out row to relay ${config.relayUrl}: ${e.message}")
+                    }
+                }
+                continue
+            }
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
                 val relayId = RelayClient.postCarriedEnvelope(config, envelope, network)
@@ -1018,13 +1091,16 @@ class MeshService : Service() {
                     relayId = envelope.id,
                     msgId = envelope.msgId,
                     disposition = disposition,
+                    recipientHint = envelope.recipientHint,
                 )
             }
             // Consumed/Expired ack unconditionally; a SEEN envelope is
             // acked only if this device durably consumed it as a 1:1
-            // message from someone else (DTN_TODOS.md §3.1) -- see
+            // message from someone else (DTN_TODOS.md §3.1); a legacy
+            // shared-mailbox group-hint row is never acked at all
+            // (specs/group-relay-durability.md §5.2) -- see
             // CoreRelayEnvelopeDisposition's KDoc.
-            val ackIds = store.coreRelayAckIdsWithConsumed(dispositions, identity.userId)
+            val ackIds = store.coreRelayAckIdsWithConsumed(dispositions, identity.userId, now)
             if (ackIds.isNotEmpty()) {
                 Log.i(TAG, "Acking ${ackIds.size} relay envelope(s) on ${config.relayUrl}: $ackIds")
                 RelayClient.ackEnvelopes(config, ackIds, network)
@@ -1804,11 +1880,22 @@ class MeshService : Service() {
                     arrival,
                     envelope.msgId,
                 )
-                relayForeignEnvelope(sourceAddress, envelope)
-                if (sourceAddress == null) {
-                    carryRelayEnvelope(envelope)
-                } else {
-                    carryForeignEnvelope(envelope, forceFamily = true)
+                // specs/group-relay-durability.md §4.3 no-reinjection rule:
+                // a relay-fetched group message addressed to OUR OWN hint is
+                // a per-member fan-out copy -- the relay fan-out already
+                // reaches every member durably, so re-flooding/carrying it
+                // would give the same content a second flood identity under
+                // the fan-out msg_id. Legacy group-hint relay rows and every
+                // BLE/LAN-sourced group frame keep the flood+carry behavior.
+                val ownFanoutCopy = sourceAddress == null &&
+                    coreIsOwnFanoutHint(envelope.recipientHint, identity.userId, System.currentTimeMillis())
+                if (!ownFanoutCopy) {
+                    relayForeignEnvelope(sourceAddress, envelope)
+                    if (sourceAddress == null) {
+                        carryRelayEnvelope(envelope)
+                    } else {
+                        carryForeignEnvelope(envelope, forceFamily = true)
+                    }
                 }
                 // DTN D4: [deliverOpenedGroupEnvelope] durably stores our own
                 // copy and throws (rather than returning) on a store
@@ -2046,13 +2133,22 @@ class MeshService : Service() {
         return recognizesGroupHint(hint, now)
     }
 
-    private fun recognizesGroupHint(hint: ByteArray, now: Long): Boolean {
+    private fun recognizesGroupHint(hint: ByteArray, now: Long): Boolean =
+        groupMatchingHint(hint, now) != null
+
+    /**
+     * The imported group whose recent-day hints include [hint], if any --
+     * the group-shaped sibling of [contactMatchingHint], used by the fan-out
+     * upload path (specs/group-relay-durability.md §4.2) which needs the
+     * group's member list, not just a yes/no.
+     */
+    private fun groupMatchingHint(hint: ByteArray, now: Long): Group? {
         for (group in store.listGroups()) {
             if (recentHintsFor(group.id, now).any { it.contentEquals(hint) }) {
-                return true
+                return group
             }
         }
-        return false
+        return null
     }
 
     /**

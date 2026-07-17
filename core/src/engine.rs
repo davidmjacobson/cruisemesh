@@ -8,8 +8,9 @@
 use std::collections::HashSet;
 
 use crate::{
-    compute_recipient_hint, encode_envelope_frame, CarriedEnvelope, CoreError, MessageOrigin,
-    MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, RECEIPT_TYPE_DELIVERED, MS_PER_DAY,
+    compute_recipient_hint, encode_envelope_frame, fanout_msg_id, CarriedEnvelope, CoreError,
+    MessageOrigin, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, RECEIPT_TYPE_DELIVERED,
+    MS_PER_DAY,
 };
 
 /// Exact carried+recently-held `msg_id` count advertised in one outgoing
@@ -56,6 +57,15 @@ pub struct CoreRelayEnvelopeDisposition {
     /// envelope -- see [`MessageStore::core_relay_ack_ids_with_consumed`].
     pub msg_id: Vec<u8>,
     pub disposition: CoreInboundDisposition,
+    /// This fetched envelope's `recipient_hint` off the §6.4 header --
+    /// whichever hint the fetch actually matched. Used by
+    /// [`MessageStore::core_relay_ack_ids_with_consumed`] to recognize a
+    /// legacy shared-mailbox group row (`specs/group-relay-durability.md`
+    /// §5.2): a hint that matches one of THIS device's imported groups'
+    /// recent-day hints, as opposed to a per-member fan-out row (addressed
+    /// to a member's own hint, indistinguishable on the wire from ordinary
+    /// 1:1 mail).
+    pub recipient_hint: Vec<u8>,
 }
 
 /// Exact frames to emit after accepting a peer's DIGEST.
@@ -67,6 +77,118 @@ pub struct CoreDigestSprayPlan {
     pub carried_frames: Vec<Vec<u8>>,
     pub own_outbound_frames: Vec<Vec<u8>>,
     pub own_receipt_frames: Vec<Vec<u8>>,
+}
+
+/// One relay-post row of a group message's per-member fan-out
+/// (`specs/group-relay-durability.md` §4, DTN_TODOS.md N1). Deliberately
+/// NOT [`CarriedEnvelope`], even though the fields coincide -- a fan-out row
+/// is a relay-upload payload only; it is never enqueued into the local carry
+/// queue. Every field here is copied onto the wire verbatim by
+/// [`encode_envelope_frame`]/the relay POST body; see
+/// [`core_group_fanout_rows`] for how each field is derived.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct CoreGroupFanoutRow {
+    pub msg_id: Vec<u8>,
+    pub hop_ttl: u8,
+    pub expiry: i64,
+    pub recipient_hint: Vec<u8>,
+    pub sealed: Vec<u8>,
+}
+
+/// Build the per-member relay-post row set for a group-addressed envelope
+/// (`specs/group-relay-durability.md` §4.1/§4.2, approved 2026-07-17 in §7):
+/// one row per entry of `member_user_ids`, **including the uploader itself**
+/// (§7.2 -- multi-device readiness; today's cost is one small row the
+/// uploader consumes and acks on its own next poll pass). Each row gets:
+///
+/// - `msg_id`: [`fanout_msg_id`] of `(original_msg_id, member_user_id)` --
+///   distinct per member, deterministic across repeated calls so retries
+///   (author re-upload, a different member's mule) converge on the same N
+///   ids and dedupe server-side with no relay change.
+/// - `recipient_hint`: [`compute_recipient_hint`] of `(member_user_id,
+///   envelope_timestamp_ms)` -- the same daily-rotating hint 1:1 mail
+///   already uses, so the member finds this row with the self-hints they
+///   already poll/subscribe with. `envelope_timestamp_ms` should be the
+///   ORIGINAL envelope's authored timestamp (not "now"), mirroring how a
+///   1:1 [`OutboundEnvelope`]'s own `recipient_hint` is computed at
+///   authoring time -- callers with only an envelope's `expiry` in hand
+///   (e.g. a [`CarriedEnvelope`], which carries no `timestamp` field on the
+///   wire) can reconstruct it as `expiry - DEFAULT_EXPIRY_MS`, since every
+///   envelope this codebase authors uses [`crate::default_expiry`].
+/// - `hop_ttl`, `expiry`, `sealed`: copied from the original envelope
+///   unchanged -- fan-out changes addressing only, never crypto or hop
+///   budget.
+///
+/// Caller supplies `member_user_ids` (typically [`crate::Group::member_user_ids`],
+/// which is already deduplicated by [`crate::create_group`]/[`crate::rotate_group`]);
+/// this function does not deduplicate or otherwise validate the list, and
+/// does not touch the store -- it is a pure function so it stays trivially
+/// unit-testable and re-callable without side effects.
+#[uniffi::export]
+pub fn core_group_fanout_rows(
+    original_msg_id: Vec<u8>,
+    member_user_ids: Vec<Vec<u8>>,
+    hop_ttl: u8,
+    expiry: i64,
+    sealed: Vec<u8>,
+    envelope_timestamp_ms: i64,
+) -> Vec<CoreGroupFanoutRow> {
+    member_user_ids
+        .into_iter()
+        .map(|member_user_id| CoreGroupFanoutRow {
+            msg_id: fanout_msg_id(original_msg_id.clone(), member_user_id.clone()),
+            hop_ttl,
+            expiry,
+            recipient_hint: compute_recipient_hint(member_user_id, envelope_timestamp_ms),
+            sealed: sealed.clone(),
+        })
+        .collect()
+}
+
+/// [`core_group_fanout_rows`] for a carried envelope, which has no
+/// `timestamp` field on the wire: reconstructs the authoring timestamp as
+/// `expiry - DEFAULT_EXPIRY_MS`, valid because every envelope this codebase
+/// authors uses [`crate::default_expiry`] (see the sibling's doc). Kept in
+/// core so neither shell hand-rolls the reconstruction.
+#[uniffi::export]
+pub fn core_group_fanout_rows_for_carried(
+    original_msg_id: Vec<u8>,
+    member_user_ids: Vec<Vec<u8>>,
+    hop_ttl: u8,
+    expiry: i64,
+    sealed: Vec<u8>,
+) -> Vec<CoreGroupFanoutRow> {
+    core_group_fanout_rows(
+        original_msg_id,
+        member_user_ids,
+        hop_ttl,
+        expiry,
+        sealed,
+        expiry - crate::DEFAULT_EXPIRY_MS,
+    )
+}
+
+/// No-gossip-reinjection classifier for relay-sourced group mail
+/// (`specs/group-relay-durability.md` §4.3): returns whether
+/// `recipient_hint` is one of THIS device's own recent-day hints -- i.e.
+/// the fetched row is a per-member fan-out copy addressed to us. A group
+/// message consumed from such a row must NOT be re-flooded into gossip or
+/// force-carried: the relay fan-out already addresses every member durably,
+/// and re-injecting it under the fan-out `msg_id` would give the same
+/// content a second flood identity (the mesh flood of the ORIGINAL id still
+/// happens from the author's BLE side, unchanged). Legacy group-hint rows
+/// return `false` here and keep today's flood+carry behavior. Same
+/// [`CARRY_HINT_DAY_WINDOW_DAYS`] window as every other hint check.
+#[uniffi::export]
+pub fn core_is_own_fanout_hint(
+    recipient_hint: Vec<u8>,
+    own_user_id: Vec<u8>,
+    now_ms: i64,
+) -> bool {
+    (0..=CARRY_HINT_DAY_WINDOW_DAYS).any(|days_ago| {
+        compute_recipient_hint(own_user_id.clone(), now_ms - days_ago * MS_PER_DAY)
+            == recipient_hint
+    })
 }
 
 /// Inbound flood-dedupe + expiry gate (DESIGN.md §5.3).
@@ -107,6 +229,17 @@ pub fn core_inbound_gate(is_new_msg_id: bool, expiry_ms: i64, now_ms: i64) -> Co
 /// [`MessageStore::core_relay_ack_ids_with_consumed`] for the narrow,
 /// independently store-verified case where a Seen copy is still safe to
 /// ack -- this function alone can't tell, since it has no store access.
+///
+/// A `Consumed` group envelope was historically ackable here even though
+/// this device is only ONE of several endpoint consumers of the family's
+/// shared relay mailbox (DTN_TODOS.md N1). That hole is now CLOSED, but not
+/// by this function: per-member fan-out (`specs/group-relay-durability.md`)
+/// makes a `Consumed` group fetch correct to ack again, by giving every
+/// member their own row -- and [`MessageStore::core_relay_ack_ids_with_consumed`]
+/// additionally withholds the ack for the narrow legacy case (a `Consumed`
+/// fetch under a group's own shared hint, not a per-member fan-out hint).
+/// This function alone has no store access and so cannot make that
+/// distinction; it is unchanged.
 ///
 /// Safety invariant (applies to this function and
 /// [`consumed_seen_is_ackable`] alike): never ack a relay copy unless THIS
@@ -167,19 +300,22 @@ pub fn core_relay_ack_ids(items: Vec<CoreRelayEnvelopeDisposition>) -> Vec<i64> 
 ///   always dedupes as Seen): that relay copy exists *for the recipient*,
 ///   and deleting it would silently drop their only remaining way to fetch
 ///   the message.
-/// - `chat_id != sender_user_id` -> a GROUP row -> NOT ackable. The family
-///   shares one relay mailbox per family token, and a group envelope on it
-///   is a single copy that every member fetches. We consumed *our* read of
-///   it, but other members -- in particular one with internet-only
-///   connectivity and no BLE path to the rest of the family -- still need
-///   the relay copy; acking here would delete their message permanently.
-///   For group envelopes this device is only ONE of several endpoint
-///   consumers, never "the" consumer, so the invariant forbids the ack.
-///   (The pre-existing CONSUMED-path ack in
-///   [`MessageStore::core_relay_ack_ids_with_consumed`] already acks a
-///   group envelope on first relay fetch -- DTN_TODOS.md N1 -- which has
-///   the same shared-mailbox problem; that is a separate, deliberately
-///   out-of-scope issue this check does not widen.)
+/// - `chat_id != sender_user_id` -> a GROUP row -> NOT ackable. This SEEN
+///   copy means we already durably consumed a copy of this exact `msg_id`
+///   as a group message -- almost always over BLE first, with the relay
+///   fetch re-presenting the SAME `msg_id` a moment later and deduping to
+///   SEEN. The relay copy in that shape is always the per-member fan-out row
+///   this device's own self-hint addresses (`specs/group-relay-durability.md`
+///   §4.3), which SHOULD be acked -- but it already was, on the ORIGINAL
+///   fetch that produced the CONSUMED disposition and the `messages` row
+///   this function is now looking up; there is no second ack to grant here.
+///   Left `false` for the same "when in doubt, don't ack" reason as the
+///   other un-ackable shapes above: this function has no way to tell a
+///   fan-out row's SEEN re-presentation (already acked once, nothing left
+///   to do) apart from a legacy shared group-hint row's SEEN
+///   re-presentation (must never be acked -- other members still need it,
+///   per [`MessageStore::core_relay_ack_ids_with_consumed`]'s legacy-row
+///   rule), and returning `false` is safe for both.
 /// - Otherwise (row exists, sender is someone else, `chat_id ==
 ///   sender_user_id`) -> a 1:1 message sealed to us that we stored -> this
 ///   device was the envelope's sole true endpoint consumer -> ackable.
@@ -456,18 +592,44 @@ impl MessageStore {
     /// relay copy unless THIS device was the envelope's sole true endpoint
     /// consumer; when in doubt, don't ack."
     ///
-    /// Note: this only extends the SEEN path. The pre-existing CONSUMED-path
-    /// group ack (DTN_TODOS.md N1 -- the first member to fetch+consume a
-    /// group envelope over the relay acks it away from every other member,
-    /// since the family shares one relay mailbox per family token) is out
-    /// of scope here and deliberately unchanged.
+    /// **Legacy group-row rule** (`specs/group-relay-durability.md` §5.2,
+    /// closing DTN_TODOS.md N1): an item whose `recipient_hint` matches one
+    /// of this device's imported groups' recent-day hints names a legacy
+    /// shared-mailbox row that EVERY member fetches -- so it is never acked
+    /// (not even on `Consumed`: this device is only one of several endpoint
+    /// consumers), except when `Expired`, which is dead weight for every
+    /// member alike. New-style group mail never trips this rule: per-member
+    /// fan-out rows ([`core_group_fanout_rows`]) are addressed to a member's
+    /// OWN hint, indistinguishable from 1:1 mail, and their `Consumed` ack
+    /// is correct precisely because each row has exactly one reader. Legacy
+    /// rows simply age out within their normal expiry; the rule is
+    /// unconditional per the approved spec (§7.3, no escape hatch).
     pub fn core_relay_ack_ids_with_consumed(
         &self,
         items: Vec<CoreRelayEnvelopeDisposition>,
         own_user_id: Vec<u8>,
+        now_ms: i64,
     ) -> Result<Vec<i64>, CoreError> {
+        // Recent-day hints of every imported group = the fingerprint of a
+        // legacy shared-mailbox group row. Same day window the carry/confirm
+        // paths use, so any row a member could still fetch is covered.
+        let mut legacy_group_hints: HashSet<Vec<u8>> = HashSet::new();
+        for group in self.list_groups()? {
+            for days_ago in 0..=CARRY_HINT_DAY_WINDOW_DAYS {
+                legacy_group_hints.insert(compute_recipient_hint(
+                    group.id.clone(),
+                    now_ms - days_ago * MS_PER_DAY,
+                ));
+            }
+        }
         let mut acked = Vec::with_capacity(items.len());
         for item in items {
+            if item.disposition != CoreInboundDisposition::Expired
+                && legacy_group_hints.contains(&item.recipient_hint)
+            {
+                // Shared legacy row; other members still need it. Never ack.
+                continue;
+            }
             if core_should_ack_inbound(item.disposition) {
                 acked.push(item.relay_id);
                 continue;
@@ -519,29 +681,28 @@ mod tests {
         }
     }
 
+    /// Test-only shorthand: a disposition item with a neutral (non-group)
+    /// `recipient_hint`, for cases where the hint doesn't matter.
+    fn disp(
+        relay_id: i64,
+        msg_id: Vec<u8>,
+        disposition: CoreInboundDisposition,
+    ) -> CoreRelayEnvelopeDisposition {
+        CoreRelayEnvelopeDisposition {
+            relay_id,
+            msg_id,
+            disposition,
+            recipient_hint: vec![0xAA; 8],
+        }
+    }
+
     #[test]
     fn relay_acknowledgement_never_deletes_carried_or_seen_mail() {
         let items = vec![
-            CoreRelayEnvelopeDisposition {
-                relay_id: 1,
-                msg_id: vec![1; 16],
-                disposition: CoreInboundDisposition::Consumed,
-            },
-            CoreRelayEnvelopeDisposition {
-                relay_id: 2,
-                msg_id: vec![2; 16],
-                disposition: CoreInboundDisposition::Carried,
-            },
-            CoreRelayEnvelopeDisposition {
-                relay_id: 3,
-                msg_id: vec![3; 16],
-                disposition: CoreInboundDisposition::Expired,
-            },
-            CoreRelayEnvelopeDisposition {
-                relay_id: 4,
-                msg_id: vec![4; 16],
-                disposition: CoreInboundDisposition::Seen,
-            },
+            disp(1, vec![1; 16], CoreInboundDisposition::Consumed),
+            disp(2, vec![2; 16], CoreInboundDisposition::Carried),
+            disp(3, vec![3; 16], CoreInboundDisposition::Expired),
+            disp(4, vec![4; 16], CoreInboundDisposition::Seen),
         ];
         assert_eq!(core_relay_ack_ids(items), vec![1, 3]);
     }
@@ -687,37 +848,184 @@ mod tests {
         let unknown_msg_id = vec![23_u8; 16];
 
         let items = vec![
-            CoreRelayEnvelopeDisposition {
-                relay_id: 100,
-                msg_id: one_to_one_msg_id,
-                disposition: CoreInboundDisposition::Seen,
-            },
-            CoreRelayEnvelopeDisposition {
-                relay_id: 200,
-                msg_id: group_msg_id,
-                disposition: CoreInboundDisposition::Seen,
-            },
-            CoreRelayEnvelopeDisposition {
-                relay_id: 300,
-                msg_id: unknown_msg_id,
-                disposition: CoreInboundDisposition::Seen,
-            },
-            CoreRelayEnvelopeDisposition {
-                relay_id: 400,
-                msg_id: vec![24_u8; 16],
-                disposition: CoreInboundDisposition::Carried,
-            },
-            CoreRelayEnvelopeDisposition {
-                relay_id: 500,
-                msg_id: vec![25_u8; 16],
-                disposition: CoreInboundDisposition::Consumed,
-            },
+            disp(100, one_to_one_msg_id, CoreInboundDisposition::Seen),
+            disp(200, group_msg_id, CoreInboundDisposition::Seen),
+            disp(300, unknown_msg_id, CoreInboundDisposition::Seen),
+            disp(400, vec![24_u8; 16], CoreInboundDisposition::Carried),
+            disp(500, vec![25_u8; 16], CoreInboundDisposition::Consumed),
         ];
 
         let acked = store
-            .core_relay_ack_ids_with_consumed(items, own_user_id)
+            .core_relay_ack_ids_with_consumed(items, own_user_id, 1_000)
             .unwrap();
         assert_eq!(acked, vec![100, 500]);
+    }
+
+    // -- D6 group relay durability (specs/group-relay-durability.md) --------
+
+    /// Store fixture with one imported group; returns (store, group_id).
+    fn store_with_group(member_ids: Vec<Vec<u8>>) -> (MessageStore, Vec<u8>) {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let group_id = vec![0x77_u8; 16];
+        store
+            .upsert_group(crate::Group {
+                id: group_id.clone(),
+                name: "fam".to_string(),
+                member_user_ids: member_ids,
+                key: vec![0x55; 32],
+            })
+            .unwrap();
+        (store, group_id)
+    }
+
+    #[test]
+    fn legacy_group_hint_row_is_never_acked_even_when_consumed() {
+        let own = vec![9_u8; 16];
+        let (store, group_id) = store_with_group(vec![own.clone(), vec![1; 16]]);
+        let now: i64 = 1_700_000_000_000;
+        // A legacy shared-mailbox row: recipient_hint derived from the GROUP
+        // id (any recent day -- use two days ago to exercise the window).
+        let legacy_hint = compute_recipient_hint(group_id, now - 2 * MS_PER_DAY);
+        let items = vec![
+            CoreRelayEnvelopeDisposition {
+                relay_id: 1,
+                msg_id: vec![1; 16],
+                disposition: CoreInboundDisposition::Consumed,
+                recipient_hint: legacy_hint.clone(),
+            },
+            // Same hint but Expired: dead weight for every member -- ackable.
+            CoreRelayEnvelopeDisposition {
+                relay_id: 2,
+                msg_id: vec![2; 16],
+                disposition: CoreInboundDisposition::Expired,
+                recipient_hint: legacy_hint,
+            },
+        ];
+        let acked = store.core_relay_ack_ids_with_consumed(items, own, now).unwrap();
+        assert_eq!(acked, vec![2]);
+    }
+
+    #[test]
+    fn fanout_row_consumed_under_own_hint_is_still_acked() {
+        let own = vec![9_u8; 16];
+        let (store, _group_id) = store_with_group(vec![own.clone(), vec![1; 16]]);
+        let now: i64 = 1_700_000_000_000;
+        // A per-member fan-out row is addressed to the MEMBER's own hint --
+        // indistinguishable from 1:1 mail, so Consumed acks normally.
+        let own_hint = compute_recipient_hint(own.clone(), now);
+        let items = vec![CoreRelayEnvelopeDisposition {
+            relay_id: 1,
+            msg_id: vec![1; 16],
+            disposition: CoreInboundDisposition::Consumed,
+            recipient_hint: own_hint,
+        }];
+        let acked = store.core_relay_ack_ids_with_consumed(items, own, now).unwrap();
+        assert_eq!(acked, vec![1]);
+    }
+
+    #[test]
+    fn core_is_own_fanout_hint_matches_only_own_recent_hints() {
+        let own = vec![0x09_u8; 16];
+        let other = vec![0x01_u8; 16];
+        let now: i64 = 1_700_000_000_000;
+        // Own hint from today and from the edge of the window both match.
+        assert!(core_is_own_fanout_hint(
+            compute_recipient_hint(own.clone(), now),
+            own.clone(),
+            now
+        ));
+        assert!(core_is_own_fanout_hint(
+            compute_recipient_hint(own.clone(), now - CARRY_HINT_DAY_WINDOW_DAYS * MS_PER_DAY),
+            own.clone(),
+            now
+        ));
+        // Another user's hint (e.g. a group id's, or a contact's) never does.
+        assert!(!core_is_own_fanout_hint(
+            compute_recipient_hint(other, now),
+            own,
+            now
+        ));
+    }
+
+    /// Spec §6 scenario (1), expressed against a lightweight in-memory
+    /// mailbox instead of the BLE-graph mesh_sim (which has no relay model):
+    /// the author fans a group message out per member; BLE-first member C
+    /// acks only C's own row, so internet-only member B still fetches B's
+    /// row afterward -- and a legacy shared row in the same mailbox survives
+    /// everyone's Consumed reads.
+    #[test]
+    fn fanout_keeps_internet_only_members_row_alive_after_another_member_acks() {
+        let author = vec![0x0A_u8; 16];
+        let member_b = vec![0x0B_u8; 16]; // internet-only
+        let member_c = vec![0x0C_u8; 16]; // BLE-first
+        let members = vec![author.clone(), member_b.clone(), member_c.clone()];
+        let now: i64 = 1_700_000_000_000;
+        let original_msg_id = vec![0x33_u8; 16];
+
+        // "Relay": (relay_id, row) pairs, delete-on-ack.
+        let mut mailbox: Vec<(i64, CoreGroupFanoutRow)> =
+            core_group_fanout_rows(original_msg_id, members, 7, now + 1000, vec![0xEE; 64], now)
+                .into_iter()
+                .enumerate()
+                .map(|(i, row)| (i as i64, row))
+                .collect();
+        assert_eq!(mailbox.len(), 3, "one row per member incl. author (§7.2)");
+
+        // C polls: C's own row comes back Consumed (its fan-out id was never
+        // seen over BLE even though C already has the group message there --
+        // spec §3d), and the engine acks it. B's row is untouched because C
+        // fetches by C's hints only.
+        let (store_c, _group) = store_with_group(vec![member_c.clone()]);
+        let c_hint = compute_recipient_hint(member_c.clone(), now);
+        let c_items: Vec<CoreRelayEnvelopeDisposition> = mailbox
+            .iter()
+            .filter(|(_, row)| row.recipient_hint == c_hint)
+            .map(|(id, row)| CoreRelayEnvelopeDisposition {
+                relay_id: *id,
+                msg_id: row.msg_id.clone(),
+                disposition: CoreInboundDisposition::Consumed,
+                recipient_hint: row.recipient_hint.clone(),
+            })
+            .collect();
+        assert_eq!(c_items.len(), 1);
+        let c_acks = store_c
+            .core_relay_ack_ids_with_consumed(c_items, member_c, now)
+            .unwrap();
+        assert_eq!(c_acks.len(), 1, "C acks its own fan-out row");
+        mailbox.retain(|(id, _)| !c_acks.contains(id));
+
+        // B polls later: B's row is still there and fetchable by B's hint.
+        let b_hint = compute_recipient_hint(member_b, now);
+        let b_rows: Vec<_> = mailbox
+            .iter()
+            .filter(|(_, row)| row.recipient_hint == b_hint)
+            .collect();
+        assert_eq!(
+            b_rows.len(),
+            1,
+            "internet-only member's durable copy must survive C's ack"
+        );
+    }
+
+    #[test]
+    fn fanout_rows_cover_every_member_including_self_deterministically() {
+        let original = vec![0x33_u8; 16];
+        let me = vec![0x01_u8; 16];
+        let them = vec![0x02_u8; 16];
+        let members = vec![me.clone(), them.clone()];
+        let a = core_group_fanout_rows(original.clone(), members.clone(), 7, 100, vec![0xEE; 32], 1_000);
+        let b = core_group_fanout_rows(original.clone(), members, 7, 100, vec![0xEE; 32], 1_000);
+        assert_eq!(a, b, "row set must be deterministic across retries");
+        assert_eq!(a.len(), 2, "one row per member, including self (spec §7.2)");
+        assert_eq!(a[0].msg_id, fanout_msg_id(original.clone(), me.clone()));
+        assert_eq!(a[1].msg_id, fanout_msg_id(original, them.clone()));
+        assert_ne!(a[0].msg_id, a[1].msg_id);
+        assert_eq!(a[0].recipient_hint, compute_recipient_hint(me, 1_000));
+        assert_eq!(a[1].recipient_hint, compute_recipient_hint(them, 1_000));
+        for row in &a {
+            assert_eq!((row.hop_ttl, row.expiry), (7, 100));
+            assert_eq!(row.sealed, vec![0xEE; 32]);
+        }
     }
 
     #[test]
