@@ -1643,6 +1643,39 @@ public protocol MessageStoreProtocol : AnyObject {
     func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64) throws  -> CoreDigestSprayPlan
     
     /**
+     * Relay ack ids for one poll pass, folding the consumed-SEEN rule
+     * (DTN_TODOS.md §3.1) in on top of [`core_should_ack_inbound`]'s
+     * Consumed/Expired rule -- so a device that has already consumed an
+     * envelope over BLE/LAN stops re-downloading its relay copy on every
+     * 60s poll pass instead of waiting out the full expiry window.
+     *
+     * Per item:
+     * - [`CoreInboundDisposition::Consumed`] or
+     * [`CoreInboundDisposition::Expired`]: ack (same as
+     * [`core_relay_ack_ids`]).
+     * - [`CoreInboundDisposition::Carried`]: never ack -- the relay copy is
+     * the durable fallback until the real recipient (or another proxy)
+     * fetches it.
+     * - [`CoreInboundDisposition::Seen`]: look up
+     * [`Self::message_origin_by_msg_id`] for the item's `msg_id` and ack
+     * only if [`core_consumed_seen_is_ackable`] says so -- i.e. this
+     * device durably stored the envelope as a 1:1 message from someone
+     * else, not merely muled it, echoed its own message back, or read
+     * one copy of a shared-mailbox group envelope.
+     *
+     * Safety invariant, stated verbatim (DTN_TODOS.md §3.1): "never ack a
+     * relay copy unless THIS device was the envelope's sole true endpoint
+     * consumer; when in doubt, don't ack."
+     *
+     * Note: this only extends the SEEN path. The pre-existing CONSUMED-path
+     * group ack (DTN_TODOS.md N1 -- the first member to fetch+consume a
+     * group envelope over the relay acks it away from every other member,
+     * since the family shares one relay mailbox per family token) is out
+     * of scope here and deliberately unchanged.
+     */
+    func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], ownUserId: Data) throws  -> [Int64]
+    
+    /**
      * Delete a contact and, with it, the entire 1:1 chat: the contact row,
      * every message whose `chat_id` is their UserID (DESIGN.md §7.1: a 1:1
      * chat's id *is* the peer's UserID), that chat's incoming/outgoing
@@ -1778,7 +1811,7 @@ public protocol MessageStoreProtocol : AnyObject {
      *
      * This is deliberately a *different* primitive from
      * [`MessageStore::highest_contiguous_lamport`], and the split matters:
-     * the lamport ratchet (`nextAuthoredLamport`, see the Kotlin side)
+     * the transactional authoring Lamport ratchet
      * lets a sender's stream legitimately start above 1 after a chat
      * history wipe, because lamports below the new base never existed for
      * anyone -- there is nothing to be "contiguous from 1" with. A
@@ -1901,6 +1934,37 @@ public protocol MessageStoreProtocol : AnyObject {
      * Missing history is expected and returns `None`.
      */
     func messageByMsgId(chatId: Data, msgId: Data) throws  -> StoredMessage?
+    
+    /**
+     * Chat and sender of a stored message keyed by its stable envelope
+     * `msg_id` alone, searched across every chat -- unlike
+     * [`Self::message_by_msg_id`], which needs `chat_id` up front and is
+     * useless here because a relay-fetched envelope only carries its own
+     * `msg_id`.
+     *
+     * This backs the consumed-SEEN relay ack rule in `engine.rs`
+     * (`MessageStore::core_relay_ack_ids_with_consumed`): a relay-fetched
+     * copy that dedupes as `Seen` (already handled via some other path) is
+     * only safe to ack if THIS device actually consumed it as a real
+     * message, not merely muled it. A row only exists here for kinds that
+     * persist a durable `msg_id` -- 1:1/group text, attachment manifests,
+     * reactions (inserted via `insert_incoming_message`) and our own
+     * authored messages (via `insert_outgoing_message`/
+     * `insert_outgoing_reply`). Hidden kinds -- receipts, profile sync,
+     * friend requests/directory, group invites, LAN endpoint hints -- are
+     * stored, if at all, via the plain `insert_message` with `msg_id =
+     * NULL`, so they never match and the caller correctly treats "no
+     * match" as "cannot vouch for this copy, don't ack."
+     *
+     * Returns `None` for an unknown `msg_id` (never stored, or hidden-kind
+     * with no durable id). The store deliberately returns the raw
+     * [`MessageOrigin`] instead of a verdict: it is the caller's job to
+     * exclude own-authored rows (`sender_user_id == own user id` -- the
+     * relay copy is there for the recipient) and group rows (`chat_id !=
+     * sender_user_id` -- other members of the shared family mailbox still
+     * need the relay copy).
+     */
+    func messageOriginByMsgId(msgId: Data) throws  -> MessageOrigin?
     
     /**
      * Stable id and optional reply target for one stored message. Returns
@@ -2376,6 +2440,46 @@ open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Dat
 }
     
     /**
+     * Relay ack ids for one poll pass, folding the consumed-SEEN rule
+     * (DTN_TODOS.md §3.1) in on top of [`core_should_ack_inbound`]'s
+     * Consumed/Expired rule -- so a device that has already consumed an
+     * envelope over BLE/LAN stops re-downloading its relay copy on every
+     * 60s poll pass instead of waiting out the full expiry window.
+     *
+     * Per item:
+     * - [`CoreInboundDisposition::Consumed`] or
+     * [`CoreInboundDisposition::Expired`]: ack (same as
+     * [`core_relay_ack_ids`]).
+     * - [`CoreInboundDisposition::Carried`]: never ack -- the relay copy is
+     * the durable fallback until the real recipient (or another proxy)
+     * fetches it.
+     * - [`CoreInboundDisposition::Seen`]: look up
+     * [`Self::message_origin_by_msg_id`] for the item's `msg_id` and ack
+     * only if [`core_consumed_seen_is_ackable`] says so -- i.e. this
+     * device durably stored the envelope as a 1:1 message from someone
+     * else, not merely muled it, echoed its own message back, or read
+     * one copy of a shared-mailbox group envelope.
+     *
+     * Safety invariant, stated verbatim (DTN_TODOS.md §3.1): "never ack a
+     * relay copy unless THIS device was the envelope's sole true endpoint
+     * consumer; when in doubt, don't ack."
+     *
+     * Note: this only extends the SEEN path. The pre-existing CONSUMED-path
+     * group ack (DTN_TODOS.md N1 -- the first member to fetch+consume a
+     * group envelope over the relay acks it away from every other member,
+     * since the family shares one relay mailbox per family token) is out
+     * of scope here and deliberately unchanged.
+     */
+open func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], ownUserId: Data)throws  -> [Int64] {
+    return try  FfiConverterSequenceInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_relay_ack_ids_with_consumed(self.uniffiClonePointer(),
+        FfiConverterSequenceTypeCoreRelayEnvelopeDisposition.lower(items),
+        FfiConverterData.lower(ownUserId),$0
+    )
+})
+}
+    
+    /**
      * Delete a contact and, with it, the entire 1:1 chat: the contact row,
      * every message whose `chat_id` is their UserID (DESIGN.md §7.1: a 1:1
      * chat's id *is* the peer's UserID), that chat's incoming/outgoing
@@ -2588,7 +2692,7 @@ open func highestContiguousLamport(chatId: Data, senderUserId: Data)throws  -> U
      *
      * This is deliberately a *different* primitive from
      * [`MessageStore::highest_contiguous_lamport`], and the split matters:
-     * the lamport ratchet (`nextAuthoredLamport`, see the Kotlin side)
+     * the transactional authoring Lamport ratchet
      * lets a sender's stream legitimately start above 1 after a chat
      * history wipe, because lamports below the new base never existed for
      * anyone -- there is nothing to be "contiguous from 1" with. A
@@ -2790,6 +2894,43 @@ open func messageByMsgId(chatId: Data, msgId: Data)throws  -> StoredMessage? {
     return try  FfiConverterOptionTypeStoredMessage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_message_by_msg_id(self.uniffiClonePointer(),
         FfiConverterData.lower(chatId),
+        FfiConverterData.lower(msgId),$0
+    )
+})
+}
+    
+    /**
+     * Chat and sender of a stored message keyed by its stable envelope
+     * `msg_id` alone, searched across every chat -- unlike
+     * [`Self::message_by_msg_id`], which needs `chat_id` up front and is
+     * useless here because a relay-fetched envelope only carries its own
+     * `msg_id`.
+     *
+     * This backs the consumed-SEEN relay ack rule in `engine.rs`
+     * (`MessageStore::core_relay_ack_ids_with_consumed`): a relay-fetched
+     * copy that dedupes as `Seen` (already handled via some other path) is
+     * only safe to ack if THIS device actually consumed it as a real
+     * message, not merely muled it. A row only exists here for kinds that
+     * persist a durable `msg_id` -- 1:1/group text, attachment manifests,
+     * reactions (inserted via `insert_incoming_message`) and our own
+     * authored messages (via `insert_outgoing_message`/
+     * `insert_outgoing_reply`). Hidden kinds -- receipts, profile sync,
+     * friend requests/directory, group invites, LAN endpoint hints -- are
+     * stored, if at all, via the plain `insert_message` with `msg_id =
+     * NULL`, so they never match and the caller correctly treats "no
+     * match" as "cannot vouch for this copy, don't ack."
+     *
+     * Returns `None` for an unknown `msg_id` (never stored, or hidden-kind
+     * with no durable id). The store deliberately returns the raw
+     * [`MessageOrigin`] instead of a verdict: it is the caller's job to
+     * exclude own-authored rows (`sender_user_id == own user id` -- the
+     * relay copy is there for the recipient) and group rows (`chat_id !=
+     * sender_user_id` -- other members of the shared family mailbox still
+     * need the relay copy).
+     */
+open func messageOriginByMsgId(msgId: Data)throws  -> MessageOrigin? {
+    return try  FfiConverterOptionTypeMessageOrigin.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_message_origin_by_msg_id(self.uniffiClonePointer(),
         FfiConverterData.lower(msgId),$0
     )
 })
@@ -3247,8 +3388,39 @@ public protocol SeenIdsProtocol : AnyObject {
      * **new** (the caller should process/relay this envelope) or `false` if
      * it was already in the set (a duplicate to drop). This is the atomic
      * test-and-set the flood receive path runs on every inbound envelope.
+     *
+     * DTN D4: this combined test-and-set is safe to use as long as the
+     * caller records *before* durably handling the envelope. Native inbound
+     * paths must NOT do that anymore -- see [`SeenIds::contains`] below and
+     * the module docs' "check-then-record" note. This method remains for
+     * the outgoing/authoring path (where there is no "handling failure" to
+     * worry about; see [`SeenIds::record`]) and for anywhere a caller has
+     * already established it will unconditionally treat the envelope as
+     * handled either way.
      */
     func checkAndRecord(msgId: Data)  -> Bool
+    
+    /**
+     * Non-mutating membership test: is `msg_id` already in the seen set?
+     *
+     * DTN D4 (seen-set poisoning ordering): the inbound receive path used to
+     * call [`SeenIds::check_and_record`] *before* the envelope was durably
+     * handled (stored/carried/delivered). If that handling then failed --
+     * e.g. a disk-full error out of `enqueueCarriedEnvelope` -- the `msg_id`
+     * was already poisoned into the seen set, so every future copy of that
+     * envelope on any link was silently dropped as a duplicate for the rest
+     * of the process lifetime, even though it was never actually handled.
+     *
+     * The fix is check-then-record: native calls `contains` (via
+     * [`crate::core_inbound_gate`]'s `is_new_msg_id = !contains(id)`) to
+     * decide whether to process the envelope at all, then only calls
+     * [`SeenIds::record`] once the envelope reaches a **terminal handled
+     * state** (consumed, carried, expired-drop, or relayed-onward-only).
+     * The invariant: an envelope whose durable handling failed must be
+     * re-presentable; an envelope that was handled (even by deliberate
+     * drop) must be deduped.
+     */
+    func contains(msgId: Data)  -> Bool
     
     /**
      * Current number of retained ids (for tests/diagnostics).
@@ -3337,10 +3509,47 @@ public convenience init() {
      * **new** (the caller should process/relay this envelope) or `false` if
      * it was already in the set (a duplicate to drop). This is the atomic
      * test-and-set the flood receive path runs on every inbound envelope.
+     *
+     * DTN D4: this combined test-and-set is safe to use as long as the
+     * caller records *before* durably handling the envelope. Native inbound
+     * paths must NOT do that anymore -- see [`SeenIds::contains`] below and
+     * the module docs' "check-then-record" note. This method remains for
+     * the outgoing/authoring path (where there is no "handling failure" to
+     * worry about; see [`SeenIds::record`]) and for anywhere a caller has
+     * already established it will unconditionally treat the envelope as
+     * handled either way.
      */
 open func checkAndRecord(msgId: Data) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_method_seenids_check_and_record(self.uniffiClonePointer(),
+        FfiConverterData.lower(msgId),$0
+    )
+})
+}
+    
+    /**
+     * Non-mutating membership test: is `msg_id` already in the seen set?
+     *
+     * DTN D4 (seen-set poisoning ordering): the inbound receive path used to
+     * call [`SeenIds::check_and_record`] *before* the envelope was durably
+     * handled (stored/carried/delivered). If that handling then failed --
+     * e.g. a disk-full error out of `enqueueCarriedEnvelope` -- the `msg_id`
+     * was already poisoned into the seen set, so every future copy of that
+     * envelope on any link was silently dropped as a duplicate for the rest
+     * of the process lifetime, even though it was never actually handled.
+     *
+     * The fix is check-then-record: native calls `contains` (via
+     * [`crate::core_inbound_gate`]'s `is_new_msg_id = !contains(id)`) to
+     * decide whether to process the envelope at all, then only calls
+     * [`SeenIds::record`] once the envelope reaches a **terminal handled
+     * state** (consumed, carried, expired-drop, or relayed-onward-only).
+     * The invariant: an envelope whose durable handling failed must be
+     * re-presentable; an envelope that was handled (even by deliberate
+     * drop) must be deduped.
+     */
+open func contains(msgId: Data) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_seenids_contains(self.uniffiClonePointer(),
         FfiConverterData.lower(msgId),$0
     )
 })
@@ -4743,12 +4952,24 @@ public func FfiConverterTypeCoreReactionTargetSummary_lower(_ value: CoreReactio
 
 public struct CoreRelayEnvelopeDisposition {
     public var relayId: Int64
+    /**
+     * Stable envelope id. Only consulted for [`CoreInboundDisposition::Seen`]
+     * items, to look up whether THIS device durably consumed this exact
+     * envelope -- see [`MessageStore::core_relay_ack_ids_with_consumed`].
+     */
+    public var msgId: Data
     public var disposition: CoreInboundDisposition
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(relayId: Int64, disposition: CoreInboundDisposition) {
+    public init(relayId: Int64, 
+        /**
+         * Stable envelope id. Only consulted for [`CoreInboundDisposition::Seen`]
+         * items, to look up whether THIS device durably consumed this exact
+         * envelope -- see [`MessageStore::core_relay_ack_ids_with_consumed`].
+         */msgId: Data, disposition: CoreInboundDisposition) {
         self.relayId = relayId
+        self.msgId = msgId
         self.disposition = disposition
     }
 }
@@ -4760,6 +4981,9 @@ extension CoreRelayEnvelopeDisposition: Equatable, Hashable {
         if lhs.relayId != rhs.relayId {
             return false
         }
+        if lhs.msgId != rhs.msgId {
+            return false
+        }
         if lhs.disposition != rhs.disposition {
             return false
         }
@@ -4768,6 +4992,7 @@ extension CoreRelayEnvelopeDisposition: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(relayId)
+        hasher.combine(msgId)
         hasher.combine(disposition)
     }
 }
@@ -4781,12 +5006,14 @@ public struct FfiConverterTypeCoreRelayEnvelopeDisposition: FfiConverterRustBuff
         return
             try CoreRelayEnvelopeDisposition(
                 relayId: FfiConverterInt64.read(from: &buf), 
+                msgId: FfiConverterData.read(from: &buf), 
                 disposition: FfiConverterTypeCoreInboundDisposition.read(from: &buf)
         )
     }
 
     public static func write(_ value: CoreRelayEnvelopeDisposition, into buf: inout [UInt8]) {
         FfiConverterInt64.write(value.relayId, into: &buf)
+        FfiConverterData.write(value.msgId, into: &buf)
         FfiConverterTypeCoreInboundDisposition.write(value.disposition, into: &buf)
     }
 }
@@ -6404,6 +6631,81 @@ public func FfiConverterTypeMessageBody_lift(_ buf: RustBuffer) throws -> Messag
 #endif
 public func FfiConverterTypeMessageBody_lower(_ value: MessageBody) -> RustBuffer {
     return FfiConverterTypeMessageBody.lower(value)
+}
+
+
+/**
+ * Where a stored message row lives (`chat_id`) and who authored it
+ * (`sender_user_id`), keyed by stable envelope `msg_id` -- see
+ * [`MessageStore::message_origin_by_msg_id`]. Both fields are needed by the
+ * relay ack-decision path: the local storage convention makes their
+ * comparison meaningful (a 1:1 incoming row has `chat_id ==
+ * sender_user_id`; a group row has `chat_id = group id`, which never equals
+ * a member's user id).
+ */
+public struct MessageOrigin {
+    public var chatId: Data
+    public var senderUserId: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(chatId: Data, senderUserId: Data) {
+        self.chatId = chatId
+        self.senderUserId = senderUserId
+    }
+}
+
+
+
+extension MessageOrigin: Equatable, Hashable {
+    public static func ==(lhs: MessageOrigin, rhs: MessageOrigin) -> Bool {
+        if lhs.chatId != rhs.chatId {
+            return false
+        }
+        if lhs.senderUserId != rhs.senderUserId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(chatId)
+        hasher.combine(senderUserId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageOrigin: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageOrigin {
+        return
+            try MessageOrigin(
+                chatId: FfiConverterData.read(from: &buf), 
+                senderUserId: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MessageOrigin, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.chatId, into: &buf)
+        FfiConverterData.write(value.senderUserId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageOrigin_lift(_ buf: RustBuffer) throws -> MessageOrigin {
+    return try FfiConverterTypeMessageOrigin.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageOrigin_lower(_ value: MessageOrigin) -> RustBuffer {
+    return FfiConverterTypeMessageOrigin.lower(value)
 }
 
 
@@ -8390,6 +8692,30 @@ fileprivate struct FfiConverterOptionTypeMessageArrival: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeMessageOrigin: FfiConverterRustBuffer {
+    typealias SwiftType = MessageOrigin?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMessageOrigin.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMessageOrigin.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeMessageReference: FfiConverterRustBuffer {
     typealias SwiftType = MessageReference?
 
@@ -9136,6 +9462,67 @@ public func computeRecipientHint(recipientUserId: Data, timestampMs: Int64) -> D
     )
 })
 }
+/**
+ * Narrow follow-up check for a relay-fetched envelope that deduped as
+ * [`CoreInboundDisposition::Seen`]: [`core_should_ack_inbound`] can't vouch
+ * for it (dedupe happens before a disposition is re-derived, so Seen alone
+ * doesn't say what the *original* handling was), but the message store can
+ * independently answer "did THIS device actually consume a copy of this
+ * exact `msg_id`, as a 1:1 message addressed to us and to us alone?"
+ *
+ * `origin` is [`MessageStore::message_origin_by_msg_id`]'s result for the
+ * envelope's `msg_id`, or `None` if no such row exists. A row only exists
+ * for kinds that persist a durable `msg_id`: 1:1/group text, attachment
+ * manifests, and reactions (inserted via `insert_incoming_message`), plus
+ * our own authored outbound messages (`insert_outgoing_message`/
+ * `insert_outgoing_reply`). Of those, exactly one shape is ackable -- a 1:1
+ * incoming row, recognizable by the local storage convention that a 1:1
+ * chat is keyed by the other party, so `chat_id == sender_user_id`:
+ *
+ * - `origin` is `None` -> NOT ackable. Either we never consumed it (merely
+ * muled/flooded a copy -- the relay copy is the real recipient's durable
+ * fallback), or it was a hidden kind -- receipts, profile sync, friend
+ * requests/directory, group invites, LAN endpoint hints -- which are
+ * stored (if at all) via the plain `insert_message` path that never
+ * records a `msg_id`. Hidden kinds leave no durable trace tying a
+ * specific `msg_id` to "we consumed it," so there is nothing to safely
+ * vouch for them with -- correctness over bandwidth, per the invariant
+ * on [`core_should_ack_inbound`].
+ * - `sender_user_id == own_user_id` -> NOT ackable. Our own outbound
+ * message echoing back (own outbound `msg_id`s are seeded into the
+ * gossip-dedupe set at startup, so a relay copy of our own envelope
+ * always dedupes as Seen): that relay copy exists *for the recipient*,
+ * and deleting it would silently drop their only remaining way to fetch
+ * the message.
+ * - `chat_id != sender_user_id` -> a GROUP row -> NOT ackable. The family
+ * shares one relay mailbox per family token, and a group envelope on it
+ * is a single copy that every member fetches. We consumed *our* read of
+ * it, but other members -- in particular one with internet-only
+ * connectivity and no BLE path to the rest of the family -- still need
+ * the relay copy; acking here would delete their message permanently.
+ * For group envelopes this device is only ONE of several endpoint
+ * consumers, never "the" consumer, so the invariant forbids the ack.
+ * (The pre-existing CONSUMED-path ack in
+ * [`MessageStore::core_relay_ack_ids_with_consumed`] already acks a
+ * group envelope on first relay fetch -- DTN_TODOS.md N1 -- which has
+ * the same shared-mailbox problem; that is a separate, deliberately
+ * out-of-scope issue this check does not widen.)
+ * - Otherwise (row exists, sender is someone else, `chat_id ==
+ * sender_user_id`) -> a 1:1 message sealed to us that we stored -> this
+ * device was the envelope's sole true endpoint consumer -> ackable.
+ *
+ * Safety invariant, stated verbatim (DTN_TODOS.md §3.1): "never ack a
+ * relay copy unless THIS device was the envelope's sole true endpoint
+ * consumer; when in doubt, don't ack."
+ */
+public func coreConsumedSeenIsAckable(origin: MessageOrigin?, ownUserId: Data) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_consumed_seen_is_ackable(
+        FfiConverterOptionTypeMessageOrigin.lower(origin),
+        FfiConverterData.lower(ownUserId),$0
+    )
+})
+}
 public func coreFormatLanEndpoint(endpoint: CoreLanEndpoint) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_format_lan_endpoint(
@@ -9155,6 +9542,18 @@ public func coreHelloIdentityMatches(currentUserId: Data?, helloUserId: Data) ->
     )
 })
 }
+/**
+ * Inbound flood-dedupe + expiry gate (DESIGN.md §5.3).
+ *
+ * `is_new_msg_id` must come from a non-mutating check
+ * ([`crate::SeenIds::contains`]), never from [`crate::SeenIds::check_and_record`]
+ * -- see DTN D4 / `gossip.rs` module docs. The caller is responsible for
+ * calling [`crate::SeenIds::record`] itself, and only once the envelope has
+ * reached a terminal handled state (consumed, carried, expired-drop, or
+ * relayed-onward-only). Invariant: an envelope whose durable handling
+ * failed must be re-presentable; an envelope that was handled (even by
+ * deliberate drop, e.g. the `Expired` arm below) must be deduped.
+ */
 public func coreInboundGate(isNewMsgId: Bool, expiryMs: Int64, nowMs: Int64) -> CoreInboundGate {
     return try!  FfiConverterTypeCoreInboundGate.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_inbound_gate(
@@ -9222,6 +9621,15 @@ public func coreReactionSummariesByTarget(messages: [StoredMessage], ownUserId: 
     )
 })
 }
+/**
+ * Ack ids among `items` using [`core_should_ack_inbound`] alone -- i.e.
+ * Consumed/Expired only. Deliberately does not know about the
+ * consumed-SEEN rule (it has no store access to check it): a caller that
+ * can look up message origins should prefer
+ * [`MessageStore::core_relay_ack_ids_with_consumed`] instead, which folds
+ * this same rule in and additionally acks the narrow SEEN case covered by
+ * [`consumed_seen_is_ackable`].
+ */
 public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
     return try!  FfiConverterSequenceInt64.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_relay_ack_ids(
@@ -9229,6 +9637,30 @@ public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
     )
 })
 }
+/**
+ * Whether a relay-fetched envelope with this disposition may be acked
+ * (deleted from the relay mailbox) on the strength of the disposition
+ * alone.
+ *
+ * Only [`CoreInboundDisposition::Consumed`] (it was ours to open, and we
+ * did) and [`CoreInboundDisposition::Expired`] (it's dead weight regardless
+ * of who it was for) are safe to remove this way.
+ * [`CoreInboundDisposition::Carried`] must NOT be acked: relay
+ * proxy-polling means we may have fetched a contact's envelope on their
+ * behalf, and the relay copy is the durable fallback until the real
+ * recipient (or another proxy) fetches and consumes it -- deleting it here
+ * would silently drop the message. [`CoreInboundDisposition::Seen`] also
+ * returns `false` here, but it is NOT necessarily a dead end: see
+ * [`consumed_seen_is_ackable`] and
+ * [`MessageStore::core_relay_ack_ids_with_consumed`] for the narrow,
+ * independently store-verified case where a Seen copy is still safe to
+ * ack -- this function alone can't tell, since it has no store access.
+ *
+ * Safety invariant (applies to this function and
+ * [`consumed_seen_is_ackable`] alike): never ack a relay copy unless THIS
+ * device was the envelope's sole true endpoint consumer; when in doubt,
+ * don't ack. Re-fetch churn is recoverable; a deleted relay copy is not.
+ */
 public func coreShouldAckInbound(disposition: CoreInboundDisposition) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_should_ack_inbound(
@@ -9965,13 +10397,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_compute_recipient_hint() != 63461) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable() != 47254) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_format_lan_endpoint() != 59419) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_hello_identity_matches() != 7419) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_inbound_gate() != 33371) {
+    if (uniffi_cruisemesh_core_checksum_func_core_inbound_gate() != 7195) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_is_visible_chat_kind() != 47018) {
@@ -9998,10 +10433,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_reaction_summaries_by_target() != 52182) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 15537) {
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 13964) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 48329) {
+    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 173) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_subnet_24_hosts() != 3135) {
@@ -10352,6 +10787,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 56337) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 54880) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 22558) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10385,7 +10823,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 43009) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 63032) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 22726) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message() != 46727) {
@@ -10419,6 +10857,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_message_by_msg_id() != 40731) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_origin_by_msg_id() != 10578) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_message_reference() != 37519) {
@@ -10505,7 +10946,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_outgoing_receipt_envelope() != 65307) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_seenids_check_and_record() != 51277) {
+    if (uniffi_cruisemesh_core_checksum_method_seenids_check_and_record() != 58281) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_seenids_contains() != 35440) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_seenids_len() != 1292) {
