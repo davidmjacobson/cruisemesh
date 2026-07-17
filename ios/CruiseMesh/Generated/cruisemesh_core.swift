@@ -1634,6 +1634,59 @@ public protocol MessageStoreProtocol : AnyObject {
     func contactAvatarEpoch(userId: Data) throws  -> Int64
     
     /**
+     * Confirm-before-delete muling (DTN_TODOS.md §3.2, D2
+     * mule-drain-confirm): removes our carried copy of a 1:1 envelope
+     * addressed to `peer_user_id` once the peer's OWN digest proves they
+     * already have it. `peer_known_msg_ids` is the `recent_msg_id` field
+     * off their DIGEST frame (built by their own
+     * [`Self::core_digest_advertised_msg_ids`]), which as of D2 includes
+     * not just what they carry but also what they've recently consumed or
+     * authored -- so a message they actually received shows up here even
+     * though a true recipient never carries what it consumes; without that,
+     * this function would never fire for genuinely delivered mail.
+     *
+     * Scoped to `peer_user_id`'s own recent-day `recipient_hint`s
+     * ([`compute_recipient_hint`] over the trailing
+     * [`CARRY_HINT_DAY_WINDOW_DAYS`] days) -- deliberately NEVER a group's
+     * hints. Group-addressed carries have a separate mule-until-opened
+     * lifecycle (DESIGN.md §5.3/§6.5: a mule keeps muling group traffic for
+     * other members even after any one member has it, since the group's
+     * digest-recentMsgIds signal is about that ONE member, not "every
+     * member has it"), so scoping this query to only the peer's own 1:1
+     * hints already excludes every group-hint carry without needing an
+     * extra guard.
+     *
+     * Invariant (DTN_TODOS.md §3.2, verbatim): worst case of a dropped
+     * mid-transfer link is a harmless duplicate resend (the peer's seen-ID
+     * set / message store dedupes it), never a lost envelope; an envelope
+     * whose confirming digest never arrives still ages out normally via
+     * [`Self::prune_expired_carried`] -- unaffected here, since
+     * [`Self::carried_envelopes_for_hints`] already excludes anything past
+     * its own `expiry` as of `now_ms`.
+     *
+     * Returns the number of carried envelopes removed, for caller logging.
+     */
+    func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data], nowMs: Int64) throws  -> UInt64
+    
+    /**
+     * Build the exact `recent_msg_id` list this device advertises in its
+     * outgoing DIGEST (DESIGN.md §7.3; DTN_TODOS.md §3.2, D2
+     * mule-drain-confirm): carried entries first (mirrors the pre-existing
+     * carried-only budget), then recently *held* message-stream ids
+     * ([`MessageStore::recent_consumed_msg_ids`] -- both consumed incoming
+     * AND our own authored messages) filling whatever room remains, bounded
+     * to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format change:
+     * the DIGEST frame's `recent_msg_id` list already carries arbitrary
+     * content (`protocol.rs`'s DIGEST frame docs).
+     *
+     * This is also the proof-of-receipt half of D2: a mule still holding
+     * our envelope in its carry queue learns, on our next digest, that we
+     * already have it -- see [`Self::core_confirm_carried_deliveries`] for
+     * the other half, which acts on this same list from the peer's side.
+     */
+    func coreDigestAdvertisedMsgIds() throws  -> [Data]
+    
+    /**
      * Build the complete digest-time mule spray in one place.
      *
      * This deliberately includes all three canonical classes: foreign
@@ -2063,6 +2116,44 @@ public protocol MessageStoreProtocol : AnyObject {
     func receiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8) throws  -> UInt64
     
     /**
+     * Up to `limit` recent message-stream `msg_id`s this device holds,
+     * newest first: every `messages` row with a recorded envelope id, which
+     * covers both *consumed* incoming messages (opened-and-stored via
+     * `insert_incoming_message`) and our own *authored* ones
+     * (`insert_outgoing_message` writes the envelope's `msg_id` into the
+     * message row too, and `open` backfills it for older rows). This is the
+     * counterpart to [`MessageStore::carried_msg_ids`] for the D2
+     * mule-drain-confirm fix (DTN_TODOS.md §3.2): a recipient does not carry
+     * a message it has decrypted and stored -- it consumes it, so
+     * `carried_msg_ids` alone never advertises "I got it" for our own
+     * incoming mail. Merging this list into what we advertise in our own
+     * outgoing DIGEST (`recent_msg_id`s, see `protocol.rs`'s DIGEST frame
+     * docs, and `engine.rs::core_digest_advertised_msg_ids`) is what lets a
+     * mule that's still holding our envelope in its carry queue notice, on
+     * its next digest exchange with us, that we already have it and drop
+     * its copy -- without any wire-format change, since the DIGEST frame
+     * already carries an arbitrary `recent_msg_id` list.
+     *
+     * Including our own authored ids alongside the consumed ones is harmless
+     * and actively useful: a mule's Hook-B spray can hand us back an
+     * envelope we ourselves authored, and advertising its `msg_id` here
+     * suppresses that resend at the source -- the same rationale as the
+     * Kotlin side's `seedSeenIdsFromOwnHistory`.
+     *
+     * Newest first (unlike `carried_msg_ids`'s oldest-first) because the
+     * caller bounds the merged advertised list to a fixed count
+     * (`engine.rs::DIGEST_ADVERTISED_MSG_IDS_LIMIT`): the most recently
+     * landed messages are the ones most likely to still be sitting in some
+     * mule's carry queue, so they're the ones worth prioritizing when the
+     * list must be truncated.
+     *
+     * Only rows with a non-`NULL` `msg_id` participate -- legacy rows that
+     * predate envelope-id recording don't have one and are silently skipped
+     * by the `WHERE` clause.
+     */
+    func recentConsumedMsgIds(limit: UInt64) throws  -> [Data]
+    
+    /**
      * Attach first-arrival diagnostics to an already inserted incoming
      * message. A redundant mesh/relay copy never overwrites the original
      * route, hop count, or receive time.
@@ -2413,6 +2504,72 @@ open func contactAvatarEpoch(userId: Data)throws  -> Int64 {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_contact_avatar_epoch(self.uniffiClonePointer(),
         FfiConverterData.lower(userId),$0
+    )
+})
+}
+    
+    /**
+     * Confirm-before-delete muling (DTN_TODOS.md §3.2, D2
+     * mule-drain-confirm): removes our carried copy of a 1:1 envelope
+     * addressed to `peer_user_id` once the peer's OWN digest proves they
+     * already have it. `peer_known_msg_ids` is the `recent_msg_id` field
+     * off their DIGEST frame (built by their own
+     * [`Self::core_digest_advertised_msg_ids`]), which as of D2 includes
+     * not just what they carry but also what they've recently consumed or
+     * authored -- so a message they actually received shows up here even
+     * though a true recipient never carries what it consumes; without that,
+     * this function would never fire for genuinely delivered mail.
+     *
+     * Scoped to `peer_user_id`'s own recent-day `recipient_hint`s
+     * ([`compute_recipient_hint`] over the trailing
+     * [`CARRY_HINT_DAY_WINDOW_DAYS`] days) -- deliberately NEVER a group's
+     * hints. Group-addressed carries have a separate mule-until-opened
+     * lifecycle (DESIGN.md §5.3/§6.5: a mule keeps muling group traffic for
+     * other members even after any one member has it, since the group's
+     * digest-recentMsgIds signal is about that ONE member, not "every
+     * member has it"), so scoping this query to only the peer's own 1:1
+     * hints already excludes every group-hint carry without needing an
+     * extra guard.
+     *
+     * Invariant (DTN_TODOS.md §3.2, verbatim): worst case of a dropped
+     * mid-transfer link is a harmless duplicate resend (the peer's seen-ID
+     * set / message store dedupes it), never a lost envelope; an envelope
+     * whose confirming digest never arrives still ages out normally via
+     * [`Self::prune_expired_carried`] -- unaffected here, since
+     * [`Self::carried_envelopes_for_hints`] already excludes anything past
+     * its own `expiry` as of `now_ms`.
+     *
+     * Returns the number of carried envelopes removed, for caller logging.
+     */
+open func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data], nowMs: Int64)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_confirm_carried_deliveries(self.uniffiClonePointer(),
+        FfiConverterData.lower(peerUserId),
+        FfiConverterSequenceData.lower(peerKnownMsgIds),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Build the exact `recent_msg_id` list this device advertises in its
+     * outgoing DIGEST (DESIGN.md §7.3; DTN_TODOS.md §3.2, D2
+     * mule-drain-confirm): carried entries first (mirrors the pre-existing
+     * carried-only budget), then recently *held* message-stream ids
+     * ([`MessageStore::recent_consumed_msg_ids`] -- both consumed incoming
+     * AND our own authored messages) filling whatever room remains, bounded
+     * to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format change:
+     * the DIGEST frame's `recent_msg_id` list already carries arbitrary
+     * content (`protocol.rs`'s DIGEST frame docs).
+     *
+     * This is also the proof-of-receipt half of D2: a mule still holding
+     * our envelope in its carry queue learns, on our next digest, that we
+     * already have it -- see [`Self::core_confirm_carried_deliveries`] for
+     * the other half, which acts on this same list from the peer's side.
+     */
+open func coreDigestAdvertisedMsgIds()throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_digest_advertised_msg_ids(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -3123,6 +3280,50 @@ open func receiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8)th
         FfiConverterData.lower(chatId),
         FfiConverterData.lower(senderUserId),
         FfiConverterUInt8.lower(receiptType),$0
+    )
+})
+}
+    
+    /**
+     * Up to `limit` recent message-stream `msg_id`s this device holds,
+     * newest first: every `messages` row with a recorded envelope id, which
+     * covers both *consumed* incoming messages (opened-and-stored via
+     * `insert_incoming_message`) and our own *authored* ones
+     * (`insert_outgoing_message` writes the envelope's `msg_id` into the
+     * message row too, and `open` backfills it for older rows). This is the
+     * counterpart to [`MessageStore::carried_msg_ids`] for the D2
+     * mule-drain-confirm fix (DTN_TODOS.md §3.2): a recipient does not carry
+     * a message it has decrypted and stored -- it consumes it, so
+     * `carried_msg_ids` alone never advertises "I got it" for our own
+     * incoming mail. Merging this list into what we advertise in our own
+     * outgoing DIGEST (`recent_msg_id`s, see `protocol.rs`'s DIGEST frame
+     * docs, and `engine.rs::core_digest_advertised_msg_ids`) is what lets a
+     * mule that's still holding our envelope in its carry queue notice, on
+     * its next digest exchange with us, that we already have it and drop
+     * its copy -- without any wire-format change, since the DIGEST frame
+     * already carries an arbitrary `recent_msg_id` list.
+     *
+     * Including our own authored ids alongside the consumed ones is harmless
+     * and actively useful: a mule's Hook-B spray can hand us back an
+     * envelope we ourselves authored, and advertising its `msg_id` here
+     * suppresses that resend at the source -- the same rationale as the
+     * Kotlin side's `seedSeenIdsFromOwnHistory`.
+     *
+     * Newest first (unlike `carried_msg_ids`'s oldest-first) because the
+     * caller bounds the merged advertised list to a fixed count
+     * (`engine.rs::DIGEST_ADVERTISED_MSG_IDS_LIMIT`): the most recently
+     * landed messages are the ones most likely to still be sitting in some
+     * mule's carry queue, so they're the ones worth prioritizing when the
+     * list must be truncated.
+     *
+     * Only rows with a non-`NULL` `msg_id` participate -- legacy rows that
+     * predate envelope-id recording don't have one and are silently skipped
+     * by the `WHERE` clause.
+     */
+open func recentConsumedMsgIds(limit: UInt64)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_recent_consumed_msg_ids(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(limit),$0
     )
 })
 }
@@ -10784,6 +10985,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_avatar_epoch() != 49788) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 38296) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 37419) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 56337) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10899,6 +11106,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_receipt_through() != 17794) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_recent_consumed_msg_ids() != 58947) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_message_arrival() != 42850) {
