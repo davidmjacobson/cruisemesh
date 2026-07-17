@@ -85,6 +85,15 @@ impl SeenIds {
     /// **new** (the caller should process/relay this envelope) or `false` if
     /// it was already in the set (a duplicate to drop). This is the atomic
     /// test-and-set the flood receive path runs on every inbound envelope.
+    ///
+    /// DTN D4: this combined test-and-set is safe to use as long as the
+    /// caller records *before* durably handling the envelope. Native inbound
+    /// paths must NOT do that anymore -- see [`SeenIds::contains`] below and
+    /// the module docs' "check-then-record" note. This method remains for
+    /// the outgoing/authoring path (where there is no "handling failure" to
+    /// worry about; see [`SeenIds::record`]) and for anywhere a caller has
+    /// already established it will unconditionally treat the envelope as
+    /// handled either way.
     pub fn check_and_record(&self, msg_id: Vec<u8>) -> bool {
         let mut inner = self.inner.lock().expect("seen-ids mutex poisoned");
         if inner.seen.contains(&msg_id) {
@@ -92,6 +101,29 @@ impl SeenIds {
         }
         inner.insert(msg_id);
         true
+    }
+
+    /// Non-mutating membership test: is `msg_id` already in the seen set?
+    ///
+    /// DTN D4 (seen-set poisoning ordering): the inbound receive path used to
+    /// call [`SeenIds::check_and_record`] *before* the envelope was durably
+    /// handled (stored/carried/delivered). If that handling then failed --
+    /// e.g. a disk-full error out of `enqueueCarriedEnvelope` -- the `msg_id`
+    /// was already poisoned into the seen set, so every future copy of that
+    /// envelope on any link was silently dropped as a duplicate for the rest
+    /// of the process lifetime, even though it was never actually handled.
+    ///
+    /// The fix is check-then-record: native calls `contains` (via
+    /// [`crate::core_inbound_gate`]'s `is_new_msg_id = !contains(id)`) to
+    /// decide whether to process the envelope at all, then only calls
+    /// [`SeenIds::record`] once the envelope reaches a **terminal handled
+    /// state** (consumed, carried, expired-drop, or relayed-onward-only).
+    /// The invariant: an envelope whose durable handling failed must be
+    /// re-presentable; an envelope that was handled (even by deliberate
+    /// drop) must be deduped.
+    pub fn contains(&self, msg_id: Vec<u8>) -> bool {
+        let inner = self.inner.lock().expect("seen-ids mutex poisoned");
+        inner.seen.contains(&msg_id)
     }
 
     /// Record `msg_id` as seen without reporting novelty, for envelopes this
@@ -174,5 +206,60 @@ mod tests {
         seen.check_and_record(b"b".to_vec());
         seen.check_and_record(b"a".to_vec()); // duplicate, no growth
         assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn contains_is_non_mutating() {
+        let seen = SeenIds::new();
+        // Repeated `contains` checks on an unseen id never insert it.
+        assert!(!seen.contains(b"a".to_vec()));
+        assert!(!seen.contains(b"a".to_vec()));
+        assert_eq!(seen.len(), 0);
+        assert!(seen.check_and_record(b"a".to_vec()));
+        assert!(seen.contains(b"a".to_vec()));
+        assert_eq!(seen.len(), 1);
+    }
+
+    /// DTN D4's required scenario, expressed purely against [`SeenIds`] and
+    /// [`crate::core_inbound_gate`]: a msg_id is gated (checked, not
+    /// recorded), simulated durable handling fails so the caller does NOT
+    /// call `record`, and the same msg_id arriving again must still gate as
+    /// `Dispatch`, not `Seen`.
+    #[test]
+    fn failed_handling_leaves_msg_id_re_presentable() {
+        use crate::{core_inbound_gate, CoreInboundGate};
+
+        let seen = SeenIds::new();
+        let msg_id = b"msg-1".to_vec();
+        let expiry_ms = 1_000;
+        let now_ms = 10;
+
+        // First arrival: not yet seen -> Dispatch.
+        let is_new = !seen.contains(msg_id.clone());
+        assert!(is_new);
+        assert_eq!(
+            core_inbound_gate(is_new, expiry_ms, now_ms),
+            CoreInboundGate::Dispatch
+        );
+        // Simulated durable handling (e.g. enqueueCarriedEnvelope) fails: the
+        // caller must NOT call `record` in this branch.
+
+        // Second arrival of the same msg_id: still not recorded, so it must
+        // gate as Dispatch again -- the earlier failure did not poison it.
+        let is_new_again = !seen.contains(msg_id.clone());
+        assert!(is_new_again);
+        assert_eq!(
+            core_inbound_gate(is_new_again, expiry_ms, now_ms),
+            CoreInboundGate::Dispatch
+        );
+
+        // Now simulate handling succeeding this time: the caller records it.
+        seen.record(msg_id.clone());
+        let is_new_third = !seen.contains(msg_id.clone());
+        assert!(!is_new_third);
+        assert_eq!(
+            core_inbound_gate(is_new_third, expiry_ms, now_ms),
+            CoreInboundGate::Seen
+        );
     }
 }

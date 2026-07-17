@@ -528,6 +528,23 @@ final class MeshController: ObservableObject {
         )
     }
 
+    /// DTN D4 (seen-set poisoning ordering, mirrors Android
+    /// `MeshService.processInboundEnvelope`'s KDoc): [GossipState.seenIds]
+    /// is checked with the non-mutating `contains`, never `checkAndRecord`,
+    /// and only recorded once this envelope reaches a **terminal handled
+    /// state** -- consumed, carried, or expired-drop -- at each `return`
+    /// below. Invariant: an envelope whose durable handling failed must be
+    /// re-presentable; an envelope that was handled (even by deliberate
+    /// drop) must be deduped. Before this, `checkAndRecord` ran up front, so
+    /// a later store failure (e.g. disk-full out of `carryForeign`)
+    /// permanently poisoned the `msgId` even though it was never actually
+    /// carried or delivered.
+    ///
+    /// Loop-hazard note (see `relayForeign`'s doc comment): recording after
+    /// relaying is safe here because the arriving link is excluded from the
+    /// relay fanout and this function runs synchronously per received frame,
+    /// so this node cannot re-ingest the frame it just relayed before the
+    /// `record` call below completes.
     func processInboundEnvelope(
         sourceAddress: String?,
         msgId: Data,
@@ -540,7 +557,7 @@ final class MeshController: ObservableObject {
         let sourceLabel = sourceAddress ?? "relay"
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         switch coreInboundGate(
-            isNewMsgId: GossipState.seenIds.checkAndRecord(msgId: msgId),
+            isNewMsgId: !GossipState.seenIds.contains(msgId: msgId),
             expiryMs: expiry,
             nowMs: now
         ) {
@@ -548,6 +565,8 @@ final class MeshController: ObservableObject {
             return .seen
         case .expired:
             log.info("Dropping expired envelope from \(sourceLabel, privacy: .public)")
+            // A deliberate drop is still a terminal handled state.
+            GossipState.seenIds.record(msgId: msgId)
             return .expired
         case .dispatch:
             break
@@ -567,6 +586,9 @@ final class MeshController: ObservableObject {
                 msgId: msgId,
                 arrival: arrival
             )
+            // DTN D4: reaching this line means delivery ran to completion --
+            // safe, and required, to record.
+            GossipState.seenIds.record(msgId: msgId)
             return .consumed
         } catch {
             // Pairwise open failed: either foreign 1:1 traffic, or a group
@@ -595,7 +617,7 @@ final class MeshController: ObservableObject {
                     recipientHint: recipientHint,
                     sealed: sealed
                 )
-                carryForeign(
+                _ = carryForeign(
                     msgId: msgId,
                     hopTtl: hopTtl,
                     expiry: expiry,
@@ -603,6 +625,11 @@ final class MeshController: ObservableObject {
                     sealed: sealed,
                     forceFamily: true
                 )
+                // DTN D4: we already durably delivered our own copy above
+                // (`deliverOpenedGroupEnvelope`), so record regardless of
+                // whether the best-effort mule copy for absent members
+                // succeeded -- same reasoning as Android's KDoc.
+                GossipState.seenIds.record(msgId: msgId)
                 return .consumed
             }
             relayForeign(
@@ -613,7 +640,23 @@ final class MeshController: ObservableObject {
                 recipientHint: recipientHint,
                 sealed: sealed
             )
-            carryForeign(msgId: msgId, hopTtl: hopTtl, expiry: expiry, recipientHint: recipientHint, sealed: sealed)
+            let carried = carryForeign(
+                msgId: msgId,
+                hopTtl: hopTtl,
+                expiry: expiry,
+                recipientHint: recipientHint,
+                sealed: sealed
+            )
+            // DTN D4: only record once the durable carry actually succeeded.
+            // `carryForeign` reports store failure via its Bool return
+            // (rather than swallowing it silently), so a disk-full failure
+            // here leaves this msgId unrecorded: the next copy of this
+            // envelope on any link re-gates as `.dispatch` and gets another
+            // chance to carry it, instead of being silently dropped as
+            // `.seen` for the rest of the process lifetime.
+            if carried {
+                GossipState.seenIds.record(msgId: msgId)
+            }
             return .carried
         }
     }
@@ -1561,6 +1604,12 @@ final class MeshController: ObservableObject {
         return authored.envelope
     }
 
+    /// Android `carryForeignEnvelope` twin. Returns `true` if the store
+    /// operation completed (whether it newly queued the envelope or found it
+    /// already carried) and `false` if the store call itself failed (`try?`
+    /// turns a thrown error into `nil`). DTN D4: `processInboundEnvelope`
+    /// uses this return value to decide whether it's safe to mark the
+    /// envelope's `msgId` seen -- see its doc comment.
     private func carryForeign(
         msgId: Data,
         hopTtl: UInt8,
@@ -1568,10 +1617,10 @@ final class MeshController: ObservableObject {
         recipientHint: Data,
         sealed: Data,
         forceFamily: Bool = false
-    ) {
+    ) -> Bool {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let isFamily = forceFamily || hintMatchesAnyContact(hint: recipientHint, now: now)
-        _ = try? store.enqueueCarriedEnvelope(
+        guard let stored = try? store.enqueueCarriedEnvelope(
             envelope: CarriedEnvelope(
                 msgId: msgId,
                 hopTtl: hopTtl,
@@ -1582,10 +1631,33 @@ final class MeshController: ObservableObject {
             isFamily: isFamily,
             receivedAtMs: now,
             foreignBudgetBytes: MeshDefaults.foreignCarryBudgetBytes
-        )
-        if isFamily { RelaySyncEvents.requestSync() }
+        ) else {
+            return false
+        }
+        if stored, isFamily {
+            RelaySyncEvents.requestSync()
+        }
+        return true
     }
 
+    /// Floods a foreign (not-for-us) envelope onward, Android
+    /// `relayForeignEnvelope` twin. The arriving link is excluded from the
+    /// fanout below to avoid the trivial echo.
+    ///
+    /// DTN D4 loop-hazard note: since `processInboundEnvelope` moved to
+    /// check-then-record, `GossipState.seenIds` is *not yet* updated for
+    /// this `msgId` at the moment this call happens (it's recorded after
+    /// this function returns, once the whole terminal branch succeeds -- see
+    /// `processInboundEnvelope`'s doc comment). That's still safe against
+    /// self-re-ingestion: the arriving link is excluded from the fanout (so
+    /// this node can't hand the relayed frame straight back to itself), and
+    /// `processInboundEnvelope` runs synchronously per received frame, so
+    /// there is no way for this same `msgId` to re-enter
+    /// `processInboundEnvelope` on *this* node before the terminal `record`
+    /// call a few lines below this call site completes. A frame this node
+    /// relays could only loop back from a third node's rebroadcast, which
+    /// takes at least one more hop and one more link round-trip -- by then
+    /// this node's record has long since happened.
     private func relayForeign(
         sourceAddress: String?,
         msgId: Data,

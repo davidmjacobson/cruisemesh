@@ -44,6 +44,16 @@ pub struct CoreDigestSprayPlan {
     pub own_receipt_frames: Vec<Vec<u8>>,
 }
 
+/// Inbound flood-dedupe + expiry gate (DESIGN.md §5.3).
+///
+/// `is_new_msg_id` must come from a non-mutating check
+/// ([`crate::SeenIds::contains`]), never from [`crate::SeenIds::check_and_record`]
+/// -- see DTN D4 / `gossip.rs` module docs. The caller is responsible for
+/// calling [`crate::SeenIds::record`] itself, and only once the envelope has
+/// reached a terminal handled state (consumed, carried, expired-drop, or
+/// relayed-onward-only). Invariant: an envelope whose durable handling
+/// failed must be re-presentable; an envelope that was handled (even by
+/// deliberate drop, e.g. the `Expired` arm below) must be deduped.
 #[uniffi::export]
 pub fn core_inbound_gate(is_new_msg_id: bool, expiry_ms: i64, now_ms: i64) -> CoreInboundGate {
     if !is_new_msg_id {
