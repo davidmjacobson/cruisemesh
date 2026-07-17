@@ -1835,10 +1835,18 @@ final class MeshController: ObservableObject {
                     }
                     dispositions.append(CoreRelayEnvelopeDisposition(
                         relayId: env.id,
+                        msgId: env.msgId,
                         disposition: disposition
                     ))
                 }
-                let acks = coreRelayAckIds(items: dispositions)
+                // Consumed/Expired ack unconditionally; a SEEN envelope is
+                // acked only if this device durably consumed it as a 1:1
+                // message from someone else (DTN_TODOS.md §3.1) -- see
+                // CoreRelayEnvelopeDisposition's doc comment in engine.rs.
+                let acks = try store.coreRelayAckIdsWithConsumed(
+                    items: dispositions,
+                    ownUserId: identity.userId
+                )
                 if !acks.isEmpty {
                     try RelayClient.ackEnvelopes(config: config, ids: acks)
                 }

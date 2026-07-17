@@ -135,6 +135,19 @@ pub struct MessageReference {
     pub reply_to_msg_id: Option<Vec<u8>>,
 }
 
+/// Where a stored message row lives (`chat_id`) and who authored it
+/// (`sender_user_id`), keyed by stable envelope `msg_id` -- see
+/// [`MessageStore::message_origin_by_msg_id`]. Both fields are needed by the
+/// relay ack-decision path: the local storage convention makes their
+/// comparison meaningful (a 1:1 incoming row has `chat_id ==
+/// sender_user_id`; a group row has `chat_id = group id`, which never equals
+/// a member's user id).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct MessageOrigin {
+    pub chat_id: Vec<u8>,
+    pub sender_user_id: Vec<u8>,
+}
+
 /// An accepted friend (DESIGN.md §6.2): the public half of someone else's
 /// identity, imported from a scanned/pasted `FriendCard`. `user_id` is
 /// derived the same way as one's own (`friend_card_user_id`), so it's a
@@ -302,6 +315,15 @@ impl MessageStore {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_chat_msg_id
              ON messages(chat_id, msg_id)",
+            [],
+        )
+        .map_err(store_err)?;
+        // Unlike the composite index above, `message_origin_by_msg_id` looks
+        // a `msg_id` up with no `chat_id` in hand (a relay-fetched envelope
+        // knows only its own `msg_id`), so it needs `msg_id` leading an index
+        // on its own to avoid a full table scan.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(msg_id)",
             [],
         )
         .map_err(store_err)?;
@@ -679,6 +701,53 @@ impl MessageStore {
              LIMIT 1",
             params![chat_id, msg_id],
             row_to_message,
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    /// Chat and sender of a stored message keyed by its stable envelope
+    /// `msg_id` alone, searched across every chat -- unlike
+    /// [`Self::message_by_msg_id`], which needs `chat_id` up front and is
+    /// useless here because a relay-fetched envelope only carries its own
+    /// `msg_id`.
+    ///
+    /// This backs the consumed-SEEN relay ack rule in `engine.rs`
+    /// (`MessageStore::core_relay_ack_ids_with_consumed`): a relay-fetched
+    /// copy that dedupes as `Seen` (already handled via some other path) is
+    /// only safe to ack if THIS device actually consumed it as a real
+    /// message, not merely muled it. A row only exists here for kinds that
+    /// persist a durable `msg_id` -- 1:1/group text, attachment manifests,
+    /// reactions (inserted via `insert_incoming_message`) and our own
+    /// authored messages (via `insert_outgoing_message`/
+    /// `insert_outgoing_reply`). Hidden kinds -- receipts, profile sync,
+    /// friend requests/directory, group invites, LAN endpoint hints -- are
+    /// stored, if at all, via the plain `insert_message` with `msg_id =
+    /// NULL`, so they never match and the caller correctly treats "no
+    /// match" as "cannot vouch for this copy, don't ack."
+    ///
+    /// Returns `None` for an unknown `msg_id` (never stored, or hidden-kind
+    /// with no durable id). The store deliberately returns the raw
+    /// [`MessageOrigin`] instead of a verdict: it is the caller's job to
+    /// exclude own-authored rows (`sender_user_id == own user id` -- the
+    /// relay copy is there for the recipient) and group rows (`chat_id !=
+    /// sender_user_id` -- other members of the shared family mailbox still
+    /// need the relay copy).
+    pub fn message_origin_by_msg_id(
+        &self,
+        msg_id: Vec<u8>,
+    ) -> Result<Option<MessageOrigin>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT chat_id, sender_user_id FROM messages
+             WHERE msg_id = ?1 ORDER BY id ASC LIMIT 1",
+            params![msg_id],
+            |row| {
+                Ok(MessageOrigin {
+                    chat_id: row.get(0)?,
+                    sender_user_id: row.get(1)?,
+                })
+            },
         )
         .optional()
         .map_err(store_err)
@@ -2696,6 +2765,109 @@ mod tests {
                 .unwrap()
                 .msg_id,
             vec![2; MESSAGE_ID_LEN],
+        );
+    }
+
+    #[test]
+    fn message_origin_by_msg_id_finds_a_one_to_one_row_by_msg_id_alone() {
+        // Unlike `message_by_msg_id`, no `chat_id` is supplied -- this is the
+        // relay ack-decision path, which only ever has the envelope's
+        // `msg_id` in hand. A 1:1 incoming row follows the local convention
+        // "chat keyed by the other party": chat_id == sender_user_id, which
+        // is exactly what the ack-decision helper keys off.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let incoming = msg(b"alice", b"alice", 1, "hi");
+        let incoming_id = vec![7; MESSAGE_ID_LEN];
+        store
+            .insert_incoming_message(incoming.clone(), incoming_id.clone(), None)
+            .unwrap();
+
+        assert_eq!(
+            store.message_origin_by_msg_id(incoming_id).unwrap(),
+            Some(MessageOrigin {
+                chat_id: b"alice".to_vec(),
+                sender_user_id: b"alice".to_vec(),
+            }),
+        );
+    }
+
+    #[test]
+    fn message_origin_by_msg_id_reports_a_group_row_with_its_group_chat_id() {
+        // A consumed group message is stored under chat_id = group id with
+        // sender_user_id = the authoring member, so chat_id !=
+        // sender_user_id. The origin must surface both fields untouched: the
+        // ack-decision helper relies on that inequality to refuse to ack a
+        // group envelope off the shared family relay mailbox (other members
+        // still need the relay copy).
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let group_message = msg(b"group-1", b"alice", 1, "hi group");
+        let group_msg_id = vec![10; MESSAGE_ID_LEN];
+        store
+            .insert_incoming_message(group_message, group_msg_id.clone(), None)
+            .unwrap();
+
+        assert_eq!(
+            store.message_origin_by_msg_id(group_msg_id).unwrap(),
+            Some(MessageOrigin {
+                chat_id: b"group-1".to_vec(),
+                sender_user_id: b"alice".to_vec(),
+            }),
+        );
+    }
+
+    #[test]
+    fn message_origin_by_msg_id_returns_none_for_an_unknown_msg_id() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert_eq!(
+            store
+                .message_origin_by_msg_id(vec![0xEE; MESSAGE_ID_LEN])
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn message_origin_by_msg_id_returns_our_own_id_for_authored_outbound_messages() {
+        // Our own outbound envelope also has a `messages` row (via
+        // `insert_outgoing_message`), with `sender_user_id == us`. The store
+        // deliberately does NOT filter this out -- it's the caller's job
+        // (`engine::consumed_seen_is_ackable`) to compare the returned
+        // sender against its own identity and refuse to ack an own-authored
+        // envelope, since that relay copy exists for the recipient, not us.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let message = msg(b"chat-a", b"self", 1, "hello");
+        let envelope = outbound_for(&message, b"recipient", &[8; MESSAGE_ID_LEN]);
+        store
+            .insert_outgoing_message(message, envelope, 1_700_000_000_000)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .message_origin_by_msg_id(vec![8; MESSAGE_ID_LEN])
+                .unwrap(),
+            Some(MessageOrigin {
+                chat_id: b"chat-a".to_vec(),
+                sender_user_id: b"self".to_vec(),
+            }),
+        );
+    }
+
+    #[test]
+    fn message_origin_by_msg_id_does_not_match_hidden_kind_rows_with_no_msg_id() {
+        // Hidden kinds (receipts, profile sync, friend requests/directory,
+        // group invites, LAN endpoint hints) are stored via plain
+        // `insert_message`, which never records a `msg_id` -- so they must
+        // never spuriously match a real envelope's `msg_id` here.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "hidden-kind-payload"))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .message_origin_by_msg_id(vec![9; MESSAGE_ID_LEN])
+                .unwrap(),
+            None,
         );
     }
 
