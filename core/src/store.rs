@@ -91,6 +91,17 @@
 //! [`MessageStore::messages_after`] answers the other half: given what a
 //! peer's digest says they already have, which of *our* messages from a
 //! given sender are they missing.
+//!
+//! The advertised msg-id list is also how a mule learns it can safely drop a
+//! carried 1:1 envelope (DTN_TODOS.md §3.2, D2 mule-drain-confirm): the true
+//! recipient doesn't carry a message it opens, it *consumes* it, so
+//! [`MessageStore::recent_consumed_msg_ids`] feeds the same advertised list
+//! alongside [`MessageStore::carried_msg_ids`] (see
+//! `engine.rs::core_digest_advertised_msg_ids`) -- otherwise a message we
+//! successfully received would never show up in what we tell a mule we
+//! already have, and the mule would keep it until expiry. The other half of
+//! D2 -- actually removing a carried envelope once a peer's digest proves
+//! they have it -- is `engine.rs::core_confirm_carried_deliveries`.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
@@ -2144,6 +2155,56 @@ impl MessageStore {
             .prepare(
                 "SELECT msg_id FROM carried_envelopes
                  ORDER BY received_at ASC, msg_id ASC
+                 LIMIT ?1",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Up to `limit` recent message-stream `msg_id`s this device holds,
+    /// newest first: every `messages` row with a recorded envelope id, which
+    /// covers both *consumed* incoming messages (opened-and-stored via
+    /// `insert_incoming_message`) and our own *authored* ones
+    /// (`insert_outgoing_message` writes the envelope's `msg_id` into the
+    /// message row too, and `open` backfills it for older rows). This is the
+    /// counterpart to [`MessageStore::carried_msg_ids`] for the D2
+    /// mule-drain-confirm fix (DTN_TODOS.md §3.2): a recipient does not carry
+    /// a message it has decrypted and stored -- it consumes it, so
+    /// `carried_msg_ids` alone never advertises "I got it" for our own
+    /// incoming mail. Merging this list into what we advertise in our own
+    /// outgoing DIGEST (`recent_msg_id`s, see `protocol.rs`'s DIGEST frame
+    /// docs, and `engine.rs::core_digest_advertised_msg_ids`) is what lets a
+    /// mule that's still holding our envelope in its carry queue notice, on
+    /// its next digest exchange with us, that we already have it and drop
+    /// its copy -- without any wire-format change, since the DIGEST frame
+    /// already carries an arbitrary `recent_msg_id` list.
+    ///
+    /// Including our own authored ids alongside the consumed ones is harmless
+    /// and actively useful: a mule's Hook-B spray can hand us back an
+    /// envelope we ourselves authored, and advertising its `msg_id` here
+    /// suppresses that resend at the source -- the same rationale as the
+    /// Kotlin side's `seedSeenIdsFromOwnHistory`.
+    ///
+    /// Newest first (unlike `carried_msg_ids`'s oldest-first) because the
+    /// caller bounds the merged advertised list to a fixed count
+    /// (`engine.rs::DIGEST_ADVERTISED_MSG_IDS_LIMIT`): the most recently
+    /// landed messages are the ones most likely to still be sitting in some
+    /// mule's carry queue, so they're the ones worth prioritizing when the
+    /// list must be truncated.
+    ///
+    /// Only rows with a non-`NULL` `msg_id` participate -- legacy rows that
+    /// predate envelope-id recording don't have one and are silently skipped
+    /// by the `WHERE` clause.
+    pub fn recent_consumed_msg_ids(&self, limit: u64) -> Result<Vec<Vec<u8>>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT msg_id FROM messages
+                 WHERE msg_id IS NOT NULL
+                 ORDER BY id DESC
                  LIMIT ?1",
             )
             .map_err(store_err)?;
@@ -5275,6 +5336,79 @@ mod tests {
 
         let ids = store.carried_msg_ids(2).unwrap();
         assert_eq!(ids, vec![b"m1".to_vec(), b"m2".to_vec()]);
+    }
+
+    #[test]
+    fn recent_consumed_msg_ids_are_returned_newest_first_and_limited() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_incoming_message(
+                msg(b"chat-a", b"alice", 1, "one"),
+                vec![1; MESSAGE_ID_LEN],
+                None,
+            )
+            .unwrap();
+        store
+            .insert_incoming_message(
+                msg(b"chat-a", b"alice", 2, "two"),
+                vec![2; MESSAGE_ID_LEN],
+                None,
+            )
+            .unwrap();
+        store
+            .insert_incoming_message(
+                msg(b"chat-a", b"alice", 3, "three"),
+                vec![3; MESSAGE_ID_LEN],
+                None,
+            )
+            .unwrap();
+
+        let ids = store.recent_consumed_msg_ids(2).unwrap();
+        assert_eq!(ids, vec![vec![3; MESSAGE_ID_LEN], vec![2; MESSAGE_ID_LEN]]);
+    }
+
+    #[test]
+    fn recent_consumed_msg_ids_skips_rows_without_a_msg_id() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // Legacy rows (inserted before envelope-id recording existed) carry
+        // no msg_id; `insert_message` reproduces that shape.
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "legacy"))
+            .unwrap();
+        store
+            .insert_incoming_message(
+                msg(b"chat-a", b"alice", 2, "two"),
+                vec![2; MESSAGE_ID_LEN],
+                None,
+            )
+            .unwrap();
+
+        let ids = store.recent_consumed_msg_ids(10).unwrap();
+        assert_eq!(ids, vec![vec![2; MESSAGE_ID_LEN]]);
+    }
+
+    #[test]
+    fn recent_consumed_msg_ids_includes_own_authored_messages() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_incoming_message(
+                msg(b"chat-a", b"alice", 1, "theirs"),
+                vec![1; MESSAGE_ID_LEN],
+                None,
+            )
+            .unwrap();
+        // Our own authored message: `insert_outgoing_message` records the
+        // envelope's msg_id on the message row too, so it must be advertised
+        // alongside consumed incoming ids -- that's what suppresses a mule's
+        // Hook-B spray from handing us back an envelope we authored.
+        let authored = msg(b"chat-a", b"self", 1, "mine");
+        let envelope = outbound_for(&authored, b"alice", &[2; MESSAGE_ID_LEN]);
+        store
+            .insert_outgoing_message(authored, envelope, 1_000)
+            .unwrap();
+
+        let ids = store.recent_consumed_msg_ids(10).unwrap();
+        assert_eq!(ids, vec![vec![2; MESSAGE_ID_LEN], vec![1; MESSAGE_ID_LEN]]);
     }
 
     #[test]

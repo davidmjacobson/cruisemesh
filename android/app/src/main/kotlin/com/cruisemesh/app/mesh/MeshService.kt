@@ -146,12 +146,18 @@ private const val RELAY_BATCH_LIMIT: ULong = 128uL
 private const val RELAY_POLL_INTERVAL_MS = 60_000L
 
 /**
- * Exact carried-`msg_id` count advertised in the interim digest. This is the
- * stand-in for §7.3's deferred bloom filter: large enough to suppress blind
- * resend of a typical family-scale carry queue, still small enough to fit in
- * one HELLO sync over fragmented BLE.
+ * Bound on how many of our own carried `msg_id`s [seedSeenIdsFromOwnHistory]
+ * re-seeds into [GossipState.seenIds] at startup.
+ *
+ * DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): this used to also be the cap
+ * on the outgoing DIGEST's advertised `msg_id` list, but that decision now
+ * lives in core (`engine.rs::DIGEST_ADVERTISED_MSG_IDS_LIMIT`, behind
+ * [MessageStore.coreDigestAdvertisedMsgIds]) so both platforms share one
+ * source of truth. This constant now only bounds the unrelated seeding
+ * query below; it's kept at the same value as a reasonable, previously
+ * proven bound, not because the two uses need to match.
  */
-private const val DIGEST_CARRIED_MSG_IDS_LIMIT: ULong = 512uL
+private const val SEEN_ID_SEED_CARRIED_LIMIT: ULong = 512uL
 
 /**
  * BLE_1TO1_MULING.md Hook B: bounded per-digest-exchange budget (sealed-byte
@@ -478,7 +484,7 @@ class MeshService : Service() {
                     GossipState.seenIds.record(envelope.msgId)
                 }
             }
-            for (msgId in store.carriedMsgIds(DIGEST_CARRIED_MSG_IDS_LIMIT)) {
+            for (msgId in store.carriedMsgIds(SEEN_ID_SEED_CARRIED_LIMIT)) {
                 GossipState.seenIds.record(msgId)
             }
         } catch (e: CoreException) {
@@ -1370,20 +1376,26 @@ class MeshService : Service() {
     /**
      * HELLO handling (DESIGN.md §5.2 handshake). Records the address->userId
      * mapping, then kicks off the real digest sync (DESIGN.md §7.3). Every
-     * peer, contact or stranger, gets a digest now because the carried
-     * `msg_id` set is useful to both: it suppresses blind re-spray of foreign
-     * mule traffic on reconnect. A known contact additionally gets the
-     * per-sender lamport digest for the 1:1 chat, i.e. "here's what I have
-     * from myself, contiguously, through lamport N per sender." That's the
-     * wire-chatId convention from the class KDoc applied to DIGEST frames:
-     * `chatId` here is OUR OWN userId, and `entries` is
-     * [MessageStore.chatDigest] keyed by the *local* chat (the contact's
-     * userId), because locally that's how this 1:1 chat's history is stored.
-     * The peer's [handleDigest] uses the matching digest we sent it (from a
-     * prior HELLO) the same way to send us what we're missing -- see that
-     * method for the receiving half of this exchange. This replaces the
-     * earlier naive stand-in that just resent our entire outgoing history on
-     * every reconnect.
+     * peer, contact or stranger, gets a digest now because the advertised
+     * `msg_id` set ([MessageStore.coreDigestAdvertisedMsgIds]) is useful to
+     * both: it suppresses blind re-spray of foreign mule traffic on
+     * reconnect, and (DTN D2 mule-drain-confirm, DTN_TODOS.md §3.2) it
+     * doubles as our proof-of-receipt to anyone muling something FOR us --
+     * the advertised set includes not just what we're still carrying for
+     * others but also what we've recently consumed or authored ourselves,
+     * which is exactly the signal [MessageStore.coreConfirmCarriedDeliveries]
+     * on the mule's side (called from [sprayDigestPlanTo]) acts on. A known
+     * contact additionally gets the per-sender lamport digest for the 1:1
+     * chat, i.e. "here's what I have from myself, contiguously, through
+     * lamport N per sender." That's the wire-chatId convention from the
+     * class KDoc applied to DIGEST frames: `chatId` here is OUR OWN userId,
+     * and `entries` is [MessageStore.chatDigest] keyed by the *local* chat
+     * (the contact's userId), because locally that's how this 1:1 chat's
+     * history is stored. The peer's [handleDigest] uses the matching digest
+     * we sent it (from a prior HELLO) the same way to send us what we're
+     * missing -- see that method for the receiving half of this exchange.
+     * This replaces the earlier naive stand-in that just resent our entire
+     * outgoing history on every reconnect.
      *
      * An unrecognized userId still means "not a friend (yet)" for sealed 1:1
      * chat: `entries` is empty, because we have no local chat history keyed to
@@ -1419,7 +1431,7 @@ class MeshService : Service() {
         } else {
             sendLanEndpointHintTo(address)
         }
-        val digestFrame = encodeDigest(identity.userId, digestEntries, store.carriedMsgIds(DIGEST_CARRIED_MSG_IDS_LIMIT))
+        val digestFrame = encodeDigest(identity.userId, digestEntries, store.coreDigestAdvertisedMsgIds())
         MeshRouter.sendToAddress(address, digestFrame)
     }
 
@@ -1511,6 +1523,15 @@ class MeshService : Service() {
     ) {
         val now = System.currentTimeMillis()
         try {
+            // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): confirm delivery
+            // of anything this digest's advertised `msg_id`s prove the peer
+            // already has BEFORE building the spray plan below, so a
+            // just-confirmed carried envelope isn't immediately re-sprayed
+            // back at the peer who just told us they have it.
+            val confirmed = store.coreConfirmCarriedDeliveries(peerUserId, peerKnownMsgIds, now)
+            if (confirmed > 0uL) {
+                Log.i(TAG, "Confirmed delivery of $confirmed carried envelope(s) to ${UserIdHex.encode(peerUserId)}; dropped our copy")
+            }
             val plan = store.coreDigestSprayPlan(
                 ownUserId = identity.userId,
                 peerUserId = peerUserId,
@@ -1897,11 +1918,28 @@ class MeshService : Service() {
      * Hands over every carried envelope destined for the peer that just
      * HELLO'd on [address] (DESIGN.md §5.3): we compute the peer's recent-day
      * `recipient_hint`s ([recentHintsFor]) and pull matching envelopes from
-     * the store, send each on this link, and drop it once sent (a mule's job
-     * ends on delivery). Expired entries are pruned first. If the peer already
-     * saw an envelope via an earlier flood, their own seen-ID set drops the
-     * duplicate harmlessly; if they didn't (the whole point -- they were out
-     * of range when it flooded), this is how it reaches them.
+     * the store, and send each on this link. Expired entries are pruned
+     * first. If the peer already saw an envelope via an earlier flood, their
+     * own seen-ID set drops the duplicate harmlessly; if they didn't (the
+     * whole point -- they were out of range when it flooded), this is how it
+     * reaches them.
+     *
+     * DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): this function only ever
+     * *attempts* delivery -- it no longer calls [MessageStore.removeCarriedEnvelope]
+     * on a successful [MeshRouter.sendToAddress]. That return only means a
+     * transport function accepted the write (e.g. [BleCentral]'s `sendFrame`
+     * just enqueues fragments into a per-address write queue), not that the
+     * bytes made it to the peer; a disconnect mid-transfer used to silently
+     * drop the whole write queue after we'd already deleted our only copy.
+     * The carried row is now removed later, once the peer's own next digest
+     * exchange proves they actually have it -- see
+     * [MessageStore.coreConfirmCarriedDeliveries], called from
+     * [sprayDigestPlanTo].
+     *
+     * Invariant, stated verbatim (DTN_TODOS.md §3.2): worst case of a
+     * dropped mid-transfer link is a harmless duplicate resend (the peer's
+     * seen-set/store dedupes it), never a lost envelope; an unconfirmed
+     * carry still dies at its normal expiry via [MessageStore.pruneExpiredCarried].
      */
     private fun drainCarriedEnvelopesTo(address: String, peerUserId: ByteArray) {
         val now = System.currentTimeMillis()
@@ -1916,15 +1954,10 @@ class MeshService : Service() {
             for (env in toDeliver) {
                 val frame = encodeEnvelopeFrame(env.msgId, env.hopTtl, env.expiry, env.recipientHint, env.sealed)
                 if (MeshRouter.sendToAddress(address, frame)) {
-                    // Keep group carries so we can still mule to other members;
-                    // only drop true 1:1-targeted envelopes once handed over.
-                    if (!recognizesGroupHint(env.recipientHint, now)) {
-                        store.removeCarriedEnvelope(env.msgId)
-                    }
                     delivered++
                 }
             }
-            Log.i(TAG, "Drained $delivered carried envelope(s) to $address")
+            Log.i(TAG, "Attempted delivery of $delivered carried envelope(s) to $address (removal awaits their digest confirmation)")
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to drain carried envelopes to $address: ${e.message}")
         }

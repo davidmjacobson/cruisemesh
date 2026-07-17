@@ -302,7 +302,11 @@ const LAN_ENDPOINT_VERSION: u8 = 1;
 const TRANSPORT_PROBE_VERSION: u8 = 1;
 const MAX_LAN_HOST_BYTES: usize = u8::MAX as usize;
 const MESSAGE_EXTENSION_REPLY_TO_MSG_ID: u8 = 1;
-const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+/// Milliseconds in a day, for the [`compute_recipient_hint`] daily-rotating
+/// salt. `pub` (not just `const`) so `engine.rs`'s D2 mule-drain-confirm
+/// hint window can reuse the same constant instead of re-deriving it --
+/// single source of truth, mirroring [`DEFAULT_EXPIRY_MS`].
+pub const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 const PROFILE_SYNC_VERSION: u8 = 2;
 const PROFILE_SYNC_MAX_AVATAR_BYTES: usize = 64 * 1024;
 const FRIEND_DIRECTORY_VERSION: u8 = 1;

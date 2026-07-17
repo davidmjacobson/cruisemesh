@@ -8,9 +8,30 @@
 use std::collections::HashSet;
 
 use crate::{
-    encode_envelope_frame, CarriedEnvelope, CoreError, MessageOrigin, MessageStore,
-    OutboundEnvelope, OutgoingReceiptEnvelope, RECEIPT_TYPE_DELIVERED,
+    compute_recipient_hint, encode_envelope_frame, CarriedEnvelope, CoreError, MessageOrigin,
+    MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, RECEIPT_TYPE_DELIVERED, MS_PER_DAY,
 };
+
+/// Exact carried+recently-held `msg_id` count advertised in one outgoing
+/// DIGEST (DESIGN.md §7.3's deferred bloom-filter stand-in). Single source of
+/// truth for [`MessageStore::core_digest_advertised_msg_ids`] -- previously
+/// duplicated Kotlin-side only as `DIGEST_CARRIED_MSG_IDS_LIMIT` (DTN
+/// D2, DTN_TODOS.md §3.2): large enough to suppress blind resend of a
+/// typical family-scale carry queue, still small enough to fit in one HELLO
+/// sync over fragmented BLE.
+const DIGEST_ADVERTISED_MSG_IDS_LIMIT: u64 = 512;
+
+/// How many recent day-numbers to hash a peer's UserID against when scoping
+/// carried envelopes to them for D2's confirm-before-delete check
+/// (DTN_TODOS.md §3.2; DESIGN.md §5.3 carry queue, §6.4 `recipient_hint`).
+/// Mirrors the Kotlin/Swift shells' own `CARRY_HINT_DAY_WINDOW` (kept there
+/// for their own, unrelated envelope-selection hint sets) and the same
+/// rationale: `recipient_hint` is `BLAKE2b-8(UserID || day-number)` where
+/// day-number is the envelope's *creation* day, and an unexpired envelope
+/// was created at most [`crate::DEFAULT_EXPIRY_MS`] (7 days) ago, so hashing
+/// today back through 7 days covers every day-salt a still-carried envelope
+/// for this peer could use.
+const CARRY_HINT_DAY_WINDOW_DAYS: i64 = 7;
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreInboundGate {
@@ -325,6 +346,90 @@ impl MessageStore {
             own_outbound_frames: own_outbound.into_iter().map(frame_outbound).collect(),
             own_receipt_frames: own_receipts.into_iter().map(frame_receipt).collect(),
         })
+    }
+
+    /// Build the exact `recent_msg_id` list this device advertises in its
+    /// outgoing DIGEST (DESIGN.md §7.3; DTN_TODOS.md §3.2, D2
+    /// mule-drain-confirm): carried entries first (mirrors the pre-existing
+    /// carried-only budget), then recently *held* message-stream ids
+    /// ([`MessageStore::recent_consumed_msg_ids`] -- both consumed incoming
+    /// AND our own authored messages) filling whatever room remains, bounded
+    /// to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format change:
+    /// the DIGEST frame's `recent_msg_id` list already carries arbitrary
+    /// content (`protocol.rs`'s DIGEST frame docs).
+    ///
+    /// This is also the proof-of-receipt half of D2: a mule still holding
+    /// our envelope in its carry queue learns, on our next digest, that we
+    /// already have it -- see [`Self::core_confirm_carried_deliveries`] for
+    /// the other half, which acts on this same list from the peer's side.
+    pub fn core_digest_advertised_msg_ids(&self) -> Result<Vec<Vec<u8>>, CoreError> {
+        let carried = self.carried_msg_ids(DIGEST_ADVERTISED_MSG_IDS_LIMIT)?;
+        let remaining = DIGEST_ADVERTISED_MSG_IDS_LIMIT.saturating_sub(carried.len() as u64);
+        if remaining == 0 {
+            return Ok(carried);
+        }
+        let mut advertised = carried;
+        advertised.extend(self.recent_consumed_msg_ids(remaining)?);
+        Ok(advertised)
+    }
+
+    /// Confirm-before-delete muling (DTN_TODOS.md §3.2, D2
+    /// mule-drain-confirm): removes our carried copy of a 1:1 envelope
+    /// addressed to `peer_user_id` once the peer's OWN digest proves they
+    /// already have it. `peer_known_msg_ids` is the `recent_msg_id` field
+    /// off their DIGEST frame (built by their own
+    /// [`Self::core_digest_advertised_msg_ids`]), which as of D2 includes
+    /// not just what they carry but also what they've recently consumed or
+    /// authored -- so a message they actually received shows up here even
+    /// though a true recipient never carries what it consumes; without that,
+    /// this function would never fire for genuinely delivered mail.
+    ///
+    /// Scoped to `peer_user_id`'s own recent-day `recipient_hint`s
+    /// ([`compute_recipient_hint`] over the trailing
+    /// [`CARRY_HINT_DAY_WINDOW_DAYS`] days) -- deliberately NEVER a group's
+    /// hints. Group-addressed carries have a separate mule-until-opened
+    /// lifecycle (DESIGN.md §5.3/§6.5: a mule keeps muling group traffic for
+    /// other members even after any one member has it, since the group's
+    /// digest-recentMsgIds signal is about that ONE member, not "every
+    /// member has it"), so scoping this query to only the peer's own 1:1
+    /// hints already excludes every group-hint carry without needing an
+    /// extra guard.
+    ///
+    /// Invariant (DTN_TODOS.md §3.2, verbatim): worst case of a dropped
+    /// mid-transfer link is a harmless duplicate resend (the peer's seen-ID
+    /// set / message store dedupes it), never a lost envelope; an envelope
+    /// whose confirming digest never arrives still ages out normally via
+    /// [`Self::prune_expired_carried`] -- unaffected here, since
+    /// [`Self::carried_envelopes_for_hints`] already excludes anything past
+    /// its own `expiry` as of `now_ms`.
+    ///
+    /// Returns the number of carried envelopes removed, for caller logging.
+    pub fn core_confirm_carried_deliveries(
+        &self,
+        peer_user_id: Vec<u8>,
+        peer_known_msg_ids: Vec<Vec<u8>>,
+        now_ms: i64,
+    ) -> Result<u64, CoreError> {
+        if peer_known_msg_ids.is_empty() {
+            return Ok(0);
+        }
+        let peer_hints: Vec<Vec<u8>> = (0..=CARRY_HINT_DAY_WINDOW_DAYS)
+            .map(|days_ago| {
+                compute_recipient_hint(peer_user_id.clone(), now_ms - days_ago * MS_PER_DAY)
+            })
+            .collect();
+        let candidates = self.carried_envelopes_for_hints(peer_hints, now_ms)?;
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let known: HashSet<Vec<u8>> = peer_known_msg_ids.into_iter().collect();
+        let mut removed = 0_u64;
+        for candidate in candidates {
+            if known.contains(&candidate.msg_id) && self.remove_carried_envelope(candidate.msg_id)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Relay ack ids for one poll pass, folding the consumed-SEEN rule
@@ -672,5 +777,195 @@ mod tests {
         assert!(core_hello_identity_matches(None, vec![1]));
         assert!(core_hello_identity_matches(Some(vec![1]), vec![1]));
         assert!(!core_hello_identity_matches(Some(vec![1]), vec![2]));
+    }
+
+    // -- D2 mule-drain-confirm (DTN_TODOS.md §3.2) ---------------------------
+
+    const BIG_BUDGET: i64 = 5 * 1024 * 1024;
+
+    fn carried_envelope(msg_id: &[u8], hint: Vec<u8>, expiry: i64) -> CarriedEnvelope {
+        CarriedEnvelope {
+            msg_id: msg_id.to_vec(),
+            hop_ttl: 7,
+            expiry,
+            recipient_hint: hint,
+            sealed: vec![0xAB; 10],
+        }
+    }
+
+    #[test]
+    fn digest_advertised_msg_ids_lists_carried_then_recent_consumed() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried_envelope(&[1; 16], b"hint".to_vec(), 9_000),
+                false,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .insert_incoming_message(
+                crate::StoredMessage {
+                    chat_id: vec![9; 16],
+                    sender_user_id: vec![9; 16],
+                    lamport: 1,
+                    timestamp: 1,
+                    kind: 1,
+                    payload: b"hi".to_vec(),
+                },
+                vec![2; 16],
+                None,
+            )
+            .unwrap();
+
+        let ids = store.core_digest_advertised_msg_ids().unwrap();
+        assert_eq!(ids, vec![vec![1; 16], vec![2; 16]]);
+    }
+
+    #[test]
+    fn digest_advertised_msg_ids_stops_at_the_cap_before_appending_consumed_ids() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for i in 0..DIGEST_ADVERTISED_MSG_IDS_LIMIT {
+            let mut msg_id = vec![0_u8; 16];
+            msg_id[0..8].copy_from_slice(&i.to_be_bytes());
+            store
+                .enqueue_carried_envelope(
+                    carried_envelope(&msg_id, b"hint".to_vec(), 9_000),
+                    false,
+                    1_000 + i as i64,
+                    BIG_BUDGET,
+                )
+                .unwrap();
+        }
+        store
+            .insert_incoming_message(
+                crate::StoredMessage {
+                    chat_id: vec![9; 16],
+                    sender_user_id: vec![9; 16],
+                    lamport: 1,
+                    timestamp: 1,
+                    kind: 1,
+                    payload: b"hi".to_vec(),
+                },
+                vec![0xFF; 16],
+                None,
+            )
+            .unwrap();
+
+        // Carried alone already fills the cap, so the consumed id must be
+        // left off entirely -- confirms the builder actually enforces the
+        // bound rather than merely defaulting to a generous query limit.
+        let ids = store.core_digest_advertised_msg_ids().unwrap();
+        assert_eq!(ids.len(), DIGEST_ADVERTISED_MSG_IDS_LIMIT as usize);
+        assert!(!ids.contains(&vec![0xFF; 16]));
+    }
+
+    #[test]
+    fn confirm_carried_deliveries_removes_only_the_advertised_one_to_one_carry() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let peer_user_id = vec![5_u8; 16];
+        let now_ms = 1_700_000_000_000_i64;
+        let peer_hint_today = compute_recipient_hint(peer_user_id.clone(), now_ms);
+
+        let advertised_id = vec![1_u8; 16];
+        let unadvertised_id = vec![2_u8; 16];
+        store
+            .enqueue_carried_envelope(
+                carried_envelope(&advertised_id, peer_hint_today.clone(), now_ms + 60_000),
+                false,
+                now_ms,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried_envelope(&unadvertised_id, peer_hint_today, now_ms + 60_000),
+                false,
+                now_ms,
+                BIG_BUDGET,
+            )
+            .unwrap();
+
+        // Only the id the peer's digest actually advertised is proven
+        // delivered; the other carry -- addressed to the same peer -- must
+        // survive since we have no positive evidence for it yet.
+        let removed = store
+            .core_confirm_carried_deliveries(peer_user_id, vec![advertised_id], now_ms)
+            .unwrap();
+
+        assert_eq!(removed, 1);
+        assert_eq!(store.carried_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn confirm_carried_deliveries_never_removes_a_group_addressed_carry() {
+        // Even though the group envelope's msg_id is advertised, it must
+        // survive: the confirm query is scoped to the peer's own recent-day
+        // hints only, never a group's, so a group-hinted carry never even
+        // becomes a candidate. Group carries have their own
+        // mule-until-opened lifecycle (DESIGN.md §5.3/§6.5) -- the shared
+        // family mailbox means other members can still need it even after
+        // this one peer's digest proves THEY have it.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let peer_user_id = vec![5_u8; 16];
+        let group_id = vec![7_u8; 16];
+        let now_ms = 1_700_000_000_000_i64;
+        let group_hint_today = compute_recipient_hint(group_id, now_ms);
+
+        let group_msg_id = vec![3_u8; 16];
+        store
+            .enqueue_carried_envelope(
+                carried_envelope(&group_msg_id, group_hint_today, now_ms + 60_000),
+                true,
+                now_ms,
+                BIG_BUDGET,
+            )
+            .unwrap();
+
+        let removed = store
+            .core_confirm_carried_deliveries(peer_user_id, vec![group_msg_id], now_ms)
+            .unwrap();
+
+        assert_eq!(removed, 0);
+        assert_eq!(store.carried_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn confirm_carried_deliveries_leaves_an_expired_carry_for_the_existing_pruner() {
+        // An expired candidate is already excluded by
+        // `carried_envelopes_for_hints`'s own `expiry > now_ms` filter, so
+        // confirm can't touch it either way -- it still dies at expiry via
+        // `prune_expired_carried`, not here.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let peer_user_id = vec![5_u8; 16];
+        let now_ms = 1_700_000_000_000_i64;
+        let peer_hint_today = compute_recipient_hint(peer_user_id.clone(), now_ms);
+
+        let expired_id = vec![1_u8; 16];
+        store
+            .enqueue_carried_envelope(
+                carried_envelope(&expired_id, peer_hint_today, now_ms - 1),
+                false,
+                now_ms - 10_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+
+        let removed = store
+            .core_confirm_carried_deliveries(peer_user_id, vec![expired_id], now_ms)
+            .unwrap();
+
+        assert_eq!(removed, 0);
+        assert_eq!(store.carried_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn confirm_carried_deliveries_is_a_no_op_when_the_peer_advertises_nothing() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let removed = store
+            .core_confirm_carried_deliveries(vec![5_u8; 16], vec![], 1_700_000_000_000)
+            .unwrap();
+        assert_eq!(removed, 0);
     }
 }

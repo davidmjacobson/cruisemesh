@@ -478,8 +478,13 @@ final class MeshController: ObservableObject {
         } else {
             entries = []
         }
-        let carried = (try? store.carriedMsgIds(limit: MeshDefaults.digestCarriedMsgIdsLimit)) ?? []
-        let digest = encodeDigest(chatId: identity.userId, entries: entries, recentMsgIds: carried)
+        // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): the advertised list
+        // now includes not just what we're still carrying for others but
+        // also what we've recently consumed or authored ourselves, so a
+        // mule still holding our envelope learns on this digest that we
+        // already have it -- see `store.coreConfirmCarriedDeliveries`.
+        let advertised = (try? store.coreDigestAdvertisedMsgIds()) ?? []
+        let digest = encodeDigest(chatId: identity.userId, entries: entries, recentMsgIds: advertised)
         MeshRouter.sendToAddress(address: address, frame: digest)
         refreshNearby()
     }
@@ -1682,11 +1687,33 @@ final class MeshController: ObservableObject {
         }
     }
 
+    /// Hands over every carried envelope destined for the peer that just
+    /// HELLO'd on `address` (DESIGN.md §5.3): compute the peer's recent-day
+    /// `recipient_hint`s (`deliveryHintsForPeer`) and pull matching envelopes
+    /// from the store, and send each on this link. Expired entries are
+    /// pruned first.
+    ///
+    /// DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): this function only
+    /// ever *attempts* delivery -- it no longer calls
+    /// `store.removeCarriedEnvelope` on a successful
+    /// `MeshRouter.sendToAddress`. That return only means a transport
+    /// function accepted the write, not that the bytes made it to the peer;
+    /// a disconnect mid-transfer used to silently drop the whole write
+    /// queue after we'd already deleted our only copy. The carried row is
+    /// now removed later, once the peer's own next digest exchange proves
+    /// they actually have it -- see `store.coreConfirmCarriedDeliveries`,
+    /// called from `sprayDigestPlanTo`.
+    ///
+    /// Invariant, stated verbatim (DTN_TODOS.md §3.2): worst case of a
+    /// dropped mid-transfer link is a harmless duplicate resend (the peer's
+    /// seen-set/store dedupes it), never a lost envelope; an unconfirmed
+    /// carry still dies at its normal expiry via `store.pruneExpiredCarried`.
     private func drainCarriedEnvelopesTo(address: String, peerUserId: Data) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         try? store.pruneExpiredCarried(nowMs: now)
         let hints = deliveryHintsForPeer(peerUserId: peerUserId, now: now)
         let toDeliver = (try? store.carriedEnvelopesForHints(hints: hints, nowMs: now)) ?? []
+        var delivered = 0
         for env in toDeliver {
             let frame = encodeEnvelopeFrame(
                 msgId: env.msgId,
@@ -1696,10 +1723,11 @@ final class MeshController: ObservableObject {
                 sealed: env.sealed
             )
             if MeshRouter.sendToAddress(address: address, frame: frame) {
-                if !recognizesGroupHint(env.recipientHint, now: now) {
-                    try? store.removeCarriedEnvelope(msgId: env.msgId)
-                }
+                delivered += 1
             }
+        }
+        if delivered > 0 {
+            log.info("Attempted delivery of \(delivered) carried envelope(s) to \(address, privacy: .public) (removal awaits their digest confirmation)")
         }
     }
 
@@ -1710,6 +1738,18 @@ final class MeshController: ObservableObject {
         identity: Identity
     ) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
+        // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): confirm delivery of
+        // anything this digest's advertised msg_ids prove the peer already
+        // has BEFORE building the spray plan below, so a just-confirmed
+        // carried envelope isn't immediately re-sprayed back at the peer who
+        // just told us they have it.
+        if let confirmed = try? store.coreConfirmCarriedDeliveries(
+            peerUserId: peerUserId,
+            peerKnownMsgIds: peerKnownIds,
+            nowMs: now
+        ), confirmed > 0 {
+            log.info("Confirmed delivery of \(confirmed) carried envelope(s) to \(UserIdHex.encode(peerUserId), privacy: .public); dropped our copy")
+        }
         guard let plan = try? store.coreDigestSprayPlan(
             ownUserId: identity.userId,
             peerUserId: peerUserId,
