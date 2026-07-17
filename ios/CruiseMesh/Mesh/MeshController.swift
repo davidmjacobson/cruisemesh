@@ -18,6 +18,17 @@ final class MeshController: ObservableObject {
     private var identity: Identity!
     private var relayTimer: Timer?
     private var pathMonitor: NWPathMonitor?
+    /// DTN_TODOS.md D3 (iOS half of audit finding F1, "relay poll-only"): opens
+    /// relayd's `GET /ws` push socket (see `RelayPushClient`'s class doc) once
+    /// the mesh is running, an identity/relay config exist, and the network
+    /// path is satisfied, and calls `runRelaySync()` on every pushed frame
+    /// instead of waiting for the next `relayTimer` tick. Never processes
+    /// envelope content itself -- see `RelayPushClient`'s class doc. Mirrors
+    /// Android's `relayPushClient` / `updateRelayPushSubscription`
+    /// (`MeshService.kt`).
+    private lazy var relayPushClient = RelayPushClient { [weak self] in
+        Task { @MainActor in self?.runRelaySync() }
+    }
     private var isRunning = false
     private var meshRolesRunning = false
     private var pausedForBluetoothAudio = false
@@ -190,6 +201,7 @@ final class MeshController: ObservableObject {
         relayTimer = nil
         pathMonitor?.cancel()
         pathMonitor = nil
+        relayPushClient.stop()
         relayCancellable?.cancel()
         relayCancellable = nil
         relaySyncPending = false
@@ -1813,12 +1825,47 @@ final class MeshController: ObservableObject {
             if path.status == .satisfied {
                 Task { @MainActor in self?.runRelaySync() }
             }
+            // Recheck the push subscription on every path change, mirroring
+            // Android's relayNetworkCallback calling updateRelayPushSubscription
+            // from both onCapabilitiesChanged and onLost -- the push socket
+            // should be up in exactly the situations runRelaySync would
+            // already succeed in, and torn down the moment that stops being
+            // true.
+            Task { @MainActor in self?.updateRelayPushSubscription() }
         }
         pathMonitor?.start(queue: .global(qos: .utility))
 
         // Immediate kick on send
         relayCancellable = RelaySyncEvents.subject.sink { [weak self] in
             Task { @MainActor in self?.runRelaySync() }
+        }
+        updateRelayPushSubscription()
+    }
+
+    /// Starts `relayPushClient` against the user's relay config once the mesh
+    /// is running, an identity and relay config exist, and the current
+    /// network path is satisfied -- or stops it otherwise. Called from
+    /// `startRelayLoop` and on every path update, mirroring the points
+    /// `runRelaySync` is itself kicked from (Android
+    /// `updateRelayPushSubscription` parity, DTN_TODOS.md D3).
+    ///
+    /// The hint set passed to `RelayPushClient.start` is recomputed on every
+    /// (re)connect via `relayPushHints`, so a contact or group added after
+    /// the socket is already open is picked up the next reconnect without
+    /// this needing its own change tracking; until then the 60s poll already
+    /// covers it.
+    private func updateRelayPushSubscription() {
+        guard isRunning,
+              let identity,
+              let config = RelayConfigStore.load(),
+              pathMonitor?.currentPath.status == .satisfied
+        else {
+            relayPushClient.stop()
+            return
+        }
+        let ownUserId = identity.userId
+        relayPushClient.start(config: config) {
+            relayPushHints(ownUserId: ownUserId)
         }
     }
 
@@ -1981,4 +2028,31 @@ final class MeshController: ObservableObject {
             MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
         }
     }
+}
+
+/// Self + owned-group recipient hints for the current moment -- the same hint
+/// set `MeshController.relaySyncBlocking` computes inline for its own relay
+/// fetch. A free function (not a `MeshController` method) so it carries no
+/// main-actor isolation: `RelayPushClient` (DTN_TODOS.md D3) invokes its
+/// `hintsProvider` closure from its own private queue, off the main actor,
+/// the same reason `relaySyncBlocking` itself is `nonisolated` and
+/// duplicates this computation inline rather than calling the
+/// `@MainActor`-isolated `recentHintsFor`/`deliveryHintsForPeer` helpers.
+/// Unlike Android's `relayHintsForConfig`/`relayProxyHints`, there is no
+/// "proxy" hint set here (mail addressed to a BLE-only contact, fetched on
+/// their behalf) -- the iOS poll path doesn't compute those either, so there
+/// is nothing to mirror for that half yet.
+private func relayPushHints(ownUserId: Data) -> [Data] {
+    let store = AppStore.get()
+    let now = Int64(Date().timeIntervalSince1970 * 1000)
+    var hints = (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
+        computeRecipientHint(recipientUserId: ownUserId, timestampMs: now - daysAgo * MeshDefaults.msPerDay)
+    }
+    let groups = (try? store.listGroups()) ?? []
+    for group in groups where group.memberUserIds.contains(ownUserId) {
+        hints.append(contentsOf: (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
+            computeRecipientHint(recipientUserId: group.id, timestampMs: now - daysAgo * MeshDefaults.msPerDay)
+        })
+    }
+    return hints
 }
