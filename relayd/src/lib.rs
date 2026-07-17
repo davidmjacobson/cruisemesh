@@ -90,11 +90,57 @@ const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `DEFAULT_EXPIRY_MS`) is honored when tighter; this caps the rest.
 pub const MAX_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
+/// DTN_TODOS.md D7 (N2): hard cap on the *decoded* `sealed` ciphertext of a
+/// single envelope — the only thing standing between a client and unbounded
+/// per-row SQLite growth was previously axum's default 2 MiB request-body
+/// limit (which bounds the whole JSON request, not this field).
+///
+/// Derivation, anchored to the client-side attachment ceiling so a
+/// legitimate envelope can never trip this:
+///
+/// 1. `core/src/content.rs::ATTACHMENT_MAX_BLOB_BYTES` = 180 KiB
+///    (184,320 bytes) is the largest inline attachment blob a client will
+///    ever produce — enforced before sealing by both shells (Android's
+///    `AttachmentPayload.MAX_BLOB_BYTES` calls the same core constant via
+///    `attachment_max_blob_bytes()`).
+/// 2. `encode_attachment_payload` wire overhead (version + media_type +
+///    u16-length-prefixed mime + u32 duration + u32 blob_len +
+///    u16-length-prefixed caption) is at most a few dozen bytes for any
+///    real mime type/caption; generously budget 1 KiB.
+/// 3. `seal_message` overhead (`core/src/crypto.rs`): Ed25519 sign_pk (32
+///    bytes) + signature (64 bytes), padded up to the next 256-byte
+///    `PAD_BUCKET`, plus the sealed envelope header (1-byte version +
+///    32-byte ephemeral X25519 pk + 24-byte nonce = 57 bytes) and the
+///    Poly1305 AEAD tag (16 bytes); generously budget 1 KiB.
+/// 4. Realistic ceiling: 180 KiB + 1 KiB + 1 KiB ≈ 182 KiB.
+/// 5. Round up ~2x for headroom (future envelope kinds, estimation slop):
+///    **512 KiB (524,288 bytes)**.
+///
+/// Base64 inflation of the JSON `sealed` field (this cap applies to the
+/// decoded bytes, not the wire string) is handled separately: 512 KiB
+/// decoded is ~683 KiB of base64, comfortably inside axum's default 2 MiB
+/// request-body limit, so this cap is the one that actually fires.
+pub const MAX_ENVELOPE_SEALED_BYTES: usize = 512 * 1024;
+
+/// DTN_TODOS.md D7 (N2): default per-family-token storage quota (sum of
+/// `LENGTH(sealed)` across that family's rows), configurable via
+/// `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` (see `DEPLOY.md`).
+///
+/// 256 MiB ≈ "a family's whole cruise of photos": at the 180 KiB
+/// `ATTACHMENT_MAX_BLOB_BYTES` ceiling that is ~1,450 max-size photo/audio
+/// attachments, or many times that for the more typical few-hundred-KB
+/// compressed photo `MediaCompressor` actually produces. A family of five
+/// phones each sending dozens of photos a day for a week-long cruise, plus
+/// text/receipt traffic (which is tiny by comparison), stays well under
+/// this on any realistic itinerary while still bounding the $4 VPS's disk.
+pub const DEFAULT_FAMILY_QUOTA_BYTES: u64 = 256 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct AppState {
     store: RelayStore,
     auth_tokens: HashSet<String>,
     tx: tokio::sync::broadcast::Sender<std::sync::Arc<BroadcastEnvelope>>,
+    family_quota_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -106,7 +152,12 @@ pub struct BroadcastEnvelope {
 
 impl AppState {
     pub fn new(store: RelayStore, auth_tokens: HashSet<String>) -> Self {
-        Self::with_hub_capacity(store, auth_tokens, WS_BROADCAST_CAPACITY)
+        Self::with_config(
+            store,
+            auth_tokens,
+            WS_BROADCAST_CAPACITY,
+            DEFAULT_FAMILY_QUOTA_BYTES,
+        )
     }
 
     /// Test helper: custom broadcast capacity for slow-consumer coverage.
@@ -115,11 +166,35 @@ impl AppState {
         auth_tokens: HashSet<String>,
         capacity: usize,
     ) -> Self {
-        let (tx, _) = tokio::sync::broadcast::channel(capacity.max(1));
+        Self::with_config(store, auth_tokens, capacity, DEFAULT_FAMILY_QUOTA_BYTES)
+    }
+
+    /// Test helper: custom per-family storage quota (default hub capacity).
+    pub fn with_family_quota_bytes(
+        store: RelayStore,
+        auth_tokens: HashSet<String>,
+        family_quota_bytes: u64,
+    ) -> Self {
+        Self::with_config(
+            store,
+            auth_tokens,
+            WS_BROADCAST_CAPACITY,
+            family_quota_bytes,
+        )
+    }
+
+    pub fn with_config(
+        store: RelayStore,
+        auth_tokens: HashSet<String>,
+        hub_capacity: usize,
+        family_quota_bytes: u64,
+    ) -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(hub_capacity.max(1));
         Self {
             store,
             auth_tokens,
             tx,
+            family_quota_bytes,
         }
     }
 }
@@ -200,10 +275,28 @@ impl RelayStore {
     }
 
     /// Bulk insert inside a single transaction (index/plan benchmarks).
+    ///
+    /// Not reachable from any HTTP route today (only the query-plan tests
+    /// call it), but it is the crate's other envelope-ingest path, so it
+    /// gets the same per-envelope size cap as `POST /envelopes`
+    /// (`MAX_ENVELOPE_SEALED_BYTES`, DTN_TODOS.md D7) as defense-in-depth
+    /// for whenever/if it is wired to a real endpoint. It intentionally
+    /// does NOT enforce the per-family storage quota — that check needs a
+    /// prune-then-recheck decision per row (see `post_envelope`), which
+    /// doesn't make sense to run per-row inside one bulk transaction.
     pub fn insert_envelopes_batch(
         &self,
         rows: &[(String, Vec<u8>, u8, Vec<u8>, Vec<u8>, i64, i64)],
     ) -> Result<(), String> {
+        for (_, _, _, _, sealed, _, _) in rows {
+            if sealed.len() > MAX_ENVELOPE_SEALED_BYTES {
+                return Err(format!(
+                    "sealed envelope of {} bytes exceeds the {}-byte cap",
+                    sealed.len(),
+                    MAX_ENVELOPE_SEALED_BYTES
+                ));
+            }
+        }
         let mut conn = self.conn.lock().expect("relay store mutex poisoned");
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         {
@@ -403,6 +496,47 @@ impl RelayStore {
         Ok(count.unwrap_or(0) as u64)
     }
 
+    /// Sum of `LENGTH(sealed)` across a family's rows — the quota-relevant
+    /// storage figure (DTN_TODOS.md D7). Sealed ciphertext dominates row
+    /// size; header columns (msg_id, hints, timestamps) are a few dozen
+    /// bytes each and are not counted, so this is a conservative (slight
+    /// under-)estimate of actual disk usage, which is fine for a soft quota.
+    pub fn family_sealed_bytes(&self, family_token: &str) -> Result<u64, String> {
+        let conn = self.conn.lock().expect("relay store mutex poisoned");
+        // SUM() over zero matching rows returns one row with a SQL NULL
+        // (not zero rows), so the inner type must be Option<i64> — a plain
+        // i64 here fails every empty-family lookup with "Invalid column
+        // type Null".
+        let total: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT SUM(LENGTH(sealed)) FROM envelopes WHERE family_token = ?1",
+                params![family_token],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(total.flatten().unwrap_or(0) as u64)
+    }
+
+    /// Whether a `(family_token, msg_id)` row already exists. Used to skip
+    /// the quota check on dedupe re-posts: `insert_envelope`'s
+    /// `ON CONFLICT` path never rewrites `sealed`, so a re-post of an
+    /// existing msg_id adds zero bytes and must not be charged against the
+    /// quota (a receipt envelope re-uploaded every sync would otherwise
+    /// eventually get rejected for growth that never happened).
+    pub fn envelope_exists(&self, family_token: &str, msg_id: &[u8]) -> Result<bool, String> {
+        let conn = self.conn.lock().expect("relay store mutex poisoned");
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM envelopes WHERE family_token = ?1 AND msg_id = ?2 LIMIT 1",
+                params![family_token, msg_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(found.is_some())
+    }
+
     /// `EXPLAIN QUERY PLAN` for the fetch path. Used by tests to ensure the
     /// family+hint+id index is used instead of a table scan.
     pub fn explain_fetch_plan(
@@ -475,6 +609,20 @@ pub fn parse_bind(raw: &str) -> Result<SocketAddr, String> {
     raw.parse::<SocketAddr>().map_err(|e| e.to_string())
 }
 
+/// Parse `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` (DTN_TODOS.md D7,
+/// `DEPLOY.md` §5). `0` is rejected — a family with a zero quota could
+/// never post anything, which is never what an operator means; unset the
+/// env var (or pass the default) to disable an override.
+pub fn parse_family_quota_bytes(raw: &str) -> Result<u64, String> {
+    let value: u64 = raw
+        .parse()
+        .map_err(|_| format!("not a valid byte count: {raw:?}"))?;
+    if value == 0 {
+        return Err("family quota must be greater than 0 bytes".to_string());
+    }
+    Ok(value)
+}
+
 #[derive(Serialize)]
 struct HealthzResponse {
     status: &'static str,
@@ -522,7 +670,46 @@ async fn post_envelope(
             "sealed must not be empty".to_string(),
         ));
     }
+    // DTN_TODOS.md D7: per-envelope size cap, checked before any storage
+    // work (see MAX_ENVELOPE_SEALED_BYTES doc comment for the derivation).
+    if sealed.len() > MAX_ENVELOPE_SEALED_BYTES {
+        return Err(ApiError::envelope_too_large(sealed.len()));
+    }
     let now = now_ms();
+
+    // DTN_TODOS.md D7: per-family storage quota. A re-post of an existing
+    // msg_id is dedupe (insert_envelope's ON CONFLICT path never rewrites
+    // `sealed`) and adds zero bytes, so it is never quota-checked — only a
+    // genuinely new row can push a family over its quota.
+    let is_new_msg_id = !state
+        .store
+        .envelope_exists(&family_token, &msg_id)
+        .map_err(ApiError::internal)?;
+    if is_new_msg_id {
+        let candidate_bytes = sealed.len() as u64;
+        let usage = state
+            .store
+            .family_sealed_bytes(&family_token)
+            .map_err(ApiError::internal)?;
+        if usage.saturating_add(candidate_bytes) > state.family_quota_bytes {
+            // Durability over eviction (DTN_TODOS.md §3, D7): never
+            // silently drop unacked mail to make room. Prune this family's
+            // (and everyone else's) expired rows first — often enough on
+            // its own — then re-check before giving up and rejecting.
+            state.store.prune_expired(now).map_err(ApiError::internal)?;
+            let usage_after_prune = state
+                .store
+                .family_sealed_bytes(&family_token)
+                .map_err(ApiError::internal)?;
+            if usage_after_prune.saturating_add(candidate_bytes) > state.family_quota_bytes {
+                return Err(ApiError::family_quota_exceeded(
+                    usage_after_prune,
+                    state.family_quota_bytes,
+                ));
+            }
+        }
+    }
+
     let id = state
         .store
         .insert_envelope(
@@ -928,6 +1115,14 @@ fn now_ms() -> i64 {
 struct ApiError {
     status: StatusCode,
     message: String,
+    /// Stable machine-readable discriminant for the two new D7 rejection
+    /// kinds, so a client can distinguish "shrink the envelope" from "the
+    /// family mailbox is full" without parsing `message` or relying on
+    /// `status` alone (413 vs 507 also differ, but `code` is meant to be
+    /// the primary, forward-compatible signal). `None` for pre-existing
+    /// error kinds — omitted from the response body, so their wire shape
+    /// is unchanged.
+    code: Option<&'static str>,
 }
 
 impl ApiError {
@@ -935,6 +1130,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message,
+            code: None,
         }
     }
 
@@ -942,6 +1138,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message,
+            code: None,
         }
     }
 
@@ -949,17 +1146,48 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message,
+            code: None,
+        }
+    }
+
+    /// DTN_TODOS.md D7: sealed ciphertext exceeds `MAX_ENVELOPE_SEALED_BYTES`.
+    /// 413 Payload Too Large is the standard HTTP status for exactly this.
+    fn envelope_too_large(sealed_len: usize) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: format!(
+                "sealed envelope of {sealed_len} bytes exceeds the \
+                 {MAX_ENVELOPE_SEALED_BYTES}-byte per-envelope cap"
+            ),
+            code: Some("envelope_too_large"),
+        }
+    }
+
+    /// DTN_TODOS.md D7: per-family storage quota exceeded even after
+    /// pruning expired rows. 507 Insufficient Storage is the standard HTTP
+    /// status for "server understood the request but cannot store the
+    /// result" — deliberately distinct from 413 (which means "this one
+    /// request is malformed") since the client's remedy is different
+    /// (wait for space / ack backlog vs. shrink the payload).
+    fn family_quota_exceeded(usage_bytes: u64, quota_bytes: u64) -> Self {
+        Self {
+            status: StatusCode::INSUFFICIENT_STORAGE,
+            message: format!(
+                "family storage quota exceeded: {usage_bytes} bytes used, \
+                 {quota_bytes} byte quota (expired rows already pruned)"
+            ),
+            code: Some("family_quota_exceeded"),
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "error": self.message })),
-        )
-            .into_response()
+        let body = match self.code {
+            Some(code) => serde_json::json!({ "error": self.message, "code": code }),
+            None => serde_json::json!({ "error": self.message }),
+        };
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -1610,5 +1838,135 @@ mod tests {
                 last_seen_ms: now - PRESENCE_RETENTION_MS + 1,
             }]
         );
+    }
+
+    // --- DTN_TODOS.md D7: per-envelope size cap + per-family quota ---
+
+    #[test]
+    fn family_sealed_bytes_is_zero_for_an_untouched_family() {
+        let (_db, store) = test_store();
+        // Regression guard for the SUM(...) over zero rows -> SQL NULL
+        // footgun (Invalid column type Null) rather than 0.
+        assert_eq!(store.family_sealed_bytes("family-a").unwrap(), 0);
+    }
+
+    #[test]
+    fn family_sealed_bytes_sums_only_the_callers_family() {
+        let (_db, store) = test_store();
+        let now = 1_700_000_000_000i64;
+        store
+            .insert_envelope(
+                "family-a",
+                sample_msg_id(1),
+                7,
+                sample_hint(1),
+                vec![0u8; 100],
+                now + 60_000,
+                now,
+            )
+            .unwrap();
+        store
+            .insert_envelope(
+                "family-a",
+                sample_msg_id(2),
+                7,
+                sample_hint(1),
+                vec![0u8; 250],
+                now + 60_000,
+                now,
+            )
+            .unwrap();
+        store
+            .insert_envelope(
+                "family-b",
+                sample_msg_id(3),
+                7,
+                sample_hint(1),
+                vec![0u8; 9_999],
+                now + 60_000,
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(store.family_sealed_bytes("family-a").unwrap(), 350);
+        assert_eq!(store.family_sealed_bytes("family-b").unwrap(), 9_999);
+    }
+
+    #[test]
+    fn envelope_exists_is_scoped_to_family_and_msg_id() {
+        let (_db, store) = test_store();
+        let now = 1_700_000_000_000i64;
+        store
+            .insert_envelope(
+                "family-a",
+                sample_msg_id(1),
+                7,
+                sample_hint(1),
+                sample_sealed(1),
+                now + 60_000,
+                now,
+            )
+            .unwrap();
+
+        assert!(store
+            .envelope_exists("family-a", &sample_msg_id(1))
+            .unwrap());
+        assert!(!store
+            .envelope_exists("family-a", &sample_msg_id(2))
+            .unwrap());
+        // Same msg_id, different family: not the same row.
+        assert!(!store
+            .envelope_exists("family-b", &sample_msg_id(1))
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn post_rejects_a_sealed_payload_over_the_cap_with_413() {
+        let app = test_app();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/envelopes")
+            .header("authorization", "Bearer family-a")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "msg_id": encode_base64_field(&sample_msg_id(1)),
+                    "hop_ttl": 7,
+                    "recipient_hint": encode_base64_field(&sample_hint(1)),
+                    "sealed": encode_base64_field(&vec![7u8; MAX_ENVELOPE_SEALED_BYTES + 1]),
+                    "expiry_ms": now_ms() + 60_000,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let json = body_json(response).await;
+        assert_eq!(json["code"], "envelope_too_large");
+    }
+
+    #[tokio::test]
+    async fn post_accepts_a_sealed_payload_exactly_at_the_cap() {
+        let app = test_app();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/envelopes")
+            .header("authorization", "Bearer family-a")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "msg_id": encode_base64_field(&sample_msg_id(1)),
+                    "hop_ttl": 7,
+                    "recipient_hint": encode_base64_field(&sample_hint(1)),
+                    "sealed": encode_base64_field(&vec![7u8; MAX_ENVELOPE_SEALED_BYTES]),
+                    "expiry_ms": now_ms() + 60_000,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
