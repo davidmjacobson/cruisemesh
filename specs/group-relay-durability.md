@@ -1,6 +1,11 @@
 # Group relay durability
 
-Status: **draft for review — do not implement until approved** (DTN_TODOS.md D6 / finding N1).
+Status: **approved 2026-07-17** (DTN_TODOS.md D6 / finding N1). Option (d)
+per-member fan-out, with the §7 questions resolved in the future-proof
+direction: fan-out includes a self-addressed row (multi-device readiness),
+the attachment storage multiplier is accepted (kind=17 external chunks
+remain the eventual scaling path), and the legacy never-ack transition rule
+is unconditional.
 
 ## 1. Problem
 
@@ -94,8 +99,11 @@ Rejected.
 
 Stop making group rows shared. The uploader (author, or any member muling
 the envelope — both know the member list from the group config) posts **one
-relay row per member other than itself**, each addressed by that member's
-own daily `recipient_hint` — exactly the shape 1:1 mail already has. Each
+relay row per member, including itself** (the self-addressed row is the
+multi-device future-proofing resolved in §7.2 — today the uploader consumes
+and acks its own row on the next poll, a trivial cost), each addressed by
+that member's own daily `recipient_hint` — exactly the shape 1:1 mail
+already has. Each
 member then fetches it with the self-hints they already poll with, opens it
 (group-sealed body, unchanged), gets `CONSUMED`, and acks **their own row**.
 Delete-on-ack becomes correct again because each row has exactly one
@@ -147,8 +155,10 @@ crypto.
 
 `upload…Outbound/FamilyCarried` (both platforms; logic in core where
 possible): when an envelope's `recipient_hint` matches a group this device
-has imported, post one row per member ≠ self using §4.1 identities, instead
-of one group-hint row. A non-member mule can't decompose (it can't
+has imported, post one row per member (including self, per §3d) using §4.1
+identities, instead of one group-hint row. Mark the source envelope
+relay-posted only after **all** member rows post successfully — a partial
+failure retries the whole set, and the derived ids make retries dedupe. A non-member mule can't decompose (it can't
 recognize the hint as a group) and keeps uploading the single group-hint
 row — that legacy-shaped row is covered by §5.5.
 
@@ -226,14 +236,16 @@ today's "membership change ⇒ key rotation" model (DESIGN.md §6.5):
   confirm delivery + tick behavior; metered-data sanity (no group refetch
   loop).
 
-## 7. Open questions for review
+## 7. Review resolutions (approved 2026-07-17)
 
-1. Accept the (members − 1)× relay storage/upload multiplier for
-   attachments, given D7's quota? (Alternative: fan out manifests only and
-   keep blobs single-copy — rejected here for complexity, but flaggable.)
-2. Should the author also post a self-addressed fan-out row as a
-   multi-device future-proof? (Current answer: no — v1 is single-device,
-   DESIGN.md §13.)
-3. Is the transition rule in §5.2 (never ack legacy group rows) worth a
-   config escape hatch, or acceptable as unconditional given the 7-day
-   row lifetime?
+1. **Storage multiplier: accepted.** The members× multiplier is fine at
+   family scale under D7's quota; `kind=17` external content-addressed
+   chunks remain the eventual scaling path for large media and are out of
+   scope here.
+2. **Self-addressed row: yes.** Fan-out covers every member *including*
+   the uploader, so a future second device of the same identity can fetch
+   its copy. Today the uploader consumes and acks its own row on the next
+   poll pass — one small row per message, deleted within a minute.
+3. **Transition rule: unconditional.** No config escape hatch; legacy
+   group-hint rows are simply never acked and age out within their 7-day
+   expiry.
