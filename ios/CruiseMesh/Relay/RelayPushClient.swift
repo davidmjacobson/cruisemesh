@@ -206,7 +206,7 @@ extension RelayPushClient: URLSessionWebSocketDelegate {
     func urlSession(
         _ session: URLSession,
         webSocketTask: URLSessionWebSocketTask,
-        didOpenWithProtocol protocol: String?
+        didOpenWithProtocol _: String?
     ) {
         queue.async { [self] in
             guard self.webSocketTask === webSocketTask else { return }
