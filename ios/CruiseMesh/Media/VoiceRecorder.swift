@@ -2,7 +2,7 @@ import AVFoundation
 import Foundation
 
 final class VoiceRecorder: NSObject {
-    static let maxDurationSeconds: TimeInterval = 30
+    static let maxDurationSeconds: TimeInterval = 60
 
     private var recorder: AVAudioRecorder?
     private var outputURL: URL?

@@ -2,6 +2,7 @@ package com.cruisemesh.app.relay
 
 import android.net.Network
 import uniffi.cruisemesh_core.CarriedEnvelope
+import uniffi.cruisemesh_core.CoreGroupFanoutRow
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.OutgoingReceiptEnvelope
 import java.io.IOException
@@ -70,6 +71,23 @@ object RelayClient {
             recipientHint = envelope.recipientHint,
             sealed = envelope.sealed,
             expiryMs = envelope.expiry,
+            network = network,
+        )
+
+    /**
+     * Posts one per-member fan-out row of a group message
+     * (specs/group-relay-durability.md §4; built by the core's
+     * `coreGroupFanoutRows`/`coreGroupFanoutRowsForCarried`). Same wire shape
+     * as every other envelope post -- fan-out changes addressing, not format.
+     */
+    fun postFanoutRow(config: RelayConfig, row: CoreGroupFanoutRow, network: Network? = null): Long =
+        postEnvelope(
+            config,
+            msgId = row.msgId,
+            hopTtl = row.hopTtl,
+            recipientHint = row.recipientHint,
+            sealed = row.sealed,
+            expiryMs = row.expiry,
             network = network,
         )
 

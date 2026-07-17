@@ -802,12 +802,38 @@ fun ContactsScreen(
                     }
                 } else {
                     item {
-                        Text(
-                            "No contacts yet",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(16.dp)
-                        )
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 32.dp, vertical = 56.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(64.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.secondaryContainer),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    Icons.Default.Person,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    modifier = Modifier.size(30.dp),
+                                )
+                            }
+                            Text(
+                                "No contacts yet",
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.padding(top = 16.dp),
+                            )
+                            Text(
+                                "Add a friend to see them here.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 6.dp),
+                            )
+                        }
                     }
                 }
             }

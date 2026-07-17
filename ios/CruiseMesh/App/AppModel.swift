@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
     @Published var pendingFriendToken: String?
 
     init() {
+        try? BackupService.installPendingRestoreIfNeeded()
         let id = IdentityStore.loadOrCreate()
         self.identity = id
         self.displayName = ProfileStore.loadDisplayName()

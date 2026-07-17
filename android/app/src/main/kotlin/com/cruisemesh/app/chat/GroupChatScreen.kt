@@ -1,6 +1,12 @@
 package com.cruisemesh.app.chat
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -32,11 +38,13 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -55,7 +63,12 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.media.KIND_GROUP_INVITE
+import com.cruisemesh.app.media.AttachmentPayload
+import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
+import com.cruisemesh.app.media.MediaCompressor
+import com.cruisemesh.app.media.VoiceRecorder
 import com.cruisemesh.app.media.isVisibleChatKind
+import com.cruisemesh.app.notify.ChatMuteStore
 import com.cruisemesh.app.ui.AvatarBadge
 import com.cruisemesh.app.ui.BubbleGrouping
 import com.cruisemesh.app.ui.ChatListLogic
@@ -68,6 +81,7 @@ import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
 import kotlinx.coroutines.launch
+import androidx.core.content.ContextCompat
 
 /**
  * Group chat thread (DESIGN.md §6.5). Local `chat_id` is the group id.
@@ -89,7 +103,10 @@ fun GroupChatScreen(
     val density = LocalDensity.current
     val keyboardFreeze = rememberOverlayKeyboardFreeze()
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
-    var draft by remember { mutableStateOf("") }
+    var draft by remember(group.id) { mutableStateOf(DraftStore.load(context, group.id)) }
+    var pendingPhoto by remember { mutableStateOf<ByteArray?>(null) }
+    var isMuted by remember(group.id) { mutableStateOf(ChatMuteStore.isMuted(context, group.id)) }
+    var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
     var showDetails by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var focused by remember(group.id) { mutableStateOf<FocusedMessage?>(null) }
@@ -97,6 +114,7 @@ fun GroupChatScreen(
     var replyingTo by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
+    val voiceRecorder = remember { VoiceRecorder(context) }
 
     fun reload() {
         messages = store.messagesForChat(group.id)
@@ -107,6 +125,83 @@ fun GroupChatScreen(
             snackbarHostState.showSnackbar("Couldn't send. Your message is still here.")
         }
     }
+
+    fun stagePhoto(jpeg: ByteArray?) {
+        if (jpeg == null) {
+            Toast.makeText(context, "Could not prepare photo (too large or unreadable)", Toast.LENGTH_SHORT).show()
+        } else {
+            pendingPhoto = jpeg
+        }
+    }
+
+    fun sendVoiceFile(file: java.io.File, durationMs: Int) {
+        val bytes = try { file.readBytes() } catch (_: Exception) { null }
+        file.delete()
+        if (bytes == null || bytes.isEmpty()) {
+            Toast.makeText(context, "Could not save voice memo", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (bytes.size > AttachmentPayload.MAX_BLOB_BYTES) {
+            Toast.makeText(context, "Voice memo is too large to send over the mesh", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val replyId = replyingTo?.let {
+            store.messageReference(it.chatId, it.senderUserId, it.lamport)?.msgId
+        }
+        if (sender.sendAttachment(
+                group,
+                AttachmentPayload(
+                    mediaType = AttachmentPayload.MediaType.AUDIO,
+                    mimeType = "audio/mp4",
+                    durationMs = durationMs.coerceAtMost(MAX_VOICE_MS),
+                    blob = bytes,
+                ),
+                replyId,
+            ) == SendResult.STORED
+        ) {
+            replyingTo = null
+            reload()
+        } else {
+            showSendFailure()
+        }
+    }
+
+    val galleryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri -> if (uri != null) stagePhoto(MediaCompressor.compressImageUri(context, uri)) }
+
+    val cameraLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicture(),
+    ) { success ->
+        val uri = pendingCameraUri
+        pendingCameraUri = null
+        if (success && uri != null) stagePhoto(MediaCompressor.compressImageUri(context, uri))
+    }
+
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            launchCamera(context) { uri ->
+                pendingCameraUri = uri
+                cameraLauncher.launch(uri)
+            }
+        } else {
+            Toast.makeText(context, "Camera permission is required to take photos", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        Toast.makeText(
+            context,
+            if (granted) "Microphone ready — hold the mic to record" else "Microphone permission is required for voice memos",
+            Toast.LENGTH_SHORT,
+        ).show()
+    }
+
+    DisposableEffect(Unit) { onDispose { voiceRecorder.cancel() } }
 
     fun senderName(userId: ByteArray): String {
         if (userId.contentEquals(ownUserId)) return "You"
@@ -121,6 +216,10 @@ fun GroupChatScreen(
                 reload()
             }
         }
+    }
+
+    LaunchedEffect(draft) {
+        DraftStore.save(context, group.id, draft)
     }
 
     val listState = rememberLazyListState()
@@ -255,41 +354,76 @@ fun GroupChatScreen(
                 )
             }
 
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 16.dp),
-            ) {
-                OutlinedTextField(
-                    value = draft,
-                    onValueChange = { draft = it },
-                    placeholder = { Text("Message") },
-                    modifier = Modifier.weight(1f),
-                )
-                Button(
-                    onClick = {
-                        val text = draft.trim()
-                        if (text.isNotEmpty()) {
-                            val replyToMsgId = replyingTo?.let {
-                                replyMetadata[messageStableKey(it)]?.msgId
-                            }
-                            if (sender.sendText(group, text, replyToMsgId) == SendResult.STORED) {
-                                draft = ""
-                                replyingTo = null
-                                reload()
-                            } else {
-                                showSendFailure()
-                            }
-                        }
-                    },
-                    modifier = Modifier
-                        .padding(start = 8.dp)
-                        .height(56.dp),
-                ) {
-                    Text("Send")
-                }
+            pendingPhoto?.let { photo ->
+                PendingPhotoCard(bytes = photo, onRemove = { pendingPhoto = null })
             }
+            MessageComposer(
+                draft = draft,
+                onDraftChange = { draft = it },
+                onSend = {
+                    val text = draft.trim()
+                    val replyToMsgId = replyingTo?.let { replyMetadata[messageStableKey(it)]?.msgId }
+                    val photo = pendingPhoto
+                    val result = if (photo != null) {
+                        sender.sendAttachment(
+                            group,
+                            AttachmentPayload(
+                                mediaType = AttachmentPayload.MediaType.IMAGE,
+                                mimeType = "image/jpeg",
+                                durationMs = 0,
+                                blob = photo,
+                                caption = text,
+                            ),
+                            replyToMsgId,
+                        )
+                    } else if (text.isNotEmpty()) {
+                        sender.sendText(group, text, replyToMsgId)
+                    } else {
+                        SendResult.FAILED
+                    }
+                    if (result == SendResult.STORED) {
+                        pendingPhoto = null
+                        draft = ""
+                        replyingTo = null
+                        reload()
+                    } else {
+                        showSendFailure()
+                    }
+                },
+                hasPendingAttachment = pendingPhoto != null,
+                ownBubbleColor = MaterialTheme.colorScheme.primary,
+                onPickGallery = {
+                    galleryLauncher.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                    )
+                },
+                onPickCamera = {
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        launchCamera(context) { uri ->
+                            pendingCameraUri = uri
+                            cameraLauncher.launch(uri)
+                        }
+                    } else {
+                        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                    }
+                },
+                onStartVoice = {
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        false
+                    } else {
+                        voiceRecorder.start()
+                    }
+                },
+                onStopVoice = {
+                    voiceRecorder.stop()?.let { (file, durationMs) -> sendVoiceFile(file, durationMs) }
+                },
+                onCancelVoice = { voiceRecorder.cancel() },
+            )
         }
     }
 
@@ -304,6 +438,20 @@ fun GroupChatScreen(
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.padding(bottom = 8.dp),
                     )
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Mute notifications", modifier = Modifier.weight(1f))
+                        Switch(
+                            checked = isMuted,
+                            onCheckedChange = {
+                                isMuted = it
+                                ChatMuteStore.setMuted(context, group.id, it)
+                                ChatEvents.notifyChatChanged(group.id)
+                            },
+                        )
+                    }
                     for (memberId in group.memberUserIds) {
                         Text(
                             "• ${senderName(memberId)}",
@@ -422,13 +570,20 @@ fun GroupChatScreen(
                 currentInfoMessage.lamport,
             )
         }
-        AlertDialog(
-            onDismissRequest = { infoMessage = null },
-            title = { Text("Message info") },
-            text = { Text(messageInfoText(currentInfoMessage, infoIsOwn, null, infoArrival)) },
-            confirmButton = {
-                TextButton(onClick = { infoMessage = null }) { Text("OK") }
-            },
+        MessageInfoBottomSheet(
+            onDismiss = { infoMessage = null },
+            text = messageInfoText(
+                currentInfoMessage,
+                infoIsOwn,
+                null,
+                infoArrival,
+                outboundExpiryMs = if (infoIsOwn) store.outboundMessageExpiry(
+                    currentInfoMessage.chatId,
+                    currentInfoMessage.senderUserId,
+                    currentInfoMessage.lamport,
+                ) else null,
+                nowMs = System.currentTimeMillis(),
+            ),
         )
     }
 }
@@ -611,10 +766,21 @@ fun GroupMessageBubbleVisual(
                         modifier = Modifier.padding(bottom = 8.dp),
                     )
                 }
-                Text(
-                    text = String(message.payload, Charsets.UTF_8),
-                    style = MaterialTheme.typography.bodyLarge,
-                )
+                if (message.kind == KIND_ATTACHMENT_MANIFEST) {
+                    val attachment = remember(message.payload) {
+                        AttachmentPayload.decode(message.payload)
+                    }
+                    if (attachment == null) {
+                        Text("Unsupported attachment")
+                    } else {
+                        AttachmentBubbleContent(attachment, contentColor)
+                    }
+                } else {
+                    Text(
+                        text = String(message.payload, Charsets.UTF_8),
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                }
                 if (showTimestamp) {
                     Text(
                         text = formatConversationTimestamp(message.timestamp),

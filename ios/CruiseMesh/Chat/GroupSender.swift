@@ -65,6 +65,22 @@ final class GroupSender {
         )
     }
 
+    func sendAttachment(
+        group: Group,
+        attachment: AttachmentPayload,
+        replyToMsgId: Data? = nil
+    ) {
+        guard group.memberUserIds.contains(identity.userId),
+              attachment.blob.count <= AttachmentPayload.maxBlobBytes else { return }
+        enqueueGroupMessage(
+            group: group,
+            kind: ProtocolKind.attachmentManifest,
+            payload: attachment.encode(),
+            label: "sendAttachment",
+            replyToMsgId: replyToMsgId
+        )
+    }
+
     func sendReaction(group: Group, target: MessageTarget, emoji: String) {
         guard group.memberUserIds.contains(identity.userId) else { return }
         enqueueGroupMessage(

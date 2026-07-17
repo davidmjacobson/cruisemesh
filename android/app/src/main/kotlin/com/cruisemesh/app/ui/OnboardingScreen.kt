@@ -146,7 +146,8 @@ fun OnboardingScreen(
                 )
                 Text(
                     text = "Step ${page + 1} of $pages",
-                    style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.SemiBold),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp),
                 )
                 Row(

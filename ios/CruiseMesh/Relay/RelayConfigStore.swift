@@ -12,6 +12,7 @@ func normalizeRelayUrl(_ value: String) -> String {
 enum RelayConfigStore {
     private static let urlKey = "cruisemesh.relay.url"
     private static let tokenKey = "cruisemesh.relay.token"
+    private static let shareOnlineKey = "cruisemesh.relay.shareOnline"
 
     static func load() -> RelayConfig? {
         let url = normalizeRelayUrl(UserDefaults.standard.string(forKey: urlKey) ?? "")
@@ -30,5 +31,14 @@ enum RelayConfigStore {
         }
         UserDefaults.standard.set(url, forKey: urlKey)
         UserDefaults.standard.set(token, forKey: tokenKey)
+    }
+
+    static func shareOnline() -> Bool {
+        guard UserDefaults.standard.object(forKey: shareOnlineKey) != nil else { return true }
+        return UserDefaults.standard.bool(forKey: shareOnlineKey)
+    }
+
+    static func setShareOnline(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: shareOnlineKey)
     }
 }

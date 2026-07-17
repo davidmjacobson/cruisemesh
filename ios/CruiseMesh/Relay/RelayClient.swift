@@ -14,6 +14,11 @@ struct RelayFetchPage {
     let nextCursor: Int64
 }
 
+struct RelayPresencePage {
+    let nowMs: Int64
+    let presence: [CoreRelayPresence]
+}
+
 /// HTTPS client for `cruisemesh-relayd` (DESIGN.md §9). Mirrors Android `RelayClient`.
 enum RelayClient {
     private static let connectTimeout: TimeInterval = 10
@@ -41,6 +46,22 @@ enum RelayClient {
             recipientHint: Data(envelope.recipientHint),
             sealed: Data(envelope.sealed),
             expiryMs: envelope.expiry
+        )
+    }
+
+    /// Posts one per-member fan-out row of a group message
+    /// (specs/group-relay-durability.md §4; built by the core's
+    /// `coreGroupFanoutRows`/`coreGroupFanoutRowsForCarried`). Same wire
+    /// shape as every other envelope post -- fan-out changes addressing,
+    /// not format. Mirrors Android `RelayClient.postFanoutRow`.
+    static func postFanoutRow(config: RelayConfig, row: CoreGroupFanoutRow) throws -> Int64 {
+        try postEnvelope(
+            config: config,
+            msgId: Data(row.msgId),
+            hopTtl: row.hopTtl,
+            recipientHint: Data(row.recipientHint),
+            sealed: Data(row.sealed),
+            expiryMs: row.expiry
         )
     }
 
@@ -83,6 +104,23 @@ enum RelayClient {
         request.httpBody = try relayEncodeAckRequest(ids: ids)
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
+    }
+
+    static func syncPresence(
+        config: RelayConfig,
+        announce: [Data],
+        query: [Data]
+    ) throws -> RelayPresencePage {
+        let url = try buildURL(config.relayUrl, path: "/presence")
+        var request = URLRequest(url: url, timeoutInterval: connectTimeout)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(&request, config: config)
+        request.httpBody = try relayEncodePresenceRequest(announce: announce, query: query)
+        let (data, response) = try syncRequest(request)
+        try ensureOK(response, data: data)
+        let page = try relayDecodePresencePage(body: data)
+        return RelayPresencePage(nowMs: page.nowMs, presence: page.presence)
     }
 
     private static func postEnvelope(

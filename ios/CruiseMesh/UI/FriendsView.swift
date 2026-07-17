@@ -92,6 +92,21 @@ struct FriendsView: View {
                     }
                 }
                 Section("Friends") {
+                    if contacts.isEmpty {
+                        VStack(spacing: 8) {
+                            Image(systemName: "person.crop.circle.badge.plus")
+                                .font(.title)
+                                .foregroundStyle(.secondary)
+                            Text("No friends yet")
+                                .font(.headline)
+                            Text("Scan or paste a friend card to get started.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                    }
                     ForEach(contacts, id: \.userId) { contact in
                         NavigationLink {
                             ChatView(contact: contact, identity: identity)

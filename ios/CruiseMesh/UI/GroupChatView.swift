@@ -1,11 +1,16 @@
+import AVFoundation
 import Combine
+import PhotosUI
 import SwiftUI
+import UIKit
 
 /// Group chat thread (DESIGN.md §6.5). Local `chat_id` is the group id.
 /// Group wire receipts are deferred — no ✓/✓✓ ticks yet.
 struct GroupChatView: View {
     let group: Group
     let identity: Identity
+    @ObservedObject private var connectivity = MeshConnectivityStatus.shared
+    @ObservedObject private var connectivityClock = ConnectivityClock.shared
 
     @Environment(\.dismiss) private var dismiss
     @State private var messages: [StoredMessage] = []
@@ -16,9 +21,27 @@ struct GroupChatView: View {
     @State private var cancellable: AnyCancellable?
     @State private var replyingTo: StoredMessage?
     @State private var replyMetadata: [String: MessageReplyMetadata] = [:]
+    @State private var photoItem: PhotosPickerItem?
+    @State private var showCamera = false
+    @State private var pendingPhoto: Data?
+    @State private var showVoice = false
+    @State private var voiceRecorder = VoiceRecorder()
+    @State private var voiceRecording = false
+    @State private var statusMessage: String?
+    @State private var viewedPhoto: ViewedPhoto?
+    @State private var isMuted = false
 
     private let store = AppStore.get()
     private var sender: GroupSender { GroupSender(store: store, identity: identity) }
+
+    private var reachableMemberSummary: String {
+        let others = group.memberUserIds.filter { $0 != identity.userId }
+        let count = others.count {
+            let level = connectivity.level(for: $0, nowMs: connectivityClock.nowMs)
+            return level == .nearby || level == .onlineRelay
+        }
+        return "\(count) of \(others.count) reachable"
+    }
 
     private var visible: [StoredMessage] {
         messages.filter { isVisibleChatKind($0.kind) }
@@ -43,28 +66,35 @@ struct GroupChatView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 2) {
                             ForEach(Array(visible.enumerated()), id: \.element.stableGroupRowId) { index, message in
+                                let messageSenderName = senderName(message.senderUserId)
+                                let messageColor = ChatListLogic.avatarHueAndInitials(
+                                    userId: message.senderUserId,
+                                    name: messageSenderName,
+                                    displayId: formatUserId(userId: message.senderUserId)
+                                ).0
+                                let replyKey = replyMessageKey(message)
+                                let reactionKey = MessageTarget(
+                                    senderUserId: message.senderUserId,
+                                    lamport: message.lamport,
+                                    kind: message.kind
+                                ).stableKey
                                 GroupMessageRow(
                                     message: message,
                                     isOwn: message.senderUserId == identity.userId,
                                     groupName: group.name,
                                     senderLabel: senderLabel(at: index),
-                                    contactColor: ChatListLogic.avatarHueAndInitials(
-                                        userId: message.senderUserId,
-                                        name: senderName(message.senderUserId),
-                                        displayId: formatUserId(userId: message.senderUserId)
-                                    ).0,
-                                    quoted: replyMetadata[replyMessageKey(message)]?.quoted,
-                                    canReply: replyMetadata[replyMessageKey(message)]?.msgId != nil,
-                                    reactions: reactions[MessageTarget(
-                                        senderUserId: message.senderUserId,
-                                        lamport: message.lamport,
-                                        kind: message.kind
-                                    ).stableKey] ?? [],
+                                    contactColor: messageColor,
+                                    quoted: replyMetadata[replyKey]?.quoted,
+                                    canReply: replyMetadata[replyKey]?.msgId != nil,
+                                    reactions: reactions[reactionKey] ?? [],
                                     onReact: { emoji in
                                         sendReaction(to: message, emoji: emoji)
                                     },
                                     onReply: {
                                         replyingTo = message
+                                    },
+                                    onPhotoTap: { jpeg in
+                                        viewedPhoto = ViewedPhoto(jpeg: jpeg)
                                     },
                                     onQuotedTap: { target in
                                         withAnimation {
@@ -95,7 +125,25 @@ struct GroupChatView: View {
                         replyingTo = nil
                     }
                 }
-                HStack(alignment: .center, spacing: 8) {
+                if let pendingPhoto {
+                    PendingPhotoPreview(jpeg: pendingPhoto) { self.pendingPhoto = nil }
+                }
+                HStack(alignment: .bottom, spacing: 8) {
+                    Menu {
+                        PhotosPicker(selection: $photoItem, matching: .images) {
+                            Label("Photo library", systemImage: "photo")
+                        }
+                        Button { showCamera = true } label: {
+                            Label("Take photo", systemImage: "camera")
+                        }
+                        Button { showVoice = true } label: {
+                            Label("Voice memo", systemImage: "mic")
+                        }
+                    } label: {
+                        Image(systemName: "plus.circle.fill").font(.system(size: 28))
+                    }
+                    .accessibilityLabel("Attach")
+
                     TextField("Message", text: $draft, axis: .vertical)
                         .lineLimit(1...4)
                         .padding(.horizontal, 14)
@@ -105,23 +153,22 @@ struct GroupChatView: View {
                                 .fill(Color(uiColor: .secondarySystemBackground))
                         )
 
-                    Button {
-                        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !text.isEmpty else { return }
-                        let replyToMsgId = replyingTo.flatMap {
-                            replyMetadata[replyMessageKey($0)]?.msgId
+                    if canSend {
+                        Button {
+                            sendCurrentDraft()
+                        } label: {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.system(size: 32, weight: .semibold))
                         }
-                        sender.sendText(group: group, text: text, replyToMsgId: replyToMsgId)
-                        draft = ""
-                        replyingTo = nil
-                        reload()
-                    } label: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 32, weight: .semibold))
+                        .accessibilityLabel("Send")
+                    } else {
+                        HoldToRecordButton(
+                            recorder: voiceRecorder,
+                            onFinished: sendVoice,
+                            onError: { statusMessage = $0 },
+                            onAccessibilityFallback: { showVoice = true }
+                        )
                     }
-                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    .opacity(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.36 : 1)
-                    .accessibilityLabel("Send")
                 }
             }
             .padding(12)
@@ -137,7 +184,7 @@ struct GroupChatView: View {
                         VStack(alignment: .leading) {
                             Text(group.name)
                                 .font(.headline)
-                            Text("\(group.memberUserIds.count) members · tap for details")
+                            Text("\(reachableMemberSummary) · tap for details")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -147,6 +194,8 @@ struct GroupChatView: View {
             }
         }
         .onAppear {
+            draft = DraftStore.load(chatId: group.id)
+            isMuted = ChatMuteStore.isMuted(group.id)
             ChatVisibility.setVisible(group.id)
             MeshController.shared.notifyChatViewed(chatId: group.id)
             loadContacts()
@@ -158,15 +207,96 @@ struct GroupChatView: View {
         .onDisappear {
             ChatVisibility.clearVisible(group.id)
             ChatEvents.notifyChatChanged(group.id)
+            voiceRecorder.cancel()
+        }
+        .onChange(of: photoItem) { item in
+            guard let item else { return }
+            Task {
+                if let data = try? await item.loadTransferable(type: Data.self),
+                   let jpeg = MediaCompressor.compressImage(data: data) {
+                    pendingPhoto = jpeg
+                } else {
+                    statusMessage = "Could not prepare photo"
+                }
+                photoItem = nil
+            }
+        }
+        .onChange(of: draft) { DraftStore.save(chatId: group.id, text: $0) }
+        .sheet(isPresented: $showCamera) {
+            CameraPicker { image in
+                if let jpeg = MediaCompressor.compress(image: image) {
+                    pendingPhoto = jpeg
+                } else {
+                    statusMessage = "Could not prepare photo"
+                }
+            }
+        }
+        .sheet(isPresented: $showVoice, onDismiss: {
+            voiceRecorder.cancel()
+            voiceRecording = false
+        }) {
+            NavigationStack {
+                VStack(spacing: 24) {
+                    Image(systemName: voiceRecording ? "waveform.circle.fill" : "mic.circle")
+                        .font(.system(size: 72))
+                        .foregroundStyle(voiceRecording ? Color.red : Color.accentColor)
+                    Text(voiceRecording ? "Recording…" : "Voice memo")
+                        .font(.title2.weight(.semibold))
+                    Text("Voice memos stop automatically after \(Int(VoiceRecorder.maxDurationSeconds)) seconds.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    if voiceRecording {
+                        Button("Stop and send") {
+                            if let (url, duration) = voiceRecorder.stop() {
+                                sendVoice(url: url, durationMs: duration)
+                            }
+                            voiceRecording = false
+                            showVoice = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                    } else {
+                        Button("Start recording") {
+                            if voiceRecorder.start() { voiceRecording = true }
+                            else { statusMessage = "Microphone unavailable"; showVoice = false }
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                    Spacer()
+                }
+                .padding(24)
+                .navigationTitle("Voice memo")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { showVoice = false }
+                    }
+                }
+            }
         }
         .sheet(isPresented: $showDetails) {
             GroupDetailsSheet(
                 group: group,
-                nameForMember: senderName
+                nameForMember: senderName,
+                isMuted: isMuted,
+                onMutedChange: {
+                    isMuted = $0
+                    ChatMuteStore.setMuted($0, chatId: group.id)
+                    ChatEvents.notifyChatChanged(group.id)
+                }
             ) {
                 showDetails = false
                 confirmDelete = true
             }
+        }
+        .fullScreenCover(item: $viewedPhoto) { photo in
+            PhotoViewerOverlay(jpeg: photo.jpeg)
+        }
+        .alert("Notice", isPresented: Binding(
+            get: { statusMessage != nil },
+            set: { if !$0 { statusMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { statusMessage = nil }
+        } message: {
+            Text(statusMessage ?? "")
         }
         .alert("Delete \(group.name)?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) {
@@ -177,6 +307,60 @@ struct GroupChatView: View {
         } message: {
             Text("Removes this group and its message history from this device. Other members keep their copy.")
         }
+    }
+
+    private var canSend: Bool {
+        pendingPhoto != nil || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func sendCurrentDraft() {
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let replyToMsgId = replyingTo.flatMap { replyMetadata[replyMessageKey($0)]?.msgId }
+        if let photo = pendingPhoto {
+            sender.sendAttachment(
+                group: group,
+                attachment: AttachmentPayload(
+                    mediaType: .image,
+                    mimeType: "image/jpeg",
+                    durationMs: 0,
+                    blob: photo,
+                    caption: text
+                ),
+                replyToMsgId: replyToMsgId
+            )
+            pendingPhoto = nil
+        } else {
+            guard !text.isEmpty else { return }
+            sender.sendText(group: group, text: text, replyToMsgId: replyToMsgId)
+        }
+        draft = ""
+        replyingTo = nil
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        reload()
+    }
+
+    private func sendVoice(url: URL, durationMs: Int32) {
+        defer { try? FileManager.default.removeItem(at: url) }
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else {
+            statusMessage = "Could not save voice memo"
+            return
+        }
+        guard data.count <= AttachmentPayload.maxBlobBytes else {
+            statusMessage = "Voice memo too large for the mesh"
+            return
+        }
+        sender.sendAttachment(
+            group: group,
+            attachment: AttachmentPayload(
+                mediaType: .audio,
+                mimeType: "audio/mp4",
+                durationMs: min(durationMs, 60_000),
+                blob: data
+            ),
+            replyToMsgId: replyingTo.flatMap { replyMetadata[replyMessageKey($0)]?.msgId }
+        )
+        replyingTo = nil
+        reload()
     }
 
     private func senderName(_ userId: Data) -> String {
@@ -254,10 +438,19 @@ private struct GroupMessageRow: View {
     let reactions: [ReactionSummary]
     let onReact: (String) -> Void
     let onReply: () -> Void
+    let onPhotoTap: (Data) -> Void
     let onQuotedTap: (StoredMessage) -> Void
     @State private var showInfo = false
 
     var body: some View {
+        let outboundExpiry = isOwn
+            ? ((try? AppStore.get().outboundMessageExpiry(
+                chatId: message.chatId,
+                senderUserId: message.senderUserId,
+                lamport: message.lamport
+            )) ?? nil)
+            : nil
+
         if message.kind == ProtocolKind.groupInvite {
             Text(ChatListLogic.previewText(message, groupName: groupName))
                 .font(.caption2)
@@ -285,7 +478,30 @@ private struct GroupMessageRow: View {
                                 }
                             )
                         }
-                        Text(String(data: message.payload, encoding: .utf8) ?? "")
+                        if message.kind == ProtocolKind.attachmentManifest {
+                            if let attachment = AttachmentPayload.decode(message.payload) {
+                                switch attachment.mediaType {
+                                case .image:
+                                    ChatImageView(
+                                        jpeg: attachment.blob,
+                                        canReply: canReply,
+                                        onReply: onReply,
+                                        onOpen: onPhotoTap,
+                                        onStatus: { _ in }
+                                    )
+                                case .audio:
+                                    VoiceMemoPlayerView(
+                                        blob: attachment.blob,
+                                        durationMs: attachment.durationMs
+                                    )
+                                }
+                                if !attachment.caption.isEmpty { Text(attachment.caption) }
+                            } else {
+                                Text("Unsupported attachment")
+                            }
+                        } else {
+                            Text(String(data: message.payload, encoding: .utf8) ?? "")
+                        }
                     }
                         .padding(10)
                         .background(
@@ -318,10 +534,8 @@ private struct GroupMessageRow: View {
                 if !isOwn { Spacer(minLength: 40) }
             }
             .padding(.vertical, 2)
-            .alert("Message info", isPresented: $showInfo) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(messageInfoText(
+            .sheet(isPresented: $showInfo) {
+                MessageInfoSheet(text: messageInfoText(
                     message: message,
                     isOwn: isOwn,
                     tick: nil,
@@ -329,7 +543,8 @@ private struct GroupMessageRow: View {
                         chatId: message.chatId,
                         senderUserId: message.senderUserId,
                         lamport: message.lamport
-                    )
+                    ),
+                    outboundExpiryMs: outboundExpiry
                 ))
             }
         }
@@ -346,6 +561,8 @@ private struct GroupMessageRow: View {
 private struct GroupDetailsSheet: View {
     let group: Group
     let nameForMember: (Data) -> String
+    let isMuted: Bool
+    let onMutedChange: (Bool) -> Void
     let onDelete: () -> Void
     @Environment(\.dismiss) private var dismiss
 
@@ -355,6 +572,10 @@ private struct GroupDetailsSheet: View {
                 Section("Group") {
                     LabeledContent("Name", value: group.name)
                     LabeledContent("Members", value: "\(group.memberUserIds.count)")
+                    Toggle("Mute notifications", isOn: Binding(
+                        get: { isMuted },
+                        set: onMutedChange
+                    ))
                 }
                 Section("Members") {
                     ForEach(group.memberUserIds, id: \.self) { memberId in

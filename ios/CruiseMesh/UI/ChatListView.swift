@@ -13,6 +13,8 @@ struct ChatSummary: Identifiable {
     let ownDeliveredThrough: UInt64
     let ownReadThrough: UInt64
     let avatarData: Data?
+    let draft: String
+    let isMuted: Bool
 }
 
 /// Navigation target for the chat list — a 1:1 contact chat or a group chat.
@@ -26,6 +28,8 @@ struct ChatListView: View {
     @ObservedObject var appModel: AppModel
     @ObservedObject private var bluetooth = BluetoothAccess.shared
     @ObservedObject private var runtime = MeshRuntimeStatus.shared
+    @ObservedObject private var connectivity = MeshConnectivityStatus.shared
+    @ObservedObject private var connectivityClock = ConnectivityClock.shared
     @State private var summaries: [ChatSummary] = []
     @State private var showFriends = false
     @State private var showProfile = false
@@ -34,6 +38,7 @@ struct ChatListView: View {
     @State private var cancellable: AnyCancellable?
     @State private var bluetoothAudioWarningDismissed = false
     @State private var publishedFriendDirectory = false
+    @State private var path = NavigationPath()
     @AppStorage("hideBluetoothAudioWarning") private var hideBluetoothAudioWarning = false
 
     private var connectivityWarning: ConnectivityWarning? {
@@ -68,7 +73,7 @@ struct ChatListView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             SwiftUI.Group {
                 if summaries.isEmpty {
                     VStack(spacing: 12) {
@@ -90,7 +95,14 @@ struct ChatListView: View {
                 } else {
                     List(summaries) { summary in
                         NavigationLink(value: route(for: summary)) {
-                            ChatRowView(summary: summary, ownUserId: identity.userId)
+                            ChatRowView(
+                                summary: summary,
+                                ownUserId: identity.userId,
+                                reachability: summary.isGroup ? nil : connectivity.level(
+                                    for: summary.chatId,
+                                    nowMs: connectivityClock.nowMs
+                                )
+                            )
                         }
                         .swipeActions {
                             Button(role: .destructive) {
@@ -180,9 +192,10 @@ struct ChatListView: View {
                 }
             }
             .sheet(isPresented: $showNewGroup) {
-                NewGroupView(identity: identity) {
+                NewGroupView(identity: identity) { group in
                     showNewGroup = false
                     reload()
+                    path.append(ChatRoute.group(group.id))
                 }
             }
             .sheet(isPresented: $showProfile) {
@@ -215,6 +228,10 @@ struct ChatListView: View {
             }
             .onChange(of: appModel.pendingFriendToken) { token in
                 if token != nil { showFriends = true }
+            }
+            .onReceive(NotificationOpenEvents.subject) { event in
+                let (chatId, isGroup) = event
+                path.append(isGroup ? ChatRoute.group(chatId) : ChatRoute.contact(chatId))
             }
         }
     }
@@ -262,7 +279,9 @@ struct ChatListView: View {
                 unreadCount: Int(unread),
                 ownDeliveredThrough: deliveredThrough,
                 ownReadThrough: readThrough,
-                avatarData: (try? store.contactAvatar(userId: c.userId)) ?? nil
+                avatarData: (try? store.contactAvatar(userId: c.userId)) ?? nil,
+                draft: DraftStore.load(chatId: c.userId),
+                isMuted: ChatMuteStore.isMuted(c.userId)
             )
         }
         let groups = (try? store.listGroups()) ?? []
@@ -282,7 +301,9 @@ struct ChatListView: View {
                 unreadCount: Int(unread),
                 ownDeliveredThrough: 0,
                 ownReadThrough: 0,
-                avatarData: nil
+                avatarData: nil,
+                draft: DraftStore.load(chatId: g.id),
+                isMuted: ChatMuteStore.isMuted(g.id)
             )
         }
         summaries = (direct + groupSummaries)
@@ -293,6 +314,7 @@ struct ChatListView: View {
 private struct ChatRowView: View {
     let summary: ChatSummary
     let ownUserId: Data
+    let reachability: ReachabilityLevel?
 
     private var displayName: String {
         summary.isGroup
@@ -307,7 +329,8 @@ private struct ChatRowView: View {
                 name: summary.title,
                 size: 48,
                 photo: summary.avatarData.flatMap { UIImage(data: $0) },
-                isGroup: summary.isGroup
+                isGroup: summary.isGroup,
+                reachability: reachability
             )
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
@@ -315,6 +338,11 @@ private struct ChatRowView: View {
                         .font(.headline)
                         .fontWeight(summary.unreadCount > 0 ? .bold : .semibold)
                     Spacer()
+                    if summary.isMuted {
+                        Image(systemName: "bell.slash.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     if let last = summary.lastMessage {
                         Text(ChatListLogic.formatRelativeTime(timestampMs: last.timestamp))
                             .font(.caption)
@@ -322,7 +350,12 @@ private struct ChatRowView: View {
                     }
                 }
                 HStack {
-                    if let last = summary.lastMessage {
+                    if !summary.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("Draft: \(summary.draft)")
+                            .font(.subheadline)
+                            .foregroundStyle(.red)
+                            .lineLimit(1)
+                    } else if let last = summary.lastMessage {
                         let isOwn = last.senderUserId == ownUserId
                         if isOwn && !summary.isGroup {
                             SignalTickView(status: tickStatusFor(

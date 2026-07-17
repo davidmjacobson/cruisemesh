@@ -3,7 +3,7 @@ import SwiftUI
 /// Create a group: name + multi-select friends (DESIGN.md §14.6 / §6.5).
 struct NewGroupView: View {
     let identity: Identity
-    let onDone: () -> Void
+    let onDone: (Group) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
@@ -62,7 +62,7 @@ struct NewGroupView: View {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Create") { create() }
+                    Button("Create (\(selected.count + 1))") { create() }
                         .disabled(!canCreate)
                 }
             }
@@ -83,8 +83,8 @@ struct NewGroupView: View {
     private func create() {
         let members = contacts.filter { selected.contains($0.userId) }
         let sender = GroupSender(store: store, identity: identity)
-        _ = sender.createAndInvite(name: name, members: members)
+        guard let group = sender.createAndInvite(name: name, members: members) else { return }
         dismiss()
-        onDone()
+        onDone(group)
     }
 }

@@ -1,28 +1,22 @@
 import PhotosUI
 import SwiftUI
 
-/// Hosted privacy policy (App Store / Play Console + in-app link).
 private let privacyPolicyURL = URL(string: "https://cruisemesh.app/privacy")!
 
 struct ProfileView: View {
     let identity: Identity
     @ObservedObject var appModel: AppModel
     @ObservedObject private var runtime = MeshRuntimeStatus.shared
-    @ObservedObject private var lanDiagnostics = LanTransportDiagnostics.shared
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
 
-    @State private var displayName: String = ""
-    @State private var relayUrl: String = ""
-    @State private var relayToken: String = ""
+    @State private var displayName = ""
     @State private var meshOn = true
+    @State private var shareOnline = true
     @State private var avatarImage: UIImage?
     @State private var photoItem: PhotosPickerItem?
     @State private var friendsOfFriends = true
-    @State private var lanAddress = ""
-    @State private var lanError: String?
-    @State private var showLanQR = false
-    @State private var showLanScanner = false
+    @State private var showMyCard = false
 
     var body: some View {
         NavigationStack {
@@ -45,174 +39,90 @@ struct ProfileView: View {
                         Button("Remove profile photo", role: .destructive) {
                             ProfilePhotoStore.clear()
                             avatarImage = nil
-                            let epoch = ProfileStore.bumpOwnAvatarEpoch()
-                            ProfileSyncSender.queueToAllContacts(
-                                store: AppStore.get(),
-                                identity: identity,
-                                displayName: displayName,
-                                epoch: epoch
-                            )
+                            syncProfile(epoch: ProfileStore.bumpOwnAvatarEpoch())
                         }
                     }
                     TextField("Display name", text: $displayName)
                     LabeledContent("User ID", value: formatUserId(userId: identity.userId))
                     LabeledContent(
-                        "Fingerprint",
+                        "Safety words",
                         value: fingerprintWords(userId: identity.userId).joined(separator: " ")
                     )
                     Text("Read these words aloud with your friend to verify keys.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Section("Relay (optional)") {
-                    TextField("Relay URL", text: $relayUrl)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    SecureField("Family token", text: $relayToken)
-                    Text("When any family phone has internet, queued messages flush through this mailbox.")
+
+                Section("My friend card") {
+                    Button {
+                        showMyCard = true
+                    } label: {
+                        Label("Show my friend card", systemImage: "qrcode")
+                    }
+                }
+
+                Section("Backup") {
+                    NavigationLink {
+                        BackupExportView()
+                    } label: {
+                        Label("Back up account", systemImage: "externaldrive")
+                    }
+                    Text("Save your identity and messages to an encrypted file.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
                 Section("Mesh") {
                     Toggle("Mesh running", isOn: $meshOn)
                         .onChange(of: meshOn) { on in
                             if on { appModel.startMesh() } else { appModel.stopMesh() }
                         }
                     LabeledContent("Status", value: runtime.pillText)
+                    Toggle("Share when I'm online", isOn: $shareOnline)
+                        .onChange(of: shareOnline) { RelayConfigStore.setShareOnline($0) }
                 }
-                Section("Local Wi-Fi (experimental)") {
-                    Text(lanDiagnostics.snapshot.state)
-                    if let endpoint = lanDiagnostics.snapshot.localEndpoint {
-                        LabeledContent("This phone", value: endpoint)
-                            .font(.footnote.monospaced())
-                        Button("Copy this phone's address") {
-                            UIPasteboard.general.string = endpoint
-                        }
-                        HStack {
-                            Button("Show address QR") { showLanQR = true }
-                            Spacer()
-                            Button("Scan address QR") { showLanScanner = true }
-                        }
-                    }
-                    if !lanDiagnostics.snapshot.activePeerNames.isEmpty {
-                        Text("Secure link: \(lanDiagnostics.snapshot.activePeerNames.joined(separator: ", "))")
-                            .foregroundStyle(.tint)
-                    }
-                    if let endpoint = lanDiagnostics.snapshot.lastPeerEndpoint {
-                        LabeledContent("Last peer", value: endpoint)
-                            .font(.caption)
-                    }
-                    TextField("Friend IP address", text: $lanAddress)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.numbersAndPunctuation)
-                    Text("The port is optional. Manual connection still requires an accepted friend and CruiseMesh's encrypted identity check.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Button("Connect securely") {
-                        if !appModel.meshEnabled {
-                            appModel.startMesh()
-                            meshOn = true
-                        }
-                        lanError = lanDiagnostics.requestManualConnection(lanAddress)
-                    }
-                    Button("Test encrypted LAN link") {
-                        lanError = lanDiagnostics.requestConnectionTest()
-                    }
-                    Button("Search this /24 network") {
-                        lanError = lanDiagnostics.requestSubnetScan()
-                    }
-                    if let total = lanDiagnostics.snapshot.scanTotal {
-                        ProgressView(
-                            value: Double(lanDiagnostics.snapshot.scanProgress ?? 0),
-                            total: Double(total)
-                        ) {
-                            Text("Checked \(lanDiagnostics.snapshot.scanProgress ?? 0) of \(total) addresses")
-                                .font(.caption)
-                        }
-                    }
-                    if let probe = lanDiagnostics.snapshot.probeStatus {
-                        Text(probe)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Text(
-                        "Encrypted frames: \(lanDiagnostics.snapshot.sentFrames) sent · \(lanDiagnostics.snapshot.receivedFrames) received"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    if let error = lanError ?? lanDiagnostics.snapshot.lastError {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
-                }
+
                 Section("Privacy") {
                     Toggle("Friends of friends", isOn: $friendsOfFriends)
-                    Text("Let your CruiseMesh friends introduce you to people they know. Your messages and phone contacts are never shared.")
+                        .onChange(of: friendsOfFriends) { updateFriendsOfFriends($0) }
+                    Text("Let friends introduce you to people they know. Messages and phone contacts are never shared.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Section("Legal") {
-                    Button("Privacy policy") {
-                        openURL(privacyPolicyURL)
+
+                Section("Advanced") {
+                    NavigationLink {
+                        AdvancedSettingsView(appModel: appModel)
+                    } label: {
+                        Label("Relay, local Wi-Fi, and diagnostics", systemImage: "gearshape.2")
                     }
-                    Text(privacyPolicyURL.absoluteString)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                }
+
+                Section("Legal") {
+                    Button("Privacy policy") { openURL(privacyPolicyURL) }
                 }
             }
-            .navigationTitle("Profile")
+            .navigationTitle("Profile & settings")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
-                        let previousName = appModel.displayName
-                        let trimmedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-                        ProfileStore.saveDisplayName(trimmedName)
-                        appModel.displayName = trimmedName
-                        RelayConfigStore.save(relayUrl: relayUrl, relayToken: relayToken)
-                        let policyChanged = FriendsOfFriendsStore.isEnabled() != friendsOfFriends
-                        if policyChanged {
-                            FriendsOfFriendsStore.setEnabled(friendsOfFriends)
-                            if !friendsOfFriends { try? AppStore.get().clearFriendSuggestions() }
-                        }
-                        if trimmedName != previousName {
-                            let epoch = ProfileStore.bumpOwnAvatarEpoch()
-                            ProfileSyncSender.queueToAllContacts(
-                                store: AppStore.get(),
-                                identity: identity,
-                                displayName: trimmedName,
-                                epoch: epoch
-                            )
-                        }
-                        if policyChanged {
-                            ProfileSyncSender.queueToAllContacts(
-                                store: AppStore.get(),
-                                identity: identity,
-                                displayName: trimmedName,
-                                epoch: ProfileStore.loadOwnAvatarEpoch()
-                            )
-                            FriendDirectorySender.queueToAllContacts(
-                                store: AppStore.get(),
-                                identity: identity
-                            )
-                        }
-                        dismiss()
-                    }
-                }
             }
             .onAppear {
                 displayName = appModel.displayName
-                if let cfg = RelayConfigStore.load() {
-                    relayUrl = cfg.relayUrl
-                    relayToken = cfg.relayToken
-                }
                 meshOn = appModel.meshEnabled
+                shareOnline = RelayConfigStore.shareOnline()
                 avatarImage = ProfilePhotoStore.loadAvatarImage()
                 friendsOfFriends = FriendsOfFriendsStore.isEnabled()
+            }
+            .task(id: displayName) {
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                guard !Task.isCancelled else { return }
+                let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard trimmed != appModel.displayName else { return }
+                ProfileStore.saveDisplayName(trimmed)
+                appModel.displayName = trimmed
+                syncProfile(epoch: ProfileStore.bumpOwnAvatarEpoch())
             }
             .onChange(of: photoItem) { item in
                 guard let item else { return }
@@ -222,38 +132,139 @@ struct ProfileView: View {
                           let saved = ProfilePhotoStore.save(image: image) else { return }
                     await MainActor.run {
                         avatarImage = saved
-                        let epoch = ProfileStore.bumpOwnAvatarEpoch()
-                        ProfileSyncSender.queueToAllContacts(
-                            store: AppStore.get(),
-                            identity: identity,
-                            displayName: displayName,
-                            epoch: epoch
-                        )
+                        syncProfile(epoch: ProfileStore.bumpOwnAvatarEpoch())
                     }
                 }
             }
-            .sheet(isPresented: $showLanQR) {
-                if let endpointText = lanDiagnostics.snapshot.localEndpoint,
-                   let endpoint = parseLanManualEndpoint(endpointText) {
-                    LanEndpointQRView(endpoint: endpoint)
+            .sheet(isPresented: $showMyCard) {
+                MyQRView(identity: identity, displayName: displayName, onSayHi: { _ in })
+            }
+        }
+    }
+
+    private func syncProfile(epoch: Int64) {
+        ProfileSyncSender.queueToAllContacts(
+            store: AppStore.get(),
+            identity: identity,
+            displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines),
+            epoch: epoch
+        )
+    }
+
+    private func updateFriendsOfFriends(_ enabled: Bool) {
+        guard FriendsOfFriendsStore.isEnabled() != enabled else { return }
+        FriendsOfFriendsStore.setEnabled(enabled)
+        if !enabled { try? AppStore.get().clearFriendSuggestions() }
+        syncProfile(epoch: ProfileStore.loadOwnAvatarEpoch())
+        FriendDirectorySender.queueToAllContacts(store: AppStore.get(), identity: identity)
+    }
+}
+
+private struct AdvancedSettingsView: View {
+    @ObservedObject var appModel: AppModel
+    @ObservedObject private var lanDiagnostics = LanTransportDiagnostics.shared
+
+    @State private var relayUrl = ""
+    @State private var relayToken = ""
+    @State private var lanAddress = ""
+    @State private var lanError: String?
+    @State private var showLanQR = false
+    @State private var showLanScanner = false
+
+    var body: some View {
+        Form {
+            Section("Relay") {
+                TextField("Relay URL", text: $relayUrl)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                SecureField("Family token", text: $relayToken)
+                Text("When any family phone has internet, queued messages flush through this mailbox.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Local Wi-Fi (experimental)") {
+                Text(lanDiagnostics.snapshot.state)
+                if let endpoint = lanDiagnostics.snapshot.localEndpoint {
+                    LabeledContent("This phone", value: endpoint).font(.footnote.monospaced())
+                    Button("Copy this phone's address") { UIPasteboard.general.string = endpoint }
+                    HStack {
+                        Button("Show address QR") { showLanQR = true }
+                        Spacer()
+                        Button("Scan address QR") { showLanScanner = true }
+                    }
+                }
+                if !lanDiagnostics.snapshot.activePeerNames.isEmpty {
+                    Text("Secure link: \(lanDiagnostics.snapshot.activePeerNames.joined(separator: ", "))")
+                        .foregroundStyle(.tint)
+                }
+                if let endpoint = lanDiagnostics.snapshot.lastPeerEndpoint {
+                    LabeledContent("Last peer", value: endpoint).font(.caption)
+                }
+                TextField("Friend IP address", text: $lanAddress)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.numbersAndPunctuation)
+                Text("The port is optional. An accepted friend and encrypted identity check are still required.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Connect securely") {
+                    if !appModel.meshEnabled { appModel.startMesh() }
+                    lanError = lanDiagnostics.requestManualConnection(lanAddress)
+                }
+                Button("Test encrypted LAN link") { lanError = lanDiagnostics.requestConnectionTest() }
+                Button("Search this /24 network") { lanError = lanDiagnostics.requestSubnetScan() }
+                if let total = lanDiagnostics.snapshot.scanTotal {
+                    ProgressView(
+                        value: Double(lanDiagnostics.snapshot.scanProgress ?? 0),
+                        total: Double(total)
+                    ) {
+                        Text("Checked \(lanDiagnostics.snapshot.scanProgress ?? 0) of \(total) addresses")
+                            .font(.caption)
+                    }
+                }
+                if let probe = lanDiagnostics.snapshot.probeStatus {
+                    Text(probe).font(.caption).foregroundStyle(.secondary)
+                }
+                Text("Encrypted frames: \(lanDiagnostics.snapshot.sentFrames) sent · \(lanDiagnostics.snapshot.receivedFrames) received")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let error = lanError ?? lanDiagnostics.snapshot.lastError {
+                    Text(error).font(.caption).foregroundStyle(.red)
                 }
             }
-            .sheet(isPresented: $showLanScanner) {
-                QRScannerView { code in
-                    let fragment = URL(string: code)?.fragment ?? code
-                    guard let endpoint = parseLanEndpointLink(fragment) else {
-                        lanError = "That QR code is not a CruiseMesh LAN address"
-                        return
-                    }
-                    showLanScanner = false
-                    if !appModel.meshEnabled {
-                        appModel.startMesh()
-                        meshOn = true
-                    }
-                    LanTransportDiagnostics.shared.queueManualConnection(endpoint)
-                    lanAddress = endpoint.display
-                    lanError = nil
+        }
+        .navigationTitle("Advanced settings")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            if let config = RelayConfigStore.load() {
+                relayUrl = config.relayUrl
+                relayToken = config.relayToken
+            }
+        }
+        .task(id: relayUrl + "\u{0}" + relayToken) {
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled else { return }
+            RelayConfigStore.save(relayUrl: relayUrl, relayToken: relayToken)
+        }
+        .sheet(isPresented: $showLanQR) {
+            if let endpointText = lanDiagnostics.snapshot.localEndpoint,
+               let endpoint = parseLanManualEndpoint(endpointText) {
+                LanEndpointQRView(endpoint: endpoint)
+            }
+        }
+        .sheet(isPresented: $showLanScanner) {
+            QRScannerView { code in
+                let fragment = URL(string: code)?.fragment ?? code
+                guard let endpoint = parseLanEndpointLink(fragment) else {
+                    lanError = "That QR code is not a CruiseMesh LAN address"
+                    return
                 }
+                showLanScanner = false
+                if !appModel.meshEnabled { appModel.startMesh() }
+                LanTransportDiagnostics.shared.queueManualConnection(endpoint)
+                lanAddress = endpoint.display
+                lanError = nil
             }
         }
     }
@@ -276,8 +287,7 @@ private struct LanEndpointQRView: View {
                         .padding()
                         .background(RoundedRectangle(cornerRadius: 16).fill(Color.white))
                 }
-                Text(endpoint.display)
-                    .font(.body.monospaced())
+                Text(endpoint.display).font(.body.monospaced())
                 Text("Your friend must already be accepted. The QR only supplies a local network address; the encrypted identity check still applies.")
                     .font(.caption)
                     .foregroundStyle(.secondary)

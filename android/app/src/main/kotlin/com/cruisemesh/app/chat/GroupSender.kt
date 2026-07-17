@@ -10,6 +10,8 @@ import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
 import com.cruisemesh.app.media.KIND_GROUP_INVITE
 import com.cruisemesh.app.media.KIND_REACTION
+import com.cruisemesh.app.media.AttachmentPayload
+import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import uniffi.cruisemesh_core.createGroup
 
 private const val TAG = "GroupSender"
@@ -74,6 +76,27 @@ class GroupSender(
         if (payload.isEmpty()) return SendResult.FAILED
 
         return enqueueGroupMessage(group, KIND_TEXT, payload, "sendText", replyToMsgId)
+    }
+
+    fun sendAttachment(
+        group: Group,
+        attachment: AttachmentPayload,
+        replyToMsgId: ByteArray? = null,
+    ): SendResult {
+        if (attachment.blob.size > AttachmentPayload.MAX_BLOB_BYTES) return SendResult.FAILED
+        val payload = try {
+            attachment.encode()
+        } catch (e: Exception) {
+            Log.e(TAG, "sendAttachment: could not encode group attachment", e)
+            return SendResult.FAILED
+        }
+        return enqueueGroupMessage(
+            group,
+            KIND_ATTACHMENT_MANIFEST,
+            payload,
+            "sendAttachment",
+            replyToMsgId,
+        )
     }
 
     /** Sends or clears this user's emoji reaction to [target] in [group]. */

@@ -25,7 +25,12 @@ enum MeshDefaults {
     static let foreignCarryBudgetBytes: Int64 = 5 * 1024 * 1024
     static let carryHintDayWindow: Int64 = 7
     static let msPerDay: Int64 = 24 * 60 * 60 * 1000
-    static let digestCarriedMsgIdsLimit: UInt64 = 512
+    // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): the outgoing DIGEST's
+    // advertised msg_id cap used to live here as `digestCarriedMsgIdsLimit`.
+    // That decision -- and the carried+recently-held id list it bounds --
+    // now lives in core (`engine.rs::DIGEST_ADVERTISED_MSG_IDS_LIMIT`,
+    // behind `store.coreDigestAdvertisedMsgIds()`), so both platforms share
+    // one source of truth instead of two constants that could drift.
     static let relayBatchLimit: UInt64 = 128
     static let ownOutboundSprayBudgetBytes: UInt64 = 256 * 1024
     static let ownReceiptSprayBudgetBytes: UInt64 = 64 * 1024

@@ -23,4 +23,8 @@ enum ProfileStore {
         UserDefaults.standard.set(epoch, forKey: ownAvatarEpochKey)
         return epoch
     }
+
+    static func restoreOwnAvatarEpoch(_ epoch: Int64) {
+        UserDefaults.standard.set(epoch, forKey: ownAvatarEpochKey)
+    }
 }
