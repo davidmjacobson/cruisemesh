@@ -1336,11 +1336,29 @@ class MeshService : Service() {
             Log.w(TAG, "Authenticated LAN link could not be registered")
             return
         }
-        val peerName = store.getContact(userId)?.name ?: "Accepted friend"
+        val contact = store.getContact(userId)
+        val peerName = contact?.name ?: "Accepted friend"
         endpoint?.let { lanEndpointCache.save(networkId, userId, it) }
         LanTransportDiagnostics.authenticated(address, peerName)
         Log.i(TAG, "Secure LAN link active with $peerName")
         sendHello(address)
+        val currentTransport = lanTransport
+        val eagerHint = authenticatedLanEndpointHint(
+            contact = contact,
+            hint = currentTransport?.currentEndpointHint(),
+            networkId = currentTransport?.currentNetworkId(),
+        )
+        val ownIdentity = identity
+        if (eagerHint != null && ownIdentity != null) {
+            LanEndpointSender.queueToContact(
+                this,
+                store,
+                ownIdentity,
+                eagerHint.contact,
+                eagerHint.hint,
+                eagerHint.networkId,
+            )
+        }
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
     }
 
