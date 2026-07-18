@@ -19,6 +19,12 @@ import uniffi.cruisemesh_core.Frame
  * this without limit. Re-stashing an address (a newer hint arrives before
  * the older one was ever claimed) replaces its entry and counts as the
  * freshest; when over capacity the oldest entry is evicted first.
+ *
+ * Methods are @Synchronized: [MeshService] gives no single-thread guarantee
+ * for frame handling -- hints, HELLOs, and disconnects for different links
+ * arrive on different transport/binder threads, and a LinkedHashMap can
+ * corrupt structurally under concurrent mutation. Leaf monitor; never calls
+ * out.
  */
 class PendingLanHintHold(private val maxEntries: Int = MAX_ENTRIES) {
     // LinkedHashMap in insertion order: re-stashing an address removes then
@@ -27,6 +33,7 @@ class PendingLanHintHold(private val maxEntries: Int = MAX_ENTRIES) {
     private val held = LinkedHashMap<String, Frame.LanEndpoint>()
 
     /** Stashes [hint] for [address], evicting the oldest held entry if now over capacity. */
+    @Synchronized
     fun stash(address: String, hint: Frame.LanEndpoint) {
         held.remove(address)
         held[address] = hint
@@ -37,14 +44,17 @@ class PendingLanHintHold(private val maxEntries: Int = MAX_ENTRIES) {
     }
 
     /** Removes and returns the held hint for [address], if any. */
+    @Synchronized
     fun take(address: String): Frame.LanEndpoint? = held.remove(address)
 
     /** [address] disconnected; its held hint (if any) is stale. */
+    @Synchronized
     fun clear(address: String) {
         held.remove(address)
     }
 
     /** Number of addresses currently held, for tests/diagnostics. */
+    @Synchronized
     fun size(): Int = held.size
 
     companion object {

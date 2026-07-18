@@ -15,6 +15,11 @@ package com.cruisemesh.app.mesh
  * over this path. A real STATE_DISCONNECTED callback always tears the link
  * down immediately regardless of this count -- this class only governs the
  * notify-failure path.
+ *
+ * Methods are @Synchronized: GATT callbacks arrive on arbitrary binder
+ * threads. Today every call happens under [BlePeripheral]'s own lock, but
+ * this class stays independently safe (a leaf monitor -- it never calls
+ * out, so it cannot deadlock with the caller's lock).
  */
 class NotifyFailureTracker(private val maxConsecutiveFailures: Int = MAX_CONSECUTIVE_FAILURES) {
     private val counts = mutableMapOf<String, Int>()
@@ -25,6 +30,7 @@ class NotifyFailureTracker(private val maxConsecutiveFailures: Int = MAX_CONSECU
      * intervening success -- the caller's signal to actually tear the link
      * down.
      */
+    @Synchronized
     fun recordFailure(address: String): Boolean {
         val count = (counts[address] ?: 0) + 1
         counts[address] = count
@@ -32,21 +38,25 @@ class NotifyFailureTracker(private val maxConsecutiveFailures: Int = MAX_CONSECU
     }
 
     /** A notify to [address] succeeded; its failure streak resets. */
+    @Synchronized
     fun recordSuccess(address: String) {
         counts.remove(address)
     }
 
     /** [address] disconnected (or was torn down); forget its failure history. */
+    @Synchronized
     fun clear(address: String) {
         counts.remove(address)
     }
 
     /** Forgets every address's failure history, e.g. on a full role stop(). */
+    @Synchronized
     fun clearAll() {
         counts.clear()
     }
 
     /** Current consecutive-failure count for [address], for tests/diagnostics. */
+    @Synchronized
     fun failureCount(address: String): Int = counts[address] ?: 0
 
     companion object {

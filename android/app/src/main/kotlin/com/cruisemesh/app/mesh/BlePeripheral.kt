@@ -138,11 +138,24 @@ class BlePeripheral(
     private val inFlightFragment = mutableMapOf<String, ByteArray>()
     private val notifyFailures = NotifyFailureTracker()
 
-    // GATT server callbacks arrive on a binder thread; Handler.postDelayed's
-    // callback runs on whichever Looper the Handler was built with -- use the
-    // main looper so paced-send firing (and its map mutations) lands on the
-    // same thread as the rest of this class's Android-framework calls
-    // (mirrors BleCentral's connect-watchdog Handler).
+    // Guards every read-modify-write of the per-address state above
+    // (connectedDevices, negotiatedMtu, reassemblers, notifyQueues,
+    // notifyInFlight, notifyFrameStarted, inFlightFragment). GATT server
+    // callbacks arrive on arbitrary binder threads -- the 2026-07-17 field
+    // log shows onNotificationSent for ONE address delivered on two
+    // different binder threads while MeshService queued frames from a third
+    // -- so the unguarded check-then-act on notifyInFlight could let several
+    // notifications go out concurrently for one address, saturating the
+    // controller (the likely trigger of the status=129 burst itself). Lock
+    // ordering: only leaf locks (NotifyFailureTracker's / MeshRouter's) are
+    // ever taken while holding this one, so callouts to
+    // onCentralDisconnected under it cannot deadlock.
+    private val lock = Any()
+
+    // Paced sends fire on the main looper (mirrors BleCentral's
+    // connect-watchdog Handler); the callback still takes [lock] before
+    // touching state -- the Looper choice is about framework-call affinity,
+    // not mutual exclusion.
     private val handler = Handler(Looper.getMainLooper())
 
     @Volatile private var advertising = false
@@ -170,7 +183,7 @@ class BlePeripheral(
             Log.i(TAG, "Central ${device.address} connection state=$newState")
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    connectedDevices[device.address] = device
+                    synchronized(lock) { connectedDevices[device.address] = device }
                     // Legacy connectable advertising auto-stops the instant a
                     // central connects. Without restarting it, this phone goes
                     // dark to every other peer for the rest of the process
@@ -188,7 +201,7 @@ class BlePeripheral(
 
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
             Log.i(TAG, "MTU negotiated for ${device.address}: $mtu")
-            negotiatedMtu[device.address] = mtu
+            synchronized(lock) { negotiatedMtu[device.address] = mtu }
         }
 
         override fun onCharacteristicWriteRequest(
@@ -202,7 +215,14 @@ class BlePeripheral(
         ) {
             Log.i(TAG, "Write request from ${device.address} for ${characteristic.uuid} (${value.size} bytes)")
             if (characteristic.uuid == MeshConstants.INBOUND_CHARACTERISTIC_UUID) {
-                val reassembler = reassemblers.getOrPut(device.address) { FrameReassembler() }
+                // Only the map access needs the lock; GATT write requests on
+                // one connection are request/response-serialized, so the
+                // reassembler itself sees them in order. Reassembly and frame
+                // handling stay outside the lock so inbound processing never
+                // serializes against the send paths.
+                val reassembler = synchronized(lock) {
+                    reassemblers.getOrPut(device.address) { FrameReassembler() }
+                }
                 reassembler.accept(value)?.let { onFrameReceived(device.address, it) }
             }
             if (responseNeeded) {
@@ -241,66 +261,68 @@ class BlePeripheral(
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
-            val address = device.address
-            if (address !in connectedDevices) {
-                // This address was already torn down -- by an earlier
-                // failure in this same burst, or a raced STATE_DISCONNECTED
-                // -- and the BLE stack can keep delivering queued
-                // onNotificationSent callbacks for a device object after
-                // cleanup. Without this guard, a single congestion burst
-                // re-ran the full teardown path (including re-firing
-                // onCentralDisconnected) 14 times for one address within
-                // ~40ms (Pixel 10 Pro field log, 2026-07-17). Invariant:
-                // once an address leaves connectedDevices, every further
-                // callback for it is a no-op.
-                return
-            }
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                // Invariant: a single failed notify does NOT prove the link
-                // is dead. status=129 (GATT_CONGESTED-adjacent) fired during
-                // the on-HELLO spray (drainCarriedEnvelopesTo + digest
-                // frames -- DESIGN.md §5.3/§7.3 -- can queue 19+ frames for
-                // one address at once) while the field log showed the
-                // central still writing to us on this exact address 300ms to
-                // 30s later. Tearing down on the very first failure wiped
-                // MeshRouter's learned address->userId mapping while the
-                // link was still usable, permanently losing anything that
-                // arrived afterward with nowhere to route it (e.g. a LAN
-                // endpoint hint -- see MeshService.handleLanEndpointHint).
-                // Retry the fragment that failed instead, and only tear the
-                // link down once NotifyFailureTracker sees
-                // MAX_CONSECUTIVE_FAILURES in a row for this address with no
-                // success in between; a real STATE_DISCONNECTED callback
-                // (below) always tears the link down regardless of this
-                // count.
-                notifyInFlight.remove(address)
-                val retryFragment = inFlightFragment.remove(address)
-                if (notifyFailures.recordFailure(address)) {
-                    Log.w(
-                        TAG,
-                        "onNotificationSent: notify failed for $address (status=$status) " +
-                            "${NotifyFailureTracker.MAX_CONSECUTIVE_FAILURES} times in a row; tearing down link",
-                    )
-                    gattServer?.cancelConnection(device)
-                    tearDownLink(
-                        address,
-                        "notification send failed ${NotifyFailureTracker.MAX_CONSECUTIVE_FAILURES}x in a row (status=$status)",
-                    )
+            synchronized(lock) {
+                val address = device.address
+                if (address !in connectedDevices) {
+                    // This address was already torn down -- by an earlier
+                    // failure in this same burst, or a raced STATE_DISCONNECTED
+                    // -- and the BLE stack can keep delivering queued
+                    // onNotificationSent callbacks for a device object after
+                    // cleanup. Without this guard, a single congestion burst
+                    // re-ran the full teardown path (including re-firing
+                    // onCentralDisconnected) 14 times for one address within
+                    // ~40ms (Pixel 10 Pro field log, 2026-07-17). Invariant:
+                    // once an address leaves connectedDevices, every further
+                    // callback for it is a no-op.
                     return
                 }
-                Log.w(TAG, "onNotificationSent: notify failed for $address (status=$status); retrying")
-                if (retryFragment != null) {
-                    notifyInFlight += address
-                    sendFragment(device, retryFragment)
-                } else {
-                    sendNextQueuedFragment(device)
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    // Invariant: a single failed notify does NOT prove the link
+                    // is dead. status=129 (GATT_CONGESTED-adjacent) fired during
+                    // the on-HELLO spray (drainCarriedEnvelopesTo + digest
+                    // frames -- DESIGN.md §5.3/§7.3 -- can queue 19+ frames for
+                    // one address at once) while the field log showed the
+                    // central still writing to us on this exact address 300ms to
+                    // 30s later. Tearing down on the very first failure wiped
+                    // MeshRouter's learned address->userId mapping while the
+                    // link was still usable, permanently losing anything that
+                    // arrived afterward with nowhere to route it (e.g. a LAN
+                    // endpoint hint -- see MeshService.handleLanEndpointHint).
+                    // Retry the fragment that failed instead, and only tear the
+                    // link down once NotifyFailureTracker sees
+                    // MAX_CONSECUTIVE_FAILURES in a row for this address with no
+                    // success in between; a real STATE_DISCONNECTED callback
+                    // (below) always tears the link down regardless of this
+                    // count.
+                    notifyInFlight.remove(address)
+                    val retryFragment = inFlightFragment.remove(address)
+                    if (notifyFailures.recordFailure(address)) {
+                        Log.w(
+                            TAG,
+                            "onNotificationSent: notify failed for $address (status=$status) " +
+                                "${NotifyFailureTracker.MAX_CONSECUTIVE_FAILURES} times in a row; tearing down link",
+                        )
+                        gattServer?.cancelConnection(device)
+                        tearDownLink(
+                            address,
+                            "notification send failed ${NotifyFailureTracker.MAX_CONSECUTIVE_FAILURES}x in a row (status=$status)",
+                        )
+                        return
+                    }
+                    Log.w(TAG, "onNotificationSent: notify failed for $address (status=$status); retrying")
+                    if (retryFragment != null) {
+                        notifyInFlight += address
+                        sendFragment(device, retryFragment)
+                    } else {
+                        sendNextQueuedFragment(device)
+                    }
+                    return
                 }
-                return
+                notifyFailures.recordSuccess(address)
+                notifyInFlight.remove(address)
+                inFlightFragment.remove(address)
+                sendNextQueuedFragment(device)
             }
-            notifyFailures.recordSuccess(address)
-            notifyInFlight.remove(address)
-            inFlightFragment.remove(address)
-            sendNextQueuedFragment(device)
         }
     }
 
@@ -383,14 +405,16 @@ class BlePeripheral(
         runCatching { gattServer?.close() }
         gattServer = null
         handler.removeCallbacksAndMessages(null)
-        connectedDevices.clear()
-        negotiatedMtu.clear()
-        reassemblers.clear()
-        notifyQueues.clear()
-        notifyInFlight.clear()
-        notifyFrameStarted.clear()
-        inFlightFragment.clear()
-        notifyFailures.clearAll()
+        synchronized(lock) {
+            connectedDevices.clear()
+            negotiatedMtu.clear()
+            reassemblers.clear()
+            notifyQueues.clear()
+            notifyInFlight.clear()
+            notifyFrameStarted.clear()
+            inFlightFragment.clear()
+            notifyFailures.clearAll()
+        }
     }
 
     /**
@@ -399,15 +423,10 @@ class BlePeripheral(
      * §5.2).
      */
     fun notifyFrame(frame: ByteArray) {
-        connectedDevices.values.forEach { device ->
-            val payloadSize = (negotiatedMtu[device.address] ?: FrameFraming.DEFAULT_ATT_MTU) -
-                FrameFraming.ATT_HEADER_OVERHEAD
-            val fragments = FrameFraming.fragmentOrNull(frame, payloadSize) ?: run {
-                Log.w(TAG, "notifyFrame: dropping ${frame.size}-byte frame for ${device.address} -- too large to fragment")
-                return@forEach
-            }
-            notifyQueues.getOrPut(device.address) { ArrayDeque() }.add(ArrayDeque(fragments))
-            sendNextQueuedFragment(device)
+        synchronized(lock) {
+            connectedDevices.values.toList()
+        }.forEach { device ->
+            sendFrame(device.address, frame)
         }
     }
 
@@ -420,19 +439,21 @@ class BlePeripheral(
      * or reply on the exact link a frame arrived on.
      */
     fun sendFrame(deviceAddress: String, frame: ByteArray) {
-        val device = connectedDevices[deviceAddress] ?: run {
-            Log.w(TAG, "sendFrame: no connection tracked for $deviceAddress")
-            return
+        synchronized(lock) {
+            val device = connectedDevices[deviceAddress] ?: run {
+                Log.w(TAG, "sendFrame: no connection tracked for $deviceAddress")
+                return
+            }
+            val payloadSize = (negotiatedMtu[deviceAddress] ?: FrameFraming.DEFAULT_ATT_MTU) -
+                FrameFraming.ATT_HEADER_OVERHEAD
+            val fragments = FrameFraming.fragmentOrNull(frame, payloadSize) ?: run {
+                Log.w(TAG, "sendFrame: dropping ${frame.size}-byte frame for $deviceAddress -- too large to fragment")
+                return
+            }
+            notifyQueues.getOrPut(deviceAddress) { ArrayDeque() }.add(ArrayDeque(fragments))
+            Log.i(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
+            sendNextQueuedFragment(device)
         }
-        val payloadSize = (negotiatedMtu[deviceAddress] ?: FrameFraming.DEFAULT_ATT_MTU) -
-            FrameFraming.ATT_HEADER_OVERHEAD
-        val fragments = FrameFraming.fragmentOrNull(frame, payloadSize) ?: run {
-            Log.w(TAG, "sendFrame: dropping ${frame.size}-byte frame for $deviceAddress -- too large to fragment")
-            return
-        }
-        notifyQueues.getOrPut(deviceAddress) { ArrayDeque() }.add(ArrayDeque(fragments))
-        Log.i(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
-        sendNextQueuedFragment(device)
     }
 
     /**
@@ -445,6 +466,12 @@ class BlePeripheral(
      * only when several more whole frames are already queued behind it --
      * see [FRAME_PACING_DEEP_QUEUE_THRESHOLD]. Throttling changes WHEN
      * frames go out, never WHETHER: nothing here is dropped, just delayed.
+     *
+     * Callers must hold [lock] (all current callers do; the monitor is
+     * reentrant, so calls from already-locked paths are fine) -- the
+     * check-then-act on [notifyInFlight] below is exactly the race that lets
+     * two threads each see the address as idle and put two notifications in
+     * flight at once.
      */
     private fun sendNextQueuedFragment(device: BluetoothDevice) {
         val address = device.address
@@ -477,15 +504,21 @@ class BlePeripheral(
         // the actual send below is paced -- otherwise a concurrent
         // notifyFrame()/sendFrame() call queued during the pacing delay
         // would see this address as idle and jump the queue, violating the
-        // one-notification-per-connection GATT constraint.
+        // one-notification-per-connection GATT constraint. That reservation
+        // is also what makes the paced callback below race-free: any retry
+        // or new queueing for this address between now and the delayed
+        // firing sees the slot taken and backs off, so the delayed
+        // sendFragment can never double-send alongside another path.
         notifyInFlight += address
         val queuedFrames = frames.size
         if (shouldPaceFrameStart(startingNewFrame, queuedFrames)) {
             handler.postDelayed({
-                if (address in connectedDevices) {
-                    sendFragment(device, fragment)
-                } else {
-                    notifyInFlight.remove(address)
+                synchronized(lock) {
+                    if (address in connectedDevices) {
+                        sendFragment(device, fragment)
+                    } else {
+                        notifyInFlight.remove(address)
+                    }
                 }
             }, FRAME_PACING_DELAY_MS)
         } else {
@@ -493,6 +526,7 @@ class BlePeripheral(
         }
     }
 
+    /** Callers must hold [lock]; see [sendNextQueuedFragment]. */
     private fun sendFragment(device: BluetoothDevice, fragment: ByteArray) {
         val address = device.address
         val characteristic = outboundCharacteristic
@@ -542,22 +576,28 @@ class BlePeripheral(
      * onNotificationSent callback the BLE stack delivers after cleanup, or a
      * STATE_DISCONNECTED racing a notify-failure teardown) is a no-op rather
      * than re-running cleanup and re-firing [onCentralDisconnected].
+     *
+     * Takes [lock] itself (reentrant for already-locked callers) so the
+     * STATE_DISCONNECTED callback path is guarded too, and the idempotence
+     * check-then-act on [connectedDevices] can't race a concurrent teardown.
      */
     private fun tearDownLink(address: String, reason: String) {
-        if (address !in connectedDevices) return
-        Log.i(TAG, "tearDownLink: $address ($reason)")
-        connectedDevices.remove(address)
-        negotiatedMtu.remove(address)
-        reassemblers.remove(address)
-        notifyQueues.remove(address)
-        notifyInFlight.remove(address)
-        notifyFrameStarted.remove(address)
-        inFlightFragment.remove(address)
-        notifyFailures.clear(address)
-        onCentralDisconnected(address)
-        // A link just dropped; make sure we're advertising again so this peer
-        // stays reachable. No-ops if advertising is already up.
-        beginAdvertising()
+        synchronized(lock) {
+            if (address !in connectedDevices) return
+            Log.i(TAG, "tearDownLink: $address ($reason)")
+            connectedDevices.remove(address)
+            negotiatedMtu.remove(address)
+            reassemblers.remove(address)
+            notifyQueues.remove(address)
+            notifyInFlight.remove(address)
+            notifyFrameStarted.remove(address)
+            inFlightFragment.remove(address)
+            notifyFailures.clear(address)
+            onCentralDisconnected(address)
+            // A link just dropped; make sure we're advertising again so this peer
+            // stays reachable. No-ops if advertising is already up.
+            beginAdvertising()
+        }
     }
 
     private fun buildGattService(): BluetoothGattService {
