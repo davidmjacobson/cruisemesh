@@ -125,6 +125,10 @@ internal class LanTransport(
     private val eligibleWifiNetworks = linkedSetOf<Network>()
     private val instanceTokenBytes = ByteArray(8).also(secureRandom::nextBytes)
     private val instanceToken = instanceTokenBytes.toHex()
+    private val scanPlanner = LanScanPlanner()
+
+    @Volatile
+    private var runningScanBreadth: LanScanBreadth? = null
     private val automaticScanRunnable = Runnable {
         if (!started || wifiNetwork == null) return@Runnable
         if (
@@ -134,8 +138,10 @@ internal class LanTransport(
                 scanRemaining = scanRemaining.get(),
             )
         ) {
-            Log.i(TAG, "Starting automatic local Wi-Fi fallback search")
-            startSubnetScan()
+            scanPlanner.takeDueScan(System.currentTimeMillis())?.let { breadth ->
+                Log.i(TAG, "Starting automatic local Wi-Fi fallback search (${breadth.name})")
+                startSubnetScan(breadth)
+            }
         }
         scheduleAutomaticSubnetScan(AUTO_SCAN_RETRY_INTERVAL_MS)
     }
@@ -178,7 +184,8 @@ internal class LanTransport(
             LanTransportDiagnostics.registerManualConnector { endpoint ->
                 mainHandler.post { connectManually(endpoint) }
             }
-            LanTransportDiagnostics.registerScanRequester(::startSubnetScan)
+            // The manual diagnostics button always sweeps the full subnet.
+            LanTransportDiagnostics.registerScanRequester { startSubnetScan() }
         } catch (error: RuntimeException) {
             Log.w(TAG, "Unable to monitor Wi-Fi for LAN transport", error)
         }
@@ -230,7 +237,7 @@ internal class LanTransport(
         connections[address]?.close()
     }
 
-    fun startSubnetScan(): String? {
+    fun startSubnetScan(breadth: LanScanBreadth = LanScanBreadth.FULL_SUBNET): String? {
         if (!started) return "Start the mesh before searching the local subnet"
         if (scanRemaining.get() > 0) return "A local subnet search is already running"
         val network = wifiNetwork ?: return "This phone is not connected to Wi-Fi"
@@ -238,9 +245,16 @@ internal class LanTransport(
             ?.let { runCatching { InetAddress.getByName(it) }.getOrNull() }
             as? Inet4Address
             ?: return "The selected Wi-Fi network has no IPv4 address to search"
-        val prefixLength = localPrefixLength(network, local)
+        val networkPrefixLength = localPrefixLength(network, local)
+        val prefixLength = when (breadth) {
+            LanScanBreadth.FULL_SUBNET -> networkPrefixLength
+            // A larger prefix is a narrower sweep, so this caps the local tier
+            // at our /24 without widening a network that is narrower than one.
+            LanScanBreadth.LOCAL_24 -> maxOf(networkPrefixLength, DEFAULT_SCAN_PREFIX_LENGTH)
+        }
         val candidates = subnetHosts(local, prefixLength).shuffled()
         val generation = scanGeneration.incrementAndGet()
+        runningScanBreadth = breadth
         scanRemaining.set(candidates.size)
         Log.i(
             TAG,
@@ -301,8 +315,28 @@ internal class LanTransport(
 
     private fun scanAdvanced(generation: Int) {
         if (generation != scanGeneration.get()) return
-        scanRemaining.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+        val remaining = scanRemaining.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
         LanTransportDiagnostics.scanAdvanced()
+        if (remaining == 0) {
+            onScanCompleted()
+        }
+    }
+
+    /**
+     * Every candidate of the running sweep has been probed. Runs on whichever
+     * scan worker retired the last candidate. A completed local-tier sweep
+     * makes the full sweep eligible ([LanScanPlanner.onScanCompleted]) and
+     * pulls the next check forward so escalation doesn't wait out the periodic
+     * interval -- the check's loneliness gate still applies, so if this sweep
+     * (or NSD) produced a connection, no escalation happens.
+     */
+    private fun onScanCompleted() {
+        val breadth = runningScanBreadth ?: return
+        runningScanBreadth = null
+        scanPlanner.onScanCompleted(breadth)
+        if (breadth == LanScanBreadth.LOCAL_24) {
+            scheduleAutomaticSubnetScan(AUTO_SCAN_ESCALATE_DELAY_MS)
+        }
     }
 
     fun currentEndpointHint(): Frame.LanEndpoint? = endpointHint
@@ -314,6 +348,7 @@ internal class LanTransport(
             val endpoint = LanManualEndpoint(hint.host, hint.port.toInt())
             onEndpointObserved(expectedUserId, endpoint, currentNetworkId)
             if (!started) return@post
+            scanPlanner.onPeerEvidence(System.currentTimeMillis())
             if (!shouldInitiateLanConnection(instanceToken, remoteToken)) {
                 Log.i(
                     TAG,
@@ -412,6 +447,7 @@ internal class LanTransport(
             "LAN session ready on ${localEndpoint?.display ?: "the selected Wi-Fi network"}",
         )
         endpointHint?.let { onNetworkReady(it, currentNetworkId) }
+        scanPlanner.onNetworkJoined(System.currentTimeMillis())
         scheduleAutomaticSubnetScan(AUTO_SCAN_INITIAL_DELAY_MS)
     }
 
@@ -848,6 +884,7 @@ internal class LanTransport(
                                 serviceInfo.network == wifiNetwork
                             )
                     ) {
+                        scanPlanner.onPeerEvidence(System.currentTimeMillis())
                         if (shouldInitiateLanConnection(instanceToken, token)) {
                             connectToService(serviceInfo)
                         } else {
@@ -877,6 +914,8 @@ internal class LanTransport(
 
     private fun teardownNetworkSession() {
         mainHandler.removeCallbacks(automaticScanRunnable)
+        scanPlanner.onNetworkLost()
+        runningScanBreadth = null
         scanGeneration.incrementAndGet()
         scanRemaining.set(0)
         discoveryListener?.let(::stopDiscovery)
@@ -1035,6 +1074,7 @@ internal class LanTransport(
         private const val RECONNECT_SLOT_DELAY_MS = 5_000L
         private const val AUTO_SCAN_INITIAL_DELAY_MS = 5_000L
         private const val AUTO_SCAN_RECONNECT_DELAY_MS = 2_000L
+        private const val AUTO_SCAN_ESCALATE_DELAY_MS = 2_000L
         private const val AUTO_SCAN_RETRY_INTERVAL_MS = 5 * 60_000L
         private const val MAX_PACKET_SIZE = 65_535
 
