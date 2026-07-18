@@ -1071,12 +1071,12 @@
         }
       }
     },
-    "Search this /24 network": {
+    "Search local subnet": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Search this /24 network"
+            "value": "Search local subnet"
           }
         }
       }
