@@ -74,4 +74,20 @@ class LanTransportTest {
         assertNull(parseLanManualEndpoint("10.0.0.2:not-a-port", 45_892))
         assertNull(parseLanManualEndpoint("10.0.0.2:70000", 45_892))
     }
+
+    @Test
+    fun `automatic subnet fallback runs only while LAN discovery is idle`() {
+        assertTrue(shouldRunAutomaticLanScan(0, 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(0, 1, 0))
+        assertTrue(!shouldRunAutomaticLanScan(0, 0, 12))
+    }
+
+    @Test
+    fun `authenticated scan endpoints are retained but unrelated TCP services are not`() {
+        assertTrue(shouldRetainLanReconnectTarget("scan:10.0.0.2", wasAuthenticated = true))
+        assertTrue(!shouldRetainLanReconnectTarget("scan:10.0.0.3", wasAuthenticated = false))
+        assertTrue(shouldRetainLanReconnectTarget("manual:10.0.0.4", wasAuthenticated = false))
+        assertTrue(shouldRetainLanReconnectTarget("cache:friend:10.0.0.5", wasAuthenticated = false))
+    }
 }

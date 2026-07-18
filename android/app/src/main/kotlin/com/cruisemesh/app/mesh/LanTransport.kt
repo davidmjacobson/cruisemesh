@@ -81,9 +81,10 @@ internal class LanTransport(
     private val connectionBackoff = ReconnectBackoffTracker()
     private val sockets = ConcurrentHashMap.newKeySet<Socket>()
     private val connections = ConcurrentHashMap<String, LanConnection>()
+    private val authenticatedUserIds = ConcurrentHashMap<String, String>()
     private val outboundServiceKeys = ConcurrentHashMap.newKeySet<String>()
+    private val reconnectTargets = ConcurrentHashMap<String, ReconnectTarget>()
     private val resolvedServices = ConcurrentHashMap<String, NsdServiceInfo>()
-    private val hintedPeers = ConcurrentHashMap<String, HintedPeer>()
 
     @Volatile
     private var started = false
@@ -110,6 +111,20 @@ internal class LanTransport(
     private val eligibleWifiNetworks = linkedSetOf<Network>()
     private val instanceTokenBytes = ByteArray(8).also(secureRandom::nextBytes)
     private val instanceToken = instanceTokenBytes.toHex()
+    private val automaticScanRunnable = Runnable {
+        if (!started || wifiNetwork == null) return@Runnable
+        if (
+            shouldRunAutomaticLanScan(
+                activeConnections = connections.size,
+                outboundAttempts = outboundServiceKeys.size,
+                scanRemaining = scanRemaining.get(),
+            )
+        ) {
+            Log.i(TAG, "Starting automatic local Wi-Fi fallback search")
+            startSubnetScan()
+        }
+        scheduleAutomaticSubnetScan(AUTO_SCAN_RETRY_INTERVAL_MS)
+    }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -226,6 +241,7 @@ internal class LanTransport(
     private fun scanHost(network: Network, candidate: InetAddress, generation: Int) {
         if (generation != scanGeneration.get()) return
         val endpoint = InetSocketAddress(candidate, lanDefaultTcpPort().toInt())
+        val serviceKey = "scan:${candidate.hostAddress}"
         var advanced = false
         try {
             val socket = network.socketFactory.createSocket().apply {
@@ -239,14 +255,20 @@ internal class LanTransport(
                 socket.closeQuietly()
                 return
             }
-            if (!tryAcquireSocketSlot()) {
+            if (!outboundServiceKeys.add(serviceKey)) {
                 socket.closeQuietly()
                 return
             }
+            if (!tryAcquireSocketSlot()) {
+                outboundServiceKeys.remove(serviceKey)
+                socket.closeQuietly()
+                return
+            }
+            rememberReconnectTarget(serviceKey, listOf(endpoint), expectedUserId = null)
             runConnection(
                 socket = socket,
                 initiator = true,
-                outboundServiceKey = "scan:${candidate.hostAddress}",
+                outboundServiceKey = serviceKey,
                 expectedUserId = null,
                 advertisedEndpoint = endpoint,
             )
@@ -278,7 +300,6 @@ internal class LanTransport(
                 return@post
             }
             val network = wifiNetwork ?: return@post
-            hintedPeers[remoteToken] = HintedPeer(hint, expectedUserId.copyOf())
             Log.i(TAG, "BLE introduced LAN peer at ${endpoint.display}")
             connectToEndpoints(
                 network = network,
@@ -369,6 +390,7 @@ internal class LanTransport(
             "LAN session ready on ${localEndpoint?.display ?: "the selected Wi-Fi network"}",
         )
         endpointHint?.let { onNetworkReady(it, currentNetworkId) }
+        scheduleAutomaticSubnetScan(AUTO_SCAN_INITIAL_DELAY_MS)
     }
 
     private fun openListener(): ServerSocket? {
@@ -461,6 +483,14 @@ internal class LanTransport(
         endpoints: List<InetSocketAddress>,
         expectedUserId: ByteArray? = null,
     ) {
+        if (endpoints.isEmpty()) return
+        rememberReconnectTarget(key, endpoints, expectedUserId)
+        if (
+            expectedUserId != null &&
+            authenticatedUserIds.containsValue(expectedUserId.toHex())
+        ) {
+            return
+        }
         if (!connectionBackoff.canAttempt(key, System.currentTimeMillis())) return
         if (!outboundServiceKeys.add(key)) return
         if (!tryAcquireSocketSlot()) {
@@ -588,6 +618,14 @@ internal class LanTransport(
             address = "lan:${UUID.randomUUID()}"
             connection = LanConnection(address, socket, output, session)
             connections[address] = connection
+            authenticatedUserIds[address] = trustedUserId.toHex()
+            outboundServiceKey?.let { key ->
+                reconnectTargets[key]?.let { target ->
+                    reconnectTargets[key] = target.copy(
+                        expectedUserId = trustedUserId.copyOf(),
+                    )
+                }
+            }
             val authenticatedEndpoint = advertisedEndpoint?.let {
                 LanManualEndpoint(
                     socket.inetAddress?.hostAddress ?: it.hostString,
@@ -602,6 +640,7 @@ internal class LanTransport(
             )
             outboundServiceKey?.let(connectionBackoff::recordSuccess)
             authenticated = true
+            scheduleAutomaticSubnetScan(AUTO_SCAN_RETRY_INTERVAL_MS)
             Log.i(TAG, "Authenticated CruiseMesh peer over local Wi-Fi")
 
             while (started && !socket.isClosed) {
@@ -639,36 +678,65 @@ internal class LanTransport(
             if (connection == null) noise?.close()
             address?.let {
                 connections.remove(it, connection)
+                authenticatedUserIds.remove(it)
                 onDisconnected(it)
             }
             sockets.remove(socket)
             socket.closeQuietly()
             releaseSocketSlot()
             outboundServiceKey?.let {
-                connectionBackoff.recordFailure(it, System.currentTimeMillis())
                 outboundServiceKeys.remove(it)
-                scheduleReconnect(it)
+                if (shouldRetainLanReconnectTarget(it, authenticated)) {
+                    connectionBackoff.recordFailure(it, System.currentTimeMillis())
+                    scheduleReconnect(it)
+                } else {
+                    reconnectTargets.remove(it)
+                }
+            }
+            if (authenticated) {
+                scheduleAutomaticSubnetScan(AUTO_SCAN_RECONNECT_DELAY_MS)
             }
         }
     }
 
     private fun scheduleReconnect(serviceKey: String) {
+        val now = System.currentTimeMillis()
+        val delayMs = connectionBackoff.retryDelayMs(serviceKey, now)
+            ?: if (connectionBackoff.isGivenUp(serviceKey)) return else RECONNECT_SLOT_DELAY_MS
         mainHandler.postDelayed(
             {
                 if (!started || wifiNetwork == null || outboundServiceKeys.contains(serviceKey)) {
                     return@postDelayed
                 }
-                val resolved = resolvedServices[serviceKey]
-                if (resolved != null) {
-                    connectToService(resolved)
-                    return@postDelayed
-                }
-                hintedPeers[serviceKey]?.let { hinted ->
-                    connectToHint(hinted.hint, hinted.expectedUserId)
-                }
+                val network = wifiNetwork ?: return@postDelayed
+                val target = reconnectTargets[serviceKey] ?: return@postDelayed
+                Log.i(TAG, "Retrying secure local Wi-Fi connection")
+                connectToEndpoints(
+                    network = network,
+                    key = serviceKey,
+                    endpoints = target.endpoints,
+                    expectedUserId = target.expectedUserId,
+                )
             },
-            RECONNECT_DELAY_MS,
+            delayMs,
         )
+    }
+
+    private fun rememberReconnectTarget(
+        serviceKey: String,
+        endpoints: List<InetSocketAddress>,
+        expectedUserId: ByteArray?,
+    ) {
+        reconnectTargets[serviceKey] = ReconnectTarget(
+            endpoints = endpoints.toList(),
+            expectedUserId = expectedUserId?.copyOf(),
+        )
+    }
+
+    private fun scheduleAutomaticSubnetScan(delayMs: Long) {
+        mainHandler.removeCallbacks(automaticScanRunnable)
+        if (!started || wifiNetwork == null) return
+        mainHandler.postDelayed(automaticScanRunnable, delayMs)
     }
 
     private fun makeRegistrationListener() = object : NsdManager.RegistrationListener {
@@ -775,6 +843,7 @@ internal class LanTransport(
     }
 
     private fun teardownNetworkSession() {
+        mainHandler.removeCallbacks(automaticScanRunnable)
         scanGeneration.incrementAndGet()
         scanRemaining.set(0)
         discoveryListener?.let(::stopDiscovery)
@@ -788,12 +857,13 @@ internal class LanTransport(
         requestedServiceName = null
         registeredServiceName = null
         resolvedServices.clear()
-        hintedPeers.clear()
+        reconnectTargets.clear()
         outboundServiceKeys.clear()
         serverSocket?.closeQuietly()
         serverSocket = null
         sockets.toList().forEach(Socket::closeQuietly)
         connections.clear()
+        authenticatedUserIds.clear()
         endpointHint = null
         currentNetworkId = null
         LanTransportDiagnostics.waitingForWifi()
@@ -910,7 +980,10 @@ internal class LanTransport(
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
         private const val SCAN_CONNECT_TIMEOUT_MS = 350
         private const val SCAN_CONCURRENCY = 8
-        private const val RECONNECT_DELAY_MS = 30_000L
+        private const val RECONNECT_SLOT_DELAY_MS = 5_000L
+        private const val AUTO_SCAN_INITIAL_DELAY_MS = 5_000L
+        private const val AUTO_SCAN_RECONNECT_DELAY_MS = 2_000L
+        private const val AUTO_SCAN_RETRY_INTERVAL_MS = 5 * 60_000L
         private const val MAX_PACKET_SIZE = 65_535
 
         private fun writePacket(output: DataOutputStream, bytes: ByteArray) {
@@ -929,9 +1002,9 @@ internal class LanTransport(
         }
     }
 
-    private data class HintedPeer(
-        val hint: Frame.LanEndpoint,
-        val expectedUserId: ByteArray,
+    private data class ReconnectTarget(
+        val endpoints: List<InetSocketAddress>,
+        val expectedUserId: ByteArray?,
     )
 }
 
@@ -947,6 +1020,17 @@ internal fun sameLanServiceType(value: String): Boolean =
  */
 internal fun shouldInitiateLanConnection(localToken: String, remoteToken: String): Boolean =
     localToken != remoteToken && localToken < remoteToken
+
+internal fun shouldRunAutomaticLanScan(
+    activeConnections: Int,
+    outboundAttempts: Int,
+    scanRemaining: Int,
+): Boolean = activeConnections == 0 && outboundAttempts == 0 && scanRemaining == 0
+
+internal fun shouldRetainLanReconnectTarget(
+    serviceKey: String,
+    wasAuthenticated: Boolean,
+): Boolean = wasAuthenticated || !serviceKey.startsWith("scan:")
 
 private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
