@@ -5,6 +5,10 @@ import SwiftUI
 struct ContactDetailsSheet: View {
     let contact: Contact
     var avatarData: Data? = nil
+    var reachability: ReachabilityLevel? = nil
+    var connectivityText: String? = nil
+    var isMuted: Bool = false
+    var onMutedChange: (Bool) -> Void = { _ in }
     let onDelete: () -> Void
     @Environment(\.dismiss) private var dismiss
 
@@ -22,7 +26,8 @@ struct ContactDetailsSheet: View {
                         userId: contact.userId,
                         name: contact.name,
                         size: 72,
-                        photo: avatarData.flatMap { UIImage(data: $0) }
+                        photo: avatarData.flatMap { UIImage(data: $0) },
+                        reachability: reachability
                     )
                         .padding(.top, 8)
 
@@ -34,6 +39,29 @@ struct ContactDetailsSheet: View {
                         .font(.body.monospaced())
                         .multilineTextAlignment(.center)
                         .padding(.top, 8)
+
+                    if let connectivityText {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Connectivity")
+                                .font(.title3.weight(.semibold))
+                            Text(connectivityText)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(20)
+                        .background(
+                            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                                .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 1)
+                        )
+                        .padding(.top, 24)
+                    }
+
+                    Toggle("Mute notifications", isOn: Binding(
+                        get: { isMuted },
+                        set: onMutedChange
+                    ))
+                    .padding(.top, 24)
 
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Safety words")

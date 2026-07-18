@@ -91,8 +91,19 @@
 //! [`MessageStore::messages_after`] answers the other half: given what a
 //! peer's digest says they already have, which of *our* messages from a
 //! given sender are they missing.
+//!
+//! The advertised msg-id list is also how a mule learns it can safely drop a
+//! carried 1:1 envelope (DTN_TODOS.md §3.2, D2 mule-drain-confirm): the true
+//! recipient doesn't carry a message it opens, it *consumes* it, so
+//! [`MessageStore::recent_consumed_msg_ids`] feeds the same advertised list
+//! alongside [`MessageStore::carried_msg_ids`] (see
+//! `engine.rs::core_digest_advertised_msg_ids`) -- otherwise a message we
+//! successfully received would never show up in what we tell a mule we
+//! already have, and the mule would keep it until expiry. The other half of
+//! D2 -- actually removing a carried envelope once a peer's digest proves
+//! they have it -- is `engine.rs::core_confirm_carried_deliveries`.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -133,6 +144,19 @@ pub struct MessageArrival {
 pub struct MessageReference {
     pub msg_id: Vec<u8>,
     pub reply_to_msg_id: Option<Vec<u8>>,
+}
+
+/// Where a stored message row lives (`chat_id`) and who authored it
+/// (`sender_user_id`), keyed by stable envelope `msg_id` -- see
+/// [`MessageStore::message_origin_by_msg_id`]. Both fields are needed by the
+/// relay ack-decision path: the local storage convention makes their
+/// comparison meaningful (a 1:1 incoming row has `chat_id ==
+/// sender_user_id`; a group row has `chat_id = group id`, which never equals
+/// a member's user id).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct MessageOrigin {
+    pub chat_id: Vec<u8>,
+    pub sender_user_id: Vec<u8>,
 }
 
 /// An accepted friend (DESIGN.md §6.2): the public half of someone else's
@@ -275,6 +299,19 @@ impl MessageStore {
         ensure_column(&conn, "messages", "received_at", "INTEGER")?;
         ensure_column(&conn, "messages", "msg_id", "BLOB")?;
         ensure_column(&conn, "messages", "reply_to_msg_id", "BLOB")?;
+        ensure_column(&conn, "messages", "outbound_expiry", "INTEGER")?;
+        ensure_column(
+            &conn,
+            "groups",
+            "metadata_revision",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "groups",
+            "metadata_changed_by",
+            "BLOB NOT NULL DEFAULT X''",
+        )?;
         // Older stores already have stable ids for locally authored rows in
         // the outbound queue. Backfill those so they can be quoted after an
         // upgrade; received legacy rows cannot be recovered retroactively.
@@ -305,9 +342,31 @@ impl MessageStore {
             [],
         )
         .map_err(store_err)?;
+        // Unlike the composite index above, `message_origin_by_msg_id` looks
+        // a `msg_id` up with no `chat_id` in hand (a relay-fetched envelope
+        // knows only its own `msg_id`), so it needs `msg_id` leading an index
+        // on its own to avoid a full table scan.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(msg_id)",
+            [],
+        )
+        .map_err(store_err)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Writes a transactionally consistent standalone SQLite snapshot.
+    /// The destination must not already exist; callers should use a unique
+    /// temporary path and remove it after reading the backup bytes.
+    pub fn backup_to(&self, destination: String) -> Result<(), CoreError> {
+        if destination.trim().is_empty() {
+            return Err(CoreError::Store("backup destination is empty".into()));
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute("VACUUM INTO ?1", params![destination])
+            .map_err(store_err)?;
+        Ok(())
     }
 
     /// Insert a message from a remote sender's stream, distinguishing a true
@@ -550,8 +609,8 @@ mod outgoing_message_reference {
         tx.execute(
             "INSERT OR IGNORE INTO messages
                 (chat_id, sender_user_id, lamport, timestamp, kind, payload,
-                 msg_id, reply_to_msg_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 msg_id, reply_to_msg_id, outbound_expiry)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 message.chat_id,
                 message.sender_user_id,
@@ -561,13 +620,15 @@ mod outgoing_message_reference {
                 message.payload,
                 envelope.msg_id,
                 reply_to_msg_id,
+                envelope.expiry,
             ],
         )
         .map_err(store_err)?;
         tx.execute(
             "UPDATE messages
              SET msg_id = COALESCE(msg_id, ?4),
-                 reply_to_msg_id = COALESCE(reply_to_msg_id, ?5)
+                 reply_to_msg_id = COALESCE(reply_to_msg_id, ?5),
+                 outbound_expiry = COALESCE(outbound_expiry, ?6)
              WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
             params![
                 message.chat_id,
@@ -575,6 +636,7 @@ mod outgoing_message_reference {
                 message.lamport as i64,
                 envelope.msg_id,
                 reply_to_msg_id,
+                envelope.expiry,
             ],
         )
         .map_err(store_err)?;
@@ -663,6 +725,26 @@ impl MessageStore {
         .map_err(store_err)
     }
 
+    /// Expiry of a locally-authored message's durable outbound envelope.
+    /// This remains available after the retry queue prunes expired ciphertext.
+    pub fn outbound_message_expiry(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        lamport: u64,
+    ) -> Result<Option<i64>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT outbound_expiry FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+            params![chat_id, sender_user_id, lamport as i64],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(store_err)
+        .map(|value| value.flatten())
+    }
+
     /// Resolve a quoted message by stable envelope id within one chat.
     /// Missing history is expected and returns `None`.
     pub fn message_by_msg_id(
@@ -679,6 +761,53 @@ impl MessageStore {
              LIMIT 1",
             params![chat_id, msg_id],
             row_to_message,
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    /// Chat and sender of a stored message keyed by its stable envelope
+    /// `msg_id` alone, searched across every chat -- unlike
+    /// [`Self::message_by_msg_id`], which needs `chat_id` up front and is
+    /// useless here because a relay-fetched envelope only carries its own
+    /// `msg_id`.
+    ///
+    /// This backs the consumed-SEEN relay ack rule in `engine.rs`
+    /// (`MessageStore::core_relay_ack_ids_with_consumed`): a relay-fetched
+    /// copy that dedupes as `Seen` (already handled via some other path) is
+    /// only safe to ack if THIS device actually consumed it as a real
+    /// message, not merely muled it. A row only exists here for kinds that
+    /// persist a durable `msg_id` -- 1:1/group text, attachment manifests,
+    /// reactions (inserted via `insert_incoming_message`) and our own
+    /// authored messages (via `insert_outgoing_message`/
+    /// `insert_outgoing_reply`). Hidden kinds -- receipts, profile sync,
+    /// friend requests/directory, group invites, LAN endpoint hints -- are
+    /// stored, if at all, via the plain `insert_message` with `msg_id =
+    /// NULL`, so they never match and the caller correctly treats "no
+    /// match" as "cannot vouch for this copy, don't ack."
+    ///
+    /// Returns `None` for an unknown `msg_id` (never stored, or hidden-kind
+    /// with no durable id). The store deliberately returns the raw
+    /// [`MessageOrigin`] instead of a verdict: it is the caller's job to
+    /// exclude own-authored rows (`sender_user_id == own user id` -- the
+    /// relay copy is there for the recipient) and group rows (`chat_id !=
+    /// sender_user_id` -- other members of the shared family mailbox still
+    /// need the relay copy).
+    pub fn message_origin_by_msg_id(
+        &self,
+        msg_id: Vec<u8>,
+    ) -> Result<Option<MessageOrigin>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.query_row(
+            "SELECT chat_id, sender_user_id FROM messages
+             WHERE msg_id = ?1 ORDER BY id ASC LIMIT 1",
+            params![msg_id],
+            |row| {
+                Ok(MessageOrigin {
+                    chat_id: row.get(0)?,
+                    sender_user_id: row.get(1)?,
+                })
+            },
         )
         .optional()
         .map_err(store_err)
@@ -1793,27 +1922,7 @@ impl MessageStore {
         validate_group(&group)?;
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
-        tx.execute(
-            "INSERT INTO groups (group_id, name, group_key)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(group_id) DO UPDATE SET
-                name = excluded.name,
-                group_key = excluded.group_key",
-            params![&group.id, &group.name, &group.key],
-        )
-        .map_err(store_err)?;
-        tx.execute(
-            "DELETE FROM group_members WHERE group_id = ?1",
-            params![&group.id],
-        )
-        .map_err(store_err)?;
-        for member_user_id in canonicalize_members(group.member_user_ids) {
-            tx.execute(
-                "INSERT INTO group_members (group_id, user_id) VALUES (?1, ?2)",
-                params![&group.id, member_user_id],
-            )
-            .map_err(store_err)?;
-        }
+        upsert_group_tx(&tx, &group)?;
         tx.commit().map_err(store_err)?;
         Ok(())
     }
@@ -1823,7 +1932,8 @@ impl MessageStore {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let row: Option<GroupRow> = conn
             .query_row(
-                "SELECT group_id, name, group_key FROM groups WHERE group_id = ?1",
+                "SELECT group_id, name, group_key, metadata_revision, metadata_changed_by
+                 FROM groups WHERE group_id = ?1",
                 params![&group_id],
                 row_to_group_row,
             )
@@ -1838,7 +1948,8 @@ impl MessageStore {
         let raw = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT group_id, name, group_key FROM groups ORDER BY name ASC, group_id ASC",
+                    "SELECT group_id, name, group_key, metadata_revision, metadata_changed_by
+                     FROM groups ORDER BY name ASC, group_id ASC",
                 )
                 .map_err(store_err)?;
             let rows = stmt.query_map([], row_to_group_row).map_err(store_err)?;
@@ -2084,6 +2195,56 @@ impl MessageStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
 
+    /// Up to `limit` recent message-stream `msg_id`s this device holds,
+    /// newest first: every `messages` row with a recorded envelope id, which
+    /// covers both *consumed* incoming messages (opened-and-stored via
+    /// `insert_incoming_message`) and our own *authored* ones
+    /// (`insert_outgoing_message` writes the envelope's `msg_id` into the
+    /// message row too, and `open` backfills it for older rows). This is the
+    /// counterpart to [`MessageStore::carried_msg_ids`] for the D2
+    /// mule-drain-confirm fix (DTN_TODOS.md §3.2): a recipient does not carry
+    /// a message it has decrypted and stored -- it consumes it, so
+    /// `carried_msg_ids` alone never advertises "I got it" for our own
+    /// incoming mail. Merging this list into what we advertise in our own
+    /// outgoing DIGEST (`recent_msg_id`s, see `protocol.rs`'s DIGEST frame
+    /// docs, and `engine.rs::core_digest_advertised_msg_ids`) is what lets a
+    /// mule that's still holding our envelope in its carry queue notice, on
+    /// its next digest exchange with us, that we already have it and drop
+    /// its copy -- without any wire-format change, since the DIGEST frame
+    /// already carries an arbitrary `recent_msg_id` list.
+    ///
+    /// Including our own authored ids alongside the consumed ones is harmless
+    /// and actively useful: a mule's Hook-B spray can hand us back an
+    /// envelope we ourselves authored, and advertising its `msg_id` here
+    /// suppresses that resend at the source -- the same rationale as the
+    /// Kotlin side's `seedSeenIdsFromOwnHistory`.
+    ///
+    /// Newest first (unlike `carried_msg_ids`'s oldest-first) because the
+    /// caller bounds the merged advertised list to a fixed count
+    /// (`engine.rs::DIGEST_ADVERTISED_MSG_IDS_LIMIT`): the most recently
+    /// landed messages are the ones most likely to still be sitting in some
+    /// mule's carry queue, so they're the ones worth prioritizing when the
+    /// list must be truncated.
+    ///
+    /// Only rows with a non-`NULL` `msg_id` participate -- legacy rows that
+    /// predate envelope-id recording don't have one and are silently skipped
+    /// by the `WHERE` clause.
+    pub fn recent_consumed_msg_ids(&self, limit: u64) -> Result<Vec<Vec<u8>>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT msg_id FROM messages
+                 WHERE msg_id IS NOT NULL
+                 ORDER BY id DESC
+                 LIMIT ?1",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
     /// Carried envelopes suitable to spray to a non-recipient mule on peer
     /// sync: unexpired as of `now_ms`, not already known to the peer
     /// (`peer_known_msg_ids` from its digest), and not actually addressed to
@@ -2287,6 +2448,8 @@ struct GroupRow {
     id: Vec<u8>,
     name: String,
     key: Vec<u8>,
+    metadata_revision: u64,
+    metadata_changed_by: Vec<u8>,
 }
 
 fn row_to_group_row(row: &rusqlite::Row) -> rusqlite::Result<GroupRow> {
@@ -2294,6 +2457,8 @@ fn row_to_group_row(row: &rusqlite::Row) -> rusqlite::Result<GroupRow> {
         id: row.get(0)?,
         name: row.get(1)?,
         key: row.get(2)?,
+        metadata_revision: row.get(3)?,
+        metadata_changed_by: row.get(4)?,
     })
 }
 
@@ -2303,7 +2468,64 @@ fn hydrate_group(conn: &Connection, row: GroupRow) -> Result<Group, CoreError> {
         id: row.id,
         name: row.name,
         key: row.key,
+        metadata_revision: row.metadata_revision,
+        metadata_changed_by: row.metadata_changed_by,
     })
+}
+
+/// Persist a group and its canonical member set inside an existing transaction.
+/// A stale invite (revision zero) must not roll back newer metadata.
+pub(crate) fn upsert_group_tx(tx: &Transaction<'_>, group: &Group) -> Result<(), CoreError> {
+    validate_group(group)?;
+    let current: Option<(u64, Vec<u8>)> = tx
+        .query_row(
+            "SELECT metadata_revision, metadata_changed_by FROM groups WHERE group_id = ?1",
+            params![&group.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(store_err)?;
+    if current.as_ref().is_some_and(|(revision, changed_by)| {
+        (*revision, changed_by.as_slice())
+            > (
+                group.metadata_revision,
+                group.metadata_changed_by.as_slice(),
+            )
+    }) {
+        return Ok(());
+    }
+
+    tx.execute(
+        "INSERT INTO groups
+            (group_id, name, group_key, metadata_revision, metadata_changed_by)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(group_id) DO UPDATE SET
+            name = excluded.name,
+            group_key = excluded.group_key,
+            metadata_revision = excluded.metadata_revision,
+            metadata_changed_by = excluded.metadata_changed_by",
+        params![
+            &group.id,
+            &group.name,
+            &group.key,
+            group.metadata_revision,
+            &group.metadata_changed_by,
+        ],
+    )
+    .map_err(store_err)?;
+    tx.execute(
+        "DELETE FROM group_members WHERE group_id = ?1",
+        params![&group.id],
+    )
+    .map_err(store_err)?;
+    for member_user_id in canonicalize_members(group.member_user_ids.clone()) {
+        tx.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES (?1, ?2)",
+            params![&group.id, member_user_id],
+        )
+        .map_err(store_err)?;
+    }
+    Ok(())
 }
 
 fn load_group_members(conn: &Connection, group_id: &[u8]) -> Result<Vec<Vec<u8>>, CoreError> {
@@ -2415,6 +2637,7 @@ CREATE TABLE IF NOT EXISTS messages (
     received_at    INTEGER,
     msg_id         BLOB,
     reply_to_msg_id BLOB,
+    outbound_expiry INTEGER,
     UNIQUE(chat_id, sender_user_id, lamport)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_lamport ON messages(chat_id, lamport);
@@ -2470,9 +2693,11 @@ CREATE TABLE IF NOT EXISTS contact_provenance (
 );
 
 CREATE TABLE IF NOT EXISTS groups (
-    group_id   BLOB PRIMARY KEY,
-    name       TEXT NOT NULL,
-    group_key  BLOB NOT NULL
+    group_id             BLOB PRIMARY KEY,
+    name                 TEXT NOT NULL,
+    group_key            BLOB NOT NULL,
+    metadata_revision    INTEGER NOT NULL DEFAULT 0,
+    metadata_changed_by  BLOB NOT NULL DEFAULT X''
 );
 
 CREATE TABLE IF NOT EXISTS group_members (
@@ -2628,6 +2853,8 @@ mod tests {
             name: name.to_string(),
             member_user_ids: members.iter().map(|member| member.to_vec()).collect(),
             key: vec![key_byte; 32],
+            metadata_revision: 0,
+            metadata_changed_by: Vec::new(),
         }
     }
 
@@ -2696,6 +2923,109 @@ mod tests {
                 .unwrap()
                 .msg_id,
             vec![2; MESSAGE_ID_LEN],
+        );
+    }
+
+    #[test]
+    fn message_origin_by_msg_id_finds_a_one_to_one_row_by_msg_id_alone() {
+        // Unlike `message_by_msg_id`, no `chat_id` is supplied -- this is the
+        // relay ack-decision path, which only ever has the envelope's
+        // `msg_id` in hand. A 1:1 incoming row follows the local convention
+        // "chat keyed by the other party": chat_id == sender_user_id, which
+        // is exactly what the ack-decision helper keys off.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let incoming = msg(b"alice", b"alice", 1, "hi");
+        let incoming_id = vec![7; MESSAGE_ID_LEN];
+        store
+            .insert_incoming_message(incoming.clone(), incoming_id.clone(), None)
+            .unwrap();
+
+        assert_eq!(
+            store.message_origin_by_msg_id(incoming_id).unwrap(),
+            Some(MessageOrigin {
+                chat_id: b"alice".to_vec(),
+                sender_user_id: b"alice".to_vec(),
+            }),
+        );
+    }
+
+    #[test]
+    fn message_origin_by_msg_id_reports_a_group_row_with_its_group_chat_id() {
+        // A consumed group message is stored under chat_id = group id with
+        // sender_user_id = the authoring member, so chat_id !=
+        // sender_user_id. The origin must surface both fields untouched: the
+        // ack-decision helper relies on that inequality to refuse to ack a
+        // group envelope off the shared family relay mailbox (other members
+        // still need the relay copy).
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let group_message = msg(b"group-1", b"alice", 1, "hi group");
+        let group_msg_id = vec![10; MESSAGE_ID_LEN];
+        store
+            .insert_incoming_message(group_message, group_msg_id.clone(), None)
+            .unwrap();
+
+        assert_eq!(
+            store.message_origin_by_msg_id(group_msg_id).unwrap(),
+            Some(MessageOrigin {
+                chat_id: b"group-1".to_vec(),
+                sender_user_id: b"alice".to_vec(),
+            }),
+        );
+    }
+
+    #[test]
+    fn message_origin_by_msg_id_returns_none_for_an_unknown_msg_id() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert_eq!(
+            store
+                .message_origin_by_msg_id(vec![0xEE; MESSAGE_ID_LEN])
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn message_origin_by_msg_id_returns_our_own_id_for_authored_outbound_messages() {
+        // Our own outbound envelope also has a `messages` row (via
+        // `insert_outgoing_message`), with `sender_user_id == us`. The store
+        // deliberately does NOT filter this out -- it's the caller's job
+        // (`engine::consumed_seen_is_ackable`) to compare the returned
+        // sender against its own identity and refuse to ack an own-authored
+        // envelope, since that relay copy exists for the recipient, not us.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let message = msg(b"chat-a", b"self", 1, "hello");
+        let envelope = outbound_for(&message, b"recipient", &[8; MESSAGE_ID_LEN]);
+        store
+            .insert_outgoing_message(message, envelope, 1_700_000_000_000)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .message_origin_by_msg_id(vec![8; MESSAGE_ID_LEN])
+                .unwrap(),
+            Some(MessageOrigin {
+                chat_id: b"chat-a".to_vec(),
+                sender_user_id: b"self".to_vec(),
+            }),
+        );
+    }
+
+    #[test]
+    fn message_origin_by_msg_id_does_not_match_hidden_kind_rows_with_no_msg_id() {
+        // Hidden kinds (receipts, profile sync, friend requests/directory,
+        // group invites, LAN endpoint hints) are stored via plain
+        // `insert_message`, which never records a `msg_id` -- so they must
+        // never spuriously match a real envelope's `msg_id` here.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "hidden-kind-payload"))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .message_origin_by_msg_id(vec![9; MESSAGE_ID_LEN])
+                .unwrap(),
+            None,
         );
     }
 
@@ -4342,6 +4672,8 @@ mod tests {
                 name: "Family".to_string(),
                 member_user_ids: vec![b"alice".to_vec(), b"carol".to_vec()],
                 key: vec![0x22; 32],
+                metadata_revision: 0,
+                metadata_changed_by: Vec::new(),
             })
         );
     }
@@ -4357,6 +4689,22 @@ mod tests {
         store.upsert_group(rotated.clone()).unwrap();
 
         assert_eq!(store.get_group(rotated.id.clone()).unwrap(), Some(rotated));
+    }
+
+    #[test]
+    fn stale_group_invite_cannot_roll_back_newer_metadata() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let stale = group(0x11, "Old name", 0x22, &[b"alice", b"bob"]);
+        let mut current = stale.clone();
+        current.name = "New name".to_string();
+        current.member_user_ids.push(b"carol".to_vec());
+        current.metadata_revision = 4;
+        current.metadata_changed_by = b"alice".to_vec();
+        store.upsert_group(current.clone()).unwrap();
+
+        store.upsert_group(stale).unwrap();
+
+        assert_eq!(store.get_group(current.id.clone()).unwrap(), Some(current));
     }
 
     #[test]
@@ -5106,6 +5454,110 @@ mod tests {
     }
 
     #[test]
+    fn recent_consumed_msg_ids_are_returned_newest_first_and_limited() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_incoming_message(
+                msg(b"chat-a", b"alice", 1, "one"),
+                vec![1; MESSAGE_ID_LEN],
+                None,
+            )
+            .unwrap();
+        store
+            .insert_incoming_message(
+                msg(b"chat-a", b"alice", 2, "two"),
+                vec![2; MESSAGE_ID_LEN],
+                None,
+            )
+            .unwrap();
+        store
+            .insert_incoming_message(
+                msg(b"chat-a", b"alice", 3, "three"),
+                vec![3; MESSAGE_ID_LEN],
+                None,
+            )
+            .unwrap();
+
+        let ids = store.recent_consumed_msg_ids(2).unwrap();
+        assert_eq!(ids, vec![vec![3; MESSAGE_ID_LEN], vec![2; MESSAGE_ID_LEN]]);
+    }
+
+    #[test]
+    fn recent_consumed_msg_ids_skips_rows_without_a_msg_id() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // Legacy rows (inserted before envelope-id recording existed) carry
+        // no msg_id; `insert_message` reproduces that shape.
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "legacy"))
+            .unwrap();
+        store
+            .insert_incoming_message(
+                msg(b"chat-a", b"alice", 2, "two"),
+                vec![2; MESSAGE_ID_LEN],
+                None,
+            )
+            .unwrap();
+
+        let ids = store.recent_consumed_msg_ids(10).unwrap();
+        assert_eq!(ids, vec![vec![2; MESSAGE_ID_LEN]]);
+    }
+
+    /// specs/group-relay-durability.md §4.3 / §6 scenario (2): the same
+    /// logical group message can arrive under two envelope identities -- the
+    /// ORIGINAL msg_id over BLE and a per-member fan-out msg_id from the
+    /// relay. The `UNIQUE(chat_id, sender_user_id, lamport)` dedup renders
+    /// it once regardless; the second insert is a silent no-op.
+    #[test]
+    fn same_message_under_two_envelope_ids_renders_once() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let ble_first = store
+            .insert_incoming_message(
+                msg(b"group-g", b"alice", 5, "meet at the buffet"),
+                vec![0x11; MESSAGE_ID_LEN], // original envelope id (BLE flood)
+                None,
+            )
+            .unwrap();
+        let relay_second = store
+            .insert_incoming_message(
+                msg(b"group-g", b"alice", 5, "meet at the buffet"),
+                vec![0x22; MESSAGE_ID_LEN], // fan-out id (relay fetch)
+                None,
+            )
+            .unwrap();
+        assert!(ble_first);
+        assert!(!relay_second, "duplicate must be a silent no-op");
+        assert_eq!(
+            store.messages_for_chat(b"group-g".to_vec()).unwrap().len(),
+            1,
+            "one rendered row despite two envelope identities"
+        );
+    }
+
+    #[test]
+    fn recent_consumed_msg_ids_includes_own_authored_messages() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_incoming_message(
+                msg(b"chat-a", b"alice", 1, "theirs"),
+                vec![1; MESSAGE_ID_LEN],
+                None,
+            )
+            .unwrap();
+        // Our own authored message: `insert_outgoing_message` records the
+        // envelope's msg_id on the message row too, so it must be advertised
+        // alongside consumed incoming ids -- that's what suppresses a mule's
+        // Hook-B spray from handing us back an envelope we authored.
+        let authored = msg(b"chat-a", b"self", 1, "mine");
+        let envelope = outbound_for(&authored, b"alice", &[2; MESSAGE_ID_LEN]);
+        store
+            .insert_outgoing_message(authored, envelope, 1_000)
+            .unwrap();
+
+        let ids = store.recent_consumed_msg_ids(10).unwrap();
+        assert_eq!(ids, vec![vec![2; MESSAGE_ID_LEN], vec![1; MESSAGE_ID_LEN]]);
+    }
+
+    #[test]
     fn peer_sync_candidates_exclude_the_peers_known_ids_and_targeted_delivery() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store
@@ -5302,6 +5754,29 @@ mod tests {
         assert_eq!(found, vec![env]);
 
         drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn backup_to_writes_a_consistent_reopenable_snapshot() {
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        store
+            .insert_message(msg(b"chat", b"sender", 1, "backed up"))
+            .unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("cruisemesh-backup-{unique}.sqlite"));
+
+        store.backup_to(path.to_string_lossy().to_string()).unwrap();
+        let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(
+            restored.messages_for_chat(b"chat".to_vec()).unwrap().len(),
+            1
+        );
+
+        drop(restored);
         fs::remove_file(path).unwrap();
     }
 }

@@ -11,11 +11,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -27,6 +29,8 @@ import androidx.compose.ui.unit.dp
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -36,6 +40,8 @@ fun ContactDetailsSheet(
     onDeleteContact: () -> Unit,
     onDismiss: () -> Unit,
     connectivityText: String? = null,
+    isMuted: Boolean = false,
+    onMutedChange: (Boolean) -> Unit = {},
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         ContactDetailsSheetContent(
@@ -43,6 +49,8 @@ fun ContactDetailsSheet(
             avatarBytes = avatarBytes,
             onDeleteContact = onDeleteContact,
             connectivityText = connectivityText,
+            isMuted = isMuted,
+            onMutedChange = onMutedChange,
             modifier = Modifier.padding(bottom = 24.dp),
         )
     }
@@ -55,6 +63,8 @@ fun ContactDetailsSheetContent(
     onDeleteContact: () -> Unit,
     modifier: Modifier = Modifier,
     connectivityText: String? = null,
+    isMuted: Boolean = false,
+    onMutedChange: (Boolean) -> Unit = {},
 ) {
     val displayId = formatUserId(contact.userId)
     val displayName = ChatListLogic.displayNameOrId(contact.name, displayId)
@@ -93,8 +103,7 @@ fun ContactDetailsSheetContent(
                 shape = RoundedCornerShape(24.dp),
             ) {
                 Column(modifier = Modifier.padding(20.dp)) {
-                    Text(
-                        text = "Connectivity",
+                    Text(text = stringResource(R.string.ui_connectivity),
                         style = MaterialTheme.typography.titleMedium,
                     )
                     Text(
@@ -114,8 +123,7 @@ fun ContactDetailsSheetContent(
             shape = RoundedCornerShape(24.dp),
         ) {
             Column(modifier = Modifier.padding(20.dp)) {
-                Text(
-                    text = "Safety words",
+                Text(text = stringResource(R.string.ui_safety_words),
                     style = MaterialTheme.typography.titleMedium,
                 )
                 Spacer(modifier = Modifier.height(12.dp))
@@ -136,8 +144,7 @@ fun ContactDetailsSheetContent(
                         }
                     }
                 }
-                Text(
-                    text = "Read these aloud to verify.",
+                Text(text = stringResource(R.string.ui_read_these_aloud_to_verify),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 12.dp),
@@ -145,14 +152,26 @@ fun ContactDetailsSheetContent(
             }
         }
 
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(stringResource(R.string.ui_mute_notifications), modifier = Modifier.weight(1f))
+            Switch(checked = isMuted, onCheckedChange = onMutedChange)
+        }
+
         Button(
             onClick = onDeleteContact,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.error,
+                contentColor = MaterialTheme.colorScheme.onError,
+            ),
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 24.dp)
                 .height(52.dp),
         ) {
-            Text("Delete contact")
+            Text(stringResource(R.string.ui_delete_contact))
         }
     }
 }

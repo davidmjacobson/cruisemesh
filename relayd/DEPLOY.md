@@ -75,6 +75,7 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 | `CRUISEMESH_RELAY_TOKENS` | *(required)* | Comma-separated allowlist. Empty → process refuses to start. |
 | `CRUISEMESH_RELAY_DB` | `cruisemesh-relayd.sqlite` | **Use an absolute path.** Relative paths resolve against the process CWD, which is easy to get wrong under systemd/Docker/IDE launchers. |
 | `CRUISEMESH_RELAY_BIND` | `0.0.0.0:8080` | Inside Docker keep `0.0.0.0:8080`; Caddy is the public listener. |
+| `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` | `268435456` (256 MiB) | Per-family-token storage quota. See §11. Must be a positive integer; unset uses the default. |
 | `RELAY_DOMAIN` | *(compose required)* | Hostname in the Caddyfile for TLS. |
 
 ### The `CRUISEMESH_RELAY_DB` path gotcha
@@ -164,8 +165,87 @@ docker run --rm -v relayd_relay-data:/data -v "${PWD}:/backup" alpine \
 Volume name may be prefixed with the compose project name (`relayd_relay-data`
 if started from this directory).
 
-## 10. Not in this deploy yet
+## 10. Resource limits (DTN_TODOS.md D7)
+
+The relay is content-agnostic (§6) and never inspects `sealed`, so the only
+protection against unbounded SQLite growth on the $4 VPS is server-side
+size/quota gating on ingest. Two independent limits apply to every
+`POST /envelopes`:
+
+### Per-envelope sealed-size cap
+
+Hardcoded at **512 KiB** (`MAX_ENVELOPE_SEALED_BYTES` in `relayd/src/lib.rs`;
+not configurable, since it is derived from the client-side attachment
+ceiling rather than an operational trade-off). Oversized posts are
+rejected with:
+
+```
+HTTP 413 Payload Too Large
+{ "error": "sealed envelope of ... bytes exceeds the 524288-byte per-envelope cap",
+  "code": "envelope_too_large" }
+```
+
+Derivation (full detail in the `MAX_ENVELOPE_SEALED_BYTES` doc comment):
+the largest inline attachment blob a client will ever produce is 180 KiB
+(`core/src/content.rs::ATTACHMENT_MAX_BLOB_BYTES`, the same constant
+`AttachmentPayload.MAX_BLOB_BYTES` uses on Android), plus a generous
+allowance for attachment-wire and sealing/signing overhead (~182 KiB
+realistic ceiling), rounded up ~2x for headroom. This is well under axum's
+default 2 MiB request-body limit, so this cap — not axum's — is what
+actually fires on an oversized post.
+
+### Per-family storage quota
+
+Default **256 MiB** per family token (sum of `LENGTH(sealed)` across that
+family's rows), configurable via `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES`
+(§5). 256 MiB is meant to comfortably cover "a family's whole cruise of
+photos": at the 180 KiB attachment ceiling that's ~1,450 max-size
+attachments, or many times that for the smaller compressed photos
+`MediaCompressor` normally produces — several phones, dozens of
+photos/day, a week at sea, plus text/receipt traffic (negligible by
+comparison).
+
+**Durability over eviction.** Unlike a cache, this mailbox never silently
+deletes unacked mail to make room — that would be data loss for a family
+member who hasn't fetched yet. When a new envelope would push a family
+over quota:
+
+1. Expired rows for that family are pruned first (reusing the existing
+   `prune_expired` used by every fetch) — this alone is often enough,
+   since a device that's been offline past its `expiry_ms` was going to
+   lose those rows anyway.
+2. If the family is *still* over quota after pruning, the post is
+   rejected — the unacked backlog is left completely untouched:
+
+   ```
+   HTTP 507 Insufficient Storage
+   { "error": "family storage quota exceeded: ... bytes used, ... byte quota (expired rows already pruned)",
+     "code": "family_quota_exceeded" }
+   ```
+
+507 (not 413) is deliberate: it is a distinct status from the size-cap
+rejection because the client's remedy is different (wait for the mailbox
+to drain / an existing member to ack, vs. shrink this one payload). Both
+error bodies also carry a `code` field so a client can branch without
+parsing `message` text.
+
+**Re-posting an existing `msg_id` is never quota-checked** — dedupe (§6,
+"Dedupe") never rewrites `sealed`, so a retried post (e.g. a receipt
+envelope re-uploaded every sync) adds zero bytes and must not start
+failing once a family's mailbox is merely full.
+
+**Client-side handling of these two new error shapes is a follow-up, not
+yet implemented** — today's upload loop already logs-and-continues per
+envelope on any non-2xx response, so a rejected envelope is simply left
+queued locally for a later retry (harmless for the size cap, which never
+succeeds on retry without shrinking the payload; more useful for the quota
+error, which can resolve once the family drains their mailbox).
+
+## 11. Not in this deploy yet
 
 - Multi-region / federation — single VPS is the intended family-scale deploy.
 - Android/iOS clients still primarily poll today; wiring the phone apps to
   `GET /ws` is a client change, not a server gap.
+- Client-side handling of the D7 413/507 error bodies (see §10) — surfacing
+  a distinct "mailbox full" state to the user, rather than the current
+  generic log-and-retry.

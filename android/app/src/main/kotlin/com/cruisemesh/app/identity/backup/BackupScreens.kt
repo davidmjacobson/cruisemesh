@@ -42,6 +42,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 /** UI state shared by both flows: nothing running, working, done, or a typed error message. */
 private sealed interface BackupUiState {
@@ -93,7 +95,7 @@ fun BackupExportScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Back up account") },
+                title = { Text(stringResource(R.string.ui_back_up_account)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -131,8 +133,7 @@ fun BackupExportScreen(onBack: () -> Unit) {
                 label = "Confirm passphrase",
             )
             if (confirm.isNotEmpty() && !matches) {
-                Text(
-                    "Passphrases don't match",
+                Text(stringResource(R.string.ui_passphrases_don_t_match),
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 4.dp),
@@ -145,7 +146,7 @@ fun BackupExportScreen(onBack: () -> Unit) {
                 enabled = canStart,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Choose where to save")
+                Text(stringResource(R.string.ui_choose_where_to_save))
             }
 
             StatusArea(
@@ -202,7 +203,7 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Restore from backup") },
+                title = { Text(stringResource(R.string.ui_restore_from_backup)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -229,7 +230,11 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                 onClick = { openDocument.launch(arrayOf("application/octet-stream", "*/*")) },
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(if (pickedName == null) "Choose backup file" else "Choose a different file")
+                Text(
+                    stringResource(
+                        if (pickedName == null) R.string.ui_choose_backup_file else R.string.ui_choose_different_file,
+                    ),
+                )
             }
             pickedName?.let {
                 Text(
@@ -267,7 +272,7 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                 enabled = canRestore,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Restore")
+                Text(stringResource(R.string.ui_restore))
             }
 
             StatusArea(
@@ -296,7 +301,7 @@ private fun PassphraseField(value: String, onValueChange: (String) -> Unit, labe
 private fun PassphraseStrengthText(strength: BackupPassphrase.Strength, empty: Boolean) {
     if (empty) {
         Text(
-            "At least ${BackupPassphrase.MIN_LENGTH} characters.",
+            stringResource(R.string.ui_minimum_passphrase_length, BackupPassphrase.MIN_LENGTH),
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.padding(top = 4.dp),
         )

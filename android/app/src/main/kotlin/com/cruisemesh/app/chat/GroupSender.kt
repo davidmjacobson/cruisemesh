@@ -10,6 +10,8 @@ import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
 import com.cruisemesh.app.media.KIND_GROUP_INVITE
 import com.cruisemesh.app.media.KIND_REACTION
+import com.cruisemesh.app.media.AttachmentPayload
+import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import uniffi.cruisemesh_core.createGroup
 
 private const val TAG = "GroupSender"
@@ -76,6 +78,27 @@ class GroupSender(
         return enqueueGroupMessage(group, KIND_TEXT, payload, "sendText", replyToMsgId)
     }
 
+    fun sendAttachment(
+        group: Group,
+        attachment: AttachmentPayload,
+        replyToMsgId: ByteArray? = null,
+    ): SendResult {
+        if (attachment.blob.size > AttachmentPayload.MAX_BLOB_BYTES) return SendResult.FAILED
+        val payload = try {
+            attachment.encode()
+        } catch (e: Exception) {
+            Log.e(TAG, "sendAttachment: could not encode group attachment", e)
+            return SendResult.FAILED
+        }
+        return enqueueGroupMessage(
+            group,
+            KIND_ATTACHMENT_MANIFEST,
+            payload,
+            "sendAttachment",
+            replyToMsgId,
+        )
+    }
+
     /** Sends or clears this user's emoji reaction to [target] in [group]. */
     fun sendReaction(group: Group, target: MessageTarget, emoji: String): SendResult {
         val payload = try {
@@ -85,6 +108,55 @@ class GroupSender(
             return SendResult.FAILED
         }
         return enqueueGroupMessage(group, KIND_REACTION, payload, "sendReaction")
+    }
+
+    /** Rename locally and queue a convergent hidden update for every member. */
+    fun renameGroup(group: Group, name: String): Group? {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty() || trimmed == group.name) return null
+        val result = try {
+            store.authorGroupMetadataUpdate(
+                identity,
+                group,
+                trimmed,
+                group.memberUserIds,
+                System.currentTimeMillis(),
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "renameGroup: metadata update was not stored", e)
+            return null
+        }
+        publishGroupFrame("renameGroup", result.authored)
+        ChatEvents.notifyChatChanged(group.id)
+        return result.group
+    }
+
+    /** Add accepted contacts without rotating/removing the existing group key. */
+    fun addMembers(group: Group, additions: List<Contact>): Group? {
+        val newMembers = additions.filterNot { addition ->
+            group.memberUserIds.any { it.contentEquals(addition.userId) }
+        }.distinctBy { it.userId.toList() }
+        if (newMembers.isEmpty()) return null
+        val allIds = group.memberUserIds + newMembers.map { it.userId }
+        val result = try {
+            store.authorGroupMetadataUpdate(
+                identity,
+                group,
+                group.name,
+                allIds,
+                System.currentTimeMillis(),
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "addMembers: metadata update was not stored", e)
+            return null
+        }
+
+        // Give new members the key before flooding the group-sealed metadata
+        // update; both remain durably queued if nobody is live right now.
+        queueInvites(result.group, newMembers)
+        publishGroupFrame("addMembers", result.authored)
+        ChatEvents.notifyChatChanged(group.id)
+        return result.group
     }
 
     private fun enqueueGroupMessage(
@@ -104,8 +176,13 @@ class GroupSender(
         }
 
         val (chatId, authored) = queued
+        ChatEvents.notifyChatChanged(chatId)
+        publishGroupFrame(logLabel, authored)
+        return SendResult.STORED
+    }
+
+    private fun publishGroupFrame(logLabel: String, authored: uniffi.cruisemesh_core.AuthoredEnvelope) {
         try {
-            ChatEvents.notifyChatChanged(chatId)
             RelaySyncEvents.requestSync()
             val fanout = MeshRouter.relayToAll(authored.frame)
             if (fanout == 0) {
@@ -116,7 +193,6 @@ class GroupSender(
         } catch (e: Exception) {
             Log.w(TAG, "$logLabel: stored locally; immediate group delivery will retry", e)
         }
-        return SendResult.STORED
     }
 
     /**

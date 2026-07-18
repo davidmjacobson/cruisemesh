@@ -2,15 +2,19 @@ use rusqlite::{params, OptionalExtension, Transaction};
 
 use crate::store::{
     outbound_message_dedupe_key, row_to_outbound, row_to_outgoing_receipt, store_err,
+    upsert_group_tx,
 };
 use crate::{
-    compute_recipient_hint, default_expiry, encode_envelope_frame, encode_group_invite_content,
-    encode_message_body, encode_message_body_with_reply, encode_receipt_content, generate_msg_id,
-    seal_group_message, seal_message, Contact, CoreError, Group, Identity, MessageBody,
-    MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, ReceiptContent, StoredMessage,
-    DEFAULT_HOP_TTL, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST,
-    KIND_GROUP_INVITE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC,
-    KIND_REACTION, KIND_RECEIPT, KIND_TEXT, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
+    apply_group_metadata_update, compute_recipient_hint, create_group_metadata_update,
+    default_expiry, encode_envelope_frame, encode_group_invite_content,
+    encode_group_metadata_update, encode_message_body, encode_message_body_with_reply,
+    encode_receipt_content, generate_msg_id, seal_group_message, seal_message, Contact, CoreError,
+    Group, GroupMetadataUpdate, Identity, MessageBody, MessageStore, OutboundEnvelope,
+    OutgoingReceiptEnvelope, ReceiptContent, StoredMessage, DEFAULT_HOP_TTL,
+    KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
+    KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT,
+    KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_TEXT, RECEIPT_TYPE_DELIVERED,
+    RECEIPT_TYPE_READ,
 };
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -25,6 +29,13 @@ pub struct AuthoredEnvelope {
 pub struct AuthoredReceipt {
     pub envelope: OutgoingReceiptEnvelope,
     pub frame: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct AuthoredGroupMetadataUpdate {
+    pub group: Group,
+    pub update: GroupMetadataUpdate,
+    pub authored: AuthoredEnvelope,
 }
 
 #[uniffi::export]
@@ -151,7 +162,7 @@ impl MessageStore {
         reply_to_msg_id: Option<Vec<u8>>,
         timestamp_ms: i64,
     ) -> Result<AuthoredEnvelope, CoreError> {
-        if kind != KIND_TEXT && kind != KIND_REACTION {
+        if kind != KIND_TEXT && kind != KIND_ATTACHMENT_MANIFEST && kind != KIND_REACTION {
             return Err(CoreError::Malformed(format!(
                 "unsupported group authored kind {kind}"
             )));
@@ -202,6 +213,68 @@ impl MessageStore {
         )?;
         tx.commit().map_err(store_err)?;
         Ok(authored(message, envelope, acknowledged_delivered))
+    }
+
+    /// Atomically apply a local add-only group metadata change and queue its
+    /// hidden group-stream update. The returned frame uses the existing group
+    /// key and normal DTN fan-out path.
+    pub fn author_group_metadata_update(
+        &self,
+        identity: Identity,
+        group: Group,
+        name: String,
+        member_user_ids: Vec<Vec<u8>>,
+        timestamp_ms: i64,
+    ) -> Result<AuthoredGroupMetadataUpdate, CoreError> {
+        let update = create_group_metadata_update(
+            group.clone(),
+            identity.user_id.clone(),
+            name,
+            member_user_ids,
+        )?;
+        let updated_group =
+            apply_group_metadata_update(group.clone(), update.clone(), identity.user_id.clone())?
+                .ok_or_else(|| {
+                CoreError::Malformed("group metadata update had no effect".to_string())
+            })?;
+        let payload = encode_group_metadata_update(update.clone())?;
+
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
+        let (lamport, acknowledged_delivered) =
+            next_authored_lamport(&tx, &group.id, &identity.user_id)?;
+        let message = StoredMessage {
+            chat_id: group.id.clone(),
+            sender_user_id: identity.user_id.clone(),
+            lamport,
+            timestamp: timestamp_ms,
+            kind: KIND_GROUP_METADATA_UPDATE,
+            payload,
+        };
+        let body = encoded_body(&message, group.id.clone(), None)?;
+        let msg_id = generate_msg_id();
+        let sealed = seal_group_message(identity, group.clone(), body)?;
+        let envelope = OutboundEnvelope {
+            msg_id,
+            recipient_user_id: group.id.clone(),
+            chat_id: group.id,
+            sender_user_id: message.sender_user_id.clone(),
+            kind: KIND_GROUP_METADATA_UPDATE,
+            lamport,
+            timestamp: timestamp_ms,
+            hop_ttl: DEFAULT_HOP_TTL,
+            expiry: default_expiry(timestamp_ms),
+            recipient_hint: compute_recipient_hint(message.chat_id.clone(), timestamp_ms),
+            sealed,
+        };
+        upsert_group_tx(&tx, &updated_group)?;
+        insert_authored_rows(&tx, &message, &envelope, None, timestamp_ms)?;
+        tx.commit().map_err(store_err)?;
+        Ok(AuthoredGroupMetadataUpdate {
+            group: updated_group,
+            update,
+            authored: authored(message, envelope, acknowledged_delivered),
+        })
     }
 
     /// Queue one pairwise-sealed group invite for every non-self member while
@@ -634,7 +707,10 @@ fn is_pairwise_kind(kind: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{decode_message_body, generate_identity, open_message};
+    use crate::{
+        create_group, decode_extended_message_body, decode_group_metadata_update,
+        decode_message_body, generate_identity, open_group_message, open_message,
+    };
 
     fn contact(identity: &Identity, name: &str) -> Contact {
         Contact {
@@ -708,6 +784,82 @@ mod tests {
             .author_pairwise_message(alice, contact(&bob, "Bob"), KIND_TEXT, vec![2], None, 2)
             .unwrap();
         assert_eq!((first.message.lamport, second.message.lamport), (1, 2));
+    }
+
+    #[test]
+    fn group_attachment_authoring_is_durable_and_openable() {
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        let alice = generate_identity();
+        let bob = generate_identity();
+        let group = create_group(
+            "Family".to_string(),
+            vec![alice.user_id.clone(), bob.user_id.clone()],
+        )
+        .unwrap();
+        store.upsert_group(group.clone()).unwrap();
+
+        let result = store
+            .author_group_message(
+                alice.clone(),
+                group.clone(),
+                KIND_ATTACHMENT_MANIFEST,
+                b"encoded attachment".to_vec(),
+                None,
+                77,
+            )
+            .unwrap();
+        assert_eq!(result.message.kind, KIND_ATTACHMENT_MANIFEST);
+        assert_eq!(
+            store.messages_for_chat(group.id.clone()).unwrap(),
+            vec![result.message.clone()]
+        );
+        let opened = open_group_message(group, result.envelope.sealed).unwrap();
+        let body = decode_extended_message_body(opened.payload).unwrap();
+        assert_eq!(body.kind, KIND_ATTACHMENT_MANIFEST);
+        assert_eq!(body.content, b"encoded attachment");
+    }
+
+    #[test]
+    fn group_metadata_authoring_updates_state_and_queue_atomically() {
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        let alice = generate_identity();
+        let bob = generate_identity();
+        let carol = generate_identity();
+        let group = create_group(
+            "Family".to_string(),
+            vec![alice.user_id.clone(), bob.user_id.clone()],
+        )
+        .unwrap();
+        store.upsert_group(group.clone()).unwrap();
+
+        let result = store
+            .author_group_metadata_update(
+                alice.clone(),
+                group.clone(),
+                "Cabin Crew".to_string(),
+                vec![
+                    alice.user_id.clone(),
+                    bob.user_id.clone(),
+                    carol.user_id.clone(),
+                ],
+                88,
+            )
+            .unwrap();
+        assert_eq!(result.group.name, "Cabin Crew");
+        assert!(result.group.member_user_ids.contains(&carol.user_id));
+        assert_eq!(
+            store.get_group(group.id.clone()).unwrap(),
+            Some(result.group.clone())
+        );
+        assert_eq!(result.authored.message.kind, KIND_GROUP_METADATA_UPDATE);
+
+        let opened = open_group_message(group, result.authored.envelope.sealed).unwrap();
+        let body = decode_extended_message_body(opened.payload).unwrap();
+        assert_eq!(body.kind, KIND_GROUP_METADATA_UPDATE);
+        assert_eq!(
+            decode_group_metadata_update(body.content).unwrap(),
+            result.update
+        );
     }
 
     #[test]

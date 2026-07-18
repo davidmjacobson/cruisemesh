@@ -58,6 +58,7 @@ import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.CoreInboundDisposition
 import uniffi.cruisemesh_core.CoreInboundGate
+import uniffi.cruisemesh_core.CoreRelayEnvelopeDisposition
 import uniffi.cruisemesh_core.DigestEntry
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Group
@@ -70,9 +71,13 @@ import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
+import uniffi.cruisemesh_core.applyGroupMetadataUpdate
+import uniffi.cruisemesh_core.coreGroupFanoutRows
+import uniffi.cruisemesh_core.coreGroupFanoutRowsForCarried
 import uniffi.cruisemesh_core.coreInboundGate
-import uniffi.cruisemesh_core.coreShouldAckInbound
+import uniffi.cruisemesh_core.coreIsOwnFanoutHint
 import uniffi.cruisemesh_core.decodeGroupInviteContent
+import uniffi.cruisemesh_core.decodeGroupMetadataUpdate
 import uniffi.cruisemesh_core.decodeFriendDirectoryContent
 import uniffi.cruisemesh_core.decodeIntroducedFriendRequest
 import uniffi.cruisemesh_core.decodeLanEndpointContent
@@ -112,6 +117,7 @@ private const val KIND_PROFILE_SYNC: UByte = 5u
 private const val KIND_FRIEND_DIRECTORY: UByte = 6u
 private const val KIND_INTRODUCED_FRIEND_REQUEST: UByte = 7u
 private const val KIND_LAN_ENDPOINT_HINT: UByte = 8u
+private const val KIND_GROUP_METADATA_UPDATE: UByte = 19u
 
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
@@ -147,12 +153,18 @@ private const val RELAY_BATCH_LIMIT: ULong = 128uL
 private const val RELAY_POLL_INTERVAL_MS = 60_000L
 
 /**
- * Exact carried-`msg_id` count advertised in the interim digest. This is the
- * stand-in for §7.3's deferred bloom filter: large enough to suppress blind
- * resend of a typical family-scale carry queue, still small enough to fit in
- * one HELLO sync over fragmented BLE.
+ * Bound on how many of our own carried `msg_id`s [seedSeenIdsFromOwnHistory]
+ * re-seeds into [GossipState.seenIds] at startup.
+ *
+ * DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): this used to also be the cap
+ * on the outgoing DIGEST's advertised `msg_id` list, but that decision now
+ * lives in core (`engine.rs::DIGEST_ADVERTISED_MSG_IDS_LIMIT`, behind
+ * [MessageStore.coreDigestAdvertisedMsgIds]) so both platforms share one
+ * source of truth. This constant now only bounds the unrelated seeding
+ * query below; it's kept at the same value as a reasonable, previously
+ * proven bound, not because the two uses need to match.
  */
-private const val DIGEST_CARRIED_MSG_IDS_LIMIT: ULong = 512uL
+private const val SEEN_ID_SEED_CARRIED_LIMIT: ULong = 512uL
 
 /**
  * BLE_1TO1_MULING.md Hook B: bounded per-digest-exchange budget (sealed-byte
@@ -496,7 +508,7 @@ class MeshService : Service() {
                     GossipState.seenIds.record(envelope.msgId)
                 }
             }
-            for (msgId in store.carriedMsgIds(DIGEST_CARRIED_MSG_IDS_LIMIT)) {
+            for (msgId in store.carriedMsgIds(SEEN_ID_SEED_CARRIED_LIMIT)) {
                 GossipState.seenIds.record(msgId)
             }
         } catch (e: CoreException) {
@@ -891,11 +903,54 @@ class MeshService : Service() {
             // text uses recipientUserId = group.id and rides the family's
             // fallback (or any member's) relay config.
             val contact = contactsByUserId[UserIdHex.encode(envelope.recipientUserId)]
-            val config = if (contact != null) {
-                resolvedRelayConfig(contact, fallbackConfig)
-            } else {
-                relayConfigForGroupRecipient(envelope.recipientUserId, contacts, fallbackConfig)
-            } ?: continue
+            if (contact == null) {
+                // Group-addressed: per-member fan-out instead of one shared
+                // group-hint row (specs/group-relay-durability.md §4.2).
+                val group = store.getGroup(envelope.recipientUserId)
+                val config = relayConfigForGroupRecipient(envelope.recipientUserId, contacts, fallbackConfig)
+                    ?: continue
+                if (group == null) {
+                    // Recipient is neither contact nor imported group (e.g. a
+                    // group deleted mid-queue); keep the legacy single post so
+                    // the envelope isn't stranded.
+                    try {
+                        RelayClient.postOutboundEnvelope(config, envelope, network)
+                        store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to upload outbound envelope to relay ${config.relayUrl}: ${e.message}")
+                    }
+                    continue
+                }
+                val rows = coreGroupFanoutRows(
+                    envelope.msgId,
+                    group.memberUserIds,
+                    envelope.hopTtl,
+                    envelope.expiry,
+                    envelope.sealed,
+                    envelope.timestamp,
+                )
+                // Spec §4.2: mark relay-posted only after ALL member rows
+                // post. A partial failure retries the whole set next pass;
+                // the deterministic fan-out msg_ids dedupe server-side.
+                var posted = 0
+                for (row in rows) {
+                    try {
+                        RelayClient.postFanoutRow(config, row, network)
+                        posted++
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to upload fan-out row to relay ${config.relayUrl}: ${e.message}")
+                    }
+                }
+                if (posted == rows.size) {
+                    store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
+                    Log.i(
+                        TAG,
+                        "Uploaded group envelope ${UserIdHex.encode(envelope.msgId)} as $posted fan-out row(s) to relay ${config.relayUrl}",
+                    )
+                }
+                continue
+            }
+            val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
                 val relayId = RelayClient.postOutboundEnvelope(config, envelope, network)
                 store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
@@ -930,7 +985,34 @@ class MeshService : Service() {
         network: Network?,
     ) {
         for (envelope in store.familyCarriedEnvelopes(RELAY_BATCH_LIMIT, now)) {
-            val contact = contactMatchingHint(contacts, envelope.recipientHint, now) ?: continue
+            val contact = contactMatchingHint(contacts, envelope.recipientHint, now)
+            if (contact == null) {
+                // Group-hinted carried envelope: previously skipped entirely
+                // (no contact match). A member mule can now decompose it into
+                // per-member fan-out rows (specs/group-relay-durability.md
+                // §4.2) so the group's mail reaches internet-only members
+                // through this phone's uplink too. No mark-posted concept for
+                // carried rows -- re-posts every pass dedupe server-side via
+                // the deterministic fan-out ids. Non-member mules still can't
+                // recognize the hint and still skip, unchanged.
+                val group = groupMatchingHint(envelope.recipientHint, now) ?: continue
+                val config = relayConfigForGroupRecipient(group.id, contacts, fallbackConfig) ?: continue
+                val rows = coreGroupFanoutRowsForCarried(
+                    envelope.msgId,
+                    group.memberUserIds,
+                    envelope.hopTtl,
+                    envelope.expiry,
+                    envelope.sealed,
+                )
+                for (row in rows) {
+                    try {
+                        RelayClient.postFanoutRow(config, row, network)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to upload carried fan-out row to relay ${config.relayUrl}: ${e.message}")
+                    }
+                }
+                continue
+            }
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
                 val relayId = RelayClient.postCarriedEnvelope(config, envelope, network)
@@ -957,12 +1039,16 @@ class MeshService : Service() {
      * across BLE clusters"). Every fetched envelope still goes through
      * [handleRelayEnvelope] -> [processInboundEnvelope] exactly as before;
      * what's new is that the ack decision now follows the returned
-     * [CoreInboundDisposition] ([coreShouldAckInbound]) instead of unconditionally acking
-     * everything the fetch returned. A proxied envelope comes back as
-     * CARRIED, not CONSUMED, so it is deliberately left on the relay --
-     * [MeshService.carryRelayEnvelope] already queued it for BLE delivery to
-     * its real recipient, and the relay copy remains the durable fallback
-     * until they (or another proxy) fetch and consume it, or it expires.
+     * [CoreInboundDisposition] via [MessageStore.coreRelayAckIdsWithConsumed]
+     * instead of unconditionally acking everything the fetch returned. A
+     * proxied envelope comes back as CARRIED, not CONSUMED, so it is
+     * deliberately left on the relay -- [MeshService.carryRelayEnvelope]
+     * already queued it for BLE delivery to its real recipient, and the
+     * relay copy remains the durable fallback until they (or another proxy)
+     * fetch and consume it, or it expires. A SEEN envelope this device
+     * already consumed as a 1:1 message over BLE/LAN is now also acked
+     * (DTN_TODOS.md §3.1) instead of being re-fetched on every pass until
+     * expiry -- see [CoreRelayEnvelopeDisposition]'s KDoc for the exact rule.
      *
      * The un-acked proxy envelopes DO still advance the cursor within this
      * pass (`after = page.nextCursor` is unconditional), so the inner loop
@@ -1001,13 +1087,23 @@ class MeshService : Service() {
                 "Fetched ${page.envelopes.size} relay envelope(s) from ${config.relayUrl} after=$after next=${page.nextCursor}",
             )
             if (page.envelopes.isEmpty()) return
-            val ackIds = ArrayList<Long>(page.envelopes.size)
+            val dispositions = ArrayList<CoreRelayEnvelopeDisposition>(page.envelopes.size)
             for (envelope in page.envelopes) {
                 val disposition = handleRelayEnvelope(envelope, identity)
-                if (coreShouldAckInbound(disposition)) {
-                    ackIds += envelope.id
-                }
+                dispositions += CoreRelayEnvelopeDisposition(
+                    relayId = envelope.id,
+                    msgId = envelope.msgId,
+                    disposition = disposition,
+                    recipientHint = envelope.recipientHint,
+                )
             }
+            // Consumed/Expired ack unconditionally; a SEEN envelope is
+            // acked only if this device durably consumed it as a 1:1
+            // message from someone else (DTN_TODOS.md §3.1); a legacy
+            // shared-mailbox group-hint row is never acked at all
+            // (specs/group-relay-durability.md §5.2) -- see
+            // CoreRelayEnvelopeDisposition's KDoc.
+            val ackIds = store.coreRelayAckIdsWithConsumed(dispositions, identity.userId, now)
             if (ackIds.isNotEmpty()) {
                 Log.i(TAG, "Acking ${ackIds.size} relay envelope(s) on ${config.relayUrl}: $ackIds")
                 RelayClient.ackEnvelopes(config, ackIds, network)
@@ -1418,20 +1514,26 @@ class MeshService : Service() {
     /**
      * HELLO handling (DESIGN.md §5.2 handshake). Records the address->userId
      * mapping, then kicks off the real digest sync (DESIGN.md §7.3). Every
-     * peer, contact or stranger, gets a digest now because the carried
-     * `msg_id` set is useful to both: it suppresses blind re-spray of foreign
-     * mule traffic on reconnect. A known contact additionally gets the
-     * per-sender lamport digest for the 1:1 chat, i.e. "here's what I have
-     * from myself, contiguously, through lamport N per sender." That's the
-     * wire-chatId convention from the class KDoc applied to DIGEST frames:
-     * `chatId` here is OUR OWN userId, and `entries` is
-     * [MessageStore.chatDigest] keyed by the *local* chat (the contact's
-     * userId), because locally that's how this 1:1 chat's history is stored.
-     * The peer's [handleDigest] uses the matching digest we sent it (from a
-     * prior HELLO) the same way to send us what we're missing -- see that
-     * method for the receiving half of this exchange. This replaces the
-     * earlier naive stand-in that just resent our entire outgoing history on
-     * every reconnect.
+     * peer, contact or stranger, gets a digest now because the advertised
+     * `msg_id` set ([MessageStore.coreDigestAdvertisedMsgIds]) is useful to
+     * both: it suppresses blind re-spray of foreign mule traffic on
+     * reconnect, and (DTN D2 mule-drain-confirm, DTN_TODOS.md §3.2) it
+     * doubles as our proof-of-receipt to anyone muling something FOR us --
+     * the advertised set includes not just what we're still carrying for
+     * others but also what we've recently consumed or authored ourselves,
+     * which is exactly the signal [MessageStore.coreConfirmCarriedDeliveries]
+     * on the mule's side (called from [sprayDigestPlanTo]) acts on. A known
+     * contact additionally gets the per-sender lamport digest for the 1:1
+     * chat, i.e. "here's what I have from myself, contiguously, through
+     * lamport N per sender." That's the wire-chatId convention from the
+     * class KDoc applied to DIGEST frames: `chatId` here is OUR OWN userId,
+     * and `entries` is [MessageStore.chatDigest] keyed by the *local* chat
+     * (the contact's userId), because locally that's how this 1:1 chat's
+     * history is stored. The peer's [handleDigest] uses the matching digest
+     * we sent it (from a prior HELLO) the same way to send us what we're
+     * missing -- see that method for the receiving half of this exchange.
+     * This replaces the earlier naive stand-in that just resent our entire
+     * outgoing history on every reconnect.
      *
      * An unrecognized userId still means "not a friend (yet)" for sealed 1:1
      * chat: `entries` is empty, because we have no local chat history keyed to
@@ -1467,7 +1569,7 @@ class MeshService : Service() {
         } else {
             sendLanEndpointHintTo(address)
         }
-        val digestFrame = encodeDigest(identity.userId, digestEntries, store.carriedMsgIds(DIGEST_CARRIED_MSG_IDS_LIMIT))
+        val digestFrame = encodeDigest(identity.userId, digestEntries, store.coreDigestAdvertisedMsgIds())
         MeshRouter.sendToAddress(address, digestFrame)
     }
 
@@ -1559,6 +1661,15 @@ class MeshService : Service() {
     ) {
         val now = System.currentTimeMillis()
         try {
+            // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): confirm delivery
+            // of anything this digest's advertised `msg_id`s prove the peer
+            // already has BEFORE building the spray plan below, so a
+            // just-confirmed carried envelope isn't immediately re-sprayed
+            // back at the peer who just told us they have it.
+            val confirmed = store.coreConfirmCarriedDeliveries(peerUserId, peerKnownMsgIds, now)
+            if (confirmed > 0uL) {
+                Log.i(TAG, "Confirmed delivery of $confirmed carried envelope(s) to ${UserIdHex.encode(peerUserId)}; dropped our copy")
+            }
             val plan = store.coreDigestSprayPlan(
                 ownUserId = identity.userId,
                 peerUserId = peerUserId,
@@ -1674,6 +1785,17 @@ class MeshService : Service() {
      * check explained in this class's KDoc, kind dispatch) is unchanged --
      * see [deliverOpenedEnvelope].
      *
+     * DTN D4 (seen-set poisoning ordering): [GossipState.seenIds] is checked
+     * with the non-mutating [uniffi.cruisemesh_core.SeenIds.contains], never
+     * [uniffi.cruisemesh_core.SeenIds.checkAndRecord], and only recorded once
+     * this envelope reaches a **terminal handled state** -- consumed,
+     * carried, or expired-drop -- at each `return` below. Invariant: an
+     * envelope whose durable handling failed must be re-presentable; an
+     * envelope that was handled (even by deliberate drop) must be deduped.
+     * Before this, `checkAndRecord` ran up front, so a later store failure
+     * (e.g. disk-full out of [carryForeignEnvelope]) permanently poisoned the
+     * `msg_id` even though it was never actually carried or delivered.
+     *
      * [processInboundEnvelope] now returns a [CoreInboundDisposition] so
      * [pollRelayMailbox] (the relay path) can decide whether it's safe to ack
      * the envelope; this BLE path has no such concept (a link frame isn't
@@ -1721,9 +1843,13 @@ class MeshService : Service() {
         identity: Identity,
     ): CoreInboundDisposition {
         val sourceLabel = sourceAddress ?: "relay"
+        // DTN D4: a non-mutating check, not checkAndRecord -- see the KDoc
+        // above. `record` is only called once handling below actually
+        // reaches a terminal state, so a failure partway through leaves this
+        // msg_id re-presentable on the next copy instead of poisoned forever.
         when (
             coreInboundGate(
-                GossipState.seenIds.checkAndRecord(envelope.msgId),
+                !GossipState.seenIds.contains(envelope.msgId),
                 envelope.expiry,
                 System.currentTimeMillis(),
             )
@@ -1731,6 +1857,8 @@ class MeshService : Service() {
             CoreInboundGate.SEEN -> return CoreInboundDisposition.SEEN
             CoreInboundGate.EXPIRED -> {
                 Log.i(TAG, "Dropping expired envelope from $sourceLabel (expiry=${envelope.expiry})")
+                // A deliberate drop is still a terminal handled state.
+                GossipState.seenIds.record(envelope.msgId)
                 return CoreInboundDisposition.EXPIRED
             }
             CoreInboundGate.DISPATCH -> Unit
@@ -1755,12 +1883,29 @@ class MeshService : Service() {
                     arrival,
                     envelope.msgId,
                 )
-                relayForeignEnvelope(sourceAddress, envelope)
-                if (sourceAddress == null) {
-                    carryRelayEnvelope(envelope)
-                } else {
-                    carryForeignEnvelope(envelope, forceFamily = true)
+                // specs/group-relay-durability.md §4.3 no-reinjection rule:
+                // a relay-fetched group message addressed to OUR OWN hint is
+                // a per-member fan-out copy -- the relay fan-out already
+                // reaches every member durably, so re-flooding/carrying it
+                // would give the same content a second flood identity under
+                // the fan-out msg_id. Legacy group-hint relay rows and every
+                // BLE/LAN-sourced group frame keep the flood+carry behavior.
+                val ownFanoutCopy = sourceAddress == null &&
+                    coreIsOwnFanoutHint(envelope.recipientHint, identity.userId, System.currentTimeMillis())
+                if (!ownFanoutCopy) {
+                    relayForeignEnvelope(sourceAddress, envelope)
+                    if (sourceAddress == null) {
+                        carryRelayEnvelope(envelope)
+                    } else {
+                        carryForeignEnvelope(envelope, forceFamily = true)
+                    }
                 }
+                // DTN D4: [deliverOpenedGroupEnvelope] durably stores our own
+                // copy and throws (rather than returning) on a store
+                // failure, so reaching this line means we already have it --
+                // record regardless of whether the best-effort mule copy for
+                // absent members above was stored.
+                GossipState.seenIds.record(envelope.msgId)
                 return CoreInboundDisposition.CONSUMED
             }
             // Not for us (or unopenable) -> foreign traffic. Two jobs, both
@@ -1768,15 +1913,30 @@ class MeshService : Service() {
             // right now, and carry it so we can hand it to its recipient the
             // next time we meet them, even if that's hours from now.
             relayForeignEnvelope(sourceAddress, envelope)
-            if (sourceAddress == null) {
+            val carried = if (sourceAddress == null) {
                 carryRelayEnvelope(envelope)
             } else {
                 carryForeignEnvelope(envelope)
+            }
+            // DTN D4: only record once the durable carry actually succeeded.
+            // [carryForeignEnvelope]/[carryRelayEnvelope] catch their own
+            // store exceptions and report failure via their Boolean return
+            // instead of throwing, so a disk-full failure here leaves this
+            // msg_id unrecorded: the next copy of this envelope on any link
+            // re-gates as Dispatch and gets another chance to carry it,
+            // instead of being silently dropped as Seen for the rest of the
+            // process lifetime.
+            if (carried) {
+                GossipState.seenIds.record(envelope.msgId)
             }
             return CoreInboundDisposition.CARRIED
         }
         val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
         deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
+        // DTN D4: [deliverOpenedEnvelope] does not swallow store exceptions
+        // (see [handleIncomingChatMessage] etc.), so reaching this line means
+        // the message was durably stored -- safe, and required, to record.
+        GossipState.seenIds.record(envelope.msgId)
         return CoreInboundDisposition.CONSUMED
     }
 
@@ -1827,10 +1987,16 @@ class MeshService : Service() {
      * Idempotent on `msg_id`, so re-seeing an envelope we already carry is a
      * no-op. Reached only after [handleEnvelope]'s dedupe + expiry gates, so
      * we never carry a stale duplicate or an already-expired envelope.
+     *
+     * Returns `true` if the store operation completed (whether it newly
+     * queued the envelope or found it already carried) and `false` if the
+     * store call itself failed. DTN D4: [processInboundEnvelope] uses this
+     * return value to decide whether it's safe to mark the envelope's
+     * `msg_id` seen -- see its KDoc.
      */
-    private fun carryForeignEnvelope(envelope: Frame.Envelope, forceFamily: Boolean = false) {
+    private fun carryForeignEnvelope(envelope: Frame.Envelope, forceFamily: Boolean = false): Boolean {
         val now = System.currentTimeMillis()
-        try {
+        return try {
             val isFamily = forceFamily || hintMatchesKnownTarget(envelope.recipientHint, now)
             val stored = store.enqueueCarriedEnvelope(
                 CarriedEnvelope(
@@ -1850,8 +2016,10 @@ class MeshService : Service() {
                     requestRelaySync("family carry queued")
                 }
             }
+            true
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to enqueue carried envelope: ${e.message}")
+            false
         }
     }
 
@@ -1867,10 +2035,14 @@ class MeshService : Service() {
      * side too (`from_relay = 1` is excluded from the upload query), so this
      * is belt-and-suspenders, but skipping the call here avoids scheduling a
      * pointless relay-sync pass. Idempotent on `msg_id` like its sibling.
+     *
+     * Returns `true`/`false` on store success/failure -- see
+     * [carryForeignEnvelope]'s KDoc for why [processInboundEnvelope] needs
+     * this (DTN D4).
      */
-    private fun carryRelayEnvelope(envelope: Frame.Envelope) {
+    private fun carryRelayEnvelope(envelope: Frame.Envelope): Boolean {
         val now = System.currentTimeMillis()
-        try {
+        return try {
             val stored = store.enqueueRelayCarriedEnvelope(
                 CarriedEnvelope(
                     msgId = envelope.msgId,
@@ -1884,8 +2056,10 @@ class MeshService : Service() {
             if (stored) {
                 Log.i(TAG, "Carrying relay-sourced envelope (proxy) for later BLE delivery")
             }
+            true
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to enqueue relay-carried envelope: ${e.message}")
+            false
         }
     }
 
@@ -1893,11 +2067,28 @@ class MeshService : Service() {
      * Hands over every carried envelope destined for the peer that just
      * HELLO'd on [address] (DESIGN.md §5.3): we compute the peer's recent-day
      * `recipient_hint`s ([recentHintsFor]) and pull matching envelopes from
-     * the store, send each on this link, and drop it once sent (a mule's job
-     * ends on delivery). Expired entries are pruned first. If the peer already
-     * saw an envelope via an earlier flood, their own seen-ID set drops the
-     * duplicate harmlessly; if they didn't (the whole point -- they were out
-     * of range when it flooded), this is how it reaches them.
+     * the store, and send each on this link. Expired entries are pruned
+     * first. If the peer already saw an envelope via an earlier flood, their
+     * own seen-ID set drops the duplicate harmlessly; if they didn't (the
+     * whole point -- they were out of range when it flooded), this is how it
+     * reaches them.
+     *
+     * DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): this function only ever
+     * *attempts* delivery -- it no longer calls [MessageStore.removeCarriedEnvelope]
+     * on a successful [MeshRouter.sendToAddress]. That return only means a
+     * transport function accepted the write (e.g. [BleCentral]'s `sendFrame`
+     * just enqueues fragments into a per-address write queue), not that the
+     * bytes made it to the peer; a disconnect mid-transfer used to silently
+     * drop the whole write queue after we'd already deleted our only copy.
+     * The carried row is now removed later, once the peer's own next digest
+     * exchange proves they actually have it -- see
+     * [MessageStore.coreConfirmCarriedDeliveries], called from
+     * [sprayDigestPlanTo].
+     *
+     * Invariant, stated verbatim (DTN_TODOS.md §3.2): worst case of a
+     * dropped mid-transfer link is a harmless duplicate resend (the peer's
+     * seen-set/store dedupes it), never a lost envelope; an unconfirmed
+     * carry still dies at its normal expiry via [MessageStore.pruneExpiredCarried].
      */
     private fun drainCarriedEnvelopesTo(address: String, peerUserId: ByteArray) {
         val now = System.currentTimeMillis()
@@ -1912,15 +2103,10 @@ class MeshService : Service() {
             for (env in toDeliver) {
                 val frame = encodeEnvelopeFrame(env.msgId, env.hopTtl, env.expiry, env.recipientHint, env.sealed)
                 if (MeshRouter.sendToAddress(address, frame)) {
-                    // Keep group carries so we can still mule to other members;
-                    // only drop true 1:1-targeted envelopes once handed over.
-                    if (!recognizesGroupHint(env.recipientHint, now)) {
-                        store.removeCarriedEnvelope(env.msgId)
-                    }
                     delivered++
                 }
             }
-            Log.i(TAG, "Drained $delivered carried envelope(s) to $address")
+            Log.i(TAG, "Attempted delivery of $delivered carried envelope(s) to $address (removal awaits their digest confirmation)")
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to drain carried envelopes to $address: ${e.message}")
         }
@@ -1950,13 +2136,22 @@ class MeshService : Service() {
         return recognizesGroupHint(hint, now)
     }
 
-    private fun recognizesGroupHint(hint: ByteArray, now: Long): Boolean {
+    private fun recognizesGroupHint(hint: ByteArray, now: Long): Boolean =
+        groupMatchingHint(hint, now) != null
+
+    /**
+     * The imported group whose recent-day hints include [hint], if any --
+     * the group-shaped sibling of [contactMatchingHint], used by the fan-out
+     * upload path (specs/group-relay-durability.md §4.2) which needs the
+     * group's member list, not just a yes/no.
+     */
+    private fun groupMatchingHint(hint: ByteArray, now: Long): Group? {
         for (group in store.listGroups()) {
             if (recentHintsFor(group.id, now).any { it.contentEquals(hint) }) {
-                return true
+                return group
             }
         }
-        return false
+        return null
     }
 
     /**
@@ -1983,8 +2178,24 @@ class MeshService : Service() {
      * carrier's copy and stops here. The `msg_id`, `expiry`, `recipient_hint`,
      * and sealed bytes are all preserved verbatim -- only `hop_ttl` changes --
      * so every carrier along the way computes the same dedupe key. The
-     * arriving link is excluded from the flood to avoid the trivial echo; the
-     * seen-ID set (already updated by [handleEnvelope]) stops longer loops.
+     * arriving link is excluded from the flood to avoid the trivial echo;
+     * the mesh's other seen-ID sets stop longer loops once the recipients
+     * record this `msg_id` themselves.
+     *
+     * DTN D4 loop-hazard note: since [processInboundEnvelope] moved to
+     * check-then-record, [GossipState.seenIds] is *not yet* updated for this
+     * `msg_id` at the moment this call happens (it's recorded after this
+     * function returns, once the whole terminal branch succeeds -- see
+     * [processInboundEnvelope]'s KDoc). That's still safe against
+     * self-re-ingestion: the arriving link is excluded from the fanout above
+     * (so this node can't hand the relayed frame straight back to itself),
+     * and [processInboundEnvelope] runs synchronously per received frame, so
+     * there is no way for this same `msg_id` to re-enter [processInboundEnvelope]
+     * on *this* node before the terminal `record` call a few lines below this
+     * one completes. A frame this node relays could only loop back from a
+     * third node's rebroadcast, which takes at least one more hop and one
+     * more link round-trip -- by then this node's record has long since
+     * happened.
      */
     private fun relayForeignEnvelope(address: String?, envelope: Frame.Envelope) {
         val remainingHops = envelope.hopTtl.toInt()
@@ -2196,7 +2407,7 @@ class MeshService : Service() {
             return
         }
         when (body.kind) {
-            KIND_TEXT -> handleIncomingGroupChatMessage(
+            KIND_TEXT, KIND_ATTACHMENT_MANIFEST, KIND_REACTION -> handleIncomingGroupChatMessage(
                 address,
                 group,
                 opened.senderUserId,
@@ -2205,7 +2416,7 @@ class MeshService : Service() {
                 msgId,
                 extendedBody.replyToMsgId,
             )
-            KIND_REACTION -> handleIncomingGroupChatMessage(
+            KIND_GROUP_METADATA_UPDATE -> handleIncomingGroupMetadataUpdate(
                 address,
                 group,
                 opened.senderUserId,
@@ -2215,6 +2426,43 @@ class MeshService : Service() {
                 extendedBody.replyToMsgId,
             )
             else -> Log.i(TAG, "Dropping group envelope from $address: unhandled kind=${body.kind}")
+        }
+    }
+
+    private fun handleIncomingGroupMetadataUpdate(
+        address: String,
+        group: Group,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        arrival: MessageArrival,
+        msgId: ByteArray,
+        replyToMsgId: ByteArray?,
+    ) {
+        val updated = try {
+            val update = decodeGroupMetadataUpdate(body.content)
+            applyGroupMetadataUpdate(group, update, senderUserId)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping invalid group metadata from $address: ${e.message}")
+            return
+        }
+        val inserted = store.insertIncomingMessage(
+            StoredMessage(
+                chatId = group.id,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = body.kind,
+                payload = body.content,
+            ),
+            msgId,
+            replyToMsgId,
+        )
+        if (!inserted) return
+        store.recordMessageArrival(group.id, senderUserId, body.lamport, arrival)
+        if (updated != null) {
+            store.upsertGroup(updated)
+            Log.i(TAG, "Applied group metadata revision ${updated.metadataRevision} for ${updated.name}")
+            ChatEvents.notifyChatChanged(group.id)
         }
     }
 
@@ -2268,7 +2516,15 @@ class MeshService : Service() {
         } else if (isVisibleChatKind(body.kind)) {
             val senderName = store.getContact(senderUserId)?.name
                 ?: UserIdHex.encode(senderUserId).take(8)
-            val preview = body.content.toString(Charsets.UTF_8)
+            val preview = if (body.kind == KIND_ATTACHMENT_MANIFEST) {
+                try {
+                    AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))
+                } catch (_: Exception) {
+                    "Attachment"
+                }
+            } else {
+                body.content.toString(Charsets.UTF_8)
+            }
             MessageNotifier.notifyIncomingGroupMessage(this, group, senderName, preview)
         }
     }

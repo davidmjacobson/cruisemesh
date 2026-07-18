@@ -65,6 +65,22 @@ final class GroupSender {
         )
     }
 
+    func sendAttachment(
+        group: Group,
+        attachment: AttachmentPayload,
+        replyToMsgId: Data? = nil
+    ) {
+        guard group.memberUserIds.contains(identity.userId),
+              attachment.blob.count <= AttachmentPayload.maxBlobBytes else { return }
+        enqueueGroupMessage(
+            group: group,
+            kind: ProtocolKind.attachmentManifest,
+            payload: attachment.encode(),
+            label: "sendAttachment",
+            replyToMsgId: replyToMsgId
+        )
+    }
+
     func sendReaction(group: Group, target: MessageTarget, emoji: String) {
         guard group.memberUserIds.contains(identity.userId) else { return }
         enqueueGroupMessage(
@@ -73,6 +89,52 @@ final class GroupSender {
             payload: ReactionPayload(target: target, emoji: emoji).encode(),
             label: "sendReaction"
         )
+    }
+
+    @discardableResult
+    func renameGroup(group: Group, name: String) -> Group? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != group.name else { return nil }
+        do {
+            let result = try store.authorGroupMetadataUpdate(
+                identity: identity,
+                group: group,
+                name: trimmed,
+                memberUserIds: group.memberUserIds,
+                timestampMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            )
+            publishGroupFrame(label: "renameGroup", authored: result.authored)
+            ChatEvents.notifyChatChanged(group.id)
+            return result.group
+        } catch {
+            log.error("renameGroup: metadata update was not stored: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
+    @discardableResult
+    func addMembers(group: Group, additions: [Contact]) -> Group? {
+        var seen = Set(group.memberUserIds)
+        let newMembers = additions.filter { seen.insert($0.userId).inserted }
+        guard !newMembers.isEmpty else { return nil }
+        do {
+            let result = try store.authorGroupMetadataUpdate(
+                identity: identity,
+                group: group,
+                name: group.name,
+                memberUserIds: group.memberUserIds + newMembers.map(\.userId),
+                timestampMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            )
+            // Queue pairwise key-bearing invitations before the live metadata
+            // flood. Both paths remain durable when members are offline.
+            queueInvites(group: result.group, members: newMembers)
+            publishGroupFrame(label: "addMembers", authored: result.authored)
+            ChatEvents.notifyChatChanged(group.id)
+            return result.group
+        } catch {
+            log.error("addMembers: metadata update was not stored: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
     }
 
     private func enqueueGroupMessage(
@@ -89,10 +151,12 @@ final class GroupSender {
         ) else {
             return
         }
-        let chatId = authored.message.chatId
-        ChatEvents.notifyChatChanged(chatId)
-        RelaySyncEvents.requestSync()
+        ChatEvents.notifyChatChanged(authored.message.chatId)
+        publishGroupFrame(label: label, authored: authored)
+    }
 
+    private func publishGroupFrame(label: String, authored: AuthoredEnvelope) {
+        RelaySyncEvents.requestSync()
         let fanout = MeshRouter.relayToAll(frame: authored.frame)
         if fanout == 0 {
             log.info("\(label, privacy: .public): no live links; group message stays local for carry/digest/relay")

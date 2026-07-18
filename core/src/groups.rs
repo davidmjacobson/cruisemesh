@@ -17,6 +17,7 @@ const GROUP_ID_LEN: usize = 16;
 const GROUP_KEY_LEN: usize = 32;
 const GROUP_ENVELOPE_VERSION: u8 = 1;
 const GROUP_NONCE_LEN: usize = 24;
+const GROUP_METADATA_VERSION: u8 = 1;
 
 /// A persisted/imported group: id, display name, full member list, and the
 /// current symmetric group key.
@@ -26,6 +27,20 @@ pub struct Group {
     pub name: String,
     pub member_user_ids: Vec<Vec<u8>>,
     pub key: Vec<u8>,
+    pub metadata_revision: u64,
+    pub metadata_changed_by: Vec<u8>,
+}
+
+/// An add-only membership snapshot plus a convergent group-name update.
+/// Membership is merged as a set so reordered concurrent additions cannot
+/// remove a member. The `(revision, changed_by)` tuple orders name changes.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct GroupMetadataUpdate {
+    pub group_id: Vec<u8>,
+    pub name: String,
+    pub revision: u64,
+    pub changed_by: Vec<u8>,
+    pub member_user_ids: Vec<Vec<u8>>,
 }
 
 /// Generate a fresh group id + key with a canonicalized member list
@@ -41,6 +56,8 @@ pub fn create_group(name: String, member_user_ids: Vec<Vec<u8>>) -> Result<Group
         name,
         member_user_ids: canonicalize_members(member_user_ids),
         key,
+        metadata_revision: 0,
+        metadata_changed_by: Vec::new(),
     })
 }
 
@@ -57,6 +74,8 @@ pub fn rotate_group(group: Group, member_user_ids: Vec<Vec<u8>>) -> Result<Group
         name: group.name,
         member_user_ids: canonicalize_members(member_user_ids),
         key,
+        metadata_revision: group.metadata_revision,
+        metadata_changed_by: group.metadata_changed_by,
     })
 }
 
@@ -110,9 +129,171 @@ pub fn decode_group_invite_content(bytes: Vec<u8>) -> Result<Group, CoreError> {
         name,
         member_user_ids: canonicalize_members(member_user_ids),
         key,
+        metadata_revision: 0,
+        metadata_changed_by: Vec::new(),
     };
     validate_group(&group)?;
     Ok(group)
+}
+
+/// Create the next locally-authored metadata update. Membership is add-only;
+/// callers may pass the current list plus newly accepted contacts.
+#[uniffi::export]
+pub fn create_group_metadata_update(
+    group: Group,
+    changed_by: Vec<u8>,
+    name: String,
+    member_user_ids: Vec<Vec<u8>>,
+) -> Result<GroupMetadataUpdate, CoreError> {
+    validate_group(&group)?;
+    if !group
+        .member_user_ids
+        .iter()
+        .any(|member| *member == changed_by)
+    {
+        return Err(CoreError::Malformed(
+            "group metadata author is not a member".to_string(),
+        ));
+    }
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(CoreError::Malformed(
+            "group name must not be empty".to_string(),
+        ));
+    }
+    let member_user_ids = canonicalize_members(member_user_ids);
+    if !group
+        .member_user_ids
+        .iter()
+        .all(|member| member_user_ids.contains(member))
+    {
+        return Err(CoreError::Malformed(
+            "group metadata update cannot remove members".to_string(),
+        ));
+    }
+    let revision = group
+        .metadata_revision
+        .checked_add(1)
+        .ok_or_else(|| CoreError::Malformed("group metadata revision overflow".to_string()))?;
+    Ok(GroupMetadataUpdate {
+        group_id: group.id,
+        name,
+        revision,
+        changed_by,
+        member_user_ids,
+    })
+}
+
+/// Apply a verified member-authored update. Name changes use the deterministic
+/// `(revision, changed_by)` winner. Member ids are always unioned, even for a
+/// losing concurrent name update, so delivery order cannot lose additions.
+#[uniffi::export]
+pub fn apply_group_metadata_update(
+    group: Group,
+    update: GroupMetadataUpdate,
+    sender_user_id: Vec<u8>,
+) -> Result<Option<Group>, CoreError> {
+    validate_group(&group)?;
+    validate_group_metadata_update(&update)?;
+    if update.group_id != group.id {
+        return Err(CoreError::Malformed(
+            "group metadata update id does not match group".to_string(),
+        ));
+    }
+    if update.changed_by != sender_user_id {
+        return Err(CoreError::Malformed(
+            "group metadata signer does not match changed_by".to_string(),
+        ));
+    }
+    if !group
+        .member_user_ids
+        .iter()
+        .any(|member| *member == sender_user_id)
+    {
+        return Err(CoreError::Malformed(
+            "group metadata signer is not a member".to_string(),
+        ));
+    }
+
+    let mut merged_members = group.member_user_ids.clone();
+    merged_members.extend(update.member_user_ids.clone());
+    merged_members = canonicalize_members(merged_members);
+    let membership_changed = merged_members != group.member_user_ids;
+    let name_wins = (update.revision, update.changed_by.as_slice())
+        > (
+            group.metadata_revision,
+            group.metadata_changed_by.as_slice(),
+        );
+    if !membership_changed && !name_wins {
+        return Ok(None);
+    }
+
+    Ok(Some(Group {
+        id: group.id,
+        name: if name_wins { update.name } else { group.name },
+        member_user_ids: merged_members,
+        key: group.key,
+        metadata_revision: if name_wins {
+            update.revision
+        } else {
+            group.metadata_revision
+        },
+        metadata_changed_by: if name_wins {
+            update.changed_by
+        } else {
+            group.metadata_changed_by
+        },
+    }))
+}
+
+/// Encode a group metadata update for a hidden group-stream message.
+#[uniffi::export]
+pub fn encode_group_metadata_update(update: GroupMetadataUpdate) -> Result<Vec<u8>, CoreError> {
+    validate_group_metadata_update(&update)?;
+    let members = canonicalize_members(update.member_user_ids);
+    let mut out = Vec::new();
+    out.push(GROUP_METADATA_VERSION);
+    out.extend_from_slice(&update.group_id);
+    out.extend_from_slice(&update.revision.to_be_bytes());
+    write_bytes16(&mut out, &update.changed_by);
+    write_bytes16(&mut out, update.name.as_bytes());
+    out.extend_from_slice(&(members.len() as u16).to_be_bytes());
+    for member in members {
+        write_bytes16(&mut out, &member);
+    }
+    Ok(out)
+}
+
+/// Decode a hidden group-stream metadata update.
+#[uniffi::export]
+pub fn decode_group_metadata_update(bytes: Vec<u8>) -> Result<GroupMetadataUpdate, CoreError> {
+    let mut cursor = Cursor::new(&bytes);
+    let version = cursor.take(1)?[0];
+    if version != GROUP_METADATA_VERSION {
+        return Err(CoreError::Malformed(format!(
+            "unsupported group metadata version {version}"
+        )));
+    }
+    let group_id = cursor.take(GROUP_ID_LEN)?.to_vec();
+    let revision = cursor.take_u64()?;
+    let changed_by = cursor.take_bytes16()?;
+    let name = String::from_utf8(cursor.take_bytes16()?)
+        .map_err(|e| CoreError::Malformed(format!("group metadata name is not UTF-8: {e}")))?;
+    let count = cursor.take_u16()? as usize;
+    let mut member_user_ids = Vec::with_capacity(count.min(bytes.len()));
+    for _ in 0..count {
+        member_user_ids.push(cursor.take_bytes16()?);
+    }
+    cursor.finish()?;
+    let update = GroupMetadataUpdate {
+        group_id,
+        name,
+        revision,
+        changed_by,
+        member_user_ids: canonicalize_members(member_user_ids),
+    };
+    validate_group_metadata_update(&update)?;
+    Ok(update)
 }
 
 /// Sign `payload` with the sender's Ed25519 key, pad it to the next 256-byte
@@ -173,6 +354,41 @@ pub(crate) fn validate_group(group: &Group) -> Result<(), CoreError> {
     validate_group_id(&group.id)?;
     if group.key.len() != GROUP_KEY_LEN {
         return Err(key_len_err(GROUP_KEY_LEN as u32, group.key.len()));
+    }
+    Ok(())
+}
+
+fn validate_group_metadata_update(update: &GroupMetadataUpdate) -> Result<(), CoreError> {
+    validate_group_id(&update.group_id)?;
+    if update.revision == 0 {
+        return Err(CoreError::Malformed(
+            "group metadata revision must be positive".to_string(),
+        ));
+    }
+    if update.changed_by.is_empty() {
+        return Err(CoreError::Malformed(
+            "group metadata changed_by must not be empty".to_string(),
+        ));
+    }
+    if update.name.trim().is_empty() {
+        return Err(CoreError::Malformed(
+            "group metadata name must not be empty".to_string(),
+        ));
+    }
+    if update.name.len() > u16::MAX as usize || update.changed_by.len() > u16::MAX as usize {
+        return Err(CoreError::Malformed(
+            "group metadata field is too large".to_string(),
+        ));
+    }
+    if update.member_user_ids.len() > u16::MAX as usize
+        || update
+            .member_user_ids
+            .iter()
+            .any(|member| member.len() > u16::MAX as usize)
+    {
+        return Err(CoreError::Malformed(
+            "group metadata member list is too large".to_string(),
+        ));
     }
     Ok(())
 }
@@ -240,6 +456,12 @@ impl<'a> Cursor<'a> {
         ))
     }
 
+    fn take_u64(&mut self) -> Result<u64, CoreError> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("exactly 8 bytes"),
+        ))
+    }
+
     fn take_bytes16(&mut self) -> Result<Vec<u8>, CoreError> {
         let len = self.take_u16()? as usize;
         Ok(self.take(len)?.to_vec())
@@ -268,6 +490,8 @@ mod tests {
             name: "Bridge Crew".to_string(),
             member_user_ids: vec![b"carol".to_vec(), b"alice".to_vec(), b"alice".to_vec()],
             key: vec![0x22; GROUP_KEY_LEN],
+            metadata_revision: 0,
+            metadata_changed_by: Vec::new(),
         }
     }
 
@@ -311,7 +535,98 @@ mod tests {
                 name: "Bridge Crew".to_string(),
                 member_user_ids: vec![b"alice".to_vec(), b"carol".to_vec()],
                 key: vec![0x22; GROUP_KEY_LEN],
+                metadata_revision: 0,
+                metadata_changed_by: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn group_metadata_round_trips_and_applies_rename() {
+        let group = sample_group();
+        let update = create_group_metadata_update(
+            group.clone(),
+            b"alice".to_vec(),
+            "Night Watch".to_string(),
+            group.member_user_ids.clone(),
+        )
+        .unwrap();
+        let decoded =
+            decode_group_metadata_update(encode_group_metadata_update(update).unwrap()).unwrap();
+        let applied = apply_group_metadata_update(group, decoded, b"alice".to_vec())
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.name, "Night Watch");
+        assert_eq!(applied.metadata_revision, 1);
+        assert_eq!(applied.metadata_changed_by, b"alice".to_vec());
+    }
+
+    #[test]
+    fn group_metadata_rejects_non_member_and_member_removal_at_authoring() {
+        let group = sample_group();
+        assert!(create_group_metadata_update(
+            group.clone(),
+            b"mallory".to_vec(),
+            "Nope".to_string(),
+            group.member_user_ids.clone(),
+        )
+        .is_err());
+        assert!(create_group_metadata_update(
+            group,
+            b"alice".to_vec(),
+            "Nope".to_string(),
+            vec![b"alice".to_vec()],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn concurrent_metadata_updates_converge_without_losing_member_additions() {
+        let group = sample_group();
+        let alice_update = create_group_metadata_update(
+            group.clone(),
+            b"alice".to_vec(),
+            "Alice name".to_string(),
+            vec![b"alice".to_vec(), b"carol".to_vec(), b"dave".to_vec()],
+        )
+        .unwrap();
+        let carol_update = create_group_metadata_update(
+            group.clone(),
+            b"carol".to_vec(),
+            "Carol name".to_string(),
+            vec![b"alice".to_vec(), b"carol".to_vec(), b"erin".to_vec()],
+        )
+        .unwrap();
+
+        let a_then_c = apply_group_metadata_update(
+            apply_group_metadata_update(group.clone(), alice_update.clone(), b"alice".to_vec())
+                .unwrap()
+                .unwrap(),
+            carol_update.clone(),
+            b"carol".to_vec(),
+        )
+        .unwrap()
+        .unwrap();
+        let c_then_a = apply_group_metadata_update(
+            apply_group_metadata_update(group, carol_update, b"carol".to_vec())
+                .unwrap()
+                .unwrap(),
+            alice_update,
+            b"alice".to_vec(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(a_then_c, c_then_a);
+        assert_eq!(a_then_c.name, "Carol name");
+        assert_eq!(
+            a_then_c.member_user_ids,
+            vec![
+                b"alice".to_vec(),
+                b"carol".to_vec(),
+                b"dave".to_vec(),
+                b"erin".to_vec(),
+            ]
         );
     }
 

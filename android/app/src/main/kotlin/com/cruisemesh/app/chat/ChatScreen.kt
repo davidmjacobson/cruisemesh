@@ -46,6 +46,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -79,6 +80,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -87,6 +89,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.media.AttachmentPayload
 import com.cruisemesh.app.media.ImageGallery
@@ -96,6 +99,7 @@ import com.cruisemesh.app.media.VoiceRecorder
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.media.isVisibleChatKind
 import com.cruisemesh.app.mesh.ContactReachability
+import com.cruisemesh.app.notify.ChatMuteStore
 import com.cruisemesh.app.mesh.ReachabilityLevel
 import com.cruisemesh.app.ui.AvatarBadge
 import com.cruisemesh.app.ui.BubbleGrouping
@@ -118,6 +122,8 @@ import uniffi.cruisemesh_core.formatUserId
 import java.io.File
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 /** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
 private const val KIND_TEXT: kotlin.UByte = 1u
@@ -126,10 +132,10 @@ private const val KIND_TEXT: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
 
-private const val MAX_VOICE_MS = 60_000
+internal const val MAX_VOICE_MS = 60_000
 
 /** Below this hold duration a mic press is treated as an accidental tap, not a memo. */
-private const val MIN_VOICE_MS = 500L
+internal const val MIN_VOICE_MS = 500L
 
 val REACTION_CHOICES = listOf("👍", "❤️", "😂", "😮", "😢", "🙏")
 
@@ -178,7 +184,8 @@ fun ChatScreen(
     var readThrough by remember(contact.userId) {
         mutableStateOf(store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_READ))
     }
-    var draft by remember { mutableStateOf("") }
+    var draft by remember(contact.userId) { mutableStateOf(DraftStore.load(context, contact.userId)) }
+    var isMuted by remember(contact.userId) { mutableStateOf(ChatMuteStore.isMuted(context, contact.userId)) }
     var replyingTo by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
     // A photo picked but not yet sent: shown as a preview card above the composer
@@ -301,6 +308,10 @@ fun ChatScreen(
         }
     }
 
+    LaunchedEffect(draft) {
+        DraftStore.save(context, currentContact.userId, draft)
+    }
+
     ConversationScreen(
         contact = currentContact,
         ownUserId = ownUserId,
@@ -396,10 +407,16 @@ fun ChatScreen(
         reachability = reachability,
         reachabilityStatusText = reachabilityStatusText,
         reachabilityDetailsText = reachabilityDetailsText,
+        isMuted = isMuted,
+        onMutedChange = {
+            isMuted = it
+            ChatMuteStore.setMuted(context, currentContact.userId, it)
+            ChatEvents.notifyChatChanged(currentContact.userId)
+        },
     )
 }
 
-private fun launchCamera(context: android.content.Context, onReady: (Uri) -> Unit) {
+internal fun launchCamera(context: android.content.Context, onReady: (Uri) -> Unit) {
     onReady(createCameraCaptureUri(context))
 }
 
@@ -432,6 +449,8 @@ private fun ConversationScreen(
     reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
     reachabilityStatusText: String = ContactReachability.chatHeaderCopy(ReachabilityLevel.OFFLINE, null, 0L),
     reachabilityDetailsText: String = reachabilityStatusText,
+    isMuted: Boolean = false,
+    onMutedChange: (Boolean) -> Unit = {},
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
@@ -586,6 +605,11 @@ private fun ConversationScreen(
                             toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
                         },
                         onPhotoClick = { viewerPhoto = it },
+                        outboundExpiryMs = if (isOwn) store?.outboundMessageExpiry(
+                            message.chatId,
+                            message.senderUserId,
+                            message.lamport,
+                        ) else null,
                         onLongPress = { target, bounds -> openOverlay(target, bounds) },
                     )
                 }
@@ -622,6 +646,8 @@ private fun ConversationScreen(
         ContactDetailsSheet(
             contact = contact,
             connectivityText = reachabilityDetailsText,
+            isMuted = isMuted,
+            onMutedChange = onMutedChange,
             avatarBytes = contactAvatar,
             onDeleteContact = {
                 showContactDetails = false
@@ -634,8 +660,8 @@ private fun ConversationScreen(
     if (confirmDelete) {
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete $displayName?") },
-            text = { Text("This removes the contact and deletes your chat history with them.") },
+            title = { Text(stringResource(R.string.ui_delete_named, displayName)) },
+            text = { Text(stringResource(R.string.ui_this_removes_the_contact_and_deletes_your_chat)) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -643,12 +669,12 @@ private fun ConversationScreen(
                         onDeleteContact()
                     },
                 ) {
-                    Text("Delete")
+                    Text(stringResource(R.string.ui_delete))
                 }
             },
             dismissButton = {
                 TextButton(onClick = { confirmDelete = false }) {
-                    Text("Cancel")
+                    Text(stringResource(R.string.ui_cancel))
                 }
             },
         )
@@ -726,13 +752,20 @@ private fun ConversationScreen(
         } else {
             arrivalFor(currentInfoMessage)
         }
-        AlertDialog(
-            onDismissRequest = { infoMessage = null },
-            title = { Text("Message info") },
-            text = { Text(messageInfoText(currentInfoMessage, infoIsOwn, infoTick, infoArrival)) },
-            confirmButton = {
-                TextButton(onClick = { infoMessage = null }) { Text("OK") }
-            },
+        MessageInfoBottomSheet(
+            onDismiss = { infoMessage = null },
+            text = messageInfoText(
+                    currentInfoMessage,
+                    infoIsOwn,
+                    infoTick,
+                    infoArrival,
+                    outboundExpiryMs = if (infoIsOwn) store?.outboundMessageExpiry(
+                        currentInfoMessage.chatId,
+                        currentInfoMessage.senderUserId,
+                        currentInfoMessage.lamport,
+                    ) else null,
+                    nowMs = System.currentTimeMillis(),
+                ),
         )
     }
 
@@ -751,7 +784,7 @@ private fun ConversationScreen(
  * rides along with the image in a single attachment.
  */
 @Composable
-private fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
+internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
     val bitmap = remember(bytes) {
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
     }
@@ -792,8 +825,7 @@ private fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
             }
         }
         Spacer(modifier = Modifier.width(12.dp))
-        Text(
-            text = "Photo ready — add a caption or send",
+        Text(text = stringResource(R.string.ui_photo_ready_add_a_caption_or_send),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -812,7 +844,7 @@ private fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
  * through [onStartVoice] / [onStopVoice] / [onCancelVoice].
  */
 @Composable
-private fun MessageComposer(
+internal fun MessageComposer(
     draft: String,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
@@ -825,6 +857,7 @@ private fun MessageComposer(
     onCancelVoice: () -> Unit,
 ) {
     val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
     val onBubbleColor = MaterialTheme.colorScheme.onPrimary
     var recording by remember { mutableStateOf(false) }
     var elapsedMs by remember { mutableLongStateOf(0L) }
@@ -883,10 +916,9 @@ private fun MessageComposer(
                         .background(Color(0xFFE53935)),
                 )
                 Spacer(modifier = Modifier.width(10.dp))
-                Text("Recording… ${formatDurationMs(elapsedMs.toInt())}")
+                Text(stringResource(R.string.ui_recording_duration, formatDurationMs(elapsedMs.toInt())))
                 Spacer(modifier = Modifier.weight(1f))
-                Text(
-                    text = "release to send",
+                Text(text = stringResource(R.string.ui_release_to_send),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -895,7 +927,9 @@ private fun MessageComposer(
             TextField(
                 value = draft,
                 onValueChange = onDraftChange,
-                placeholder = { Text(if (hasPendingAttachment) "Add a caption…" else "Message") },
+                placeholder = {
+                    Text(stringResource(if (hasPendingAttachment) R.string.ui_add_a_caption else R.string.ui_message))
+                },
                 trailingIcon = {
                     IconButton(onClick = onPickCamera) {
                         Icon(ComposerCameraIcon, contentDescription = "Take photo")
@@ -922,7 +956,10 @@ private fun MessageComposer(
                     .size(48.dp)
                     .clip(CircleShape)
                     .background(ownBubbleColor)
-                    .clickable(onClick = onSend)
+                    .clickable {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onSend()
+                    }
                     .semantics { contentDescription = "Send" },
                 contentAlignment = Alignment.Center,
             ) {
@@ -1062,8 +1099,7 @@ private fun GapIndicator() {
             .padding(bottom = 8.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(
-            text = "Some messages are still making their way across the ship",
+        Text(text = stringResource(R.string.ui_some_messages_are_still_making_their_way_across),
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
         )
@@ -1090,6 +1126,7 @@ private fun MessageBubble(
     reactions: List<ReactionSummary> = emptyList(),
     onReact: (String) -> Unit = {},
     onPhotoClick: (ByteArray) -> Unit = {},
+    outboundExpiryMs: Long? = null,
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
 ) {
     var showLegend by remember { mutableStateOf(false) }
@@ -1140,20 +1177,31 @@ private fun MessageBubble(
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                 )
             }
+            if (isOwn && tick == TickStatus.SENT && outboundExpiryMs != null &&
+                outboundExpiryMs <= System.currentTimeMillis()
+            ) {
+                Text(text = stringResource(R.string.ui_not_delivered),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 12.dp),
+                )
+            }
         }
     }
 
     if (showLegend && tick != null) {
-        AlertDialog(
-            onDismissRequest = { showLegend = false },
-            title = { Text("Message status") },
-            text = {
-                Text(tickLegendText(tick))
-            },
-            confirmButton = {
-                TextButton(onClick = { showLegend = false }) { Text("OK") }
-            }
-        )
+        LaunchedEffect(showLegend) {
+            delay(2_500)
+            showLegend = false
+        }
+        Surface(
+            color = MaterialTheme.colorScheme.inverseSurface,
+            contentColor = MaterialTheme.colorScheme.inverseOnSurface,
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.padding(horizontal = 16.dp),
+        ) {
+            Text(tickLegendText(tick), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(10.dp))
+        }
     }
 }
 
@@ -1209,7 +1257,7 @@ fun MessageBubbleVisual(
                             AttachmentPayload.decode(message.payload)
                         }
                         if (attachment == null) {
-                            Text("Unsupported attachment")
+                            Text(stringResource(R.string.ui_unsupported_attachment))
                         } else {
                             AttachmentBubbleContent(attachment = attachment, contentColor = contentColor)
                         }
@@ -1284,8 +1332,9 @@ fun ReactionRow(
                 },
                 modifier = Modifier.clickable { onReact(reaction.emoji) },
             ) {
+                val reactionLabel = if (reaction.count > 1) "${reaction.emoji} ${reaction.count}" else reaction.emoji
                 Text(
-                    text = if (reaction.count > 1) "${reaction.emoji} ${reaction.count}" else reaction.emoji,
+                    text = reactionLabel,
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
@@ -1312,18 +1361,59 @@ fun messageInfoText(
     isOwn: Boolean,
     tick: TickStatus?,
     arrival: MessageArrival? = null,
+    outboundExpiryMs: Long? = null,
+    nowMs: Long = System.currentTimeMillis(),
 ): String {
     val sentAt = java.text.SimpleDateFormat(
         "MMMM d, yyyy h:mm a",
         java.util.Locale.getDefault(),
     ).format(java.util.Date(message.timestamp))
     val direction = if (isOwn) "Sent by you" else "Received"
-    val status = tick?.let { "\nStatus: ${tickLegendText(it)}" }.orEmpty()
+    val status = when {
+        isOwn && tick == TickStatus.SENT && outboundExpiryMs != null && outboundExpiryMs <= nowMs ->
+            "\nStatus: Not delivered — expired"
+        isOwn && tick == TickStatus.SENT && outboundExpiryMs != null ->
+            "\nStatus: Still trying — expires in ${expiryRemainingText(outboundExpiryMs - nowMs)}"
+        else -> tick?.let { "\nStatus: ${tickLegendText(it)}" }.orEmpty()
+    }
     val arrivalLine = arrival?.let {
         if (isOwn) "\n${messageDeliveryConfirmationText(it)}"
         else "\n${messageArrivalText(it)}"
     }.orEmpty()
     return "$direction\nTime: $sentAt$status$arrivalLine"
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun MessageInfoBottomSheet(text: String, onDismiss: () -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(stringResource(R.string.ui_message_info), style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.ui_done)) }
+            }
+            text.lineSequence().forEach { line ->
+                val parts = line.split(":", limit = 2)
+                if (parts.size == 2) {
+                    Text(parts[0], style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 12.dp))
+                    Text(parts[1].trim(), style = MaterialTheme.typography.bodyLarge)
+                } else {
+                    Text(line, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(top = 12.dp))
+                }
+            }
+        }
+    }
+}
+
+private fun expiryRemainingText(remainingMs: Long): String {
+    val minutes = (remainingMs.coerceAtLeast(0L) + 59_999L) / 60_000L
+    return when {
+        minutes >= 2 * 24 * 60 -> "${(minutes + 1_439) / 1_440} days"
+        minutes >= 24 * 60 -> "1 day"
+        minutes >= 120 -> "${(minutes + 59) / 60} hours"
+        minutes >= 60 -> "1 hour"
+        else -> "$minutes minutes"
+    }
 }
 
 private fun messageRouteText(arrival: MessageArrival): String =
@@ -1358,7 +1448,7 @@ private fun messageDeliveryConfirmationText(arrival: MessageArrival): String {
 }
 
 @Composable
-private fun AttachmentBubbleContent(
+internal fun AttachmentBubbleContent(
     attachment: AttachmentPayload,
     contentColor: Color,
 ) {
@@ -1402,7 +1492,7 @@ private fun ChatImageAttachment(jpeg: ByteArray) {
     val imageBitmap = remember(decoded) { decoded?.asImageBitmap() }
 
     if (decoded == null || imageBitmap == null) {
-        Text("Photo (could not display)")
+        Text(stringResource(R.string.ui_photo_could_not_display))
         return
     }
 
@@ -1485,7 +1575,7 @@ private fun VoiceMemoPlayer(
             )
         }
         Text(
-            text = "Voice memo · ${formatDurationMs(durationMs)}",
+            text = stringResource(R.string.ui_voice_memo_duration, formatDurationMs(durationMs)),
             style = MaterialTheme.typography.bodyMedium,
         )
     }

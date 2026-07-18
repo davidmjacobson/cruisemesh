@@ -1,6 +1,12 @@
 package com.cruisemesh.app.chat
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -23,6 +29,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -32,11 +39,13 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -55,7 +64,13 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.media.KIND_GROUP_INVITE
+import com.cruisemesh.app.media.AttachmentPayload
+import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
+import com.cruisemesh.app.media.MediaCompressor
+import com.cruisemesh.app.media.VoiceRecorder
 import com.cruisemesh.app.media.isVisibleChatKind
+import com.cruisemesh.app.notify.ChatMuteStore
+import com.cruisemesh.app.mesh.ReachabilityLevel
 import com.cruisemesh.app.ui.AvatarBadge
 import com.cruisemesh.app.ui.BubbleGrouping
 import com.cruisemesh.app.ui.ChatListLogic
@@ -68,6 +83,10 @@ import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
 import kotlinx.coroutines.launch
+import androidx.core.content.ContextCompat
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.res.pluralStringResource
+import com.cruisemesh.app.R
 
 /**
  * Group chat thread (DESIGN.md §6.5). Local `chat_id` is the group id.
@@ -83,23 +102,35 @@ fun GroupChatScreen(
     onBack: () -> Unit,
     onDeleteGroup: () -> Unit,
     reachableMemberCount: Int? = null,
+    memberReachabilityByUserId: Map<String, ReachabilityLevel> = emptyMap(),
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     val density = LocalDensity.current
     val keyboardFreeze = rememberOverlayKeyboardFreeze()
+    var currentGroup by remember(group.id) { mutableStateOf(group) }
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
-    var draft by remember { mutableStateOf("") }
+    var draft by remember(group.id) { mutableStateOf(DraftStore.load(context, group.id)) }
+    var pendingPhoto by remember { mutableStateOf<ByteArray?>(null) }
+    var isMuted by remember(group.id) { mutableStateOf(ChatMuteStore.isMuted(context, group.id)) }
+    var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
     var showDetails by remember { mutableStateOf(false) }
+    var showRename by remember { mutableStateOf(false) }
+    var renameDraft by remember(group.id) { mutableStateOf(group.name) }
+    var showAddMembers by remember { mutableStateOf(false) }
+    var selectedAddMemberIds by remember { mutableStateOf(setOf<String>()) }
+    var groupActionError by remember { mutableStateOf<String?>(null) }
     var confirmDelete by remember { mutableStateOf(false) }
     var focused by remember(group.id) { mutableStateOf<FocusedMessage?>(null) }
     var infoMessage by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
     var replyingTo by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
+    val voiceRecorder = remember { VoiceRecorder(context) }
 
     fun reload() {
-        messages = store.messagesForChat(group.id)
+        messages = store.messagesForChat(currentGroup.id)
+        store.getGroup(currentGroup.id)?.let { currentGroup = it }
     }
 
     fun showSendFailure() {
@@ -107,6 +138,83 @@ fun GroupChatScreen(
             snackbarHostState.showSnackbar("Couldn't send. Your message is still here.")
         }
     }
+
+    fun stagePhoto(jpeg: ByteArray?) {
+        if (jpeg == null) {
+            Toast.makeText(context, "Could not prepare photo (too large or unreadable)", Toast.LENGTH_SHORT).show()
+        } else {
+            pendingPhoto = jpeg
+        }
+    }
+
+    fun sendVoiceFile(file: java.io.File, durationMs: Int) {
+        val bytes = try { file.readBytes() } catch (_: Exception) { null }
+        file.delete()
+        if (bytes == null || bytes.isEmpty()) {
+            Toast.makeText(context, "Could not save voice memo", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (bytes.size > AttachmentPayload.MAX_BLOB_BYTES) {
+            Toast.makeText(context, "Voice memo is too large to send over the mesh", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val replyId = replyingTo?.let {
+            store.messageReference(it.chatId, it.senderUserId, it.lamport)?.msgId
+        }
+        if (sender.sendAttachment(
+                currentGroup,
+                AttachmentPayload(
+                    mediaType = AttachmentPayload.MediaType.AUDIO,
+                    mimeType = "audio/mp4",
+                    durationMs = durationMs.coerceAtMost(MAX_VOICE_MS),
+                    blob = bytes,
+                ),
+                replyId,
+            ) == SendResult.STORED
+        ) {
+            replyingTo = null
+            reload()
+        } else {
+            showSendFailure()
+        }
+    }
+
+    val galleryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri -> if (uri != null) stagePhoto(MediaCompressor.compressImageUri(context, uri)) }
+
+    val cameraLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicture(),
+    ) { success ->
+        val uri = pendingCameraUri
+        pendingCameraUri = null
+        if (success && uri != null) stagePhoto(MediaCompressor.compressImageUri(context, uri))
+    }
+
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            launchCamera(context) { uri ->
+                pendingCameraUri = uri
+                cameraLauncher.launch(uri)
+            }
+        } else {
+            Toast.makeText(context, "Camera permission is required to take photos", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        Toast.makeText(
+            context,
+            if (granted) "Microphone ready — hold the mic to record" else "Microphone permission is required for voice memos",
+            Toast.LENGTH_SHORT,
+        ).show()
+    }
+
+    DisposableEffect(Unit) { onDispose { voiceRecorder.cancel() } }
 
     fun senderName(userId: ByteArray): String {
         if (userId.contentEquals(ownUserId)) return "You"
@@ -121,6 +229,10 @@ fun GroupChatScreen(
                 reload()
             }
         }
+    }
+
+    LaunchedEffect(draft) {
+        DraftStore.save(context, group.id, draft)
     }
 
     val listState = rememberLazyListState()
@@ -145,7 +257,7 @@ fun GroupChatScreen(
 
     fun toggleReaction(target: MessageTarget, emoji: String) {
         val existingOwn = reactions[target.stableKey].orEmpty().firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
-        sender.sendReaction(group, target, if (existingOwn != null) "" else emoji)
+        sender.sendReaction(currentGroup, target, if (existingOwn != null) "" else emoji)
         reload()
     }
 
@@ -188,8 +300,8 @@ fun GroupChatScreen(
     Scaffold(
         topBar = {
             GroupConversationTopBar(
-                group = group,
-                memberCount = group.memberUserIds.size,
+                group = currentGroup,
+                memberCount = currentGroup.memberUserIds.size,
                 reachableMemberCount = reachableMemberCount,
                 onBack = onBack,
                 onOpenDetails = { showDetails = true },
@@ -234,7 +346,7 @@ fun GroupChatScreen(
                         } else {
                             null
                         },
-                        groupName = group.name,
+                        groupName = currentGroup.name,
                         grouping = grouping[index],
                         quoted = replyMetadata[messageStableKey(message)]?.quoted,
                         onQuotedClick = { target -> scrollToMessage(target) },
@@ -255,60 +367,157 @@ fun GroupChatScreen(
                 )
             }
 
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 16.dp),
-            ) {
-                OutlinedTextField(
-                    value = draft,
-                    onValueChange = { draft = it },
-                    placeholder = { Text("Message") },
-                    modifier = Modifier.weight(1f),
-                )
-                Button(
-                    onClick = {
-                        val text = draft.trim()
-                        if (text.isNotEmpty()) {
-                            val replyToMsgId = replyingTo?.let {
-                                replyMetadata[messageStableKey(it)]?.msgId
-                            }
-                            if (sender.sendText(group, text, replyToMsgId) == SendResult.STORED) {
-                                draft = ""
-                                replyingTo = null
-                                reload()
-                            } else {
-                                showSendFailure()
-                            }
-                        }
-                    },
-                    modifier = Modifier
-                        .padding(start = 8.dp)
-                        .height(56.dp),
-                ) {
-                    Text("Send")
-                }
+            pendingPhoto?.let { photo ->
+                PendingPhotoCard(bytes = photo, onRemove = { pendingPhoto = null })
             }
+            MessageComposer(
+                draft = draft,
+                onDraftChange = { draft = it },
+                onSend = {
+                    val text = draft.trim()
+                    val replyToMsgId = replyingTo?.let { replyMetadata[messageStableKey(it)]?.msgId }
+                    val photo = pendingPhoto
+                    val result = if (photo != null) {
+                        sender.sendAttachment(
+                            currentGroup,
+                            AttachmentPayload(
+                                mediaType = AttachmentPayload.MediaType.IMAGE,
+                                mimeType = "image/jpeg",
+                                durationMs = 0,
+                                blob = photo,
+                                caption = text,
+                            ),
+                            replyToMsgId,
+                        )
+                    } else if (text.isNotEmpty()) {
+                        sender.sendText(currentGroup, text, replyToMsgId)
+                    } else {
+                        SendResult.FAILED
+                    }
+                    if (result == SendResult.STORED) {
+                        pendingPhoto = null
+                        draft = ""
+                        replyingTo = null
+                        reload()
+                    } else {
+                        showSendFailure()
+                    }
+                },
+                hasPendingAttachment = pendingPhoto != null,
+                ownBubbleColor = MaterialTheme.colorScheme.primary,
+                onPickGallery = {
+                    galleryLauncher.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                    )
+                },
+                onPickCamera = {
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        launchCamera(context) { uri ->
+                            pendingCameraUri = uri
+                            cameraLauncher.launch(uri)
+                        }
+                    } else {
+                        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                    }
+                },
+                onStartVoice = {
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        false
+                    } else {
+                        voiceRecorder.start()
+                    }
+                },
+                onStopVoice = {
+                    voiceRecorder.stop()?.let { (file, durationMs) -> sendVoiceFile(file, durationMs) }
+                },
+                onCancelVoice = { voiceRecorder.cancel() },
+            )
         }
     }
 
     if (showDetails) {
         AlertDialog(
             onDismissRequest = { showDetails = false },
-            title = { Text(group.name) },
+            title = { Text(currentGroup.name) },
             text = {
                 Column {
                     Text(
-                        "${group.memberUserIds.size} members",
+                        pluralStringResource(
+                            R.plurals.ui_member_count,
+                            currentGroup.memberUserIds.size,
+                            currentGroup.memberUserIds.size,
+                        ),
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.padding(bottom = 8.dp),
                     )
-                    for (memberId in group.memberUserIds) {
-                        Text(
-                            "• ${senderName(memberId)}",
-                            style = MaterialTheme.typography.bodySmall,
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(stringResource(R.string.ui_mute_notifications), modifier = Modifier.weight(1f))
+                        Switch(
+                            checked = isMuted,
+                            onCheckedChange = {
+                                isMuted = it
+                                ChatMuteStore.setMuted(context, currentGroup.id, it)
+                                ChatEvents.notifyChatChanged(currentGroup.id)
+                            },
                         )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        TextButton(
+                            onClick = {
+                                renameDraft = currentGroup.name
+                                groupActionError = null
+                                showDetails = false
+                                showRename = true
+                            },
+                        ) { Text(stringResource(R.string.ui_rename)) }
+                        TextButton(
+                            onClick = {
+                                selectedAddMemberIds = emptySet()
+                                groupActionError = null
+                                showDetails = false
+                                showAddMembers = true
+                            },
+                            enabled = contactsByUserId.values.any { contact ->
+                                currentGroup.memberUserIds.none { it.contentEquals(contact.userId) }
+                            },
+                        ) { Text(stringResource(R.string.ui_add_members)) }
+                    }
+                    for (memberId in currentGroup.memberUserIds) {
+                        val memberKey = UserIdHex.encode(memberId)
+                        val memberName = if (memberId.contentEquals(ownUserId)) {
+                            "You"
+                        } else {
+                            senderName(memberId)
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            AvatarBadge(
+                                userId = memberId,
+                                name = memberName,
+                                displayId = memberKey,
+                                size = 36.dp,
+                                reachability = if (memberId.contentEquals(ownUserId)) {
+                                    null
+                                } else {
+                                    memberReachabilityByUserId[memberKey]
+                                },
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(memberName, style = MaterialTheme.typography.bodyMedium)
+                        }
                     }
                 }
             },
@@ -318,10 +527,128 @@ fun GroupChatScreen(
                         showDetails = false
                         confirmDelete = true
                     },
-                ) { Text("Leave / delete") }
+                ) { Text(stringResource(R.string.ui_leave_delete)) }
             },
             dismissButton = {
-                TextButton(onClick = { showDetails = false }) { Text("Close") }
+                TextButton(onClick = { showDetails = false }) { Text(stringResource(R.string.ui_close)) }
+            },
+        )
+    }
+
+    if (showRename) {
+        AlertDialog(
+            onDismissRequest = { showRename = false },
+            title = { Text(stringResource(R.string.ui_rename_group)) },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = renameDraft,
+                        onValueChange = { renameDraft = it },
+                        label = { Text(stringResource(R.string.ui_group_name)) },
+                        singleLine = true,
+                    )
+                    groupActionError?.let {
+                        Text(
+                            it,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = renameDraft.trim().isNotEmpty() && renameDraft.trim() != currentGroup.name,
+                    onClick = {
+                        val updated = sender.renameGroup(currentGroup, renameDraft)
+                        if (updated == null) {
+                            groupActionError = "Couldn't rename the group. The change was not queued."
+                        } else {
+                            currentGroup = updated
+                            showRename = false
+                            showDetails = true
+                        }
+                    },
+                ) { Text(stringResource(R.string.ui_rename)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRename = false }) { Text(stringResource(R.string.ui_cancel)) }
+            },
+        )
+    }
+
+    if (showAddMembers) {
+        val availableContacts = contactsByUserId.values
+            .filter { contact -> currentGroup.memberUserIds.none { it.contentEquals(contact.userId) } }
+            .sortedBy { it.name.lowercase() }
+        AlertDialog(
+            onDismissRequest = { showAddMembers = false },
+            title = { Text(stringResource(R.string.ui_add_members)) },
+            text = {
+                Column {
+                    if (availableContacts.isEmpty()) {
+                        Text(stringResource(R.string.ui_all_of_your_contacts_are_already_in_this))
+                    } else {
+                        for (contact in availableContacts) {
+                            val key = UserIdHex.encode(contact.userId)
+                            val selected = key in selectedAddMemberIds
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Checkbox(
+                                    checked = selected,
+                                    onCheckedChange = { checked ->
+                                        selectedAddMemberIds = if (checked) {
+                                            selectedAddMemberIds + key
+                                        } else {
+                                            selectedAddMemberIds - key
+                                        }
+                                    },
+                                )
+                                AvatarBadge(
+                                    userId = contact.userId,
+                                    name = contact.name,
+                                    displayId = key,
+                                    size = 36.dp,
+                                    reachability = memberReachabilityByUserId[key],
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(ChatListLogic.displayNameOrId(contact.name, key))
+                            }
+                        }
+                    }
+                    groupActionError?.let {
+                        Text(
+                            it,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = selectedAddMemberIds.isNotEmpty(),
+                    onClick = {
+                        val additions = availableContacts.filter {
+                            UserIdHex.encode(it.userId) in selectedAddMemberIds
+                        }
+                        val updated = sender.addMembers(currentGroup, additions)
+                        if (updated == null) {
+                            groupActionError = "Couldn't add members. No invitations were queued."
+                        } else {
+                            currentGroup = updated
+                            showAddMembers = false
+                            showDetails = true
+                        }
+                    },
+                ) { Text(stringResource(R.string.ui_add_count, selectedAddMemberIds.size)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddMembers = false }) { Text(stringResource(R.string.ui_cancel)) }
             },
         )
     }
@@ -329,9 +656,9 @@ fun GroupChatScreen(
     if (confirmDelete) {
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete ${group.name}?") },
+            title = { Text(stringResource(R.string.ui_delete_named, currentGroup.name)) },
             text = {
-                Text("Removes this group and its message history from this device. Other members keep their copy.")
+                Text(stringResource(R.string.ui_removes_this_group_and_its_message_history_from))
             },
             confirmButton = {
                 TextButton(
@@ -339,10 +666,10 @@ fun GroupChatScreen(
                         confirmDelete = false
                         onDeleteGroup()
                     },
-                ) { Text("Delete") }
+                ) { Text(stringResource(R.string.ui_delete)) }
             },
             dismissButton = {
-                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+                TextButton(onClick = { confirmDelete = false }) { Text(stringResource(R.string.ui_cancel)) }
             },
         )
     }
@@ -422,13 +749,20 @@ fun GroupChatScreen(
                 currentInfoMessage.lamport,
             )
         }
-        AlertDialog(
-            onDismissRequest = { infoMessage = null },
-            title = { Text("Message info") },
-            text = { Text(messageInfoText(currentInfoMessage, infoIsOwn, null, infoArrival)) },
-            confirmButton = {
-                TextButton(onClick = { infoMessage = null }) { Text("OK") }
-            },
+        MessageInfoBottomSheet(
+            onDismiss = { infoMessage = null },
+            text = messageInfoText(
+                currentInfoMessage,
+                infoIsOwn,
+                null,
+                infoArrival,
+                outboundExpiryMs = if (infoIsOwn) store.outboundMessageExpiry(
+                    currentInfoMessage.chatId,
+                    currentInfoMessage.senderUserId,
+                    currentInfoMessage.lamport,
+                ) else null,
+                nowMs = System.currentTimeMillis(),
+            ),
         )
     }
 }
@@ -487,7 +821,7 @@ private fun GroupConversationTopBar(
             }
         },
         actions = {
-            TextButton(onClick = onOpenDetails) { Text("Info") }
+            TextButton(onClick = onOpenDetails) { Text(stringResource(R.string.ui_info)) }
         },
     )
 }
@@ -611,10 +945,21 @@ fun GroupMessageBubbleVisual(
                         modifier = Modifier.padding(bottom = 8.dp),
                     )
                 }
-                Text(
-                    text = String(message.payload, Charsets.UTF_8),
-                    style = MaterialTheme.typography.bodyLarge,
-                )
+                if (message.kind == KIND_ATTACHMENT_MANIFEST) {
+                    val attachment = remember(message.payload) {
+                        AttachmentPayload.decode(message.payload)
+                    }
+                    if (attachment == null) {
+                        Text(stringResource(R.string.ui_unsupported_attachment))
+                    } else {
+                        AttachmentBubbleContent(attachment, contentColor)
+                    }
+                } else {
+                    Text(
+                        text = String(message.payload, Charsets.UTF_8),
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                }
                 if (showTimestamp) {
                     Text(
                         text = formatConversationTimestamp(message.timestamp),

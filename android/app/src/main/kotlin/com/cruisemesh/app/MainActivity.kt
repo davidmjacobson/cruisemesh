@@ -46,6 +46,7 @@ import androidx.navigation.navArgument
 import com.cruisemesh.app.chat.ChatScreen
 import com.cruisemesh.app.chat.GroupChatScreen
 import com.cruisemesh.app.chat.GroupSender
+import com.cruisemesh.app.chat.DraftStore
 import com.cruisemesh.app.chat.RealMeshSender
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
@@ -85,6 +86,7 @@ import com.cruisemesh.app.mesh.parseLanEndpointLink
 import com.cruisemesh.app.mesh.parseLanManualEndpoint
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.MessageNotifier
+import com.cruisemesh.app.notify.ChatMuteStore
 import com.cruisemesh.app.relay.RelayImport
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.ui.ChatListLogic
@@ -98,6 +100,7 @@ import com.cruisemesh.app.ui.MeshStatusTextLogic
 import com.cruisemesh.app.ui.NewGroupScreen
 import com.cruisemesh.app.ui.OnboardingScreen
 import com.cruisemesh.app.ui.ProfileScreen
+import com.cruisemesh.app.ui.AdvancedSettingsScreen
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.fingerprintWords
@@ -108,6 +111,8 @@ import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.parseFriendText
 import uniffi.cruisemesh_core.lanDefaultTcpPort
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
@@ -206,6 +211,9 @@ fun CruiseMeshApp(
         }
         composable("home") { HomeRoute(identity, navController) }
         composable("profile") { ProfileRoute(identity, navController) }
+        composable("advancedSettings") {
+            AdvancedSettingsScreen(onBack = { navController.popBackStack() })
+        }
         composable("backup") { BackupExportScreen(onBack = { navController.popBackStack() }) }
         composable("restore") { BackupRestoreScreen(onBack = { navController.popBackStack() }) }
         composable("myQr") {
@@ -647,6 +655,8 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 ownDeliveredThrough = deliveredThrough,
                 ownReadThrough = readThrough,
                 avatarBytes = store.contactAvatar(c.userId),
+                draft = DraftStore.load(context, c.userId),
+                isMuted = ChatMuteStore.isMuted(context, c.userId),
             )
         }
         val groups = store.listGroups().map { g ->
@@ -661,6 +671,8 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 unreadCount = unreadCount,
                 ownDeliveredThrough = 0uL,
                 ownReadThrough = 0uL,
+                draft = DraftStore.load(context, g.id),
+                isMuted = ChatMuteStore.isMuted(context, g.id),
             )
         }
         summaries = (direct + groups).sortedByDescending { it.lastMessage?.timestamp ?: 0L }
@@ -729,6 +741,21 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 store.deleteContact(summary.chatId)
                 FriendDirectorySender.queueToAllContacts(context, store, identity)
             }
+            reloadSummaries()
+        },
+        onMarkRead = { summary ->
+            val senderIds = if (summary.isGroup) {
+                summary.group?.memberUserIds.orEmpty().filterNot { it.contentEquals(identity.userId) }
+            } else {
+                listOf(summary.chatId)
+            }
+            for (senderId in senderIds) {
+                val through = store.highestLamport(summary.chatId, senderId)
+                if (through > 0uL) {
+                    store.recordOutgoingReceipt(summary.chatId, senderId, RECEIPT_TYPE_READ, through)
+                }
+            }
+            MessageNotifier.cancel(context, summary.chatId)
             reloadSummaries()
         },
         onNewChatClick = { navController.navigate("contacts") },
@@ -844,6 +871,7 @@ private fun ProfileRoute(identity: Identity, navController: NavHostController) {
         } else null,
         onShowMyQr = { navController.navigate("myQr") },
         onBackUp = { navController.navigate("backup") },
+        onAdvanced = { navController.navigate("advancedSettings") },
         onProfileChanged = { epoch ->
             ProfileSyncSender.queueToAllContacts(context, store, identity, epoch)
         },
@@ -912,9 +940,9 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
                 verticalArrangement = Arrangement.Center,
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Text("Camera permission is needed to scan a friend card.")
+                Text(stringResource(R.string.ui_camera_permission_is_needed_to_scan_a_friend))
                 Button(onClick = { navController.popBackStack() }, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Back")
+                    Text(stringResource(R.string.ui_back))
                 }
             }
         }
@@ -1223,6 +1251,25 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
         val reachableMemberCount = remember(group, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs) {
             groupReachableCounts(group, identity.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs).first
         }
+        val memberReachabilityByUserId = remember(
+            contactsByUserId,
+            nearbyPeerIds,
+            relayHealth,
+            contactLastSeen,
+            presenceLastSeen,
+            connectivityNowMs,
+        ) {
+            contactsByUserId.values.associate { contact ->
+                UserIdHex.encode(contact.userId) to reachabilityLevelForUserId(
+                    contact.userId,
+                    nearbyPeerIds,
+                    relayHealth,
+                    contactLastSeen,
+                    presenceLastSeen,
+                    connectivityNowMs,
+                )
+            }
+        }
         GroupChatScreen(
             group = group,
             ownUserId = identity.userId,
@@ -1235,6 +1282,7 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
                 navController.popBackStack()
             },
             reachableMemberCount = reachableMemberCount,
+            memberReachabilityByUserId = memberReachabilityByUserId,
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }

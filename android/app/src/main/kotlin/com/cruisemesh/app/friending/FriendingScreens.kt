@@ -86,6 +86,9 @@ import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.makeFriendCard
 import uniffi.cruisemesh_core.makeFriendLink
 import uniffi.cruisemesh_core.parseFriendText
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.res.pluralStringResource
+import com.cruisemesh.app.R
 
 /** Shows this device's own FriendCard (DESIGN.md §6.2) as a QR code to be scanned by a peer. */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -131,7 +134,7 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("My friend card") },
+                title = { Text(stringResource(R.string.ui_my_friend_card)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -149,8 +152,7 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text(
-                "Let a friend scan this code to add you.",
+            Text(stringResource(R.string.ui_let_a_friend_scan_this_code_to_add),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -179,13 +181,18 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                     name = it
                     ProfileStore.saveDisplayName(context, it)
                 },
-                label = { Text("Your name") },
+                label = { Text(stringResource(R.string.ui_your_name)) },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
 
             TextButton(onClick = { showAdvanced = !showAdvanced }) {
-                Text(if (showAdvanced) "Hide advanced relay settings" else "Advanced relay settings")
+                Text(
+                    stringResource(
+                        if (showAdvanced) R.string.ui_hide_advanced_relay_settings
+                        else R.string.ui_advanced_relay_settings,
+                    ),
+                )
             }
             if (showAdvanced) {
                 OutlinedTextField(
@@ -194,7 +201,7 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                         relayUrl = it
                         RelayConfigStore.save(context, relayUrl = it, relayToken = relayToken)
                     },
-                    label = { Text("Relay URL (optional)") },
+                    label = { Text(stringResource(R.string.ui_relay_url_optional)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -204,7 +211,7 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                         relayToken = it
                         RelayConfigStore.save(context, relayUrl = relayUrl, relayToken = it)
                     },
-                    label = { Text("Relay token (optional)") },
+                    label = { Text(stringResource(R.string.ui_relay_token_optional)) },
                     visualTransformation = PasswordVisualTransformation(),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
@@ -225,7 +232,7 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                     },
                     modifier = Modifier.weight(1f),
                 ) {
-                    Text("Share card")
+                    Text(stringResource(R.string.ui_share_card))
                 }
                 TextButton(
                     onClick = {
@@ -234,7 +241,7 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                         Toast.makeText(context, "Copied friend card link", Toast.LENGTH_SHORT).show()
                     },
                 ) {
-                    Text("Copy")
+                    Text(stringResource(R.string.ui_copy))
                 }
             }
         }
@@ -366,7 +373,7 @@ fun ScanScreen(
                 )
             }
             if (currentAdded == null) {
-                Button(onClick = onBack, modifier = Modifier.padding(top = 16.dp)) { Text("Cancel") }
+                Button(onClick = onBack, modifier = Modifier.padding(top = 16.dp)) { Text(stringResource(R.string.ui_cancel)) }
             }
         }
     }
@@ -482,7 +489,7 @@ fun AddFriendScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Add a friend") },
+                title = { Text(stringResource(R.string.ui_add_a_friend)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -499,16 +506,14 @@ fun AddFriendScreen(
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text("Friends of friends", style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.ui_friends_of_friends), style = MaterialTheme.typography.titleMedium)
             if (!FriendsOfFriendsStore.isEnabled(context)) {
-                Text(
-                    "Friends-of-friends introductions are off in Profile & settings.",
+                Text(stringResource(R.string.ui_friends_of_friends_introductions_are_off_in_profile),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else if (groupedSuggestions.isEmpty()) {
-                Text(
-                    "Suggestions appear after your friends' phones sync.",
+                Text(stringResource(R.string.ui_suggestions_appear_after_your_friends_phones_sync),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -516,7 +521,7 @@ fun AddFriendScreen(
                 val available = groupedSuggestions.values.map { it.first() }.filter { it.state == 0.toUByte() }
                 if (available.size > 1) {
                     TextButton(onClick = { confirmAddAll = true }, modifier = Modifier.align(Alignment.End)) {
-                        Text("Add all (${available.size})")
+                        Text(stringResource(R.string.ui_add_all_count, available.size))
                     }
                 }
                 groupedSuggestions.values.forEach { sources ->
@@ -534,14 +539,17 @@ fun AddFriendScreen(
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(suggestion.candidate.name, fontWeight = FontWeight.Medium)
                                 Text(
-                                    "Through ${mutualNames.ifEmpty { listOf("a mutual friend") }.joinToString()}",
+                                    stringResource(
+                                        R.string.ui_through_mutual_friends,
+                                        mutualNames.ifEmpty { listOf("a mutual friend") }.joinToString(),
+                                    ),
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                                 TextButton(onClick = {
                                     onHideSuggestion(suggestion)
                                     reloadSuggestions()
-                                }) { Text("Hide") }
+                                }) { Text(stringResource(R.string.ui_hide)) }
                             }
                             Button(
                                 onClick = {
@@ -550,16 +558,20 @@ fun AddFriendScreen(
                                 },
                                 enabled = suggestion.state == 0.toUByte(),
                             ) {
-                                Text(if (suggestion.state == 1.toUByte()) "Requested" else "Add")
+                                Text(
+                                    stringResource(
+                                        if (suggestion.state == 1.toUByte()) R.string.ui_requested else R.string.ui_add,
+                                    ),
+                                )
                             }
                         }
                     }
                 }
             }
 
-            Text("Add directly", style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.ui_add_directly), style = MaterialTheme.typography.titleMedium)
             Button(onClick = onScanClick, modifier = Modifier.fillMaxWidth()) {
-                Text("Scan QR code")
+                Text(stringResource(R.string.ui_scan_qr_code))
             }
             OutlinedTextField(
                 value = pasted,
@@ -567,7 +579,7 @@ fun AddFriendScreen(
                     pasted = it
                     error = null
                 },
-                label = { Text("Friend card") },
+                label = { Text(stringResource(R.string.ui_friend_card)) },
                 minLines = 4,
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -578,7 +590,7 @@ fun AddFriendScreen(
                     error = null
                 },
                 modifier = Modifier.align(Alignment.End),
-            ) { Text("Paste") }
+            ) { Text(stringResource(R.string.ui_paste)) }
             Button(
                 onClick = {
                     when (val result = onImportText(pasted)) {
@@ -592,7 +604,7 @@ fun AddFriendScreen(
                 enabled = pasted.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Preview friend")
+                Text(stringResource(R.string.ui_preview_friend))
             }
             error?.let {
                 Text(it, color = MaterialTheme.colorScheme.error)
@@ -604,17 +616,25 @@ fun AddFriendScreen(
         val available = groupedSuggestions.values.map { it.first() }.filter { it.state == 0.toUByte() }
         AlertDialog(
             onDismissRequest = { confirmAddAll = false },
-            title = { Text("Add ${available.size} friends?") },
-            text = { Text("CruiseMesh will request each connection through the mutual friends shown in the list.") },
+            title = {
+                Text(
+                    pluralStringResource(
+                        R.plurals.ui_add_friends_question,
+                        available.size,
+                        available.size,
+                    ),
+                )
+            },
+            text = { Text(stringResource(R.string.ui_cruisemesh_will_request_each_connection_through_the_mutual)) },
             confirmButton = {
                 TextButton(onClick = {
                     available.forEach { onRequestSuggestion(it) }
                     confirmAddAll = false
                     reloadSuggestions()
-                }) { Text("Add all") }
+                }) { Text(stringResource(R.string.ui_add_all)) }
             },
             dismissButton = {
-                TextButton(onClick = { confirmAddAll = false }) { Text("Cancel") }
+                TextButton(onClick = { confirmAddAll = false }) { Text(stringResource(R.string.ui_cancel)) }
             },
         )
     }
@@ -675,7 +695,7 @@ fun ContactsScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("New chat") },
+                title = { Text(stringResource(R.string.ui_new_chat)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -704,8 +724,7 @@ fun ContactsScreen(
                             Icon(Icons.Default.Add, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Spacer(modifier = Modifier.width(16.dp))
-                        Text(
-                            text = "Add a friend",
+                        Text(text = stringResource(R.string.ui_add_a_friend),
                             style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium)
                         )
                     }
@@ -734,8 +753,7 @@ fun ContactsScreen(
                             )
                         }
                         Spacer(modifier = Modifier.width(16.dp))
-                        Text(
-                            text = "New group",
+                        Text(text = stringResource(R.string.ui_new_group),
                             style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium)
                         )
                     }
@@ -759,8 +777,7 @@ fun ContactsScreen(
                             Icon(Icons.Default.Person, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Spacer(modifier = Modifier.width(16.dp))
-                        Text(
-                            text = "My friend card",
+                        Text(text = stringResource(R.string.ui_my_friend_card),
                             style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Medium)
                         )
                     }
@@ -768,8 +785,7 @@ fun ContactsScreen(
                 
                 if (contacts.isNotEmpty()) {
                     item {
-                        Text(
-                            "Contacts",
+                        Text(stringResource(R.string.ui_contacts),
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp)
@@ -802,12 +818,36 @@ fun ContactsScreen(
                     }
                 } else {
                     item {
-                        Text(
-                            "No contacts yet",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(16.dp)
-                        )
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 32.dp, vertical = 56.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(64.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.secondaryContainer),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    Icons.Default.Person,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    modifier = Modifier.size(30.dp),
+                                )
+                            }
+                            Text(stringResource(R.string.ui_no_contacts_yet),
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.padding(top = 16.dp),
+                            )
+                            Text(stringResource(R.string.ui_add_a_friend_to_see_them_here),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 6.dp),
+                            )
+                        }
                     }
                 }
             }
@@ -818,8 +858,8 @@ fun ContactsScreen(
     if (toDelete != null) {
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
-            title = { Text("Delete ${toDelete.name}?") },
-            text = { Text("This removes the contact and deletes your chat history with them. It can't be undone.") },
+            title = { Text(stringResource(R.string.ui_delete_named, toDelete.name)) },
+            text = { Text(stringResource(R.string.ui_this_removes_the_contact_and_deletes_your_chat_f3fb0a50)) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -827,12 +867,12 @@ fun ContactsScreen(
                         onContactDelete(toDelete)
                     },
                 ) {
-                    Text("Delete")
+                    Text(stringResource(R.string.ui_delete))
                 }
             },
             dismissButton = {
                 TextButton(onClick = { pendingDelete = null }) {
-                    Text("Cancel")
+                    Text(stringResource(R.string.ui_cancel))
                 }
             },
         )

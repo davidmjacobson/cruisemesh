@@ -18,6 +18,17 @@ final class MeshController: ObservableObject {
     private var identity: Identity!
     private var relayTimer: Timer?
     private var pathMonitor: NWPathMonitor?
+    /// DTN_TODOS.md D3 (iOS half of audit finding F1, "relay poll-only"): opens
+    /// relayd's `GET /ws` push socket (see `RelayPushClient`'s class doc) once
+    /// the mesh is running, an identity/relay config exist, and the network
+    /// path is satisfied, and calls `runRelaySync()` on every pushed frame
+    /// instead of waiting for the next `relayTimer` tick. Never processes
+    /// envelope content itself -- see `RelayPushClient`'s class doc. Mirrors
+    /// Android's `relayPushClient` / `updateRelayPushSubscription`
+    /// (`MeshService.kt`).
+    private lazy var relayPushClient = RelayPushClient { [weak self] in
+        Task { @MainActor in self?.runRelaySync() }
+    }
     private var isRunning = false
     private var meshRolesRunning = false
     private var pausedForBluetoothAudio = false
@@ -107,6 +118,10 @@ final class MeshController: ObservableObject {
                 guard let self, self.isRunning else { return }
                 MeshRouter.onConnected(address: address, transport: .lan)
                 guard MeshRouter.onHello(address: address, userId: userId) else { return }
+                MeshConnectivityStatus.shared.mergeLastSeen(
+                    userId: userId,
+                    seenAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                )
                 let name = (try? self.store.getContact(userId: userId))?.name
                     ?? String(UserIdHex.encode(userId).prefix(8))
                 LanTransportDiagnostics.shared.authenticated(address: address, peerName: name)
@@ -186,10 +201,12 @@ final class MeshController: ObservableObject {
         MeshRouter.unregisterPeripheral()
         MeshRouter.unregisterLan()
         MeshRouter.reset()
+        MeshConnectivityStatus.shared.clear()
         relayTimer?.invalidate()
         relayTimer = nil
         pathMonitor?.cancel()
         pathMonitor = nil
+        relayPushClient.stop()
         relayCancellable?.cancel()
         relayCancellable = nil
         relaySyncPending = false
@@ -468,6 +485,10 @@ final class MeshController: ObservableObject {
             log.warning("Dropping HELLO that conflicts with the authenticated link identity")
             return
         }
+        MeshConnectivityStatus.shared.mergeLastSeen(
+            userId: userId,
+            seenAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
         log.info("HELLO from \(address, privacy: .public) \(UserIdHex.encode(userId), privacy: .public)")
         sendLanEndpointHint(address: address)
         queueCurrentLanEndpoint(to: userId)
@@ -478,8 +499,13 @@ final class MeshController: ObservableObject {
         } else {
             entries = []
         }
-        let carried = (try? store.carriedMsgIds(limit: MeshDefaults.digestCarriedMsgIdsLimit)) ?? []
-        let digest = encodeDigest(chatId: identity.userId, entries: entries, recentMsgIds: carried)
+        // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): the advertised list
+        // now includes not just what we're still carrying for others but
+        // also what we've recently consumed or authored ourselves, so a
+        // mule still holding our envelope learns on this digest that we
+        // already have it -- see `store.coreConfirmCarriedDeliveries`.
+        let advertised = (try? store.coreDigestAdvertisedMsgIds()) ?? []
+        let digest = encodeDigest(chatId: identity.userId, entries: entries, recentMsgIds: advertised)
         MeshRouter.sendToAddress(address: address, frame: digest)
         refreshNearby()
     }
@@ -528,6 +554,23 @@ final class MeshController: ObservableObject {
         )
     }
 
+    /// DTN D4 (seen-set poisoning ordering, mirrors Android
+    /// `MeshService.processInboundEnvelope`'s KDoc): [GossipState.seenIds]
+    /// is checked with the non-mutating `contains`, never `checkAndRecord`,
+    /// and only recorded once this envelope reaches a **terminal handled
+    /// state** -- consumed, carried, or expired-drop -- at each `return`
+    /// below. Invariant: an envelope whose durable handling failed must be
+    /// re-presentable; an envelope that was handled (even by deliberate
+    /// drop) must be deduped. Before this, `checkAndRecord` ran up front, so
+    /// a later store failure (e.g. disk-full out of `carryForeign`)
+    /// permanently poisoned the `msgId` even though it was never actually
+    /// carried or delivered.
+    ///
+    /// Loop-hazard note (see `relayForeign`'s doc comment): recording after
+    /// relaying is safe here because the arriving link is excluded from the
+    /// relay fanout and this function runs synchronously per received frame,
+    /// so this node cannot re-ingest the frame it just relayed before the
+    /// `record` call below completes.
     func processInboundEnvelope(
         sourceAddress: String?,
         msgId: Data,
@@ -540,7 +583,7 @@ final class MeshController: ObservableObject {
         let sourceLabel = sourceAddress ?? "relay"
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         switch coreInboundGate(
-            isNewMsgId: GossipState.seenIds.checkAndRecord(msgId: msgId),
+            isNewMsgId: !GossipState.seenIds.contains(msgId: msgId),
             expiryMs: expiry,
             nowMs: now
         ) {
@@ -548,6 +591,8 @@ final class MeshController: ObservableObject {
             return .seen
         case .expired:
             log.info("Dropping expired envelope from \(sourceLabel, privacy: .public)")
+            // A deliberate drop is still a terminal handled state.
+            GossipState.seenIds.record(msgId: msgId)
             return .expired
         case .dispatch:
             break
@@ -567,6 +612,9 @@ final class MeshController: ObservableObject {
                 msgId: msgId,
                 arrival: arrival
             )
+            // DTN D4: reaching this line means delivery ran to completion --
+            // safe, and required, to record.
+            GossipState.seenIds.record(msgId: msgId)
             return .consumed
         } catch {
             // Pairwise open failed: either foreign 1:1 traffic, or a group
@@ -587,22 +635,43 @@ final class MeshController: ObservableObject {
                         receivedHopTtl: hopTtl
                     )
                 )
-                relayForeign(
-                    sourceAddress: sourceAddress,
-                    msgId: msgId,
-                    hopTtl: hopTtl,
-                    expiry: expiry,
-                    recipientHint: recipientHint,
-                    sealed: sealed
-                )
-                carryForeign(
-                    msgId: msgId,
-                    hopTtl: hopTtl,
-                    expiry: expiry,
-                    recipientHint: recipientHint,
-                    sealed: sealed,
-                    forceFamily: true
-                )
+                // specs/group-relay-durability.md §4.3 no-reinjection rule:
+                // a relay-fetched group message addressed to OUR OWN hint is
+                // a per-member fan-out copy -- the relay fan-out already
+                // reaches every member durably, so re-flooding/carrying it
+                // would give the same content a second flood identity under
+                // the fan-out msgId. Legacy group-hint relay rows and every
+                // BLE/LAN-sourced group frame keep the flood+carry behavior.
+                // Mirrors MeshService.kt.
+                let ownFanoutCopy = sourceAddress == nil &&
+                    coreIsOwnFanoutHint(
+                        recipientHint: recipientHint,
+                        ownUserId: identity.userId,
+                        nowMs: now
+                    )
+                if !ownFanoutCopy {
+                    relayForeign(
+                        sourceAddress: sourceAddress,
+                        msgId: msgId,
+                        hopTtl: hopTtl,
+                        expiry: expiry,
+                        recipientHint: recipientHint,
+                        sealed: sealed
+                    )
+                    _ = carryForeign(
+                        msgId: msgId,
+                        hopTtl: hopTtl,
+                        expiry: expiry,
+                        recipientHint: recipientHint,
+                        sealed: sealed,
+                        forceFamily: true
+                    )
+                }
+                // DTN D4: we already durably delivered our own copy above
+                // (`deliverOpenedGroupEnvelope`), so record regardless of
+                // whether the best-effort mule copy for absent members
+                // succeeded -- same reasoning as Android's KDoc.
+                GossipState.seenIds.record(msgId: msgId)
                 return .consumed
             }
             relayForeign(
@@ -613,7 +682,23 @@ final class MeshController: ObservableObject {
                 recipientHint: recipientHint,
                 sealed: sealed
             )
-            carryForeign(msgId: msgId, hopTtl: hopTtl, expiry: expiry, recipientHint: recipientHint, sealed: sealed)
+            let carried = carryForeign(
+                msgId: msgId,
+                hopTtl: hopTtl,
+                expiry: expiry,
+                recipientHint: recipientHint,
+                sealed: sealed
+            )
+            // DTN D4: only record once the durable carry actually succeeded.
+            // `carryForeign` reports store failure via its Bool return
+            // (rather than swallowing it silently), so a disk-full failure
+            // here leaves this msgId unrecorded: the next copy of this
+            // envelope on any link re-gates as `.dispatch` and gets another
+            // chance to carry it, instead of being silently dropped as
+            // `.seen` for the rest of the process lifetime.
+            if carried {
+                GossipState.seenIds.record(msgId: msgId)
+            }
             return .carried
         }
     }
@@ -787,8 +872,18 @@ final class MeshController: ObservableObject {
             return
         }
         switch body.kind {
-        case ProtocolKind.text, ProtocolKind.reaction:
+        case ProtocolKind.text, ProtocolKind.attachmentManifest, ProtocolKind.reaction:
             handleIncomingGroupChatMessage(
+                group: group,
+                senderUserId: opened.senderUserId,
+                body: body,
+                msgId: msgId,
+                replyToMsgId: extendedBody.replyToMsgId,
+                arrival: arrival
+            )
+        case ProtocolKind.groupMetadataUpdate:
+            handleIncomingGroupMetadataUpdate(
+                sourceLabel: sourceLabel,
                 group: group,
                 senderUserId: opened.senderUserId,
                 body: body,
@@ -798,6 +893,58 @@ final class MeshController: ObservableObject {
             )
         default:
             log.info("Dropping group envelope from \(sourceLabel, privacy: .public): unhandled kind=\(body.kind)")
+        }
+    }
+
+    private func handleIncomingGroupMetadataUpdate(
+        sourceLabel: String,
+        group: Group,
+        senderUserId: Data,
+        body: MessageBody,
+        msgId: Data,
+        replyToMsgId: Data?,
+        arrival: MessageArrival?
+    ) {
+        let updated: Group?
+        do {
+            let update = try decodeGroupMetadataUpdate(bytes: body.content)
+            updated = try applyGroupMetadataUpdate(
+                group: group,
+                update: update,
+                senderUserId: senderUserId
+            )
+        } catch {
+            log.warning("Dropping invalid group metadata from \(sourceLabel, privacy: .public)")
+            return
+        }
+        let inserted = (try? store.insertIncomingMessage(
+            message: StoredMessage(
+                chatId: group.id,
+                senderUserId: senderUserId,
+                lamport: body.lamport,
+                timestamp: body.timestamp,
+                kind: body.kind,
+                payload: body.content
+            ),
+            msgId: msgId,
+            replyToMsgId: replyToMsgId
+        )) ?? false
+        guard inserted else { return }
+        if let arrival {
+            _ = try? store.recordMessageArrival(
+                chatId: group.id,
+                senderUserId: senderUserId,
+                lamport: body.lamport,
+                arrival: arrival
+            )
+        }
+        if let updated {
+            do {
+                try store.upsertGroup(group: updated)
+                ChatEvents.notifyChatChanged(group.id)
+            } catch {
+                log.error("Failed to persist group metadata revision \(updated.metadataRevision)")
+            }
         }
     }
 
@@ -833,7 +980,7 @@ final class MeshController: ObservableObject {
         ChatEvents.notifyChatChanged(group.id)
 
         // Local read watermark only (group wire receipts are deferred).
-        let throughLamport = (try? store.highestContiguousLamport(chatId: group.id, senderUserId: senderUserId)) ?? 0
+        let throughLamport = (try? store.highestLamport(chatId: group.id, senderUserId: senderUserId)) ?? 0
         try? store.recordOutgoingReceipt(
             chatId: group.id,
             senderUserId: senderUserId,
@@ -850,7 +997,9 @@ final class MeshController: ObservableObject {
         } else if isVisibleChatKind(body.kind) {
             let senderName = (try? store.getContact(userId: senderUserId))?.name
                 ?? String(UserIdHex.encode(senderUserId).prefix(8))
-            let preview = String(data: body.content, encoding: .utf8) ?? ""
+            let preview = body.kind == ProtocolKind.attachmentManifest
+                ? AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))
+                : (String(data: body.content, encoding: .utf8) ?? "")
             MessageNotifier.notifyIncomingGroupMessage(group: group, senderName: senderName, preview: preview)
         }
     }
@@ -1561,6 +1710,12 @@ final class MeshController: ObservableObject {
         return authored.envelope
     }
 
+    /// Android `carryForeignEnvelope` twin. Returns `true` if the store
+    /// operation completed (whether it newly queued the envelope or found it
+    /// already carried) and `false` if the store call itself failed (`try?`
+    /// turns a thrown error into `nil`). DTN D4: `processInboundEnvelope`
+    /// uses this return value to decide whether it's safe to mark the
+    /// envelope's `msgId` seen -- see its doc comment.
     private func carryForeign(
         msgId: Data,
         hopTtl: UInt8,
@@ -1568,10 +1723,10 @@ final class MeshController: ObservableObject {
         recipientHint: Data,
         sealed: Data,
         forceFamily: Bool = false
-    ) {
+    ) -> Bool {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let isFamily = forceFamily || hintMatchesAnyContact(hint: recipientHint, now: now)
-        _ = try? store.enqueueCarriedEnvelope(
+        guard let stored = try? store.enqueueCarriedEnvelope(
             envelope: CarriedEnvelope(
                 msgId: msgId,
                 hopTtl: hopTtl,
@@ -1582,10 +1737,33 @@ final class MeshController: ObservableObject {
             isFamily: isFamily,
             receivedAtMs: now,
             foreignBudgetBytes: MeshDefaults.foreignCarryBudgetBytes
-        )
-        if isFamily { RelaySyncEvents.requestSync() }
+        ) else {
+            return false
+        }
+        if stored, isFamily {
+            RelaySyncEvents.requestSync()
+        }
+        return true
     }
 
+    /// Floods a foreign (not-for-us) envelope onward, Android
+    /// `relayForeignEnvelope` twin. The arriving link is excluded from the
+    /// fanout below to avoid the trivial echo.
+    ///
+    /// DTN D4 loop-hazard note: since `processInboundEnvelope` moved to
+    /// check-then-record, `GossipState.seenIds` is *not yet* updated for
+    /// this `msgId` at the moment this call happens (it's recorded after
+    /// this function returns, once the whole terminal branch succeeds -- see
+    /// `processInboundEnvelope`'s doc comment). That's still safe against
+    /// self-re-ingestion: the arriving link is excluded from the fanout (so
+    /// this node can't hand the relayed frame straight back to itself), and
+    /// `processInboundEnvelope` runs synchronously per received frame, so
+    /// there is no way for this same `msgId` to re-enter
+    /// `processInboundEnvelope` on *this* node before the terminal `record`
+    /// call a few lines below this call site completes. A frame this node
+    /// relays could only loop back from a third node's rebroadcast, which
+    /// takes at least one more hop and one more link round-trip -- by then
+    /// this node's record has long since happened.
     private func relayForeign(
         sourceAddress: String?,
         msgId: Data,
@@ -1610,11 +1788,33 @@ final class MeshController: ObservableObject {
         }
     }
 
+    /// Hands over every carried envelope destined for the peer that just
+    /// HELLO'd on `address` (DESIGN.md §5.3): compute the peer's recent-day
+    /// `recipient_hint`s (`deliveryHintsForPeer`) and pull matching envelopes
+    /// from the store, and send each on this link. Expired entries are
+    /// pruned first.
+    ///
+    /// DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): this function only
+    /// ever *attempts* delivery -- it no longer calls
+    /// `store.removeCarriedEnvelope` on a successful
+    /// `MeshRouter.sendToAddress`. That return only means a transport
+    /// function accepted the write, not that the bytes made it to the peer;
+    /// a disconnect mid-transfer used to silently drop the whole write
+    /// queue after we'd already deleted our only copy. The carried row is
+    /// now removed later, once the peer's own next digest exchange proves
+    /// they actually have it -- see `store.coreConfirmCarriedDeliveries`,
+    /// called from `sprayDigestPlanTo`.
+    ///
+    /// Invariant, stated verbatim (DTN_TODOS.md §3.2): worst case of a
+    /// dropped mid-transfer link is a harmless duplicate resend (the peer's
+    /// seen-set/store dedupes it), never a lost envelope; an unconfirmed
+    /// carry still dies at its normal expiry via `store.pruneExpiredCarried`.
     private func drainCarriedEnvelopesTo(address: String, peerUserId: Data) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         try? store.pruneExpiredCarried(nowMs: now)
         let hints = deliveryHintsForPeer(peerUserId: peerUserId, now: now)
         let toDeliver = (try? store.carriedEnvelopesForHints(hints: hints, nowMs: now)) ?? []
+        var delivered = 0
         for env in toDeliver {
             let frame = encodeEnvelopeFrame(
                 msgId: env.msgId,
@@ -1624,10 +1824,11 @@ final class MeshController: ObservableObject {
                 sealed: env.sealed
             )
             if MeshRouter.sendToAddress(address: address, frame: frame) {
-                if !recognizesGroupHint(env.recipientHint, now: now) {
-                    try? store.removeCarriedEnvelope(msgId: env.msgId)
-                }
+                delivered += 1
             }
+        }
+        if delivered > 0 {
+            log.info("Attempted delivery of \(delivered) carried envelope(s) to \(address, privacy: .public) (removal awaits their digest confirmation)")
         }
     }
 
@@ -1638,6 +1839,18 @@ final class MeshController: ObservableObject {
         identity: Identity
     ) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
+        // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): confirm delivery of
+        // anything this digest's advertised msg_ids prove the peer already
+        // has BEFORE building the spray plan below, so a just-confirmed
+        // carried envelope isn't immediately re-sprayed back at the peer who
+        // just told us they have it.
+        if let confirmed = try? store.coreConfirmCarriedDeliveries(
+            peerUserId: peerUserId,
+            peerKnownMsgIds: peerKnownIds,
+            nowMs: now
+        ), confirmed > 0 {
+            log.info("Confirmed delivery of \(confirmed) carried envelope(s) to \(UserIdHex.encode(peerUserId), privacy: .public); dropped our copy")
+        }
         guard let plan = try? store.coreDigestSprayPlan(
             ownUserId: identity.userId,
             peerUserId: peerUserId,
@@ -1701,6 +1914,13 @@ final class MeshController: ObservableObject {
             if path.status == .satisfied {
                 Task { @MainActor in self?.runRelaySync() }
             }
+            // Recheck the push subscription on every path change, mirroring
+            // Android's relayNetworkCallback calling updateRelayPushSubscription
+            // from both onCapabilitiesChanged and onLost -- the push socket
+            // should be up in exactly the situations runRelaySync would
+            // already succeed in, and torn down the moment that stops being
+            // true.
+            Task { @MainActor in self?.updateRelayPushSubscription() }
         }
         pathMonitor?.start(queue: .global(qos: .utility))
 
@@ -1708,10 +1928,46 @@ final class MeshController: ObservableObject {
         relayCancellable = RelaySyncEvents.subject.sink { [weak self] in
             Task { @MainActor in self?.runRelaySync() }
         }
+        updateRelayPushSubscription()
+    }
+
+    /// Starts `relayPushClient` against the user's relay config once the mesh
+    /// is running, an identity and relay config exist, and the current
+    /// network path is satisfied -- or stops it otherwise. Called from
+    /// `startRelayLoop` and on every path update, mirroring the points
+    /// `runRelaySync` is itself kicked from (Android
+    /// `updateRelayPushSubscription` parity, DTN_TODOS.md D3).
+    ///
+    /// The hint set passed to `RelayPushClient.start` is recomputed on every
+    /// (re)connect via `relayPushHints`, so a contact or group added after
+    /// the socket is already open is picked up the next reconnect without
+    /// this needing its own change tracking; until then the 60s poll already
+    /// covers it.
+    private func updateRelayPushSubscription() {
+        guard isRunning,
+              let identity,
+              let config = RelayConfigStore.load(),
+              pathMonitor?.currentPath.status == .satisfied
+        else {
+            relayPushClient.stop()
+            return
+        }
+        let ownUserId = identity.userId
+        relayPushClient.start(config: config) {
+            relayPushHints(ownUserId: ownUserId)
+        }
     }
 
     private func runRelaySync() {
-        guard isRunning, let identity, let config = RelayConfigStore.load() else { return }
+        guard isRunning, let identity else { return }
+        guard let config = RelayConfigStore.load() else {
+            MeshConnectivityStatus.shared.setRelayHealth(.noConfig)
+            return
+        }
+        guard pathMonitor?.currentPath.status == .satisfied else {
+            MeshConnectivityStatus.shared.setRelayHealth(.noInternet)
+            return
+        }
         if relaySyncInFlight {
             relaySyncPending = true
             return
@@ -1780,7 +2036,49 @@ final class MeshController: ObservableObject {
                 limit: MeshDefaults.relayBatchLimit,
                 nowMs: now
             )
+            let importedGroups = try store.listGroups()
+            let groupsById = Dictionary(
+                uniqueKeysWithValues: importedGroups.map { ($0.id, $0) }
+            )
+            // Recent-day hints per imported group, for recognizing
+            // group-hinted carried envelopes below (same window every other
+            // hint check uses).
+            let groupHintSets: [(group: Group, hints: Set<Data>)] = importedGroups.map { group in
+                let hints = (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
+                    computeRecipientHint(
+                        recipientUserId: group.id,
+                        timestampMs: now - daysAgo * MeshDefaults.msPerDay
+                    )
+                }
+                return (group, Set(hints))
+            }
             for env in outbound {
+                if let group = groupsById[env.recipientUserId] {
+                    // Group-addressed: per-member fan-out instead of one
+                    // shared group-hint row (specs/group-relay-durability.md
+                    // §4.2). Mark relay-posted only after ALL member rows
+                    // post; a partial failure retries the whole set next
+                    // pass, and the deterministic fan-out msg_ids dedupe
+                    // server-side. Mirrors MeshService.kt.
+                    let rows = coreGroupFanoutRows(
+                        originalMsgId: env.msgId,
+                        memberUserIds: group.memberUserIds,
+                        hopTtl: env.hopTtl,
+                        expiry: env.expiry,
+                        sealed: env.sealed,
+                        envelopeTimestampMs: env.timestamp
+                    )
+                    var posted = 0
+                    for row in rows {
+                        if (try? RelayClient.postFanoutRow(config: config, row: row)) != nil {
+                            posted += 1
+                        }
+                    }
+                    if posted == rows.count {
+                        _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                    }
+                    continue
+                }
                 _ = try RelayClient.postOutboundEnvelope(config: config, envelope: env)
                 _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
             }
@@ -1789,7 +2087,60 @@ final class MeshController: ObservableObject {
                 nowMs: now
             )
             for env in family {
+                // Group-hinted carried envelopes decompose into per-member
+                // fan-out rows so a member mule's uplink serves the whole
+                // group (specs/group-relay-durability.md §4.2); re-posts on
+                // later passes dedupe server-side via the deterministic ids.
+                // Everything else posts unchanged.
+                if let match = groupHintSets.first(where: { $0.hints.contains(env.recipientHint) }) {
+                    let rows = coreGroupFanoutRowsForCarried(
+                        originalMsgId: env.msgId,
+                        memberUserIds: match.group.memberUserIds,
+                        hopTtl: env.hopTtl,
+                        expiry: env.expiry,
+                        sealed: env.sealed
+                    )
+                    for row in rows {
+                        _ = try? RelayClient.postFanoutRow(config: config, row: row)
+                    }
+                    continue
+                }
                 _ = try RelayClient.postCarriedEnvelope(config: config, envelope: env)
+            }
+
+            let contacts = try store.listContacts()
+            let presenceHints: (Data, Int64) -> [Data] = { userId, timestamp in
+                (0...3).map { daysAgo in
+                    computeRecipientHint(
+                        recipientUserId: userId,
+                        timestampMs: timestamp - Int64(daysAgo) * MeshDefaults.msPerDay
+                    )
+                }
+            }
+            let announce = RelayConfigStore.shareOnline()
+                ? presenceHints(identity.userId, now)
+                : []
+            let query = Array(Set(contacts.flatMap { presenceHints($0.userId, now) }))
+            if !announce.isEmpty || !query.isEmpty {
+                let contactByHint = Dictionary(uniqueKeysWithValues: contacts.flatMap { contact in
+                    presenceHints(contact.userId, now).map { ($0, contact.userId) }
+                })
+                let page = try RelayClient.syncPresence(
+                    config: config,
+                    announce: announce,
+                    query: query
+                )
+                let localNow = Int64(Date().timeIntervalSince1970 * 1_000)
+                await MainActor.run {
+                    for item in page.presence {
+                        guard let userId = contactByHint[item.hint] else { continue }
+                        let localSeenAt = localNow - max(0, page.nowMs - item.lastSeenMs)
+                        MeshConnectivityStatus.shared.mergePresenceLastSeen(
+                            userId: userId,
+                            seenAtMs: localSeenAt
+                        )
+                    }
+                }
             }
 
             var hints: [Data] = [computeRecipientHint(
@@ -1835,19 +2186,39 @@ final class MeshController: ObservableObject {
                     }
                     dispositions.append(CoreRelayEnvelopeDisposition(
                         relayId: env.id,
-                        disposition: disposition
+                        msgId: env.msgId,
+                        disposition: disposition,
+                        recipientHint: env.recipientHint
                     ))
                 }
-                let acks = coreRelayAckIds(items: dispositions)
+                // Consumed/Expired ack unconditionally; a SEEN envelope is
+                // acked only if this device durably consumed it as a 1:1
+                // message from someone else (DTN_TODOS.md §3.1); a legacy
+                // shared-mailbox group-hint row is never acked at all
+                // (specs/group-relay-durability.md §5.2) -- see
+                // CoreRelayEnvelopeDisposition's doc comment in engine.rs.
+                let acks = try store.coreRelayAckIdsWithConsumed(
+                    items: dispositions,
+                    ownUserId: identity.userId,
+                    nowMs: now
+                )
                 if !acks.isEmpty {
                     try RelayClient.ackEnvelopes(config: config, ids: acks)
                 }
                 afterId = page.nextCursor
                 if page.envelopes.count < Int(MeshDefaults.relayBatchLimit) { break }
             }
+            await MainActor.run {
+                MeshConnectivityStatus.shared.setRelayHealth(.ok(
+                    lastSyncMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                ))
+            }
         } catch {
             let message = error.localizedDescription
             await MainActor.run {
+                MeshConnectivityStatus.shared.setRelayHealth(.failing(
+                    lastAttemptMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                ))
                 log.warning("Relay sync failed: \(message, privacy: .public)")
             }
         }
@@ -1855,10 +2226,38 @@ final class MeshController: ObservableObject {
 
     private func refreshNearby() {
         guard isRunning else { return }
+        MeshConnectivityStatus.shared.refreshNearbyRoutes()
         if pausedForBluetoothAudio {
             MeshRuntimeStatus.shared.markPausedForBluetoothAudio()
         } else {
             MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
         }
     }
+}
+
+/// Self + owned-group recipient hints for the current moment -- the same hint
+/// set `MeshController.relaySyncBlocking` computes inline for its own relay
+/// fetch. A free function (not a `MeshController` method) so it carries no
+/// main-actor isolation: `RelayPushClient` (DTN_TODOS.md D3) invokes its
+/// `hintsProvider` closure from its own private queue, off the main actor,
+/// the same reason `relaySyncBlocking` itself is `nonisolated` and
+/// duplicates this computation inline rather than calling the
+/// `@MainActor`-isolated `recentHintsFor`/`deliveryHintsForPeer` helpers.
+/// Unlike Android's `relayHintsForConfig`/`relayProxyHints`, there is no
+/// "proxy" hint set here (mail addressed to a BLE-only contact, fetched on
+/// their behalf) -- the iOS poll path doesn't compute those either, so there
+/// is nothing to mirror for that half yet.
+private func relayPushHints(ownUserId: Data) -> [Data] {
+    let store = AppStore.get()
+    let now = Int64(Date().timeIntervalSince1970 * 1000)
+    var hints = (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
+        computeRecipientHint(recipientUserId: ownUserId, timestampMs: now - daysAgo * MeshDefaults.msPerDay)
+    }
+    let groups = (try? store.listGroups()) ?? []
+    for group in groups where group.memberUserIds.contains(ownUserId) {
+        hints.append(contentsOf: (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
+            computeRecipientHint(recipientUserId: group.id, timestampMs: now - daysAgo * MeshDefaults.msPerDay)
+        })
+    }
+    return hints
 }
