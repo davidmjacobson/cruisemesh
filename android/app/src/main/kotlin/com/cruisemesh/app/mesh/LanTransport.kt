@@ -227,6 +227,7 @@ internal class LanTransport(
         val candidates = subnet24Hosts(local).shuffled()
         val generation = scanGeneration.incrementAndGet()
         scanRemaining.set(candidates.size)
+        Log.i(TAG, "Scanning ${candidates.size} subnet hosts for CruiseMesh peers")
         LanTransportDiagnostics.scanStarted(candidates.size)
         for (candidate in candidates) {
             try {
@@ -293,10 +294,12 @@ internal class LanTransport(
             val remoteToken = hint.instanceToken.toHex()
             val endpoint = LanManualEndpoint(hint.host, hint.port.toInt())
             onEndpointObserved(expectedUserId, endpoint, currentNetworkId)
-            if (
-                !started ||
-                !shouldInitiateLanConnection(instanceToken, remoteToken)
-            ) {
+            if (!started) return@post
+            if (!shouldInitiateLanConnection(instanceToken, remoteToken)) {
+                Log.i(
+                    TAG,
+                    "Resolved LAN peer ${endpoint.display}; awaiting their connection (tie-break)",
+                )
                 return@post
             }
             val network = wifiNetwork ?: return@post
@@ -620,10 +623,12 @@ internal class LanTransport(
             connections[address] = connection
             authenticatedUserIds[address] = trustedUserId.toHex()
             outboundServiceKey?.let { key ->
-                reconnectTargets[key]?.let { target ->
-                    reconnectTargets[key] = target.copy(
-                        expectedUserId = trustedUserId.copyOf(),
-                    )
+                // computeIfPresent keeps this a single atomic step; scan and
+                // reconnect attempts touch the same key from other executor
+                // threads and a plain read-modify-write could lose a racing
+                // update to this reconnect target's endpoint list.
+                reconnectTargets.computeIfPresent(key) { _, target ->
+                    target.copy(expectedUserId = trustedUserId.copyOf())
                 }
             }
             val authenticatedEndpoint = advertisedEndpoint?.let {
@@ -816,7 +821,6 @@ internal class LanTransport(
                     val version = serviceInfo.attributes[TXT_VERSION]?.toString(Charsets.UTF_8)
                     if (
                         token != null &&
-                        shouldInitiateLanConnection(instanceToken, token) &&
                         version == "1" &&
                         serviceInfo.port in 1..65_535 &&
                         (
@@ -825,7 +829,17 @@ internal class LanTransport(
                                 serviceInfo.network == wifiNetwork
                             )
                     ) {
-                        connectToService(serviceInfo)
+                        if (shouldInitiateLanConnection(instanceToken, token)) {
+                            connectToService(serviceInfo)
+                        } else {
+                            val endpoint = resolvedHosts(serviceInfo).firstOrNull()
+                                ?.let { endpointDisplay(InetSocketAddress(it, serviceInfo.port)) }
+                                ?: serviceInfo.serviceName
+                            Log.i(
+                                TAG,
+                                "Resolved LAN peer $endpoint; awaiting their connection (tie-break)",
+                            )
+                        }
                     }
                     resolveNext()
                 }
