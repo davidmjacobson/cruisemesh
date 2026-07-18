@@ -40,6 +40,7 @@ final class MeshController: ObservableObject {
     private var currentLanEndpoint: LanManualEndpoint?
     private var currentLanInstanceToken: Data?
     private var currentLanNetworkId: String?
+    private var appForeground = true
 
     private init() {}
 
@@ -146,7 +147,7 @@ final class MeshController: ObservableObject {
                 self.onFrameReceived(address: address, frame: frame)
             }
         }
-        lan.start()
+        lan.start(foregroundActive: appForeground)
         startLanHealthLoop()
 
         transport.onFrame = { [weak self] address, frame in
@@ -212,6 +213,11 @@ final class MeshController: ObservableObject {
         relaySyncPending = false
         MeshRuntimeStatus.shared.markStopped()
         log.info("Mesh stopped")
+    }
+
+    func setAppForeground(_ foreground: Bool) {
+        appForeground = foreground
+        lanTransport?.setForegroundActive(foreground)
     }
 
     // MARK: - Bluetooth audio coexistence

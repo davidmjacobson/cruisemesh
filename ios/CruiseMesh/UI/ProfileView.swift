@@ -213,7 +213,7 @@ private struct AdvancedSettingsView: View {
                     lanError = lanDiagnostics.requestManualConnection(lanAddress)
                 }
                 Button("Test encrypted LAN link") { lanError = lanDiagnostics.requestConnectionTest() }
-                Button("Search this /24 network") { lanError = lanDiagnostics.requestSubnetScan() }
+                Button("Search local subnet") { lanError = lanDiagnostics.requestSubnetScan() }
                 if let total = lanDiagnostics.snapshot.scanTotal {
                     ProgressView(
                         value: Double(lanDiagnostics.snapshot.scanProgress ?? 0),

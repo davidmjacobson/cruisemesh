@@ -42,4 +42,8 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.set(false, forKey: Self.meshEnabledKey)
         MeshController.shared.stop()
     }
+
+    func setAppForeground(_ foreground: Bool) {
+        MeshController.shared.setAppForeground(foreground)
+    }
 }

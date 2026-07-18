@@ -26,6 +26,11 @@ func parseLanEndpointLink(_ fragment: String?) -> LanManualEndpoint? {
 
 /// The active Wi-Fi IPv4 address. iOS normally exposes Wi-Fi as `en0`.
 func localWifiIPv4Address() -> String? {
+    localWifiIPv4Network()?.address
+}
+
+/// The active Wi-Fi IPv4 address and its advertised subnet prefix.
+func localWifiIPv4Network() -> LocalWifiIPv4Network? {
     var firstAddress: UnsafeMutablePointer<ifaddrs>?
     guard getifaddrs(&firstAddress) == 0, let firstAddress else { return nil }
     defer { freeifaddrs(firstAddress) }
@@ -47,7 +52,20 @@ func localWifiIPv4Address() -> String? {
             NI_NUMERICHOST
         )
         if result == 0 {
-            return String(cString: host)
+            let prefixLength: Int
+            if let netmask = current.pointee.ifa_netmask,
+               netmask.pointee.sa_family == UInt8(AF_INET) {
+                let value = netmask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                    UInt32(bigEndian: $0.pointee.sin_addr.s_addr)
+                }
+                prefixLength = ipv4PrefixLength(netmask: value) ?? defaultLanScanPrefixLength
+            } else {
+                prefixLength = defaultLanScanPrefixLength
+            }
+            return LocalWifiIPv4Network(
+                address: String(cString: host),
+                prefixLength: prefixLength
+            )
         }
     }
     return nil
@@ -61,5 +79,5 @@ func lanNetworkId(ipv4Address: String?) -> String? {
 }
 
 func subnet24Hosts(localAddress: String) -> [String] {
-    coreSubnet24Hosts(address: localAddress)
+    lanSubnetHosts(localAddress: localAddress, prefixLength: defaultLanScanPrefixLength)
 }
