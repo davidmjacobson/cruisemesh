@@ -101,6 +101,18 @@ internal class LanScanPlanner(
         }
     }
 
+    /**
+     * A broad-enough sweep received no TCP response at all, which commonly
+     * means Wi-Fi client isolation. Defer further expensive full sweeps to the
+     * backoff cap until fresh peer evidence or a network join resets the plan.
+     */
+    @Synchronized
+    fun onIsolationSuspected(nowMs: Long) {
+        if (!joined) return
+        fullBackoffIndex = fullBackoffMs.lastIndex
+        fullDueAtMs = nowMs + fullBackoffMs.last()
+    }
+
     companion object {
         const val LOCAL_SCAN_INTERVAL_MS = 5 * 60_000L
         val FULL_SCAN_BACKOFF_MS = listOf(15 * 60_000L, 60 * 60_000L, 4 * 60 * 60_000L)

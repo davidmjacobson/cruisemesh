@@ -90,7 +90,6 @@ internal class LanTransport(
     private val writeExecutor = Executors.newSingleThreadExecutor()
     private val secureRandom = SecureRandom()
     private val activeSocketCount = AtomicInteger(0)
-    private val scanRemaining = AtomicInteger(0)
     private val scanGeneration = AtomicInteger(0)
     private val connectionBackoff = ReconnectBackoffTracker()
     private val sockets = ConcurrentHashMap.newKeySet<Socket>()
@@ -128,14 +127,14 @@ internal class LanTransport(
     private val scanPlanner = LanScanPlanner()
 
     @Volatile
-    private var runningScanBreadth: LanScanBreadth? = null
+    private var runningSweep: RunningSweep? = null
     private val automaticScanRunnable = Runnable {
         if (!started || wifiNetwork == null) return@Runnable
         if (
             shouldRunAutomaticLanScan(
                 activeConnections = connections.size,
                 outboundAttempts = outboundServiceKeys.size,
-                scanRemaining = scanRemaining.get(),
+                scanRemaining = runningSweep?.outcomes?.remainingCandidates() ?: 0,
             )
         ) {
             scanPlanner.takeDueScan(System.currentTimeMillis())?.let { breadth ->
@@ -239,7 +238,9 @@ internal class LanTransport(
 
     fun startSubnetScan(breadth: LanScanBreadth = LanScanBreadth.FULL_SUBNET): String? {
         if (!started) return "Start the mesh before searching the local subnet"
-        if (scanRemaining.get() > 0) return "A local subnet search is already running"
+        if ((runningSweep?.outcomes?.remainingCandidates() ?: 0) > 0) {
+            return "A local subnet search is already running"
+        }
         val network = wifiNetwork ?: return "This phone is not connected to Wi-Fi"
         val local = endpointHint?.host
             ?.let { runCatching { InetAddress.getByName(it) }.getOrNull() }
@@ -254,38 +255,42 @@ internal class LanTransport(
         }
         val candidates = subnetHosts(local, prefixLength).shuffled()
         val generation = scanGeneration.incrementAndGet()
-        runningScanBreadth = breadth
-        scanRemaining.set(candidates.size)
+        val sweep = RunningSweep(
+            outcomes = SweepOutcomes(generation, candidates.size),
+            breadth = breadth,
+            prefixLength = effectiveScanPrefixLength(prefixLength),
+        )
+        runningSweep = sweep
         Log.i(
             TAG,
-            "Scanning ${candidates.size} subnet hosts (/${effectiveScanPrefixLength(prefixLength)}) " +
+            "Scanning ${candidates.size} subnet hosts (/${sweep.prefixLength}) " +
                 "for CruiseMesh peers",
         )
         LanTransportDiagnostics.scanStarted(candidates.size)
         for (candidate in candidates) {
             try {
-                scanExecutor.execute { scanHost(network, candidate, generation) }
+                scanExecutor.execute { scanHost(network, candidate, sweep) }
             } catch (_: RuntimeException) {
-                scanAdvanced(generation)
+                recordScanOutcome(sweep, SweepProbeOutcome.OTHER)
             }
         }
         return null
     }
 
-    private fun scanHost(network: Network, candidate: InetAddress, generation: Int) {
-        if (generation != scanGeneration.get()) return
+    private fun scanHost(network: Network, candidate: InetAddress, sweep: RunningSweep) {
+        if (sweep.outcomes.generation != scanGeneration.get()) return
         val endpoint = InetSocketAddress(candidate, lanDefaultTcpPort().toInt())
         val serviceKey = "scan:${candidate.hostAddress}"
-        var advanced = false
+        var outcomeRecorded = false
         try {
             val socket = network.socketFactory.createSocket().apply {
                 tcpNoDelay = true
                 keepAlive = true
                 connect(endpoint, SCAN_CONNECT_TIMEOUT_MS)
             }
-            advanced = true
-            scanAdvanced(generation)
-            if (generation != scanGeneration.get()) {
+            recordScanOutcome(sweep, SweepProbeOutcome.CONNECTED)
+            outcomeRecorded = true
+            if (sweep.outcomes.generation != scanGeneration.get()) {
                 socket.closeQuietly()
                 return
             }
@@ -306,20 +311,22 @@ internal class LanTransport(
                 expectedUserId = null,
                 advertisedEndpoint = endpoint,
             )
-        } catch (_: Exception) {
-            // A closed port is the expected result for almost every address.
+        } catch (error: Exception) {
+            if (!outcomeRecorded) {
+                recordScanOutcome(sweep, classifySweepProbeFailure(error))
+                outcomeRecorded = true
+            }
         } finally {
-            if (!advanced) scanAdvanced(generation)
+            if (!outcomeRecorded) recordScanOutcome(sweep, SweepProbeOutcome.OTHER)
         }
     }
 
-    private fun scanAdvanced(generation: Int) {
-        if (generation != scanGeneration.get()) return
-        val remaining = scanRemaining.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+    private fun recordScanOutcome(sweep: RunningSweep, outcome: SweepProbeOutcome) {
+        if (runningSweep !== sweep || sweep.outcomes.generation != scanGeneration.get()) return
+        val update = sweep.outcomes.record(sweep.outcomes.generation, outcome) ?: return
+        if (runningSweep !== sweep || sweep.outcomes.generation != scanGeneration.get()) return
         LanTransportDiagnostics.scanAdvanced()
-        if (remaining == 0) {
-            onScanCompleted()
-        }
+        update.completedSummary?.let { onScanCompleted(sweep, it) }
     }
 
     /**
@@ -330,11 +337,22 @@ internal class LanTransport(
      * interval -- the check's loneliness gate still applies, so if this sweep
      * (or NSD) produced a connection, no escalation happens.
      */
-    private fun onScanCompleted() {
-        val breadth = runningScanBreadth ?: return
-        runningScanBreadth = null
-        scanPlanner.onScanCompleted(breadth)
-        if (breadth == LanScanBreadth.LOCAL_24) {
+    private fun onScanCompleted(sweep: RunningSweep, summary: SweepOutcomeSummary) {
+        if (runningSweep !== sweep || sweep.outcomes.generation != scanGeneration.get()) return
+        runningSweep = null
+        Log.i(TAG, summary.logLine(sweep.prefixLength))
+        scanPlanner.onScanCompleted(sweep.breadth)
+        val verdict = lanSweepVerdict(summary)
+        when (verdict) {
+            LanSweepVerdict.ISOLATION_SUSPECTED -> {
+                scanPlanner.onIsolationSuspected(System.currentTimeMillis())
+                LanTransportDiagnostics.sweepVerdict(ISOLATION_DIAGNOSTIC)
+            }
+            LanSweepVerdict.BLOCKED_BY_POLICY ->
+                LanTransportDiagnostics.sweepVerdict(BLOCKED_DIAGNOSTIC)
+            else -> LanTransportDiagnostics.sweepVerdict(null)
+        }
+        if (sweep.breadth == LanScanBreadth.LOCAL_24) {
             scheduleAutomaticSubnetScan(AUTO_SCAN_ESCALATE_DELAY_MS)
         }
     }
@@ -915,9 +933,8 @@ internal class LanTransport(
     private fun teardownNetworkSession() {
         mainHandler.removeCallbacks(automaticScanRunnable)
         scanPlanner.onNetworkLost()
-        runningScanBreadth = null
+        runningSweep = null
         scanGeneration.incrementAndGet()
-        scanRemaining.set(0)
         discoveryListener?.let(::stopDiscovery)
         discoveryListener = null
         registrationListener?.let(::unregisterService)
@@ -1077,6 +1094,10 @@ internal class LanTransport(
         private const val AUTO_SCAN_ESCALATE_DELAY_MS = 2_000L
         private const val AUTO_SCAN_RETRY_INTERVAL_MS = 5 * 60_000L
         private const val MAX_PACKET_SIZE = 65_535
+        private const val ISOLATION_DIAGNOSTIC =
+            "This Wi-Fi appears to block phone-to-phone traffic; nearby delivery will use Bluetooth."
+        private const val BLOCKED_DIAGNOSTIC =
+            "Local Wi-Fi probes were denied, likely by a VPN or OS policy; nearby delivery will use Bluetooth."
 
         private fun writePacket(output: DataOutputStream, bytes: ByteArray) {
             require(bytes.isNotEmpty() && bytes.size <= MAX_PACKET_SIZE)
@@ -1097,6 +1118,12 @@ internal class LanTransport(
     private data class ReconnectTarget(
         val endpoints: List<InetSocketAddress>,
         val expectedUserId: ByteArray?,
+    )
+
+    private data class RunningSweep(
+        val outcomes: SweepOutcomes,
+        val breadth: LanScanBreadth,
+        val prefixLength: Int,
     )
 }
 

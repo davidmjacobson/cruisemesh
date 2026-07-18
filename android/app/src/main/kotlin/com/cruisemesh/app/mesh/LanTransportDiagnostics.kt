@@ -19,6 +19,7 @@ data class LanTransportSnapshot(
     val lastActivityAtMs: Long? = null,
     val scanProgress: Int? = null,
     val scanTotal: Int? = null,
+    val sweepVerdict: String? = null,
 )
 
 internal data class LanManualEndpoint(val host: String, val port: Int) {
@@ -261,8 +262,13 @@ object LanTransportDiagnostics {
                 scanProgress = 0,
                 scanTotal = total,
                 lastError = null,
+                sweepVerdict = null,
             )
         }
+    }
+
+    internal fun sweepVerdict(message: String?) {
+        mutableState.update { it.copy(sweepVerdict = message) }
     }
 
     internal fun scanAdvanced() {

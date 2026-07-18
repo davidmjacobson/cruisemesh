@@ -135,6 +135,14 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
             lanStatus.probeStatus?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
             }
+            lanStatus.sweepVerdict?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
             Text(
                 stringResource(R.string.ui_lan_frames, lanStatus.sentFrames, lanStatus.receivedFrames),
                 style = MaterialTheme.typography.bodySmall,
