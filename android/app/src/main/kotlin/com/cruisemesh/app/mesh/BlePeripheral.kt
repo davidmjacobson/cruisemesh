@@ -16,11 +16,39 @@ import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import java.util.ArrayDeque
 
 private const val TAG = "BlePeripheral"
+
+// A whole new *frame* (not fragment) only gets paced -- see
+// sendNextQueuedFragment -- once this many more whole frames are already
+// queued behind it for the same address. Small on purpose: the common case
+// (one or two frames in flight) must still go out back-to-back with no added
+// latency; pacing only kicks in for the bursty on-HELLO spray
+// (drainCarriedEnvelopesTo + digest frames, DESIGN.md §5.3/§7.3) that can
+// queue 19+ frames for one address at once.
+private const val FRAME_PACING_DEEP_QUEUE_THRESHOLD = 3
+
+// Modest on purpose -- just enough to let the BLE controller drain its
+// congestion window between frames; not a real backoff.
+private const val FRAME_PACING_DELAY_MS = 20L
+
+/**
+ * Pure decision behind [BlePeripheral]'s frame-start pacing, extracted so it
+ * is unit-testable without any Android/BLE dependency: pace only when the
+ * fragment about to be sent is a new frame's first ([startingNewFrame]) AND
+ * at least [threshold] more whole frames are already waiting behind it.
+ * Fragments continuing an already-started frame are never paced.
+ */
+internal fun shouldPaceFrameStart(
+    startingNewFrame: Boolean,
+    queuedFrames: Int,
+    threshold: Int = FRAME_PACING_DEEP_QUEUE_THRESHOLD,
+): Boolean = startingNewFrame && queuedFrames >= threshold
 
 /**
  * GATT-server (peripheral) half of the dual BLE role described in
@@ -54,6 +82,22 @@ private const val TAG = "BlePeripheral"
  * fires [onCentralDisconnected] so the address gets unmapped -- the
  * undelivered frame is not lost, it lives in the persistent store and
  * redelivers via digest sync on the peer's next connection.
+ *
+ * Notify-congestion hardening (2026-07-17 LAN-hint-loss bug): the above
+ * treated *any* failed notify as proof of link death, but a burst of queued
+ * frames (the on-HELLO spray below) can make the BLE controller itself
+ * report transient congestion (status=129) on a link the central is still
+ * actively using. [onNotificationSent] now only tears a link down after
+ * [NotifyFailureTracker] sees [NotifyFailureTracker.MAX_CONSECUTIVE_FAILURES]
+ * failures in a row for the same address with no success in between --
+ * anything short of that retries the same fragment. [tearDownLink] itself is
+ * idempotent per address so a stale device object that keeps delivering
+ * queued callbacks after cleanup can never re-run the teardown or re-fire
+ * [onCentralDisconnected]. Relatedly, [sendNextQueuedFragment] paces the
+ * *start* of each new frame (not fragments within one) once several whole
+ * frames are already queued for an address, so the on-HELLO spray itself is
+ * less likely to saturate the controller in the first place -- see
+ * [FRAME_PACING_DEEP_QUEUE_THRESHOLD].
  */
 @SuppressLint("MissingPermission")
 class BlePeripheral(
@@ -73,8 +117,34 @@ class BlePeripheral(
     private val connectedDevices = mutableMapOf<String, BluetoothDevice>()
     private val negotiatedMtu = mutableMapOf<String, Int>()
     private val reassemblers = mutableMapOf<String, FrameReassembler>()
-    private val notifyQueues = mutableMapOf<String, ArrayDeque<ByteArray>>()
+
+    // Queued outbound frames per address, each still split into its own
+    // fragments in send order -- nested (rather than one flat fragment
+    // queue) so sendNextQueuedFragment can tell when it's about to start a
+    // new frame vs. continue one already in progress (see
+    // FRAME_PACING_DEEP_QUEUE_THRESHOLD).
+    private val notifyQueues = mutableMapOf<String, ArrayDeque<ArrayDeque<ByteArray>>>()
     private val notifyInFlight = mutableSetOf<String>()
+
+    // Addresses whose head-of-queue frame already has >=1 fragment sent --
+    // absence means the next fragment sendNextQueuedFragment picks up will
+    // be a new frame's first, which is what FRAME_PACING_DEEP_QUEUE_THRESHOLD
+    // gates.
+    private val notifyFrameStarted = mutableSetOf<String>()
+
+    // The exact fragment bytes currently awaiting an onNotificationSent ack
+    // for an address, kept so a tolerated failure (see NotifyFailureTracker)
+    // can retry the same fragment instead of silently skipping it.
+    private val inFlightFragment = mutableMapOf<String, ByteArray>()
+    private val notifyFailures = NotifyFailureTracker()
+
+    // GATT server callbacks arrive on a binder thread; Handler.postDelayed's
+    // callback runs on whichever Looper the Handler was built with -- use the
+    // main looper so paced-send firing (and its map mutations) lands on the
+    // same thread as the rest of this class's Android-framework calls
+    // (mirrors BleCentral's connect-watchdog Handler).
+    private val handler = Handler(Looper.getMainLooper())
+
     @Volatile private var advertising = false
 
     private val advertiseCallback = object : AdvertiseCallback() {
@@ -171,25 +241,65 @@ class BlePeripheral(
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                // Mirrors BleCentral's onCharacteristicWrite hardening: a
-                // rejected notify means this central's link is already dead
-                // on its side (supervision-timeout death, stale gatt, etc.)
-                // even though our GATT server object still thinks it's
-                // connected -- the exact "phone A thinks the link is alive,
-                // phone B saw it die 30s ago" blackhole observed live
-                // 2026-07-10. cancelConnection() plus the map cleanup below
-                // returns this address to the digest-sync retry path instead
-                // of pretending the send succeeded.
-                Log.w(
-                    TAG,
-                    "onNotificationSent: notify failed for ${device.address} (status=$status); tearing down link",
-                )
-                gattServer?.cancelConnection(device)
-                tearDownLink(device.address, "notification send failed (status=$status)")
+            val address = device.address
+            if (address !in connectedDevices) {
+                // This address was already torn down -- by an earlier
+                // failure in this same burst, or a raced STATE_DISCONNECTED
+                // -- and the BLE stack can keep delivering queued
+                // onNotificationSent callbacks for a device object after
+                // cleanup. Without this guard, a single congestion burst
+                // re-ran the full teardown path (including re-firing
+                // onCentralDisconnected) 14 times for one address within
+                // ~40ms (Pixel 10 Pro field log, 2026-07-17). Invariant:
+                // once an address leaves connectedDevices, every further
+                // callback for it is a no-op.
                 return
             }
-            notifyInFlight.remove(device.address)
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                // Invariant: a single failed notify does NOT prove the link
+                // is dead. status=129 (GATT_CONGESTED-adjacent) fired during
+                // the on-HELLO spray (drainCarriedEnvelopesTo + digest
+                // frames -- DESIGN.md §5.3/§7.3 -- can queue 19+ frames for
+                // one address at once) while the field log showed the
+                // central still writing to us on this exact address 300ms to
+                // 30s later. Tearing down on the very first failure wiped
+                // MeshRouter's learned address->userId mapping while the
+                // link was still usable, permanently losing anything that
+                // arrived afterward with nowhere to route it (e.g. a LAN
+                // endpoint hint -- see MeshService.handleLanEndpointHint).
+                // Retry the fragment that failed instead, and only tear the
+                // link down once NotifyFailureTracker sees
+                // MAX_CONSECUTIVE_FAILURES in a row for this address with no
+                // success in between; a real STATE_DISCONNECTED callback
+                // (below) always tears the link down regardless of this
+                // count.
+                notifyInFlight.remove(address)
+                val retryFragment = inFlightFragment.remove(address)
+                if (notifyFailures.recordFailure(address)) {
+                    Log.w(
+                        TAG,
+                        "onNotificationSent: notify failed for $address (status=$status) " +
+                            "${NotifyFailureTracker.MAX_CONSECUTIVE_FAILURES} times in a row; tearing down link",
+                    )
+                    gattServer?.cancelConnection(device)
+                    tearDownLink(
+                        address,
+                        "notification send failed ${NotifyFailureTracker.MAX_CONSECUTIVE_FAILURES}x in a row (status=$status)",
+                    )
+                    return
+                }
+                Log.w(TAG, "onNotificationSent: notify failed for $address (status=$status); retrying")
+                if (retryFragment != null) {
+                    notifyInFlight += address
+                    sendFragment(device, retryFragment)
+                } else {
+                    sendNextQueuedFragment(device)
+                }
+                return
+            }
+            notifyFailures.recordSuccess(address)
+            notifyInFlight.remove(address)
+            inFlightFragment.remove(address)
             sendNextQueuedFragment(device)
         }
     }
@@ -272,11 +382,15 @@ class BlePeripheral(
         }
         runCatching { gattServer?.close() }
         gattServer = null
+        handler.removeCallbacksAndMessages(null)
         connectedDevices.clear()
         negotiatedMtu.clear()
         reassemblers.clear()
         notifyQueues.clear()
         notifyInFlight.clear()
+        notifyFrameStarted.clear()
+        inFlightFragment.clear()
+        notifyFailures.clearAll()
     }
 
     /**
@@ -292,7 +406,7 @@ class BlePeripheral(
                 Log.w(TAG, "notifyFrame: dropping ${frame.size}-byte frame for ${device.address} -- too large to fragment")
                 return@forEach
             }
-            notifyQueues.getOrPut(device.address) { ArrayDeque() }.addAll(fragments)
+            notifyQueues.getOrPut(device.address) { ArrayDeque() }.add(ArrayDeque(fragments))
             sendNextQueuedFragment(device)
         }
     }
@@ -316,17 +430,77 @@ class BlePeripheral(
             Log.w(TAG, "sendFrame: dropping ${frame.size}-byte frame for $deviceAddress -- too large to fragment")
             return
         }
-        notifyQueues.getOrPut(deviceAddress) { ArrayDeque() }.addAll(fragments)
+        notifyQueues.getOrPut(deviceAddress) { ArrayDeque() }.add(ArrayDeque(fragments))
         Log.i(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
         sendNextQueuedFragment(device)
     }
 
+    /**
+     * Sends this address's next queued fragment, unless one is already
+     * in-flight (a GATT server allows only one outstanding notification per
+     * connection -- [notifyInFlight] enforces that one-at-a-time invariant
+     * across every caller). Fragments *within* one frame always go out back
+     * to back the moment the previous one is acked (chained from
+     * [onNotificationSent]); only the *start* of a new frame is paced, and
+     * only when several more whole frames are already queued behind it --
+     * see [FRAME_PACING_DEEP_QUEUE_THRESHOLD]. Throttling changes WHEN
+     * frames go out, never WHETHER: nothing here is dropped, just delayed.
+     */
     private fun sendNextQueuedFragment(device: BluetoothDevice) {
         val address = device.address
         if (address in notifyInFlight) return
-        val fragment = notifyQueues[address]?.poll() ?: return
-        val characteristic = outboundCharacteristic ?: return
-        val server = gattServer ?: return
+        val frames = notifyQueues[address] ?: return
+        val currentFrame = frames.peekFirst() ?: return
+        // Decide "am I about to send this frame's first fragment" BEFORE
+        // polling -- notifyFrameStarted tracks whether the head frame has
+        // already had >=1 fragment sent.
+        val startingNewFrame = address !in notifyFrameStarted
+        val fragment = currentFrame.poll() ?: run {
+            // Defensive: an empty frame should never be queued (notifyFrame
+            // / sendFrame only add non-empty fragment lists), but if one
+            // slips through, drop it and move on rather than getting stuck.
+            frames.poll()
+            notifyFrameStarted.remove(address)
+            return sendNextQueuedFragment(device)
+        }
+        if (currentFrame.isEmpty()) {
+            // That was the frame's last fragment -- it's fully handed off
+            // to sendFragment now, so drop it from the outer queue and reset
+            // the started-marker for whatever frame comes next.
+            frames.poll()
+            notifyFrameStarted.remove(address)
+        } else {
+            notifyFrameStarted += address
+        }
+
+        // Reserve this address's one in-flight slot immediately, even when
+        // the actual send below is paced -- otherwise a concurrent
+        // notifyFrame()/sendFrame() call queued during the pacing delay
+        // would see this address as idle and jump the queue, violating the
+        // one-notification-per-connection GATT constraint.
+        notifyInFlight += address
+        val queuedFrames = frames.size
+        if (shouldPaceFrameStart(startingNewFrame, queuedFrames)) {
+            handler.postDelayed({
+                if (address in connectedDevices) {
+                    sendFragment(device, fragment)
+                } else {
+                    notifyInFlight.remove(address)
+                }
+            }, FRAME_PACING_DELAY_MS)
+        } else {
+            sendFragment(device, fragment)
+        }
+    }
+
+    private fun sendFragment(device: BluetoothDevice, fragment: ByteArray) {
+        val address = device.address
+        val characteristic = outboundCharacteristic
+        val server = gattServer
+        if (characteristic == null || server == null) {
+            notifyInFlight.remove(address)
+            return
+        }
         characteristic.value = fragment
         // notifyCharacteristicChanged throws IllegalArgumentException on an
         // oversized value; letting that unwind here would abandon the GATT
@@ -336,18 +510,19 @@ class BlePeripheral(
         val notified = try {
             server.notifyCharacteristicChanged(device, characteristic, false)
         } catch (e: Exception) {
-            Log.w(TAG, "sendNextQueuedFragment: notify threw for $address (${e.message}); dropping fragment")
+            Log.w(TAG, "sendFragment: notify threw for $address (${e.message}); dropping fragment")
             false
         }
         if (notified) {
-            notifyInFlight += address
+            inFlightFragment[address] = fragment
         } else {
-            // Same reasoning as onNotificationSent's failure branch: a
-            // rejected notify on a link we believe is established (the
-            // in-flight guard above only lets one notify through at a time)
-            // means the link isn't usable. Leaving it mapped would
-            // black-hole every future send to this address.
-            Log.w(TAG, "sendNextQueuedFragment: notifyCharacteristicChanged rejected for $address; tearing down link")
+            // A synchronous rejection (as opposed to the async
+            // onNotificationSent failure path) means the call was refused
+            // outright -- e.g. no CCCD subscription -- not a transient
+            // congestion status. Treated as fatal immediately, same as
+            // before this file's notify-failure tolerance was added.
+            Log.w(TAG, "sendFragment: notifyCharacteristicChanged rejected for $address; tearing down link")
+            notifyInFlight.remove(address)
             gattServer?.cancelConnection(device)
             tearDownLink(address, "notifyCharacteristicChanged rejected")
         }
@@ -356,18 +531,29 @@ class BlePeripheral(
     /**
      * Single per-address teardown path shared by the normal
      * STATE_DISCONNECTED callback and the notify-failure paths
-     * (onNotificationSent / sendNextQueuedFragment) so the map cleanup and
-     * the [onCentralDisconnected] signal to MeshRouter can never drift apart
-     * -- mirrors [BleCentral.tearDownLink] (see that class's doc comment for
+     * (onNotificationSent / sendFragment) so the map cleanup and the
+     * [onCentralDisconnected] signal to MeshRouter can never drift apart --
+     * mirrors [BleCentral.tearDownLink] (see that class's doc comment for
      * the blackhole bug this fixes).
+     *
+     * Invariant: idempotent per address. [address] leaving [connectedDevices]
+     * is the single source of truth for "already torn down" -- the guard
+     * below means a second call for the same address (e.g. a queued
+     * onNotificationSent callback the BLE stack delivers after cleanup, or a
+     * STATE_DISCONNECTED racing a notify-failure teardown) is a no-op rather
+     * than re-running cleanup and re-firing [onCentralDisconnected].
      */
     private fun tearDownLink(address: String, reason: String) {
+        if (address !in connectedDevices) return
         Log.i(TAG, "tearDownLink: $address ($reason)")
         connectedDevices.remove(address)
         negotiatedMtu.remove(address)
         reassemblers.remove(address)
         notifyQueues.remove(address)
         notifyInFlight.remove(address)
+        notifyFrameStarted.remove(address)
+        inFlightFragment.remove(address)
+        notifyFailures.clear(address)
         onCentralDisconnected(address)
         // A link just dropped; make sure we're advertising again so this peer
         // stays reachable. No-ops if advertising is already up.

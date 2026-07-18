@@ -225,6 +225,16 @@ class MeshService : Service() {
     private var lanTransport: LanTransport? = null
     private val lanHealthTracker = LanHealthTracker()
     private val lanProbeNonce = AtomicLong(System.nanoTime())
+
+    /**
+     * Holds a LAN endpoint hint that arrived on a link before that address's
+     * HELLO (DESIGN.md §5.2/§7.2) registered its userId with [MeshRouter] --
+     * ordinary frame reordering, or the BLE congestion burst
+     * [BlePeripheral]'s notify-failure tolerance now survives instead of
+     * misreading as a dead link (Pixel 10 Pro field log, 2026-07-17). See
+     * [handleLanEndpointHint] (stashes) and [handleHello] (replays).
+     */
+    private val pendingLanHints = PendingLanHintHold()
     /**
      * The network relay traffic is pinned to: the best network with validated
      * internet, as granted by [ConnectivityManager.requestNetwork]. The system
@@ -1204,6 +1214,7 @@ class MeshService : Service() {
 
     private fun onCentralPeerDisconnected(address: String) {
         MeshRouter.onDisconnected(address)
+        pendingLanHints.clear(address)
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
     }
 
@@ -1214,6 +1225,7 @@ class MeshService : Service() {
 
     private fun onPeripheralCentralDisconnected(address: String) {
         MeshRouter.onDisconnected(address)
+        pendingLanHints.clear(address)
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
     }
 
@@ -1317,7 +1329,14 @@ class MeshService : Service() {
     private fun handleLanEndpointHint(address: String, hint: Frame.LanEndpoint) {
         if (MeshRouter.transportFor(address) == MeshRouterState.Transport.LAN) return
         val peerUserId = MeshRouter.userIdFor(address) ?: run {
-            Log.w(TAG, "Dropping LAN endpoint hint before HELLO from $address")
+            // The frame-reordering (or notify-congestion) race this log
+            // message used to describe permanently as a drop: HELLO hasn't
+            // registered this address's userId yet. Hold the hint instead --
+            // handleHello replays it the moment this address does HELLO, and
+            // onCentralPeerDisconnected/onPeripheralCentralDisconnected clear
+            // it if the link dies first.
+            Log.i(TAG, "Holding LAN endpoint hint from $address until HELLO")
+            pendingLanHints.stash(address, hint)
             return
         }
         if (store.getContact(peerUserId) == null) {
@@ -1453,6 +1472,15 @@ class MeshService : Service() {
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
         MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(userId), System.currentTimeMillis())
         Log.i(TAG, "HELLO from $address: userId=${UserIdHex.encode(userId)}")
+
+        // A LAN endpoint hint that arrived on this address before this HELLO
+        // (see handleLanEndpointHint) is now resolvable -- replay it through
+        // the normal path instead of leaving the same-Wi-Fi introduction
+        // lost for the rest of the connection.
+        pendingLanHints.take(address)?.let { hint ->
+            Log.i(TAG, "Replaying held LAN endpoint hint from $address")
+            handleLanEndpointHint(address, hint)
+        }
 
         // Hand off anything we're muling for this peer (DESIGN.md §5.3 carry
         // queue) before the digest sync. This runs for *any* peer, contact or
