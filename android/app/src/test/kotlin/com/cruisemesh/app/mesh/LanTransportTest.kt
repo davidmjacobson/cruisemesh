@@ -74,4 +74,39 @@ class LanTransportTest {
         assertNull(parseLanManualEndpoint("10.0.0.2:not-a-port", 45_892))
         assertNull(parseLanManualEndpoint("10.0.0.2:70000", 45_892))
     }
+
+    @Test
+    fun `automatic subnet fallback runs only while LAN discovery is idle`() {
+        assertTrue(shouldRunAutomaticLanScan(0, 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(0, 1, 0))
+        assertTrue(!shouldRunAutomaticLanScan(0, 0, 12))
+    }
+
+    @Test
+    fun `automatic subnet fallback gate rejects when every busy signal is set`() {
+        assertTrue(!shouldRunAutomaticLanScan(2, 3, 41))
+    }
+
+    @Test
+    fun `automatic subnet fallback gate treats one remaining scan host as busy`() {
+        assertTrue(!shouldRunAutomaticLanScan(0, 0, 1))
+    }
+
+    @Test
+    fun `authenticated scan endpoints are retained but unrelated TCP services are not`() {
+        assertTrue(shouldRetainLanReconnectTarget("scan:10.0.0.2", wasAuthenticated = true))
+        assertTrue(!shouldRetainLanReconnectTarget("scan:10.0.0.3", wasAuthenticated = false))
+        assertTrue(shouldRetainLanReconnectTarget("manual:10.0.0.4", wasAuthenticated = false))
+        assertTrue(shouldRetainLanReconnectTarget("cache:friend:10.0.0.5", wasAuthenticated = false))
+    }
+
+    @Test
+    fun `reconnect target retention only special-cases the scan colon prefix`() {
+        // "scanner:" starts with "scan" but not the "scan:" service-key prefix
+        // this function actually gates on; it must not be swept up as noise.
+        assertTrue(shouldRetainLanReconnectTarget("scanner:10.0.0.6", wasAuthenticated = false))
+        assertTrue(!shouldRetainLanReconnectTarget("scan:", wasAuthenticated = false))
+        assertTrue(shouldRetainLanReconnectTarget("scan:", wasAuthenticated = true))
+    }
 }
