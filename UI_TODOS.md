@@ -12,6 +12,35 @@ must exist but live behind Advanced. When a change forces a choice between
 capability on the surface and simplicity on the surface, pick simplicity and move
 the capability behind one more tap.
 
+## 0. Completion record
+
+Implementation status: **U1-U13 complete** on the merged UI wave plus the
+`agent/ui-todos-completion` follow-up. The follow-up closes the audit gaps that
+were not actually end-to-end in the first wave: group attachment transport,
+group rename/add-member convergence, and localization resources/CI enforcement.
+
+| Item | Status | Shipped outcome |
+|---|---|---|
+| U1 | ✅ Complete | Simple settings surface with the LAN/relay/debug controls under Advanced |
+| U2 | ✅ Complete | iOS reachability dots, status copy, details, group summary, and decay clock |
+| U3 | ✅ Complete | iOS Files/share-sheet backup and restore with Android-compatible fixtures |
+| U4 | ✅ Complete | Group photo/voice composition plus attachment encryption, receive, notification, and fan-out support |
+| U5 | ✅ Complete | Expiry-aware delivery status and truthful message-info copy |
+| U6 | ✅ Complete | Actionable notifications and local per-chat mute state |
+| U7 | ✅ Complete | Conflict-safe group rename, add members, upgraded member rows, and kind-19 protocol spec |
+| U8 | ✅ Complete | Persistent drafts, list actions/animation, group navigation, and send haptics |
+| U9 | ✅ Complete | iOS hold-to-record voice memo flow |
+| U10 | ✅ Complete | Structured message-info sheets and compact tick help |
+| U11 | ✅ Complete | Android resources/plurals, iOS string catalog, and a hardcoded-string CI guard |
+| U12 | ✅ Complete | Onboarding restore and small-screen hierarchy polish |
+| U13 | ✅ Complete | Destructive styling, empty-state, casing, and Legal cleanup |
+
+Validation evidence for the completion follow-up: 254 Rust core tests and 8 mesh
+simulations pass; the Android clean debug unit-test task passes; a debug APK with
+arm64-v8a, armeabi-v7a, and x86_64 native cores assembles successfully; and the
+localization guard passes. iOS simulator validation is performed on the configured
+macOS validation host before release publishing.
+
 ---
 
 ## 1. Current state
