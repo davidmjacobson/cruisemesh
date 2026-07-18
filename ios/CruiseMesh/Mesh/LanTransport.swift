@@ -17,20 +17,26 @@ final class LanTransport {
     private let identity: Identity
     private let trustedPeerForStaticKey: TrustedPeerLookup
     private let diagnostics = LanTransportDiagnostics.shared
+    private let scanPlanner = LanScanPlanner()
     private let instanceToken: Data
     private let instanceTokenString: String
 
     private var started = false
+    private var foregroundActive = true
     private var listener: NWListener?
     private var browser: NWBrowser?
+    private var wifiPathMonitor: NWPathMonitor?
+    private var activeNetwork: LocalWifiIPv4Network?
+    private var announcedEndpoint: LanManualEndpoint?
+    private var announcedNetworkId: String?
     private var connections: [String: LanConnection] = [:]
     private var discoveredEndpoints: [String: NWEndpoint] = [:]
     private var bonjourServiceKeys = Set<String>()
     private var outboundAddresses: [String: String] = [:]
     private var reconnectAttempts: [String: Int] = [:]
-    private var scanGeneration: UUID?
-    private var scanCandidates: [String] = []
+    private var runningScan: RunningScan?
     private var scanConnections: [UUID: NWConnection] = [:]
+    private var automaticScanWorkItem: DispatchWorkItem?
 
     init(identity: Identity, trustedPeerForStaticKey: @escaping TrustedPeerLookup) {
         self.identity = identity
@@ -41,12 +47,28 @@ final class LanTransport {
         instanceTokenString = token.map { String(format: "%02x", $0) }.joined()
     }
 
-    func start() {
+    func start(foregroundActive: Bool = true) {
         queue.async { [weak self] in
             guard let self, !started else { return }
             started = true
+            self.foregroundActive = foregroundActive
             startListener(preferDefaultPort: true)
             startBrowser()
+            startWifiPathMonitor()
+        }
+    }
+
+    func setForegroundActive(_ active: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            foregroundActive = active
+            if active {
+                scheduleAutomaticScan(after: .milliseconds(0))
+            } else {
+                automaticScanWorkItem?.cancel()
+                automaticScanWorkItem = nil
+                cancelRunningScan()
+            }
         }
     }
 
@@ -60,10 +82,15 @@ final class LanTransport {
             browser = nil
             listener?.cancel()
             listener = nil
-            scanGeneration = nil
-            scanCandidates.removeAll()
-            scanConnections.values.forEach { $0.cancel() }
-            scanConnections.removeAll()
+            wifiPathMonitor?.cancel()
+            wifiPathMonitor = nil
+            automaticScanWorkItem?.cancel()
+            automaticScanWorkItem = nil
+            cancelRunningScan(updateDiagnostics: false)
+            scanPlanner.onNetworkLost()
+            activeNetwork = nil
+            announcedEndpoint = nil
+            announcedNetworkId = nil
             discoveredEndpoints.removeAll()
             bonjourServiceKeys.removeAll()
             outboundAddresses.removeAll()
@@ -86,12 +113,17 @@ final class LanTransport {
     func connect(_ endpoint: LanManualEndpoint, remoteInstanceToken: Data? = nil, manual: Bool = false) {
         queue.async { [weak self] in
             guard let self, started else { return }
-            if let remoteInstanceToken,
-               !shouldInitiateLanConnection(
+            if let remoteInstanceToken {
+                scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
+                if !shouldInitiateLanConnection(
                     localToken: instanceTokenString,
                     remoteToken: remoteInstanceToken.map { String(format: "%02x", $0) }.joined()
-               ) {
-                return
+                ) {
+                    log.info(
+                        "Resolved LAN peer \(endpoint.display, privacy: .public); awaiting their connection (tie-break)"
+                    )
+                    return
+                }
             }
             let key = "endpoint:\(endpoint.display)"
             let networkEndpoint = NWEndpoint.hostPort(
@@ -112,23 +144,15 @@ final class LanTransport {
     }
 
     func startSubnetScan() -> String? {
-        guard let localAddress = localWifiIPv4Address() else {
+        guard let network = localWifiIPv4Network() else {
             return "Connect this phone to Wi-Fi before searching the local subnet"
         }
-        let candidates = subnet24Hosts(localAddress: localAddress)
-        guard !candidates.isEmpty else { return "CruiseMesh could not determine the local /24 network" }
-        queue.async { [weak self] in
-            guard let self, started else { return }
-            scanGeneration = UUID()
-            scanCandidates = candidates
-            scanConnections.values.forEach { $0.cancel() }
-            scanConnections.removeAll()
-            diagnostics.scanStarted(total: candidates.count)
-            for _ in 0..<Self.scanConcurrency {
-                startNextScanCandidate(generation: scanGeneration!)
-            }
+        return queue.sync {
+            guard started else { return "Start the mesh before searching the local subnet" }
+            guard foregroundActive else { return "Return to CruiseMesh before searching the local subnet" }
+            guard runningScan == nil else { return "A local subnet search is already running" }
+            return startSubnetScan(.fullSubnet, network: network, automatic: false)
         }
-        return nil
     }
 
     private func startListener(preferDefaultPort: Bool) {
@@ -187,12 +211,10 @@ final class LanTransport {
         case .ready:
             if let port = failedListener.port {
                 log.info("Listening for CruiseMesh LAN peers on TCP \(port.rawValue)")
-                let endpoint = localWifiIPv4Address().map {
-                    LanManualEndpoint(host: $0, port: port.rawValue)
-                }
-                diagnostics.listening(localEndpoint: endpoint?.display)
-                if let endpoint {
-                    onNetworkReady?(endpoint, instanceToken, lanNetworkId(ipv4Address: endpoint.host))
+                if let network = localWifiIPv4Network() {
+                    networkBecameAvailable(network)
+                } else {
+                    diagnostics.listening(localEndpoint: nil)
                 }
             }
         case .failed(let error):
@@ -215,7 +237,7 @@ final class LanTransport {
 
     private func startBrowser() {
         let newBrowser = NWBrowser(
-            for: .bonjour(type: appleLanServiceType(), domain: nil),
+            for: .bonjourWithTXTRecord(type: appleLanServiceType(), domain: nil),
             using: lanParameters()
         )
         browser = newBrowser
@@ -225,21 +247,108 @@ final class LanTransport {
             }
         }
         newBrowser.stateUpdateHandler = { [weak self] state in
-            if case .failed(let error) = state {
-                self?.log.warning(
-                    "LAN discovery failed: \(String(describing: error), privacy: .public)"
+            switch state {
+            case .failed(let error):
+                self?.log.warning("LAN discovery failed: \(String(describing: error), privacy: .public)")
+                self?.diagnostics.connectionFailed(
+                    "Bonjour",
+                    reason: "Local Wi-Fi discovery is unavailable; check Local Network permission"
                 )
+            case .waiting(let error):
+                self?.log.debug("LAN discovery waiting: \(String(describing: error), privacy: .public)")
+            default:
+                break
             }
         }
         newBrowser.start(queue: queue)
+    }
+
+    private func startWifiPathMonitor() {
+        let monitor = NWPathMonitor(requiredInterfaceType: .wifi)
+        wifiPathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            queue.async { [weak self] in
+                guard let self, started else { return }
+                if path.status == .satisfied, let network = localWifiIPv4Network() {
+                    networkBecameAvailable(network)
+                } else {
+                    networkBecameUnavailable()
+                }
+            }
+        }
+        monitor.start(queue: queue)
+    }
+
+    private func networkBecameAvailable(_ network: LocalWifiIPv4Network) {
+        let changed = activeNetwork != network
+        if changed {
+            if activeNetwork != nil {
+                tearDownNetworkLinks()
+            }
+            cancelRunningScan()
+            activeNetwork = network
+            announcedEndpoint = nil
+            announcedNetworkId = nil
+            scanPlanner.onNetworkJoined(nowMs: Self.nowMs)
+            scheduleAutomaticScan(after: Self.initialAutomaticScanDelay)
+        }
+        guard let port = listener?.port else { return }
+        let endpoint = LanManualEndpoint(host: network.address, port: port.rawValue)
+        let networkId = lanNetworkId(ipv4Address: network.address)
+        diagnostics.listening(localEndpoint: endpoint.display)
+        if endpoint != announcedEndpoint || networkId != announcedNetworkId {
+            announcedEndpoint = endpoint
+            announcedNetworkId = networkId
+            log.info("LAN session ready on \(endpoint.display, privacy: .public)")
+            onNetworkReady?(endpoint, instanceToken, networkId)
+        }
+    }
+
+    private func networkBecameUnavailable() {
+        guard activeNetwork != nil else { return }
+        activeNetwork = nil
+        announcedEndpoint = nil
+        announcedNetworkId = nil
+        scanPlanner.onNetworkLost()
+        automaticScanWorkItem?.cancel()
+        automaticScanWorkItem = nil
+        cancelRunningScan(updateDiagnostics: false)
+        tearDownNetworkLinks()
+        diagnostics.waitingForWifi()
+    }
+
+    private func tearDownNetworkLinks() {
+        discoveredEndpoints.removeAll()
+        bonjourServiceKeys.removeAll()
+        outboundAddresses.removeAll()
+        reconnectAttempts.removeAll()
+        let active = Array(connections.values)
+        connections.removeAll()
+        for link in active {
+            link.close(notifyOwner: false)
+            if link.wasAuthenticated {
+                onDisconnected?(link.address)
+            }
+        }
     }
 
     private func updateDiscoveredServices(_ results: Set<NWBrowser.Result>) {
         guard started else { return }
         var current: [String: NWEndpoint] = [:]
         for result in results {
-            guard case let .service(name, _, _, _) = result.endpoint else { continue }
-            guard shouldInitiateLanConnection(localToken: instanceTokenString, remoteToken: name) else {
+            guard case let .service(_, _, _, _) = result.endpoint,
+                  case let .bonjour(txtRecord) = result.metadata,
+                  let remoteToken = lanBonjourPeerToken(txtRecord.dictionary),
+                  remoteToken != instanceTokenString else { continue }
+            scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
+            guard shouldInitiateLanConnection(
+                localToken: instanceTokenString,
+                remoteToken: remoteToken
+            ) else {
+                log.info(
+                    "Resolved LAN peer \(String(describing: result.endpoint), privacy: .public); awaiting their connection (tie-break)"
+                )
                 continue
             }
             let key = serviceKey(result.endpoint)
@@ -315,6 +424,7 @@ final class LanTransport {
             reconnectAttempts[serviceKey] = 0
         }
         onAuthenticated?(link.address, userId)
+        scheduleAutomaticScan(after: Self.automaticScanRetryInterval)
     }
 
     fileprivate func connectionReceivedFrame(_ link: LanConnection, frame: Data) {
@@ -359,12 +469,54 @@ final class LanTransport {
         }
         if link.wasAuthenticated {
             onDisconnected?(link.address)
+            scheduleAutomaticScan(after: Self.reconnectAutomaticScanDelay)
         }
     }
 
+    private func startSubnetScan(
+        _ breadth: LanScanBreadth,
+        network: LocalWifiIPv4Network,
+        automatic: Bool
+    ) -> String? {
+        guard runningScan == nil else { return "A local subnet search is already running" }
+        guard !automatic || foregroundActive else { return "Automatic scans run only in the foreground" }
+        let prefixLength = breadth == .fullSubnet
+            ? network.prefixLength
+            : max(network.prefixLength, defaultLanScanPrefixLength)
+        let effectivePrefix = effectiveLanScanPrefixLength(prefixLength)
+        let candidates = lanSubnetHosts(
+            localAddress: network.address,
+            prefixLength: effectivePrefix
+        ).shuffled()
+        guard !candidates.isEmpty else { return "CruiseMesh could not determine the local subnet" }
+        let generation = UUID()
+        runningScan = RunningScan(
+            generation: generation,
+            breadth: breadth,
+            prefixLength: effectivePrefix,
+            candidates: candidates,
+            nextCandidateIndex: 0,
+            remaining: candidates.count
+        )
+        log.info(
+            "Scanning \(candidates.count) subnet hosts (/\(effectivePrefix)) for CruiseMesh peers"
+        )
+        diagnostics.scanStarted(total: candidates.count)
+        for _ in 0..<min(Self.scanConcurrency, candidates.count) {
+            startNextScanCandidate(generation: generation)
+        }
+        return nil
+    }
+
     private func startNextScanCandidate(generation: UUID) {
-        guard started, scanGeneration == generation, !scanCandidates.isEmpty else { return }
-        let host = scanCandidates.removeFirst()
+        guard started,
+              foregroundActive,
+              var scan = runningScan,
+              scan.generation == generation,
+              scan.nextCandidateIndex < scan.candidates.count else { return }
+        let host = scan.candidates[scan.nextCandidateIndex]
+        scan.nextCandidateIndex += 1
+        runningScan = scan
         guard let port = NWEndpoint.Port(rawValue: lanDefaultTcpPort()) else { return }
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: port)
         let connection = NWConnection(to: endpoint, using: lanParameters())
@@ -374,7 +526,9 @@ final class LanTransport {
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let self, let connection else { return }
             queue.async { [weak self] in
-                guard let self, !completed, self.scanGeneration == generation else { return }
+                guard let self,
+                      !completed,
+                      self.runningScan?.generation == generation else { return }
                 switch state {
                 case .ready:
                     completed = true
@@ -384,14 +538,12 @@ final class LanTransport {
                     let key = "scan:\(host):\(lanDefaultTcpPort())"
                     self.discoveredEndpoints[key] = endpoint
                     self.connect(to: endpoint, serviceKey: key)
-                    self.diagnostics.scanAdvanced()
-                    self.startNextScanCandidate(generation: generation)
+                    self.scanCandidateCompleted(generation: generation)
                 case .failed, .cancelled:
                     completed = true
                     connection.cancel()
                     self.scanConnections.removeValue(forKey: id)
-                    self.diagnostics.scanAdvanced()
-                    self.startNextScanCandidate(generation: generation)
+                    self.scanCandidateCompleted(generation: generation)
                 default:
                     break
                 }
@@ -399,13 +551,68 @@ final class LanTransport {
         }
         connection.start(queue: queue)
         queue.asyncAfter(deadline: .now() + Self.scanTimeout) { [weak self, weak connection] in
-            guard let self, let connection, !completed, scanGeneration == generation else { return }
+            guard let self,
+                  let connection,
+                  !completed,
+                  runningScan?.generation == generation else { return }
             completed = true
             connection.cancel()
             scanConnections.removeValue(forKey: id)
-            diagnostics.scanAdvanced()
+            scanCandidateCompleted(generation: generation)
+        }
+    }
+
+    private func scanCandidateCompleted(generation: UUID) {
+        guard var scan = runningScan, scan.generation == generation else { return }
+        scan.remaining = max(scan.remaining - 1, 0)
+        diagnostics.scanAdvanced()
+        if scan.remaining == 0 {
+            runningScan = nil
+            scanPlanner.onScanCompleted(scan.breadth)
+            log.info(
+                "Sweep complete (/\(scan.prefixLength)): \(scan.candidates.count) probed."
+            )
+            if scan.breadth == .local24 {
+                scheduleAutomaticScan(after: Self.escalateAutomaticScanDelay)
+            }
+        } else {
+            runningScan = scan
             startNextScanCandidate(generation: generation)
         }
+    }
+
+    private func cancelRunningScan(updateDiagnostics: Bool = true) {
+        guard runningScan != nil || !scanConnections.isEmpty else { return }
+        runningScan = nil
+        scanConnections.values.forEach { $0.cancel() }
+        scanConnections.removeAll()
+        if updateDiagnostics {
+            diagnostics.scanCancelled()
+        }
+    }
+
+    private func scheduleAutomaticScan(after delay: DispatchTimeInterval) {
+        automaticScanWorkItem?.cancel()
+        guard started, activeNetwork != nil, foregroundActive else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.runAutomaticScanCheck()
+        }
+        automaticScanWorkItem = work
+        queue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func runAutomaticScanCheck() {
+        automaticScanWorkItem = nil
+        guard started, foregroundActive, let network = activeNetwork else { return }
+        if shouldRunAutomaticLanScan(
+            activeConnections: connections.count,
+            outboundAttempts: outboundAddresses.count,
+            scanRemaining: runningScan?.remaining ?? 0
+        ), let breadth = scanPlanner.takeDueScan(nowMs: Self.nowMs) {
+            log.info("Starting automatic local Wi-Fi fallback search (\(String(describing: breadth)))")
+            _ = startSubnetScan(breadth, network: network, automatic: true)
+        }
+        scheduleAutomaticScan(after: Self.automaticScanRetryInterval)
     }
 
     private func lanParameters() -> NWParameters {
@@ -419,8 +626,25 @@ final class LanTransport {
     private static let reconnectDelays: [DispatchTimeInterval] = [
         .seconds(2), .seconds(5), .seconds(15), .seconds(30), .seconds(60), .seconds(300),
     ]
-    private static let scanConcurrency = 8
+    private static let scanConcurrency = 64
     private static let scanTimeout: DispatchTimeInterval = .milliseconds(350)
+    private static let initialAutomaticScanDelay: DispatchTimeInterval = .seconds(5)
+    private static let reconnectAutomaticScanDelay: DispatchTimeInterval = .seconds(2)
+    private static let escalateAutomaticScanDelay: DispatchTimeInterval = .seconds(2)
+    private static let automaticScanRetryInterval: DispatchTimeInterval = .seconds(5 * 60)
+
+    private static var nowMs: Int64 {
+        Int64(Date().timeIntervalSince1970 * 1_000)
+    }
+
+    private struct RunningScan {
+        let generation: UUID
+        let breadth: LanScanBreadth
+        let prefixLength: Int
+        let candidates: [String]
+        var nextCandidateIndex: Int
+        var remaining: Int
+    }
 }
 
 private final class LanConnection {
@@ -632,6 +856,21 @@ func appleLanServiceType() -> String {
 
 func shouldInitiateLanConnection(localToken: String, remoteToken: String) -> Bool {
     localToken != remoteToken && localToken < remoteToken
+}
+
+func lanBonjourPeerToken(_ txtRecord: [String: String]) -> String? {
+    guard txtRecord["v"] == "1",
+          let token = txtRecord["i"],
+          !token.isEmpty else { return nil }
+    return token
+}
+
+func shouldRunAutomaticLanScan(
+    activeConnections: Int,
+    outboundAttempts: Int,
+    scanRemaining: Int
+) -> Bool {
+    activeConnections == 0 && outboundAttempts == 0 && scanRemaining == 0
 }
 
 private func serviceKey(_ endpoint: NWEndpoint) -> String {

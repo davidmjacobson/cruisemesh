@@ -225,7 +225,16 @@ final class LanTransportDiagnostics: ObservableObject {
             let progress = min((next.scanProgress ?? 0) + 1, total)
             next.scanProgress = progress == total ? nil : progress
             next.scanTotal = progress == total ? nil : total
-            if progress == total { next.probeStatus = "Local /24 search finished" }
+            if progress == total { next.probeStatus = "Local subnet search finished" }
+            return next
+        }
+    }
+
+    func scanCancelled() {
+        publish {
+            var next = $0
+            next.scanProgress = nil
+            next.scanTotal = nil
             return next
         }
     }

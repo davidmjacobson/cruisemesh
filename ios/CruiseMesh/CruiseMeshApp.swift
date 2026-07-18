@@ -3,6 +3,7 @@ import UserNotifications
 
 @main
 struct CruiseMeshApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var appModel = AppModel()
     @State private var onboardingCompleted = OnboardingStore.isCompleted()
 
@@ -32,6 +33,9 @@ struct CruiseMeshApp: App {
                     LanTransportDiagnostics.shared.queueManualConnection(endpoint)
                     appModel.startMesh()
                 }
+            }
+            .onChange(of: scenePhase) { phase in
+                appModel.setAppForeground(phase == .active)
             }
         }
     }
