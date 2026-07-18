@@ -358,6 +358,10 @@ A deliberately dumb mailbox:
 - Phones poll it whenever internet appears and also push all queued outbound —
   including envelopes they're muling for family members, which is how one phone with
   a Wi-Fi package uplinks the whole family.
+- A phone that catches shore cellular (e.g. 5G near a balcony) while staying on the
+  ship LAN is the same uplink with no Wi-Fi package at all — binding relay traffic
+  to the cellular network per-socket while the LAN transport keeps using Wi-Fi. See
+  [`specs/cellular-gateway.md`](specs/cellular-gateway.md).
 
 ---
 
