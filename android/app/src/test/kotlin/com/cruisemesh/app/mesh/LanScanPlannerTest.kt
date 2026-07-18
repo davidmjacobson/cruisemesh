@@ -105,4 +105,39 @@ class LanScanPlannerTest {
         planner.onScanCompleted(LanScanBreadth.LOCAL_24)
         assertEquals(LanScanBreadth.FULL_SUBNET, planner.takeDueScan(rejoinAt + 2_000))
     }
+
+    @Test
+    fun isolationDefersTheFullSweepToTheCapUntilPeerEvidenceResetsIt() {
+        val planner = LanScanPlanner(localIntervalMs = Long.MAX_VALUE / 2)
+        planner.onNetworkJoined(0)
+        assertEquals(LanScanBreadth.LOCAL_24, planner.takeDueScan(0))
+        planner.onScanCompleted(LanScanBreadth.LOCAL_24)
+
+        val isolationAt = 10_000L
+        planner.onIsolationSuspected(isolationAt)
+        assertNull(planner.takeDueScan(isolationAt + 4 * 60 * minute - 1))
+        assertEquals(
+            LanScanBreadth.FULL_SUBNET,
+            planner.takeDueScan(isolationAt + 4 * 60 * minute),
+        )
+
+        val evidenceAt = isolationAt + 4 * 60 * minute + 1_000
+        planner.onIsolationSuspected(evidenceAt)
+        planner.onPeerEvidence(evidenceAt + 1_000)
+        assertEquals(LanScanBreadth.FULL_SUBNET, planner.takeDueScan(evidenceAt + 1_000))
+    }
+
+    @Test
+    fun networkJoinResetsAnIsolationDeferral() {
+        val planner = LanScanPlanner()
+        planner.onNetworkJoined(0)
+        planner.takeDueScan(0)
+        planner.onScanCompleted(LanScanBreadth.LOCAL_24)
+        planner.onIsolationSuspected(1_000)
+
+        planner.onNetworkJoined(2_000)
+        assertEquals(LanScanBreadth.LOCAL_24, planner.takeDueScan(2_000))
+        planner.onScanCompleted(LanScanBreadth.LOCAL_24)
+        assertEquals(LanScanBreadth.FULL_SUBNET, planner.takeDueScan(3_000))
+    }
 }
