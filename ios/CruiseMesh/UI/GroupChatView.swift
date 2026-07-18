@@ -30,12 +30,14 @@ struct GroupChatView: View {
     @State private var statusMessage: String?
     @State private var viewedPhoto: ViewedPhoto?
     @State private var isMuted = false
+    @State private var updatedGroup: Group?
 
     private let store = AppStore.get()
     private var sender: GroupSender { GroupSender(store: store, identity: identity) }
+    private var activeGroup: Group { updatedGroup ?? group }
 
     private var reachableMemberSummary: String {
-        let others = group.memberUserIds.filter { $0 != identity.userId }
+        let others = activeGroup.memberUserIds.filter { $0 != identity.userId }
         let count = others.count {
             let level = connectivity.level(for: $0, nowMs: connectivityClock.nowMs)
             return level == .nearby || level == .onlineRelay
@@ -81,7 +83,7 @@ struct GroupChatView: View {
                                 GroupMessageRow(
                                     message: message,
                                     isOwn: message.senderUserId == identity.userId,
-                                    groupName: group.name,
+                                    groupName: activeGroup.name,
                                     senderLabel: senderLabel(at: index),
                                     contactColor: messageColor,
                                     quoted: replyMetadata[replyKey]?.quoted,
@@ -174,15 +176,15 @@ struct GroupChatView: View {
             .padding(12)
             .background(.bar)
         }
-        .navigationTitle(group.name)
+        .navigationTitle(activeGroup.name)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
                 Button { showDetails = true } label: {
                     HStack {
-                        AvatarView(userId: group.id, name: group.name, size: 32, isGroup: true)
+                        AvatarView(userId: activeGroup.id, name: activeGroup.name, size: 32, isGroup: true)
                         VStack(alignment: .leading) {
-                            Text(group.name)
+                            Text(activeGroup.name)
                                 .font(.headline)
                             Text("\(reachableMemberSummary) · tap for details")
                                 .font(.caption2)
@@ -194,19 +196,20 @@ struct GroupChatView: View {
             }
         }
         .onAppear {
-            draft = DraftStore.load(chatId: group.id)
-            isMuted = ChatMuteStore.isMuted(group.id)
-            ChatVisibility.setVisible(group.id)
-            MeshController.shared.notifyChatViewed(chatId: group.id)
+            updatedGroup = (try? store.getGroup(groupId: group.id)) ?? group
+            draft = DraftStore.load(chatId: activeGroup.id)
+            isMuted = ChatMuteStore.isMuted(activeGroup.id)
+            ChatVisibility.setVisible(activeGroup.id)
+            MeshController.shared.notifyChatViewed(chatId: activeGroup.id)
             loadContacts()
             reload()
             cancellable = ChatEvents.subject.sink { chatId in
-                if chatId == group.id { reload() }
+                if chatId == activeGroup.id { reload() }
             }
         }
         .onDisappear {
-            ChatVisibility.clearVisible(group.id)
-            ChatEvents.notifyChatChanged(group.id)
+            ChatVisibility.clearVisible(activeGroup.id)
+            ChatEvents.notifyChatChanged(activeGroup.id)
             voiceRecorder.cancel()
         }
         .onChange(of: photoItem) { item in
@@ -221,7 +224,7 @@ struct GroupChatView: View {
                 photoItem = nil
             }
         }
-        .onChange(of: draft) { DraftStore.save(chatId: group.id, text: $0) }
+        .onChange(of: draft) { DraftStore.save(chatId: activeGroup.id, text: $0) }
         .sheet(isPresented: $showCamera) {
             CameraPicker { image in
                 if let jpeg = MediaCompressor.compress(image: image) {
@@ -274,13 +277,27 @@ struct GroupChatView: View {
         }
         .sheet(isPresented: $showDetails) {
             GroupDetailsSheet(
-                group: group,
+                group: activeGroup,
+                identity: identity,
+                contacts: Array(contactsById.values),
+                connectivity: connectivity,
+                nowMs: connectivityClock.nowMs,
                 nameForMember: senderName,
                 isMuted: isMuted,
                 onMutedChange: {
                     isMuted = $0
-                    ChatMuteStore.setMuted($0, chatId: group.id)
-                    ChatEvents.notifyChatChanged(group.id)
+                    ChatMuteStore.setMuted($0, chatId: activeGroup.id)
+                    ChatEvents.notifyChatChanged(activeGroup.id)
+                },
+                onRename: { name in
+                    guard let changed = sender.renameGroup(group: activeGroup, name: name) else { return false }
+                    updatedGroup = changed
+                    return true
+                },
+                onAddMembers: { contacts in
+                    guard let changed = sender.addMembers(group: activeGroup, additions: contacts) else { return false }
+                    updatedGroup = changed
+                    return true
                 }
             ) {
                 showDetails = false
@@ -298,9 +315,9 @@ struct GroupChatView: View {
         } message: {
             Text(statusMessage ?? "")
         }
-        .alert("Delete \(group.name)?", isPresented: $confirmDelete) {
+        .alert("Delete \(activeGroup.name)?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) {
-                _ = try? store.deleteGroup(groupId: group.id)
+                _ = try? store.deleteGroup(groupId: activeGroup.id)
                 dismiss()
             }
             Button("Cancel", role: .cancel) {}
@@ -318,7 +335,7 @@ struct GroupChatView: View {
         let replyToMsgId = replyingTo.flatMap { replyMetadata[replyMessageKey($0)]?.msgId }
         if let photo = pendingPhoto {
             sender.sendAttachment(
-                group: group,
+                group: activeGroup,
                 attachment: AttachmentPayload(
                     mediaType: .image,
                     mimeType: "image/jpeg",
@@ -331,7 +348,7 @@ struct GroupChatView: View {
             pendingPhoto = nil
         } else {
             guard !text.isEmpty else { return }
-            sender.sendText(group: group, text: text, replyToMsgId: replyToMsgId)
+            sender.sendText(group: activeGroup, text: text, replyToMsgId: replyToMsgId)
         }
         draft = ""
         replyingTo = nil
@@ -350,7 +367,7 @@ struct GroupChatView: View {
             return
         }
         sender.sendAttachment(
-            group: group,
+            group: activeGroup,
             attachment: AttachmentPayload(
                 mediaType: .audio,
                 mimeType: "audio/mp4",
@@ -402,7 +419,7 @@ struct GroupChatView: View {
     }
 
     private func reload() {
-        let loadedMessages = (try? store.messagesForChat(chatId: group.id)) ?? []
+        let loadedMessages = (try? store.messagesForChat(chatId: activeGroup.id)) ?? []
         messages = loadedMessages
         replyMetadata = loadMessageReplyMetadata(
             store: store,
@@ -410,7 +427,10 @@ struct GroupChatView: View {
         ) { message in
             senderName(message.senderUserId)
         }
-        MeshController.shared.notifyChatViewed(chatId: group.id)
+        MeshController.shared.notifyChatViewed(chatId: activeGroup.id)
+        if let stored = try? store.getGroup(groupId: activeGroup.id) {
+            updatedGroup = stored
+        }
     }
 
     private func sendReaction(to message: StoredMessage, emoji: String) {
@@ -422,7 +442,7 @@ struct GroupChatView: View {
         let existingOwn = reactions[target.stableKey]?.contains {
             $0.emoji == emoji && $0.reactedByOwnUser
         } ?? false
-        sender.sendReaction(group: group, target: target, emoji: existingOwn ? "" : emoji)
+        sender.sendReaction(group: activeGroup, target: target, emoji: existingOwn ? "" : emoji)
         reload()
     }
 }
@@ -560,11 +580,28 @@ private struct GroupMessageRow: View {
 
 private struct GroupDetailsSheet: View {
     let group: Group
+    let identity: Identity
+    let contacts: [Contact]
+    @ObservedObject var connectivity: MeshConnectivityStatus
+    let nowMs: Int64
     let nameForMember: (Data) -> String
     let isMuted: Bool
     let onMutedChange: (Bool) -> Void
+    let onRename: (String) -> Bool
+    let onAddMembers: ([Contact]) -> Bool
     let onDelete: () -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var showRename = false
+    @State private var renameDraft = ""
+    @State private var showAddMembers = false
+    @State private var selectedMemberIds = Set<Data>()
+    @State private var actionError: String?
+
+    private var availableContacts: [Contact] {
+        contacts
+            .filter { !group.memberUserIds.contains($0.userId) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
 
     var body: some View {
         NavigationStack {
@@ -576,10 +613,31 @@ private struct GroupDetailsSheet: View {
                         get: { isMuted },
                         set: onMutedChange
                     ))
+                    Button("Rename group") {
+                        renameDraft = group.name
+                        actionError = nil
+                        showRename = true
+                    }
+                    Button("Add members") {
+                        selectedMemberIds = []
+                        actionError = nil
+                        showAddMembers = true
+                    }
+                    .disabled(availableContacts.isEmpty)
                 }
                 Section("Members") {
                     ForEach(group.memberUserIds, id: \.self) { memberId in
-                        Text(nameForMember(memberId))
+                        HStack(spacing: 12) {
+                            AvatarView(
+                                userId: memberId,
+                                name: nameForMember(memberId),
+                                size: 36,
+                                reachability: memberId == identity.userId
+                                    ? nil
+                                    : connectivity.level(for: memberId, nowMs: nowMs)
+                            )
+                            Text(memberId == identity.userId ? "You" : nameForMember(memberId))
+                        }
                     }
                 }
                 Section {
@@ -590,6 +648,89 @@ private struct GroupDetailsSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
+                }
+            }
+        }
+        .sheet(isPresented: $showRename) {
+            NavigationStack {
+                Form {
+                    TextField("Group name", text: $renameDraft)
+                    if let actionError {
+                        Text(actionError).foregroundStyle(.red)
+                    }
+                }
+                .navigationTitle("Rename group")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { showRename = false }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Rename") {
+                            if onRename(renameDraft) {
+                                showRename = false
+                            } else {
+                                actionError = "Couldn't rename the group. The change was not queued."
+                            }
+                        }
+                        .disabled(
+                            renameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || renameDraft.trimmingCharacters(in: .whitespacesAndNewlines) == group.name
+                        )
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $showAddMembers) {
+            NavigationStack {
+                List(availableContacts, id: \.userId) { contact in
+                    Button {
+                        if selectedMemberIds.contains(contact.userId) {
+                            selectedMemberIds.remove(contact.userId)
+                        } else {
+                            selectedMemberIds.insert(contact.userId)
+                        }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: selectedMemberIds.contains(contact.userId)
+                                ? "checkmark.circle.fill" : "circle")
+                            AvatarView(
+                                userId: contact.userId,
+                                name: contact.name,
+                                size: 36,
+                                reachability: connectivity.level(for: contact.userId, nowMs: nowMs)
+                            )
+                            Text(ChatListLogic.displayNameOrId(
+                                name: contact.name,
+                                displayId: formatUserId(userId: contact.userId)
+                            ))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                .overlay(alignment: .bottom) {
+                    if let actionError {
+                        Text(actionError)
+                            .foregroundStyle(.red)
+                            .padding()
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    }
+                }
+                .navigationTitle("Add members")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { showAddMembers = false }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Add (\(selectedMemberIds.count))") {
+                            let additions = availableContacts.filter { selectedMemberIds.contains($0.userId) }
+                            if onAddMembers(additions) {
+                                showAddMembers = false
+                            } else {
+                                actionError = "Couldn't add members. No invitations were queued."
+                            }
+                        }
+                        .disabled(selectedMemberIds.isEmpty)
+                    }
                 }
             }
         }

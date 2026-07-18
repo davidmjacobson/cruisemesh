@@ -9,8 +9,8 @@ use std::collections::HashSet;
 
 use crate::{
     compute_recipient_hint, encode_envelope_frame, fanout_msg_id, CarriedEnvelope, CoreError,
-    MessageOrigin, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, RECEIPT_TYPE_DELIVERED,
-    MS_PER_DAY,
+    MessageOrigin, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, MS_PER_DAY,
+    RECEIPT_TYPE_DELIVERED,
 };
 
 /// Exact carried+recently-held `msg_id` count advertised in one outgoing
@@ -180,11 +180,7 @@ pub fn core_group_fanout_rows_for_carried(
 /// return `false` here and keep today's flood+carry behavior. Same
 /// [`CARRY_HINT_DAY_WINDOW_DAYS`] window as every other hint check.
 #[uniffi::export]
-pub fn core_is_own_fanout_hint(
-    recipient_hint: Vec<u8>,
-    own_user_id: Vec<u8>,
-    now_ms: i64,
-) -> bool {
+pub fn core_is_own_fanout_hint(recipient_hint: Vec<u8>, own_user_id: Vec<u8>, now_ms: i64) -> bool {
     (0..=CARRY_HINT_DAY_WINDOW_DAYS).any(|days_ago| {
         compute_recipient_hint(own_user_id.clone(), now_ms - days_ago * MS_PER_DAY)
             == recipient_hint
@@ -561,7 +557,9 @@ impl MessageStore {
         let known: HashSet<Vec<u8>> = peer_known_msg_ids.into_iter().collect();
         let mut removed = 0_u64;
         for candidate in candidates {
-            if known.contains(&candidate.msg_id) && self.remove_carried_envelope(candidate.msg_id)? {
+            if known.contains(&candidate.msg_id)
+                && self.remove_carried_envelope(candidate.msg_id)?
+            {
                 removed += 1;
             }
         }
@@ -873,6 +871,8 @@ mod tests {
                 name: "fam".to_string(),
                 member_user_ids: member_ids,
                 key: vec![0x55; 32],
+                metadata_revision: 0,
+                metadata_changed_by: Vec::new(),
             })
             .unwrap();
         (store, group_id)
@@ -901,7 +901,9 @@ mod tests {
                 recipient_hint: legacy_hint,
             },
         ];
-        let acked = store.core_relay_ack_ids_with_consumed(items, own, now).unwrap();
+        let acked = store
+            .core_relay_ack_ids_with_consumed(items, own, now)
+            .unwrap();
         assert_eq!(acked, vec![2]);
     }
 
@@ -919,7 +921,9 @@ mod tests {
             disposition: CoreInboundDisposition::Consumed,
             recipient_hint: own_hint,
         }];
-        let acked = store.core_relay_ack_ids_with_consumed(items, own, now).unwrap();
+        let acked = store
+            .core_relay_ack_ids_with_consumed(items, own, now)
+            .unwrap();
         assert_eq!(acked, vec![1]);
     }
 
@@ -1013,7 +1017,14 @@ mod tests {
         let me = vec![0x01_u8; 16];
         let them = vec![0x02_u8; 16];
         let members = vec![me.clone(), them.clone()];
-        let a = core_group_fanout_rows(original.clone(), members.clone(), 7, 100, vec![0xEE; 32], 1_000);
+        let a = core_group_fanout_rows(
+            original.clone(),
+            members.clone(),
+            7,
+            100,
+            vec![0xEE; 32],
+            1_000,
+        );
         let b = core_group_fanout_rows(original.clone(), members, 7, 100, vec![0xEE; 32], 1_000);
         assert_eq!(a, b, "row set must be deterministic across retries");
         assert_eq!(a.len(), 2, "one row per member, including self (spec §7.2)");

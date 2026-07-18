@@ -51,6 +51,8 @@ import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.mesh.MeshStartupPreferences
 import com.cruisemesh.app.relay.RelayConfigStore
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 /** Hosted privacy policy (Play Console + in-app link). */
 const val PRIVACY_POLICY_URL = "https://cruisemesh.app/privacy"
@@ -122,7 +124,7 @@ fun ProfileScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Profile & settings") },
+                title = { Text(stringResource(R.string.ui_profile_settings)) },
                 navigationIcon = {
                     IconButton(onClick = ::leaveScreen) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -179,8 +181,7 @@ fun ProfileScreen(
                     modifier = Modifier.padding(top = 16.dp),
                 )
                 Text(fingerprint.joinToString(" "), modifier = Modifier.padding(top = 8.dp))
-                Text(
-                    "Read these aloud to verify.",
+                Text(stringResource(R.string.ui_read_these_aloud_to_verify),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 4.dp),
@@ -190,21 +191,20 @@ fun ProfileScreen(
             SettingsSpacer()
             ProfileSection(title = "My friend card") {
                 Button(onClick = onShowMyQr, modifier = Modifier.fillMaxWidth()) {
-                    Text("Show my friend card")
+                    Text(stringResource(R.string.ui_show_my_friend_card))
                 }
             }
 
             SettingsSpacer()
             ProfileSection(title = "Backup") {
-                Text(
-                    "Save your identity and messages to an encrypted file.",
+                Text(stringResource(R.string.ui_save_your_identity_and_messages_to_an_encrypted),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Button(
                     onClick = onBackUp,
                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-                ) { Text("Back up account") }
+                ) { Text(stringResource(R.string.ui_back_up_account)) }
             }
 
             SettingsSpacer()
@@ -212,7 +212,7 @@ fun ProfileScreen(
                 Text(meshStatus, modifier = Modifier.padding(top = 4.dp))
                 if (onStartMesh != null) {
                     Button(onClick = onStartMesh, modifier = Modifier.padding(top = 12.dp)) {
-                        Text("Start mesh")
+                        Text(stringResource(R.string.ui_start_mesh))
                     }
                 }
                 SettingsToggle(
@@ -250,15 +250,14 @@ fun ProfileScreen(
 
             SettingsSpacer()
             ProfileSection(title = "Advanced") {
-                Text(
-                    "Relay configuration, local Wi-Fi tools, and diagnostics.",
+                Text(stringResource(R.string.ui_relay_configuration_local_wi_fi_tools_and_diagnostics),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Button(
                     onClick = onAdvanced,
                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-                ) { Text("Open advanced settings") }
+                ) { Text(stringResource(R.string.ui_open_advanced_settings)) }
             }
 
             SettingsSpacer()
@@ -268,7 +267,7 @@ fun ProfileScreen(
                         context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL)))
                     },
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Privacy policy") }
+                ) { Text(stringResource(R.string.ui_privacy_policy)) }
             }
         }
     }

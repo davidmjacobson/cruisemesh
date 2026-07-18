@@ -16,6 +16,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 @Composable
 fun LocalProfileEditor(
@@ -52,26 +54,26 @@ fun LocalProfileEditor(
                 onClick = onTakePhoto,
                 modifier = Modifier.weight(1f),
             ) {
-                Text("Take photo")
+                Text(stringResource(R.string.ui_take_photo))
             }
             Button(
                 onClick = onChoosePhoto,
                 modifier = Modifier.weight(1f),
             ) {
-                Text("Choose photo")
+                Text(stringResource(R.string.ui_choose_photo))
             }
         }
 
         if (onRemovePhoto != null && avatarPath != null) {
             TextButton(onClick = onRemovePhoto, modifier = Modifier.padding(top = 4.dp)) {
-                Text("Remove photo")
+                Text(stringResource(R.string.ui_remove_photo))
             }
         }
 
         OutlinedTextField(
             value = displayName,
             onValueChange = onDisplayNameChange,
-            label = { Text("Display name") },
+            label = { Text(stringResource(R.string.ui_display_name)) },
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 12.dp),

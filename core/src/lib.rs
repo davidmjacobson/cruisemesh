@@ -20,7 +20,7 @@ mod semantic;
 mod store;
 mod transport_policy;
 
-pub use authoring::{AuthoredEnvelope, AuthoredReceipt};
+pub use authoring::{AuthoredEnvelope, AuthoredGroupMetadataUpdate, AuthoredReceipt};
 pub use backup::{
     backup_min_passphrase_length, backup_passphrase_strength, decode_identity_bytes,
     encode_identity_bytes, open_backup, seal_backup, BackupPassphraseStrength, CoreBackupError,
@@ -42,8 +42,10 @@ pub use framing::{
 };
 pub use gossip::SeenIds;
 pub use groups::{
-    create_group, decode_group_invite_content, encode_group_invite_content, open_group_message,
-    rotate_group, seal_group_message, Group,
+    apply_group_metadata_update, create_group, create_group_metadata_update,
+    decode_group_invite_content, decode_group_metadata_update, encode_group_invite_content,
+    encode_group_metadata_update, open_group_message, rotate_group, seal_group_message, Group,
+    GroupMetadataUpdate,
 };
 pub use identity::{
     fingerprint_words, generate_identity, make_friend_card, make_friend_link, parse_friend_card,
@@ -70,9 +72,9 @@ pub use protocol::{
     FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket, LanEndpointContent,
     MessageBody, ProfileSyncContent, ReceiptContent, SuggestedFriendCard, DEFAULT_EXPIRY_MS,
     DEFAULT_HOP_TTL, KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY,
-    KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT,
-    KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
-    RECEIPT_TYPE_READ,
+    KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_GROUP_METADATA_UPDATE,
+    KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION,
+    KIND_RECEIPT, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 pub use relay_wire::{
     normalize_relay_url, relay_build_fetch_path, relay_decode_fetch_page,

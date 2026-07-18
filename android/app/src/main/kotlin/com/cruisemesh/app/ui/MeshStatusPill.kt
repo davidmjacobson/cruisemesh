@@ -45,6 +45,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.mesh.ReachabilityLevel
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 /** How urgent a home-screen connectivity callout is. */
 enum class ConnectivityWarningSeverity {
@@ -172,15 +174,14 @@ fun MeshStatusLegendDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Mesh status") },
+        title = { Text(stringResource(R.string.ui_mesh_status)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
                     statusText,
                     style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
                 )
-                Text(
-                    "Open the app when you sit down with family so phones can sync over Bluetooth.",
+                Text(stringResource(R.string.ui_open_the_app_when_you_sit_down_with),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -201,15 +202,15 @@ fun MeshStatusLegendDialog(
                         onStartMesh()
                     },
                 ) {
-                    Text("Start mesh")
+                    Text(stringResource(R.string.ui_start_mesh))
                 }
             } else {
-                TextButton(onClick = onDismiss) { Text("Done") }
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.ui_done)) }
             }
         },
         dismissButton = {
             if (canStartMesh) {
-                TextButton(onClick = onDismiss) { Text("Cancel") }
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.ui_cancel)) }
             }
         },
     )

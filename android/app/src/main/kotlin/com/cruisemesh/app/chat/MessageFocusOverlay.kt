@@ -52,6 +52,8 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 /** Captured at long-press time: which message and where its bubble sits on screen (window coords). */
 data class FocusedMessage(
@@ -292,17 +294,17 @@ private fun MessageActionPanel(
     ) {
         Column(modifier = Modifier.padding(vertical = 6.dp)) {
             DropdownMenuItem(
-                text = { Text("Reply") },
+                text = { Text(stringResource(R.string.ui_reply)) },
                 enabled = canReply,
                 onClick = onReply,
             )
             DropdownMenuItem(
-                text = { Text("Copy") },
+                text = { Text(stringResource(R.string.ui_copy)) },
                 enabled = canCopy,
                 onClick = onCopy,
             )
             DropdownMenuItem(
-                text = { Text("Info") },
+                text = { Text(stringResource(R.string.ui_info)) },
                 onClick = onInfo,
             )
         }

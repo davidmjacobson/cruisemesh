@@ -39,6 +39,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 private data class PermissionItem(
     val title: String,
@@ -86,7 +88,7 @@ fun OnboardingScreen(
                 ) {
                     if (canGoBack) {
                         TextButton(onClick = { page -= 1 }) {
-                            Text("Back")
+                            Text(stringResource(R.string.ui_back))
                         }
                     } else {
                         Spacer(modifier = Modifier.height(1.dp))
@@ -98,7 +100,11 @@ fun OnboardingScreen(
                             page += 1
                         }
                     }) {
-                        Text(if (isLastPage) "Start using CruiseMesh" else "Next")
+                        Text(
+                            stringResource(
+                                if (isLastPage) R.string.ui_start_using_cruisemesh else R.string.ui_next,
+                            ),
+                        )
                     }
                 }
             }
@@ -139,13 +145,12 @@ fun OnboardingScreen(
                     .padding(innerPadding)
                     .padding(horizontal = 24.dp, vertical = 20.dp),
             ) {
-                Text(
-                    text = "CruiseMesh setup",
+                Text(text = stringResource(R.string.ui_cruisemesh_setup),
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.primary,
                 )
                 Text(
-                    text = "Step ${page + 1} of $pages",
+                    text = stringResource(R.string.ui_step_of, page + 1, pages),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp),
@@ -229,7 +234,7 @@ private fun WelcomeSlide(onRestore: () -> Unit) {
             onClick = onRestore,
             modifier = Modifier.padding(top = 8.dp),
         ) {
-            Text("Already set up? Restore from a backup")
+            Text(stringResource(R.string.ui_already_set_up_restore_from_a_backup))
         }
     }
 }
@@ -269,8 +274,7 @@ private fun PermissionsSlide(
                     .fillMaxWidth()
                     .padding(bottom = 4.dp),
             ) {
-                Text(
-                    text = "Nearby permissions are required. Skipping them means the mesh stays off.",
+                Text(text = stringResource(R.string.ui_nearby_permissions_are_required_skipping_them_means_the),
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(16.dp),
                 )
@@ -300,7 +304,12 @@ private fun PermissionsSlide(
                 .fillMaxWidth()
                 .padding(top = 18.dp),
         ) {
-            Text(if (meshPermissionsGranted) "Nearby access enabled" else "Enable nearby access (required)")
+            Text(
+                stringResource(
+                    if (meshPermissionsGranted) R.string.ui_nearby_access_enabled
+                    else R.string.ui_enable_nearby_access_required,
+                ),
+            )
         }
 
         OutlinedButton(
@@ -310,15 +319,19 @@ private fun PermissionsSlide(
                 .fillMaxWidth()
                 .padding(top = 12.dp),
         ) {
-            Text(if (batteryExemptionGranted) "Background activity enabled" else "Enable background activity")
+            Text(
+                stringResource(
+                    if (batteryExemptionGranted) R.string.ui_background_activity_enabled
+                    else R.string.ui_enable_background_activity,
+                ),
+            )
         }
 
         Text(
-            text = if (meshPermissionsGranted) {
-                "Nearby access is on. Background exemption is optional but makes delivery more reliable when the app is not open."
-            } else {
-                "You can finish setup without granting access, but the home screen will keep warning you — and no messages will move over the mesh until you do."
-            },
+            text = stringResource(
+                if (meshPermissionsGranted) R.string.ui_nearby_access_on_detail
+                else R.string.ui_nearby_access_off_detail,
+            ),
             style = MaterialTheme.typography.bodySmall,
             color = if (meshPermissionsGranted) {
                 MaterialTheme.colorScheme.onSurfaceVariant
@@ -359,7 +372,7 @@ private fun ProfileSlide(
         )
 
         Text(
-            text = "Device ID: $displayId",
+            text = stringResource(R.string.ui_device_id, displayId),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,

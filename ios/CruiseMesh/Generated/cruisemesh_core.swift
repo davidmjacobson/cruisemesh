@@ -1560,6 +1560,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func authorGroupMessage(identity: Identity, group: Group, kind: UInt8, payload: Data, replyToMsgId: Data?, timestampMs: Int64) throws  -> AuthoredEnvelope
     
     /**
+     * Atomically apply a local add-only group metadata change and queue its
+     * hidden group-stream update. The returned frame uses the existing group
+     * key and normal DTN fan-out path.
+     */
+    func authorGroupMetadataUpdate(identity: Identity, group: Group, name: String, memberUserIds: [Data], timestampMs: Int64) throws  -> AuthoredGroupMetadataUpdate
+
+    /**
      * Assign, seal, and durably queue a pairwise chat-stream message in one
      * store transaction. The counter ratchets past both receipt watermarks.
      */
@@ -2375,6 +2382,23 @@ open func authorGroupMessage(identity: Identity, group: Group, kind: UInt8, payl
 })
 }
     
+    /**
+     * Atomically apply a local add-only group metadata change and queue its
+     * hidden group-stream update. The returned frame uses the existing group
+     * key and normal DTN fan-out path.
+     */
+open func authorGroupMetadataUpdate(identity: Identity, group: Group, name: String, memberUserIds: [Data], timestampMs: Int64)throws  -> AuthoredGroupMetadataUpdate {
+    return try  FfiConverterTypeAuthoredGroupMetadataUpdate.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_author_group_metadata_update(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeGroup.lower(group),
+        FfiConverterString.lower(name),
+        FfiConverterSequenceData.lower(memberUserIds),
+        FfiConverterInt64.lower(timestampMs),$0
+    )
+})
+}
+
     /**
      * Assign, seal, and durably queue a pairwise chat-stream message in one
      * store transaction. The counter ratchets past both receipt watermarks.
@@ -3969,6 +3993,80 @@ public func FfiConverterTypeAuthoredEnvelope_lift(_ buf: RustBuffer) throws -> A
 #endif
 public func FfiConverterTypeAuthoredEnvelope_lower(_ value: AuthoredEnvelope) -> RustBuffer {
     return FfiConverterTypeAuthoredEnvelope.lower(value)
+}
+
+
+public struct AuthoredGroupMetadataUpdate {
+    public var group: Group
+    public var update: GroupMetadataUpdate
+    public var authored: AuthoredEnvelope
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(group: Group, update: GroupMetadataUpdate, authored: AuthoredEnvelope) {
+        self.group = group
+        self.update = update
+        self.authored = authored
+    }
+}
+
+
+
+extension AuthoredGroupMetadataUpdate: Equatable, Hashable {
+    public static func ==(lhs: AuthoredGroupMetadataUpdate, rhs: AuthoredGroupMetadataUpdate) -> Bool {
+        if lhs.group != rhs.group {
+            return false
+        }
+        if lhs.update != rhs.update {
+            return false
+        }
+        if lhs.authored != rhs.authored {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(group)
+        hasher.combine(update)
+        hasher.combine(authored)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAuthoredGroupMetadataUpdate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AuthoredGroupMetadataUpdate {
+        return
+            try AuthoredGroupMetadataUpdate(
+                group: FfiConverterTypeGroup.read(from: &buf),
+                update: FfiConverterTypeGroupMetadataUpdate.read(from: &buf),
+                authored: FfiConverterTypeAuthoredEnvelope.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AuthoredGroupMetadataUpdate, into buf: inout [UInt8]) {
+        FfiConverterTypeGroup.write(value.group, into: &buf)
+        FfiConverterTypeGroupMetadataUpdate.write(value.update, into: &buf)
+        FfiConverterTypeAuthoredEnvelope.write(value.authored, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAuthoredGroupMetadataUpdate_lift(_ buf: RustBuffer) throws -> AuthoredGroupMetadataUpdate {
+    return try FfiConverterTypeAuthoredGroupMetadataUpdate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAuthoredGroupMetadataUpdate_lower(_ value: AuthoredGroupMetadataUpdate) -> RustBuffer {
+    return FfiConverterTypeAuthoredGroupMetadataUpdate.lower(value)
 }
 
 
@@ -6375,14 +6473,18 @@ public struct Group {
     public var name: String
     public var memberUserIds: [Data]
     public var key: Data
+    public var metadataRevision: UInt64
+    public var metadataChangedBy: Data
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: Data, name: String, memberUserIds: [Data], key: Data) {
+    public init(id: Data, name: String, memberUserIds: [Data], key: Data, metadataRevision: UInt64, metadataChangedBy: Data) {
         self.id = id
         self.name = name
         self.memberUserIds = memberUserIds
         self.key = key
+        self.metadataRevision = metadataRevision
+        self.metadataChangedBy = metadataChangedBy
     }
 }
 
@@ -6402,6 +6504,12 @@ extension Group: Equatable, Hashable {
         if lhs.key != rhs.key {
             return false
         }
+        if lhs.metadataRevision != rhs.metadataRevision {
+            return false
+        }
+        if lhs.metadataChangedBy != rhs.metadataChangedBy {
+            return false
+        }
         return true
     }
 
@@ -6410,6 +6518,8 @@ extension Group: Equatable, Hashable {
         hasher.combine(name)
         hasher.combine(memberUserIds)
         hasher.combine(key)
+        hasher.combine(metadataRevision)
+        hasher.combine(metadataChangedBy)
     }
 }
 
@@ -6424,7 +6534,9 @@ public struct FfiConverterTypeGroup: FfiConverterRustBuffer {
                 id: FfiConverterData.read(from: &buf), 
                 name: FfiConverterString.read(from: &buf), 
                 memberUserIds: FfiConverterSequenceData.read(from: &buf), 
-                key: FfiConverterData.read(from: &buf)
+                key: FfiConverterData.read(from: &buf),
+                metadataRevision: FfiConverterUInt64.read(from: &buf),
+                metadataChangedBy: FfiConverterData.read(from: &buf)
         )
     }
 
@@ -6433,6 +6545,8 @@ public struct FfiConverterTypeGroup: FfiConverterRustBuffer {
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterSequenceData.write(value.memberUserIds, into: &buf)
         FfiConverterData.write(value.key, into: &buf)
+        FfiConverterUInt64.write(value.metadataRevision, into: &buf)
+        FfiConverterData.write(value.metadataChangedBy, into: &buf)
     }
 }
 
@@ -6449,6 +6563,101 @@ public func FfiConverterTypeGroup_lift(_ buf: RustBuffer) throws -> Group {
 #endif
 public func FfiConverterTypeGroup_lower(_ value: Group) -> RustBuffer {
     return FfiConverterTypeGroup.lower(value)
+}
+
+
+/**
+ * An add-only membership snapshot plus a convergent group-name update.
+ * Membership is merged as a set so reordered concurrent additions cannot
+ * remove a member. The `(revision, changed_by)` tuple orders name changes.
+ */
+public struct GroupMetadataUpdate {
+    public var groupId: Data
+    public var name: String
+    public var revision: UInt64
+    public var changedBy: Data
+    public var memberUserIds: [Data]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupId: Data, name: String, revision: UInt64, changedBy: Data, memberUserIds: [Data]) {
+        self.groupId = groupId
+        self.name = name
+        self.revision = revision
+        self.changedBy = changedBy
+        self.memberUserIds = memberUserIds
+    }
+}
+
+
+
+extension GroupMetadataUpdate: Equatable, Hashable {
+    public static func ==(lhs: GroupMetadataUpdate, rhs: GroupMetadataUpdate) -> Bool {
+        if lhs.groupId != rhs.groupId {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.revision != rhs.revision {
+            return false
+        }
+        if lhs.changedBy != rhs.changedBy {
+            return false
+        }
+        if lhs.memberUserIds != rhs.memberUserIds {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(groupId)
+        hasher.combine(name)
+        hasher.combine(revision)
+        hasher.combine(changedBy)
+        hasher.combine(memberUserIds)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupMetadataUpdate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupMetadataUpdate {
+        return
+            try GroupMetadataUpdate(
+                groupId: FfiConverterData.read(from: &buf),
+                name: FfiConverterString.read(from: &buf),
+                revision: FfiConverterUInt64.read(from: &buf),
+                changedBy: FfiConverterData.read(from: &buf),
+                memberUserIds: FfiConverterSequenceData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupMetadataUpdate, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.groupId, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterUInt64.write(value.revision, into: &buf)
+        FfiConverterData.write(value.changedBy, into: &buf)
+        FfiConverterSequenceData.write(value.memberUserIds, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupMetadataUpdate_lift(_ buf: RustBuffer) throws -> GroupMetadataUpdate {
+    return try FfiConverterTypeGroupMetadataUpdate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupMetadataUpdate_lower(_ value: GroupMetadataUpdate) -> RustBuffer {
+    return FfiConverterTypeGroupMetadataUpdate.lower(value)
 }
 
 
@@ -9814,6 +10023,20 @@ fileprivate struct FfiConverterSequenceTypeCoreTransport: FfiConverterRustBuffer
         return seq
     }
 }
+/**
+ * Apply a verified member-authored update. Name changes use the deterministic
+ * `(revision, changed_by)` winner. Member ids are always unioned, even for a
+ * losing concurrent name update, so delivery order cannot lose additions.
+ */
+public func applyGroupMetadataUpdate(group: Group, update: GroupMetadataUpdate, senderUserId: Data)throws  -> Group? {
+    return try  FfiConverterOptionTypeGroup.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_apply_group_metadata_update(
+        FfiConverterTypeGroup.lower(group),
+        FfiConverterTypeGroupMetadataUpdate.lower(update),
+        FfiConverterData.lower(senderUserId),$0
+    )
+})
+}
 public func attachmentMaxBlobBytes() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_attachment_max_blob_bytes($0
@@ -10232,6 +10455,20 @@ public func createGroup(name: String, memberUserIds: [Data])throws  -> Group {
 })
 }
 /**
+ * Create the next locally-authored metadata update. Membership is add-only;
+ * callers may pass the current list plus newly accepted contacts.
+ */
+public func createGroupMetadataUpdate(group: Group, changedBy: Data, name: String, memberUserIds: [Data])throws  -> GroupMetadataUpdate {
+    return try  FfiConverterTypeGroupMetadataUpdate.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_create_group_metadata_update(
+        FfiConverterTypeGroup.lower(group),
+        FfiConverterData.lower(changedBy),
+        FfiConverterString.lower(name),
+        FfiConverterSequenceData.lower(memberUserIds),$0
+    )
+})
+}
+/**
  * Create a short-lived introduction ticket signed by the mutual friend.
  */
 public func createIntroductionTicket(introducer: Identity, candidateUserId: Data, inviteeUserId: Data, candidatePolicyRevision: UInt64, issuedAtMs: Int64, expiresAtMs: Int64, offerId: Data)throws  -> IntroductionTicket {
@@ -10278,6 +10515,16 @@ public func decodeFriendDirectoryContent(bytes: Data)throws  -> FriendDirectoryC
 public func decodeGroupInviteContent(bytes: Data)throws  -> Group {
     return try  FfiConverterTypeGroup.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_decode_group_invite_content(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
+ * Decode a hidden group-stream metadata update.
+ */
+public func decodeGroupMetadataUpdate(bytes: Data)throws  -> GroupMetadataUpdate {
+    return try  FfiConverterTypeGroupMetadataUpdate.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_decode_group_metadata_update(
         FfiConverterData.lower(bytes),$0
     )
 })
@@ -10433,6 +10680,16 @@ public func encodeGroupInviteContent(group: Group)throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_encode_group_invite_content(
         FfiConverterTypeGroup.lower(group),$0
+    )
+})
+}
+/**
+ * Encode a group metadata update for a hidden group-stream message.
+ */
+public func encodeGroupMetadataUpdate(update: GroupMetadataUpdate)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_encode_group_metadata_update(
+        FfiConverterTypeGroupMetadataUpdate.lower(update),$0
     )
 })
 }
@@ -10911,6 +11168,9 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_apply_group_metadata_update() != 46889) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_attachment_max_blob_bytes() != 21631) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11004,6 +11264,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_create_group() != 45726) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_create_group_metadata_update() != 14819) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_create_introduction_ticket() != 2547) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11017,6 +11280,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_decode_group_invite_content() != 49763) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_decode_group_metadata_update() != 28762) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_decode_identity_bytes() != 3390) {
@@ -11062,6 +11328,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_group_invite_content() != 23463) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_encode_group_metadata_update() != 34191) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_hello() != 21775) {
@@ -11296,6 +11565,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_author_group_message() != 44512) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_author_group_metadata_update() != 40770) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_author_pairwise_message() != 25955) {

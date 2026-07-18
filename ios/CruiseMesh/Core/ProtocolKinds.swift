@@ -13,6 +13,7 @@ enum ProtocolKind {
     static let attachmentManifest: UInt8 = 16
     static let attachmentChunk: UInt8 = 17
     static let reaction: UInt8 = 18
+    static let groupMetadataUpdate: UInt8 = 19
 }
 
 enum ReceiptType {
@@ -51,4 +52,5 @@ func isAuthoredChatKind(_ kind: UInt8) -> Bool {
         || kind == ProtocolKind.lanEndpointHint
         || kind == ProtocolKind.attachmentManifest
         || kind == ProtocolKind.reaction
+        || kind == ProtocolKind.groupMetadataUpdate
 }

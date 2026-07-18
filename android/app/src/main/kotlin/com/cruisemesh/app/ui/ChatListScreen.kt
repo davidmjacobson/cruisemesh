@@ -54,6 +54,8 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 /**
  * One row on the home conversation list — either a 1:1 contact chat or a
@@ -116,7 +118,7 @@ fun ChatListScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("CruiseMesh") },
+                title = { Text(stringResource(R.string.app_name)) },
                 navigationIcon = {
                     IconButton(onClick = onProfileClick) {
                         AvatarBadge(
@@ -172,13 +174,11 @@ fun ChatListScreen(
                                 modifier = Modifier.size(34.dp),
                             )
                         }
-                        Text(
-                            text = "All quiet on deck",
+                        Text(text = stringResource(R.string.ui_all_quiet_on_deck),
                             style = MaterialTheme.typography.titleMedium,
                             modifier = Modifier.padding(top = 18.dp),
                         )
-                        Text(
-                            text = "Add a friend to start messaging over Bluetooth — no Wi-Fi needed.",
+                        Text(text = stringResource(R.string.ui_add_a_friend_to_start_messaging_over_bluetooth),
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(top = 6.dp),
@@ -187,7 +187,7 @@ fun ChatListScreen(
                             onClick = onNewChatClick,
                             modifier = Modifier.padding(top = 16.dp)
                         ) {
-                            Text("Add a friend")
+                            Text(stringResource(R.string.ui_add_a_friend))
                         }
                     }
                 }
@@ -201,25 +201,28 @@ fun ChatListScreen(
                             AlertDialog(
                                 onDismissRequest = { showDeleteDialog = false },
                                 title = {
-                                    Text(if (summary.isGroup) "Delete group" else "Delete contact")
+                                    Text(
+                                        stringResource(
+                                            if (summary.isGroup) R.string.ui_delete_group else R.string.ui_delete_contact,
+                                        ),
+                                    )
                                 },
                                 text = {
                                     Text(
-                                        if (summary.isGroup) {
-                                            "Delete this group and its message history from this device?"
-                                        } else {
-                                            "Delete contact and all message history?"
-                                        },
+                                        stringResource(
+                                            if (summary.isGroup) R.string.ui_delete_group_history_question
+                                            else R.string.ui_delete_contact_history_question,
+                                        ),
                                     )
                                 },
                                 confirmButton = {
                                     TextButton(onClick = {
                                         showDeleteDialog = false
                                         onDeleteSummary(summary)
-                                    }) { Text("Delete") }
+                                    }) { Text(stringResource(R.string.ui_delete)) }
                                 },
                                 dismissButton = {
-                                    TextButton(onClick = { showDeleteDialog = false }) { Text("Cancel") }
+                                    TextButton(onClick = { showDeleteDialog = false }) { Text(stringResource(R.string.ui_cancel)) }
                                 }
                             )
                         }
@@ -237,7 +240,7 @@ fun ChatListScreen(
                             ) {
                                 if (summary.unreadCount > 0) {
                                     DropdownMenuItem(
-                                        text = { Text("Mark as read") },
+                                        text = { Text(stringResource(R.string.ui_mark_as_read)) },
                                         onClick = {
                                             showRowMenu = false
                                             onMarkRead(summary)
@@ -245,7 +248,7 @@ fun ChatListScreen(
                                     )
                                 }
                                 DropdownMenuItem(
-                                    text = { Text("Delete") },
+                                    text = { Text(stringResource(R.string.ui_delete)) },
                                     onClick = {
                                         showRowMenu = false
                                         showDeleteDialog = true
@@ -313,8 +316,7 @@ fun ChatRow(
                     modifier = Modifier.weight(1f)
                 )
                 if (summary.isMuted) {
-                    Text(
-                        "🔕",
+                    Text(stringResource(R.string.ui_text),
                         modifier = Modifier.padding(start = 6.dp),
                         style = MaterialTheme.typography.labelSmall,
                     )
@@ -336,7 +338,7 @@ fun ChatRow(
             ) {
                 if (summary.draft.isNotBlank()) {
                     Text(
-                        text = "Draft: ${summary.draft}",
+                        text = stringResource(R.string.ui_draft_preview, summary.draft),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.error,
                         maxLines = 1,
@@ -530,6 +532,8 @@ private fun ChatListScreenPreview() {
                         name = "Bridge Crew",
                         memberUserIds = listOf(ownUserId, mayaId),
                         key = ByteArray(32) { 0x22 },
+                        metadataRevision = 0uL,
+                        metadataChangedBy = byteArrayOf(),
                     ),
                     lastMessage = message(ownUserId, groupId, "Dinner at 7?", 2uL),
                     unreadCount = 0,

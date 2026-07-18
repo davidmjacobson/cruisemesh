@@ -71,11 +71,13 @@ import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.computeRecipientHint
+import uniffi.cruisemesh_core.applyGroupMetadataUpdate
 import uniffi.cruisemesh_core.coreGroupFanoutRows
 import uniffi.cruisemesh_core.coreGroupFanoutRowsForCarried
 import uniffi.cruisemesh_core.coreInboundGate
 import uniffi.cruisemesh_core.coreIsOwnFanoutHint
 import uniffi.cruisemesh_core.decodeGroupInviteContent
+import uniffi.cruisemesh_core.decodeGroupMetadataUpdate
 import uniffi.cruisemesh_core.decodeFriendDirectoryContent
 import uniffi.cruisemesh_core.decodeIntroducedFriendRequest
 import uniffi.cruisemesh_core.decodeLanEndpointContent
@@ -115,6 +117,7 @@ private const val KIND_PROFILE_SYNC: UByte = 5u
 private const val KIND_FRIEND_DIRECTORY: UByte = 6u
 private const val KIND_INTRODUCED_FRIEND_REQUEST: UByte = 7u
 private const val KIND_LAN_ENDPOINT_HINT: UByte = 8u
+private const val KIND_GROUP_METADATA_UPDATE: UByte = 19u
 
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
@@ -2404,7 +2407,7 @@ class MeshService : Service() {
             return
         }
         when (body.kind) {
-            KIND_TEXT -> handleIncomingGroupChatMessage(
+            KIND_TEXT, KIND_ATTACHMENT_MANIFEST, KIND_REACTION -> handleIncomingGroupChatMessage(
                 address,
                 group,
                 opened.senderUserId,
@@ -2413,7 +2416,7 @@ class MeshService : Service() {
                 msgId,
                 extendedBody.replyToMsgId,
             )
-            KIND_REACTION -> handleIncomingGroupChatMessage(
+            KIND_GROUP_METADATA_UPDATE -> handleIncomingGroupMetadataUpdate(
                 address,
                 group,
                 opened.senderUserId,
@@ -2423,6 +2426,43 @@ class MeshService : Service() {
                 extendedBody.replyToMsgId,
             )
             else -> Log.i(TAG, "Dropping group envelope from $address: unhandled kind=${body.kind}")
+        }
+    }
+
+    private fun handleIncomingGroupMetadataUpdate(
+        address: String,
+        group: Group,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        arrival: MessageArrival,
+        msgId: ByteArray,
+        replyToMsgId: ByteArray?,
+    ) {
+        val updated = try {
+            val update = decodeGroupMetadataUpdate(body.content)
+            applyGroupMetadataUpdate(group, update, senderUserId)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping invalid group metadata from $address: ${e.message}")
+            return
+        }
+        val inserted = store.insertIncomingMessage(
+            StoredMessage(
+                chatId = group.id,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = body.kind,
+                payload = body.content,
+            ),
+            msgId,
+            replyToMsgId,
+        )
+        if (!inserted) return
+        store.recordMessageArrival(group.id, senderUserId, body.lamport, arrival)
+        if (updated != null) {
+            store.upsertGroup(updated)
+            Log.i(TAG, "Applied group metadata revision ${updated.metadataRevision} for ${updated.name}")
+            ChatEvents.notifyChatChanged(group.id)
         }
     }
 
@@ -2476,7 +2516,15 @@ class MeshService : Service() {
         } else if (isVisibleChatKind(body.kind)) {
             val senderName = store.getContact(senderUserId)?.name
                 ?: UserIdHex.encode(senderUserId).take(8)
-            val preview = body.content.toString(Charsets.UTF_8)
+            val preview = if (body.kind == KIND_ATTACHMENT_MANIFEST) {
+                try {
+                    AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))
+                } catch (_: Exception) {
+                    "Attachment"
+                }
+            } else {
+                body.content.toString(Charsets.UTF_8)
+            }
             MessageNotifier.notifyIncomingGroupMessage(this, group, senderName, preview)
         }
     }

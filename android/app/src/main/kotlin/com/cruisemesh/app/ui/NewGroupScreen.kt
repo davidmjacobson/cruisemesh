@@ -33,6 +33,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.formatUserId
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.res.pluralStringResource
+import com.cruisemesh.app.R
 
 /**
  * Create a group: name + multi-select friends (DESIGN.md §14.6 / §6.5).
@@ -55,7 +58,7 @@ fun NewGroupScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("New group") },
+                title = { Text(stringResource(R.string.ui_new_group)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -73,23 +76,21 @@ fun NewGroupScreen(
             OutlinedTextField(
                 value = name,
                 onValueChange = { name = it },
-                label = { Text("Group name") },
+                label = { Text(stringResource(R.string.ui_group_name)) },
                 singleLine = true,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 8.dp, bottom = 16.dp),
             )
 
-            Text(
-                "Members",
+            Text(stringResource(R.string.ui_members),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(bottom = 8.dp),
             )
 
             if (contacts.isEmpty()) {
-                Text(
-                    "Add friends before creating a group.",
+                Text(stringResource(R.string.ui_add_friends_before_creating_a_group),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -144,7 +145,12 @@ fun NewGroupScreen(
                     .fillMaxWidth()
                     .padding(vertical = 16.dp),
             ) {
-                Text(if (selected.isEmpty()) "Create group" else "Create group (${selected.size})")
+                val createLabel = if (selected.isEmpty()) {
+                    stringResource(R.string.ui_create_group)
+                } else {
+                    pluralStringResource(R.plurals.ui_create_group_count, selected.size, selected.size)
+                }
+                Text(createLabel)
             }
         }
     }

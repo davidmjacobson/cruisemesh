@@ -103,7 +103,7 @@
 //! D2 -- actually removing a carried envelope once a peer's digest proves
 //! they have it -- is `engine.rs::core_confirm_carried_deliveries`.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -300,6 +300,18 @@ impl MessageStore {
         ensure_column(&conn, "messages", "msg_id", "BLOB")?;
         ensure_column(&conn, "messages", "reply_to_msg_id", "BLOB")?;
         ensure_column(&conn, "messages", "outbound_expiry", "INTEGER")?;
+        ensure_column(
+            &conn,
+            "groups",
+            "metadata_revision",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "groups",
+            "metadata_changed_by",
+            "BLOB NOT NULL DEFAULT X''",
+        )?;
         // Older stores already have stable ids for locally authored rows in
         // the outbound queue. Backfill those so they can be quoted after an
         // upgrade; received legacy rows cannot be recovered retroactively.
@@ -1910,27 +1922,7 @@ impl MessageStore {
         validate_group(&group)?;
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
-        tx.execute(
-            "INSERT INTO groups (group_id, name, group_key)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(group_id) DO UPDATE SET
-                name = excluded.name,
-                group_key = excluded.group_key",
-            params![&group.id, &group.name, &group.key],
-        )
-        .map_err(store_err)?;
-        tx.execute(
-            "DELETE FROM group_members WHERE group_id = ?1",
-            params![&group.id],
-        )
-        .map_err(store_err)?;
-        for member_user_id in canonicalize_members(group.member_user_ids) {
-            tx.execute(
-                "INSERT INTO group_members (group_id, user_id) VALUES (?1, ?2)",
-                params![&group.id, member_user_id],
-            )
-            .map_err(store_err)?;
-        }
+        upsert_group_tx(&tx, &group)?;
         tx.commit().map_err(store_err)?;
         Ok(())
     }
@@ -1940,7 +1932,8 @@ impl MessageStore {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let row: Option<GroupRow> = conn
             .query_row(
-                "SELECT group_id, name, group_key FROM groups WHERE group_id = ?1",
+                "SELECT group_id, name, group_key, metadata_revision, metadata_changed_by
+                 FROM groups WHERE group_id = ?1",
                 params![&group_id],
                 row_to_group_row,
             )
@@ -1955,7 +1948,8 @@ impl MessageStore {
         let raw = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT group_id, name, group_key FROM groups ORDER BY name ASC, group_id ASC",
+                    "SELECT group_id, name, group_key, metadata_revision, metadata_changed_by
+                     FROM groups ORDER BY name ASC, group_id ASC",
                 )
                 .map_err(store_err)?;
             let rows = stmt.query_map([], row_to_group_row).map_err(store_err)?;
@@ -2454,6 +2448,8 @@ struct GroupRow {
     id: Vec<u8>,
     name: String,
     key: Vec<u8>,
+    metadata_revision: u64,
+    metadata_changed_by: Vec<u8>,
 }
 
 fn row_to_group_row(row: &rusqlite::Row) -> rusqlite::Result<GroupRow> {
@@ -2461,6 +2457,8 @@ fn row_to_group_row(row: &rusqlite::Row) -> rusqlite::Result<GroupRow> {
         id: row.get(0)?,
         name: row.get(1)?,
         key: row.get(2)?,
+        metadata_revision: row.get(3)?,
+        metadata_changed_by: row.get(4)?,
     })
 }
 
@@ -2470,7 +2468,64 @@ fn hydrate_group(conn: &Connection, row: GroupRow) -> Result<Group, CoreError> {
         id: row.id,
         name: row.name,
         key: row.key,
+        metadata_revision: row.metadata_revision,
+        metadata_changed_by: row.metadata_changed_by,
     })
+}
+
+/// Persist a group and its canonical member set inside an existing transaction.
+/// A stale invite (revision zero) must not roll back newer metadata.
+pub(crate) fn upsert_group_tx(tx: &Transaction<'_>, group: &Group) -> Result<(), CoreError> {
+    validate_group(group)?;
+    let current: Option<(u64, Vec<u8>)> = tx
+        .query_row(
+            "SELECT metadata_revision, metadata_changed_by FROM groups WHERE group_id = ?1",
+            params![&group.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(store_err)?;
+    if current.as_ref().is_some_and(|(revision, changed_by)| {
+        (*revision, changed_by.as_slice())
+            > (
+                group.metadata_revision,
+                group.metadata_changed_by.as_slice(),
+            )
+    }) {
+        return Ok(());
+    }
+
+    tx.execute(
+        "INSERT INTO groups
+            (group_id, name, group_key, metadata_revision, metadata_changed_by)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(group_id) DO UPDATE SET
+            name = excluded.name,
+            group_key = excluded.group_key,
+            metadata_revision = excluded.metadata_revision,
+            metadata_changed_by = excluded.metadata_changed_by",
+        params![
+            &group.id,
+            &group.name,
+            &group.key,
+            group.metadata_revision,
+            &group.metadata_changed_by,
+        ],
+    )
+    .map_err(store_err)?;
+    tx.execute(
+        "DELETE FROM group_members WHERE group_id = ?1",
+        params![&group.id],
+    )
+    .map_err(store_err)?;
+    for member_user_id in canonicalize_members(group.member_user_ids.clone()) {
+        tx.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES (?1, ?2)",
+            params![&group.id, member_user_id],
+        )
+        .map_err(store_err)?;
+    }
+    Ok(())
 }
 
 fn load_group_members(conn: &Connection, group_id: &[u8]) -> Result<Vec<Vec<u8>>, CoreError> {
@@ -2638,9 +2693,11 @@ CREATE TABLE IF NOT EXISTS contact_provenance (
 );
 
 CREATE TABLE IF NOT EXISTS groups (
-    group_id   BLOB PRIMARY KEY,
-    name       TEXT NOT NULL,
-    group_key  BLOB NOT NULL
+    group_id             BLOB PRIMARY KEY,
+    name                 TEXT NOT NULL,
+    group_key            BLOB NOT NULL,
+    metadata_revision    INTEGER NOT NULL DEFAULT 0,
+    metadata_changed_by  BLOB NOT NULL DEFAULT X''
 );
 
 CREATE TABLE IF NOT EXISTS group_members (
@@ -2796,6 +2853,8 @@ mod tests {
             name: name.to_string(),
             member_user_ids: members.iter().map(|member| member.to_vec()).collect(),
             key: vec![key_byte; 32],
+            metadata_revision: 0,
+            metadata_changed_by: Vec::new(),
         }
     }
 
@@ -4613,6 +4672,8 @@ mod tests {
                 name: "Family".to_string(),
                 member_user_ids: vec![b"alice".to_vec(), b"carol".to_vec()],
                 key: vec![0x22; 32],
+                metadata_revision: 0,
+                metadata_changed_by: Vec::new(),
             })
         );
     }
@@ -4628,6 +4689,22 @@ mod tests {
         store.upsert_group(rotated.clone()).unwrap();
 
         assert_eq!(store.get_group(rotated.id.clone()).unwrap(), Some(rotated));
+    }
+
+    #[test]
+    fn stale_group_invite_cannot_roll_back_newer_metadata() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let stale = group(0x11, "Old name", 0x22, &[b"alice", b"bob"]);
+        let mut current = stale.clone();
+        current.name = "New name".to_string();
+        current.member_user_ids.push(b"carol".to_vec());
+        current.metadata_revision = 4;
+        current.metadata_changed_by = b"alice".to_vec();
+        store.upsert_group(current.clone()).unwrap();
+
+        store.upsert_group(stale).unwrap();
+
+        assert_eq!(store.get_group(current.id.clone()).unwrap(), Some(current));
     }
 
     #[test]
@@ -5683,13 +5760,21 @@ mod tests {
     #[test]
     fn backup_to_writes_a_consistent_reopenable_snapshot() {
         let store = MessageStore::open(":memory:".into()).unwrap();
-        store.insert_message(msg(b"chat", b"sender", 1, "backed up")).unwrap();
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        store
+            .insert_message(msg(b"chat", b"sender", 1, "backed up"))
+            .unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!("cruisemesh-backup-{unique}.sqlite"));
 
         store.backup_to(path.to_string_lossy().to_string()).unwrap();
         let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
-        assert_eq!(restored.messages_for_chat(b"chat".to_vec()).unwrap().len(), 1);
+        assert_eq!(
+            restored.messages_for_chat(b"chat".to_vec()).unwrap().len(),
+            1
+        );
 
         drop(restored);
         fs::remove_file(path).unwrap();

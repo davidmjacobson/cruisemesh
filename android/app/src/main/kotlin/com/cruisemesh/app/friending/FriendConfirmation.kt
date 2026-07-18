@@ -33,6 +33,8 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 private const val RECEIPT_TYPE_DELIVERED: UByte = 1u
 
@@ -98,7 +100,7 @@ fun FriendConfirmationSheet(
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             Text(
-                if (connected) "You're connected" else "Friend added",
+                stringResource(if (connected) R.string.ui_connected else R.string.ui_friend_added),
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
             )
@@ -125,11 +127,11 @@ fun FriendConfirmationSheet(
                 )
             }
 
-            Button(onClick = onSayHi, modifier = Modifier.fillMaxWidth()) { Text("Say hi") }
+            Button(onClick = onSayHi, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.ui_say_hi)) }
             if (onAddAnother != null) {
-                TextButton(onClick = onAddAnother, modifier = Modifier.fillMaxWidth()) { Text("Add another") }
+                TextButton(onClick = onAddAnother, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.ui_add_another)) }
             }
-            TextButton(onClick = onDone, modifier = Modifier.fillMaxWidth()) { Text("Done") }
+            TextButton(onClick = onDone, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.ui_done)) }
         }
     }
 }
@@ -147,13 +149,13 @@ fun FriendPreviewSheet(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text("Add this friend?", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Text(stringResource(R.string.ui_add_this_friend), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             FriendIdentityBlock(preview.contact, null)
             preview.keyChangeWarning?.let {
                 Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
             }
-            Button(onClick = onConfirm, modifier = Modifier.fillMaxWidth()) { Text("Add this friend") }
-            TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text("Cancel") }
+            Button(onClick = onConfirm, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.ui_add_this_friend_60651604)) }
+            TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.ui_cancel)) }
         }
     }
 }
@@ -173,8 +175,7 @@ private fun FriendIdentityBlock(contact: Contact, avatar: ByteArray?) {
         style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
         textAlign = TextAlign.Center,
     )
-    Text(
-        "Ask them to check these words match their card.",
+    Text(stringResource(R.string.ui_ask_them_to_check_these_words_match_their),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         textAlign = TextAlign.Center,

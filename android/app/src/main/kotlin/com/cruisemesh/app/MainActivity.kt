@@ -111,6 +111,8 @@ import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.parseFriendText
 import uniffi.cruisemesh_core.lanDefaultTcpPort
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
@@ -938,9 +940,9 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
                 verticalArrangement = Arrangement.Center,
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Text("Camera permission is needed to scan a friend card.")
+                Text(stringResource(R.string.ui_camera_permission_is_needed_to_scan_a_friend))
                 Button(onClick = { navController.popBackStack() }, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Back")
+                    Text(stringResource(R.string.ui_back))
                 }
             }
         }
@@ -1249,6 +1251,25 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
         val reachableMemberCount = remember(group, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs) {
             groupReachableCounts(group, identity.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs).first
         }
+        val memberReachabilityByUserId = remember(
+            contactsByUserId,
+            nearbyPeerIds,
+            relayHealth,
+            contactLastSeen,
+            presenceLastSeen,
+            connectivityNowMs,
+        ) {
+            contactsByUserId.values.associate { contact ->
+                UserIdHex.encode(contact.userId) to reachabilityLevelForUserId(
+                    contact.userId,
+                    nearbyPeerIds,
+                    relayHealth,
+                    contactLastSeen,
+                    presenceLastSeen,
+                    connectivityNowMs,
+                )
+            }
+        }
         GroupChatScreen(
             group = group,
             ownUserId = identity.userId,
@@ -1261,6 +1282,7 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
                 navController.popBackStack()
             },
             reachableMemberCount = reachableMemberCount,
+            memberReachabilityByUserId = memberReachabilityByUserId,
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }

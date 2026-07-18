@@ -122,6 +122,8 @@ import uniffi.cruisemesh_core.formatUserId
 import java.io.File
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 /** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
 private const val KIND_TEXT: kotlin.UByte = 1u
@@ -658,8 +660,8 @@ private fun ConversationScreen(
     if (confirmDelete) {
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete $displayName?") },
-            text = { Text("This removes the contact and deletes your chat history with them.") },
+            title = { Text(stringResource(R.string.ui_delete_named, displayName)) },
+            text = { Text(stringResource(R.string.ui_this_removes_the_contact_and_deletes_your_chat)) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -667,12 +669,12 @@ private fun ConversationScreen(
                         onDeleteContact()
                     },
                 ) {
-                    Text("Delete")
+                    Text(stringResource(R.string.ui_delete))
                 }
             },
             dismissButton = {
                 TextButton(onClick = { confirmDelete = false }) {
-                    Text("Cancel")
+                    Text(stringResource(R.string.ui_cancel))
                 }
             },
         )
@@ -823,8 +825,7 @@ internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
             }
         }
         Spacer(modifier = Modifier.width(12.dp))
-        Text(
-            text = "Photo ready — add a caption or send",
+        Text(text = stringResource(R.string.ui_photo_ready_add_a_caption_or_send),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -915,10 +916,9 @@ internal fun MessageComposer(
                         .background(Color(0xFFE53935)),
                 )
                 Spacer(modifier = Modifier.width(10.dp))
-                Text("Recording… ${formatDurationMs(elapsedMs.toInt())}")
+                Text(stringResource(R.string.ui_recording_duration, formatDurationMs(elapsedMs.toInt())))
                 Spacer(modifier = Modifier.weight(1f))
-                Text(
-                    text = "release to send",
+                Text(text = stringResource(R.string.ui_release_to_send),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -927,7 +927,9 @@ internal fun MessageComposer(
             TextField(
                 value = draft,
                 onValueChange = onDraftChange,
-                placeholder = { Text(if (hasPendingAttachment) "Add a caption…" else "Message") },
+                placeholder = {
+                    Text(stringResource(if (hasPendingAttachment) R.string.ui_add_a_caption else R.string.ui_message))
+                },
                 trailingIcon = {
                     IconButton(onClick = onPickCamera) {
                         Icon(ComposerCameraIcon, contentDescription = "Take photo")
@@ -1097,8 +1099,7 @@ private fun GapIndicator() {
             .padding(bottom = 8.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(
-            text = "Some messages are still making their way across the ship",
+        Text(text = stringResource(R.string.ui_some_messages_are_still_making_their_way_across),
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
         )
@@ -1179,8 +1180,7 @@ private fun MessageBubble(
             if (isOwn && tick == TickStatus.SENT && outboundExpiryMs != null &&
                 outboundExpiryMs <= System.currentTimeMillis()
             ) {
-                Text(
-                    text = "Not delivered",
+                Text(text = stringResource(R.string.ui_not_delivered),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.padding(horizontal = 12.dp),
@@ -1257,7 +1257,7 @@ fun MessageBubbleVisual(
                             AttachmentPayload.decode(message.payload)
                         }
                         if (attachment == null) {
-                            Text("Unsupported attachment")
+                            Text(stringResource(R.string.ui_unsupported_attachment))
                         } else {
                             AttachmentBubbleContent(attachment = attachment, contentColor = contentColor)
                         }
@@ -1332,8 +1332,9 @@ fun ReactionRow(
                 },
                 modifier = Modifier.clickable { onReact(reaction.emoji) },
             ) {
+                val reactionLabel = if (reaction.count > 1) "${reaction.emoji} ${reaction.count}" else reaction.emoji
                 Text(
-                    text = if (reaction.count > 1) "${reaction.emoji} ${reaction.count}" else reaction.emoji,
+                    text = reactionLabel,
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
@@ -1388,8 +1389,8 @@ internal fun MessageInfoBottomSheet(text: String, onDismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Message info", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-                TextButton(onClick = onDismiss) { Text("Done") }
+                Text(stringResource(R.string.ui_message_info), style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.ui_done)) }
             }
             text.lineSequence().forEach { line ->
                 val parts = line.split(":", limit = 2)
@@ -1491,7 +1492,7 @@ private fun ChatImageAttachment(jpeg: ByteArray) {
     val imageBitmap = remember(decoded) { decoded?.asImageBitmap() }
 
     if (decoded == null || imageBitmap == null) {
-        Text("Photo (could not display)")
+        Text(stringResource(R.string.ui_photo_could_not_display))
         return
     }
 
@@ -1574,7 +1575,7 @@ private fun VoiceMemoPlayer(
             )
         }
         Text(
-            text = "Voice memo · ${formatDurationMs(durationMs)}",
+            text = stringResource(R.string.ui_voice_memo_duration, formatDurationMs(durationMs)),
             style = MaterialTheme.typography.bodyMedium,
         )
     }

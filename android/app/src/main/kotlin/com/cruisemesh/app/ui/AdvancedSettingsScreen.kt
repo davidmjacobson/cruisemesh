@@ -48,6 +48,8 @@ import com.cruisemesh.app.mesh.lanEndpointLink
 import com.cruisemesh.app.mesh.parseLanManualEndpoint
 import com.cruisemesh.app.relay.RelayConfigStore
 import uniffi.cruisemesh_core.lanDefaultTcpPort
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,7 +70,7 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Advanced settings") },
+                title = { Text(stringResource(R.string.ui_advanced_settings)) },
                 navigationIcon = {
                     IconButton(onClick = ::saveAndBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -84,34 +86,33 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState())
                 .padding(24.dp),
         ) {
-            Text("Relay", style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.ui_relay), style = MaterialTheme.typography.titleMedium)
             OutlinedTextField(
                 value = relayUrl,
                 onValueChange = { relayUrl = it },
-                label = { Text("Relay URL") },
+                label = { Text(stringResource(R.string.ui_relay_url)) },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             )
             OutlinedTextField(
                 value = relayToken,
                 onValueChange = { relayToken = it },
-                label = { Text("Family token") },
+                label = { Text(stringResource(R.string.ui_family_token)) },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             )
-            Text(
-                "When any family phone has internet, queued messages flush through this mailbox.",
+            Text(stringResource(R.string.ui_when_any_family_phone_has_internet_queued_messages),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
             )
 
             Spacer(modifier = Modifier.height(28.dp))
-            Text("Local Wi-Fi (experimental)", style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.ui_local_wi_fi_experimental), style = MaterialTheme.typography.titleMedium)
             Text(lanStatus.state, modifier = Modifier.padding(top = 8.dp))
             lanStatus.localEndpoint?.let { endpoint ->
                 Text(
-                    "This phone: $endpoint",
+                    stringResource(R.string.ui_this_phone, endpoint),
                     style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
                     modifier = Modifier.padding(top = 8.dp),
                 )
@@ -119,14 +120,14 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     clipboard.setPrimaryClip(ClipData.newPlainText("CruiseMesh LAN address", endpoint))
                     Toast.makeText(context, "Local address copied", Toast.LENGTH_SHORT).show()
-                }) { Text("Copy this phone's address") }
+                }) { Text(stringResource(R.string.ui_copy_this_phone_s_address)) }
                 TextButton(onClick = {
                     showLanQrEndpoint = parseLanManualEndpoint(endpoint, lanDefaultTcpPort().toInt())
-                }) { Text("Show address QR") }
+                }) { Text(stringResource(R.string.ui_show_address_qr)) }
             }
             if (lanStatus.activePeerNames.isNotEmpty()) {
                 Text(
-                    "Secure link: ${lanStatus.activePeerNames.joinToString()}",
+                    stringResource(R.string.ui_secure_link, lanStatus.activePeerNames.joinToString()),
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.padding(top = 4.dp),
                 )
@@ -135,13 +136,13 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
             }
             Text(
-                "LAN frames: ${lanStatus.sentFrames} sent · ${lanStatus.receivedFrames} received",
+                stringResource(R.string.ui_lan_frames, lanStatus.sentFrames, lanStatus.receivedFrames),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
             )
             lanStatus.lastPeerEndpoint?.let {
-                Text("Last peer: $it", style = MaterialTheme.typography.bodySmall)
+                Text(stringResource(R.string.ui_last_peer, it), style = MaterialTheme.typography.bodySmall)
             }
             lanStatus.lastError?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
@@ -149,9 +150,9 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
             OutlinedTextField(
                 value = friendLanAddress,
                 onValueChange = { friendLanAddress = it },
-                label = { Text("Friend IP address") },
-                placeholder = { Text("10.0.0.42:45892") },
-                supportingText = { Text("The port is optional.") },
+                label = { Text(stringResource(R.string.ui_friend_ip_address)) },
+                placeholder = { Text(stringResource(R.string.ui_10_0_0_42_45892)) },
+                supportingText = { Text(stringResource(R.string.ui_the_port_is_optional)) },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             )
@@ -164,9 +165,8 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                 },
                 enabled = friendLanAddress.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("Connect securely") }
-            Text(
-                "Manual connection requires an accepted friend and CruiseMesh's encrypted identity check.",
+            ) { Text(stringResource(R.string.ui_connect_securely)) }
+            Text(stringResource(R.string.ui_manual_connection_requires_an_accepted_friend_and_cruisemesh),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
@@ -179,7 +179,7 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                 },
                 enabled = lanStatus.activePeerNames.isNotEmpty(),
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            ) { Text("Test encrypted LAN link") }
+            ) { Text(stringResource(R.string.ui_test_encrypted_lan_link)) }
             Button(
                 onClick = {
                     LanTransportDiagnostics.requestSubnetScan()?.let {
@@ -188,16 +188,15 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                 },
                 enabled = lanStatus.scanTotal == null,
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            ) { Text("Search this /24 network") }
+            ) { Text(stringResource(R.string.ui_search_this_24_network)) }
             lanStatus.scanTotal?.let { total ->
                 Text(
-                    "Checked ${lanStatus.scanProgress ?: 0} of $total addresses",
+                    stringResource(R.string.ui_checked_addresses, lanStatus.scanProgress ?: 0, total),
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 4.dp),
                 )
             }
-            Text(
-                "Subnet search probes only TCP 45892 with low concurrency and never expands to a /16.",
+            Text(stringResource(R.string.ui_subnet_search_probes_only_tcp_45892_with_low),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
@@ -205,7 +204,7 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
 
             if (DebugFileLog.isEnabled(context)) {
                 Spacer(modifier = Modifier.height(28.dp))
-                Text("Diagnostics", style = MaterialTheme.typography.titleMedium)
+                Text(stringResource(R.string.ui_diagnostics), style = MaterialTheme.typography.titleMedium)
                 Button(
                     onClick = {
                         val intent = DebugFileLog.shareIntent(context)
@@ -216,7 +215,7 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                         }
                     },
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                ) { Text("Share debug log") }
+                ) { Text(stringResource(R.string.ui_share_debug_log)) }
             }
         }
     }
@@ -225,7 +224,7 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
         val qr = remember(endpoint) { encodeQrBitmap(lanEndpointLink(endpoint)) }
         AlertDialog(
             onDismissRequest = { showLanQrEndpoint = null },
-            title = { Text("CruiseMesh LAN address") },
+            title = { Text(stringResource(R.string.ui_cruisemesh_lan_address)) },
             text = {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Image(
@@ -233,15 +232,14 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                         contentDescription = "CruiseMesh LAN address QR code",
                         modifier = Modifier.fillMaxWidth(),
                     )
-                    Text(
-                        "Scan with the other phone's camera to connect securely.",
+                    Text(stringResource(R.string.ui_scan_with_the_other_phone_s_camera_to),
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(top = 8.dp),
                     )
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showLanQrEndpoint = null }) { Text("Done") }
+                TextButton(onClick = { showLanQrEndpoint = null }) { Text(stringResource(R.string.ui_done)) }
             },
         )
     }

@@ -626,6 +626,8 @@ fn group_message_floods_and_mules_to_every_other_member_with_dedupe() {
         name: "Deck Crew".to_string(),
         member_user_ids: net.nodes.iter().map(|node| node.user_id()).collect(),
         key: vec![0x55; 32],
+        metadata_revision: 0,
+        metadata_changed_by: Vec::new(),
     };
     for node in &net.nodes {
         node.import_group(group.clone());

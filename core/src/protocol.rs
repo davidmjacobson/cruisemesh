@@ -275,6 +275,8 @@ pub const KIND_ATTACHMENT_MANIFEST: u8 = 16;
 pub const KIND_ATTACHMENT_CHUNK: u8 = 17;
 /// Hidden chat-stream event carrying an emoji reaction to another message.
 pub const KIND_REACTION: u8 = 18;
+/// Hidden group-stream event carrying a convergent name/add-member update.
+pub const KIND_GROUP_METADATA_UPDATE: u8 = 19;
 
 /// `ReceiptContent.receipt_type` value: recipient's device decrypted and
 /// stored the message (the ✓✓ tick, DESIGN.md §7.2).

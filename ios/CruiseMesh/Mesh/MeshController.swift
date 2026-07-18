@@ -872,8 +872,18 @@ final class MeshController: ObservableObject {
             return
         }
         switch body.kind {
-        case ProtocolKind.text, ProtocolKind.reaction:
+        case ProtocolKind.text, ProtocolKind.attachmentManifest, ProtocolKind.reaction:
             handleIncomingGroupChatMessage(
+                group: group,
+                senderUserId: opened.senderUserId,
+                body: body,
+                msgId: msgId,
+                replyToMsgId: extendedBody.replyToMsgId,
+                arrival: arrival
+            )
+        case ProtocolKind.groupMetadataUpdate:
+            handleIncomingGroupMetadataUpdate(
+                sourceLabel: sourceLabel,
                 group: group,
                 senderUserId: opened.senderUserId,
                 body: body,
@@ -883,6 +893,58 @@ final class MeshController: ObservableObject {
             )
         default:
             log.info("Dropping group envelope from \(sourceLabel, privacy: .public): unhandled kind=\(body.kind)")
+        }
+    }
+
+    private func handleIncomingGroupMetadataUpdate(
+        sourceLabel: String,
+        group: Group,
+        senderUserId: Data,
+        body: MessageBody,
+        msgId: Data,
+        replyToMsgId: Data?,
+        arrival: MessageArrival?
+    ) {
+        let updated: Group?
+        do {
+            let update = try decodeGroupMetadataUpdate(bytes: body.content)
+            updated = try applyGroupMetadataUpdate(
+                group: group,
+                update: update,
+                senderUserId: senderUserId
+            )
+        } catch {
+            log.warning("Dropping invalid group metadata from \(sourceLabel, privacy: .public)")
+            return
+        }
+        let inserted = (try? store.insertIncomingMessage(
+            message: StoredMessage(
+                chatId: group.id,
+                senderUserId: senderUserId,
+                lamport: body.lamport,
+                timestamp: body.timestamp,
+                kind: body.kind,
+                payload: body.content
+            ),
+            msgId: msgId,
+            replyToMsgId: replyToMsgId
+        )) ?? false
+        guard inserted else { return }
+        if let arrival {
+            _ = try? store.recordMessageArrival(
+                chatId: group.id,
+                senderUserId: senderUserId,
+                lamport: body.lamport,
+                arrival: arrival
+            )
+        }
+        if let updated {
+            do {
+                try store.upsertGroup(group: updated)
+                ChatEvents.notifyChatChanged(group.id)
+            } catch {
+                log.error("Failed to persist group metadata revision \(updated.metadataRevision)")
+            }
         }
     }
 
@@ -918,7 +980,7 @@ final class MeshController: ObservableObject {
         ChatEvents.notifyChatChanged(group.id)
 
         // Local read watermark only (group wire receipts are deferred).
-        let throughLamport = (try? store.highestContiguousLamport(chatId: group.id, senderUserId: senderUserId)) ?? 0
+        let throughLamport = (try? store.highestLamport(chatId: group.id, senderUserId: senderUserId)) ?? 0
         try? store.recordOutgoingReceipt(
             chatId: group.id,
             senderUserId: senderUserId,
@@ -935,7 +997,9 @@ final class MeshController: ObservableObject {
         } else if isVisibleChatKind(body.kind) {
             let senderName = (try? store.getContact(userId: senderUserId))?.name
                 ?? String(UserIdHex.encode(senderUserId).prefix(8))
-            let preview = String(data: body.content, encoding: .utf8) ?? ""
+            let preview = body.kind == ProtocolKind.attachmentManifest
+                ? AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))
+                : (String(data: body.content, encoding: .utf8) ?? "")
             MessageNotifier.notifyIncomingGroupMessage(group: group, senderName: senderName, preview: preview)
         }
     }

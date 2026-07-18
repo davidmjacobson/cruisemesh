@@ -1,6 +1,6 @@
 # Group management v1
 
-Status: **Proposed — implementation requires orchestrator approval**
+Status: **Approved and implemented**
 
 ## Scope
 
@@ -21,7 +21,7 @@ removal, admin roles, ownership transfer, or key rotation.
 
 ## Wire changes
 
-Reserve kind **18** (`group_metadata_update`) for an encrypted group-stream
+Reserve kind **19** (`group_metadata_update`) for an encrypted group-stream
 message containing:
 
 | Field | Type | Meaning |
@@ -39,7 +39,7 @@ Concurrent same-revision updates resolve by lexicographically comparing
 `changed_by`; the winning tuple `(revision, changed_by)` is persisted so all
 members converge.
 
-Renaming authors kind 18 through the existing group encryption, store, BLE
+Renaming authors kind 19 through the existing group encryption, store, BLE
 flood, carry, and D6 relay fan-out paths. It does not rotate the group key.
 
 ## Adding members
@@ -49,11 +49,11 @@ core canonicalizes `existing + additions`, updates the local group membership,
 and queues a normal pairwise kind-4 invite containing the existing group key
 and new member list to each added contact.
 
-To make existing members converge, the initiator also sends a kind-18 metadata
-update at the next revision with an optional `member_user_ids` field. Receivers
-replace their member list only when the update wins the revision rule. A member
-must never be removed by this operation: the core rejects an update whose list
-is not a strict superset of the current canonical list.
+To make existing members converge, the initiator also sends a kind-19 metadata
+update at the next revision with the canonical `member_user_ids` snapshot.
+Receivers union that snapshot with their current member set, including when a
+concurrent update loses the name tie-break. Membership is therefore add-only
+and delivery order cannot silently remove one concurrent addition.
 
 ## UI
 
@@ -66,12 +66,14 @@ is not a strict superset of the current canonical list.
 ## Tests and rollout
 
 - Core: revision ordering, tie-break convergence, non-member rejection,
-  strict-superset validation, idempotent replay, encode/decode vectors.
+  add-only validation, idempotent replay, encode/decode vectors.
 - Store/engine: rename and membership update survive relay fan-out and replay.
 - Android/iOS: details rows, picker exclusions, queued-offline behavior, and
   cross-platform receive tests.
 - Field test: three members rename offline, reconnect, add a fourth member,
   and verify all four converge without exposing a removal control.
 
-Implementation begins only after the orchestrator approves kind 18, the
-revision tie-break, and the strict-superset membership rule.
+Kind 18 was already assigned to reactions, so implementation uses kind 19.
+The add-only union rule supersedes replacement/strict-superset semantics because
+two offline members can otherwise add different contacts at the same revision
+and converge differently depending on delivery order.

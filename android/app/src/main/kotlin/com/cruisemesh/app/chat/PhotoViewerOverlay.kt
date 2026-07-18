@@ -43,6 +43,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.cruisemesh.app.media.ImageGallery
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 private const val MIN_SCALE = 1f
 private const val MAX_SCALE = 5f
@@ -161,8 +163,7 @@ fun PhotoViewerOverlay(
                         },
                 )
             } else {
-                Text(
-                    text = "Photo could not be displayed",
+                Text(text = stringResource(R.string.ui_photo_could_not_be_displayed),
                     color = Color.White,
                     modifier = Modifier.padding(24.dp),
                 )
@@ -188,7 +189,7 @@ fun PhotoViewerOverlay(
                         ).show()
                     },
                 ) {
-                    Text("Save", color = Color.White)
+                    Text(stringResource(R.string.ui_save), color = Color.White)
                 }
             }
         }

@@ -29,6 +29,8 @@ import androidx.compose.ui.unit.dp
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
+import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.R
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -101,8 +103,7 @@ fun ContactDetailsSheetContent(
                 shape = RoundedCornerShape(24.dp),
             ) {
                 Column(modifier = Modifier.padding(20.dp)) {
-                    Text(
-                        text = "Connectivity",
+                    Text(text = stringResource(R.string.ui_connectivity),
                         style = MaterialTheme.typography.titleMedium,
                     )
                     Text(
@@ -122,8 +123,7 @@ fun ContactDetailsSheetContent(
             shape = RoundedCornerShape(24.dp),
         ) {
             Column(modifier = Modifier.padding(20.dp)) {
-                Text(
-                    text = "Safety words",
+                Text(text = stringResource(R.string.ui_safety_words),
                     style = MaterialTheme.typography.titleMedium,
                 )
                 Spacer(modifier = Modifier.height(12.dp))
@@ -144,8 +144,7 @@ fun ContactDetailsSheetContent(
                         }
                     }
                 }
-                Text(
-                    text = "Read these aloud to verify.",
+                Text(text = stringResource(R.string.ui_read_these_aloud_to_verify),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 12.dp),
@@ -157,7 +156,7 @@ fun ContactDetailsSheetContent(
             modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("Mute notifications", modifier = Modifier.weight(1f))
+            Text(stringResource(R.string.ui_mute_notifications), modifier = Modifier.weight(1f))
             Switch(checked = isMuted, onCheckedChange = onMutedChange)
         }
 
@@ -172,7 +171,7 @@ fun ContactDetailsSheetContent(
                 .padding(top = 24.dp)
                 .height(52.dp),
         ) {
-            Text("Delete contact")
+            Text(stringResource(R.string.ui_delete_contact))
         }
     }
 }
