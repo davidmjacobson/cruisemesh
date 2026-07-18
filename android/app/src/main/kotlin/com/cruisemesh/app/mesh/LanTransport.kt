@@ -30,6 +30,9 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
@@ -72,7 +75,18 @@ internal class LanTransport(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val acceptExecutor = Executors.newSingleThreadExecutor()
     private val connectionExecutor = Executors.newFixedThreadPool(MAX_CONNECTIONS + 2)
-    private val scanExecutor = Executors.newFixedThreadPool(SCAN_CONCURRENCY)
+    // A /16 sweep queues up to ~65k connect probes, so it needs far more
+    // parallelism than a /24 -- but those worker threads only need to exist
+    // while a scan is running. allowCoreThreadTimeOut lets all SCAN_CONCURRENCY
+    // threads reap after they go idle between scans instead of lingering for
+    // the process lifetime.
+    private val scanExecutor = ThreadPoolExecutor(
+        SCAN_CONCURRENCY,
+        SCAN_CONCURRENCY,
+        SCAN_THREAD_KEEPALIVE_SECONDS,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue(),
+    ).apply { allowCoreThreadTimeOut(true) }
     private val writeExecutor = Executors.newSingleThreadExecutor()
     private val secureRandom = SecureRandom()
     private val activeSocketCount = AtomicInteger(0)
@@ -224,10 +238,15 @@ internal class LanTransport(
             ?.let { runCatching { InetAddress.getByName(it) }.getOrNull() }
             as? Inet4Address
             ?: return "The selected Wi-Fi network has no IPv4 address to search"
-        val candidates = subnet24Hosts(local).shuffled()
+        val prefixLength = localPrefixLength(network, local)
+        val candidates = subnetHosts(local, prefixLength).shuffled()
         val generation = scanGeneration.incrementAndGet()
         scanRemaining.set(candidates.size)
-        Log.i(TAG, "Scanning ${candidates.size} subnet hosts for CruiseMesh peers")
+        Log.i(
+            TAG,
+            "Scanning ${candidates.size} subnet hosts (/${effectiveScanPrefixLength(prefixLength)}) " +
+                "for CruiseMesh peers",
+        )
         LanTransportDiagnostics.scanStarted(candidates.size)
         for (candidate in candidates) {
             try {
@@ -921,6 +940,19 @@ internal class LanTransport(
         return address?.hostAddress?.let { LanManualEndpoint(it, port) }
     }
 
+    /**
+     * The subnet prefix length the network advertises for [local] -- this is
+     * what makes the scan cover a whole /16 cruise LAN rather than just our own
+     * /24. Falls back to [DEFAULT_SCAN_PREFIX_LENGTH] when the platform reports
+     * no matching link address; [subnetHosts] clamps the breadth either way.
+     */
+    private fun localPrefixLength(network: Network, local: Inet4Address): Int =
+        connectivityManager.getLinkProperties(network)
+            ?.linkAddresses
+            ?.firstOrNull { it.address == local }
+            ?.prefixLength
+            ?: DEFAULT_SCAN_PREFIX_LENGTH
+
     private fun isEligibleWifiNetwork(network: Network): Boolean {
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
         if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return false
@@ -993,7 +1025,13 @@ internal class LanTransport(
         private const val CONNECT_TIMEOUT_MS = 3_000
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
         private const val SCAN_CONNECT_TIMEOUT_MS = 350
-        private const val SCAN_CONCURRENCY = 8
+        // Sized for the /16 case: at 64-way parallelism a fully unresponsive
+        // /16 finishes its ~65k probes in roughly six minutes worst case
+        // (SCAN_CONNECT_TIMEOUT_MS per dead host), and far faster in practice
+        // since unallocated addresses fail fast. A /24 still finishes in
+        // seconds. Threads reap between scans -- see scanExecutor.
+        private const val SCAN_CONCURRENCY = 64
+        private const val SCAN_THREAD_KEEPALIVE_SECONDS = 10L
         private const val RECONNECT_SLOT_DELAY_MS = 5_000L
         private const val AUTO_SCAN_INITIAL_DELAY_MS = 5_000L
         private const val AUTO_SCAN_RECONNECT_DELAY_MS = 2_000L
