@@ -45,7 +45,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.mesh.ReachabilityLevel
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.R
 
 /** How urgent a home-screen connectivity callout is. */
@@ -172,6 +176,13 @@ fun MeshStatusLegendDialog(
     onStartMesh: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    // How many other people's messages this phone is currently carrying
+    // (DTN mule queue). Snapshot when the dialog opens; a COUNT(*) on the
+    // local store. `carriedLen` is the read-only core accessor.
+    val context = LocalContext.current
+    val carriedCount = remember {
+        runCatching { AppStore.get(context).carriedLen().toLong() }.getOrDefault(0L)
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.ui_mesh_status)) },
@@ -191,6 +202,17 @@ fun MeshStatusLegendDialog(
                     LegendRow(ReachabilityLevel.RECENT, "Recent", "Seen recently")
                     LegendRow(ReachabilityLevel.MESH_CARRY, "Carried", "Nearby phones may carry messages")
                     LegendRow(ReachabilityLevel.OFFLINE, "Offline", "No recent route")
+                }
+                if (carriedCount > 0L) {
+                    Text(
+                        pluralStringResource(
+                            R.plurals.ui_carrying_for_others,
+                            carriedCount.toInt(),
+                            carriedCount.toInt(),
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         },

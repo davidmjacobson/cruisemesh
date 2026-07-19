@@ -389,6 +389,10 @@ private struct MeshStatusSheet: View {
     @ObservedObject var appModel: AppModel
     @ObservedObject private var runtime = MeshRuntimeStatus.shared
     @Environment(\.dismiss) private var dismiss
+    // How many other people's messages this phone is carrying (DTN mule
+    // queue). Snapshot when the sheet appears; `carriedLen` is the read-only
+    // core accessor.
+    @State private var carriedCount: UInt64 = 0
 
     private var meshOn: Binding<Bool> {
         Binding(
@@ -423,12 +427,22 @@ private struct MeshStatusSheet: View {
                     LegendRow(color: .orange, hollow: true, label: "Carried", detail: "Nearby phones may carry messages")
                     LegendRow(color: .gray, label: "Offline", detail: "No recent route")
                 }
+                if carriedCount > 0 {
+                    Section {
+                        Text(carriedCount == 1
+                            ? "Carrying 1 message for others"
+                            : "Carrying \(carriedCount) messages for others")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Section {
                     Text("Open the app when you sit down with family so phones can sync over Bluetooth.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
+            .onAppear { carriedCount = (try? AppStore.get().carriedLen()) ?? 0 }
             .navigationTitle("Mesh status")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
