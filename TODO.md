@@ -26,14 +26,18 @@ built). Do not re-open.
 - **T9 — isolation verdict shown too soon** ✅ merged (PR #87): verdict gated
   on sweep completion, neutral in-progress state, resets on network change.
 - **Release diagnostic logging** (Android; §1.5) ✅ merged (PR #88).
+- **T2 — show how many messages you're muling** ✅ merged (PR #91): mule count
+  in the mesh-status legend, both platforms, from `carriedLen()`.
 - **`backup_to` hardening** (was a §2 carryover) ✅ folded into T4-07.
 
-Still open and worth doing next (my read): **T1 swipe-to-reply** and **T2
-mule count** are the highest-value self-contained 🔴 code items. **T11
-friending reciprocity** is 🔴 but blocked on a device log (David repro +
-logcat). **T12 QR density** is a quick 🟡 (root cause already diagnosed).
-**T13 iOS diagnostic-log parity** now that the Android half shipped. Larger:
-**D9** group receipts. Field/device: **L3/V1/V2**.
+Still open and worth doing next (my read): **T1 swipe-to-reply** is the top
+self-contained 🔴 code item (gesture + animation + composer focus, both
+platforms). **T11 friending reciprocity** is 🔴 but blocked on a device log
+(David repro + logcat). **T15 keep-on-Wi-Fi** is 🔴 but starts as an
+investigation. Quick 🟡 wins: **T14** scan-button relabel (one string),
+**T12 QR density** (root cause diagnosed), **T16 rename contacts**. **T13**
+iOS diagnostic-log parity. Larger: **D9** group receipts. Field/device:
+**L3/V1/V2**. Explore/spec: **T3** Nearby, **T17** open-relay messaging.
 
 ---
 
@@ -293,6 +297,61 @@ with no in-app export, so a field iPhone can't hand over a log.
   to be gated; `OSLogStore` reading is on-demand so an always-available
   "Share diagnostics" button may be enough — state which in the PR.
 - Validate on the Mac host (currently unreachable — check first).
+
+### T14 🟢 Manual scan button mislabels its breadth
+
+The Advanced-settings button reads "Search this /24 network"
+(`ui_search_this_24_network`) but its `onClick` calls `startSubnetScan()`,
+which defaults to `LanScanBreadth.FULL_SUBNET` — i.e. it sweeps the whole
+advertised subnet (clamped to /16), not a /24. Just relabel it, e.g.
+"Search my LAN" / "Search this network". (The tiered *auto* scan does have a
+real /24 tier — that's `LanScanPlanner`; this is only the manual button's
+copy.) One-line string change on Android; check iOS for the same label.
+
+### T15 🔴 Help keep the user on the Wi-Fi network (expands T7)
+
+Field: cruise Wi-Fi (e.g. "Norwegian") drops the session after ~1 hour, and
+Android adaptive connectivity ("switch to mobile data when Wi-Fi has no
+internet") can drop the association — both break LAN delivery, which needs
+the Wi-Fi association even without internet. T7 covers *guidance*; this asks
+whether the app can do more:
+- Detect the symptom (Wi-Fi association lost / captive-portal re-auth needed
+  shortly after join while cellular stays up) and surface a contextual
+  prompt.
+- Investigate holding the association: a `WifiManager`/`ConnectivityManager`
+  keepalive, `requestNetwork` with a Wi-Fi transport to keep it bound, or a
+  foreground-service nudge; and re-associate / re-auth flows for the ~1h
+  timeout. Note what's actually possible without owning the captive portal.
+- Do NOT fight the OS where it's not allowed — measure first, and keep relay
+  sync riding cellular when Wi-Fi is truly dead. Relates to [[T7]] and the
+  LAN discovery work.
+
+### T16 🟡 Rename contacts (local nicknames)
+
+A friend may accept with a default name like "iPhone"; the user should be
+able to set a local nickname ("Dad") shown everywhere in place of the card
+name. Local-only, never synced or sent.
+- Core-first: add a local alias (e.g. `nickname: Option<String>`) to the
+  contact store — a new nullable column or a small alias table keyed by
+  userId — with a resolve helper (`display_name = nickname ?? card name`).
+- UI: an edit affordance in Contact details (both platforms); the resolved
+  display name flows to chat list, chat header, group member rows, etc.
+- Keep the original card `name` intact (still shown as "also known as", and
+  used for fingerprint/verification). Nickname is presentation only.
+
+### T17 🟡 Explore: let anyone on our relay message me (easier onboarding)
+
+Research/design spike (no product code until reviewed), like T3. Today
+messaging requires mutual friending (a Noise handshake gated on contact
+trust). Explore an opt-in mode where any CruiseMesh relay user can send you
+a message, to make onboarding many users at once easier.
+- Deliverable: a short spec in `specs/open-relay-messaging.md` weighing: how
+  a first message reaches someone with no prior pairwise key exchange (the
+  sealed-envelope model needs the recipient's agree key — where does it come
+  from?); spam/abuse exposure and rate-limiting; whether it's a "request to
+  connect" inbox rather than open delivery; and how it interacts with the
+  friending trust model and the relay's family-token addressing.
+- Explicitly out of scope until the spec is signed off. Findings first.
 
 ---
 
