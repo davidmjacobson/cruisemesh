@@ -511,7 +511,14 @@ final class MeshController: ObservableObject {
         // mule still holding our envelope learns on this digest that we
         // already have it -- see `store.coreConfirmCarriedDeliveries`.
         let advertised = (try? store.coreDigestAdvertisedMsgIds()) ?? []
-        let digest = encodeDigest(chatId: identity.userId, entries: entries, recentMsgIds: advertised)
+        guard let digest = try? encodeDigest(
+            chatId: identity.userId,
+            entries: entries,
+            recentMsgIds: advertised
+        ) else {
+            log.warning("Could not encode DIGEST for \(address, privacy: .public)")
+            return
+        }
         MeshRouter.sendToAddress(address: address, frame: digest)
         refreshNearby()
     }

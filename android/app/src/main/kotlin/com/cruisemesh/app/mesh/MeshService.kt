@@ -1616,7 +1616,12 @@ class MeshService : Service() {
         } else {
             sendLanEndpointHintTo(address)
         }
-        val digestFrame = encodeDigest(identity.userId, digestEntries, store.coreDigestAdvertisedMsgIds())
+        val digestFrame = try {
+            encodeDigest(identity.userId, digestEntries, store.coreDigestAdvertisedMsgIds())
+        } catch (error: CoreException) {
+            Log.w(TAG, "Could not encode DIGEST for $address", error)
+            return
+        }
         MeshRouter.sendToAddress(address, digestFrame)
     }
 
