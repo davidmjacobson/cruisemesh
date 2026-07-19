@@ -78,6 +78,36 @@ have malicious effect? This is an authorized review of our own codebase.
   separate small PRs. Consider `cargo-fuzz` targets for the decoders as a
   lasting artifact.
 
+**Status (Codex, 2026-07-19): review DONE, 9 of 10 fixes on branches.**
+Findings doc: `specs/adversarial-payload-review.md` (on
+`agent/t4-adversarial-payload-review`) — 10 findings T4-01…T4-10, no
+memory-safety/forgery issue; the risk is DoS (unbounded carry storage,
+33 MiB BLE reassembly, unbounded relay/relayd admission, unauthorized-sender
+persistence, KDF CPU bomb). One hardening branch per finding, each +1 commit
+off master, **not yet merged or independently re-verified by me:**
+
+| Finding | Branch | State |
+|---|---|---|
+| T4-01 carry storage exhaustion | `agent/t4-carry-queue-hardening` | committed |
+| T4-02 BLE 33 MiB reassembly | `agent/t4-p2p-frame-limits` | committed |
+| T4-03 unbounded relay response | `agent/t4-relay-response-limits` | committed |
+| T4-04 unknown-sender persistence | `agent/t4-inbound-sender-authorization` | committed |
+| T4-05 group/identity amplification | `agent/t4-structured-content-limits` | committed |
+| **T4-06 iOS marks failed store consumed+acks** | — | **NOT STARTED** |
+| T4-07 backup KDF CPU bomb | `agent/t4-backup-hardening` | committed (also the carried-over backup_to hardening) |
+| T4-08 `encode_digest` panic | `agent/t4-digest-encoding` | committed |
+| T4-09 relayd ingress cardinality/quota | `agent/t4-relayd-request-limits` | committed |
+| T4-10 numeric/kind validation | `agent/t4-message-semantics-validation` | committed |
+| fuzzing | `agent/t4-decoder-fuzz-targets` | committed (`f660445`) — was interrupted uncommitted; finished + CI smoke added |
+
+Remaining work: (a) **T4-06** (Medium) — no branch; needs a core-owned
+explicit ingest result (stored/duplicate/rejected/failed) so a failed store
+is never recorded seen/acked, wired into both shells; this touches DTN ack
+safety, review carefully. (b) Merge sequencing: several branches edit the
+same core files (`engine.rs`, generated bindings) — merge one at a time,
+regenerate UniFFI, re-run suites. (c) Independent verification: I have not
+re-run each branch's tests.
+
 ### T5 🟡 Onboarding copy rework
 
 Current copy is awkward ("mesh off without this" style phrasing). Rebrand the
