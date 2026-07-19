@@ -976,7 +976,7 @@ int8_t uniffi_cruisemesh_core_fn_func_core_hello_identity_matches(RustBuffer cur
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_INBOUND_GATE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_INBOUND_GATE
-RustBuffer uniffi_cruisemesh_core_fn_func_core_inbound_gate(int8_t is_new_msg_id, int64_t expiry_ms, int64_t now_ms, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_cruisemesh_core_fn_func_core_inbound_gate(int8_t is_new_msg_id, uint8_t hop_ttl, int64_t expiry_ms, int64_t now_ms, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_IS_OWN_FANOUT_HINT
@@ -1007,6 +1007,11 @@ RustBuffer uniffi_cruisemesh_core_fn_func_core_last_visible_message(RustBuffer m
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_MAKE_LAN_ENDPOINT_LINK
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_MAKE_LAN_ENDPOINT_LINK
 RustBuffer uniffi_cruisemesh_core_fn_func_core_make_lan_endpoint_link(RustBuffer endpoint, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_PAIRWISE_SENDER_AUTHORIZED
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_PAIRWISE_SENDER_AUTHORIZED
+int8_t uniffi_cruisemesh_core_fn_func_core_pairwise_sender_authorized(uint8_t kind, int8_t sender_is_contact, int8_t sender_is_self, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_PARSE_LAN_ENDPOINT
@@ -1692,7 +1697,7 @@ void ffi_cruisemesh_core_rust_future_complete_void(uint64_t handle, RustCallStat
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_APPLY_GROUP_METADATA_UPDATE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_APPLY_GROUP_METADATA_UPDATE
 uint16_t uniffi_cruisemesh_core_checksum_func_apply_group_metadata_update(void
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_ATTACHMENT_MAX_BLOB_BYTES
@@ -1809,6 +1814,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_core_make_lan_endpoint_link(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_PAIRWISE_SENDER_AUTHORIZED
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_PAIRWISE_SENDER_AUTHORIZED
+uint16_t uniffi_cruisemesh_core_checksum_func_core_pairwise_sender_authorized(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_PARSE_LAN_ENDPOINT
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_PARSE_LAN_ENDPOINT
 uint16_t uniffi_cruisemesh_core_checksum_func_core_parse_lan_endpoint(void
@@ -1884,7 +1895,7 @@ uint16_t uniffi_cruisemesh_core_checksum_func_create_group(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CREATE_GROUP_METADATA_UPDATE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CREATE_GROUP_METADATA_UPDATE
 uint16_t uniffi_cruisemesh_core_checksum_func_create_group_metadata_update(void
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CREATE_INTRODUCTION_TICKET
@@ -1920,7 +1931,7 @@ uint16_t uniffi_cruisemesh_core_checksum_func_decode_group_invite_content(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_DECODE_GROUP_METADATA_UPDATE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_DECODE_GROUP_METADATA_UPDATE
 uint16_t uniffi_cruisemesh_core_checksum_func_decode_group_metadata_update(void
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_DECODE_IDENTITY_BYTES
@@ -2016,7 +2027,7 @@ uint16_t uniffi_cruisemesh_core_checksum_func_encode_group_invite_content(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_ENCODE_GROUP_METADATA_UPDATE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_ENCODE_GROUP_METADATA_UPDATE
 uint16_t uniffi_cruisemesh_core_checksum_func_encode_group_metadata_update(void
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_ENCODE_HELLO
@@ -2490,7 +2501,7 @@ uint16_t uniffi_cruisemesh_core_checksum_method_messagestore_author_group_messag
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_MESSAGESTORE_AUTHOR_GROUP_METADATA_UPDATE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_MESSAGESTORE_AUTHOR_GROUP_METADATA_UPDATE
 uint16_t uniffi_cruisemesh_core_checksum_method_messagestore_author_group_metadata_update(void
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_MESSAGESTORE_AUTHOR_PAIRWISE_MESSAGE
@@ -2514,7 +2525,7 @@ uint16_t uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_e
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_MESSAGESTORE_BACKUP_TO
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_MESSAGESTORE_BACKUP_TO
 uint16_t uniffi_cruisemesh_core_checksum_method_messagestore_backup_to(void
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_MESSAGESTORE_CARRIED_ENVELOPES_FOR_HINTS
@@ -2760,7 +2771,7 @@ uint16_t uniffi_cruisemesh_core_checksum_method_messagestore_outbound_envelopes_
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_MESSAGESTORE_OUTBOUND_MESSAGE_EXPIRY
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_MESSAGESTORE_OUTBOUND_MESSAGE_EXPIRY
 uint16_t uniffi_cruisemesh_core_checksum_method_messagestore_outbound_message_expiry(void
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_MESSAGESTORE_OUTGOING_RECEIPT_ENVELOPE
@@ -2985,3 +2996,4 @@ uint32_t ffi_cruisemesh_core_uniffi_contract_version(void
     
 );
 #endif
+

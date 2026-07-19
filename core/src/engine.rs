@@ -9,8 +9,10 @@ use std::collections::HashSet;
 
 use crate::{
     compute_recipient_hint, encode_envelope_frame, fanout_msg_id, CarriedEnvelope, CoreError,
-    MessageOrigin, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, MS_PER_DAY,
-    RECEIPT_TYPE_DELIVERED,
+    MessageOrigin, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
+    KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
+    KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION,
+    KIND_RECEIPT, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
 };
 
 /// Exact carried+recently-held `msg_id` count advertised in one outgoing
@@ -34,11 +36,17 @@ const DIGEST_ADVERTISED_MSG_IDS_LIMIT: u64 = 512;
 /// for this peer could use.
 const CARRY_HINT_DAY_WINDOW_DAYS: i64 = 7;
 
+/// Relayd already clamps accepted envelopes to 30 days. Apply the same
+/// ceiling before a P2P envelope can be opened, flooded, or persisted so an
+/// attacker cannot manufacture effectively permanent carry rows.
+pub const MAX_CARRY_FUTURE_MS: i64 = 30 * crate::MS_PER_DAY;
+
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreInboundGate {
     Dispatch,
     Seen,
     Expired,
+    Rejected,
 }
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +55,55 @@ pub enum CoreInboundDisposition {
     Carried,
     Expired,
     Seen,
+    /// Envelope whose public header failed local validation (bad hop/expiry).
+    /// Not ackable -- its header is invalid locally, but this device has not
+    /// proven it was the sealed payload's sole true endpoint consumer (T4-01).
+    Rejected,
+    /// A message addressed to us that we opened but could NOT durably store
+    /// (e.g. disk full, corrupt store). Unlike [`CoreInboundDisposition::Seen`]
+    /// this is not a "already have it" dead end and unlike
+    /// [`CoreInboundDisposition::Consumed`] nothing was persisted, so the
+    /// shells must NOT record its `msg_id` as seen: the same envelope must
+    /// re-present and re-dispatch on its next copy (T4-06). Never acked
+    /// (`core_should_ack_inbound` returns `false`), so the relay copy — often
+    /// the only copy — is preserved for that retry rather than deleted. The
+    /// safety direction here is the same as `Carried`: churn is recoverable,
+    /// deletion is not.
+    Failed,
+}
+
+/// Decide whether an authenticated pairwise sender may dispatch this message
+/// kind into application handlers. Cryptographic opening proves who signed a
+/// payload, but it does not by itself make that identity an accepted contact.
+///
+/// Direct friend requests and ticket-bearing introduced friend requests are
+/// the only onboarding kinds intentionally accepted from an unknown sender.
+/// Every ordinary chat/control kind requires an accepted contact, except for
+/// this device's own relay/fan-out copies. Unknown and group-only kinds fail
+/// closed before either platform can write message or group state.
+#[uniffi::export]
+pub fn core_pairwise_sender_authorized(
+    kind: u8,
+    sender_is_contact: bool,
+    sender_is_self: bool,
+) -> bool {
+    let recognized_pairwise_kind = matches!(
+        kind,
+        KIND_TEXT
+            | KIND_RECEIPT
+            | KIND_FRIEND_REQUEST
+            | KIND_GROUP_INVITE
+            | KIND_PROFILE_SYNC
+            | KIND_FRIEND_DIRECTORY
+            | KIND_INTRODUCED_FRIEND_REQUEST
+            | KIND_LAN_ENDPOINT_HINT
+            | KIND_ATTACHMENT_MANIFEST
+            | KIND_REACTION
+    );
+    recognized_pairwise_kind
+        && (sender_is_contact
+            || sender_is_self
+            || matches!(kind, KIND_FRIEND_REQUEST | KIND_INTRODUCED_FRIEND_REQUEST))
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
@@ -187,7 +244,8 @@ pub fn core_is_own_fanout_hint(recipient_hint: Vec<u8>, own_user_id: Vec<u8>, no
     })
 }
 
-/// Inbound flood-dedupe + expiry gate (DESIGN.md §5.3).
+/// Inbound flood-dedupe, expiry, and public-header resource gate
+/// (DESIGN.md §5.3).
 ///
 /// `is_new_msg_id` must come from a non-mutating check
 /// ([`crate::SeenIds::contains`]), never from [`crate::SeenIds::check_and_record`]
@@ -198,11 +256,20 @@ pub fn core_is_own_fanout_hint(recipient_hint: Vec<u8>, own_user_id: Vec<u8>, no
 /// failed must be re-presentable; an envelope that was handled (even by
 /// deliberate drop, e.g. the `Expired` arm below) must be deduped.
 #[uniffi::export]
-pub fn core_inbound_gate(is_new_msg_id: bool, expiry_ms: i64, now_ms: i64) -> CoreInboundGate {
+pub fn core_inbound_gate(
+    is_new_msg_id: bool,
+    hop_ttl: u8,
+    expiry_ms: i64,
+    now_ms: i64,
+) -> CoreInboundGate {
     if !is_new_msg_id {
         CoreInboundGate::Seen
     } else if expiry_ms <= now_ms {
         CoreInboundGate::Expired
+    } else if hop_ttl > crate::DEFAULT_HOP_TTL
+        || expiry_ms > now_ms.saturating_add(MAX_CARRY_FUTURE_MS)
+    {
+        CoreInboundGate::Rejected
     } else {
         CoreInboundGate::Dispatch
     }
@@ -214,12 +281,16 @@ pub fn core_inbound_gate(is_new_msg_id: bool, expiry_ms: i64, now_ms: i64) -> Co
 ///
 /// Only [`CoreInboundDisposition::Consumed`] (it was ours to open, and we
 /// did) and [`CoreInboundDisposition::Expired`] (it's dead weight regardless
-/// of who it was for) are safe to remove this way.
+/// of who it was for) are safe to remove this way. A `Rejected` envelope is
+/// not ackable: its public header is invalid locally, but this device has not
+/// proven it was the sealed payload's sole true endpoint consumer.
 /// [`CoreInboundDisposition::Carried`] must NOT be acked: relay
 /// proxy-polling means we may have fetched a contact's envelope on their
 /// behalf, and the relay copy is the durable fallback until the real
 /// recipient (or another proxy) fetches and consumes it -- deleting it here
-/// would silently drop the message. [`CoreInboundDisposition::Seen`] also
+/// would silently drop the message. [`CoreInboundDisposition::Failed`]
+/// (durable storage of a message that was ours failed) is likewise never
+/// acked, so the relay copy survives for the retry. [`CoreInboundDisposition::Seen`] also
 /// returns `false` here, but it is NOT necessarily a dead end: see
 /// [`consumed_seen_is_ackable`] and
 /// [`MessageStore::core_relay_ack_ids_with_consumed`] for the narrow,
@@ -701,8 +772,21 @@ mod tests {
             disp(2, vec![2; 16], CoreInboundDisposition::Carried),
             disp(3, vec![3; 16], CoreInboundDisposition::Expired),
             disp(4, vec![4; 16], CoreInboundDisposition::Seen),
+            disp(5, vec![5; 16], CoreInboundDisposition::Rejected),
         ];
         assert_eq!(core_relay_ack_ids(items), vec![1, 3]);
+    }
+
+    #[test]
+    fn failed_delivery_is_never_acked() {
+        // T4-06: a message that was ours but could not be durably stored must
+        // leave the relay copy intact so the next poll re-fetches and retries.
+        assert!(!core_should_ack_inbound(CoreInboundDisposition::Failed));
+        let items = vec![
+            disp(1, vec![1; 16], CoreInboundDisposition::Consumed),
+            disp(2, vec![2; 16], CoreInboundDisposition::Failed),
+        ];
+        assert_eq!(core_relay_ack_ids(items), vec![1]);
     }
 
     // -- consumed-SEEN relay ack rule (DTN_TODOS.md §3.1 / D1) --------------
@@ -1041,9 +1125,83 @@ mod tests {
 
     #[test]
     fn inbound_gate_prioritizes_seen_then_expiry() {
-        assert_eq!(core_inbound_gate(false, 0, 10), CoreInboundGate::Seen);
-        assert_eq!(core_inbound_gate(true, 10, 10), CoreInboundGate::Expired);
-        assert_eq!(core_inbound_gate(true, 11, 10), CoreInboundGate::Dispatch);
+        assert_eq!(
+            core_inbound_gate(false, u8::MAX, i64::MAX, 10),
+            CoreInboundGate::Seen
+        );
+        assert_eq!(
+            core_inbound_gate(true, crate::DEFAULT_HOP_TTL, 10, 10),
+            CoreInboundGate::Expired
+        );
+        assert_eq!(
+            core_inbound_gate(true, crate::DEFAULT_HOP_TTL, 11, 10),
+            CoreInboundGate::Dispatch
+        );
+    }
+
+    #[test]
+    fn inbound_gate_rejects_amplified_hop_and_expiry_fields() {
+        assert_eq!(
+            core_inbound_gate(true, crate::DEFAULT_HOP_TTL + 1, 11, 10),
+            CoreInboundGate::Rejected
+        );
+        assert_eq!(
+            core_inbound_gate(
+                true,
+                crate::DEFAULT_HOP_TTL,
+                10 + MAX_CARRY_FUTURE_MS + 1,
+                10,
+            ),
+            CoreInboundGate::Rejected
+        );
+        assert_eq!(
+            core_inbound_gate(
+                true,
+                crate::DEFAULT_HOP_TTL,
+                10 + MAX_CARRY_FUTURE_MS,
+                10,
+            ),
+            CoreInboundGate::Dispatch
+        );
+    }
+
+    #[test]
+    fn pairwise_sender_authorization_limits_unknown_senders_to_onboarding() {
+        for kind in [
+            KIND_TEXT,
+            KIND_RECEIPT,
+            KIND_GROUP_INVITE,
+            KIND_PROFILE_SYNC,
+            KIND_FRIEND_DIRECTORY,
+            KIND_LAN_ENDPOINT_HINT,
+            KIND_ATTACHMENT_MANIFEST,
+            KIND_REACTION,
+        ] {
+            assert!(!core_pairwise_sender_authorized(kind, false, false));
+            assert!(core_pairwise_sender_authorized(kind, true, false));
+            assert!(core_pairwise_sender_authorized(kind, false, true));
+        }
+        assert!(core_pairwise_sender_authorized(
+            KIND_FRIEND_REQUEST,
+            false,
+            false
+        ));
+        assert!(core_pairwise_sender_authorized(
+            KIND_INTRODUCED_FRIEND_REQUEST,
+            false,
+            false
+        ));
+        assert!(!core_pairwise_sender_authorized(0xFF, true, true));
+        assert!(!core_pairwise_sender_authorized(
+            crate::KIND_GROUP_METADATA_UPDATE,
+            true,
+            false
+        ));
+        assert!(!core_pairwise_sender_authorized(
+            crate::KIND_ATTACHMENT_CHUNK,
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -1108,7 +1266,7 @@ mod tests {
             hop_ttl: 7,
             expiry,
             recipient_hint: hint,
-            sealed: vec![0xAB; 10],
+            sealed: msg_id.to_vec(),
         }
     }
 

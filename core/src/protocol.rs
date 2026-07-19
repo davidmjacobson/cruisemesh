@@ -240,6 +240,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::{signing_key_from_bytes, verifying_key_from_bytes};
 use crate::identity::derive_user_id;
+use crate::limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 use crate::store::DigestEntry;
 use crate::{CoreError, Identity};
 
@@ -1160,6 +1161,11 @@ pub fn encode_transport_probe(nonce: u64, response: bool) -> Vec<u8> {
 /// truncated or trailing-garbage DIGEST body.
 #[uniffi::export]
 pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
+    if bytes.len() > MAX_P2P_FRAME_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "frame exceeds {MAX_P2P_FRAME_BYTES}-byte limit"
+        )));
+    }
     let (frame_type, rest) = bytes
         .split_first()
         .ok_or_else(|| CoreError::Malformed("empty frame: missing frame-type byte".to_string()))?;
@@ -1185,6 +1191,11 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
                 return Err(CoreError::Malformed(
                     "envelope frame missing sealed payload".to_string(),
                 ));
+            }
+            if sealed.len() > MAX_ENVELOPE_SEALED_BYTES {
+                return Err(CoreError::Malformed(format!(
+                    "sealed envelope exceeds {MAX_ENVELOPE_SEALED_BYTES}-byte limit"
+                )));
             }
             Ok(Frame::Envelope {
                 msg_id,
@@ -1962,6 +1973,24 @@ mod tests {
     fn parse_frame_rejects_empty_input() {
         let err = parse_frame(Vec::new()).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn parse_frame_rejects_oversized_input_before_dispatch() {
+        let err = parse_frame(vec![0x99; MAX_P2P_FRAME_BYTES + 1]).unwrap_err();
+        assert!(err.to_string().contains("frame exceeds"));
+    }
+
+    #[test]
+    fn parse_frame_accepts_envelope_at_sealed_limit() {
+        let framed = encode_envelope_frame(
+            vec![1; MSG_ID_LEN],
+            DEFAULT_HOP_TTL,
+            default_expiry(0),
+            vec![2; RECIPIENT_HINT_LEN],
+            vec![3; MAX_ENVELOPE_SEALED_BYTES],
+        );
+        assert!(matches!(parse_frame(framed), Ok(Frame::Envelope { .. })));
     }
 
     #[test]
