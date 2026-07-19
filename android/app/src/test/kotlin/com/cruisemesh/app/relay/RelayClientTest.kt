@@ -9,6 +9,8 @@ import org.junit.Test
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.OutgoingReceiptEnvelope
 import java.nio.charset.StandardCharsets
+import java.io.ByteArrayInputStream
+import java.io.IOException
 import java.util.Base64
 
 class RelayClientTest {
@@ -97,7 +99,7 @@ class RelayClientTest {
         server.start()
         try {
             val config = RelayConfig(server.url("/").toString(), "family-token")
-            val page = RelayClient.fetchEnvelopes(config, listOf(ByteArray(8) { 4 }), afterId = 0, limit = 50)
+            val page = RelayClient.fetchEnvelopes(config, listOf(ByteArray(8) { 4 }), afterId = 0, limit = 16)
             assertEquals(1, page.envelopes.size)
             assertEquals(9L, page.nextCursor)
             assertEquals(9L, page.envelopes[0].id)
@@ -108,7 +110,7 @@ class RelayClientTest {
             RelayClient.ackEnvelopes(config, listOf(9L))
 
             val fetchRequest = server.takeRequest()
-            assertEquals("/envelopes?hints=BAQEBAQEBAQ&after=0&limit=50", fetchRequest.path)
+            assertEquals("/envelopes?hints=BAQEBAQEBAQ&after=0&limit=16", fetchRequest.path)
             assertEquals("CruiseMeshRelayClient/0.1", fetchRequest.getHeader("User-Agent"))
             assertEquals("1", fetchRequest.getHeader("bypass-tunnel-reminder"))
             val ackRequest = server.takeRequest()
@@ -164,6 +166,17 @@ class RelayClientTest {
         } finally {
             server.shutdown()
         }
+    }
+
+    @Test
+    fun `bounded response reader rejects a body above its limit`() {
+        val error = runCatching {
+            ByteArrayInputStream(ByteArray(9)).readBounded(8)
+        }.exceptionOrNull()
+
+        assertEquals(IOException::class.java, error?.javaClass)
+        val exact = ByteArray(8) { it.toByte() }
+        assertArrayEquals(exact, ByteArrayInputStream(exact).readBounded(8))
     }
 
     private fun sampleOutboundEnvelope() = OutboundEnvelope(

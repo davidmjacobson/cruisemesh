@@ -1565,7 +1565,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * key and normal DTN fan-out path.
      */
     func authorGroupMetadataUpdate(identity: Identity, group: Group, name: String, memberUserIds: [Data], timestampMs: Int64) throws  -> AuthoredGroupMetadataUpdate
-
+    
     /**
      * Assign, seal, and durably queue a pairwise chat-stream message in one
      * store transaction. The counter ratchets past both receipt watermarks.
@@ -1590,8 +1590,8 @@ public protocol MessageStoreProtocol : AnyObject {
      * The destination must not already exist; callers should use a unique
      * temporary path and remove it after reading the backup bytes.
      */
-    func backupTo(destination: String) throws
-
+    func backupTo(destination: String) throws 
+    
     /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
@@ -1800,18 +1800,19 @@ public protocol MessageStoreProtocol : AnyObject {
      * Store a foreign envelope for later store-and-forward delivery
      * (DESIGN.md §5.3 carry queue). Keyed on `msg_id`, so re-enqueuing an
      * envelope we're already carrying is a no-op (returns `false`); a fresh
-     * insert returns `true`.
+     * insert returns `true`. A digest over `recipient_hint || sealed` also
+     * collapses a ciphertext rewrapped under a new attacker-selected public
+     * `msg_id`, while preserving group fan-out copies with different hints.
      *
      * `is_family` marks whether this envelope is addressed to someone this
      * node knows (its `recipient_hint` matched a contact -- the caller
      * decides, since it holds the contacts and the hint derivation). Family
-     * envelopes are kept until they expire and **never** evicted for space;
-     * only foreign envelopes count against `foreign_budget_bytes` (DESIGN.md
-     * §5.3: "Family messages always win eviction fights"). When inserting a
-     * new foreign envelope pushes the foreign total over budget, the oldest
-     * foreign envelopes (by `received_at_ms`) are evicted until it fits --
-     * possibly including this one, if a single envelope exceeds the whole
-     * budget. All of this happens in one transaction.
+     * envelopes win eviction fights: foreign rows are evicted first. Foreign
+     * rows additionally share `foreign_budget_bytes`, and the entire queue
+     * has a hard 64 MiB sealed-byte ceiling so a forged family hint cannot
+     * grow it indefinitely. Resource eviction is never reported as delivery
+     * and never produces a receipt or relay ack. All of this happens in one
+     * transaction.
      */
     func enqueueCarriedEnvelope(envelope: CarriedEnvelope, isFamily: Bool, receivedAtMs: Int64, foreignBudgetBytes: Int64) throws  -> Bool
     
@@ -1823,8 +1824,8 @@ public protocol MessageStoreProtocol : AnyObject {
      * `relayProxyHints` on the Kotlin side). This is the relay-sourced
      * twin of [`MessageStore::enqueue_carried_envelope`]: always
      * `is_family = 1` (the relay hint match already proved it's addressed
-     * to someone we know, so it's kept until expiry and never evicted for
-     * space) and `from_relay = 1`, which excludes it from
+     * to someone we know, so it gets family-first eviction priority) and
+     * `from_relay = 1`, which excludes it from
      * [`MessageStore::family_carried_envelopes`] -- the relay-upload query
      * -- because it is *already on the relay*; re-uploading it would just
      * churn traffic and could resurrect a copy the real recipient already
@@ -2081,7 +2082,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * This remains available after the retry queue prunes expired ciphertext.
      */
     func outboundMessageExpiry(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> Int64?
-
+    
     /**
      * The latest relay-uploadable receipt envelope persisted for this
      * cumulative outgoing receipt watermark, if any.
@@ -2336,7 +2337,7 @@ public static func `open`(path: String)throws  -> MessageStore {
     )
 })
 }
-
+    
 
     
     /**
@@ -2354,7 +2355,7 @@ open func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, co
     )
 })
 }
-
+    
 open func authorFriendRequest(identity: Identity, contact: Contact, friendCardJson: String, timestampMs: Int64)throws  -> AuthoredEnvelope {
     return try  FfiConverterTypeAuthoredEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_author_friend_request(self.uniffiClonePointer(),
@@ -2398,7 +2399,7 @@ open func authorGroupMetadataUpdate(identity: Identity, group: Group, name: Stri
     )
 })
 }
-
+    
     /**
      * Assign, seal, and durably queue a pairwise chat-stream message in one
      * store transaction. The counter ratchets past both receipt watermarks.
@@ -2460,7 +2461,7 @@ open func backupTo(destination: String)throws  {try rustCallWithError(FfiConvert
     )
 }
 }
-
+    
     /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
@@ -2763,18 +2764,19 @@ open func deleteGroup(groupId: Data)throws  -> Bool {
      * Store a foreign envelope for later store-and-forward delivery
      * (DESIGN.md §5.3 carry queue). Keyed on `msg_id`, so re-enqueuing an
      * envelope we're already carrying is a no-op (returns `false`); a fresh
-     * insert returns `true`.
+     * insert returns `true`. A digest over `recipient_hint || sealed` also
+     * collapses a ciphertext rewrapped under a new attacker-selected public
+     * `msg_id`, while preserving group fan-out copies with different hints.
      *
      * `is_family` marks whether this envelope is addressed to someone this
      * node knows (its `recipient_hint` matched a contact -- the caller
      * decides, since it holds the contacts and the hint derivation). Family
-     * envelopes are kept until they expire and **never** evicted for space;
-     * only foreign envelopes count against `foreign_budget_bytes` (DESIGN.md
-     * §5.3: "Family messages always win eviction fights"). When inserting a
-     * new foreign envelope pushes the foreign total over budget, the oldest
-     * foreign envelopes (by `received_at_ms`) are evicted until it fits --
-     * possibly including this one, if a single envelope exceeds the whole
-     * budget. All of this happens in one transaction.
+     * envelopes win eviction fights: foreign rows are evicted first. Foreign
+     * rows additionally share `foreign_budget_bytes`, and the entire queue
+     * has a hard 64 MiB sealed-byte ceiling so a forged family hint cannot
+     * grow it indefinitely. Resource eviction is never reported as delivery
+     * and never produces a receipt or relay ack. All of this happens in one
+     * transaction.
      */
 open func enqueueCarriedEnvelope(envelope: CarriedEnvelope, isFamily: Bool, receivedAtMs: Int64, foreignBudgetBytes: Int64)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -2795,8 +2797,8 @@ open func enqueueCarriedEnvelope(envelope: CarriedEnvelope, isFamily: Bool, rece
      * `relayProxyHints` on the Kotlin side). This is the relay-sourced
      * twin of [`MessageStore::enqueue_carried_envelope`]: always
      * `is_family = 1` (the relay hint match already proved it's addressed
-     * to someone we know, so it's kept until expiry and never evicted for
-     * space) and `from_relay = 1`, which excludes it from
+     * to someone we know, so it gets family-first eviction priority) and
+     * `from_relay = 1`, which excludes it from
      * [`MessageStore::family_carried_envelopes`] -- the relay-upload query
      * -- because it is *already on the relay*; re-uploading it would just
      * churn traffic and could resurrect a copy the real recipient already
@@ -3236,7 +3238,7 @@ open func outboundMessageExpiry(chatId: Data, senderUserId: Data, lamport: UInt6
     )
 })
 }
-
+    
     /**
      * The latest relay-uploadable receipt envelope persisted for this
      * cumulative outgoing receipt watermark, if any.
@@ -4041,8 +4043,8 @@ public struct FfiConverterTypeAuthoredGroupMetadataUpdate: FfiConverterRustBuffe
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AuthoredGroupMetadataUpdate {
         return
             try AuthoredGroupMetadataUpdate(
-                group: FfiConverterTypeGroup.read(from: &buf),
-                update: FfiConverterTypeGroupMetadataUpdate.read(from: &buf),
+                group: FfiConverterTypeGroup.read(from: &buf), 
+                update: FfiConverterTypeGroupMetadataUpdate.read(from: &buf), 
                 authored: FfiConverterTypeAuthoredEnvelope.read(from: &buf)
         )
     }
@@ -6534,8 +6536,8 @@ public struct FfiConverterTypeGroup: FfiConverterRustBuffer {
                 id: FfiConverterData.read(from: &buf), 
                 name: FfiConverterString.read(from: &buf), 
                 memberUserIds: FfiConverterSequenceData.read(from: &buf), 
-                key: FfiConverterData.read(from: &buf),
-                metadataRevision: FfiConverterUInt64.read(from: &buf),
+                key: FfiConverterData.read(from: &buf), 
+                metadataRevision: FfiConverterUInt64.read(from: &buf), 
                 metadataChangedBy: FfiConverterData.read(from: &buf)
         )
     }
@@ -6628,10 +6630,10 @@ public struct FfiConverterTypeGroupMetadataUpdate: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupMetadataUpdate {
         return
             try GroupMetadataUpdate(
-                groupId: FfiConverterData.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
-                revision: FfiConverterUInt64.read(from: &buf),
-                changedBy: FfiConverterData.read(from: &buf),
+                groupId: FfiConverterData.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                revision: FfiConverterUInt64.read(from: &buf), 
+                changedBy: FfiConverterData.read(from: &buf), 
                 memberUserIds: FfiConverterSequenceData.read(from: &buf)
         )
     }
@@ -8454,6 +8456,25 @@ public enum CoreInboundDisposition {
     case carried
     case expired
     case seen
+    /**
+     * Envelope whose public header failed local validation (bad hop/expiry).
+     * Not ackable -- its header is invalid locally, but this device has not
+     * proven it was the sealed payload's sole true endpoint consumer (T4-01).
+     */
+    case rejected
+    /**
+     * A message addressed to us that we opened but could NOT durably store
+     * (e.g. disk full, corrupt store). Unlike [`CoreInboundDisposition::Seen`]
+     * this is not a "already have it" dead end and unlike
+     * [`CoreInboundDisposition::Consumed`] nothing was persisted, so the
+     * shells must NOT record its `msg_id` as seen: the same envelope must
+     * re-present and re-dispatch on its next copy (T4-06). Never acked
+     * (`core_should_ack_inbound` returns `false`), so the relay copy — often
+     * the only copy — is preserved for that retry rather than deleted. The
+     * safety direction here is the same as `Carried`: churn is recoverable,
+     * deletion is not.
+     */
+    case failed
 }
 
 
@@ -8474,6 +8495,10 @@ public struct FfiConverterTypeCoreInboundDisposition: FfiConverterRustBuffer {
         case 3: return .expired
         
         case 4: return .seen
+        
+        case 5: return .rejected
+        
+        case 6: return .failed
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -8497,6 +8522,14 @@ public struct FfiConverterTypeCoreInboundDisposition: FfiConverterRustBuffer {
         
         case .seen:
             writeInt(&buf, Int32(4))
+        
+        
+        case .rejected:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .failed:
+            writeInt(&buf, Int32(6))
         
         }
     }
@@ -8531,6 +8564,7 @@ public enum CoreInboundGate {
     case dispatch
     case seen
     case expired
+    case rejected
 }
 
 
@@ -8550,6 +8584,8 @@ public struct FfiConverterTypeCoreInboundGate: FfiConverterRustBuffer {
         
         case 3: return .expired
         
+        case 4: return .rejected
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -8568,6 +8604,10 @@ public struct FfiConverterTypeCoreInboundGate: FfiConverterRustBuffer {
         
         case .expired:
             writeInt(&buf, Int32(3))
+        
+        
+        case .rejected:
+            writeInt(&buf, Int32(4))
         
         }
     }
@@ -10247,7 +10287,8 @@ public func coreHelloIdentityMatches(currentUserId: Data?, helloUserId: Data) ->
 })
 }
 /**
- * Inbound flood-dedupe + expiry gate (DESIGN.md §5.3).
+ * Inbound flood-dedupe, expiry, and public-header resource gate
+ * (DESIGN.md §5.3).
  *
  * `is_new_msg_id` must come from a non-mutating check
  * ([`crate::SeenIds::contains`]), never from [`crate::SeenIds::check_and_record`]
@@ -10258,10 +10299,11 @@ public func coreHelloIdentityMatches(currentUserId: Data?, helloUserId: Data) ->
  * failed must be re-presentable; an envelope that was handled (even by
  * deliberate drop, e.g. the `Expired` arm below) must be deduped.
  */
-public func coreInboundGate(isNewMsgId: Bool, expiryMs: Int64, nowMs: Int64) -> CoreInboundGate {
+public func coreInboundGate(isNewMsgId: Bool, hopTtl: UInt8, expiryMs: Int64, nowMs: Int64) -> CoreInboundGate {
     return try!  FfiConverterTypeCoreInboundGate.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_inbound_gate(
         FfiConverterBool.lower(isNewMsgId),
+        FfiConverterUInt8.lower(hopTtl),
         FfiConverterInt64.lower(expiryMs),
         FfiConverterInt64.lower(nowMs),$0
     )
@@ -10324,6 +10366,26 @@ public func coreMakeLanEndpointLink(endpoint: CoreLanEndpoint) -> String {
     )
 })
 }
+/**
+ * Decide whether an authenticated pairwise sender may dispatch this message
+ * kind into application handlers. Cryptographic opening proves who signed a
+ * payload, but it does not by itself make that identity an accepted contact.
+ *
+ * Direct friend requests and ticket-bearing introduced friend requests are
+ * the only onboarding kinds intentionally accepted from an unknown sender.
+ * Every ordinary chat/control kind requires an accepted contact, except for
+ * this device's own relay/fan-out copies. Unknown and group-only kinds fail
+ * closed before either platform can write message or group state.
+ */
+public func corePairwiseSenderAuthorized(kind: UInt8, senderIsContact: Bool, senderIsSelf: Bool) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_pairwise_sender_authorized(
+        FfiConverterUInt8.lower(kind),
+        FfiConverterBool.lower(senderIsContact),
+        FfiConverterBool.lower(senderIsSelf),$0
+    )
+})
+}
 public func coreParseLanEndpoint(text: String, defaultPort: UInt16) -> CoreLanEndpoint? {
     return try!  FfiConverterOptionTypeCoreLanEndpoint.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_parse_lan_endpoint(
@@ -10370,12 +10432,16 @@ public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
  *
  * Only [`CoreInboundDisposition::Consumed`] (it was ours to open, and we
  * did) and [`CoreInboundDisposition::Expired`] (it's dead weight regardless
- * of who it was for) are safe to remove this way.
+ * of who it was for) are safe to remove this way. A `Rejected` envelope is
+ * not ackable: its public header is invalid locally, but this device has not
+ * proven it was the sealed payload's sole true endpoint consumer.
  * [`CoreInboundDisposition::Carried`] must NOT be acked: relay
  * proxy-polling means we may have fetched a contact's envelope on their
  * behalf, and the relay copy is the durable fallback until the real
  * recipient (or another proxy) fetches and consumes it -- deleting it here
- * would silently drop the message. [`CoreInboundDisposition::Seen`] also
+ * would silently drop the message. [`CoreInboundDisposition::Failed`]
+ * (durable storage of a message that was ours failed) is likewise never
+ * acked, so the relay copy survives for the retry. [`CoreInboundDisposition::Seen`] also
  * returns `false` here, but it is NOT necessarily a dead end: see
  * [`consumed_seen_is_ackable`] and
  * [`MessageStore::core_relay_ack_ids_with_consumed`] for the narrow,
@@ -10644,8 +10710,8 @@ public func encodeAttachmentPayload(payload: CoreAttachmentPayload)throws  -> Da
  * each fixed-width 16-byte `msg_id`. `entries` is typically the output of
  * the store's `chat_digest`; an empty list is valid ("send me everything").
  */
-public func encodeDigest(chatId: Data, entries: [DigestEntry], recentMsgIds: [Data]) -> Data {
-    return try!  FfiConverterData.lift(try! rustCall() {
+public func encodeDigest(chatId: Data, entries: [DigestEntry], recentMsgIds: [Data])throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_encode_digest(
         FfiConverterData.lower(chatId),
         FfiConverterSequenceTypeDigestEntry.lower(entries),
@@ -10757,8 +10823,8 @@ public func encodeLanEndpointContent(content: LanEndpointContent)throws  -> Data
 /**
  * Encode a [`MessageBody`] to its wire form (see module docs for layout).
  */
-public func encodeMessageBody(body: MessageBody) -> Data {
-    return try!  FfiConverterData.lift(try! rustCall() {
+public func encodeMessageBody(body: MessageBody)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_encode_message_body(
         FfiConverterTypeMessageBody.lower(body),$0
     )
@@ -10780,8 +10846,8 @@ public func encodeMessageBodyWithReply(body: MessageBody, replyToMsgId: Data)thr
 /**
  * Encode a [`ProfileSyncContent`] to its wire form.
  */
-public func encodeProfileSyncContent(content: ProfileSyncContent) -> Data {
-    return try!  FfiConverterData.lift(try! rustCall() {
+public func encodeProfileSyncContent(content: ProfileSyncContent)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_encode_profile_sync_content(
         FfiConverterTypeProfileSyncContent.lower(content),$0
     )
@@ -10797,8 +10863,8 @@ public func encodeReactionPayload(payload: CoreReactionPayload)throws  -> Data {
 /**
  * Encode a [`ReceiptContent`] to its wire form (see module docs for layout).
  */
-public func encodeReceiptContent(content: ReceiptContent) -> Data {
-    return try!  FfiConverterData.lift(try! rustCall() {
+public func encodeReceiptContent(content: ReceiptContent)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_encode_receipt_content(
         FfiConverterTypeReceiptContent.lower(content),$0
     )
@@ -10940,8 +11006,8 @@ public func lanServiceType() -> String {
 /**
  * Build the JSON payload shared via QR code / pasted text when friending.
  */
-public func makeFriendCard(name: String, identity: Identity, relayUrl: String?, relayToken: String?) -> String {
-    return try!  FfiConverterString.lift(try! rustCall() {
+public func makeFriendCard(name: String, identity: Identity, relayUrl: String?, relayToken: String?)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_make_friend_card(
         FfiConverterString.lower(name),
         FfiConverterTypeIdentity.lower(identity),
@@ -10953,8 +11019,8 @@ public func makeFriendCard(name: String, identity: Identity, relayUrl: String?, 
 /**
  * Compact, chat-app-safe text form of a FriendCard.
  */
-public func makeFriendLink(cardJson: String) -> String {
-    return try!  FfiConverterString.lift(try! rustCall() {
+public func makeFriendLink(cardJson: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_make_friend_link(
         FfiConverterString.lower(cardJson),$0
     )
@@ -11084,6 +11150,27 @@ public func relayEncodePresenceRequest(announce: [Data], query: [Data])throws  -
     uniffi_cruisemesh_core_fn_func_relay_encode_presence_request(
         FfiConverterSequenceData.lower(announce),
         FfiConverterSequenceData.lower(query),$0
+    )
+})
+}
+/**
+ * Fetch pages stay deliberately small because every sealed row is controlled
+ * by the relay until it has passed the authenticated envelope ingest path.
+ */
+public func relayFetchBatchLimit() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_fetch_batch_limit($0
+    )
+})
+}
+/**
+ * Maximum response body that either mobile shell may accumulate before
+ * cancelling the relay request. The core repeats this check at every decoder
+ * so callers outside the first-party shells cannot bypass it.
+ */
+public func relayMaxResponseBytes() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_max_response_bytes($0
     )
 })
 }
@@ -11220,7 +11307,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_hello_identity_matches() != 7419) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_inbound_gate() != 7195) {
+    if (uniffi_cruisemesh_core_checksum_func_core_inbound_gate() != 47063) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_is_own_fanout_hint() != 52117) {
@@ -11241,6 +11328,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_make_lan_endpoint_link() != 27969) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_pairwise_sender_authorized() != 18726) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_parse_lan_endpoint() != 56400) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11253,7 +11343,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 13964) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 1610) {
+    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 45795) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_subnet_24_hosts() != 3135) {
@@ -11331,7 +11421,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_attachment_payload() != 6055) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_encode_digest() != 65002) {
+    if (uniffi_cruisemesh_core_checksum_func_encode_digest() != 30845) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_envelope_frame() != 1240) {
@@ -11361,19 +11451,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_lan_endpoint_content() != 29267) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_encode_message_body() != 28014) {
+    if (uniffi_cruisemesh_core_checksum_func_encode_message_body() != 32564) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_message_body_with_reply() != 53763) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_encode_profile_sync_content() != 26330) {
+    if (uniffi_cruisemesh_core_checksum_func_encode_profile_sync_content() != 47026) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_reaction_payload() != 17821) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_encode_receipt_content() != 55046) {
+    if (uniffi_cruisemesh_core_checksum_func_encode_receipt_content() != 20486) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_transport_probe() != 39450) {
@@ -11412,10 +11502,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_lan_service_type() != 61768) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_make_friend_card() != 38013) {
+    if (uniffi_cruisemesh_core_checksum_func_make_friend_card() != 28124) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 24162) {
+    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 2265) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 27474) {
@@ -11458,6 +11548,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_encode_presence_request() != 64701) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_fetch_batch_limit() != 7996) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_rotate_group() != 56003) {
@@ -11637,10 +11733,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_group() != 30648) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_carried_envelope() != 54243) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_carried_envelope() != 15186) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_relay_carried_envelope() != 65235) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_relay_carried_envelope() != 14046) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_ensure_authored_receipt() != 16297) {

@@ -312,22 +312,32 @@ struct MyQRView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 16) {
-                let json = makeFriendCard(
+                let json = try? makeFriendCard(
                     name: displayName.isEmpty ? "Friend" : displayName,
                     identity: identity,
                     relayUrl: RelayConfigStore.load()?.relayUrl,
                     relayToken: RelayConfigStore.load()?.relayToken
                 )
-                let link = makeFriendLink(cardJson: json)
-                let appLink = "https://cruisemesh.app/f#\(link)"
-                if let image = QRCodeGenerator.image(from: appLink, size: 240) {
-                    Image(uiImage: image)
-                        .interpolation(.none)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 240, height: 240)
-                        .padding()
-                        .background(RoundedRectangle(cornerRadius: 16).fill(Color.white))
+                let link = json.flatMap { try? makeFriendLink(cardJson: $0) }
+                let appLink = link.map { "https://cruisemesh.app/f#\($0)" }
+                if let appLink {
+                    if let image = QRCodeGenerator.image(from: appLink, size: 240) {
+                        Image(uiImage: image)
+                            .interpolation(.none)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 240, height: 240)
+                            .padding()
+                            .background(RoundedRectangle(cornerRadius: 16).fill(Color.white))
+                    }
+                    ShareLink(item: "Add me on CruiseMesh: \(appLink)") {
+                        Label("Share card text", systemImage: "square.and.arrow.up")
+                    }
+                } else {
+                    Text("Shorten your name or relay settings to create a friend card.")
+                        .font(.body)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
                 }
                 Text(formatUserId(userId: identity.userId))
                     .font(.footnote.monospaced())
@@ -336,13 +346,12 @@ struct MyQRView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
-                ShareLink(item: "Add me on CruiseMesh: \(appLink)") {
-                    Label("Share card text", systemImage: "square.and.arrow.up")
-                }
-                Button {
-                    UIPasteboard.general.string = appLink
-                } label: {
-                    Label("Copy link", systemImage: "doc.on.doc")
+                if let appLink {
+                    Button {
+                        UIPasteboard.general.string = appLink
+                    } label: {
+                        Label("Copy link", systemImage: "doc.on.doc")
+                    }
                 }
                 Spacer()
             }

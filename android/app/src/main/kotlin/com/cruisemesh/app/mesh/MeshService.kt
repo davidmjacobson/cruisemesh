@@ -76,6 +76,7 @@ import uniffi.cruisemesh_core.coreGroupFanoutRows
 import uniffi.cruisemesh_core.coreGroupFanoutRowsForCarried
 import uniffi.cruisemesh_core.coreInboundGate
 import uniffi.cruisemesh_core.coreIsOwnFanoutHint
+import uniffi.cruisemesh_core.corePairwiseSenderAuthorized
 import uniffi.cruisemesh_core.decodeGroupInviteContent
 import uniffi.cruisemesh_core.decodeGroupMetadataUpdate
 import uniffi.cruisemesh_core.decodeFriendDirectoryContent
@@ -98,6 +99,7 @@ import uniffi.cruisemesh_core.openGroupMessage
 import uniffi.cruisemesh_core.parseFriendCard
 import uniffi.cruisemesh_core.openMessage
 import uniffi.cruisemesh_core.parseFrame
+import uniffi.cruisemesh_core.relayFetchBatchLimit
 import uniffi.cruisemesh_core.sealMessage
 import uniffi.cruisemesh_core.verifyIntroductionTicket
 
@@ -149,7 +151,7 @@ private const val PRESENCE_HINT_DAY_WINDOW: Long = 3
 
 /** DESIGN.md §5.3: the bounded budget (~5 MB) of *foreign* muled envelopes; family (known-recipient) traffic is exempt. */
 private const val FOREIGN_CARRY_BUDGET_BYTES: Long = 5L * 1024 * 1024
-private const val RELAY_BATCH_LIMIT: ULong = 128uL
+private const val RELAY_STORE_BATCH_LIMIT: ULong = 128uL
 private const val RELAY_POLL_INTERVAL_MS = 60_000L
 
 /**
@@ -885,7 +887,7 @@ class MeshService : Service() {
         network: Network?,
     ) {
         val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
-        for (envelope in store.pendingRelayOutgoingReceiptEnvelopes(RELAY_BATCH_LIMIT, now)) {
+        for (envelope in store.pendingRelayOutgoingReceiptEnvelopes(RELAY_STORE_BATCH_LIMIT, now)) {
             val contact = contactsByUserId[UserIdHex.encode(envelope.recipientUserId)] ?: continue
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
@@ -908,7 +910,7 @@ class MeshService : Service() {
         network: Network?,
     ) {
         val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
-        for (envelope in store.pendingRelayOutboundEnvelopes(RELAY_BATCH_LIMIT, now)) {
+        for (envelope in store.pendingRelayOutboundEnvelopes(RELAY_STORE_BATCH_LIMIT, now)) {
             // 1:1 / invite envelopes are addressed to a contact userId; group
             // text uses recipientUserId = group.id and rides the family's
             // fallback (or any member's) relay config.
@@ -994,7 +996,7 @@ class MeshService : Service() {
         now: Long,
         network: Network?,
     ) {
-        for (envelope in store.familyCarriedEnvelopes(RELAY_BATCH_LIMIT, now)) {
+        for (envelope in store.familyCarriedEnvelopes(RELAY_STORE_BATCH_LIMIT, now)) {
             val contact = contactMatchingHint(contacts, envelope.recipientHint, now)
             if (contact == null) {
                 // Group-hinted carried envelope: previously skipped entirely
@@ -1090,8 +1092,9 @@ class MeshService : Service() {
         val hints = dedupeHints(selfHints, proxyHints)
         if (hints.isEmpty()) return
         var after = 0L
+        val fetchBatchLimit = relayFetchBatchLimit().toInt()
         while (running && hasValidatedInternet()) {
-            val page = RelayClient.fetchEnvelopes(config, hints, after, RELAY_BATCH_LIMIT.toInt(), network)
+            val page = RelayClient.fetchEnvelopes(config, hints, after, fetchBatchLimit, network)
             Log.i(
                 TAG,
                 "Fetched ${page.envelopes.size} relay envelope(s) from ${config.relayUrl} after=$after next=${page.nextCursor}",
@@ -1119,7 +1122,7 @@ class MeshService : Service() {
                 RelayClient.ackEnvelopes(config, ackIds, network)
             }
             after = page.nextCursor
-            if (page.envelopes.size < RELAY_BATCH_LIMIT.toInt()) return
+            if (page.envelopes.size < fetchBatchLimit) return
         }
     }
 
@@ -1615,7 +1618,12 @@ class MeshService : Service() {
         } else {
             sendLanEndpointHintTo(address)
         }
-        val digestFrame = encodeDigest(identity.userId, digestEntries, store.coreDigestAdvertisedMsgIds())
+        val digestFrame = try {
+            encodeDigest(identity.userId, digestEntries, store.coreDigestAdvertisedMsgIds())
+        } catch (error: CoreException) {
+            Log.w(TAG, "Could not encode DIGEST for $address", error)
+            return
+        }
         MeshRouter.sendToAddress(address, digestFrame)
     }
 
@@ -1724,7 +1732,7 @@ class MeshService : Service() {
                 nowMs = now,
                 ownOutboundBudgetBytes = OWN_OUTBOUND_SPRAY_BUDGET_BYTES.toULong(),
                 ownReceiptBudgetBytes = OWN_RECEIPT_SPRAY_BUDGET_BYTES.toULong(),
-                receiptQueryLimit = RELAY_BATCH_LIMIT,
+                receiptQueryLimit = RELAY_STORE_BATCH_LIMIT,
             )
             val frames = plan.carriedFrames + plan.ownOutboundFrames + plan.ownReceiptFrames
             val sprayed = frames.count { MeshRouter.sendToAddress(address, it) }
@@ -1896,6 +1904,7 @@ class MeshService : Service() {
         when (
             coreInboundGate(
                 !GossipState.seenIds.contains(envelope.msgId),
+                envelope.hopTtl,
                 envelope.expiry,
                 System.currentTimeMillis(),
             )
@@ -1906,6 +1915,11 @@ class MeshService : Service() {
                 // A deliberate drop is still a terminal handled state.
                 GossipState.seenIds.record(envelope.msgId)
                 return CoreInboundDisposition.EXPIRED
+            }
+            CoreInboundGate.REJECTED -> {
+                Log.w(TAG, "Dropping envelope with invalid hop or expiry fields from $sourceLabel")
+                GossipState.seenIds.record(envelope.msgId)
+                return CoreInboundDisposition.REJECTED
             }
             CoreInboundGate.DISPATCH -> Unit
         }
@@ -1921,14 +1935,25 @@ class MeshService : Service() {
             val groupOpened = tryOpenGroupMessage(envelope.recipientHint, envelope.sealed)
             if (groupOpened != null) {
                 val arrival = messageArrival(sourceAddress, envelope.hopTtl, groupOpened.second.senderUserId)
-                deliverOpenedGroupEnvelope(
-                    sourceLabel,
-                    groupOpened.first,
-                    groupOpened.second,
-                    identity,
-                    arrival,
-                    envelope.msgId,
-                )
+                try {
+                    deliverOpenedGroupEnvelope(
+                        sourceLabel,
+                        groupOpened.first,
+                        groupOpened.second,
+                        identity,
+                        arrival,
+                        envelope.msgId,
+                    )
+                } catch (e: CoreException) {
+                    // T4-06: same as the pairwise path below -- a store
+                    // failure delivering our own group copy must not unwind
+                    // the thread, must leave the msg_id re-presentable, and
+                    // must not be acked. The best-effort relay/carry for
+                    // absent members is skipped; the next re-presentation
+                    // re-runs the whole branch.
+                    Log.w(TAG, "Deferring group envelope from $sourceLabel: durable delivery failed (${e.message})")
+                    return CoreInboundDisposition.FAILED
+                }
                 // specs/group-relay-durability.md §4.3 no-reinjection rule:
                 // a relay-fetched group message addressed to OUR OWN hint is
                 // a per-member fan-out copy -- the relay fan-out already
@@ -1978,10 +2003,21 @@ class MeshService : Service() {
             return CoreInboundDisposition.CARRIED
         }
         val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
-        deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
-        // DTN D4: [deliverOpenedEnvelope] does not swallow store exceptions
-        // (see [handleIncomingChatMessage] etc.), so reaching this line means
-        // the message was durably stored -- safe, and required, to record.
+        try {
+            deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
+        } catch (e: CoreException) {
+            // T4-06: [deliverOpenedEnvelope] does not swallow store exceptions
+            // (see [handleIncomingChatMessage] etc.), so a throw here means a
+            // message that was OURS to open failed to persist (disk full,
+            // corrupt store). Translate it instead of letting it unwind: the
+            // receive thread / relay batch loop must not be torn down, the
+            // msg_id stays unrecorded so the next copy re-dispatches, and
+            // FAILED is never acked so the relay copy survives for that retry.
+            Log.w(TAG, "Deferring envelope from $sourceLabel: durable delivery failed (${e.message})")
+            return CoreInboundDisposition.FAILED
+        }
+        // DTN D4: reaching here means the message was durably stored -- safe,
+        // and required, to record.
         GossipState.seenIds.record(envelope.msgId)
         return CoreInboundDisposition.CONSUMED
     }
@@ -2028,8 +2064,8 @@ class MeshService : Service() {
      * Adds a foreign envelope to the persistent carry queue (DESIGN.md §5.3
      * store-and-forward). Classifies it as "family" -- addressed to someone we
      * know -- when its `recipient_hint` matches a contact ([hintMatchesAnyContact]);
-     * family envelopes are kept until expiry and never evicted for space,
-     * while foreign ones share a bounded [FOREIGN_CARRY_BUDGET_BYTES] budget.
+     * family envelopes win eviction fights, while foreign ones share a bounded
+     * [FOREIGN_CARRY_BUDGET_BYTES] budget and the core bounds the whole queue.
      * Idempotent on `msg_id`, so re-seeing an envelope we already carry is a
      * no-op. Reached only after [handleEnvelope]'s dedupe + expiry gates, so
      * we never carry a stale duplicate or an already-expired envelope.
@@ -2300,6 +2336,17 @@ class MeshService : Service() {
         )
         if (!body.chatId.contentEquals(opened.senderUserId)) {
             Log.w(TAG, "Dropping envelope from $address: chatId does not match the verified sender")
+            return
+        }
+        val senderIsContact = store.getContact(opened.senderUserId) != null
+        if (
+            !corePairwiseSenderAuthorized(
+                body.kind,
+                senderIsContact,
+                opened.senderUserId.contentEquals(identity.userId),
+            )
+        ) {
+            Log.w(TAG, "Dropping envelope from $address: sender is not authorized for kind=${body.kind}")
             return
         }
 

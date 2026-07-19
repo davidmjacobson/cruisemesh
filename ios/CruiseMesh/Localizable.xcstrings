@@ -1111,6 +1111,16 @@
         }
       }
     },
+    "Shorten your name or relay settings to create a friend card.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shorten your name or relay settings to create a friend card."
+          }
+        }
+      }
+    },
     "Show address QR": {
       "localizations": {
         "en": {
