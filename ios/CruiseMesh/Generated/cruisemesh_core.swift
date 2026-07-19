@@ -10770,8 +10770,8 @@ public func encodeMessageBodyWithReply(body: MessageBody, replyToMsgId: Data)thr
 /**
  * Encode a [`ProfileSyncContent`] to its wire form.
  */
-public func encodeProfileSyncContent(content: ProfileSyncContent) -> Data {
-    return try!  FfiConverterData.lift(try! rustCall() {
+public func encodeProfileSyncContent(content: ProfileSyncContent)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_encode_profile_sync_content(
         FfiConverterTypeProfileSyncContent.lower(content),$0
     )
@@ -10930,8 +10930,8 @@ public func lanServiceType() -> String {
 /**
  * Build the JSON payload shared via QR code / pasted text when friending.
  */
-public func makeFriendCard(name: String, identity: Identity, relayUrl: String?, relayToken: String?) -> String {
-    return try!  FfiConverterString.lift(try! rustCall() {
+public func makeFriendCard(name: String, identity: Identity, relayUrl: String?, relayToken: String?)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_make_friend_card(
         FfiConverterString.lower(name),
         FfiConverterTypeIdentity.lower(identity),
@@ -10943,8 +10943,8 @@ public func makeFriendCard(name: String, identity: Identity, relayUrl: String?, 
 /**
  * Compact, chat-app-safe text form of a FriendCard.
  */
-public func makeFriendLink(cardJson: String) -> String {
-    return try!  FfiConverterString.lift(try! rustCall() {
+public func makeFriendLink(cardJson: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_make_friend_link(
         FfiConverterString.lower(cardJson),$0
     )
@@ -11354,7 +11354,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_message_body_with_reply() != 53763) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_encode_profile_sync_content() != 26330) {
+    if (uniffi_cruisemesh_core_checksum_func_encode_profile_sync_content() != 47026) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_reaction_payload() != 17821) {
@@ -11399,10 +11399,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_lan_service_type() != 61768) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_make_friend_card() != 38013) {
+    if (uniffi_cruisemesh_core_checksum_func_make_friend_card() != 28124) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 24162) {
+    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 2265) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 27474) {

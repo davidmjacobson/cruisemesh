@@ -2851,11 +2851,18 @@ mod tests {
         Group {
             id: vec![id_byte; 16],
             name: name.to_string(),
-            member_user_ids: members.iter().map(|member| member.to_vec()).collect(),
+            member_user_ids: members.iter().map(|member| test_user_id(member)).collect(),
             key: vec![key_byte; 32],
             metadata_revision: 0,
             metadata_changed_by: Vec::new(),
         }
+    }
+
+    fn test_user_id(label: &[u8]) -> Vec<u8> {
+        let mut user_id = vec![0; 16];
+        let count = label.len().min(user_id.len());
+        user_id[..count].copy_from_slice(&label[..count]);
+        user_id
     }
 
     #[test]
@@ -4670,7 +4677,7 @@ mod tests {
             Some(Group {
                 id: group.id,
                 name: "Family".to_string(),
-                member_user_ids: vec![b"alice".to_vec(), b"carol".to_vec()],
+                member_user_ids: vec![test_user_id(b"alice"), test_user_id(b"carol")],
                 key: vec![0x22; 32],
                 metadata_revision: 0,
                 metadata_changed_by: Vec::new(),
@@ -4684,7 +4691,7 @@ mod tests {
         let mut rotated = group(0x11, "Bridge", 0x22, &[b"alice", b"bob"]);
         store.upsert_group(rotated.clone()).unwrap();
         rotated.key = vec![0x33; 32];
-        rotated.member_user_ids = vec![b"alice".to_vec(), b"dave".to_vec()];
+        rotated.member_user_ids = vec![test_user_id(b"alice"), test_user_id(b"dave")];
 
         store.upsert_group(rotated.clone()).unwrap();
 
@@ -4697,9 +4704,9 @@ mod tests {
         let stale = group(0x11, "Old name", 0x22, &[b"alice", b"bob"]);
         let mut current = stale.clone();
         current.name = "New name".to_string();
-        current.member_user_ids.push(b"carol".to_vec());
+        current.member_user_ids.push(test_user_id(b"carol"));
         current.metadata_revision = 4;
-        current.metadata_changed_by = b"alice".to_vec();
+        current.metadata_changed_by = test_user_id(b"alice");
         store.upsert_group(current.clone()).unwrap();
 
         store.upsert_group(stale).unwrap();
