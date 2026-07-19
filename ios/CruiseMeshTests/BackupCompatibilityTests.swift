@@ -16,10 +16,13 @@ final class BackupCompatibilityTests: XCTestCase {
             relayToken: "secret",
             shareOnline: false
         )
+        // Must be within the core's accepted PBKDF2 range (100_000..=1_200_000,
+        // the T4-07 KDF-bomb guard); the minimum keeps the test fast. Mirrors
+        // the Rust backup tests, which use PBKDF2_MIN_ITERATIONS.
         let file = try sealBackup(
             passphrase: "correct horse battery staple",
             payload: payload,
-            iterations: 10
+            iterations: 100_000
         )
         XCTAssertEqual(
             try openBackup(passphrase: "correct horse battery staple", file: file),
