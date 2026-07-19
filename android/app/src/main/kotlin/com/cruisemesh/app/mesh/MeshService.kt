@@ -76,6 +76,7 @@ import uniffi.cruisemesh_core.coreGroupFanoutRows
 import uniffi.cruisemesh_core.coreGroupFanoutRowsForCarried
 import uniffi.cruisemesh_core.coreInboundGate
 import uniffi.cruisemesh_core.coreIsOwnFanoutHint
+import uniffi.cruisemesh_core.corePairwiseSenderAuthorized
 import uniffi.cruisemesh_core.decodeGroupInviteContent
 import uniffi.cruisemesh_core.decodeGroupMetadataUpdate
 import uniffi.cruisemesh_core.decodeFriendDirectoryContent
@@ -2328,6 +2329,17 @@ class MeshService : Service() {
         )
         if (!body.chatId.contentEquals(opened.senderUserId)) {
             Log.w(TAG, "Dropping envelope from $address: chatId does not match the verified sender")
+            return
+        }
+        val senderIsContact = store.getContact(opened.senderUserId) != null
+        if (
+            !corePairwiseSenderAuthorized(
+                body.kind,
+                senderIsContact,
+                opened.senderUserId.contentEquals(identity.userId),
+            )
+        ) {
+            Log.w(TAG, "Dropping envelope from $address: sender is not authorized for kind=${body.kind}")
             return
         }
 

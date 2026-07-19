@@ -10356,6 +10356,26 @@ public func coreMakeLanEndpointLink(endpoint: CoreLanEndpoint) -> String {
     )
 })
 }
+/**
+ * Decide whether an authenticated pairwise sender may dispatch this message
+ * kind into application handlers. Cryptographic opening proves who signed a
+ * payload, but it does not by itself make that identity an accepted contact.
+ *
+ * Direct friend requests and ticket-bearing introduced friend requests are
+ * the only onboarding kinds intentionally accepted from an unknown sender.
+ * Every ordinary chat/control kind requires an accepted contact, except for
+ * this device's own relay/fan-out copies. Unknown and group-only kinds fail
+ * closed before either platform can write message or group state.
+ */
+public func corePairwiseSenderAuthorized(kind: UInt8, senderIsContact: Bool, senderIsSelf: Bool) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_pairwise_sender_authorized(
+        FfiConverterUInt8.lower(kind),
+        FfiConverterBool.lower(senderIsContact),
+        FfiConverterBool.lower(senderIsSelf),$0
+    )
+})
+}
 public func coreParseLanEndpoint(text: String, defaultPort: UInt16) -> CoreLanEndpoint? {
     return try!  FfiConverterOptionTypeCoreLanEndpoint.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_parse_lan_endpoint(
@@ -11272,6 +11292,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_make_lan_endpoint_link() != 27969) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_pairwise_sender_authorized() != 18726) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_parse_lan_endpoint() != 56400) {
