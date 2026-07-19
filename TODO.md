@@ -204,6 +204,35 @@ code today:
   counts; cross-platform scan round-trip still works for both old and new
   link forms.
 
+### T13 🟡 iOS diagnostic-log capture + share (Android parity)
+
+Android release builds now capture a metadata-only diagnostic log and share
+it (see §1.5 Recently shipped). iOS has no equivalent — it logs via `os.log`
+with no in-app export, so a field iPhone can't hand over a log.
+
+- Add an `OSLogStore`-based export: read this process's entries since the last
+  launch (or a bounded window), write them to a temp file, present a share
+  sheet. Same content rule as Android — the app already logs metadata only
+  (kinds, counts, user-id hex, addresses), never message content; verify no
+  Swift log site interpolates message text before shipping.
+- Surface it in the iOS Advanced settings (the `ProfileView` Advanced
+  destination from U1) with the same opt-in switch semantics if capture needs
+  to be gated; `OSLogStore` reading is on-demand so an always-available
+  "Share diagnostics" button may be enough — state which in the PR.
+- Validate on the Mac host (currently unreachable — check first).
+
+---
+
+## 1.5 Recently shipped (this session, not yet merged to master)
+
+- **Release diagnostic logging (Android).** `DebugFileLog` was gated on
+  `FLAG_DEBUGGABLE`, so release installs couldn't produce a log. Now: an
+  opt-in "Diagnostic logging" switch in Advanced settings (persisted across
+  restarts) plus the share button, available in release builds; debug builds
+  keep unconditional capture. Own-process logcat only; metadata only, never
+  message content. Branch `agent/release-diagnostic-log` (commit `1ffad7a`,
+  235 unit tests green). iOS parity is T13 above.
+
 ---
 
 ## 2. Carried over (still open from the retired TODO files)
