@@ -1,0 +1,60 @@
+name: Fuzz smoke
+
+on:
+  pull_request:
+    paths:
+      - "core/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz-smoke.yml"
+  push:
+    branches: [master]
+    paths:
+      - "core/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz-smoke.yml"
+  schedule:
+    # Longer nightly run to actually explore, not just smoke-build.
+    - cron: "0 5 * * *"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - protocol_decoders
+          - relay_wire
+          - ble_reassembly
+          - noise_handshake
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Cache cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-bin
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked || true
+      # Build always runs (cheap regression guard against API drift in core).
+      - name: Build target
+        run: cargo +nightly fuzz build ${{ matrix.target }}
+      # PR/push: brief smoke. Scheduled: longer exploration.
+      - name: Run target
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            SECONDS_TO_RUN=600
+          else
+            SECONDS_TO_RUN=60
+          fi
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=$SECONDS_TO_RUN -rss_limit_mb=4096
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
