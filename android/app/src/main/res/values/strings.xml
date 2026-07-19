@@ -45,6 +45,8 @@
     <string name="ui_delete_contact_history_question">Delete contact and all message history?</string>
     <string name="ui_draft_preview">Draft: %1$s</string>
     <string name="ui_diagnostics">Diagnostics</string>
+    <string name="ui_diagnostic_logging">Diagnostic logging</string>
+    <string name="ui_diagnostic_logging_desc">Records connection and delivery events to help debug mesh problems. Message content is never recorded.</string>
     <string name="ui_display_name">Display name</string>
     <string name="ui_done">Done</string>
     <string name="ui_family_token">Family token</string>
