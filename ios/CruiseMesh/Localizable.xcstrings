@@ -1211,6 +1211,16 @@
         }
       }
     },
+    "This backup file is too large.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This backup file is too large."
+          }
+        }
+      }
+    },
     "This is what people will see when you share your friend card or add each other nearby. You can change it later.": {
       "localizations": {
         "en": {

@@ -22,9 +22,9 @@ mod transport_policy;
 
 pub use authoring::{AuthoredEnvelope, AuthoredGroupMetadataUpdate, AuthoredReceipt};
 pub use backup::{
-    backup_min_passphrase_length, backup_passphrase_strength, decode_identity_bytes,
-    encode_identity_bytes, open_backup, seal_backup, BackupPassphraseStrength, CoreBackupError,
-    CoreBackupPayload,
+    backup_max_file_bytes, backup_min_passphrase_length, backup_passphrase_strength,
+    decode_identity_bytes, encode_identity_bytes, open_backup, seal_backup,
+    BackupPassphraseStrength, CoreBackupError, CoreBackupPayload,
 };
 pub use content::{
     attachment_max_blob_bytes, decode_attachment_payload, decode_reaction_payload,

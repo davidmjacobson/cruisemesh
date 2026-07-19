@@ -360,11 +360,31 @@ impl MessageStore {
     /// The destination must not already exist; callers should use a unique
     /// temporary path and remove it after reading the backup bytes.
     pub fn backup_to(&self, destination: String) -> Result<(), CoreError> {
-        if destination.trim().is_empty() {
-            return Err(CoreError::Store("backup destination is empty".into()));
+        let destination = std::path::Path::new(destination.trim());
+        if !destination.is_absolute() {
+            return Err(CoreError::Store(
+                "backup destination must be an absolute path".into(),
+            ));
         }
-        let conn = self.conn.lock().unwrap();
-        conn.execute("VACUUM INTO ?1", params![destination])
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => return Err(CoreError::Store("backup destination already exists".into())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CoreError::Store(format!(
+                    "cannot inspect backup destination: {error}"
+                )))
+            }
+        }
+        if !destination.parent().is_some_and(std::path::Path::is_dir) {
+            return Err(CoreError::Store(
+                "backup destination parent is not a directory".into(),
+            ));
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| CoreError::Store("store lock is unavailable".into()))?;
+        conn.execute("VACUUM INTO ?1", params![destination.to_string_lossy()])
             .map_err(store_err)?;
         Ok(())
     }
@@ -5777,6 +5797,22 @@ mod tests {
         );
 
         drop(restored);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn backup_to_rejects_relative_and_existing_destinations() {
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        assert!(store.backup_to("relative.sqlite".into()).is_err());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("cruisemesh-existing-{unique}.sqlite"));
+        fs::write(&path, b"leave intact").unwrap();
+        assert!(store.backup_to(path.to_string_lossy().to_string()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"leave intact");
         fs::remove_file(path).unwrap();
     }
 }
