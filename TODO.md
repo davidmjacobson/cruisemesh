@@ -152,6 +152,58 @@ prominently.
   `UI/ProfileView.swift`, Android friend card / contact details +
   `strings.xml`.
 
+### T11 🔴 iPhone→Android friending doesn't reciprocate
+
+Field report: iPhone scans an Android QR and adds the contact, but the
+Android never auto-adds the iPhone back.
+
+- The code paths look symmetric and correct: iOS sends the mutual kind=3
+  (`FriendsView.confirm()` → `FriendRequestSender.sendMutualFriendRequest`),
+  and Android's `MeshService.handleIncomingFriendRequest` imports the sender
+  even when it isn't a contact yet — the import runs *before* the dedupe
+  check, so even a re-sent request should import. So the failure is delivery
+  or open/verify, not the handler.
+- Diagnose first (David + orchestrator — logs, not code): repro while
+  capturing Android logcat filtered on
+  `FriendRequest|Dropping envelope|Dropping friend request`. Outcomes:
+  - Nothing logged → the kind=3 never arrived. Check iOS Console for
+    "Friend request queued for later delivery" (means `sendToUserId` found no
+    authenticated link at scan time and it went to mules/relay).
+  - "failed to decode body" / "failed to parse FriendCard" → cross-platform
+    encoding bug; "payload identity doesn't match verified sender" →
+    card/key mismatch.
+- Code suspects once diagnosed: (a) no iOS↔Android authenticated link at scan
+  time and the relay fallback needs the *peer's* relay token — verify iOS
+  posts to the contact's mailbox, not only its own family; (b) if the direct
+  send reports success but the write is lost, confirm hidden kind=3 messages
+  are covered by digest resend on reconnect — if hidden kinds are excluded
+  from digests, a lost first send is never retried.
+
+### T12 🟡 iPhone QR is far too dense
+
+Two platform-specific causes plus one shared root cause, all verifiable in
+code today:
+
+- **iOS error correction is higher:** `QRCodeGenerator` (FriendsView.swift)
+  sets `inputCorrectionLevel = "M"`; Android's zxing default is L. That alone
+  is ~25% more codewords → 1–2 QR versions denser. Set iOS to "L"
+  (screen-to-screen scanning doesn't need damage tolerance).
+- **iOS renders smaller:** 240 pt vs Android's 512 px bitmap — the same
+  module count looks denser and scans worse. Render at least as large
+  relative to screen width as Android does.
+- **Shared root cause — the payload is bloated:** `FriendCard` serializes
+  `sign_pk`/`agree_pk` as JSON *number arrays* (~4 chars per key byte), then
+  the whole JSON is base64url'd into `CMFRIEND1:` inside
+  `https://cruisemesh.app/f#…`. With relay URL + token the string easily
+  exceeds 500 chars. Fix: a compact `CMFRIEND2:` form (binary layout or
+  base64-fields JSON, in core `identity.rs` next to `make_friend_link`) —
+  roughly halves the payload; `parse_friend_text` keeps accepting
+  `CMFRIEND1:` for old cards. Decide separately whether the relay token (the
+  longest field) belongs in the QR at all or only in the share-text form.
+- Accept: iPhone and Android QRs for the same card have comparable module
+  counts; cross-platform scan round-trip still works for both old and new
+  link forms.
+
 ---
 
 ## 2. Carried over (still open from the retired TODO files)
