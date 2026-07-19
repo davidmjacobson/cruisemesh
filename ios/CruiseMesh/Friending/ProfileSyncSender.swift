@@ -50,14 +50,14 @@ enum ProfileSyncSender {
         avatar: Data
     ) {
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-        let payload = encodeProfileSyncContent(content: ProfileSyncContent(
+        guard let payload = try? encodeProfileSyncContent(content: ProfileSyncContent(
             avatarEpoch: epoch,
             name: displayName.isEmpty ? "Friend" : displayName,
             avatar: avatar,
             friendsOfFriendsVersion: 1,
             friendsOfFriendsEnabled: FriendsOfFriendsStore.isEnabled(),
             friendsOfFriendsRevision: FriendsOfFriendsStore.revision()
-        ))
+        )) else { return }
         guard let authored = try? store.authorPairwiseMessage(
             identity: identity,
             contact: contact,

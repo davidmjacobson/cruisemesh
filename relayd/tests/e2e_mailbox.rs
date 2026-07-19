@@ -68,7 +68,7 @@ fn author_text(sender: &Identity, recipient: &Identity, text: &str, lamport: u64
         timestamp,
         content: text.as_bytes().to_vec(),
     };
-    let payload = encode_message_body(body);
+    let payload = encode_message_body(body).unwrap();
     let sealed = seal_message(sender.clone(), recipient.agree_pk.clone(), payload).unwrap();
     AuthoredEnvelope {
         msg_id: generate_msg_id(),
@@ -95,7 +95,8 @@ fn author_receipt(
         sender_user_id: original_sender_user_id,
         lamport: through_lamport,
         receipt_type,
-    });
+    })
+    .unwrap();
     let body = MessageBody {
         kind: KIND_RECEIPT,
         chat_id,
@@ -103,7 +104,7 @@ fn author_receipt(
         timestamp,
         content,
     };
-    let payload = encode_message_body(body);
+    let payload = encode_message_body(body).unwrap();
     let sealed =
         seal_message(receipt_sender.clone(), receipt_recipient.agree_pk.clone(), payload).unwrap();
     AuthoredEnvelope {

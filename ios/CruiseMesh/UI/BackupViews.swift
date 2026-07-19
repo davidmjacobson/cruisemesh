@@ -124,7 +124,7 @@ struct BackupRestoreView: View {
                     let url = try result.get()
                     let scoped = url.startAccessingSecurityScopedResource()
                     defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                    file = try Data(contentsOf: url)
+                    file = try BackupService.readBackupFile(at: url)
                     fileName = url.lastPathComponent
                     error = nil
                 } catch {

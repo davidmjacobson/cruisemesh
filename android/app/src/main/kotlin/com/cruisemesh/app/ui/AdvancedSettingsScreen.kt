@@ -8,6 +8,7 @@ import android.content.res.Configuration
 import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -25,6 +26,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -43,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.friending.encodeQrBitmap
 import com.cruisemesh.app.mesh.LanManualEndpoint
+import com.cruisemesh.app.mesh.LanSweepDisplayState
 import com.cruisemesh.app.mesh.LanTransportDiagnostics
 import com.cruisemesh.app.mesh.lanEndpointLink
 import com.cruisemesh.app.mesh.parseLanManualEndpoint
@@ -135,11 +138,20 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
             lanStatus.probeStatus?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
             }
-            lanStatus.sweepVerdict?.let {
+            val sweepStatus = when (lanStatus.sweepDisplayState) {
+                LanSweepDisplayState.NONE -> null
+                LanSweepDisplayState.CHECKING ->
+                    R.string.ui_checking_this_network to MaterialTheme.colorScheme.onSurfaceVariant
+                LanSweepDisplayState.ISOLATION_SUSPECTED ->
+                    R.string.ui_wifi_appears_to_block_phone_to_phone_traffic to MaterialTheme.colorScheme.error
+                LanSweepDisplayState.BLOCKED_BY_POLICY ->
+                    R.string.ui_local_wi_fi_probes_were_denied to MaterialTheme.colorScheme.error
+            }
+            sweepStatus?.let { (messageId, color) ->
                 Text(
-                    it,
+                    stringResource(messageId),
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
+                    color = color,
                     modifier = Modifier.padding(top = 4.dp),
                 )
             }
@@ -210,21 +222,43 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                 modifier = Modifier.padding(top = 4.dp),
             )
 
-            if (DebugFileLog.isEnabled(context)) {
-                Spacer(modifier = Modifier.height(28.dp))
-                Text(stringResource(R.string.ui_diagnostics), style = MaterialTheme.typography.titleMedium)
-                Button(
-                    onClick = {
-                        val intent = DebugFileLog.shareIntent(context)
-                        if (intent != null) {
-                            context.startActivity(Intent.createChooser(intent, "Share debug log"))
-                        } else {
-                            Toast.makeText(context, "No log captured yet", Toast.LENGTH_SHORT).show()
-                        }
-                    },
+            Spacer(modifier = Modifier.height(28.dp))
+            Text(stringResource(R.string.ui_diagnostics), style = MaterialTheme.typography.titleMedium)
+            if (!DebugFileLog.isDebuggableBuild(context)) {
+                var diagnosticLogging by remember { mutableStateOf(DebugFileLog.isOptedIn(context)) }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                ) { Text(stringResource(R.string.ui_share_debug_log)) }
+                ) {
+                    Text(
+                        stringResource(R.string.ui_diagnostic_logging),
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = diagnosticLogging,
+                        onCheckedChange = {
+                            diagnosticLogging = it
+                            DebugFileLog.setOptIn(context, it)
+                        },
+                    )
+                }
             }
+            Text(stringResource(R.string.ui_diagnostic_logging_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            Button(
+                onClick = {
+                    val intent = DebugFileLog.shareIntent(context)
+                    if (intent != null) {
+                        context.startActivity(Intent.createChooser(intent, "Share debug log"))
+                    } else {
+                        Toast.makeText(context, "No log captured yet", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            ) { Text(stringResource(R.string.ui_share_debug_log)) }
         }
     }
 

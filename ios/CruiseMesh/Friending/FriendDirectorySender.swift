@@ -70,12 +70,12 @@ enum FriendDirectorySender {
             relayUrl: nil,
             relayToken: nil
         )
-        let card = makeFriendCard(
+        guard let card = try? makeFriendCard(
             name: displayName.isEmpty ? "Friend" : displayName,
             identity: identity,
             relayUrl: RelayConfigStore.load()?.relayUrl,
             relayToken: RelayConfigStore.load()?.relayToken
-        )
+        ) else { return false }
         let queued = queue(
             store: store,
             identity: identity,

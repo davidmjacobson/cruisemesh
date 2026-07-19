@@ -20,6 +20,9 @@ const GCM_TAG_LEN: usize = 16;
 const HEADER_LEN: usize = MAGIC.len() + 1 + 1 + KDF_PARAMS_LEN + SALT_LEN + NONCE_LEN;
 const IDENTITY_LEN: usize = 16 + 32 + 32 + 32 + 32;
 pub const PBKDF2_DEFAULT_ITERATIONS: u32 = 600_000;
+const PBKDF2_MIN_ITERATIONS: u32 = 100_000;
+const PBKDF2_MAX_ITERATIONS: u32 = 1_200_000;
+const BACKUP_MAX_FILE_BYTES: usize = 128 * 1024 * 1024;
 pub const BACKUP_MIN_PASSPHRASE_LEN: usize = 10;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -63,6 +66,13 @@ pub enum BackupPassphraseStrength {
 #[uniffi::export]
 pub fn backup_min_passphrase_length() -> u32 {
     BACKUP_MIN_PASSPHRASE_LEN as u32
+}
+
+/// Upper bound enforced before a selected backup is accumulated by either
+/// mobile shell and repeated at the core decoder boundary.
+#[uniffi::export]
+pub fn backup_max_file_bytes() -> u64 {
+    BACKUP_MAX_FILE_BYTES as u64
 }
 
 #[uniffi::export]
@@ -127,11 +137,16 @@ pub fn seal_backup(
     iterations: Option<u32>,
 ) -> Result<Vec<u8>, CoreBackupError> {
     let iterations = iterations.unwrap_or(PBKDF2_DEFAULT_ITERATIONS);
-    if iterations == 0 {
-        return Err(CoreBackupError::InvalidPayload {
-            reason: "PBKDF2 iterations must be positive".into(),
-        });
-    }
+    validate_iterations(iterations)?;
+    let plaintext = encode_inner(&payload)?;
+    validate_backup_file_len(
+        HEADER_LEN
+            .checked_add(plaintext.len())
+            .and_then(|size| size.checked_add(GCM_TAG_LEN))
+            .ok_or_else(|| CoreBackupError::InvalidPayload {
+                reason: "backup file size overflow".into(),
+            })?,
+    )?;
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut salt);
@@ -139,7 +154,6 @@ pub fn seal_backup(
     let header = encode_header(iterations, &salt, &nonce);
     let key = derive_key(&passphrase, &salt, iterations);
     let cipher = Aes256Gcm::new_from_slice(&key).expect("fixed AES-256 key size");
-    let plaintext = encode_inner(&payload)?;
     let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -161,6 +175,7 @@ pub fn open_backup(
     passphrase: String,
     file: Vec<u8>,
 ) -> Result<CoreBackupPayload, CoreBackupError> {
+    validate_backup_file_len(file.len())?;
     let parsed = decode_header(&file)?;
     if parsed.kdf_id != KDF_PBKDF2_HMAC_SHA256 {
         return Err(CoreBackupError::UnsupportedKdf {
@@ -168,9 +183,10 @@ pub fn open_backup(
         });
     }
     let iterations = u32::from_be_bytes(parsed.kdf_params[0..4].try_into().unwrap());
-    if iterations == 0 {
+    validate_iterations(iterations)?;
+    if parsed.kdf_params[4..].iter().any(|byte| *byte != 0) {
         return Err(CoreBackupError::InvalidPayload {
-            reason: "PBKDF2 iterations must be positive".into(),
+            reason: "unsupported backup KDF parameters".into(),
         });
     }
     let key = derive_key(&passphrase, parsed.salt, iterations);
@@ -185,6 +201,26 @@ pub fn open_backup(
         )
         .map_err(|_| CoreBackupError::WrongPassphraseOrCorrupt)?;
     decode_inner(&plaintext)
+}
+
+fn validate_iterations(iterations: u32) -> Result<(), CoreBackupError> {
+    if !(PBKDF2_MIN_ITERATIONS..=PBKDF2_MAX_ITERATIONS).contains(&iterations) {
+        return Err(CoreBackupError::InvalidPayload {
+            reason: format!(
+                "PBKDF2 iterations must be between {PBKDF2_MIN_ITERATIONS} and {PBKDF2_MAX_ITERATIONS}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_backup_file_len(len: usize) -> Result<(), CoreBackupError> {
+    if len > BACKUP_MAX_FILE_BYTES {
+        return Err(CoreBackupError::InvalidPayload {
+            reason: "backup file is too large".into(),
+        });
+    }
+    Ok(())
 }
 
 fn derive_key(passphrase: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
@@ -448,13 +484,13 @@ mod tests {
         let one = seal_backup(
             "correct horse battery staple".into(),
             payload.clone(),
-            Some(10),
+            Some(PBKDF2_MIN_ITERATIONS),
         )
         .unwrap();
         let two = seal_backup(
             "correct horse battery staple".into(),
             payload.clone(),
-            Some(10),
+            Some(PBKDF2_MIN_ITERATIONS),
         )
         .unwrap();
         assert_ne!(one, two);
@@ -466,7 +502,7 @@ mod tests {
 
     #[test]
     fn wrong_passphrase_and_tampering_fail() {
-        let mut file = seal_backup("right".into(), payload(), Some(10)).unwrap();
+        let mut file = seal_backup("right".into(), payload(), Some(PBKDF2_MIN_ITERATIONS)).unwrap();
         assert!(matches!(
             open_backup("wrong".into(), file.clone()),
             Err(CoreBackupError::WrongPassphraseOrCorrupt)
@@ -489,6 +525,23 @@ mod tests {
             open_backup("pw".into(), vec![0x55; 200]),
             Err(CoreBackupError::BadMagic)
         ));
+    }
+
+    #[test]
+    fn rejects_hostile_kdf_work_factor_before_deriving_a_key() {
+        let mut file = encode_header(PBKDF2_MAX_ITERATIONS + 1, &[1; SALT_LEN], &[2; NONCE_LEN]);
+        file.extend_from_slice(&[0; GCM_TAG_LEN]);
+        assert!(matches!(
+            open_backup("pw".into(), file),
+            Err(CoreBackupError::InvalidPayload { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_lengths_above_the_mobile_backup_cap() {
+        assert_eq!(backup_max_file_bytes(), 128 * 1024 * 1024);
+        assert!(validate_backup_file_len(BACKUP_MAX_FILE_BYTES).is_ok());
+        assert!(validate_backup_file_len(BACKUP_MAX_FILE_BYTES + 1).is_err());
     }
 
     #[test]
