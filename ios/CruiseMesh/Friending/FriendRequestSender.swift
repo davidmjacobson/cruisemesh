@@ -11,12 +11,14 @@ enum FriendRequestSender {
         contact: Contact,
         displayName: String
     ) -> FriendRequestDelivery {
-        let cardJson = makeFriendCard(
+        guard let cardJson = try? makeFriendCard(
             name: displayName.isEmpty ? "Friend" : displayName,
             identity: identity,
             relayUrl: RelayConfigStore.load()?.relayUrl,
             relayToken: RelayConfigStore.load()?.relayToken
-        )
+        ) else {
+            return FriendRequestDelivery(reachedDirectly: false, lamport: 0)
+        }
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
         guard let authored = try? store.authorFriendRequest(
             identity: identity, contact: contact, friendCardJson: cardJson, timestampMs: timestamp

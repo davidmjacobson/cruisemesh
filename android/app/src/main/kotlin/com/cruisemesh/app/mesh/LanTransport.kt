@@ -343,14 +343,12 @@ internal class LanTransport(
         Log.i(TAG, summary.logLine(sweep.prefixLength))
         scanPlanner.onScanCompleted(sweep.breadth)
         val verdict = lanSweepVerdict(summary)
+        LanTransportDiagnostics.sweepCompleted(summary)
         when (verdict) {
             LanSweepVerdict.ISOLATION_SUSPECTED -> {
                 scanPlanner.onIsolationSuspected(System.currentTimeMillis())
-                LanTransportDiagnostics.sweepVerdict(ISOLATION_DIAGNOSTIC)
             }
-            LanSweepVerdict.BLOCKED_BY_POLICY ->
-                LanTransportDiagnostics.sweepVerdict(BLOCKED_DIAGNOSTIC)
-            else -> LanTransportDiagnostics.sweepVerdict(null)
+            else -> Unit
         }
         if (sweep.breadth == LanScanBreadth.LOCAL_24) {
             scheduleAutomaticSubnetScan(AUTO_SCAN_ESCALATE_DELAY_MS)
@@ -367,6 +365,7 @@ internal class LanTransport(
             onEndpointObserved(expectedUserId, endpoint, currentNetworkId)
             if (!started) return@post
             scanPlanner.onPeerEvidence(System.currentTimeMillis())
+            LanTransportDiagnostics.peerEvidence()
             if (!shouldInitiateLanConnection(instanceToken, remoteToken)) {
                 Log.i(
                     TAG,
@@ -466,6 +465,7 @@ internal class LanTransport(
         )
         endpointHint?.let { onNetworkReady(it, currentNetworkId) }
         scanPlanner.onNetworkJoined(System.currentTimeMillis())
+        LanTransportDiagnostics.networkJoined()
         scheduleAutomaticSubnetScan(AUTO_SCAN_INITIAL_DELAY_MS)
     }
 
@@ -903,6 +903,7 @@ internal class LanTransport(
                             )
                     ) {
                         scanPlanner.onPeerEvidence(System.currentTimeMillis())
+                        LanTransportDiagnostics.peerEvidence()
                         if (shouldInitiateLanConnection(instanceToken, token)) {
                             connectToService(serviceInfo)
                         } else {
@@ -1094,11 +1095,6 @@ internal class LanTransport(
         private const val AUTO_SCAN_ESCALATE_DELAY_MS = 2_000L
         private const val AUTO_SCAN_RETRY_INTERVAL_MS = 5 * 60_000L
         private const val MAX_PACKET_SIZE = 65_535
-        private const val ISOLATION_DIAGNOSTIC =
-            "This Wi-Fi appears to block phone-to-phone traffic; nearby delivery will use Bluetooth."
-        private const val BLOCKED_DIAGNOSTIC =
-            "Local Wi-Fi probes were denied, likely by a VPN or OS policy; nearby delivery will use Bluetooth."
-
         private fun writePacket(output: DataOutputStream, bytes: ByteArray) {
             require(bytes.isNotEmpty() && bytes.size <= MAX_PACKET_SIZE)
             output.writeInt(bytes.size)

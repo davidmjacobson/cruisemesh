@@ -1071,12 +1071,12 @@
         }
       }
     },
-    "Search this /24 network": {
+    "Search local subnet": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Search this /24 network"
+            "value": "Search local subnet"
           }
         }
       }
@@ -1107,6 +1107,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Share card text"
+          }
+        }
+      }
+    },
+    "Shorten your name or relay settings to create a friend card.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shorten your name or relay settings to create a friend card."
           }
         }
       }
@@ -1207,6 +1217,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "The port is optional. An accepted friend and encrypted identity check are still required."
+          }
+        }
+      }
+    },
+    "This backup file is too large.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This backup file is too large."
           }
         }
       }

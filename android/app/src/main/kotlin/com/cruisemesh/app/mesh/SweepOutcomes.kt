@@ -95,6 +95,69 @@ internal enum class LanSweepVerdict {
     INCONCLUSIVE,
 }
 
+enum class LanSweepDisplayState {
+    NONE,
+    CHECKING,
+    ISOLATION_SUSPECTED,
+    BLOCKED_BY_POLICY,
+}
+
+/**
+ * Android-free state holder for the LAN sweep result shown in diagnostics.
+ *
+ * A verdict can only enter the display state through [onSweepCompleted], whose
+ * summary is emitted only after every candidate has retired. Network changes
+ * and peer evidence synchronously replace any previous verdict so diagnostics
+ * never describe a stale network.
+ */
+internal class LanSweepDisplayTracker {
+    private var state = LanSweepDisplayState.NONE
+    private var peerSeenOnNetwork = false
+
+    @Synchronized
+    fun onNetworkJoined(): LanSweepDisplayState {
+        peerSeenOnNetwork = false
+        return set(LanSweepDisplayState.CHECKING)
+    }
+
+    @Synchronized
+    fun onNetworkLost(): LanSweepDisplayState {
+        peerSeenOnNetwork = false
+        return set(LanSweepDisplayState.NONE)
+    }
+
+    @Synchronized
+    fun onSweepStarted(): LanSweepDisplayState = set(LanSweepDisplayState.CHECKING)
+
+    @Synchronized
+    fun onSweepCompleted(summary: SweepOutcomeSummary): LanSweepDisplayState {
+        val next = if (peerSeenOnNetwork) {
+            LanSweepDisplayState.NONE
+        } else {
+            when (lanSweepVerdict(summary)) {
+                LanSweepVerdict.ISOLATION_SUSPECTED -> LanSweepDisplayState.ISOLATION_SUSPECTED
+                LanSweepVerdict.BLOCKED_BY_POLICY -> LanSweepDisplayState.BLOCKED_BY_POLICY
+                else -> LanSweepDisplayState.NONE
+            }
+        }
+        return set(next)
+    }
+
+    @Synchronized
+    fun onPeerEvidence(): LanSweepDisplayState {
+        peerSeenOnNetwork = true
+        return set(LanSweepDisplayState.NONE)
+    }
+
+    @Synchronized
+    fun current(): LanSweepDisplayState = state
+
+    private fun set(next: LanSweepDisplayState): LanSweepDisplayState {
+        state = next
+        return next
+    }
+}
+
 /** Pure policy decision for the user-facing result and planner reaction. */
 internal fun lanSweepVerdict(summary: SweepOutcomeSummary): LanSweepVerdict = when {
     summary.connected > 0 -> LanSweepVerdict.FOUND_PEER

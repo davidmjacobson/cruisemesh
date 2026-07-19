@@ -511,7 +511,14 @@ final class MeshController: ObservableObject {
         // mule still holding our envelope learns on this digest that we
         // already have it -- see `store.coreConfirmCarriedDeliveries`.
         let advertised = (try? store.coreDigestAdvertisedMsgIds()) ?? []
-        let digest = encodeDigest(chatId: identity.userId, entries: entries, recentMsgIds: advertised)
+        guard let digest = try? encodeDigest(
+            chatId: identity.userId,
+            entries: entries,
+            recentMsgIds: advertised
+        ) else {
+            log.warning("Could not encode DIGEST for \(address, privacy: .public)")
+            return
+        }
         MeshRouter.sendToAddress(address: address, frame: digest)
         refreshNearby()
     }
@@ -590,6 +597,7 @@ final class MeshController: ObservableObject {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         switch coreInboundGate(
             isNewMsgId: !GossipState.seenIds.contains(msgId: msgId),
+            hopTtl: hopTtl,
             expiryMs: expiry,
             nowMs: now
         ) {
@@ -600,47 +608,47 @@ final class MeshController: ObservableObject {
             // A deliberate drop is still a terminal handled state.
             GossipState.seenIds.record(msgId: msgId)
             return .expired
+        case .rejected:
+            log.warning("Dropping envelope with invalid hop or expiry fields from \(sourceLabel, privacy: .public)")
+            GossipState.seenIds.record(msgId: msgId)
+            return .rejected
         case .dispatch:
             break
         }
+        let opened: OpenedMessage
         do {
-            let opened = try openMessage(recipient: identity, sealed: sealed)
-            let arrival = messageArrival(
-                sourceAddress: sourceAddress,
-                senderUserId: opened.senderUserId,
-                receivedHopTtl: hopTtl
-            )
-            deliverOpened(
-                sourceLabel: sourceLabel,
-                sourceAddress: sourceAddress,
-                opened: opened,
-                identity: identity,
-                msgId: msgId,
-                arrival: arrival
-            )
-            // DTN D4: reaching this line means delivery ran to completion --
-            // safe, and required, to record.
-            GossipState.seenIds.record(msgId: msgId)
-            return .consumed
+            opened = try openMessage(recipient: identity, sealed: sealed)
         } catch {
             // Pairwise open failed: either foreign 1:1 traffic, or a group
             // envelope sealed with a shared key (DESIGN.md §6.5). Try groups
             // whose recipient_hint matches before treating it as pure mule
             // traffic. Group members keep relaying/carrying so absent members
             // still get a copy.
+            //
+            // T4-06: this catch is deliberately scoped to `openMessage` ONLY.
+            // A store failure while delivering a message that WAS ours must
+            // not be misread here as "not for us, carry as foreign" -- the
+            // own-delivery path below has its own catch that returns .failed.
             if let (group, opened) = tryOpenGroupMessage(recipientHint: recipientHint, sealed: sealed, now: now) {
-                deliverOpenedGroupEnvelope(
-                    sourceLabel: sourceLabel,
-                    group: group,
-                    opened: opened,
-                    identity: identity,
-                    msgId: msgId,
-                    arrival: messageArrival(
-                        sourceAddress: sourceAddress,
-                        senderUserId: opened.senderUserId,
-                        receivedHopTtl: hopTtl
+                do {
+                    try deliverOpenedGroupEnvelope(
+                        sourceLabel: sourceLabel,
+                        group: group,
+                        opened: opened,
+                        identity: identity,
+                        msgId: msgId,
+                        arrival: messageArrival(
+                            sourceAddress: sourceAddress,
+                            senderUserId: opened.senderUserId,
+                            receivedHopTtl: hopTtl
+                        )
                     )
-                )
+                } catch {
+                    // T4-06: durable store of our own group copy failed. Leave
+                    // re-presentable (no record) and never acked.
+                    log.warning("Deferring group envelope from \(sourceLabel, privacy: .public): durable delivery failed")
+                    return .failed
+                }
                 // specs/group-relay-durability.md §4.3 no-reinjection rule:
                 // a relay-fetched group message addressed to OUR OWN hint is
                 // a per-member fan-out copy -- the relay fan-out already
@@ -707,6 +715,32 @@ final class MeshController: ObservableObject {
             }
             return .carried
         }
+
+        // `openMessage` succeeded: this envelope is ours. Delivering it is a
+        // separate do/catch from the open above so a store failure here is
+        // reported as `.failed` (re-presentable, never acked) rather than
+        // being mistaken for foreign traffic (T4-06).
+        let arrival = messageArrival(
+            sourceAddress: sourceAddress,
+            senderUserId: opened.senderUserId,
+            receivedHopTtl: hopTtl
+        )
+        do {
+            try deliverOpened(
+                sourceLabel: sourceLabel,
+                sourceAddress: sourceAddress,
+                opened: opened,
+                identity: identity,
+                msgId: msgId,
+                arrival: arrival
+            )
+        } catch {
+            log.warning("Deferring envelope from \(sourceLabel, privacy: .public): durable delivery failed")
+            return .failed
+        }
+        // DTN D4: delivery ran to completion -- safe, and required, to record.
+        GossipState.seenIds.record(msgId: msgId)
+        return .consumed
     }
 
     private func messageArrival(
@@ -757,11 +791,13 @@ final class MeshController: ObservableObject {
         identity: Identity,
         msgId: Data,
         arrival: MessageArrival
-    ) {
+    ) throws {
         let extendedBody: ExtendedMessageBody
         do {
             extendedBody = try decodeExtendedMessageBody(bytes: opened.payload)
         } catch {
+            // Undecodable body from a verified sender: deterministic reject,
+            // terminal handled state (not a store failure).
             return
         }
         let body = MessageBody(
@@ -772,10 +808,19 @@ final class MeshController: ObservableObject {
             content: extendedBody.content
         )
         guard body.chatId == opened.senderUserId else { return }
+        let senderIsContact = (try? store.getContact(userId: opened.senderUserId)) != nil
+        guard corePairwiseSenderAuthorized(
+            kind: body.kind,
+            senderIsContact: senderIsContact,
+            senderIsSelf: opened.senderUserId == identity.userId
+        ) else {
+            log.warning("Dropping pairwise envelope from unauthorized sender on \(sourceLabel, privacy: .public)")
+            return
+        }
 
         switch body.kind {
         case ProtocolKind.text, ProtocolKind.attachmentManifest, ProtocolKind.reaction:
-            handleIncomingChat(
+            try handleIncomingChat(
                 sourceAddress: sourceAddress,
                 senderUserId: opened.senderUserId,
                 body: body,
@@ -786,7 +831,7 @@ final class MeshController: ObservableObject {
                 arrival: arrival
             )
         case ProtocolKind.receipt:
-            handleIncomingReceipt(
+            try handleIncomingReceipt(
                 sourceAddress: sourceAddress,
                 envelopeSender: opened.senderUserId,
                 body: body,
@@ -829,7 +874,7 @@ final class MeshController: ObservableObject {
                 identity: identity
             )
         case ProtocolKind.groupInvite:
-            handleIncomingGroupInvite(
+            try handleIncomingGroupInvite(
                 sourceLabel: sourceLabel,
                 senderUserId: opened.senderUserId,
                 body: body,
@@ -851,7 +896,7 @@ final class MeshController: ObservableObject {
         identity: Identity,
         msgId: Data,
         arrival: MessageArrival?
-    ) {
+    ) throws {
         guard group.memberUserIds.contains(opened.senderUserId) else {
             log.warning("Dropping group envelope from \(sourceLabel, privacy: .public): signer is not a member of \(group.name, privacy: .public)")
             return
@@ -879,7 +924,7 @@ final class MeshController: ObservableObject {
         }
         switch body.kind {
         case ProtocolKind.text, ProtocolKind.attachmentManifest, ProtocolKind.reaction:
-            handleIncomingGroupChatMessage(
+            try handleIncomingGroupChatMessage(
                 group: group,
                 senderUserId: opened.senderUserId,
                 body: body,
@@ -888,7 +933,7 @@ final class MeshController: ObservableObject {
                 arrival: arrival
             )
         case ProtocolKind.groupMetadataUpdate:
-            handleIncomingGroupMetadataUpdate(
+            try handleIncomingGroupMetadataUpdate(
                 sourceLabel: sourceLabel,
                 group: group,
                 senderUserId: opened.senderUserId,
@@ -910,7 +955,7 @@ final class MeshController: ObservableObject {
         msgId: Data,
         replyToMsgId: Data?,
         arrival: MessageArrival?
-    ) {
+    ) throws {
         let updated: Group?
         do {
             let update = try decodeGroupMetadataUpdate(bytes: body.content)
@@ -920,10 +965,14 @@ final class MeshController: ObservableObject {
                 senderUserId: senderUserId
             )
         } catch {
+            // Deterministic reject (bad/inapplicable metadata) -- terminal
+            // handled state, distinct from a store failure. Swallow here so
+            // it is NOT reported as .failed by the caller.
             log.warning("Dropping invalid group metadata from \(sourceLabel, privacy: .public)")
             return
         }
-        let inserted = (try? store.insertIncomingMessage(
+        // T4-06: primary store failure propagates (see handleIncomingChat).
+        let inserted = try store.insertIncomingMessage(
             message: StoredMessage(
                 chatId: group.id,
                 senderUserId: senderUserId,
@@ -934,7 +983,7 @@ final class MeshController: ObservableObject {
             ),
             msgId: msgId,
             replyToMsgId: replyToMsgId
-        )) ?? false
+        )
         guard inserted else { return }
         if let arrival {
             _ = try? store.recordMessageArrival(
@@ -961,8 +1010,9 @@ final class MeshController: ObservableObject {
         msgId: Data,
         replyToMsgId: Data?,
         arrival: MessageArrival?
-    ) {
-        let inserted = (try? store.insertIncomingMessage(
+    ) throws {
+        // T4-06: primary store failure propagates (see handleIncomingChat).
+        let inserted = try store.insertIncomingMessage(
             message: StoredMessage(
                 chatId: group.id,
                 senderUserId: senderUserId,
@@ -973,7 +1023,7 @@ final class MeshController: ObservableObject {
             ),
             msgId: msgId,
             replyToMsgId: replyToMsgId
-        )) ?? false
+        )
         guard inserted else { return }
         if let arrival {
             _ = try? store.recordMessageArrival(
@@ -1019,7 +1069,7 @@ final class MeshController: ObservableObject {
         senderUserId: Data,
         body: MessageBody,
         identity: Identity
-    ) {
+    ) throws {
         let group: Group
         do {
             group = try decodeGroupInviteContent(bytes: body.content)
@@ -1036,21 +1086,20 @@ final class MeshController: ObservableObject {
             return
         }
 
-        do {
-            try store.upsertGroup(group: group)
-        } catch {
-            log.warning("Dropping group invite from \(sourceLabel, privacy: .public): failed to persist group")
-            return
-        }
+        // T4-06: persisting the group is the durable state that matters --
+        // let a store failure propagate so the invite is not acked/deduped
+        // and the group is not silently lost (previously this returned, which
+        // the caller treated as consumed and acked the relay copy away).
+        try store.upsertGroup(group: group)
         deliverCarriedMessagesForImportedGroup(group: group, identity: identity)
-        let inserted = (try? store.insertMessage(message: StoredMessage(
+        let inserted = try store.insertMessage(message: StoredMessage(
             chatId: group.id,
             senderUserId: senderUserId,
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.groupInvite,
             payload: body.content
-        ))) ?? false
+        ))
         guard inserted else { return }
         ChatEvents.notifyChatChanged(group.id)
         log.info("Imported group \(group.name, privacy: .public) from invite on \(sourceLabel, privacy: .public)")
@@ -1075,8 +1124,13 @@ final class MeshController: ObservableObject {
         msgId: Data,
         replyToMsgId: Data?,
         arrival: MessageArrival
-    ) {
-        let inserted = (try? store.insertIncomingMessage(
+    ) throws {
+        // T4-06: let a store failure propagate (do NOT `try?`-swallow it into
+        // the same `false` a harmless duplicate returns). `processInboundEnvelope`
+        // turns the throw into `.failed`, leaving the envelope re-presentable
+        // and its relay copy un-acked. A `false` here is a real duplicate --
+        // already durably stored -- so it stays a terminal (return) state.
+        let inserted = try store.insertIncomingMessage(
             message: StoredMessage(
                 chatId: senderUserId,
                 senderUserId: senderUserId,
@@ -1087,7 +1141,7 @@ final class MeshController: ObservableObject {
             ),
             msgId: msgId,
             replyToMsgId: replyToMsgId
-        )) ?? false
+        )
         guard inserted else { return }
         _ = try? store.recordMessageArrival(
             chatId: senderUserId,
@@ -1185,11 +1239,14 @@ final class MeshController: ObservableObject {
         body: MessageBody,
         identity: Identity,
         arrival: MessageArrival
-    ) {
+    ) throws {
         guard let receipt = try? decodeReceiptContent(bytes: body.content) else { return }
         guard receipt.senderUserId == identity.userId else { return }
         guard (try? store.getContact(userId: envelopeSender)) != nil else { return }
-        try? store.recordReceipt(
+        // T4-06: advancing the receipt watermark is the durable state here;
+        // let a store failure propagate so a relay-fetched receipt is not
+        // acked away before it is recorded.
+        try store.recordReceipt(
             chatId: envelopeSender,
             senderUserId: identity.userId,
             receiptType: receipt.receiptType,
@@ -1555,14 +1612,21 @@ final class MeshController: ObservableObject {
         let carried = (try? store.carriedEnvelopesForHints(hints: hints, nowMs: now)) ?? []
         for envelope in carried {
             guard let opened = try? openGroupMessage(group: group, sealed: envelope.sealed) else { continue }
-            deliverOpenedGroupEnvelope(
-                sourceLabel: "carry queue",
-                group: group,
-                opened: opened,
-                identity: identity,
-                msgId: envelope.msgId,
-                arrival: nil
-            )
+            do {
+                try deliverOpenedGroupEnvelope(
+                    sourceLabel: "carry queue",
+                    group: group,
+                    opened: opened,
+                    identity: identity,
+                    msgId: envelope.msgId,
+                    arrival: nil
+                )
+            } catch {
+                // T4-06: best-effort drain -- a store failure must not abort
+                // the loop. The carried envelope is left in place (this path
+                // never removes it), so a later import/trigger retries it.
+                log.warning("Deferring carried group message: durable delivery failed")
+            }
         }
     }
 
@@ -1865,7 +1929,7 @@ final class MeshController: ObservableObject {
             nowMs: now,
             ownOutboundBudgetBytes: MeshDefaults.ownOutboundSprayBudgetBytes,
             ownReceiptBudgetBytes: MeshDefaults.ownReceiptSprayBudgetBytes,
-            receiptQueryLimit: MeshDefaults.relayBatchLimit
+            receiptQueryLimit: MeshDefaults.relayStoreBatchLimit
         ) else {
             log.warning("Failed to build digest spray plan for \(address, privacy: .public)")
             return
@@ -2031,7 +2095,7 @@ final class MeshController: ObservableObject {
             _ = try store.pruneExpiredOutboundEnvelopes(nowMs: now)
             _ = try store.pruneExpiredCarried(nowMs: now)
             let receipts = try store.pendingRelayOutgoingReceiptEnvelopes(
-                limit: MeshDefaults.relayBatchLimit,
+                limit: MeshDefaults.relayStoreBatchLimit,
                 nowMs: now
             )
             for env in receipts {
@@ -2039,7 +2103,7 @@ final class MeshController: ObservableObject {
                 _ = try store.markOutgoingReceiptEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
             }
             let outbound = try store.pendingRelayOutboundEnvelopes(
-                limit: MeshDefaults.relayBatchLimit,
+                limit: MeshDefaults.relayStoreBatchLimit,
                 nowMs: now
             )
             let importedGroups = try store.listGroups()
@@ -2089,7 +2153,7 @@ final class MeshController: ObservableObject {
                 _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
             }
             let family = try store.familyCarriedEnvelopes(
-                limit: MeshDefaults.relayBatchLimit,
+                limit: MeshDefaults.relayStoreBatchLimit,
                 nowMs: now
             )
             for env in family {
@@ -2169,12 +2233,13 @@ final class MeshController: ObservableObject {
                 })
             }
             var afterId: Int64 = 0
+            let fetchBatchLimit = Int(relayFetchBatchLimit())
             while true {
                 let page = try RelayClient.fetchEnvelopes(
                     config: config,
                     hints: hints,
                     afterId: afterId,
-                    limit: Int(MeshDefaults.relayBatchLimit)
+                    limit: fetchBatchLimit
                 )
                 guard !page.envelopes.isEmpty else { break }
                 var dispositions: [CoreRelayEnvelopeDisposition] = []
@@ -2212,7 +2277,7 @@ final class MeshController: ObservableObject {
                     try RelayClient.ackEnvelopes(config: config, ids: acks)
                 }
                 afterId = page.nextCursor
-                if page.envelopes.count < Int(MeshDefaults.relayBatchLimit) { break }
+                if page.envelopes.count < fetchBatchLimit { break }
             }
             await MainActor.run {
                 MeshConnectivityStatus.shared.setRelayHealth(.ok(

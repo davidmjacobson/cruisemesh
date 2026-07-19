@@ -15,6 +15,11 @@ use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
 const USER_ID_LEN: usize = 16;
 const FRIEND_LINK_PREFIX: &str = "CMFRIEND1:";
+const MAX_FRIEND_CARD_JSON_BYTES: usize = 16 * 1024;
+const MAX_FRIEND_TEXT_BYTES: usize = 24 * 1024;
+const MAX_DISPLAY_NAME_BYTES: usize = 128;
+const MAX_RELAY_URL_BYTES: usize = 2 * 1024;
+const MAX_RELAY_TOKEN_BYTES: usize = 1024;
 
 /// A locally generated identity: both keypairs, private material included.
 ///
@@ -125,7 +130,7 @@ pub fn make_friend_card(
     identity: Identity,
     relay_url: Option<String>,
     relay_token: Option<String>,
-) -> String {
+) -> Result<String, CoreError> {
     let card = FriendCard {
         name,
         sign_pk: identity.sign_pk,
@@ -133,42 +138,49 @@ pub fn make_friend_card(
         relay_url,
         relay_token,
     };
-    // Construction is infallible: every field is already valid UTF-8 / bytes.
-    serde_json::to_string(&card).expect("FriendCard always serializes")
+    validate_friend_card(&card)?;
+    let json =
+        serde_json::to_string(&card).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+    if json.len() > MAX_FRIEND_CARD_JSON_BYTES {
+        return Err(CoreError::InvalidFriendCard(
+            "friend card is too large".to_string(),
+        ));
+    }
+    Ok(json)
 }
 
 /// Compact, chat-app-safe text form of a FriendCard.
 #[uniffi::export]
-pub fn make_friend_link(card_json: String) -> String {
-    format!(
+pub fn make_friend_link(card_json: String) -> Result<String, CoreError> {
+    parse_friend_card(card_json.clone())?;
+    Ok(format!(
         "{FRIEND_LINK_PREFIX}{}",
         BASE64URL_NOPAD.encode(card_json.as_bytes())
-    )
+    ))
 }
 
 /// Parse a friend-card JSON payload received via QR scan or pasted text.
 #[uniffi::export]
 pub fn parse_friend_card(json: String) -> Result<FriendCard, CoreError> {
+    if json.len() > MAX_FRIEND_CARD_JSON_BYTES {
+        return Err(CoreError::InvalidFriendCard(
+            "friend card is too large".to_string(),
+        ));
+    }
     let card: FriendCard =
         serde_json::from_str(&json).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
-    if card.sign_pk.len() != 32 {
-        return Err(CoreError::InvalidKeyLength {
-            expected: 32,
-            actual: card.sign_pk.len() as u32,
-        });
-    }
-    if card.agree_pk.len() != 32 {
-        return Err(CoreError::InvalidKeyLength {
-            expected: 32,
-            actual: card.agree_pk.len() as u32,
-        });
-    }
+    validate_friend_card(&card)?;
     Ok(card)
 }
 
 /// Parse either the compact `CMFRIEND1:` link form or legacy raw FriendCard JSON.
 #[uniffi::export]
 pub fn parse_friend_text(text: String) -> Result<FriendCard, CoreError> {
+    if text.len() > MAX_FRIEND_TEXT_BYTES {
+        return Err(CoreError::InvalidFriendCard(
+            "shared friend text is too large".to_string(),
+        ));
+    }
     let trimmed = text.trim();
     let extracted;
     let candidate = if trimmed.starts_with(FRIEND_LINK_PREFIX) {
@@ -196,6 +208,45 @@ pub fn parse_friend_text(text: String) -> Result<FriendCard, CoreError> {
     }
     parse_friend_card(candidate.to_string())
         .map_err(|_| CoreError::InvalidFriendCard("not a CruiseMesh friend card".to_string()))
+}
+
+fn validate_friend_card(card: &FriendCard) -> Result<(), CoreError> {
+    if card.name.len() > MAX_DISPLAY_NAME_BYTES {
+        return Err(CoreError::InvalidFriendCard(format!(
+            "display name exceeds {MAX_DISPLAY_NAME_BYTES} UTF-8 bytes"
+        )));
+    }
+    if card
+        .relay_url
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_RELAY_URL_BYTES)
+    {
+        return Err(CoreError::InvalidFriendCard(
+            "relay URL is too long".to_string(),
+        ));
+    }
+    if card
+        .relay_token
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_RELAY_TOKEN_BYTES)
+    {
+        return Err(CoreError::InvalidFriendCard(
+            "relay token is too long".to_string(),
+        ));
+    }
+    if card.sign_pk.len() != 32 {
+        return Err(CoreError::InvalidKeyLength {
+            expected: 32,
+            actual: card.sign_pk.len() as u32,
+        });
+    }
+    if card.agree_pk.len() != 32 {
+        return Err(CoreError::InvalidKeyLength {
+            expected: 32,
+            actual: card.agree_pk.len() as u32,
+        });
+    }
+    Ok(())
 }
 
 /// Small nautical/travel-themed wordlist for fingerprint phrases. Not
@@ -288,7 +339,8 @@ mod tests {
             id.clone(),
             Some("https://relay.example".to_string()),
             Some("family-token".to_string()),
-        );
+        )
+        .unwrap();
         let card = parse_friend_card(json).expect("valid card");
         assert_eq!(card.name, "Dave");
         assert_eq!(card.sign_pk, id.sign_pk);
@@ -301,8 +353,8 @@ mod tests {
     #[test]
     fn friend_link_round_trips() {
         let id = generate_identity();
-        let json = make_friend_card("Dave".to_string(), id.clone(), None, None);
-        let link = make_friend_link(json);
+        let json = make_friend_card("Dave".to_string(), id.clone(), None, None).unwrap();
+        let link = make_friend_link(json).unwrap();
         assert!(link.starts_with(FRIEND_LINK_PREFIX));
         let card = parse_friend_text(link).expect("valid link");
         assert_eq!(friend_card_user_id(card), id.user_id);
@@ -311,7 +363,7 @@ mod tests {
     #[test]
     fn parse_friend_text_accepts_raw_json_and_whitespace() {
         let id = generate_identity();
-        let json = make_friend_card("Dave".to_string(), id.clone(), None, None);
+        let json = make_friend_card("Dave".to_string(), id.clone(), None, None).unwrap();
         let card = parse_friend_text(format!("\n  {json} \t")).expect("valid raw json");
         assert_eq!(friend_card_user_id(card), id.user_id);
     }
@@ -324,8 +376,9 @@ mod tests {
             id.clone(),
             Some("https://relay.example".to_string()),
             Some("token".to_string()),
-        );
-        let link = make_friend_link(json);
+        )
+        .unwrap();
+        let link = make_friend_link(json).unwrap();
         let wrapped = format!("  {}\n{}\t  ", &link[..24], &link[24..]);
         let card = parse_friend_text(wrapped).expect("valid wrapped link");
         assert_eq!(friend_card_user_id(card.clone()), id.user_id);
@@ -336,8 +389,8 @@ mod tests {
     #[test]
     fn parse_friend_text_extracts_link_from_shared_prose() {
         let identity = generate_identity();
-        let json = make_friend_card("Alice".to_string(), identity, None, None);
-        let link = make_friend_link(json);
+        let json = make_friend_card("Alice".to_string(), identity, None, None).unwrap();
+        let link = make_friend_link(json).unwrap();
         let card = parse_friend_text(format!("Add me on CruiseMesh: {link}. Thanks!"))
             .expect("embedded link");
         assert_eq!(card.name, "Alice");
@@ -353,6 +406,32 @@ mod tests {
     fn parse_friend_text_rejects_unknown_prefix() {
         let err = parse_friend_text("CMFRIEND2:abc".to_string()).unwrap_err();
         assert!(matches!(err, CoreError::InvalidFriendCard(_)));
+    }
+
+    #[test]
+    fn friend_cards_reject_oversized_strings_before_sharing_or_import() {
+        let identity = generate_identity();
+        assert!(make_friend_card(
+            "x".repeat(MAX_DISPLAY_NAME_BYTES + 1),
+            identity.clone(),
+            None,
+            None,
+        )
+        .is_err());
+        assert!(make_friend_card(
+            "Alice".into(),
+            identity.clone(),
+            Some("x".repeat(MAX_RELAY_URL_BYTES + 1)),
+            None,
+        )
+        .is_err());
+        assert!(parse_friend_card("x".repeat(MAX_FRIEND_CARD_JSON_BYTES + 1)).is_err());
+        assert!(parse_friend_text("x".repeat(MAX_FRIEND_TEXT_BYTES + 1)).is_err());
+
+        let json = make_friend_card("Alice".into(), identity, None, None).unwrap();
+        let mut card: FriendCard = serde_json::from_str(&json).unwrap();
+        card.name = "x".repeat(MAX_DISPLAY_NAME_BYTES + 1);
+        assert!(parse_friend_card(serde_json::to_string(&card).unwrap()).is_err());
     }
 
     #[test]

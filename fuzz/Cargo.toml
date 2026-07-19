@@ -1,0 +1,44 @@
+[package]
+name = "cruisemesh-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cruisemesh-core = { path = "../core" }
+
+[[bin]]
+name = "protocol_decoders"
+path = "fuzz_targets/protocol_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_wire"
+path = "fuzz_targets/relay_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ble_reassembly"
+path = "fuzz_targets/ble_reassembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "noise_handshake"
+path = "fuzz_targets/noise_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+

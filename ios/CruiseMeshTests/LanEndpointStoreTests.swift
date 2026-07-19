@@ -4,7 +4,7 @@ import XCTest
 final class LanEndpointStoreTests: XCTestCase {
     func testEndpointContentRoundTripsThroughSharedCoreEncoding() throws {
         let original = LanEndpointContent(
-            instanceToken: Data([1, 2, 3, 4]),
+            instanceToken: Data([1, 2, 3, 4, 5, 6, 7, 8]),
             networkId: Data("network-a".utf8),
             host: "10.0.0.7",
             port: 45_892,
@@ -45,7 +45,7 @@ final class LanEndpointStoreTests: XCTestCase {
         let userId = uuidData()
         let networkId = "test-\(UUID().uuidString)"
         let endpoint = LanManualEndpoint(host: "10.0.0.9", port: 45_892)
-        let token = Data([5, 6, 7, 8])
+        let token = Data([1, 2, 3, 4, 5, 6, 7, 8])
 
         XCTAssertTrue(LanCapabilityStore.shouldSendEndpoint(
             userId: userId,
