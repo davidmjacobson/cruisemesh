@@ -2,6 +2,6 @@
 <paths>
     <cache-path name="camera" path="camera/" />
     <cache-path name="voice" path="voice/" />
-    <!-- Debug-only on-device log capture (DebugFileLog), shared via the sheet. -->
+    <!-- On-device log capture (DebugFileLog; opt-in outside debug builds), shared via the sheet. -->
     <external-files-path name="logs" path="logs/" />
 </paths>

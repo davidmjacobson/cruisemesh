@@ -8,6 +8,7 @@ import android.content.res.Configuration
 import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -25,6 +26,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -220,21 +222,43 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                 modifier = Modifier.padding(top = 4.dp),
             )
 
-            if (DebugFileLog.isEnabled(context)) {
-                Spacer(modifier = Modifier.height(28.dp))
-                Text(stringResource(R.string.ui_diagnostics), style = MaterialTheme.typography.titleMedium)
-                Button(
-                    onClick = {
-                        val intent = DebugFileLog.shareIntent(context)
-                        if (intent != null) {
-                            context.startActivity(Intent.createChooser(intent, "Share debug log"))
-                        } else {
-                            Toast.makeText(context, "No log captured yet", Toast.LENGTH_SHORT).show()
-                        }
-                    },
+            Spacer(modifier = Modifier.height(28.dp))
+            Text(stringResource(R.string.ui_diagnostics), style = MaterialTheme.typography.titleMedium)
+            if (!DebugFileLog.isDebuggableBuild(context)) {
+                var diagnosticLogging by remember { mutableStateOf(DebugFileLog.isOptedIn(context)) }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                ) { Text(stringResource(R.string.ui_share_debug_log)) }
+                ) {
+                    Text(
+                        stringResource(R.string.ui_diagnostic_logging),
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = diagnosticLogging,
+                        onCheckedChange = {
+                            diagnosticLogging = it
+                            DebugFileLog.setOptIn(context, it)
+                        },
+                    )
+                }
             }
+            Text(stringResource(R.string.ui_diagnostic_logging_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            Button(
+                onClick = {
+                    val intent = DebugFileLog.shareIntent(context)
+                    if (intent != null) {
+                        context.startActivity(Intent.createChooser(intent, "Share debug log"))
+                    } else {
+                        Toast.makeText(context, "No log captured yet", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            ) { Text(stringResource(R.string.ui_share_debug_log)) }
         }
     }
 
