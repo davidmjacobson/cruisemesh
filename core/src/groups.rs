@@ -18,6 +18,9 @@ const GROUP_KEY_LEN: usize = 32;
 const GROUP_ENVELOPE_VERSION: u8 = 1;
 const GROUP_NONCE_LEN: usize = 24;
 const GROUP_METADATA_VERSION: u8 = 1;
+const USER_ID_LEN: usize = 16;
+const MAX_GROUP_MEMBERS: usize = 64;
+const MAX_GROUP_NAME_BYTES: usize = 128;
 
 /// A persisted/imported group: id, display name, full member list, and the
 /// current symmetric group key.
@@ -47,6 +50,8 @@ pub struct GroupMetadataUpdate {
 /// (deduplicated, byte-sorted user ids).
 #[uniffi::export]
 pub fn create_group(name: String, member_user_ids: Vec<Vec<u8>>) -> Result<Group, CoreError> {
+    validate_group_name(&name)?;
+    validate_member_user_ids(&member_user_ids)?;
     let mut id = vec![0u8; GROUP_ID_LEN];
     let mut key = vec![0u8; GROUP_KEY_LEN];
     OsRng.fill_bytes(&mut id);
@@ -66,7 +71,8 @@ pub fn create_group(name: String, member_user_ids: Vec<Vec<u8>>) -> Result<Group
 /// DESIGN.md §6.5: generate a new key and re-invite the remaining members.
 #[uniffi::export]
 pub fn rotate_group(group: Group, member_user_ids: Vec<Vec<u8>>) -> Result<Group, CoreError> {
-    validate_group_id(&group.id)?;
+    validate_group(&group)?;
+    validate_member_user_ids(&member_user_ids)?;
     let mut key = vec![0u8; GROUP_KEY_LEN];
     OsRng.fill_bytes(&mut key);
     Ok(Group {
@@ -118,10 +124,16 @@ pub fn decode_group_invite_content(bytes: Vec<u8>) -> Result<Group, CoreError> {
     let name_bytes = cursor.take_bytes16()?;
     let name = String::from_utf8(name_bytes)
         .map_err(|e| CoreError::Malformed(format!("group invite name is not UTF-8: {e}")))?;
+    validate_group_name(&name)?;
     let member_count = cursor.take_u16()? as usize;
+    if member_count > MAX_GROUP_MEMBERS {
+        return Err(CoreError::Malformed(format!(
+            "group has too many members: {member_count}"
+        )));
+    }
     let mut member_user_ids = Vec::with_capacity(member_count.min(bytes.len()));
     for _ in 0..member_count {
-        member_user_ids.push(cursor.take_bytes16()?);
+        member_user_ids.push(cursor.take_user_id("group member UserID")?);
     }
     cursor.finish()?;
     let group = Group {
@@ -156,11 +168,8 @@ pub fn create_group_metadata_update(
         ));
     }
     let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err(CoreError::Malformed(
-            "group name must not be empty".to_string(),
-        ));
-    }
+    validate_group_name(&name)?;
+    validate_member_user_ids(&member_user_ids)?;
     let member_user_ids = canonicalize_members(member_user_ids);
     if !group
         .member_user_ids
@@ -218,6 +227,7 @@ pub fn apply_group_metadata_update(
     let mut merged_members = group.member_user_ids.clone();
     merged_members.extend(update.member_user_ids.clone());
     merged_members = canonicalize_members(merged_members);
+    validate_member_user_ids(&merged_members)?;
     let membership_changed = merged_members != group.member_user_ids;
     let name_wins = (update.revision, update.changed_by.as_slice())
         > (
@@ -276,13 +286,19 @@ pub fn decode_group_metadata_update(bytes: Vec<u8>) -> Result<GroupMetadataUpdat
     }
     let group_id = cursor.take(GROUP_ID_LEN)?.to_vec();
     let revision = cursor.take_u64()?;
-    let changed_by = cursor.take_bytes16()?;
+    let changed_by = cursor.take_user_id("group metadata changed_by")?;
     let name = String::from_utf8(cursor.take_bytes16()?)
         .map_err(|e| CoreError::Malformed(format!("group metadata name is not UTF-8: {e}")))?;
+    validate_group_name(&name)?;
     let count = cursor.take_u16()? as usize;
+    if count > MAX_GROUP_MEMBERS {
+        return Err(CoreError::Malformed(format!(
+            "group metadata has too many members: {count}"
+        )));
+    }
     let mut member_user_ids = Vec::with_capacity(count.min(bytes.len()));
     for _ in 0..count {
-        member_user_ids.push(cursor.take_bytes16()?);
+        member_user_ids.push(cursor.take_user_id("group member UserID")?);
     }
     cursor.finish()?;
     let update = GroupMetadataUpdate {
@@ -352,8 +368,13 @@ pub fn open_group_message(
 
 pub(crate) fn validate_group(group: &Group) -> Result<(), CoreError> {
     validate_group_id(&group.id)?;
+    validate_group_name(&group.name)?;
+    validate_member_user_ids(&group.member_user_ids)?;
     if group.key.len() != GROUP_KEY_LEN {
         return Err(key_len_err(GROUP_KEY_LEN as u32, group.key.len()));
+    }
+    if !group.metadata_changed_by.is_empty() {
+        validate_user_id(&group.metadata_changed_by, "group metadata changed_by")?;
     }
     Ok(())
 }
@@ -365,30 +386,44 @@ fn validate_group_metadata_update(update: &GroupMetadataUpdate) -> Result<(), Co
             "group metadata revision must be positive".to_string(),
         ));
     }
-    if update.changed_by.is_empty() {
+    validate_user_id(&update.changed_by, "group metadata changed_by")?;
+    validate_group_name(&update.name)?;
+    validate_member_user_ids(&update.member_user_ids)?;
+    Ok(())
+}
+
+fn validate_group_name(name: &str) -> Result<(), CoreError> {
+    if name.trim().is_empty() {
         return Err(CoreError::Malformed(
-            "group metadata changed_by must not be empty".to_string(),
+            "group name must not be empty".to_string(),
         ));
     }
-    if update.name.trim().is_empty() {
-        return Err(CoreError::Malformed(
-            "group metadata name must not be empty".to_string(),
-        ));
+    if name.len() > MAX_GROUP_NAME_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "group name exceeds {MAX_GROUP_NAME_BYTES} UTF-8 bytes"
+        )));
     }
-    if update.name.len() > u16::MAX as usize || update.changed_by.len() > u16::MAX as usize {
-        return Err(CoreError::Malformed(
-            "group metadata field is too large".to_string(),
-        ));
+    Ok(())
+}
+
+fn validate_member_user_ids(member_user_ids: &[Vec<u8>]) -> Result<(), CoreError> {
+    if member_user_ids.len() > MAX_GROUP_MEMBERS {
+        return Err(CoreError::Malformed(format!(
+            "group exceeds {MAX_GROUP_MEMBERS} members"
+        )));
     }
-    if update.member_user_ids.len() > u16::MAX as usize
-        || update
-            .member_user_ids
-            .iter()
-            .any(|member| member.len() > u16::MAX as usize)
-    {
-        return Err(CoreError::Malformed(
-            "group metadata member list is too large".to_string(),
-        ));
+    for member in member_user_ids {
+        validate_user_id(member, "group member UserID")?;
+    }
+    Ok(())
+}
+
+fn validate_user_id(user_id: &[u8], label: &str) -> Result<(), CoreError> {
+    if user_id.len() != USER_ID_LEN {
+        return Err(CoreError::Malformed(format!(
+            "{label} must be {USER_ID_LEN} bytes, got {}",
+            user_id.len()
+        )));
     }
     Ok(())
 }
@@ -467,6 +502,12 @@ impl<'a> Cursor<'a> {
         Ok(self.take(len)?.to_vec())
     }
 
+    fn take_user_id(&mut self, label: &str) -> Result<Vec<u8>, CoreError> {
+        let user_id = self.take_bytes16()?;
+        validate_user_id(&user_id, label)?;
+        Ok(user_id)
+    }
+
     fn finish(self) -> Result<(), CoreError> {
         if self.pos != self.data.len() {
             return Err(CoreError::Malformed(format!(
@@ -484,11 +525,15 @@ mod tests {
 
     use super::*;
 
+    fn user(byte: u8) -> Vec<u8> {
+        vec![byte; USER_ID_LEN]
+    }
+
     fn sample_group() -> Group {
         Group {
             id: vec![0x11; GROUP_ID_LEN],
             name: "Bridge Crew".to_string(),
-            member_user_ids: vec![b"carol".to_vec(), b"alice".to_vec(), b"alice".to_vec()],
+            member_user_ids: vec![user(3), user(1), user(1)],
             key: vec![0x22; GROUP_KEY_LEN],
             metadata_revision: 0,
             metadata_changed_by: Vec::new(),
@@ -497,31 +542,20 @@ mod tests {
 
     #[test]
     fn create_group_generates_lengths_and_canonical_members() {
-        let group = create_group(
-            "Family".to_string(),
-            vec![b"bob".to_vec(), b"alice".to_vec(), b"alice".to_vec()],
-        )
-        .unwrap();
+        let group = create_group("Family".to_string(), vec![user(2), user(1), user(1)]).unwrap();
         assert_eq!(group.id.len(), GROUP_ID_LEN);
         assert_eq!(group.key.len(), GROUP_KEY_LEN);
-        assert_eq!(
-            group.member_user_ids,
-            vec![b"alice".to_vec(), b"bob".to_vec()]
-        );
+        assert_eq!(group.member_user_ids, vec![user(1), user(2)]);
     }
 
     #[test]
     fn rotate_group_preserves_id_and_name_but_changes_key() {
         let group = sample_group();
-        let rotated =
-            rotate_group(group.clone(), vec![b"alice".to_vec(), b"dave".to_vec()]).unwrap();
+        let rotated = rotate_group(group.clone(), vec![user(1), user(4)]).unwrap();
         assert_eq!(rotated.id, group.id);
         assert_eq!(rotated.name, group.name);
         assert_ne!(rotated.key, group.key);
-        assert_eq!(
-            rotated.member_user_ids,
-            vec![b"alice".to_vec(), b"dave".to_vec()]
-        );
+        assert_eq!(rotated.member_user_ids, vec![user(1), user(4)]);
     }
 
     #[test]
@@ -533,7 +567,7 @@ mod tests {
             Group {
                 id: vec![0x11; GROUP_ID_LEN],
                 name: "Bridge Crew".to_string(),
-                member_user_ids: vec![b"alice".to_vec(), b"carol".to_vec()],
+                member_user_ids: vec![user(1), user(3)],
                 key: vec![0x22; GROUP_KEY_LEN],
                 metadata_revision: 0,
                 metadata_changed_by: Vec::new(),
@@ -546,19 +580,19 @@ mod tests {
         let group = sample_group();
         let update = create_group_metadata_update(
             group.clone(),
-            b"alice".to_vec(),
+            user(1),
             "Night Watch".to_string(),
             group.member_user_ids.clone(),
         )
         .unwrap();
         let decoded =
             decode_group_metadata_update(encode_group_metadata_update(update).unwrap()).unwrap();
-        let applied = apply_group_metadata_update(group, decoded, b"alice".to_vec())
+        let applied = apply_group_metadata_update(group, decoded, user(1))
             .unwrap()
             .unwrap();
         assert_eq!(applied.name, "Night Watch");
         assert_eq!(applied.metadata_revision, 1);
-        assert_eq!(applied.metadata_changed_by, b"alice".to_vec());
+        assert_eq!(applied.metadata_changed_by, user(1));
     }
 
     #[test]
@@ -566,18 +600,15 @@ mod tests {
         let group = sample_group();
         assert!(create_group_metadata_update(
             group.clone(),
-            b"mallory".to_vec(),
+            user(9),
             "Nope".to_string(),
             group.member_user_ids.clone(),
         )
         .is_err());
-        assert!(create_group_metadata_update(
-            group,
-            b"alice".to_vec(),
-            "Nope".to_string(),
-            vec![b"alice".to_vec()],
-        )
-        .is_err());
+        assert!(
+            create_group_metadata_update(group, user(1), "Nope".to_string(), vec![user(1)],)
+                .is_err()
+        );
     }
 
     #[test]
@@ -585,34 +616,34 @@ mod tests {
         let group = sample_group();
         let alice_update = create_group_metadata_update(
             group.clone(),
-            b"alice".to_vec(),
+            user(1),
             "Alice name".to_string(),
-            vec![b"alice".to_vec(), b"carol".to_vec(), b"dave".to_vec()],
+            vec![user(1), user(3), user(4)],
         )
         .unwrap();
         let carol_update = create_group_metadata_update(
             group.clone(),
-            b"carol".to_vec(),
+            user(3),
             "Carol name".to_string(),
-            vec![b"alice".to_vec(), b"carol".to_vec(), b"erin".to_vec()],
+            vec![user(1), user(3), user(5)],
         )
         .unwrap();
 
         let a_then_c = apply_group_metadata_update(
-            apply_group_metadata_update(group.clone(), alice_update.clone(), b"alice".to_vec())
+            apply_group_metadata_update(group.clone(), alice_update.clone(), user(1))
                 .unwrap()
                 .unwrap(),
             carol_update.clone(),
-            b"carol".to_vec(),
+            user(3),
         )
         .unwrap()
         .unwrap();
         let c_then_a = apply_group_metadata_update(
-            apply_group_metadata_update(group, carol_update, b"carol".to_vec())
+            apply_group_metadata_update(group, carol_update, user(3))
                 .unwrap()
                 .unwrap(),
             alice_update,
-            b"alice".to_vec(),
+            user(1),
         )
         .unwrap()
         .unwrap();
@@ -621,12 +652,7 @@ mod tests {
         assert_eq!(a_then_c.name, "Carol name");
         assert_eq!(
             a_then_c.member_user_ids,
-            vec![
-                b"alice".to_vec(),
-                b"carol".to_vec(),
-                b"dave".to_vec(),
-                b"erin".to_vec(),
-            ]
+            vec![user(1), user(3), user(4), user(5),]
         );
     }
 
@@ -634,6 +660,31 @@ mod tests {
     fn group_invite_decode_rejects_truncated_input() {
         let err = decode_group_invite_content(vec![0xAA; GROUP_ID_LEN]).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn group_shapes_are_bounded_before_canonicalization() {
+        assert!(create_group("Family".into(), vec![vec![1; USER_ID_LEN - 1]]).is_err());
+        assert!(create_group(
+            "Family".into(),
+            vec![vec![1; USER_ID_LEN]; MAX_GROUP_MEMBERS + 1],
+        )
+        .is_err());
+        assert!(create_group("x".repeat(MAX_GROUP_NAME_BYTES + 1), vec![user(1)],).is_err());
+
+        let mut invite = vec![0x11; GROUP_ID_LEN];
+        invite.extend_from_slice(&vec![0x22; GROUP_KEY_LEN]);
+        write_bytes16(&mut invite, b"Family");
+        invite.extend_from_slice(&((MAX_GROUP_MEMBERS + 1) as u16).to_be_bytes());
+        assert!(decode_group_invite_content(invite).is_err());
+
+        let mut metadata = vec![GROUP_METADATA_VERSION];
+        metadata.extend_from_slice(&vec![0x11; GROUP_ID_LEN]);
+        metadata.extend_from_slice(&1u64.to_be_bytes());
+        write_bytes16(&mut metadata, &user(1));
+        write_bytes16(&mut metadata, b"Family");
+        metadata.extend_from_slice(&((MAX_GROUP_MEMBERS + 1) as u16).to_be_bytes());
+        assert!(decode_group_metadata_update(metadata).is_err());
     }
 
     #[test]

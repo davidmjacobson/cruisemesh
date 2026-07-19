@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.friending.encodeQrBitmap
 import com.cruisemesh.app.mesh.LanManualEndpoint
+import com.cruisemesh.app.mesh.LanSweepDisplayState
 import com.cruisemesh.app.mesh.LanTransportDiagnostics
 import com.cruisemesh.app.mesh.lanEndpointLink
 import com.cruisemesh.app.mesh.parseLanManualEndpoint
@@ -137,11 +138,20 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
             lanStatus.probeStatus?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
             }
-            lanStatus.sweepVerdict?.let {
+            val sweepStatus = when (lanStatus.sweepDisplayState) {
+                LanSweepDisplayState.NONE -> null
+                LanSweepDisplayState.CHECKING ->
+                    R.string.ui_checking_this_network to MaterialTheme.colorScheme.onSurfaceVariant
+                LanSweepDisplayState.ISOLATION_SUSPECTED ->
+                    R.string.ui_wifi_appears_to_block_phone_to_phone_traffic to MaterialTheme.colorScheme.error
+                LanSweepDisplayState.BLOCKED_BY_POLICY ->
+                    R.string.ui_local_wi_fi_probes_were_denied to MaterialTheme.colorScheme.error
+            }
+            sweepStatus?.let { (messageId, color) ->
                 Text(
-                    it,
+                    stringResource(messageId),
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
+                    color = color,
                     modifier = Modifier.padding(top = 4.dp),
                 )
             }

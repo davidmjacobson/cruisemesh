@@ -74,7 +74,7 @@ pub struct ProfileSyncContent {
     pub avatar: Vec<u8>,   // empty = photo removed
 }
 
-#[uniffi::export] pub fn encode_profile_sync_content(content: ProfileSyncContent) -> Vec<u8>;
+#[uniffi::export] pub fn encode_profile_sync_content(content: ProfileSyncContent) -> Result<Vec<u8>, CoreError>;
 #[uniffi::export] pub fn decode_profile_sync_content(bytes: Vec<u8>) -> Result<ProfileSyncContent, CoreError>;
 ```
 

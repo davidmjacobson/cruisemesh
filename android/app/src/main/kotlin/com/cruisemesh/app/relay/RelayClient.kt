@@ -5,7 +5,9 @@ import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.CoreGroupFanoutRow
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.OutgoingReceiptEnvelope
+import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
@@ -16,6 +18,7 @@ import uniffi.cruisemesh_core.relayDecodePresencePage
 import uniffi.cruisemesh_core.relayEncodeAckRequest
 import uniffi.cruisemesh_core.relayEncodePostEnvelope
 import uniffi.cruisemesh_core.relayEncodePresenceRequest
+import uniffi.cruisemesh_core.relayMaxResponseBytes
 
 private const val CONNECT_TIMEOUT_MS = 10_000
 private const val READ_TIMEOUT_MS = 10_000
@@ -112,7 +115,7 @@ object RelayClient {
         val url = buildUrl(config.relayUrl, relayBuildFetchPath(hints, afterId, limit.toUInt()))
         val connection = openConnection(url, "GET", config, network)
         return connection.useJsonResponse { body ->
-            val response = relayDecodeFetchPage(body.toByteArray(StandardCharsets.UTF_8))
+            val response = relayDecodeFetchPage(body)
             RelayFetchPage(
                 envelopes = response.envelopes.map { item ->
                     RelayFetchedEnvelope(
@@ -147,7 +150,7 @@ object RelayClient {
         val connection = openConnection(buildUrl(config.relayUrl, "/presence"), "POST", config, network)
         connection.writeJson(String(body, StandardCharsets.UTF_8))
         return connection.useJsonResponse { responseBody ->
-            val response = relayDecodePresencePage(responseBody.toByteArray(StandardCharsets.UTF_8))
+            val response = relayDecodePresencePage(responseBody)
             RelayPresencePage(
                 nowMs = response.nowMs,
                 presence = response.presence.map { item ->
@@ -172,7 +175,7 @@ object RelayClient {
         val body = relayEncodePostEnvelope(msgId, hopTtl, recipientHint, sealed, expiryMs)
         val connection = openConnection(buildUrl(config.relayUrl, "/envelopes"), "POST", config, network)
         connection.writeJson(String(body, StandardCharsets.UTF_8))
-        return connection.useJsonResponse { relayDecodePostResponse(it.toByteArray(StandardCharsets.UTF_8)) }
+        return connection.useJsonResponse { relayDecodePostResponse(it) }
     }
 
     /**
@@ -201,13 +204,18 @@ object RelayClient {
         outputStream.use { it.write(body.toByteArray(StandardCharsets.UTF_8)) }
     }
 
-    private inline fun <T> HttpURLConnection.useJsonResponse(block: (String) -> T): T {
+    private inline fun <T> HttpURLConnection.useJsonResponse(block: (ByteArray) -> T): T {
         return try {
             val code = responseCode
+            val maxBytes = relayMaxResponseBytes().toInt()
+            if (contentLengthLong > maxBytes) {
+                throw IOException("Relay response exceeds $maxBytes bytes")
+            }
             val stream = if (code in 200..299) inputStream else errorStream
-            val body = stream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() }.orEmpty()
+            val body = stream?.use { it.readBounded(maxBytes) } ?: ByteArray(0)
             if (code !in 200..299) {
-                throw IOException("Relay request failed ($code): $body")
+                val preview = String(body, 0, minOf(body.size, 2_048), StandardCharsets.UTF_8)
+                throw IOException("Relay request failed ($code): $preview")
             }
             block(body)
         } finally {
@@ -219,4 +227,22 @@ object RelayClient {
         return "${normalizeRelayUrl(baseUrl)}$pathAndQuery"
     }
 
+}
+
+internal fun InputStream.readBounded(maxBytes: Int): ByteArray {
+    require(maxBytes >= 0) { "maxBytes must be non-negative" }
+    val output = ByteArrayOutputStream(minOf(maxBytes, 8 * 1024))
+    val buffer = ByteArray(8 * 1024)
+    var total = 0
+    while (true) {
+        val read = read(buffer)
+        if (read < 0) break
+        if (read == 0) continue
+        if (read > maxBytes - total) {
+            throw IOException("Relay response exceeds $maxBytes bytes")
+        }
+        output.write(buffer, 0, read)
+        total += read
+    }
+    return output.toByteArray()
 }

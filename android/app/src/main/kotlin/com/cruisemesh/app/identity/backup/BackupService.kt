@@ -2,6 +2,7 @@ package com.cruisemesh.app.identity.backup
 
 import android.content.Context
 import android.net.Uri
+import com.cruisemesh.app.R
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.OnboardingStore
 import com.cruisemesh.app.identity.ProfilePhotoStore
@@ -10,6 +11,10 @@ import com.cruisemesh.app.identity.decodeIdentity
 import com.cruisemesh.app.identity.encodeIdentity
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.AppStore
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
+import uniffi.cruisemesh_core.backupMaxFileBytes
 
 /**
  * Android glue for account backup/restore (LOCAL_BACKUP_RESTORE.md §6/§7):
@@ -18,11 +23,9 @@ import com.cruisemesh.app.AppStore
  * Access Framework. All calls do KDF + crypto + file I/O and MUST run off the
  * main thread (the callers use a background dispatcher).
  *
- * The message-store snapshot is a plain copy of `cruisemesh.sqlite`. The core
- * opens it in SQLite's default rollback-journal mode, so between (Mutex-guarded,
- * infrequent) write transactions the single file is self-contained and a hot
- * copy is consistent. The durable, always-atomic version is a core
- * `MessageStore.backup_to` (VACUUM INTO); see the spec's follow-up checklist.
+ * The message-store snapshot comes from the core's transactionally consistent
+ * `MessageStore.backup_to` primitive. The core requires a new absolute path so
+ * a snapshot request cannot overwrite another local file.
  */
 object BackupService {
 
@@ -36,7 +39,7 @@ object BackupService {
         snapshotFile.delete()
         val sqliteBytes = try {
             AppStore.get(context).backupTo(snapshotFile.absolutePath)
-            snapshotFile.readBytes()
+            snapshotFile.inputStream().use { input -> readBackupBytes(context, input) }
         } finally {
             snapshotFile.delete()
         }
@@ -100,10 +103,19 @@ object BackupService {
         OnboardingStore.markCompleted(context)
     }
 
-    /** Read all bytes of a SAF document (the file the user picked to restore from). */
-    fun readBytes(context: Context, uri: Uri): ByteArray =
-        context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: throw IllegalStateException("Could not open backup file")
+    /** Read a SAF document without ever accumulating more than the core's backup cap. */
+    fun readBytes(context: Context, uri: Uri): ByteArray {
+        val maxBytes = backupReadLimit()
+        val declaredLength = context.contentResolver
+            .openAssetFileDescriptor(uri, "r")
+            ?.use { it.declaredLength }
+        if (declaredLength != null && declaredLength > maxBytes) {
+            throw IOException(context.getString(R.string.ui_this_backup_file_is_too_large))
+        }
+        return context.contentResolver.openInputStream(uri)?.use { input ->
+            readBackupBytes(context, input)
+        } ?: throw IllegalStateException("Could not open backup file")
+    }
 
     /** Write bytes to a SAF document (the destination the user chose to save the backup). */
     fun writeBytes(context: Context, uri: Uri, bytes: ByteArray) {
@@ -128,4 +140,34 @@ object BackupService {
             info.versionCode
         }
     }
+
+    private fun readBackupBytes(context: Context, input: InputStream): ByteArray = try {
+        input.readBackupBytes(backupReadLimit())
+    } catch (_: BackupFileTooLargeException) {
+        throw IOException(context.getString(R.string.ui_this_backup_file_is_too_large))
+    }
+
+    private fun backupReadLimit(): Int {
+        val limit = backupMaxFileBytes()
+        check(limit <= Int.MAX_VALUE.toULong())
+        return limit.toInt()
+    }
+}
+
+internal class BackupFileTooLargeException : IOException()
+
+internal fun InputStream.readBackupBytes(maxBytes: Int): ByteArray {
+    require(maxBytes >= 0)
+    val output = ByteArrayOutputStream(minOf(maxBytes, 64 * 1024))
+    val buffer = ByteArray(64 * 1024)
+    var total = 0
+    while (true) {
+        val read = read(buffer)
+        if (read < 0) break
+        if (read == 0) continue
+        if (read > maxBytes - total) throw BackupFileTooLargeException()
+        output.write(buffer, 0, read)
+        total += read
+    }
+    return output.toByteArray()
 }

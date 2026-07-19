@@ -31,8 +31,8 @@ android {
         minSdk = 26
         // Play Console requires new releases to target API 35+.
         targetSdk = 35
-        versionCode = 1784336934
-        versionName = "0.1.1-ui"
+        versionCode = 1784406677
+        versionName = "1.0.0"
     }
 
     signingConfigs {

@@ -32,7 +32,7 @@ enum MeshDefaults {
     // now lives in core (`engine.rs::DIGEST_ADVERTISED_MSG_IDS_LIMIT`,
     // behind `store.coreDigestAdvertisedMsgIds()`), so both platforms share
     // one source of truth instead of two constants that could drift.
-    static let relayBatchLimit: UInt64 = 128
+    static let relayStoreBatchLimit: UInt64 = 128
     static let ownOutboundSprayBudgetBytes: UInt64 = 256 * 1024
     static let ownReceiptSprayBudgetBytes: UInt64 = 64 * 1024
     static let relayPollIntervalNs: UInt64 = 60_000_000_000

@@ -32,7 +32,7 @@ pub fn encode_attachment_payload(payload: CoreAttachmentPayload) -> Result<Vec<u
     if payload.duration_ms < 0 || payload.duration_ms > u32::MAX as i64 {
         return Err(CoreError::Malformed("invalid attachment duration".into()));
     }
-    if payload.blob.len() > u32::MAX as usize {
+    if payload.blob.len() > ATTACHMENT_MAX_BLOB_BYTES {
         return Err(CoreError::Malformed("attachment blob is too large".into()));
     }
     let mime = payload.mime_type.as_bytes();
@@ -69,7 +69,7 @@ pub fn decode_attachment_payload(bytes: Vec<u8>) -> Option<CoreAttachmentPayload
     let mime_type = cursor.read_string16(None)?;
     let duration_ms = cursor.read_u32()? as i64;
     let blob_len = cursor.read_u32()? as usize;
-    if blob_len > ATTACHMENT_MAX_BLOB_BYTES * 2 {
+    if blob_len > ATTACHMENT_MAX_BLOB_BYTES {
         return None;
     }
     let blob = cursor.read_exact(blob_len)?.to_vec();
@@ -218,14 +218,23 @@ mod tests {
     #[test]
     fn attachment_rejects_invalid_or_oversized_input() {
         assert!(decode_attachment_payload(vec![]).is_none());
-        let payload = CoreAttachmentPayload {
+        let mut payload = CoreAttachmentPayload {
             media_type: AttachmentMediaType::Image,
             mime_type: "image/jpeg".into(),
             duration_ms: -1,
             blob: vec![],
             caption: String::new(),
         };
+        assert!(encode_attachment_payload(payload.clone()).is_err());
+
+        payload.duration_ms = 0;
+        payload.blob = vec![0; ATTACHMENT_MAX_BLOB_BYTES + 1];
         assert!(encode_attachment_payload(payload).is_err());
+
+        let mut encoded = vec![ATTACHMENT_WIRE_VERSION, 1, 0, 0];
+        encoded.extend_from_slice(&0u32.to_be_bytes());
+        encoded.extend_from_slice(&((ATTACHMENT_MAX_BLOB_BYTES + 1) as u32).to_be_bytes());
+        assert!(decode_attachment_payload(encoded).is_none());
     }
 
     #[test]

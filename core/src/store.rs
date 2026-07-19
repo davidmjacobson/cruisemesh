@@ -103,6 +103,8 @@
 //! D2 -- actually removing a carried envelope once a peer's digest proves
 //! they have it -- is `engine.rs::core_confirm_carried_deliveries`.
 
+use blake2::digest::{Update, VariableOutput};
+use blake2::Blake2bVar;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -114,6 +116,8 @@ use crate::{
 };
 
 const MESSAGE_ID_LEN: usize = 16;
+const CARRIED_CONTENT_DIGEST_LEN: usize = 32;
+const DEFAULT_TOTAL_CARRY_BUDGET_BYTES: i64 = 64 * 1024 * 1024;
 
 /// One stored message body (DESIGN.md §7.1). `timestamp` is milliseconds
 /// since the Unix epoch; `kind` matches the DESIGN.md §7.1 `kind` byte
@@ -279,7 +283,7 @@ impl MessageStore {
     /// `":memory:"` for an ephemeral in-process store.
     #[uniffi::constructor]
     pub fn open(path: String) -> Result<Self, CoreError> {
-        let conn = Connection::open(&path).map_err(store_err)?;
+        let mut conn = Connection::open(&path).map_err(store_err)?;
         conn.execute_batch(SCHEMA).map_err(store_err)?;
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
         ensure_contact_column(&conn, "avatar", "BLOB")?;
@@ -294,6 +298,14 @@ impl MessageStore {
             "from_relay",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(&conn, "carried_envelopes", "content_digest", "BLOB")?;
+        migrate_carried_content_digests(&mut conn)?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_carried_content_digest
+             ON carried_envelopes(content_digest)",
+            [],
+        )
+        .map_err(store_err)?;
         ensure_column(&conn, "messages", "arrival_transport", "INTEGER")?;
         ensure_column(&conn, "messages", "hops_taken", "INTEGER")?;
         ensure_column(&conn, "messages", "received_at", "INTEGER")?;
@@ -360,11 +372,31 @@ impl MessageStore {
     /// The destination must not already exist; callers should use a unique
     /// temporary path and remove it after reading the backup bytes.
     pub fn backup_to(&self, destination: String) -> Result<(), CoreError> {
-        if destination.trim().is_empty() {
-            return Err(CoreError::Store("backup destination is empty".into()));
+        let destination = std::path::Path::new(destination.trim());
+        if !destination.is_absolute() {
+            return Err(CoreError::Store(
+                "backup destination must be an absolute path".into(),
+            ));
         }
-        let conn = self.conn.lock().unwrap();
-        conn.execute("VACUUM INTO ?1", params![destination])
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => return Err(CoreError::Store("backup destination already exists".into())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CoreError::Store(format!(
+                    "cannot inspect backup destination: {error}"
+                )))
+            }
+        }
+        if !destination.parent().is_some_and(std::path::Path::is_dir) {
+            return Err(CoreError::Store(
+                "backup destination parent is not a directory".into(),
+            ));
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| CoreError::Store("store lock is unavailable".into()))?;
+        conn.execute("VACUUM INTO ?1", params![destination.to_string_lossy()])
             .map_err(store_err)?;
         Ok(())
     }
@@ -428,6 +460,7 @@ mod incoming_message_reference {
         msg_id: Option<Vec<u8>>,
         reply_to_msg_id: Option<Vec<u8>>,
     ) -> Result<bool, CoreError> {
+        validate_stored_message(&message)?;
         let mut conn = store.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
 
@@ -604,6 +637,8 @@ mod outgoing_message_reference {
         reply_to_msg_id: Option<Vec<u8>>,
         queued_at_ms: i64,
     ) -> Result<bool, CoreError> {
+        validate_stored_message(&message)?;
+        validate_sqlite_u64("envelope lamport", envelope.lamport)?;
         let mut conn = store.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
         tx.execute(
@@ -1114,6 +1149,7 @@ impl MessageStore {
         envelope: OutgoingReceiptEnvelope,
         queued_at_ms: i64,
     ) -> Result<bool, CoreError> {
+        validate_receipt_watermark(envelope.receipt_type, envelope.through_lamport)?;
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
         let existing: Option<i64> = tx
@@ -1262,6 +1298,7 @@ impl MessageStore {
         receipt_type: u8,
         through_lamport: u64,
     ) -> Result<(), CoreError> {
+        validate_receipt_watermark(receipt_type, through_lamport)?;
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
             "INSERT INTO receipts (chat_id, sender_user_id, receipt_type, through_lamport)
@@ -1314,6 +1351,7 @@ impl MessageStore {
         receipt_type: u8,
         through_lamport: u64,
     ) -> Result<(), CoreError> {
+        validate_receipt_watermark(receipt_type, through_lamport)?;
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
             "INSERT INTO outgoing_receipts (chat_id, sender_user_id, receipt_type, through_lamport)
@@ -2013,18 +2051,19 @@ impl MessageStore {
     /// Store a foreign envelope for later store-and-forward delivery
     /// (DESIGN.md §5.3 carry queue). Keyed on `msg_id`, so re-enqueuing an
     /// envelope we're already carrying is a no-op (returns `false`); a fresh
-    /// insert returns `true`.
+    /// insert returns `true`. A digest over `recipient_hint || sealed` also
+    /// collapses a ciphertext rewrapped under a new attacker-selected public
+    /// `msg_id`, while preserving group fan-out copies with different hints.
     ///
     /// `is_family` marks whether this envelope is addressed to someone this
     /// node knows (its `recipient_hint` matched a contact -- the caller
     /// decides, since it holds the contacts and the hint derivation). Family
-    /// envelopes are kept until they expire and **never** evicted for space;
-    /// only foreign envelopes count against `foreign_budget_bytes` (DESIGN.md
-    /// §5.3: "Family messages always win eviction fights"). When inserting a
-    /// new foreign envelope pushes the foreign total over budget, the oldest
-    /// foreign envelopes (by `received_at_ms`) are evicted until it fits --
-    /// possibly including this one, if a single envelope exceeds the whole
-    /// budget. All of this happens in one transaction.
+    /// envelopes win eviction fights: foreign rows are evicted first. Foreign
+    /// rows additionally share `foreign_budget_bytes`, and the entire queue
+    /// has a hard 64 MiB sealed-byte ceiling so a forged family hint cannot
+    /// grow it indefinitely. Resource eviction is never reported as delivery
+    /// and never produces a receipt or relay ack. All of this happens in one
+    /// transaction.
     pub fn enqueue_carried_envelope(
         &self,
         envelope: CarriedEnvelope,
@@ -2032,14 +2071,17 @@ impl MessageStore {
         received_at_ms: i64,
         foreign_budget_bytes: i64,
     ) -> Result<bool, CoreError> {
+        validate_carried_envelope(&envelope, received_at_ms)?;
+        let content_digest = carried_content_digest(&envelope.recipient_hint, &envelope.sealed);
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
         let size = envelope.sealed.len() as i64;
         let changed = tx
             .execute(
                 "INSERT OR IGNORE INTO carried_envelopes
-                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family, received_at, size_bytes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
+                     received_at, size_bytes, content_digest)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     envelope.msg_id,
                     envelope.hop_ttl as i64,
@@ -2049,6 +2091,7 @@ impl MessageStore {
                     is_family as i64,
                     received_at_ms,
                     size,
+                    content_digest,
                 ],
             )
             .map_err(store_err)?;
@@ -2060,37 +2103,16 @@ impl MessageStore {
             return Ok(false);
         }
 
-        // Family envelopes are evict-proof; enforce the budget over foreign
-        // ones only, dropping oldest-first until back within it.
-        let mut foreign_total: i64 = tx
-            .query_row(
-                "SELECT COALESCE(SUM(size_bytes), 0) FROM carried_envelopes WHERE is_family = 0",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(store_err)?;
-        while foreign_total > foreign_budget_bytes {
-            let oldest: Option<(Vec<u8>, i64)> = tx
-                .query_row(
-                    "SELECT msg_id, size_bytes FROM carried_envelopes
-                     WHERE is_family = 0 ORDER BY received_at ASC, msg_id ASC LIMIT 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(store_err)?;
-            match oldest {
-                Some((msg_id, sz)) => {
-                    tx.execute(
-                        "DELETE FROM carried_envelopes WHERE msg_id = ?1",
-                        params![msg_id],
-                    )
-                    .map_err(store_err)?;
-                    foreign_total -= sz;
-                }
-                None => break,
-            }
-        }
+        tx.execute(
+            "DELETE FROM carried_envelopes WHERE expiry <= ?1",
+            params![received_at_ms],
+        )
+        .map_err(store_err)?;
+        enforce_carried_budgets(
+            &tx,
+            foreign_budget_bytes.max(0),
+            DEFAULT_TOTAL_CARRY_BUDGET_BYTES,
+        )?;
         tx.commit().map_err(store_err)?;
         Ok(true)
     }
@@ -2102,8 +2124,8 @@ impl MessageStore {
     /// `relayProxyHints` on the Kotlin side). This is the relay-sourced
     /// twin of [`MessageStore::enqueue_carried_envelope`]: always
     /// `is_family = 1` (the relay hint match already proved it's addressed
-    /// to someone we know, so it's kept until expiry and never evicted for
-    /// space) and `from_relay = 1`, which excludes it from
+    /// to someone we know, so it gets family-first eviction priority) and
+    /// `from_relay = 1`, which excludes it from
     /// [`MessageStore::family_carried_envelopes`] -- the relay-upload query
     /// -- because it is *already on the relay*; re-uploading it would just
     /// churn traffic and could resurrect a copy the real recipient already
@@ -2117,13 +2139,17 @@ impl MessageStore {
         envelope: CarriedEnvelope,
         now_ms: i64,
     ) -> Result<bool, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        validate_carried_envelope(&envelope, now_ms)?;
+        let content_digest = carried_content_digest(&envelope.recipient_hint, &envelope.sealed);
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
         let size = envelope.sealed.len() as i64;
-        let changed = conn
+        let changed = tx
             .execute(
                 "INSERT OR IGNORE INTO carried_envelopes
-                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family, received_at, size_bytes, from_relay)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 1)",
+                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
+                     received_at, size_bytes, from_relay, content_digest)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 1, ?8)",
                 params![
                     envelope.msg_id,
                     envelope.hop_ttl as i64,
@@ -2132,9 +2158,19 @@ impl MessageStore {
                     envelope.sealed,
                     now_ms,
                     size,
+                    content_digest,
                 ],
             )
             .map_err(store_err)?;
+        if changed > 0 {
+            tx.execute(
+                "DELETE FROM carried_envelopes WHERE expiry <= ?1",
+                params![now_ms],
+            )
+            .map_err(store_err)?;
+            enforce_carried_budgets(&tx, i64::MAX, DEFAULT_TOTAL_CARRY_BUDGET_BYTES)?;
+        }
+        tx.commit().map_err(store_err)?;
         Ok(changed > 0)
     }
 
@@ -2347,6 +2383,153 @@ impl MessageStore {
     }
 }
 
+fn validate_carried_envelope(envelope: &CarriedEnvelope, now_ms: i64) -> Result<(), CoreError> {
+    if envelope.hop_ttl > crate::DEFAULT_HOP_TTL {
+        return Err(CoreError::Malformed(format!(
+            "carried envelope hop_ttl exceeds {}",
+            crate::DEFAULT_HOP_TTL
+        )));
+    }
+    if envelope.expiry <= now_ms
+        || envelope.expiry > now_ms.saturating_add(crate::MAX_CARRY_FUTURE_MS)
+    {
+        return Err(CoreError::Malformed(
+            "carried envelope expiry is outside the accepted window".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn carried_content_digest(recipient_hint: &[u8], sealed: &[u8]) -> Vec<u8> {
+    let mut hasher =
+        Blake2bVar::new(CARRIED_CONTENT_DIGEST_LEN).expect("valid BLAKE2b digest length");
+    hasher.update(recipient_hint);
+    hasher.update(sealed);
+    let mut digest = vec![0; CARRIED_CONTENT_DIGEST_LEN];
+    hasher
+        .finalize_variable(&mut digest)
+        .expect("digest output has configured length");
+    digest
+}
+
+/// Backfill the content-level dedupe key for existing stores and collapse
+/// pre-migration duplicates deterministically, keeping the oldest row. No
+/// deletion here is a delivery signal; this is local queue compaction only.
+fn migrate_carried_content_digests(conn: &mut Connection) -> Result<(), CoreError> {
+    let tx = conn.transaction().map_err(store_err)?;
+    let mut seen: HashSet<Vec<u8>> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT content_digest FROM carried_envelopes
+                 WHERE content_digest IS NOT NULL",
+            )
+            .map_err(store_err)?;
+        let collected = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(store_err)?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(store_err)?;
+        collected
+    };
+    loop {
+        let row: Option<(i64, Vec<u8>, Vec<u8>)> = tx
+            .query_row(
+                "SELECT rowid, recipient_hint, sealed
+                 FROM carried_envelopes
+                 WHERE content_digest IS NULL
+                 ORDER BY received_at ASC, msg_id ASC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let Some((rowid, recipient_hint, sealed)) = row else {
+            break;
+        };
+        let digest = carried_content_digest(&recipient_hint, &sealed);
+        if seen.insert(digest.clone()) {
+            tx.execute(
+                "UPDATE carried_envelopes SET content_digest = ?1 WHERE rowid = ?2",
+                params![digest, rowid],
+            )
+            .map_err(store_err)?;
+        } else {
+            tx.execute(
+                "DELETE FROM carried_envelopes WHERE rowid = ?1",
+                params![rowid],
+            )
+            .map_err(store_err)?;
+        }
+    }
+    enforce_carried_budgets(&tx, i64::MAX, DEFAULT_TOTAL_CARRY_BUDGET_BYTES)?;
+    tx.commit().map_err(store_err)
+}
+
+fn enforce_carried_budgets(
+    tx: &Transaction<'_>,
+    foreign_budget_bytes: i64,
+    total_budget_bytes: i64,
+) -> Result<(), CoreError> {
+    let mut foreign_total: i64 = tx
+        .query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0)
+             FROM carried_envelopes WHERE is_family = 0",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(store_err)?;
+    while foreign_total > foreign_budget_bytes {
+        let oldest: Option<(Vec<u8>, i64)> = tx
+            .query_row(
+                "SELECT msg_id, size_bytes FROM carried_envelopes
+                 WHERE is_family = 0
+                 ORDER BY received_at ASC, msg_id ASC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let Some((msg_id, size)) = oldest else {
+            break;
+        };
+        tx.execute(
+            "DELETE FROM carried_envelopes WHERE msg_id = ?1",
+            params![msg_id],
+        )
+        .map_err(store_err)?;
+        foreign_total = foreign_total.saturating_sub(size);
+    }
+
+    let mut total: i64 = tx
+        .query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM carried_envelopes",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(store_err)?;
+    while total > total_budget_bytes.max(0) {
+        let oldest: Option<(Vec<u8>, i64)> = tx
+            .query_row(
+                "SELECT msg_id, size_bytes FROM carried_envelopes
+                 ORDER BY is_family ASC, received_at ASC, msg_id ASC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let Some((msg_id, size)) = oldest else {
+            break;
+        };
+        tx.execute(
+            "DELETE FROM carried_envelopes WHERE msg_id = ?1",
+            params![msg_id],
+        )
+        .map_err(store_err)?;
+        total = total.saturating_sub(size);
+    }
+    Ok(())
+}
+
 /// Shared by [`MessageStore::highest_contiguous_lamport`] and
 /// [`MessageStore::chat_digest`] (which needs it once per sender, under a
 /// single lock acquisition -- `Connection`'s `Mutex` isn't reentrant, so
@@ -2546,6 +2729,26 @@ fn validate_msg_id(field: &str, msg_id: &[u8]) -> Result<(), CoreError> {
     if msg_id.len() != MESSAGE_ID_LEN {
         return Err(CoreError::Malformed(format!(
             "{field} must be exactly {MESSAGE_ID_LEN} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_stored_message(message: &StoredMessage) -> Result<(), CoreError> {
+    validate_sqlite_u64("message lamport", message.lamport)
+}
+
+fn validate_receipt_watermark(receipt_type: u8, through_lamport: u64) -> Result<(), CoreError> {
+    if receipt_type != crate::RECEIPT_TYPE_DELIVERED && receipt_type != crate::RECEIPT_TYPE_READ {
+        return Err(CoreError::Malformed("invalid receipt type".into()));
+    }
+    validate_sqlite_u64("receipt watermark", through_lamport)
+}
+
+fn validate_sqlite_u64(field: &str, value: u64) -> Result<(), CoreError> {
+    if value > i64::MAX as u64 {
+        return Err(CoreError::Malformed(format!(
+            "{field} exceeds the supported range"
         )));
     }
     Ok(())
@@ -2775,7 +2978,8 @@ CREATE TABLE IF NOT EXISTS carried_envelopes (
     is_family      INTEGER NOT NULL,
     received_at    INTEGER NOT NULL,
     size_bytes     INTEGER NOT NULL,
-    from_relay     INTEGER NOT NULL DEFAULT 0
+    from_relay     INTEGER NOT NULL DEFAULT 0,
+    content_digest BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_carried_hint ON carried_envelopes(recipient_hint);
 CREATE INDEX IF NOT EXISTS idx_carried_expiry ON carried_envelopes(expiry);
@@ -2851,11 +3055,18 @@ mod tests {
         Group {
             id: vec![id_byte; 16],
             name: name.to_string(),
-            member_user_ids: members.iter().map(|member| member.to_vec()).collect(),
+            member_user_ids: members.iter().map(|member| test_user_id(member)).collect(),
             key: vec![key_byte; 32],
             metadata_revision: 0,
             metadata_changed_by: Vec::new(),
         }
+    }
+
+    fn test_user_id(label: &[u8]) -> Vec<u8> {
+        let mut user_id = vec![0; 16];
+        let count = label.len().min(user_id.len());
+        user_id[..count].copy_from_slice(&label[..count]);
+        user_id
     }
 
     #[test]
@@ -3332,6 +3543,42 @@ mod tests {
             store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn writes_reject_values_that_sqlite_cannot_represent() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(store
+            .insert_message(msg(b"chat-a", b"alice", i64::MAX as u64 + 1, "bad"))
+            .is_err());
+        assert!(store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                RECEIPT_TYPE_DELIVERED,
+                i64::MAX as u64 + 1,
+            )
+            .is_err());
+        assert!(store
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), 0xff, 1)
+            .is_err());
+        assert!(store
+            .upsert_outgoing_receipt_envelope(
+                outgoing_receipt_for(
+                    b"chat-a",
+                    b"alice",
+                    b"bob",
+                    RECEIPT_TYPE_DELIVERED,
+                    i64::MAX as u64 + 1,
+                    &[9; 16],
+                ),
+                1,
+            )
+            .is_err());
+        assert!(store
+            .messages_for_chat(b"chat-a".to_vec())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -3945,7 +4192,7 @@ mod tests {
             .enqueue_carried_envelope(
                 carried(b"expired", b"h3", 1_500, 10),
                 true,
-                3_000,
+                1_000,
                 BIG_BUDGET,
             )
             .unwrap();
@@ -4670,7 +4917,7 @@ mod tests {
             Some(Group {
                 id: group.id,
                 name: "Family".to_string(),
-                member_user_ids: vec![b"alice".to_vec(), b"carol".to_vec()],
+                member_user_ids: vec![test_user_id(b"alice"), test_user_id(b"carol")],
                 key: vec![0x22; 32],
                 metadata_revision: 0,
                 metadata_changed_by: Vec::new(),
@@ -4684,7 +4931,7 @@ mod tests {
         let mut rotated = group(0x11, "Bridge", 0x22, &[b"alice", b"bob"]);
         store.upsert_group(rotated.clone()).unwrap();
         rotated.key = vec![0x33; 32];
-        rotated.member_user_ids = vec![b"alice".to_vec(), b"dave".to_vec()];
+        rotated.member_user_ids = vec![test_user_id(b"alice"), test_user_id(b"dave")];
 
         store.upsert_group(rotated.clone()).unwrap();
 
@@ -4697,9 +4944,9 @@ mod tests {
         let stale = group(0x11, "Old name", 0x22, &[b"alice", b"bob"]);
         let mut current = stale.clone();
         current.name = "New name".to_string();
-        current.member_user_ids.push(b"carol".to_vec());
+        current.member_user_ids.push(test_user_id(b"carol"));
         current.metadata_revision = 4;
-        current.metadata_changed_by = b"alice".to_vec();
+        current.metadata_changed_by = test_user_id(b"alice");
         store.upsert_group(current.clone()).unwrap();
 
         store.upsert_group(stale).unwrap();
@@ -5328,12 +5575,15 @@ mod tests {
     const BIG_BUDGET: i64 = 5 * 1024 * 1024;
 
     fn carried(msg_id: &[u8], hint: &[u8], expiry: i64, sealed_len: usize) -> CarriedEnvelope {
+        let fill = msg_id
+            .iter()
+            .fold(0xAB_u8, |acc, byte| acc.wrapping_add(*byte));
         CarriedEnvelope {
             msg_id: msg_id.to_vec(),
             hop_ttl: 7,
             expiry,
             recipient_hint: hint.to_vec(),
-            sealed: vec![0xAB; sealed_len],
+            sealed: vec![fill; sealed_len],
         }
     }
 
@@ -5362,6 +5612,51 @@ mod tests {
             .enqueue_carried_envelope(carried(b"m1", b"h", 2_000, 100), false, 1_050, BIG_BUDGET)
             .unwrap());
         assert_eq!(store.carried_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn enqueue_dedupes_rewrapped_ciphertext_but_preserves_distinct_hints() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let original = carried(b"original", b"hint-a", 9_000, 100);
+        assert!(store
+            .enqueue_carried_envelope(original.clone(), true, 1_000, BIG_BUDGET)
+            .unwrap());
+
+        let mut rewrapped = original.clone();
+        rewrapped.msg_id = b"attacker-new-id".to_vec();
+        rewrapped.expiry = 10_000;
+        assert!(!store
+            .enqueue_carried_envelope(rewrapped, true, 2_000, BIG_BUDGET)
+            .unwrap());
+
+        let mut group_fanout = original;
+        group_fanout.msg_id = b"member-copy".to_vec();
+        group_fanout.recipient_hint = b"hint-b".to_vec();
+        assert!(store
+            .enqueue_carried_envelope(group_fanout, true, 3_000, BIG_BUDGET)
+            .unwrap());
+        assert_eq!(store.carried_len().unwrap(), 2);
+    }
+
+    #[test]
+    fn carry_ingest_rejects_amplified_hop_and_expiry_fields() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut bad_hop = carried(b"hop", b"hint", 9_000, 10);
+        bad_hop.hop_ttl = crate::DEFAULT_HOP_TTL + 1;
+        assert!(store
+            .enqueue_carried_envelope(bad_hop, true, 1_000, BIG_BUDGET)
+            .is_err());
+
+        let too_far = carried(
+            b"expiry",
+            b"hint",
+            1_000 + crate::MAX_CARRY_FUTURE_MS + 1,
+            10,
+        );
+        assert!(store
+            .enqueue_relay_carried_envelope(too_far, 1_000)
+            .is_err());
+        assert_eq!(store.carried_len().unwrap(), 0);
     }
 
     #[test]
@@ -5650,7 +5945,7 @@ mod tests {
     }
 
     #[test]
-    fn family_envelopes_are_never_evicted_for_budget() {
+    fn family_envelopes_win_foreign_budget_eviction() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         // A family envelope (is_family = true) far exceeding the budget stays.
         store
@@ -5675,6 +5970,54 @@ mod tests {
             .collect();
         // fam survives despite being 400 bytes (> budget); foreign kept to f2,f3.
         assert_eq!(ids, vec![b"fam".to_vec(), b"f2".to_vec(), b"f3".to_vec()]);
+    }
+
+    #[test]
+    fn total_budget_evicts_foreign_before_oldest_family() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"family-old", b"h1", 9_000, 100),
+                true,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"foreign", b"h2", 9_000, 100),
+                false,
+                2_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"family-new", b"h3", 9_000, 100),
+                true,
+                3_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+
+        let mut conn = store.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        enforce_carried_budgets(&tx, BIG_BUDGET, 200).unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        let ids = store.carried_msg_ids(10).unwrap();
+        assert_eq!(ids, vec![b"family-old".to_vec(), b"family-new".to_vec()]);
+
+        let mut conn = store.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        enforce_carried_budgets(&tx, BIG_BUDGET, 100).unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+        assert_eq!(
+            store.carried_msg_ids(10).unwrap(),
+            vec![b"family-new".to_vec()]
+        );
     }
 
     // --- relay proxy-polling (from_relay) -----------------------------------
@@ -5738,12 +6081,35 @@ mod tests {
             ",
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO carried_envelopes
+                (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family, received_at, size_bytes)
+             VALUES (?1, 7, 9000, ?2, ?3, 1, 1000, 4)",
+            params![
+                b"legacy-one".as_slice(),
+                b"same-hint".as_slice(),
+                b"same".as_slice()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO carried_envelopes
+                (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family, received_at, size_bytes)
+             VALUES (?1, 7, 9000, ?2, ?3, 1, 2000, 4)",
+            params![
+                b"legacy-two".as_slice(),
+                b"same-hint".as_slice(),
+                b"same".as_slice()
+            ],
+        )
+        .unwrap();
         drop(conn);
 
         // Opening an old store (pre-dating from_relay) must migrate the
         // column, not error, and the new relay-sourced path must work
         // against the migrated schema.
         let store = MessageStore::open(path_str.clone()).unwrap();
+        assert_eq!(store.carried_len().unwrap(), 1, "migration dedupes content");
         let env = carried(b"proxy", b"hint-a", 9_000, 10);
         assert!(store
             .enqueue_relay_carried_envelope(env.clone(), 1_000)
@@ -5777,6 +6143,22 @@ mod tests {
         );
 
         drop(restored);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn backup_to_rejects_relative_and_existing_destinations() {
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        assert!(store.backup_to("relative.sqlite".into()).is_err());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("cruisemesh-existing-{unique}.sqlite"));
+        fs::write(&path, b"leave intact").unwrap();
+        assert!(store.backup_to(path.to_string_lossy().to_string()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"leave intact");
         fs::remove_file(path).unwrap();
     }
 }
