@@ -1896,6 +1896,7 @@ class MeshService : Service() {
         when (
             coreInboundGate(
                 !GossipState.seenIds.contains(envelope.msgId),
+                envelope.hopTtl,
                 envelope.expiry,
                 System.currentTimeMillis(),
             )
@@ -1906,6 +1907,11 @@ class MeshService : Service() {
                 // A deliberate drop is still a terminal handled state.
                 GossipState.seenIds.record(envelope.msgId)
                 return CoreInboundDisposition.EXPIRED
+            }
+            CoreInboundGate.REJECTED -> {
+                Log.w(TAG, "Dropping envelope with invalid hop or expiry fields from $sourceLabel")
+                GossipState.seenIds.record(envelope.msgId)
+                return CoreInboundDisposition.REJECTED
             }
             CoreInboundGate.DISPATCH -> Unit
         }
@@ -2028,8 +2034,8 @@ class MeshService : Service() {
      * Adds a foreign envelope to the persistent carry queue (DESIGN.md §5.3
      * store-and-forward). Classifies it as "family" -- addressed to someone we
      * know -- when its `recipient_hint` matches a contact ([hintMatchesAnyContact]);
-     * family envelopes are kept until expiry and never evicted for space,
-     * while foreign ones share a bounded [FOREIGN_CARRY_BUDGET_BYTES] budget.
+     * family envelopes win eviction fights, while foreign ones share a bounded
+     * [FOREIGN_CARRY_BUDGET_BYTES] budget and the core bounds the whole queue.
      * Idempotent on `msg_id`, so re-seeing an envelope we already carry is a
      * no-op. Reached only after [handleEnvelope]'s dedupe + expiry gates, so
      * we never carry a stale duplicate or an already-expired envelope.

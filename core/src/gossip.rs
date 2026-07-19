@@ -238,7 +238,7 @@ mod tests {
         let is_new = !seen.contains(msg_id.clone());
         assert!(is_new);
         assert_eq!(
-            core_inbound_gate(is_new, expiry_ms, now_ms),
+            core_inbound_gate(is_new, crate::DEFAULT_HOP_TTL, expiry_ms, now_ms),
             CoreInboundGate::Dispatch
         );
         // Simulated durable handling (e.g. enqueueCarriedEnvelope) fails: the
@@ -249,7 +249,7 @@ mod tests {
         let is_new_again = !seen.contains(msg_id.clone());
         assert!(is_new_again);
         assert_eq!(
-            core_inbound_gate(is_new_again, expiry_ms, now_ms),
+            core_inbound_gate(is_new_again, crate::DEFAULT_HOP_TTL, expiry_ms, now_ms),
             CoreInboundGate::Dispatch
         );
 
@@ -258,7 +258,7 @@ mod tests {
         let is_new_third = !seen.contains(msg_id.clone());
         assert!(!is_new_third);
         assert_eq!(
-            core_inbound_gate(is_new_third, expiry_ms, now_ms),
+            core_inbound_gate(is_new_third, crate::DEFAULT_HOP_TTL, expiry_ms, now_ms),
             CoreInboundGate::Seen
         );
     }

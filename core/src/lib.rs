@@ -35,6 +35,7 @@ pub use crypto::{open_message, seal_message, OpenedMessage};
 pub use engine::{
     core_hello_identity_matches, core_inbound_gate, core_relay_ack_ids, core_should_ack_inbound,
     CoreDigestSprayPlan, CoreInboundDisposition, CoreInboundGate, CoreRelayEnvelopeDisposition,
+    MAX_CARRY_FUTURE_MS,
 };
 pub use framing::{
     ble_att_header_overhead, ble_default_att_mtu, ble_max_att_value_len, fragment_ble_frame,

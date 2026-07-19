@@ -976,7 +976,7 @@ int8_t uniffi_cruisemesh_core_fn_func_core_hello_identity_matches(RustBuffer cur
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_INBOUND_GATE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_INBOUND_GATE
-RustBuffer uniffi_cruisemesh_core_fn_func_core_inbound_gate(int8_t is_new_msg_id, int64_t expiry_ms, int64_t now_ms, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_cruisemesh_core_fn_func_core_inbound_gate(int8_t is_new_msg_id, uint8_t hop_ttl, int64_t expiry_ms, int64_t now_ms, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_IS_OWN_FANOUT_HINT
