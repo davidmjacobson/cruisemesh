@@ -72,9 +72,12 @@ const RECIPIENT_HINT_LEN: usize = 8;
 const MSG_ID_LEN: usize = 16;
 const DEFAULT_FETCH_LIMIT: usize = 100;
 const MAX_FETCH_LIMIT: usize = 500;
+pub const MAX_FETCH_HINTS: usize = 256;
+pub const MAX_ACK_IDS: usize = 512;
 const MAX_PRESENCE_ANNOUNCE: usize = 4;
 const MAX_PRESENCE_QUERY: usize = 512;
 const PRESENCE_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
+pub const WS_MAX_INBOUND_MESSAGE_BYTES: usize = 4 * 1024;
 
 /// Capacity of the global POST→WS broadcast. Lagging subscribers that fall
 /// more than this many events behind are disconnected (`Lagged`); they
@@ -221,6 +224,12 @@ pub struct StoredPresence {
     pub last_seen_ms: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuotaInsertResult {
+    Stored { id: i64 },
+    QuotaExceeded { usage_bytes: u64 },
+}
+
 impl RelayStore {
     pub fn open(path: &str) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
@@ -272,6 +281,85 @@ impl RelayStore {
             |row| row.get(0),
         )
         .map_err(|e| e.to_string())
+    }
+
+    /// Atomically admit a new row under the per-family sealed-byte quota.
+    /// The dedupe check, usage calculation, optional expiry pruning, and insert
+    /// all run while holding one store lock and one SQLite transaction.
+    pub fn insert_envelope_with_quota(
+        &self,
+        family_token: &str,
+        msg_id: Vec<u8>,
+        hop_ttl: u8,
+        recipient_hint: Vec<u8>,
+        sealed: Vec<u8>,
+        expiry_ms: i64,
+        created_at_ms: i64,
+        family_quota_bytes: u64,
+    ) -> Result<QuotaInsertResult, String> {
+        if sealed.len() > MAX_ENVELOPE_SEALED_BYTES {
+            return Err(format!(
+                "sealed envelope of {} bytes exceeds the {}-byte cap",
+                sealed.len(),
+                MAX_ENVELOPE_SEALED_BYTES
+            ));
+        }
+        let expiry_ms = Self::effective_expiry(created_at_ms, expiry_ms);
+        let mut conn = self.conn.lock().expect("relay store mutex poisoned");
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        let existing_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM envelopes WHERE family_token = ?1 AND msg_id = ?2 LIMIT 1",
+                params![family_token, msg_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(id) = existing_id {
+            tx.execute(
+                "UPDATE envelopes SET
+                    hop_ttl = MAX(hop_ttl, ?3),
+                    expiry_ms = MAX(expiry_ms, ?4)
+                 WHERE family_token = ?1 AND msg_id = ?2",
+                params![family_token, msg_id, hop_ttl as i64, expiry_ms],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(QuotaInsertResult::Stored { id });
+        }
+
+        let candidate_bytes = sealed.len() as u64;
+        let mut usage_bytes = family_sealed_bytes_on(&tx, family_token)?;
+        if usage_bytes.saturating_add(candidate_bytes) > family_quota_bytes {
+            prune_expired_on(&tx, created_at_ms)?;
+            usage_bytes = family_sealed_bytes_on(&tx, family_token)?;
+        }
+        if usage_bytes.saturating_add(candidate_bytes) > family_quota_bytes {
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(QuotaInsertResult::QuotaExceeded { usage_bytes });
+        }
+
+        let id = tx
+            .query_row(
+                "INSERT INTO envelopes
+                    (family_token, msg_id, hop_ttl, recipient_hint, sealed, expiry_ms, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 RETURNING id",
+                params![
+                    family_token,
+                    msg_id,
+                    hop_ttl as i64,
+                    recipient_hint,
+                    sealed,
+                    expiry_ms,
+                    created_at_ms,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(QuotaInsertResult::Stored { id })
     }
 
     /// Bulk insert inside a single transaction (index/plan benchmarks).
@@ -339,6 +427,9 @@ impl RelayStore {
         if hints.is_empty() {
             return Ok(Vec::new());
         }
+        if hints.len() > MAX_FETCH_HINTS {
+            return Err(format!("at most {MAX_FETCH_HINTS} hints are allowed"));
+        }
         self.prune_expired(now_ms)?;
         let conn = self.conn.lock().expect("relay store mutex poisoned");
         let hint_placeholders = (0..hints.len())
@@ -384,6 +475,9 @@ impl RelayStore {
         if ids.is_empty() {
             return Ok(0);
         }
+        if ids.len() > MAX_ACK_IDS {
+            return Err(format!("at most {MAX_ACK_IDS} ack ids are allowed"));
+        }
         let conn = self.conn.lock().expect("relay store mutex poisoned");
         let placeholders = std::iter::repeat("?")
             .take(ids.len())
@@ -407,23 +501,8 @@ impl RelayStore {
     /// Drop rows past either their per-envelope `expiry_ms` or the 30-day
     /// server retention ceiling (`created_at_ms + MAX_RETENTION_MS`).
     pub fn prune_expired(&self, now_ms: i64) -> Result<u64, String> {
-        let retention_floor = now_ms.saturating_sub(MAX_RETENTION_MS);
         let conn = self.conn.lock().expect("relay store mutex poisoned");
-        let deleted = conn
-            .execute(
-                "DELETE FROM envelopes
-                 WHERE expiry_ms <= ?1 OR created_at_ms <= ?2",
-                params![now_ms, retention_floor],
-            )
-            .map_err(|e| e.to_string())?;
-        let presence_floor = now_ms.saturating_sub(PRESENCE_RETENTION_MS);
-        let deleted_presence = conn
-            .execute(
-                "DELETE FROM presence WHERE last_seen_ms <= ?1",
-                params![presence_floor],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok((deleted + deleted_presence) as u64)
+        prune_expired_on(&conn, now_ms)
     }
 
     pub fn sync_presence(
@@ -503,19 +582,7 @@ impl RelayStore {
     /// under-)estimate of actual disk usage, which is fine for a soft quota.
     pub fn family_sealed_bytes(&self, family_token: &str) -> Result<u64, String> {
         let conn = self.conn.lock().expect("relay store mutex poisoned");
-        // SUM() over zero matching rows returns one row with a SQL NULL
-        // (not zero rows), so the inner type must be Option<i64> — a plain
-        // i64 here fails every empty-family lookup with "Invalid column
-        // type Null".
-        let total: Option<Option<i64>> = conn
-            .query_row(
-                "SELECT SUM(LENGTH(sealed)) FROM envelopes WHERE family_token = ?1",
-                params![family_token],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        Ok(total.flatten().unwrap_or(0) as u64)
+        family_sealed_bytes_on(&conn, family_token)
     }
 
     /// Whether a `(family_token, msg_id)` row already exists. Used to skip
@@ -585,6 +652,38 @@ impl RelayStore {
         }
         Ok(lines.join("\n"))
     }
+}
+
+fn family_sealed_bytes_on(conn: &Connection, family_token: &str) -> Result<u64, String> {
+    // SUM() over zero matching rows returns one row with a SQL NULL.
+    let total: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT SUM(LENGTH(sealed)) FROM envelopes WHERE family_token = ?1",
+            params![family_token],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(total.flatten().unwrap_or(0) as u64)
+}
+
+fn prune_expired_on(conn: &Connection, now_ms: i64) -> Result<u64, String> {
+    let retention_floor = now_ms.saturating_sub(MAX_RETENTION_MS);
+    let deleted = conn
+        .execute(
+            "DELETE FROM envelopes
+             WHERE expiry_ms <= ?1 OR created_at_ms <= ?2",
+            params![now_ms, retention_floor],
+        )
+        .map_err(|e| e.to_string())?;
+    let presence_floor = now_ms.saturating_sub(PRESENCE_RETENTION_MS);
+    let deleted_presence = conn
+        .execute(
+            "DELETE FROM presence WHERE last_seen_ms <= ?1",
+            params![presence_floor],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok((deleted + deleted_presence) as u64)
 }
 
 pub fn app(state: AppState) -> Router {
@@ -677,42 +776,11 @@ async fn post_envelope(
     }
     let now = now_ms();
 
-    // DTN_TODOS.md D7: per-family storage quota. A re-post of an existing
-    // msg_id is dedupe (insert_envelope's ON CONFLICT path never rewrites
-    // `sealed`) and adds zero bytes, so it is never quota-checked — only a
-    // genuinely new row can push a family over its quota.
-    let is_new_msg_id = !state
+    // Dedupe, quota accounting, expiry pruning, and insertion are one store
+    // transaction so concurrent posts cannot all pass the same usage check.
+    let result = state
         .store
-        .envelope_exists(&family_token, &msg_id)
-        .map_err(ApiError::internal)?;
-    if is_new_msg_id {
-        let candidate_bytes = sealed.len() as u64;
-        let usage = state
-            .store
-            .family_sealed_bytes(&family_token)
-            .map_err(ApiError::internal)?;
-        if usage.saturating_add(candidate_bytes) > state.family_quota_bytes {
-            // Durability over eviction (DTN_TODOS.md §3, D7): never
-            // silently drop unacked mail to make room. Prune this family's
-            // (and everyone else's) expired rows first — often enough on
-            // its own — then re-check before giving up and rejecting.
-            state.store.prune_expired(now).map_err(ApiError::internal)?;
-            let usage_after_prune = state
-                .store
-                .family_sealed_bytes(&family_token)
-                .map_err(ApiError::internal)?;
-            if usage_after_prune.saturating_add(candidate_bytes) > state.family_quota_bytes {
-                return Err(ApiError::family_quota_exceeded(
-                    usage_after_prune,
-                    state.family_quota_bytes,
-                ));
-            }
-        }
-    }
-
-    let id = state
-        .store
-        .insert_envelope(
+        .insert_envelope_with_quota(
             &family_token,
             msg_id.clone(),
             request.hop_ttl,
@@ -720,8 +788,18 @@ async fn post_envelope(
             sealed.clone(),
             request.expiry_ms,
             now,
+            state.family_quota_bytes,
         )
         .map_err(ApiError::internal)?;
+    let id = match result {
+        QuotaInsertResult::Stored { id } => id,
+        QuotaInsertResult::QuotaExceeded { usage_bytes } => {
+            return Err(ApiError::family_quota_exceeded(
+                usage_bytes,
+                state.family_quota_bytes,
+            ))
+        }
+    };
 
     let envelope = EnvelopeResponse {
         id,
@@ -772,25 +850,13 @@ async fn get_envelopes(
     Query(query): Query<GetEnvelopesQuery>,
 ) -> Result<Json<GetEnvelopesResponse>, ApiError> {
     let family_token = bearer_token(&headers, &state.auth_tokens)?;
-    let hints = query
-        .hints
-        .split(',')
-        .filter(|h| !h.is_empty())
-        .map(|hint| decode_base64_field(hint, "hints"))
-        .collect::<Result<Vec<_>, _>>()?;
-    if hints.is_empty() {
+    let (hints, _) = decode_fetch_hints(&query.hints)?;
+    let after = query.after.unwrap_or(0);
+    if after < 0 {
         return Err(ApiError::bad_request(
-            "at least one hint is required".to_string(),
+            "after must be non-negative".to_string(),
         ));
     }
-    for hint in &hints {
-        if hint.len() != RECIPIENT_HINT_LEN {
-            return Err(ApiError::bad_request(format!(
-                "each hint must be {RECIPIENT_HINT_LEN} bytes after base64url decoding"
-            )));
-        }
-    }
-    let after = query.after.unwrap_or(0);
     let limit = query
         .limit
         .unwrap_or(DEFAULT_FETCH_LIMIT)
@@ -836,9 +902,22 @@ async fn ack_envelopes(
     Json(request): Json<AckRequest>,
 ) -> Result<Json<AckResponse>, ApiError> {
     let family_token = bearer_token(&headers, &state.auth_tokens)?;
+    if request.ids.len() > MAX_ACK_IDS {
+        return Err(ApiError::bad_request(format!(
+            "ids must contain at most {MAX_ACK_IDS} entries"
+        )));
+    }
+    if request.ids.iter().any(|id| *id <= 0) {
+        return Err(ApiError::bad_request(
+            "ids must contain only positive relay ids".to_string(),
+        ));
+    }
+    let mut ids = request.ids;
+    ids.sort_unstable();
+    ids.dedup();
     let deleted = state
         .store
-        .ack_envelopes(&family_token, request.ids)
+        .ack_envelopes(&family_token, ids)
         .map_err(ApiError::internal)?;
     Ok(Json(AckResponse { deleted }))
 }
@@ -941,35 +1020,49 @@ async fn ws_handler(
         }
         t.to_string()
     };
-    let hints = query
-        .hints
-        .split(',')
-        .filter(|h| !h.is_empty())
-        .map(|hint| decode_base64_field(hint, "hints"))
-        .collect::<Result<Vec<_>, _>>()?;
-    if hints.is_empty() {
+    let (hints, hints_base64) = decode_fetch_hints(&query.hints)?;
+    let after = query.after.unwrap_or(0);
+    if after < 0 {
         return Err(ApiError::bad_request(
-            "at least one hint is required".to_string(),
+            "after must be non-negative".to_string(),
         ));
     }
-    for hint in &hints {
+
+    Ok(ws
+        .max_message_size(WS_MAX_INBOUND_MESSAGE_BYTES)
+        .max_frame_size(WS_MAX_INBOUND_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_ws(socket, state, token, hints, hints_base64, after))
+        .into_response())
+}
+
+fn decode_fetch_hints(value: &str) -> Result<(Vec<Vec<u8>>, HashSet<String>), ApiError> {
+    let mut hints = Vec::with_capacity(MAX_FETCH_HINTS.min(16));
+    let mut canonical = HashSet::with_capacity(MAX_FETCH_HINTS.min(16));
+    let mut submitted = 0usize;
+    for value in value.split(',').filter(|hint| !hint.is_empty()) {
+        submitted += 1;
+        if submitted > MAX_FETCH_HINTS {
+            return Err(ApiError::bad_request(format!(
+                "hints must contain at most {MAX_FETCH_HINTS} entries"
+            )));
+        }
+        let hint = decode_base64_field(value, "hints")?;
         if hint.len() != RECIPIENT_HINT_LEN {
             return Err(ApiError::bad_request(format!(
                 "each hint must be {RECIPIENT_HINT_LEN} bytes after base64url decoding"
             )));
         }
+        let encoded = encode_base64_field(&hint);
+        if canonical.insert(encoded) {
+            hints.push(hint);
+        }
     }
-    let after = query.after.unwrap_or(0);
-    let hints_base64: HashSet<String> = query
-        .hints
-        .split(',')
-        .filter(|h| !h.is_empty())
-        .map(String::from)
-        .collect();
-
-    Ok(ws
-        .on_upgrade(move |socket| handle_ws(socket, state, token, hints, hints_base64, after))
-        .into_response())
+    if hints.is_empty() {
+        return Err(ApiError::bad_request(
+            "at least one hint is required".to_string(),
+        ));
+    }
+    Ok((hints, canonical))
 }
 
 async fn ws_send_text(socket: &mut WebSocket, text: String) -> bool {
@@ -1257,6 +1350,104 @@ mod tests {
     async fn body_json(response: Response) -> serde_json::Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn fetch_and_ack_cardinality_caps_fail_before_dynamic_sql() {
+        let app = test_app();
+        let hint = encode_base64_field(&sample_hint(1));
+        let hints = std::iter::repeat(hint)
+            .take(MAX_FETCH_HINTS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetch = Request::builder()
+            .uri(format!("/envelopes?hints={hints}"))
+            .header("authorization", "Bearer family-a")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(fetch).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let ack = Request::builder()
+            .method("POST")
+            .uri("/envelopes/ack")
+            .header("authorization", "Bearer family-a")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"ids": (1..=MAX_ACK_IDS + 1).collect::<Vec<_>>()}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(ack).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn store_cardinality_caps_are_defense_in_depth() {
+        let (_db, store) = test_store();
+        assert!(store
+            .fetch_envelopes(
+                "family-a",
+                vec![sample_hint(1); MAX_FETCH_HINTS + 1],
+                0,
+                1,
+                1_000,
+            )
+            .is_err());
+        assert!(store
+            .ack_envelopes("family-a", vec![1; MAX_ACK_IDS + 1])
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_quota_admission_cannot_overcommit_a_family() {
+        let (_db, store) = test_store();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles = (1..=2u8)
+            .map(|byte| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .insert_envelope_with_quota(
+                            "family-a",
+                            sample_msg_id(byte),
+                            7,
+                            sample_hint(1),
+                            vec![byte; 60],
+                            2_000,
+                            1_000,
+                            100,
+                        )
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, QuotaInsertResult::Stored { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, QuotaInsertResult::QuotaExceeded { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(store.family_sealed_bytes("family-a").unwrap(), 60);
     }
 
     #[tokio::test]

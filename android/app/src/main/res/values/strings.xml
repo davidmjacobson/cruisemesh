@@ -68,6 +68,7 @@
     <string name="ui_message_info">Message info</string>
     <string name="ui_mute_notifications">Mute notifications</string>
     <string name="ui_my_friend_card">My friend card</string>
+    <string name="ui_friend_card_too_large">Shorten your name or relay settings to create a friend card.</string>
     <string name="ui_nearby_permissions_are_required_skipping_them_means_the">Nearby permissions are required. Skipping them means the mesh stays off.</string>
     <string name="ui_nearby_access_enabled">Nearby access enabled</string>
     <string name="ui_enable_nearby_access_required">Enable nearby access (required)</string>
@@ -144,6 +145,7 @@
     <string name="ui_the_port_is_optional">The port is optional.</string>
     <string name="ui_this_removes_the_contact_and_deletes_your_chat">This removes the contact and deletes your chat history with them.</string>
     <string name="ui_this_removes_the_contact_and_deletes_your_chat_f3fb0a50">This removes the contact and deletes your chat history with them. It can\'t be undone.</string>
+    <string name="ui_this_backup_file_is_too_large">This backup file is too large.</string>
     <string name="ui_unsupported_attachment">Unsupported attachment</string>
     <string name="ui_when_any_family_phone_has_internet_queued_messages">When any family phone has internet, queued messages flush through this mailbox.</string>
     <string name="ui_your_name">Your name</string>
