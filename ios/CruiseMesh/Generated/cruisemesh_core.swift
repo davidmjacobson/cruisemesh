@@ -1565,7 +1565,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * key and normal DTN fan-out path.
      */
     func authorGroupMetadataUpdate(identity: Identity, group: Group, name: String, memberUserIds: [Data], timestampMs: Int64) throws  -> AuthoredGroupMetadataUpdate
-
+    
     /**
      * Assign, seal, and durably queue a pairwise chat-stream message in one
      * store transaction. The counter ratchets past both receipt watermarks.
@@ -1590,8 +1590,8 @@ public protocol MessageStoreProtocol : AnyObject {
      * The destination must not already exist; callers should use a unique
      * temporary path and remove it after reading the backup bytes.
      */
-    func backupTo(destination: String) throws
-
+    func backupTo(destination: String) throws 
+    
     /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
@@ -2082,7 +2082,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * This remains available after the retry queue prunes expired ciphertext.
      */
     func outboundMessageExpiry(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> Int64?
-
+    
     /**
      * The latest relay-uploadable receipt envelope persisted for this
      * cumulative outgoing receipt watermark, if any.
@@ -2337,7 +2337,7 @@ public static func `open`(path: String)throws  -> MessageStore {
     )
 })
 }
-
+    
 
     
     /**
@@ -2355,7 +2355,7 @@ open func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, co
     )
 })
 }
-
+    
 open func authorFriendRequest(identity: Identity, contact: Contact, friendCardJson: String, timestampMs: Int64)throws  -> AuthoredEnvelope {
     return try  FfiConverterTypeAuthoredEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_author_friend_request(self.uniffiClonePointer(),
@@ -2399,7 +2399,7 @@ open func authorGroupMetadataUpdate(identity: Identity, group: Group, name: Stri
     )
 })
 }
-
+    
     /**
      * Assign, seal, and durably queue a pairwise chat-stream message in one
      * store transaction. The counter ratchets past both receipt watermarks.
@@ -2461,7 +2461,7 @@ open func backupTo(destination: String)throws  {try rustCallWithError(FfiConvert
     )
 }
 }
-
+    
     /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
@@ -3238,7 +3238,7 @@ open func outboundMessageExpiry(chatId: Data, senderUserId: Data, lamport: UInt6
     )
 })
 }
-
+    
     /**
      * The latest relay-uploadable receipt envelope persisted for this
      * cumulative outgoing receipt watermark, if any.
@@ -4043,8 +4043,8 @@ public struct FfiConverterTypeAuthoredGroupMetadataUpdate: FfiConverterRustBuffe
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AuthoredGroupMetadataUpdate {
         return
             try AuthoredGroupMetadataUpdate(
-                group: FfiConverterTypeGroup.read(from: &buf),
-                update: FfiConverterTypeGroupMetadataUpdate.read(from: &buf),
+                group: FfiConverterTypeGroup.read(from: &buf), 
+                update: FfiConverterTypeGroupMetadataUpdate.read(from: &buf), 
                 authored: FfiConverterTypeAuthoredEnvelope.read(from: &buf)
         )
     }
@@ -6536,8 +6536,8 @@ public struct FfiConverterTypeGroup: FfiConverterRustBuffer {
                 id: FfiConverterData.read(from: &buf), 
                 name: FfiConverterString.read(from: &buf), 
                 memberUserIds: FfiConverterSequenceData.read(from: &buf), 
-                key: FfiConverterData.read(from: &buf),
-                metadataRevision: FfiConverterUInt64.read(from: &buf),
+                key: FfiConverterData.read(from: &buf), 
+                metadataRevision: FfiConverterUInt64.read(from: &buf), 
                 metadataChangedBy: FfiConverterData.read(from: &buf)
         )
     }
@@ -6630,10 +6630,10 @@ public struct FfiConverterTypeGroupMetadataUpdate: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupMetadataUpdate {
         return
             try GroupMetadataUpdate(
-                groupId: FfiConverterData.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
-                revision: FfiConverterUInt64.read(from: &buf),
-                changedBy: FfiConverterData.read(from: &buf),
+                groupId: FfiConverterData.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                revision: FfiConverterUInt64.read(from: &buf), 
+                changedBy: FfiConverterData.read(from: &buf), 
                 memberUserIds: FfiConverterSequenceData.read(from: &buf)
         )
     }
@@ -8456,7 +8456,25 @@ public enum CoreInboundDisposition {
     case carried
     case expired
     case seen
+    /**
+     * Envelope whose public header failed local validation (bad hop/expiry).
+     * Not ackable -- its header is invalid locally, but this device has not
+     * proven it was the sealed payload's sole true endpoint consumer (T4-01).
+     */
     case rejected
+    /**
+     * A message addressed to us that we opened but could NOT durably store
+     * (e.g. disk full, corrupt store). Unlike [`CoreInboundDisposition::Seen`]
+     * this is not a "already have it" dead end and unlike
+     * [`CoreInboundDisposition::Consumed`] nothing was persisted, so the
+     * shells must NOT record its `msg_id` as seen: the same envelope must
+     * re-present and re-dispatch on its next copy (T4-06). Never acked
+     * (`core_should_ack_inbound` returns `false`), so the relay copy — often
+     * the only copy — is preserved for that retry rather than deleted. The
+     * safety direction here is the same as `Carried`: churn is recoverable,
+     * deletion is not.
+     */
+    case failed
 }
 
 
@@ -8479,7 +8497,9 @@ public struct FfiConverterTypeCoreInboundDisposition: FfiConverterRustBuffer {
         case 4: return .seen
         
         case 5: return .rejected
-
+        
+        case 6: return .failed
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -8503,10 +8523,14 @@ public struct FfiConverterTypeCoreInboundDisposition: FfiConverterRustBuffer {
         case .seen:
             writeInt(&buf, Int32(4))
         
-
+        
         case .rejected:
             writeInt(&buf, Int32(5))
-
+        
+        
+        case .failed:
+            writeInt(&buf, Int32(6))
+        
         }
     }
 }
@@ -8561,7 +8585,7 @@ public struct FfiConverterTypeCoreInboundGate: FfiConverterRustBuffer {
         case 3: return .expired
         
         case 4: return .rejected
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -8581,10 +8605,10 @@ public struct FfiConverterTypeCoreInboundGate: FfiConverterRustBuffer {
         case .expired:
             writeInt(&buf, Int32(3))
         
-
+        
         case .rejected:
             writeInt(&buf, Int32(4))
-
+        
         }
     }
 }
@@ -10385,7 +10409,9 @@ public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
  * proxy-polling means we may have fetched a contact's envelope on their
  * behalf, and the relay copy is the durable fallback until the real
  * recipient (or another proxy) fetches and consumes it -- deleting it here
- * would silently drop the message. [`CoreInboundDisposition::Seen`] also
+ * would silently drop the message. [`CoreInboundDisposition::Failed`]
+ * (durable storage of a message that was ours failed) is likewise never
+ * acked, so the relay copy survives for the retry. [`CoreInboundDisposition::Seen`] also
  * returns `false` here, but it is NOT necessarily a dead end: see
  * [`consumed_seen_is_ackable`] and
  * [`MessageStore::core_relay_ack_ids_with_consumed`] for the narrow,
@@ -11260,7 +11286,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 13964) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 29385) {
+    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 45795) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_subnet_24_hosts() != 3135) {
