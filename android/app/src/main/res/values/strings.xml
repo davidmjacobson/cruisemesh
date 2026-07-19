@@ -163,4 +163,8 @@
         <item quantity="one">Create group (%1$d)</item>
         <item quantity="other">Create group (%1$d)</item>
     </plurals>
+    <plurals name="ui_carrying_for_others">
+        <item quantity="one">Carrying %1$d message for others</item>
+        <item quantity="other">Carrying %1$d messages for others</item>
+    </plurals>
 </resources>
