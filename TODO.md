@@ -93,20 +93,19 @@ off master, **not yet merged or independently re-verified by me:**
 | T4-03 unbounded relay response | `agent/t4-relay-response-limits` | committed |
 | T4-04 unknown-sender persistence | `agent/t4-inbound-sender-authorization` | committed |
 | T4-05 group/identity amplification | `agent/t4-structured-content-limits` | committed |
-| **T4-06 iOS marks failed store consumed+acks** | — | **NOT STARTED** |
+| T4-06 failed-store must not ack | `agent/t4-durable-ingest-result` | **DONE (`02ec63d`)** — core `CoreInboundDisposition::Failed`; iOS handlers propagate the primary store throw + split delivery catch from open catch; Android wraps direct delivery. Core 255+8, Android 233, all green; iOS pending Mac |
 | T4-07 backup KDF CPU bomb | `agent/t4-backup-hardening` | committed (also the carried-over backup_to hardening) |
 | T4-08 `encode_digest` panic | `agent/t4-digest-encoding` | committed |
 | T4-09 relayd ingress cardinality/quota | `agent/t4-relayd-request-limits` | committed |
 | T4-10 numeric/kind validation | `agent/t4-message-semantics-validation` | committed |
 | fuzzing | `agent/t4-decoder-fuzz-targets` | committed (`f660445`) — was interrupted uncommitted; finished + CI smoke added |
 
-Remaining work: (a) **T4-06** (Medium) — no branch; needs a core-owned
-explicit ingest result (stored/duplicate/rejected/failed) so a failed store
-is never recorded seen/acked, wired into both shells; this touches DTN ack
-safety, review carefully. (b) Merge sequencing: several branches edit the
-same core files (`engine.rs`, generated bindings) — merge one at a time,
-regenerate UniFFI, re-run suites. (c) Independent verification: I have not
-re-run each branch's tests.
+All 10 findings now have a branch (T4-06 implemented by me; the rest by
+Codex). Remaining work: (a) Merge sequencing: several branches edit the same
+core files (`engine.rs`, generated bindings) — merge one at a time,
+regenerate UniFFI, re-run suites. (b) iOS suites for T4-06 and the Codex
+branches await Mac validation. (c) Independent verification of the 9 Codex
+branches is in progress (workspace tests per branch).
 
 ### T5 🟡 Onboarding copy rework
 
