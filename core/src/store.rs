@@ -440,6 +440,7 @@ mod incoming_message_reference {
         msg_id: Option<Vec<u8>>,
         reply_to_msg_id: Option<Vec<u8>>,
     ) -> Result<bool, CoreError> {
+        validate_stored_message(&message)?;
         let mut conn = store.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
 
@@ -616,6 +617,8 @@ mod outgoing_message_reference {
         reply_to_msg_id: Option<Vec<u8>>,
         queued_at_ms: i64,
     ) -> Result<bool, CoreError> {
+        validate_stored_message(&message)?;
+        validate_sqlite_u64("envelope lamport", envelope.lamport)?;
         let mut conn = store.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
         tx.execute(
@@ -1126,6 +1129,7 @@ impl MessageStore {
         envelope: OutgoingReceiptEnvelope,
         queued_at_ms: i64,
     ) -> Result<bool, CoreError> {
+        validate_receipt_watermark(envelope.receipt_type, envelope.through_lamport)?;
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
         let existing: Option<i64> = tx
@@ -1274,6 +1278,7 @@ impl MessageStore {
         receipt_type: u8,
         through_lamport: u64,
     ) -> Result<(), CoreError> {
+        validate_receipt_watermark(receipt_type, through_lamport)?;
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
             "INSERT INTO receipts (chat_id, sender_user_id, receipt_type, through_lamport)
@@ -1326,6 +1331,7 @@ impl MessageStore {
         receipt_type: u8,
         through_lamport: u64,
     ) -> Result<(), CoreError> {
+        validate_receipt_watermark(receipt_type, through_lamport)?;
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
             "INSERT INTO outgoing_receipts (chat_id, sender_user_id, receipt_type, through_lamport)
@@ -2708,6 +2714,26 @@ fn validate_msg_id(field: &str, msg_id: &[u8]) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn validate_stored_message(message: &StoredMessage) -> Result<(), CoreError> {
+    validate_sqlite_u64("message lamport", message.lamport)
+}
+
+fn validate_receipt_watermark(receipt_type: u8, through_lamport: u64) -> Result<(), CoreError> {
+    if receipt_type != crate::RECEIPT_TYPE_DELIVERED && receipt_type != crate::RECEIPT_TYPE_READ {
+        return Err(CoreError::Malformed("invalid receipt type".into()));
+    }
+    validate_sqlite_u64("receipt watermark", through_lamport)
+}
+
+fn validate_sqlite_u64(field: &str, value: u64) -> Result<(), CoreError> {
+    if value > i64::MAX as u64 {
+        return Err(CoreError::Malformed(format!(
+            "{field} exceeds the supported range"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn outbound_message_dedupe_key(
     chat_id: &[u8],
     sender_user_id: &[u8],
@@ -3490,6 +3516,42 @@ mod tests {
             store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn writes_reject_values_that_sqlite_cannot_represent() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(store
+            .insert_message(msg(b"chat-a", b"alice", i64::MAX as u64 + 1, "bad"))
+            .is_err());
+        assert!(store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                RECEIPT_TYPE_DELIVERED,
+                i64::MAX as u64 + 1,
+            )
+            .is_err());
+        assert!(store
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), 0xff, 1)
+            .is_err());
+        assert!(store
+            .upsert_outgoing_receipt_envelope(
+                outgoing_receipt_for(
+                    b"chat-a",
+                    b"alice",
+                    b"bob",
+                    RECEIPT_TYPE_DELIVERED,
+                    i64::MAX as u64 + 1,
+                    &[9; 16],
+                ),
+                1,
+            )
+            .is_err());
+        assert!(store
+            .messages_for_chat(b"chat-a".to_vec())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

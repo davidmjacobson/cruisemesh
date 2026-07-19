@@ -49,11 +49,9 @@
 //! `chat_id` uses a 16-bit length prefix (not 32-bit) because chat ids are
 //! UserIDs or group ids -- tens of bytes at most; `content` uses a 32-bit
 //! prefix since text bodies have more headroom (and §8 reserves room for
-//! attachment-manifest bodies later). Callers are expected to respect those
-//! bounds: `encode_message_body` truncates a length prefix silently if a
-//! field is absurdly large (over 64 KiB for `chat_id`, over 4 GiB for
-//! `content`), rather than failing, on the theory that a BLE text-messaging
-//! app never legitimately produces such a value. Decoding is fully checked
+//! attachment-manifest bodies later). `encode_message_body` rejects fields
+//! that do not fit those wire prefixes rather than silently truncating their
+//! lengths. Decoding is fully checked
 //! and never panics on attacker-controlled input; malformed or truncated
 //! bytes return [`CoreError::Malformed`]. Unknown well-formed extensions are
 //! skipped so adding future encrypted metadata does not make the base message
@@ -346,14 +344,21 @@ pub struct ExtendedMessageBody {
 
 /// Encode a [`MessageBody`] to its wire form (see module docs for layout).
 #[uniffi::export]
-pub fn encode_message_body(body: MessageBody) -> Vec<u8> {
+pub fn encode_message_body(body: MessageBody) -> Result<Vec<u8>, CoreError> {
+    validate_message_body_fields(body.kind, &body.chat_id, body.lamport, &body.content)?;
+    if body.chat_id.len() > u16::MAX as usize {
+        return Err(CoreError::Malformed("message chat id is too long".into()));
+    }
+    if body.content.len() > u32::MAX as usize {
+        return Err(CoreError::Malformed("message content is too long".into()));
+    }
     let mut out = Vec::with_capacity(1 + 2 + body.chat_id.len() + 8 + 8 + 4 + body.content.len());
     out.push(body.kind);
     write_bytes16(&mut out, &body.chat_id);
     out.extend_from_slice(&body.lamport.to_be_bytes());
     out.extend_from_slice(&body.timestamp.to_be_bytes());
     write_bytes32(&mut out, &body.content);
-    out
+    Ok(out)
 }
 
 /// Encode a message body with an encrypted reference to the message being
@@ -369,7 +374,7 @@ pub fn encode_message_body_with_reply(
             "reply_to_msg_id must be exactly {MSG_ID_LEN} bytes"
         )));
     }
-    let mut out = encode_message_body(body);
+    let mut out = encode_message_body(body)?;
     out.push(MESSAGE_EXTENSION_REPLY_TO_MSG_ID);
     out.extend_from_slice(&(MSG_ID_LEN as u16).to_be_bytes());
     out.extend_from_slice(&reply_to_msg_id);
@@ -420,6 +425,7 @@ pub fn decode_extended_message_body(bytes: Vec<u8>) -> Result<ExtendedMessageBod
             reply_to_msg_id = Some(value.to_vec());
         }
     }
+    validate_message_body_fields(kind, &chat_id, lamport, &content)?;
     Ok(ExtendedMessageBody {
         kind,
         chat_id,
@@ -513,14 +519,19 @@ pub struct LanEndpointContent {
 
 /// Encode a [`ReceiptContent`] to its wire form (see module docs for layout).
 #[uniffi::export]
-pub fn encode_receipt_content(content: ReceiptContent) -> Vec<u8> {
+pub fn encode_receipt_content(content: ReceiptContent) -> Result<Vec<u8>, CoreError> {
+    validate_receipt_content(&content)?;
+    if content.chat_id.len() > u16::MAX as usize || content.sender_user_id.len() > u16::MAX as usize
+    {
+        return Err(CoreError::Malformed("receipt identity is too long".into()));
+    }
     let mut out =
         Vec::with_capacity(2 + content.chat_id.len() + 2 + content.sender_user_id.len() + 8 + 1);
     write_bytes16(&mut out, &content.chat_id);
     write_bytes16(&mut out, &content.sender_user_id);
     out.extend_from_slice(&content.lamport.to_be_bytes());
     out.push(content.receipt_type);
-    out
+    Ok(out)
 }
 
 /// Decode a [`ReceiptContent`] from its wire form. Rejects truncated input,
@@ -533,12 +544,61 @@ pub fn decode_receipt_content(bytes: Vec<u8>) -> Result<ReceiptContent, CoreErro
     let lamport = cursor.take_u64()?;
     let receipt_type = cursor.take_u8()?;
     cursor.finish()?;
-    Ok(ReceiptContent {
+    let content = ReceiptContent {
         chat_id,
         sender_user_id,
         lamport,
         receipt_type,
-    })
+    };
+    validate_receipt_content(&content)?;
+    Ok(content)
+}
+
+fn validate_message_body_fields(
+    kind: u8,
+    chat_id: &[u8],
+    lamport: u64,
+    content: &[u8],
+) -> Result<(), CoreError> {
+    if lamport > i64::MAX as u64 {
+        return Err(CoreError::Malformed(
+            "message lamport exceeds the supported range".into(),
+        ));
+    }
+    match kind {
+        KIND_RECEIPT => {
+            let receipt = decode_receipt_content(content.to_vec())?;
+            if receipt.chat_id != chat_id {
+                return Err(CoreError::Malformed(
+                    "receipt chat id does not match its message body".into(),
+                ));
+            }
+        }
+        KIND_ATTACHMENT_MANIFEST => {
+            if crate::content::decode_attachment_payload(content.to_vec()).is_none() {
+                return Err(CoreError::Malformed("invalid attachment payload".into()));
+            }
+        }
+        KIND_REACTION => {
+            if crate::content::decode_reaction_payload(content.to_vec()).is_none() {
+                return Err(CoreError::Malformed("invalid reaction payload".into()));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_receipt_content(content: &ReceiptContent) -> Result<(), CoreError> {
+    if content.receipt_type != RECEIPT_TYPE_DELIVERED && content.receipt_type != RECEIPT_TYPE_READ {
+        return Err(CoreError::Malformed("invalid receipt type".into()));
+    }
+    if content.lamport > i64::MAX as u64 {
+        return Err(CoreError::Malformed(
+            "receipt lamport exceeds the supported range".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Encode a [`ProfileSyncContent`] to its wire form.
@@ -1416,7 +1476,7 @@ mod tests {
     #[test]
     fn message_body_round_trips() {
         let body = sample_body();
-        let encoded = encode_message_body(body.clone());
+        let encoded = encode_message_body(body.clone()).unwrap();
         let decoded = decode_message_body(encoded).expect("decodes");
         assert_eq!(decoded, body);
     }
@@ -1424,13 +1484,13 @@ mod tests {
     #[test]
     fn message_body_round_trips_with_empty_fields() {
         let body = MessageBody {
-            kind: KIND_RECEIPT,
+            kind: KIND_TEXT,
             chat_id: Vec::new(),
             lamport: 0,
             timestamp: 0,
             content: Vec::new(),
         };
-        let encoded = encode_message_body(body.clone());
+        let encoded = encode_message_body(body.clone()).unwrap();
         let decoded = decode_message_body(encoded).expect("decodes");
         assert_eq!(decoded, body);
     }
@@ -1441,7 +1501,7 @@ mod tests {
         // decode fine even if the app never produces them.
         let mut body = sample_body();
         body.timestamp = -1;
-        let encoded = encode_message_body(body.clone());
+        let encoded = encode_message_body(body.clone()).unwrap();
         let decoded = decode_message_body(encoded).expect("decodes");
         assert_eq!(decoded, body);
     }
@@ -1468,7 +1528,7 @@ mod tests {
     #[test]
     fn unknown_message_extensions_are_skipped() {
         let body = sample_body();
-        let mut encoded = encode_message_body(body.clone());
+        let mut encoded = encode_message_body(body.clone()).unwrap();
         encoded.push(99);
         encoded.extend_from_slice(&3u16.to_be_bytes());
         encoded.extend_from_slice(b"new");
@@ -1518,10 +1578,49 @@ mod tests {
 
     #[test]
     fn message_body_decode_rejects_trailing_garbage() {
-        let mut encoded = encode_message_body(sample_body());
+        let mut encoded = encode_message_body(sample_body()).unwrap();
         encoded.push(0xFF);
         let err = decode_message_body(encoded).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn message_body_rejects_unrepresentable_lamports_and_lengths() {
+        let mut body = sample_body();
+        body.lamport = i64::MAX as u64 + 1;
+        assert!(encode_message_body(body).is_err());
+
+        let mut body = sample_body();
+        body.chat_id = vec![0; u16::MAX as usize + 1];
+        assert!(encode_message_body(body).is_err());
+
+        let mut encoded = encode_message_body(sample_body()).unwrap();
+        let lamport_offset = 3 + sample_body().chat_id.len();
+        encoded[lamport_offset..lamport_offset + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(decode_message_body(encoded).is_err());
+    }
+
+    #[test]
+    fn message_body_validates_structured_content_before_dispatch() {
+        let mut attachment = sample_body();
+        attachment.kind = KIND_ATTACHMENT_MANIFEST;
+        attachment.content = b"not an attachment".to_vec();
+        assert!(encode_message_body(attachment).is_err());
+
+        let receipt = sample_receipt();
+        let mut body = MessageBody {
+            kind: KIND_RECEIPT,
+            chat_id: b"different-chat".to_vec(),
+            lamport: 0,
+            timestamp: 1,
+            content: encode_receipt_content(receipt).unwrap(),
+        };
+        assert!(encode_message_body(body.clone()).is_err());
+
+        body.kind = KIND_TEXT;
+        let mut encoded = encode_message_body(body).unwrap();
+        encoded[0] = KIND_RECEIPT;
+        assert!(decode_message_body(encoded).is_err());
     }
 
     fn sample_receipt() -> ReceiptContent {
@@ -1822,7 +1921,7 @@ mod tests {
     #[test]
     fn receipt_content_round_trips() {
         let receipt = sample_receipt();
-        let encoded = encode_receipt_content(receipt.clone());
+        let encoded = encode_receipt_content(receipt.clone()).unwrap();
         let decoded = decode_receipt_content(encoded).expect("decodes");
         assert_eq!(decoded, receipt);
     }
@@ -1831,14 +1930,14 @@ mod tests {
     fn receipt_content_round_trips_for_read_type() {
         let mut receipt = sample_receipt();
         receipt.receipt_type = RECEIPT_TYPE_READ;
-        let encoded = encode_receipt_content(receipt.clone());
+        let encoded = encode_receipt_content(receipt.clone()).unwrap();
         let decoded = decode_receipt_content(encoded).expect("decodes");
         assert_eq!(decoded, receipt);
     }
 
     #[test]
     fn receipt_content_decode_rejects_truncated() {
-        let mut encoded = encode_receipt_content(sample_receipt());
+        let mut encoded = encode_receipt_content(sample_receipt()).unwrap();
         encoded.truncate(encoded.len() - 1); // drop the receipt_type byte
         let err = decode_receipt_content(encoded).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
@@ -1848,6 +1947,21 @@ mod tests {
     fn receipt_content_decode_rejects_garbage() {
         let err = decode_receipt_content(vec![0xFF, 0xFF, 0xFF]).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn receipt_content_rejects_unknown_type_and_unrepresentable_lamport() {
+        let mut encoded = encode_receipt_content(sample_receipt()).unwrap();
+        *encoded.last_mut().unwrap() = 0xff;
+        assert!(decode_receipt_content(encoded).is_err());
+
+        let mut receipt = sample_receipt();
+        receipt.receipt_type = 0xff;
+        assert!(encode_receipt_content(receipt).is_err());
+
+        let mut receipt = sample_receipt();
+        receipt.lamport = i64::MAX as u64 + 1;
+        assert!(encode_receipt_content(receipt).is_err());
     }
 
     #[test]
@@ -2256,7 +2370,7 @@ mod tests {
         let bob = generate_identity();
 
         let body = sample_body();
-        let payload = encode_message_body(body.clone());
+        let payload = encode_message_body(body.clone()).unwrap();
 
         let sealed =
             seal_message(alice.clone(), bob.agree_pk.clone(), payload).expect("seal succeeds");
@@ -2293,9 +2407,9 @@ mod tests {
             chat_id: receipt.chat_id.clone(),
             lamport: 99,
             timestamp: 1_700_000_001_000,
-            content: encode_receipt_content(receipt.clone()),
+            content: encode_receipt_content(receipt.clone()).unwrap(),
         };
-        let payload = encode_message_body(body.clone());
+        let payload = encode_message_body(body.clone()).unwrap();
 
         let sealed =
             seal_message(alice.clone(), bob.agree_pk.clone(), payload).expect("seal succeeds");
@@ -2321,7 +2435,7 @@ mod tests {
             timestamp: 1_700_000_001_000,
             content: encode_profile_sync_content(content.clone()),
         };
-        let payload = encode_message_body(body.clone());
+        let payload = encode_message_body(body.clone()).unwrap();
 
         let sealed =
             seal_message(alice.clone(), bob.agree_pk.clone(), payload).expect("seal succeeds");
