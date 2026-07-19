@@ -11078,6 +11078,27 @@ public func relayEncodePresenceRequest(announce: [Data], query: [Data])throws  -
 })
 }
 /**
+ * Fetch pages stay deliberately small because every sealed row is controlled
+ * by the relay until it has passed the authenticated envelope ingest path.
+ */
+public func relayFetchBatchLimit() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_fetch_batch_limit($0
+    )
+})
+}
+/**
+ * Maximum response body that either mobile shell may accumulate before
+ * cancelling the relay request. The core repeats this check at every decoder
+ * so callers outside the first-party shells cannot bypass it.
+ */
+public func relayMaxResponseBytes() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_max_response_bytes($0
+    )
+})
+}
+/**
  * Rotate a group's symmetric key and replace its member list, keeping the
  * stable group id/name. This is the v1 membership-change mechanism from
  * DESIGN.md §6.5: generate a new key and re-invite the remaining members.
@@ -11445,6 +11466,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_encode_presence_request() != 64701) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_fetch_batch_limit() != 7996) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_rotate_group() != 56003) {

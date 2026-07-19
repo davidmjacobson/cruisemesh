@@ -168,7 +168,7 @@ final class RelayClientTests: XCTestCase {
             config: config,
             hints: [Data(repeating: 4, count: 8)],
             afterId: 0,
-            limit: 50
+            limit: 16
         )
         XCTAssertEqual(page.envelopes.count, 1)
         XCTAssertEqual(page.nextCursor, 9)
@@ -205,12 +205,25 @@ final class RelayClientTests: XCTestCase {
         ]
         let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
 
-        XCTAssertThrowsError(try RelayClient.fetchEnvelopes(config: config, hints: [], afterId: 0, limit: 50))
+        XCTAssertThrowsError(try RelayClient.fetchEnvelopes(config: config, hints: [], afterId: 0, limit: 16))
     }
 
     func testPostRejectsMissingEnvelopeId() {
         RelayMockURLProtocol.responses = [
             .init(statusCode: 200, body: Data(#"{}"#.utf8), headers: [:]),
+        ]
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+
+        XCTAssertThrowsError(try RelayClient.postOutboundEnvelope(config: config, envelope: sampleOutboundEnvelope()))
+    }
+
+    func testResponseContentLengthAboveCoreLimitIsRejectedBeforeBodyAccumulation() {
+        RelayMockURLProtocol.responses = [
+            .init(
+                statusCode: 200,
+                body: Data(#"{"id":7}"#.utf8),
+                headers: ["Content-Length": "\(relayMaxResponseBytes() + 1)"]
+            ),
         ]
         let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
 

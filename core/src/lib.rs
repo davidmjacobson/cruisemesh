@@ -79,8 +79,9 @@ pub use protocol::{
 pub use relay_wire::{
     normalize_relay_url, relay_build_fetch_path, relay_decode_fetch_page,
     relay_decode_post_response, relay_decode_presence_page, relay_encode_ack_request,
-    relay_encode_post_envelope, relay_encode_presence_request, CoreRelayFetchPage,
-    CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage,
+    relay_encode_post_envelope, relay_encode_presence_request, relay_fetch_batch_limit,
+    relay_max_response_bytes, CoreRelayFetchPage, CoreRelayFetchedEnvelope, CoreRelayPresence,
+    CoreRelayPresencePage,
 };
 pub use semantic::{
     core_is_visible_chat_kind, core_last_visible_message, core_reaction_summaries_by_target,
