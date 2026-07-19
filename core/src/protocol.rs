@@ -238,6 +238,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::{signing_key_from_bytes, verifying_key_from_bytes};
 use crate::identity::derive_user_id;
+use crate::limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 use crate::store::DigestEntry;
 use crate::{CoreError, Identity};
 
@@ -1093,18 +1094,51 @@ pub fn encode_digest(
     chat_id: Vec<u8>,
     entries: Vec<DigestEntry>,
     recent_msg_ids: Vec<Vec<u8>>,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        1 + 2
-            + chat_id.len()
-            + 2
-            + entries
-                .iter()
-                .map(|e| 2 + e.sender_user_id.len() + 8)
-                .sum::<usize>()
-            + 2
-            + recent_msg_ids.len() * MSG_ID_LEN,
-    );
+) -> Result<Vec<u8>, CoreError> {
+    if chat_id.len() > u16::MAX as usize {
+        return Err(CoreError::Malformed("digest chat_id is too long".into()));
+    }
+    if entries.len() > u16::MAX as usize {
+        return Err(CoreError::Malformed(
+            "digest contains too many entries".into(),
+        ));
+    }
+    if recent_msg_ids.len() > u16::MAX as usize {
+        return Err(CoreError::Malformed(
+            "digest contains too many recent message ids".into(),
+        ));
+    }
+    for entry in &entries {
+        if entry.sender_user_id.len() > u16::MAX as usize {
+            return Err(CoreError::Malformed(
+                "digest sender_user_id is too long".into(),
+            ));
+        }
+    }
+    for msg_id in &recent_msg_ids {
+        if msg_id.len() != MSG_ID_LEN {
+            return Err(CoreError::Malformed(format!(
+                "digest msg_id must be exactly {MSG_ID_LEN} bytes"
+            )));
+        }
+    }
+
+    let capacity = 1usize
+        .checked_add(2)
+        .and_then(|value| value.checked_add(chat_id.len()))
+        .and_then(|value| value.checked_add(2))
+        .and_then(|value| {
+            entries.iter().try_fold(value, |total, entry| {
+                total
+                    .checked_add(2)
+                    .and_then(|next| next.checked_add(entry.sender_user_id.len()))
+                    .and_then(|next| next.checked_add(8))
+            })
+        })
+        .and_then(|value| value.checked_add(2))
+        .and_then(|value| value.checked_add(recent_msg_ids.len().checked_mul(MSG_ID_LEN)?))
+        .ok_or_else(|| CoreError::Malformed("digest frame is too large".into()))?;
+    let mut out = Vec::with_capacity(capacity);
     out.push(FRAME_TYPE_DIGEST);
     write_bytes16(&mut out, &chat_id);
     out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
@@ -1114,15 +1148,9 @@ pub fn encode_digest(
     }
     out.extend_from_slice(&(recent_msg_ids.len() as u16).to_be_bytes());
     for msg_id in &recent_msg_ids {
-        assert_eq!(
-            msg_id.len(),
-            MSG_ID_LEN,
-            "digest msg_id must be exactly {} bytes",
-            MSG_ID_LEN
-        );
         out.extend_from_slice(msg_id);
     }
-    out
+    Ok(out)
 }
 
 /// Encode a LAN endpoint introduction. The opaque 8-byte instance token is
@@ -1193,6 +1221,11 @@ pub fn encode_transport_probe(nonce: u64, response: bool) -> Vec<u8> {
 /// truncated or trailing-garbage DIGEST body.
 #[uniffi::export]
 pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
+    if bytes.len() > MAX_P2P_FRAME_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "frame exceeds {MAX_P2P_FRAME_BYTES}-byte limit"
+        )));
+    }
     let (frame_type, rest) = bytes
         .split_first()
         .ok_or_else(|| CoreError::Malformed("empty frame: missing frame-type byte".to_string()))?;
@@ -1218,6 +1251,11 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
                 return Err(CoreError::Malformed(
                     "envelope frame missing sealed payload".to_string(),
                 ));
+            }
+            if sealed.len() > MAX_ENVELOPE_SEALED_BYTES {
+                return Err(CoreError::Malformed(format!(
+                    "sealed envelope exceeds {MAX_ENVELOPE_SEALED_BYTES}-byte limit"
+                )));
             }
             Ok(Frame::Envelope {
                 msg_id,
@@ -2052,6 +2090,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_frame_rejects_oversized_input_before_dispatch() {
+        let err = parse_frame(vec![0x99; MAX_P2P_FRAME_BYTES + 1]).unwrap_err();
+        assert!(err.to_string().contains("frame exceeds"));
+    }
+
+    #[test]
+    fn parse_frame_accepts_envelope_at_sealed_limit() {
+        let framed = encode_envelope_frame(
+            vec![1; MSG_ID_LEN],
+            DEFAULT_HOP_TTL,
+            default_expiry(0),
+            vec![2; RECIPIENT_HINT_LEN],
+            vec![3; MAX_ENVELOPE_SEALED_BYTES],
+        );
+        assert!(matches!(parse_frame(framed), Ok(Frame::Envelope { .. })));
+    }
+
+    #[test]
     fn parse_frame_rejects_unknown_type_byte() {
         let err = parse_frame(vec![0x99, 0x01, 0x02]).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
@@ -2101,7 +2157,8 @@ mod tests {
         let chat_id = b"chat-1".to_vec();
         let entries = sample_entries();
         let recent_msg_ids = sample_recent_msg_ids();
-        let framed = encode_digest(chat_id.clone(), entries.clone(), recent_msg_ids.clone());
+        let framed =
+            encode_digest(chat_id.clone(), entries.clone(), recent_msg_ids.clone()).unwrap();
         assert_eq!(framed[0], 0x03);
         match parse_frame(framed).expect("parses") {
             Frame::Digest {
@@ -2120,7 +2177,7 @@ mod tests {
     #[test]
     fn digest_frame_round_trips_with_no_entries() {
         // "I have nothing in this chat" is a valid digest (asks for everything).
-        let framed = encode_digest(b"chat-1".to_vec(), Vec::new(), Vec::new());
+        let framed = encode_digest(b"chat-1".to_vec(), Vec::new(), Vec::new()).unwrap();
         match parse_frame(framed).expect("parses") {
             Frame::Digest {
                 chat_id,
@@ -2141,7 +2198,7 @@ mod tests {
             sender_user_id: b"alice".to_vec(),
             through_lamport: u64::MAX,
         }];
-        let framed = encode_digest(Vec::new(), entries.clone(), sample_recent_msg_ids());
+        let framed = encode_digest(Vec::new(), entries.clone(), sample_recent_msg_ids()).unwrap();
         match parse_frame(framed).expect("parses") {
             Frame::Digest {
                 chat_id,
@@ -2281,7 +2338,7 @@ mod tests {
 
     #[test]
     fn parse_frame_rejects_digest_with_truncated_recent_msg_id() {
-        let mut bytes = encode_digest(b"chat-1".to_vec(), sample_entries(), Vec::new());
+        let mut bytes = encode_digest(b"chat-1".to_vec(), sample_entries(), Vec::new()).unwrap();
         bytes.extend_from_slice(&(1u16).to_be_bytes());
         bytes.extend_from_slice(&[0xAA; MSG_ID_LEN - 1]);
         let err = parse_frame(bytes).unwrap_err();
@@ -2294,10 +2351,17 @@ mod tests {
             b"chat-1".to_vec(),
             sample_entries(),
             sample_recent_msg_ids(),
-        );
+        )
+        .unwrap();
         framed.push(0xFF);
         let err = parse_frame(framed).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn digest_encoder_rejects_invalid_message_ids_without_panicking() {
+        let result = encode_digest(Vec::new(), Vec::new(), vec![vec![0; MSG_ID_LEN - 1]]);
+        assert!(matches!(result, Err(CoreError::Malformed(_))));
     }
 
     #[test]

@@ -14,8 +14,8 @@ use cruisemesh_core::{
     compute_recipient_hint, default_expiry, encode_message_body, generate_identity, generate_msg_id,
     seal_message, Identity, MessageBody, DEFAULT_HOP_TTL, KIND_TEXT,
 };
-use cruisemesh_relayd::{app, AppState, RelayStore};
-use futures_util::StreamExt;
+use cruisemesh_relayd::{app, AppState, RelayStore, WS_MAX_INBOUND_MESSAGE_BYTES};
+use futures_util::{SinkExt, StreamExt};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 use tower::util::ServiceExt;
@@ -127,6 +127,33 @@ async fn ws_auth_reject() {
         tokio_tungstenite::connect_async(&url).await.is_err(),
         "bad token must fail handshake"
     );
+}
+
+#[tokio::test]
+async fn ws_drops_clients_that_send_oversized_messages() {
+    let db = NamedTempFile::new().unwrap();
+    let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
+    let (_router, ws_url) = spawn_router(AppState::new(
+        store,
+        HashSet::from(["family-a".to_string()]),
+    ))
+    .await;
+    let url = format!("{ws_url}/ws?hints={}&token=family-a", b64(&[1u8; 8]));
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            "x".repeat(WS_MAX_INBOUND_MESSAGE_BYTES + 1).into(),
+        ))
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), socket.next())
+        .await
+        .expect("server did not close the oversized websocket");
+    match result {
+        None | Some(Err(_)) => {}
+        Some(Ok(message)) => assert!(message.is_close()),
+    }
 }
 
 #[tokio::test]
