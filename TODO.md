@@ -101,11 +101,29 @@ off master, **not yet merged or independently re-verified by me:**
 | fuzzing | `agent/t4-decoder-fuzz-targets` | committed (`f660445`) — was interrupted uncommitted; finished + CI smoke added |
 
 All 10 findings now have a branch (T4-06 implemented by me; the rest by
-Codex). Remaining work: (a) Merge sequencing: several branches edit the same
-core files (`engine.rs`, generated bindings) — merge one at a time,
-regenerate UniFFI, re-run suites. (b) iOS suites for T4-06 and the Codex
-branches await Mac validation. (c) Independent verification of the 9 Codex
-branches is in progress (workspace tests per branch).
+Codex).
+
+**Verification (2026-07-19, independent re-run):** all 9 Codex branches pass
+the Rust workspace suite (`cargo test --workspace` = core + relayd), 255–305
+tests each, 0 real failures. One WebSocket integration test
+(`ws_live_push_after_connect`) flaked once under parallel-build load; it
+passes 4/4 in isolation and on a clean full re-run — environmental, not a
+regression. All 10 branches merge cleanly onto current `master`
+individually. Fix logic read and confirmed sound for the High-severity
+findings T4-01 (BLAKE2b content-digest dedupe + 64 MiB carry budget +
+expiry/hop validation) and T4-02 (per-fragment + cumulative BLE reassembly
+cap), and the most complex shell change T4-04 (core `core_pairwise_sender_authorized`
+gate, correctly called before persistence in the shells). Android spot-check
+on T4-04 (`agent/t4-inbound-sender-authorization`): 233 unit tests, 0
+failures. iOS suites for every branch still await Mac validation.
+
+Remaining work: (a) Merge sequencing — the branches share hot files
+(`engine.rs`: T4-01/04/06; `protocol.rs`: T4-02/05/08/10; `store.rs`:
+T4-01/05/07/10; `lib.rs`: 5 branches; generated bindings: 8 branches). Merge
+one at a time onto master, and DO NOT merge the generated-binding diffs —
+regenerate them with uniffi-bindgen after each source merge, then re-run
+suites. `agent/t4-relayd-request-limits` (T4-09) is fully independent (relayd
+only) and can land anytime. (b) iOS validation on the Mac once reachable.
 
 ### T5 🟡 Onboarding copy rework
 
