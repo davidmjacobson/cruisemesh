@@ -6,8 +6,34 @@ Updated 2026-07-19. This is the single live TODO file. It replaces
 shipped (DTN D1–D7, UI U1–U13, LAN L1/L2/L4; see git history and the removed
 files' completion records) except the items carried over in §2 below.
 
-§1 is new work from David's field observations (2026-07-19 build,
-master `7d21815`). §3 has the ground rules; read them before writing code.
+§1 is new work from David's field observations. §3 has the ground rules;
+read them before writing code.
+
+---
+
+## 0. Shipped to master (2026-07-19)
+
+Done and merged; kept in §1/§2 below as reference (bodies describe what was
+built). Do not re-open.
+
+- **T4 — adversarial payload review** ✅ all 10 findings T4-01…T4-10 + review
+  doc merged (PRs #76–86). `specs/adversarial-payload-review.md`. No
+  memory-safety/forgery bug; the DoS hardening (carry-queue budget, BLE
+  reassembly cap, relay/relayd admission limits, sender authorization, KDF
+  range, digest fail-safe, message-semantics validation) is live. Verified:
+  Rust workspace 330, Android 235, iOS per-branch on the Mac.
+- **T4 fuzzing** ✅ decoder fuzz targets + CI smoke merged (PR #89).
+- **T9 — isolation verdict shown too soon** ✅ merged (PR #87): verdict gated
+  on sweep completion, neutral in-progress state, resets on network change.
+- **Release diagnostic logging** (Android; §1.5) ✅ merged (PR #88).
+- **`backup_to` hardening** (was a §2 carryover) ✅ folded into T4-07.
+
+Still open and worth doing next (my read): **T1 swipe-to-reply** and **T2
+mule count** are the highest-value self-contained 🔴 code items. **T11
+friending reciprocity** is 🔴 but blocked on a device log (David repro +
+logcat). **T12 QR density** is a quick 🟡 (root cause already diagnosed).
+**T13 iOS diagnostic-log parity** now that the Android half shipped. Larger:
+**D9** group receipts. Field/device: **L3/V1/V2**.
 
 ---
 
@@ -270,15 +296,10 @@ with no in-app export, so a field iPhone can't hand over a log.
 
 ---
 
-## 1.5 Recently shipped (this session, not yet merged to master)
+## 1.5 Shipped — see §0
 
-- **Release diagnostic logging (Android).** `DebugFileLog` was gated on
-  `FLAG_DEBUGGABLE`, so release installs couldn't produce a log. Now: an
-  opt-in "Diagnostic logging" switch in Advanced settings (persisted across
-  restarts) plus the share button, available in release builds; debug builds
-  keep unconditional capture. Own-process logcat only; metadata only, never
-  message content. Branch `agent/release-diagnostic-log` (commit `1ffad7a`,
-  235 unit tests green). iOS parity is T13 above.
+Everything formerly staged here (release diagnostic logging, the T4 fixes,
+T9, fuzzing) has merged to master. See §0 for the list with PR numbers.
 
 ---
 
@@ -309,8 +330,7 @@ with no in-app export, so a field iPhone can't hand over a log.
   screen, so the field test produces data. Small, both platforms.
 - **Relay presence "Phase 2"** (from `CONNECTIVITY_INDICATOR.md`): deferred —
   touches the live relay server; needs an explicit go-ahead.
-- **Core `backup_to` hardening** (from the local-backup feature): still TODO;
-  don't silently depend on unhardened behavior.
+- ~~Core `backup_to` hardening~~ — ✅ done, folded into T4-07 (see §0).
 
 ---
 
