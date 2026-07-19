@@ -5,6 +5,8 @@
 
 use std::sync::Mutex;
 
+use crate::limits::MAX_P2P_FRAME_BYTES;
+
 const FRAGMENT_HEADER_SIZE: usize = 4;
 pub const ATT_HEADER_OVERHEAD: u16 = 3;
 pub const DEFAULT_ATT_MTU: u16 = 23;
@@ -31,6 +33,9 @@ pub fn ble_max_att_value_len() -> u16 {
 /// platform GATT callback with an exception.
 #[uniffi::export]
 pub fn fragment_ble_frame(frame: Vec<u8>, mtu_payload_size: u32) -> Option<Vec<Vec<u8>>> {
+    if frame.len() > MAX_P2P_FRAME_BYTES {
+        return None;
+    }
     let capped_payload = (mtu_payload_size as usize).min(MAX_ATT_VALUE_LEN);
     let chunk_size = capped_payload.saturating_sub(FRAGMENT_HEADER_SIZE).max(1);
     let total = frame.len().div_ceil(chunk_size).max(1);
@@ -76,12 +81,13 @@ impl BleFrameReassembler {
     /// Feed one fragment, returning the full frame only after its last ordered
     /// fragment. Malformed or desynchronized input drops the partial frame.
     pub fn accept(&self, fragment: Vec<u8>) -> Option<Vec<u8>> {
-        if fragment.len() < FRAGMENT_HEADER_SIZE {
+        let mut state = self.state.lock().expect("BLE reassembler mutex poisoned");
+        if fragment.len() < FRAGMENT_HEADER_SIZE || fragment.len() > MAX_ATT_VALUE_LEN {
+            *state = ReassemblyState::default();
             return None;
         }
         let index = u16::from_be_bytes([fragment[0], fragment[1]]);
         let total = u16::from_be_bytes([fragment[2], fragment[3]]);
-        let mut state = self.state.lock().expect("BLE reassembler mutex poisoned");
 
         if total == 0 || index >= total {
             *state = ReassemblyState::default();
@@ -97,11 +103,13 @@ impl BleFrameReassembler {
             return None;
         }
 
-        state
-            .buffer
-            .as_mut()
-            .expect("buffer checked above")
-            .extend_from_slice(&fragment[FRAGMENT_HEADER_SIZE..]);
+        let payload = &fragment[FRAGMENT_HEADER_SIZE..];
+        let buffer = state.buffer.as_mut().expect("buffer checked above");
+        if buffer.len().saturating_add(payload.len()) > MAX_P2P_FRAME_BYTES {
+            *state = ReassemblyState::default();
+            return None;
+        }
+        buffer.extend_from_slice(payload);
         state.next_index += 1;
         if state.next_index < state.expected_total {
             return None;
@@ -157,6 +165,46 @@ mod tests {
     #[test]
     fn oversized_frame_is_rejected_without_panicking() {
         assert!(fragment_ble_frame(vec![0; MAX_FRAGMENTS + 1], 5).is_none());
+        assert!(fragment_ble_frame(vec![0; MAX_P2P_FRAME_BYTES + 1], 512).is_none());
+    }
+
+    #[test]
+    fn exact_frame_limit_round_trips() {
+        let frame = vec![7; MAX_P2P_FRAME_BYTES];
+        let (_, result) = round_trip(frame.clone(), 512);
+        assert_eq!(result, frame);
+    }
+
+    #[test]
+    fn cumulative_oversize_discards_partial_frame() {
+        let reassembler = BleFrameReassembler::new();
+        let payload_size = MAX_ATT_VALUE_LEN - FRAGMENT_HEADER_SIZE;
+        let total = (MAX_P2P_FRAME_BYTES + 1).div_ceil(payload_size) as u16;
+
+        for index in 0..total {
+            let remaining = MAX_P2P_FRAME_BYTES + 1 - index as usize * payload_size;
+            let payload_len = remaining.min(payload_size);
+            let mut fragment = Vec::with_capacity(FRAGMENT_HEADER_SIZE + payload_len);
+            fragment.extend_from_slice(&index.to_be_bytes());
+            fragment.extend_from_slice(&total.to_be_bytes());
+            fragment.resize(FRAGMENT_HEADER_SIZE + payload_len, 1);
+            assert!(reassembler.accept(fragment).is_none());
+        }
+
+        let valid = fragment_ble_frame(vec![9; 16], 20).unwrap();
+        assert_eq!(reassembler.accept(valid[0].clone()), Some(vec![9; 16]));
+    }
+
+    #[test]
+    fn oversized_fragment_is_rejected() {
+        let reassembler = BleFrameReassembler::new();
+        let valid = fragment_ble_frame(vec![9; 24], 20).unwrap();
+        assert!(reassembler.accept(valid[0].clone()).is_none());
+
+        let mut fragment = vec![0; MAX_ATT_VALUE_LEN + 1];
+        fragment[3] = 1;
+        assert!(reassembler.accept(fragment).is_none());
+        assert!(reassembler.accept(valid[1].clone()).is_none());
     }
 
     #[test]
