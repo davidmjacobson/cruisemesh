@@ -1,5 +1,88 @@
 import Foundation
 
+private final class BoundedRelayResponseDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let maxBytes: Int
+    private let semaphore: DispatchSemaphore
+    private let lock = NSLock()
+    private var data = Data()
+    private var response: URLResponse?
+    private var completedResult: Result<(Data, URLResponse), Error>?
+
+    init(maxBytes: Int, semaphore: DispatchSemaphore) {
+        self.maxBytes = maxBytes
+        self.semaphore = semaphore
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        if response.expectedContentLength > Int64(maxBytes) {
+            finish(.failure(Self.tooLarge(maxBytes)))
+            completionHandler(.cancel)
+            return
+        }
+        self.response = response
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+        guard completedResult == nil else { return }
+        guard chunk.count <= maxBytes - data.count else {
+            finish(.failure(Self.tooLarge(maxBytes)))
+            dataTask.cancel()
+            return
+        }
+        data.append(chunk)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        guard completedResult == nil else { return }
+        if let error {
+            finish(.failure(error))
+        } else if let response {
+            finish(.success((data, response)))
+        } else {
+            finish(.failure(NSError(
+                domain: "RelayClient",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "empty response"]
+            )))
+        }
+    }
+
+    func result() -> Result<(Data, URLResponse), Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return completedResult
+    }
+
+    private func finish(_ result: Result<(Data, URLResponse), Error>) {
+        lock.lock()
+        guard completedResult == nil else {
+            lock.unlock()
+            return
+        }
+        completedResult = result
+        lock.unlock()
+        semaphore.signal()
+    }
+
+    private static func tooLarge(_ maxBytes: Int) -> NSError {
+        NSError(
+            domain: "RelayClient",
+            code: 3,
+            userInfo: [NSLocalizedDescriptionKey: "relay response exceeds \(maxBytes) bytes"]
+        )
+    }
+}
+
 struct RelayFetchedEnvelope {
     let id: Int64
     let msgId: Data
@@ -160,23 +243,24 @@ enum RelayClient {
 
     private static func syncRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
         let sem = DispatchSemaphore(value: 0)
-        var result: Result<(Data, URLResponse), Error>?
-        let task = urlSession.dataTask(with: request) { data, response, error in
-            if let error {
-                result = .failure(error)
-            } else if let data, let response {
-                result = .success((data, response))
-            } else {
-                result = .failure(NSError(domain: "RelayClient", code: 2, userInfo: [NSLocalizedDescriptionKey: "empty response"]))
-            }
-            sem.signal()
-        }
+        let delegate = BoundedRelayResponseDelegate(
+            maxBytes: Int(relayMaxResponseBytes()),
+            semaphore: sem
+        )
+        let session = URLSession(
+            configuration: urlSession.configuration,
+            delegate: delegate,
+            delegateQueue: nil
+        )
+        let task = session.dataTask(with: request)
         task.resume()
         guard sem.wait(timeout: .now() + connectTimeout + 5) == .success else {
             task.cancel()
+            session.invalidateAndCancel()
             throw URLError(.timedOut)
         }
-        guard let result else {
+        session.finishTasksAndInvalidate()
+        guard let result = delegate.result() else {
             throw malformedResponse("request completed without a result")
         }
         return try result.get()
@@ -187,7 +271,7 @@ enum RelayClient {
             throw malformedResponse("non-HTTP relay response")
         }
         guard (200..<300).contains(http.statusCode) else {
-            let body = String(data: data, encoding: .utf8) ?? ""
+            let body = String(data: data.prefix(2_048), encoding: .utf8) ?? ""
             throw NSError(
                 domain: "RelayClient",
                 code: http.statusCode,

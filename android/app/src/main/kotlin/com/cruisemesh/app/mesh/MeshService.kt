@@ -99,6 +99,7 @@ import uniffi.cruisemesh_core.openGroupMessage
 import uniffi.cruisemesh_core.parseFriendCard
 import uniffi.cruisemesh_core.openMessage
 import uniffi.cruisemesh_core.parseFrame
+import uniffi.cruisemesh_core.relayFetchBatchLimit
 import uniffi.cruisemesh_core.sealMessage
 import uniffi.cruisemesh_core.verifyIntroductionTicket
 
@@ -150,7 +151,7 @@ private const val PRESENCE_HINT_DAY_WINDOW: Long = 3
 
 /** DESIGN.md §5.3: the bounded budget (~5 MB) of *foreign* muled envelopes; family (known-recipient) traffic is exempt. */
 private const val FOREIGN_CARRY_BUDGET_BYTES: Long = 5L * 1024 * 1024
-private const val RELAY_BATCH_LIMIT: ULong = 128uL
+private const val RELAY_STORE_BATCH_LIMIT: ULong = 128uL
 private const val RELAY_POLL_INTERVAL_MS = 60_000L
 
 /**
@@ -886,7 +887,7 @@ class MeshService : Service() {
         network: Network?,
     ) {
         val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
-        for (envelope in store.pendingRelayOutgoingReceiptEnvelopes(RELAY_BATCH_LIMIT, now)) {
+        for (envelope in store.pendingRelayOutgoingReceiptEnvelopes(RELAY_STORE_BATCH_LIMIT, now)) {
             val contact = contactsByUserId[UserIdHex.encode(envelope.recipientUserId)] ?: continue
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
@@ -909,7 +910,7 @@ class MeshService : Service() {
         network: Network?,
     ) {
         val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
-        for (envelope in store.pendingRelayOutboundEnvelopes(RELAY_BATCH_LIMIT, now)) {
+        for (envelope in store.pendingRelayOutboundEnvelopes(RELAY_STORE_BATCH_LIMIT, now)) {
             // 1:1 / invite envelopes are addressed to a contact userId; group
             // text uses recipientUserId = group.id and rides the family's
             // fallback (or any member's) relay config.
@@ -995,7 +996,7 @@ class MeshService : Service() {
         now: Long,
         network: Network?,
     ) {
-        for (envelope in store.familyCarriedEnvelopes(RELAY_BATCH_LIMIT, now)) {
+        for (envelope in store.familyCarriedEnvelopes(RELAY_STORE_BATCH_LIMIT, now)) {
             val contact = contactMatchingHint(contacts, envelope.recipientHint, now)
             if (contact == null) {
                 // Group-hinted carried envelope: previously skipped entirely
@@ -1091,8 +1092,9 @@ class MeshService : Service() {
         val hints = dedupeHints(selfHints, proxyHints)
         if (hints.isEmpty()) return
         var after = 0L
+        val fetchBatchLimit = relayFetchBatchLimit().toInt()
         while (running && hasValidatedInternet()) {
-            val page = RelayClient.fetchEnvelopes(config, hints, after, RELAY_BATCH_LIMIT.toInt(), network)
+            val page = RelayClient.fetchEnvelopes(config, hints, after, fetchBatchLimit, network)
             Log.i(
                 TAG,
                 "Fetched ${page.envelopes.size} relay envelope(s) from ${config.relayUrl} after=$after next=${page.nextCursor}",
@@ -1120,7 +1122,7 @@ class MeshService : Service() {
                 RelayClient.ackEnvelopes(config, ackIds, network)
             }
             after = page.nextCursor
-            if (page.envelopes.size < RELAY_BATCH_LIMIT.toInt()) return
+            if (page.envelopes.size < fetchBatchLimit) return
         }
     }
 
@@ -1730,7 +1732,7 @@ class MeshService : Service() {
                 nowMs = now,
                 ownOutboundBudgetBytes = OWN_OUTBOUND_SPRAY_BUDGET_BYTES.toULong(),
                 ownReceiptBudgetBytes = OWN_RECEIPT_SPRAY_BUDGET_BYTES.toULong(),
-                receiptQueryLimit = RELAY_BATCH_LIMIT,
+                receiptQueryLimit = RELAY_STORE_BATCH_LIMIT,
             )
             val frames = plan.carriedFrames + plan.ownOutboundFrames + plan.ownReceiptFrames
             val sprayed = frames.count { MeshRouter.sendToAddress(address, it) }

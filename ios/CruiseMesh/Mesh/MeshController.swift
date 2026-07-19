@@ -1929,7 +1929,7 @@ final class MeshController: ObservableObject {
             nowMs: now,
             ownOutboundBudgetBytes: MeshDefaults.ownOutboundSprayBudgetBytes,
             ownReceiptBudgetBytes: MeshDefaults.ownReceiptSprayBudgetBytes,
-            receiptQueryLimit: MeshDefaults.relayBatchLimit
+            receiptQueryLimit: MeshDefaults.relayStoreBatchLimit
         ) else {
             log.warning("Failed to build digest spray plan for \(address, privacy: .public)")
             return
@@ -2095,7 +2095,7 @@ final class MeshController: ObservableObject {
             _ = try store.pruneExpiredOutboundEnvelopes(nowMs: now)
             _ = try store.pruneExpiredCarried(nowMs: now)
             let receipts = try store.pendingRelayOutgoingReceiptEnvelopes(
-                limit: MeshDefaults.relayBatchLimit,
+                limit: MeshDefaults.relayStoreBatchLimit,
                 nowMs: now
             )
             for env in receipts {
@@ -2103,7 +2103,7 @@ final class MeshController: ObservableObject {
                 _ = try store.markOutgoingReceiptEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
             }
             let outbound = try store.pendingRelayOutboundEnvelopes(
-                limit: MeshDefaults.relayBatchLimit,
+                limit: MeshDefaults.relayStoreBatchLimit,
                 nowMs: now
             )
             let importedGroups = try store.listGroups()
@@ -2153,7 +2153,7 @@ final class MeshController: ObservableObject {
                 _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
             }
             let family = try store.familyCarriedEnvelopes(
-                limit: MeshDefaults.relayBatchLimit,
+                limit: MeshDefaults.relayStoreBatchLimit,
                 nowMs: now
             )
             for env in family {
@@ -2233,12 +2233,13 @@ final class MeshController: ObservableObject {
                 })
             }
             var afterId: Int64 = 0
+            let fetchBatchLimit = Int(relayFetchBatchLimit())
             while true {
                 let page = try RelayClient.fetchEnvelopes(
                     config: config,
                     hints: hints,
                     afterId: afterId,
-                    limit: Int(MeshDefaults.relayBatchLimit)
+                    limit: fetchBatchLimit
                 )
                 guard !page.envelopes.isEmpty else { break }
                 var dispositions: [CoreRelayEnvelopeDisposition] = []
@@ -2276,7 +2277,7 @@ final class MeshController: ObservableObject {
                     try RelayClient.ackEnvelopes(config: config, ids: acks)
                 }
                 afterId = page.nextCursor
-                if page.envelopes.count < Int(MeshDefaults.relayBatchLimit) { break }
+                if page.envelopes.count < fetchBatchLimit { break }
             }
             await MainActor.run {
                 MeshConnectivityStatus.shared.setRelayHealth(.ok(
