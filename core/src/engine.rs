@@ -47,6 +47,17 @@ pub enum CoreInboundDisposition {
     Carried,
     Expired,
     Seen,
+    /// A message addressed to us that we opened but could NOT durably store
+    /// (e.g. disk full, corrupt store). Unlike [`CoreInboundDisposition::Seen`]
+    /// this is not a "already have it" dead end and unlike
+    /// [`CoreInboundDisposition::Consumed`] nothing was persisted, so the
+    /// shells must NOT record its `msg_id` as seen: the same envelope must
+    /// re-present and re-dispatch on its next copy (T4-06). Never acked
+    /// (`core_should_ack_inbound` returns `false`), so the relay copy — often
+    /// the only copy — is preserved for that retry rather than deleted. The
+    /// safety direction here is the same as `Carried`: churn is recoverable,
+    /// deletion is not.
+    Failed,
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
@@ -219,7 +230,9 @@ pub fn core_inbound_gate(is_new_msg_id: bool, expiry_ms: i64, now_ms: i64) -> Co
 /// proxy-polling means we may have fetched a contact's envelope on their
 /// behalf, and the relay copy is the durable fallback until the real
 /// recipient (or another proxy) fetches and consumes it -- deleting it here
-/// would silently drop the message. [`CoreInboundDisposition::Seen`] also
+/// would silently drop the message. [`CoreInboundDisposition::Failed`]
+/// (durable storage of a message that was ours failed) is likewise never
+/// acked, so the relay copy survives for the retry. [`CoreInboundDisposition::Seen`] also
 /// returns `false` here, but it is NOT necessarily a dead end: see
 /// [`consumed_seen_is_ackable`] and
 /// [`MessageStore::core_relay_ack_ids_with_consumed`] for the narrow,
@@ -703,6 +716,18 @@ mod tests {
             disp(4, vec![4; 16], CoreInboundDisposition::Seen),
         ];
         assert_eq!(core_relay_ack_ids(items), vec![1, 3]);
+    }
+
+    #[test]
+    fn failed_delivery_is_never_acked() {
+        // T4-06: a message that was ours but could not be durably stored must
+        // leave the relay copy intact so the next poll re-fetches and retries.
+        assert!(!core_should_ack_inbound(CoreInboundDisposition::Failed));
+        let items = vec![
+            disp(1, vec![1; 16], CoreInboundDisposition::Consumed),
+            disp(2, vec![2; 16], CoreInboundDisposition::Failed),
+        ];
+        assert_eq!(core_relay_ack_ids(items), vec![1]);
     }
 
     // -- consumed-SEEN relay ack rule (DTN_TODOS.md §3.1 / D1) --------------

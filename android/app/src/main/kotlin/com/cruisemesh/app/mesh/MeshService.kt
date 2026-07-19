@@ -1921,14 +1921,25 @@ class MeshService : Service() {
             val groupOpened = tryOpenGroupMessage(envelope.recipientHint, envelope.sealed)
             if (groupOpened != null) {
                 val arrival = messageArrival(sourceAddress, envelope.hopTtl, groupOpened.second.senderUserId)
-                deliverOpenedGroupEnvelope(
-                    sourceLabel,
-                    groupOpened.first,
-                    groupOpened.second,
-                    identity,
-                    arrival,
-                    envelope.msgId,
-                )
+                try {
+                    deliverOpenedGroupEnvelope(
+                        sourceLabel,
+                        groupOpened.first,
+                        groupOpened.second,
+                        identity,
+                        arrival,
+                        envelope.msgId,
+                    )
+                } catch (e: CoreException) {
+                    // T4-06: same as the pairwise path below -- a store
+                    // failure delivering our own group copy must not unwind
+                    // the thread, must leave the msg_id re-presentable, and
+                    // must not be acked. The best-effort relay/carry for
+                    // absent members is skipped; the next re-presentation
+                    // re-runs the whole branch.
+                    Log.w(TAG, "Deferring group envelope from $sourceLabel: durable delivery failed (${e.message})")
+                    return CoreInboundDisposition.FAILED
+                }
                 // specs/group-relay-durability.md §4.3 no-reinjection rule:
                 // a relay-fetched group message addressed to OUR OWN hint is
                 // a per-member fan-out copy -- the relay fan-out already
@@ -1978,10 +1989,21 @@ class MeshService : Service() {
             return CoreInboundDisposition.CARRIED
         }
         val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
-        deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
-        // DTN D4: [deliverOpenedEnvelope] does not swallow store exceptions
-        // (see [handleIncomingChatMessage] etc.), so reaching this line means
-        // the message was durably stored -- safe, and required, to record.
+        try {
+            deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
+        } catch (e: CoreException) {
+            // T4-06: [deliverOpenedEnvelope] does not swallow store exceptions
+            // (see [handleIncomingChatMessage] etc.), so a throw here means a
+            // message that was OURS to open failed to persist (disk full,
+            // corrupt store). Translate it instead of letting it unwind: the
+            // receive thread / relay batch loop must not be torn down, the
+            // msg_id stays unrecorded so the next copy re-dispatches, and
+            // FAILED is never acked so the relay copy survives for that retry.
+            Log.w(TAG, "Deferring envelope from $sourceLabel: durable delivery failed (${e.message})")
+            return CoreInboundDisposition.FAILED
+        }
+        // DTN D4: reaching here means the message was durably stored -- safe,
+        // and required, to record.
         GossipState.seenIds.record(envelope.msgId)
         return CoreInboundDisposition.CONSUMED
     }
