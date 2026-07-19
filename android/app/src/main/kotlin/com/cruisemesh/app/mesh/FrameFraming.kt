@@ -12,8 +12,8 @@ import uniffi.cruisemesh_core.fragmentBleFrame
  * ~130 KB, which a photo attachment (~170 KB) blows past -- [FrameFraming.fragment]
  * then threw "frame too large to fragment" and, because `sendFrame` (not the
  * later `sendNextQueuedFragment`) issues the split, that throw unwound the GATT
- * callback and killed the link ("photos don't load"). 16-bit fields lift the
- * ceiling to 65535 fragments (~33 MB).
+ * callback and killed the link ("photos don't load"). 16-bit fields permit
+ * photo-scale frames while the shared core enforces its bounded P2P ceiling.
  *
  * This is a link-layer wire change: both peers must run code that reads/writes
  * this identical layout ([FrameReassembler] parses it). Fine for a fleet that
