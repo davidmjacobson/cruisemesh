@@ -1033,18 +1033,51 @@ pub fn encode_digest(
     chat_id: Vec<u8>,
     entries: Vec<DigestEntry>,
     recent_msg_ids: Vec<Vec<u8>>,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        1 + 2
-            + chat_id.len()
-            + 2
-            + entries
-                .iter()
-                .map(|e| 2 + e.sender_user_id.len() + 8)
-                .sum::<usize>()
-            + 2
-            + recent_msg_ids.len() * MSG_ID_LEN,
-    );
+) -> Result<Vec<u8>, CoreError> {
+    if chat_id.len() > u16::MAX as usize {
+        return Err(CoreError::Malformed("digest chat_id is too long".into()));
+    }
+    if entries.len() > u16::MAX as usize {
+        return Err(CoreError::Malformed(
+            "digest contains too many entries".into(),
+        ));
+    }
+    if recent_msg_ids.len() > u16::MAX as usize {
+        return Err(CoreError::Malformed(
+            "digest contains too many recent message ids".into(),
+        ));
+    }
+    for entry in &entries {
+        if entry.sender_user_id.len() > u16::MAX as usize {
+            return Err(CoreError::Malformed(
+                "digest sender_user_id is too long".into(),
+            ));
+        }
+    }
+    for msg_id in &recent_msg_ids {
+        if msg_id.len() != MSG_ID_LEN {
+            return Err(CoreError::Malformed(format!(
+                "digest msg_id must be exactly {MSG_ID_LEN} bytes"
+            )));
+        }
+    }
+
+    let capacity = 1usize
+        .checked_add(2)
+        .and_then(|value| value.checked_add(chat_id.len()))
+        .and_then(|value| value.checked_add(2))
+        .and_then(|value| {
+            entries.iter().try_fold(value, |total, entry| {
+                total
+                    .checked_add(2)
+                    .and_then(|next| next.checked_add(entry.sender_user_id.len()))
+                    .and_then(|next| next.checked_add(8))
+            })
+        })
+        .and_then(|value| value.checked_add(2))
+        .and_then(|value| value.checked_add(recent_msg_ids.len().checked_mul(MSG_ID_LEN)?))
+        .ok_or_else(|| CoreError::Malformed("digest frame is too large".into()))?;
+    let mut out = Vec::with_capacity(capacity);
     out.push(FRAME_TYPE_DIGEST);
     write_bytes16(&mut out, &chat_id);
     out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
@@ -1054,15 +1087,9 @@ pub fn encode_digest(
     }
     out.extend_from_slice(&(recent_msg_ids.len() as u16).to_be_bytes());
     for msg_id in &recent_msg_ids {
-        assert_eq!(
-            msg_id.len(),
-            MSG_ID_LEN,
-            "digest msg_id must be exactly {} bytes",
-            MSG_ID_LEN
-        );
         out.extend_from_slice(msg_id);
     }
-    out
+    Ok(out)
 }
 
 /// Encode a LAN endpoint introduction. The opaque 8-byte instance token is
@@ -1987,7 +2014,8 @@ mod tests {
         let chat_id = b"chat-1".to_vec();
         let entries = sample_entries();
         let recent_msg_ids = sample_recent_msg_ids();
-        let framed = encode_digest(chat_id.clone(), entries.clone(), recent_msg_ids.clone());
+        let framed =
+            encode_digest(chat_id.clone(), entries.clone(), recent_msg_ids.clone()).unwrap();
         assert_eq!(framed[0], 0x03);
         match parse_frame(framed).expect("parses") {
             Frame::Digest {
@@ -2006,7 +2034,7 @@ mod tests {
     #[test]
     fn digest_frame_round_trips_with_no_entries() {
         // "I have nothing in this chat" is a valid digest (asks for everything).
-        let framed = encode_digest(b"chat-1".to_vec(), Vec::new(), Vec::new());
+        let framed = encode_digest(b"chat-1".to_vec(), Vec::new(), Vec::new()).unwrap();
         match parse_frame(framed).expect("parses") {
             Frame::Digest {
                 chat_id,
@@ -2027,7 +2055,7 @@ mod tests {
             sender_user_id: b"alice".to_vec(),
             through_lamport: u64::MAX,
         }];
-        let framed = encode_digest(Vec::new(), entries.clone(), sample_recent_msg_ids());
+        let framed = encode_digest(Vec::new(), entries.clone(), sample_recent_msg_ids()).unwrap();
         match parse_frame(framed).expect("parses") {
             Frame::Digest {
                 chat_id,
@@ -2167,7 +2195,7 @@ mod tests {
 
     #[test]
     fn parse_frame_rejects_digest_with_truncated_recent_msg_id() {
-        let mut bytes = encode_digest(b"chat-1".to_vec(), sample_entries(), Vec::new());
+        let mut bytes = encode_digest(b"chat-1".to_vec(), sample_entries(), Vec::new()).unwrap();
         bytes.extend_from_slice(&(1u16).to_be_bytes());
         bytes.extend_from_slice(&[0xAA; MSG_ID_LEN - 1]);
         let err = parse_frame(bytes).unwrap_err();
@@ -2180,10 +2208,17 @@ mod tests {
             b"chat-1".to_vec(),
             sample_entries(),
             sample_recent_msg_ids(),
-        );
+        )
+        .unwrap();
         framed.push(0xFF);
         let err = parse_frame(framed).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn digest_encoder_rejects_invalid_message_ids_without_panicking() {
+        let result = encode_digest(Vec::new(), Vec::new(), vec![vec![0; MSG_ID_LEN - 1]]);
+        assert!(matches!(result, Err(CoreError::Malformed(_))));
     }
 
     #[test]

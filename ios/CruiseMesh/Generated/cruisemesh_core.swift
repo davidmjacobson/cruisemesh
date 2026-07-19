@@ -10634,8 +10634,8 @@ public func encodeAttachmentPayload(payload: CoreAttachmentPayload)throws  -> Da
  * each fixed-width 16-byte `msg_id`. `entries` is typically the output of
  * the store's `chat_digest`; an empty list is valid ("send me everything").
  */
-public func encodeDigest(chatId: Data, entries: [DigestEntry], recentMsgIds: [Data]) -> Data {
-    return try!  FfiConverterData.lift(try! rustCall() {
+public func encodeDigest(chatId: Data, entries: [DigestEntry], recentMsgIds: [Data])throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_encode_digest(
         FfiConverterData.lower(chatId),
         FfiConverterSequenceTypeDigestEntry.lower(entries),
@@ -11318,7 +11318,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_attachment_payload() != 6055) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_encode_digest() != 65002) {
+    if (uniffi_cruisemesh_core_checksum_func_encode_digest() != 30845) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_envelope_frame() != 1240) {
