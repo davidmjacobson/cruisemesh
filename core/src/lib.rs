@@ -14,6 +14,7 @@ mod groups;
 mod identity;
 mod lan_session;
 mod lan_util;
+mod limits;
 mod protocol;
 mod relay_wire;
 mod semantic;
@@ -61,6 +62,7 @@ pub use lan_util::{
     core_make_lan_endpoint_link, core_parse_lan_endpoint, core_parse_lan_endpoint_link,
     core_subnet_24_hosts, lan_endpoint_cache_is_fresh, should_resend_lan_endpoint, CoreLanEndpoint,
 };
+pub use limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 pub use protocol::{
     compute_recipient_hint, create_introduction_ticket, decode_extended_message_body,
     decode_friend_directory_content, decode_introduced_friend_request, decode_lan_endpoint_content,
