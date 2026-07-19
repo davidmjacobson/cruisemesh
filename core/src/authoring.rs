@@ -326,6 +326,7 @@ impl MessageStore {
         if receipt_type != RECEIPT_TYPE_DELIVERED && receipt_type != RECEIPT_TYPE_READ {
             return Err(CoreError::Malformed("invalid receipt type".to_string()));
         }
+        validate_sqlite_lamport("receipt watermark", through_lamport)?;
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
         let current: Option<i64> = tx
@@ -359,14 +360,14 @@ impl MessageStore {
             sender_user_id: acked_sender_user_id.clone(),
             lamport: through_lamport,
             receipt_type,
-        });
+        })?;
         let body = encode_message_body(MessageBody {
             kind: KIND_RECEIPT,
             chat_id: identity.user_id.clone(),
             lamport: 0,
             timestamp: timestamp_ms,
             content,
-        });
+        })?;
         let msg_id = generate_msg_id();
         let envelope = OutgoingReceiptEnvelope {
             msg_id: msg_id.clone(),
@@ -440,6 +441,7 @@ impl MessageStore {
                 "receipt watermark must be positive".to_string(),
             ));
         }
+        validate_sqlite_lamport("receipt watermark", through_lamport)?;
 
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
@@ -487,14 +489,14 @@ impl MessageStore {
             sender_user_id: acked_sender_user_id.clone(),
             lamport: desired,
             receipt_type,
-        });
+        })?;
         let body = encode_message_body(MessageBody {
             kind: KIND_RECEIPT,
             chat_id: identity.user_id.clone(),
             lamport: 0,
             timestamp: timestamp_ms,
             content,
-        });
+        })?;
         let envelope = OutgoingReceiptEnvelope {
             msg_id: generate_msg_id(),
             recipient_user_id: contact.user_id.clone(),
@@ -611,7 +613,7 @@ fn encoded_body(
     };
     match reply_to_msg_id {
         Some(id) => encode_message_body_with_reply(body, id.to_vec()),
-        None => Ok(encode_message_body(body)),
+        None => encode_message_body(body),
     }
 }
 
@@ -669,6 +671,15 @@ fn insert_authored_rows(
     Ok(())
 }
 
+fn validate_sqlite_lamport(field: &str, value: u64) -> Result<(), CoreError> {
+    if value > i64::MAX as u64 {
+        return Err(CoreError::Malformed(format!(
+            "{field} exceeds the supported range"
+        )));
+    }
+    Ok(())
+}
+
 fn authored(
     message: StoredMessage,
     envelope: OutboundEnvelope,
@@ -709,7 +720,8 @@ mod tests {
     use super::*;
     use crate::{
         create_group, decode_extended_message_body, decode_group_metadata_update,
-        decode_message_body, generate_identity, open_group_message, open_message,
+        decode_message_body, encode_attachment_payload, generate_identity, open_group_message,
+        open_message, AttachmentMediaType, CoreAttachmentPayload,
     };
 
     fn contact(identity: &Identity, name: &str) -> Contact {
@@ -798,12 +810,20 @@ mod tests {
         .unwrap();
         store.upsert_group(group.clone()).unwrap();
 
+        let attachment = encode_attachment_payload(CoreAttachmentPayload {
+            media_type: AttachmentMediaType::Image,
+            mime_type: "image/jpeg".into(),
+            duration_ms: 0,
+            blob: vec![1, 2, 3],
+            caption: String::new(),
+        })
+        .unwrap();
         let result = store
             .author_group_message(
                 alice.clone(),
                 group.clone(),
                 KIND_ATTACHMENT_MANIFEST,
-                b"encoded attachment".to_vec(),
+                attachment.clone(),
                 None,
                 77,
             )
@@ -816,7 +836,7 @@ mod tests {
         let opened = open_group_message(group, result.envelope.sealed).unwrap();
         let body = decode_extended_message_body(opened.payload).unwrap();
         assert_eq!(body.kind, KIND_ATTACHMENT_MANIFEST);
-        assert_eq!(body.content, b"encoded attachment");
+        assert_eq!(body.content, attachment);
     }
 
     #[test]

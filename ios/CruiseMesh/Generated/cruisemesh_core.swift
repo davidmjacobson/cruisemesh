@@ -10747,8 +10747,8 @@ public func encodeLanEndpointContent(content: LanEndpointContent)throws  -> Data
 /**
  * Encode a [`MessageBody`] to its wire form (see module docs for layout).
  */
-public func encodeMessageBody(body: MessageBody) -> Data {
-    return try!  FfiConverterData.lift(try! rustCall() {
+public func encodeMessageBody(body: MessageBody)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_encode_message_body(
         FfiConverterTypeMessageBody.lower(body),$0
     )
@@ -10787,8 +10787,8 @@ public func encodeReactionPayload(payload: CoreReactionPayload)throws  -> Data {
 /**
  * Encode a [`ReceiptContent`] to its wire form (see module docs for layout).
  */
-public func encodeReceiptContent(content: ReceiptContent) -> Data {
-    return try!  FfiConverterData.lift(try! rustCall() {
+public func encodeReceiptContent(content: ReceiptContent)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_encode_receipt_content(
         FfiConverterTypeReceiptContent.lower(content),$0
     )
@@ -11348,7 +11348,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_lan_endpoint_content() != 29267) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_encode_message_body() != 28014) {
+    if (uniffi_cruisemesh_core_checksum_func_encode_message_body() != 32564) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_message_body_with_reply() != 53763) {
@@ -11360,7 +11360,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_reaction_payload() != 17821) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_encode_receipt_content() != 55046) {
+    if (uniffi_cruisemesh_core_checksum_func_encode_receipt_content() != 20486) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_transport_probe() != 39450) {

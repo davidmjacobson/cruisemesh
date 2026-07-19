@@ -50,7 +50,7 @@ fn author_text(sender: &Identity, recipient: &Identity, text: &str, lamport: u64
         timestamp,
         content: text.as_bytes().to_vec(),
     };
-    let payload = encode_message_body(body);
+    let payload = encode_message_body(body).unwrap();
     let sealed = seal_message(sender.clone(), recipient.agree_pk.clone(), payload).unwrap();
     AuthoredEnvelope {
         msg_id: generate_msg_id(),
