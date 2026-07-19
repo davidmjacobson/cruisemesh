@@ -73,16 +73,21 @@ object ProfileSyncSender {
         friendsOfFriendsRevision: ULong,
     ) {
         val timestamp = System.currentTimeMillis()
-        val payload = encodeProfileSyncContent(
-            ProfileSyncContent(
-                avatarEpoch = epoch,
-                name = name,
-                avatar = avatar,
-                friendsOfFriendsVersion = 1u,
-                friendsOfFriendsEnabled = friendsOfFriendsEnabled,
-                friendsOfFriendsRevision = friendsOfFriendsRevision,
-            ),
-        )
+        val payload = try {
+            encodeProfileSyncContent(
+                ProfileSyncContent(
+                    avatarEpoch = epoch,
+                    name = name,
+                    avatar = avatar,
+                    friendsOfFriendsVersion = 1u,
+                    friendsOfFriendsEnabled = friendsOfFriendsEnabled,
+                    friendsOfFriendsRevision = friendsOfFriendsRevision,
+                ),
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Skipping invalid profile sync payload", e)
+            return
+        }
         val authored = store.authorPairwiseMessage(
             identity,
             contact,

@@ -105,17 +105,18 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
     val pendingImports by FriendImportEvents.pendingImports.collectAsState()
     val fingerprint = remember(identity.userId) { fingerprintWords(identity.userId) }
     val friendLink = remember(name, relayUrl, relayToken, identity) {
-        val cardJson =
-        makeFriendCard(
-            name.trim().ifEmpty { ProfileStore.defaultDisplayName() },
-            identity,
-            relayUrl.trim().ifEmpty { null },
-            relayToken.trim().ifEmpty { null },
-        )
-        makeFriendLink(cardJson)
+        runCatching {
+            val cardJson = makeFriendCard(
+                name.trim().ifEmpty { ProfileStore.defaultDisplayName() },
+                identity,
+                relayUrl.trim().ifEmpty { null },
+                relayToken.trim().ifEmpty { null },
+            )
+            makeFriendLink(cardJson)
+        }.getOrNull()
     }
-    val appLink = remember(friendLink) { "https://cruisemesh.app/f#$friendLink" }
-    val qrBitmap = remember(appLink) { encodeQrBitmap(appLink) }
+    val appLink = remember(friendLink) { friendLink?.let { "https://cruisemesh.app/f#$it" } }
+    val qrBitmap = remember(appLink) { appLink?.let(::encodeQrBitmap) }
 
     androidx.compose.runtime.LaunchedEffect(pendingImports, connectedFriend) {
         if (connectedFriend != null) return@LaunchedEffect
@@ -156,18 +157,26 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Surface(
-                shape = RoundedCornerShape(20.dp),
-                color = Color.White,
-                tonalElevation = 2.dp,
-                shadowElevation = 2.dp,
-            ) {
-                Image(
-                    bitmap = qrBitmap,
-                    contentDescription = "Friend card QR code",
-                    modifier = Modifier
-                        .padding(16.dp)
-                        .size(240.dp),
+            if (qrBitmap != null) {
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = Color.White,
+                    tonalElevation = 2.dp,
+                    shadowElevation = 2.dp,
+                ) {
+                    Image(
+                        bitmap = qrBitmap,
+                        contentDescription = "Friend card QR code",
+                        modifier = Modifier
+                            .padding(16.dp)
+                            .size(240.dp),
+                    )
+                }
+            } else {
+                Text(
+                    stringResource(R.string.ui_friend_card_too_large),
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium,
                 )
             }
             Text(
@@ -223,8 +232,10 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Button(
+                    enabled = appLink != null,
                     onClick = {
-                        val text = "Add me on CruiseMesh: $appLink"
+                        val link = appLink ?: return@Button
+                        val text = "Add me on CruiseMesh: $link"
                         val intent = Intent(Intent.ACTION_SEND)
                             .setType("text/plain")
                             .putExtra(Intent.EXTRA_TEXT, text)
@@ -235,9 +246,11 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                     Text(stringResource(R.string.ui_share_card))
                 }
                 TextButton(
+                    enabled = appLink != null,
                     onClick = {
+                        val link = appLink ?: return@TextButton
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        clipboard.setPrimaryClip(ClipData.newPlainText("CruiseMesh friend card", appLink))
+                        clipboard.setPrimaryClip(ClipData.newPlainText("CruiseMesh friend card", link))
                         Toast.makeText(context, "Copied friend card link", Toast.LENGTH_SHORT).show()
                     },
                 ) {

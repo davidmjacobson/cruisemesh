@@ -32,12 +32,17 @@ object FriendRequestSender {
         contact: Contact,
     ): FriendRequestDelivery {
         val relay = RelayConfigStore.load(context)
-        val cardJson = makeFriendCard(
-            ProfileStore.loadDisplayName(context),
-            identity,
-            relay?.relayUrl,
-            relay?.relayToken,
-        )
+        val cardJson = try {
+            makeFriendCard(
+                ProfileStore.loadDisplayName(context),
+                identity,
+                relay?.relayUrl,
+                relay?.relayToken,
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Skipping invalid friend card", e)
+            return FriendRequestDelivery(reachedDirectly = false, lamport = 0uL)
+        }
         val timestamp = System.currentTimeMillis()
         val authored = try {
             store.authorFriendRequest(identity, contact, cardJson, timestamp)

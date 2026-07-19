@@ -45,7 +45,7 @@ Add to `core/src/identity.rs` (uniffi-exported, tested):
 /// Compact, chat-app-safe text form of a FriendCard:
 /// "CMFRIEND1:" + base64url_nopad(friend-card JSON bytes)
 #[uniffi::export]
-pub fn make_friend_link(card_json: String) -> String;
+pub fn make_friend_link(card_json: String) -> Result<String, CoreError>;
 
 /// One entry point for anything a user scanned or pasted. Accepts, in order:
 /// 1. the CMFRIEND1: link form (with surrounding whitespace tolerated),
