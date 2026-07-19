@@ -9,8 +9,10 @@ use std::collections::HashSet;
 
 use crate::{
     compute_recipient_hint, encode_envelope_frame, fanout_msg_id, CarriedEnvelope, CoreError,
-    MessageOrigin, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, MS_PER_DAY,
-    RECEIPT_TYPE_DELIVERED,
+    MessageOrigin, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
+    KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
+    KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION,
+    KIND_RECEIPT, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
 };
 
 /// Exact carried+recently-held `msg_id` count advertised in one outgoing
@@ -47,6 +49,40 @@ pub enum CoreInboundDisposition {
     Carried,
     Expired,
     Seen,
+}
+
+/// Decide whether an authenticated pairwise sender may dispatch this message
+/// kind into application handlers. Cryptographic opening proves who signed a
+/// payload, but it does not by itself make that identity an accepted contact.
+///
+/// Direct friend requests and ticket-bearing introduced friend requests are
+/// the only onboarding kinds intentionally accepted from an unknown sender.
+/// Every ordinary chat/control kind requires an accepted contact, except for
+/// this device's own relay/fan-out copies. Unknown and group-only kinds fail
+/// closed before either platform can write message or group state.
+#[uniffi::export]
+pub fn core_pairwise_sender_authorized(
+    kind: u8,
+    sender_is_contact: bool,
+    sender_is_self: bool,
+) -> bool {
+    let recognized_pairwise_kind = matches!(
+        kind,
+        KIND_TEXT
+            | KIND_RECEIPT
+            | KIND_FRIEND_REQUEST
+            | KIND_GROUP_INVITE
+            | KIND_PROFILE_SYNC
+            | KIND_FRIEND_DIRECTORY
+            | KIND_INTRODUCED_FRIEND_REQUEST
+            | KIND_LAN_ENDPOINT_HINT
+            | KIND_ATTACHMENT_MANIFEST
+            | KIND_REACTION
+    );
+    recognized_pairwise_kind
+        && (sender_is_contact
+            || sender_is_self
+            || matches!(kind, KIND_FRIEND_REQUEST | KIND_INTRODUCED_FRIEND_REQUEST))
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
@@ -1044,6 +1080,45 @@ mod tests {
         assert_eq!(core_inbound_gate(false, 0, 10), CoreInboundGate::Seen);
         assert_eq!(core_inbound_gate(true, 10, 10), CoreInboundGate::Expired);
         assert_eq!(core_inbound_gate(true, 11, 10), CoreInboundGate::Dispatch);
+    }
+
+    #[test]
+    fn pairwise_sender_authorization_limits_unknown_senders_to_onboarding() {
+        for kind in [
+            KIND_TEXT,
+            KIND_RECEIPT,
+            KIND_GROUP_INVITE,
+            KIND_PROFILE_SYNC,
+            KIND_FRIEND_DIRECTORY,
+            KIND_LAN_ENDPOINT_HINT,
+            KIND_ATTACHMENT_MANIFEST,
+            KIND_REACTION,
+        ] {
+            assert!(!core_pairwise_sender_authorized(kind, false, false));
+            assert!(core_pairwise_sender_authorized(kind, true, false));
+            assert!(core_pairwise_sender_authorized(kind, false, true));
+        }
+        assert!(core_pairwise_sender_authorized(
+            KIND_FRIEND_REQUEST,
+            false,
+            false
+        ));
+        assert!(core_pairwise_sender_authorized(
+            KIND_INTRODUCED_FRIEND_REQUEST,
+            false,
+            false
+        ));
+        assert!(!core_pairwise_sender_authorized(0xFF, true, true));
+        assert!(!core_pairwise_sender_authorized(
+            crate::KIND_GROUP_METADATA_UPDATE,
+            true,
+            false
+        ));
+        assert!(!core_pairwise_sender_authorized(
+            crate::KIND_ATTACHMENT_CHUNK,
+            true,
+            false
+        ));
     }
 
     #[test]

@@ -772,6 +772,15 @@ final class MeshController: ObservableObject {
             content: extendedBody.content
         )
         guard body.chatId == opened.senderUserId else { return }
+        let senderIsContact = (try? store.getContact(userId: opened.senderUserId)) != nil
+        guard corePairwiseSenderAuthorized(
+            kind: body.kind,
+            senderIsContact: senderIsContact,
+            senderIsSelf: opened.senderUserId == identity.userId
+        ) else {
+            log.warning("Dropping pairwise envelope from unauthorized sender on \(sourceLabel, privacy: .public)")
+            return
+        }
 
         switch body.kind {
         case ProtocolKind.text, ProtocolKind.attachmentManifest, ProtocolKind.reaction:
