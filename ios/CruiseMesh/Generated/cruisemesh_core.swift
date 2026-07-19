@@ -10083,6 +10083,16 @@ public func attachmentMaxBlobBytes() -> UInt32 {
     )
 })
 }
+/**
+ * Upper bound enforced before a selected backup is accumulated by either
+ * mobile shell and repeated at the core decoder boundary.
+ */
+public func backupMaxFileBytes() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_backup_max_file_bytes($0
+    )
+})
+}
 public func backupMinPassphraseLength() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_backup_min_passphrase_length($0
@@ -11259,6 +11269,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_attachment_max_blob_bytes() != 21631) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_backup_max_file_bytes() != 41185) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_backup_min_passphrase_length() != 54885) {
