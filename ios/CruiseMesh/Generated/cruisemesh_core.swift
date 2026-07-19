@@ -1800,18 +1800,19 @@ public protocol MessageStoreProtocol : AnyObject {
      * Store a foreign envelope for later store-and-forward delivery
      * (DESIGN.md §5.3 carry queue). Keyed on `msg_id`, so re-enqueuing an
      * envelope we're already carrying is a no-op (returns `false`); a fresh
-     * insert returns `true`.
+     * insert returns `true`. A digest over `recipient_hint || sealed` also
+     * collapses a ciphertext rewrapped under a new attacker-selected public
+     * `msg_id`, while preserving group fan-out copies with different hints.
      *
      * `is_family` marks whether this envelope is addressed to someone this
      * node knows (its `recipient_hint` matched a contact -- the caller
      * decides, since it holds the contacts and the hint derivation). Family
-     * envelopes are kept until they expire and **never** evicted for space;
-     * only foreign envelopes count against `foreign_budget_bytes` (DESIGN.md
-     * §5.3: "Family messages always win eviction fights"). When inserting a
-     * new foreign envelope pushes the foreign total over budget, the oldest
-     * foreign envelopes (by `received_at_ms`) are evicted until it fits --
-     * possibly including this one, if a single envelope exceeds the whole
-     * budget. All of this happens in one transaction.
+     * envelopes win eviction fights: foreign rows are evicted first. Foreign
+     * rows additionally share `foreign_budget_bytes`, and the entire queue
+     * has a hard 64 MiB sealed-byte ceiling so a forged family hint cannot
+     * grow it indefinitely. Resource eviction is never reported as delivery
+     * and never produces a receipt or relay ack. All of this happens in one
+     * transaction.
      */
     func enqueueCarriedEnvelope(envelope: CarriedEnvelope, isFamily: Bool, receivedAtMs: Int64, foreignBudgetBytes: Int64) throws  -> Bool
     
@@ -1823,8 +1824,8 @@ public protocol MessageStoreProtocol : AnyObject {
      * `relayProxyHints` on the Kotlin side). This is the relay-sourced
      * twin of [`MessageStore::enqueue_carried_envelope`]: always
      * `is_family = 1` (the relay hint match already proved it's addressed
-     * to someone we know, so it's kept until expiry and never evicted for
-     * space) and `from_relay = 1`, which excludes it from
+     * to someone we know, so it gets family-first eviction priority) and
+     * `from_relay = 1`, which excludes it from
      * [`MessageStore::family_carried_envelopes`] -- the relay-upload query
      * -- because it is *already on the relay*; re-uploading it would just
      * churn traffic and could resurrect a copy the real recipient already
@@ -2763,18 +2764,19 @@ open func deleteGroup(groupId: Data)throws  -> Bool {
      * Store a foreign envelope for later store-and-forward delivery
      * (DESIGN.md §5.3 carry queue). Keyed on `msg_id`, so re-enqueuing an
      * envelope we're already carrying is a no-op (returns `false`); a fresh
-     * insert returns `true`.
+     * insert returns `true`. A digest over `recipient_hint || sealed` also
+     * collapses a ciphertext rewrapped under a new attacker-selected public
+     * `msg_id`, while preserving group fan-out copies with different hints.
      *
      * `is_family` marks whether this envelope is addressed to someone this
      * node knows (its `recipient_hint` matched a contact -- the caller
      * decides, since it holds the contacts and the hint derivation). Family
-     * envelopes are kept until they expire and **never** evicted for space;
-     * only foreign envelopes count against `foreign_budget_bytes` (DESIGN.md
-     * §5.3: "Family messages always win eviction fights"). When inserting a
-     * new foreign envelope pushes the foreign total over budget, the oldest
-     * foreign envelopes (by `received_at_ms`) are evicted until it fits --
-     * possibly including this one, if a single envelope exceeds the whole
-     * budget. All of this happens in one transaction.
+     * envelopes win eviction fights: foreign rows are evicted first. Foreign
+     * rows additionally share `foreign_budget_bytes`, and the entire queue
+     * has a hard 64 MiB sealed-byte ceiling so a forged family hint cannot
+     * grow it indefinitely. Resource eviction is never reported as delivery
+     * and never produces a receipt or relay ack. All of this happens in one
+     * transaction.
      */
 open func enqueueCarriedEnvelope(envelope: CarriedEnvelope, isFamily: Bool, receivedAtMs: Int64, foreignBudgetBytes: Int64)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -2795,8 +2797,8 @@ open func enqueueCarriedEnvelope(envelope: CarriedEnvelope, isFamily: Bool, rece
      * `relayProxyHints` on the Kotlin side). This is the relay-sourced
      * twin of [`MessageStore::enqueue_carried_envelope`]: always
      * `is_family = 1` (the relay hint match already proved it's addressed
-     * to someone we know, so it's kept until expiry and never evicted for
-     * space) and `from_relay = 1`, which excludes it from
+     * to someone we know, so it gets family-first eviction priority) and
+     * `from_relay = 1`, which excludes it from
      * [`MessageStore::family_carried_envelopes`] -- the relay-upload query
      * -- because it is *already on the relay*; re-uploading it would just
      * churn traffic and could resurrect a copy the real recipient already
@@ -8454,6 +8456,7 @@ public enum CoreInboundDisposition {
     case carried
     case expired
     case seen
+    case rejected
 }
 
 
@@ -8475,6 +8478,8 @@ public struct FfiConverterTypeCoreInboundDisposition: FfiConverterRustBuffer {
         
         case 4: return .seen
         
+        case 5: return .rejected
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -8498,6 +8503,10 @@ public struct FfiConverterTypeCoreInboundDisposition: FfiConverterRustBuffer {
         case .seen:
             writeInt(&buf, Int32(4))
         
+
+        case .rejected:
+            writeInt(&buf, Int32(5))
+
         }
     }
 }
@@ -8531,6 +8540,7 @@ public enum CoreInboundGate {
     case dispatch
     case seen
     case expired
+    case rejected
 }
 
 
@@ -8550,6 +8560,8 @@ public struct FfiConverterTypeCoreInboundGate: FfiConverterRustBuffer {
         
         case 3: return .expired
         
+        case 4: return .rejected
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -8569,6 +8581,10 @@ public struct FfiConverterTypeCoreInboundGate: FfiConverterRustBuffer {
         case .expired:
             writeInt(&buf, Int32(3))
         
+
+        case .rejected:
+            writeInt(&buf, Int32(4))
+
         }
     }
 }
@@ -10237,7 +10253,8 @@ public func coreHelloIdentityMatches(currentUserId: Data?, helloUserId: Data) ->
 })
 }
 /**
- * Inbound flood-dedupe + expiry gate (DESIGN.md §5.3).
+ * Inbound flood-dedupe, expiry, and public-header resource gate
+ * (DESIGN.md §5.3).
  *
  * `is_new_msg_id` must come from a non-mutating check
  * ([`crate::SeenIds::contains`]), never from [`crate::SeenIds::check_and_record`]
@@ -10248,10 +10265,11 @@ public func coreHelloIdentityMatches(currentUserId: Data?, helloUserId: Data) ->
  * failed must be re-presentable; an envelope that was handled (even by
  * deliberate drop, e.g. the `Expired` arm below) must be deduped.
  */
-public func coreInboundGate(isNewMsgId: Bool, expiryMs: Int64, nowMs: Int64) -> CoreInboundGate {
+public func coreInboundGate(isNewMsgId: Bool, hopTtl: UInt8, expiryMs: Int64, nowMs: Int64) -> CoreInboundGate {
     return try!  FfiConverterTypeCoreInboundGate.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_inbound_gate(
         FfiConverterBool.lower(isNewMsgId),
+        FfiConverterUInt8.lower(hopTtl),
         FfiConverterInt64.lower(expiryMs),
         FfiConverterInt64.lower(nowMs),$0
     )
@@ -10360,7 +10378,9 @@ public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
  *
  * Only [`CoreInboundDisposition::Consumed`] (it was ours to open, and we
  * did) and [`CoreInboundDisposition::Expired`] (it's dead weight regardless
- * of who it was for) are safe to remove this way.
+ * of who it was for) are safe to remove this way. A `Rejected` envelope is
+ * not ackable: its public header is invalid locally, but this device has not
+ * proven it was the sealed payload's sole true endpoint consumer.
  * [`CoreInboundDisposition::Carried`] must NOT be acked: relay
  * proxy-polling means we may have fetched a contact's envelope on their
  * behalf, and the relay copy is the durable fallback until the real
@@ -11207,7 +11227,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_hello_identity_matches() != 7419) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_inbound_gate() != 7195) {
+    if (uniffi_cruisemesh_core_checksum_func_core_inbound_gate() != 47063) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_is_own_fanout_hint() != 52117) {
@@ -11240,7 +11260,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 13964) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 1610) {
+    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 29385) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_subnet_24_hosts() != 3135) {
@@ -11624,10 +11644,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_group() != 30648) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_carried_envelope() != 54243) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_carried_envelope() != 15186) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_relay_carried_envelope() != 65235) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_relay_carried_envelope() != 14046) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_ensure_authored_receipt() != 16297) {

@@ -590,6 +590,7 @@ final class MeshController: ObservableObject {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         switch coreInboundGate(
             isNewMsgId: !GossipState.seenIds.contains(msgId: msgId),
+            hopTtl: hopTtl,
             expiryMs: expiry,
             nowMs: now
         ) {
@@ -600,6 +601,10 @@ final class MeshController: ObservableObject {
             // A deliberate drop is still a terminal handled state.
             GossipState.seenIds.record(msgId: msgId)
             return .expired
+        case .rejected:
+            log.warning("Dropping envelope with invalid hop or expiry fields from \(sourceLabel, privacy: .public)")
+            GossipState.seenIds.record(msgId: msgId)
+            return .rejected
         case .dispatch:
             break
         }
