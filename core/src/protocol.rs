@@ -310,6 +310,7 @@ const MESSAGE_EXTENSION_REPLY_TO_MSG_ID: u8 = 1;
 pub const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 const PROFILE_SYNC_VERSION: u8 = 2;
 const PROFILE_SYNC_MAX_AVATAR_BYTES: usize = 64 * 1024;
+const PROFILE_SYNC_MAX_NAME_BYTES: usize = 128;
 const FRIEND_DIRECTORY_VERSION: u8 = 1;
 const INTRODUCED_FRIEND_REQUEST_VERSION: u8 = 1;
 const LAN_ENDPOINT_CONTENT_VERSION: u8 = 1;
@@ -603,8 +604,18 @@ fn validate_receipt_content(content: &ReceiptContent) -> Result<(), CoreError> {
 
 /// Encode a [`ProfileSyncContent`] to its wire form.
 #[uniffi::export]
-pub fn encode_profile_sync_content(content: ProfileSyncContent) -> Vec<u8> {
+pub fn encode_profile_sync_content(content: ProfileSyncContent) -> Result<Vec<u8>, CoreError> {
     let name = content.name.as_bytes();
+    if name.len() > PROFILE_SYNC_MAX_NAME_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "profile name exceeds {PROFILE_SYNC_MAX_NAME_BYTES} UTF-8 bytes"
+        )));
+    }
+    if content.avatar.len() > PROFILE_SYNC_MAX_AVATAR_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "profile avatar exceeds {PROFILE_SYNC_MAX_AVATAR_BYTES} bytes"
+        )));
+    }
     let mut out = Vec::with_capacity(1 + 8 + 2 + name.len() + 4 + content.avatar.len() + 10);
     out.push(PROFILE_SYNC_VERSION);
     out.extend_from_slice(&content.avatar_epoch.to_be_bytes());
@@ -613,7 +624,7 @@ pub fn encode_profile_sync_content(content: ProfileSyncContent) -> Vec<u8> {
     out.push(content.friends_of_friends_version);
     out.push(u8::from(content.friends_of_friends_enabled));
     out.extend_from_slice(&content.friends_of_friends_revision.to_be_bytes());
-    out
+    Ok(out)
 }
 
 /// Decode a [`ProfileSyncContent`] from its wire form.
@@ -627,8 +638,13 @@ pub fn decode_profile_sync_content(bytes: Vec<u8>) -> Result<ProfileSyncContent,
         )));
     }
     let avatar_epoch = cursor.take_i64()?;
-    let name = String::from_utf8(cursor.take_bytes16()?)
-        .map_err(|e| CoreError::Malformed(e.to_string()))?;
+    let name_bytes = cursor.take_bytes16()?;
+    if name_bytes.len() > PROFILE_SYNC_MAX_NAME_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "profile name exceeds {PROFILE_SYNC_MAX_NAME_BYTES} UTF-8 bytes"
+        )));
+    }
+    let name = String::from_utf8(name_bytes).map_err(|e| CoreError::Malformed(e.to_string()))?;
     let avatar_len = cursor.take_u32()? as usize;
     if avatar_len > PROFILE_SYNC_MAX_AVATAR_BYTES {
         return Err(CoreError::Malformed(format!(
@@ -861,7 +877,7 @@ fn validate_friend_directory(content: &FriendDirectoryContent) -> Result<(), Cor
     }
     for entry in &content.entries {
         validate_id(&entry.candidate.user_id, "candidate UserID")?;
-        if entry.candidate.name.as_bytes().len() > 256 {
+        if entry.candidate.name.as_bytes().len() > PROFILE_SYNC_MAX_NAME_BYTES {
             return Err(CoreError::Malformed(
                 "candidate name is too long".to_string(),
             ));
@@ -1646,7 +1662,7 @@ mod tests {
     #[test]
     fn profile_sync_content_round_trips() {
         let content = sample_profile_sync();
-        let encoded = encode_profile_sync_content(content.clone());
+        let encoded = encode_profile_sync_content(content.clone()).unwrap();
         let decoded = decode_profile_sync_content(encoded).expect("decodes");
         assert_eq!(decoded, content);
     }
@@ -1661,14 +1677,14 @@ mod tests {
             friends_of_friends_enabled: false,
             friends_of_friends_revision: 8,
         };
-        let encoded = encode_profile_sync_content(content.clone());
+        let encoded = encode_profile_sync_content(content.clone()).unwrap();
         let decoded = decode_profile_sync_content(encoded).expect("decodes");
         assert_eq!(decoded, content);
     }
 
     #[test]
     fn profile_sync_content_decode_rejects_truncation_at_each_field() {
-        let encoded = encode_profile_sync_content(sample_profile_sync());
+        let encoded = encode_profile_sync_content(sample_profile_sync()).unwrap();
         for len in 0..encoded.len() {
             let err = decode_profile_sync_content(encoded[..len].to_vec()).unwrap_err();
             assert!(matches!(err, CoreError::Malformed(_)), "len {len}");
@@ -1677,7 +1693,7 @@ mod tests {
 
     #[test]
     fn profile_sync_content_decode_rejects_trailing_garbage() {
-        let mut encoded = encode_profile_sync_content(sample_profile_sync());
+        let mut encoded = encode_profile_sync_content(sample_profile_sync()).unwrap();
         encoded.push(0);
         let err = decode_profile_sync_content(encoded).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
@@ -1685,7 +1701,7 @@ mod tests {
 
     #[test]
     fn profile_sync_content_decode_rejects_unknown_version() {
-        let mut encoded = encode_profile_sync_content(sample_profile_sync());
+        let mut encoded = encode_profile_sync_content(sample_profile_sync()).unwrap();
         encoded[0] = 3;
         let err = decode_profile_sync_content(encoded).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
@@ -1894,7 +1910,7 @@ mod tests {
     #[test]
     fn introduced_friend_request_round_trips() {
         let (alice, bob, _carol, directory) = sample_directory();
-        let card = crate::make_friend_card("Bob".to_string(), bob, None, None);
+        let card = crate::make_friend_card("Bob".to_string(), bob, None, None).unwrap();
         let request = IntroducedFriendRequest {
             version: 1,
             friend_card_json: card,
@@ -1916,6 +1932,25 @@ mod tests {
         encoded.extend_from_slice(&((PROFILE_SYNC_MAX_AVATAR_BYTES + 1) as u32).to_be_bytes());
         let err = decode_profile_sync_content(encoded).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn profile_sync_rejects_oversized_names_and_authored_avatars() {
+        let mut content = sample_profile_sync();
+        content.name = "x".repeat(PROFILE_SYNC_MAX_NAME_BYTES + 1);
+        assert!(encode_profile_sync_content(content).is_err());
+
+        let mut content = sample_profile_sync();
+        content.avatar = vec![0; PROFILE_SYNC_MAX_AVATAR_BYTES + 1];
+        assert!(encode_profile_sync_content(content).is_err());
+
+        let mut encoded = vec![PROFILE_SYNC_VERSION];
+        encoded.extend_from_slice(&1i64.to_be_bytes());
+        write_bytes16(&mut encoded, &vec![b'x'; PROFILE_SYNC_MAX_NAME_BYTES + 1]);
+        encoded.extend_from_slice(&0u32.to_be_bytes());
+        encoded.extend_from_slice(&[1, 0]);
+        encoded.extend_from_slice(&0u64.to_be_bytes());
+        assert!(decode_profile_sync_content(encoded).is_err());
     }
 
     #[test]
@@ -2433,7 +2468,7 @@ mod tests {
             chat_id: bob.user_id.clone(),
             lamport: 1,
             timestamp: 1_700_000_001_000,
-            content: encode_profile_sync_content(content.clone()),
+            content: encode_profile_sync_content(content.clone()).unwrap(),
         };
         let payload = encode_message_body(body.clone()).unwrap();
 
