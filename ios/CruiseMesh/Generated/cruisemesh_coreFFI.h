@@ -1387,13 +1387,13 @@ RustBuffer uniffi_cruisemesh_core_fn_func_relay_encode_presence_request(RustBuff
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FETCH_BATCH_LIMIT
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FETCH_BATCH_LIMIT
 uint32_t uniffi_cruisemesh_core_fn_func_relay_fetch_batch_limit(RustCallStatus *_Nonnull out_status
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_MAX_RESPONSE_BYTES
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_MAX_RESPONSE_BYTES
 uint32_t uniffi_cruisemesh_core_fn_func_relay_max_response_bytes(RustCallStatus *_Nonnull out_status
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_ROTATE_GROUP
@@ -2273,13 +2273,13 @@ uint16_t uniffi_cruisemesh_core_checksum_func_relay_encode_presence_request(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FETCH_BATCH_LIMIT
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FETCH_BATCH_LIMIT
 uint16_t uniffi_cruisemesh_core_checksum_func_relay_fetch_batch_limit(void
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_MAX_RESPONSE_BYTES
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_MAX_RESPONSE_BYTES
 uint16_t uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes(void
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_ROTATE_GROUP
