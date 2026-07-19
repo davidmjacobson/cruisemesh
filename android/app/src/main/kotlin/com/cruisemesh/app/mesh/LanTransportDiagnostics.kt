@@ -19,7 +19,7 @@ data class LanTransportSnapshot(
     val lastActivityAtMs: Long? = null,
     val scanProgress: Int? = null,
     val scanTotal: Int? = null,
-    val sweepVerdict: String? = null,
+    val sweepDisplayState: LanSweepDisplayState = LanSweepDisplayState.NONE,
 )
 
 internal data class LanManualEndpoint(val host: String, val port: Int) {
@@ -74,6 +74,7 @@ object LanTransportDiagnostics {
     private val probeRequester = AtomicReference<(() -> String?)?>(null)
     private val scanRequester = AtomicReference<(() -> String?)?>(null)
     private val activePeers = mutableMapOf<String, String>()
+    private val sweepDisplayTracker = LanSweepDisplayTracker()
 
     fun requestManualConnection(text: String, defaultPort: Int): String? {
         val endpoint = parseLanManualEndpoint(text, defaultPort)
@@ -132,7 +133,15 @@ object LanTransportDiagnostics {
 
     internal fun waitingForWifi() {
         synchronized(activePeers) { activePeers.clear() }
-        mutableState.value = LanTransportSnapshot()
+        mutableState.value = LanTransportSnapshot(
+            sweepDisplayState = sweepDisplayTracker.onNetworkLost(),
+        )
+    }
+
+    internal fun networkJoined() {
+        mutableState.update {
+            it.copy(sweepDisplayState = sweepDisplayTracker.onNetworkJoined())
+        }
     }
 
     internal fun listening(localEndpoint: String?) {
@@ -191,7 +200,14 @@ object LanTransportDiagnostics {
                 activePeerNames = names,
                 lastError = null,
                 probeStatus = null,
+                sweepDisplayState = sweepDisplayTracker.onPeerEvidence(),
             )
+        }
+    }
+
+    internal fun peerEvidence() {
+        mutableState.update {
+            it.copy(sweepDisplayState = sweepDisplayTracker.onPeerEvidence())
         }
     }
 
@@ -262,13 +278,15 @@ object LanTransportDiagnostics {
                 scanProgress = 0,
                 scanTotal = total,
                 lastError = null,
-                sweepVerdict = null,
+                sweepDisplayState = sweepDisplayTracker.onSweepStarted(),
             )
         }
     }
 
-    internal fun sweepVerdict(message: String?) {
-        mutableState.update { it.copy(sweepVerdict = message) }
+    internal fun sweepCompleted(summary: SweepOutcomeSummary) {
+        mutableState.update {
+            it.copy(sweepDisplayState = sweepDisplayTracker.onSweepCompleted(summary))
+        }
     }
 
     internal fun scanAdvanced() {
