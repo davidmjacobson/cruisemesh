@@ -39,6 +39,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "backup_wire"
+path = "fuzz_targets/backup_wire.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
 

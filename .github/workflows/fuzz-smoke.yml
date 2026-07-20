@@ -27,6 +27,7 @@ jobs:
           - relay_wire
           - ble_reassembly
           - noise_handshake
+          - backup_wire
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust nightly
