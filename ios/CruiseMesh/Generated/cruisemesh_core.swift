@@ -11145,7 +11145,10 @@ public func makeFriendCard(name: String, identity: Identity, relayUrl: String?, 
 })
 }
 /**
- * Compact, chat-app-safe text form of a FriendCard.
+ * Compact, chat-app-safe text form of a FriendCard (T12). Emits the binary
+ * `CMFRIEND2:` form, which is ~half the size of the legacy JSON `CMFRIEND1:`
+ * form and so produces a much less dense QR code. `parse_friend_text` still
+ * accepts both forms, so cards already shared in the field keep working.
  */
 public func makeFriendLink(cardJson: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -11216,7 +11219,10 @@ public func parseFriendCard(json: String)throws  -> FriendCard {
 })
 }
 /**
- * Parse either the compact `CMFRIEND1:` link form or legacy raw FriendCard JSON.
+ * Parse a shared friend card in any form: the compact binary `CMFRIEND2:`
+ * link (what we emit now), the legacy `CMFRIEND1:` JSON link, either one
+ * embedded in a `https://cruisemesh.app/f#…` URL or surrounding prose, or a
+ * raw FriendCard JSON blob.
  */
 public func parseFriendText(text: String)throws  -> FriendCard {
     return try  FfiConverterTypeFriendCard.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -11636,7 +11642,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_make_friend_card() != 28124) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 2265) {
+    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 33620) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 27474) {
@@ -11657,7 +11663,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_parse_friend_card() != 1373) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_parse_friend_text() != 17133) {
+    if (uniffi_cruisemesh_core_checksum_func_parse_friend_text() != 63241) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_build_fetch_path() != 4249) {
