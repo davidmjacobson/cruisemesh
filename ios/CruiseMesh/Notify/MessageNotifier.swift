@@ -41,9 +41,12 @@ enum MessageNotifier {
         content.sound = .default
         content.userInfo = [chatUserIdKey: UserIdHex.encode(contact.userId), chatIsGroupKey: false]
         content.categoryIdentifier = categoryId
+        // Group in Notification Center by chat; a unique per-message request
+        // id (not the chat id) so a burst of messages stacks instead of each
+        // one replacing the last (FI11).
+        content.threadIdentifier = UserIdHex.encode(contact.userId)
 
-        let id = UserIdHex.encode(contact.userId)
-        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
 
@@ -54,8 +57,10 @@ enum MessageNotifier {
         content.sound = .default
         content.userInfo = [chatUserIdKey: UserIdHex.encode(contact.userId), chatIsGroupKey: false]
         content.categoryIdentifier = categoryId
+        // Own identifier prefix (FI11) so this can't be clobbered by, or
+        // clobber, that contact's message notifications.
         let request = UNNotificationRequest(
-            identifier: UserIdHex.encode(contact.userId),
+            identifier: "friend-added:" + UserIdHex.encode(contact.userId),
             content: content,
             trigger: nil
         )
@@ -70,9 +75,12 @@ enum MessageNotifier {
         content.sound = .default
         content.userInfo = [chatUserIdKey: UserIdHex.encode(group.id), chatIsGroupKey: true]
         content.categoryIdentifier = categoryId
+        // Group in Notification Center by chat; a unique per-message request
+        // id (not the chat id) so a burst of messages stacks instead of each
+        // one replacing the last (FI11).
+        content.threadIdentifier = UserIdHex.encode(group.id)
 
-        let id = UserIdHex.encode(group.id)
-        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
 }
