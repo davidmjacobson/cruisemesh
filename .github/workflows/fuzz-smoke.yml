@@ -31,14 +31,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust nightly
+        id: nightly
         uses: dtolnay/rust-toolchain@nightly
+      # FR9: caches cargo's registry/git indexes and the `fuzz/` crate's own
+      # target dir (a separate, non-workspace crate -- see fuzz/Cargo.toml).
+      # Every matrix job previously cold-compiled cruisemesh-core + all its
+      # deps from scratch.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          # One cache lineage per fuzz target so ble_reassembly's build
+          # doesn't evict noise_handshake's (all four ran in the same
+          # cold-cache state before this).
+          key: ${{ matrix.target }}
       - name: Cache cargo-fuzz
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cargo-fuzz
-          key: cargo-fuzz-bin
+          # FR9: was a single never-invalidating key -- a cargo-fuzz binary
+          # built against a stale nightly could silently mismatch today's
+          # `dtolnay/rust-toolchain@nightly` resolution. `cachekey` is that
+          # action's own output for exactly this (hashes the resolved
+          # toolchain, not just the "nightly" channel name).
+          key: cargo-fuzz-bin-${{ runner.os }}-${{ steps.nightly.outputs.cachekey }}
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked || true
+        # FR9: `|| true` used to swallow install failures -- a broken
+        # install would then fail confusingly at the build/run step instead
+        # of here, if it failed at all (a stale cached binary from the old
+        # never-invalidating key could mask it entirely).
+        run: cargo install cargo-fuzz --locked
+      # FR9: per-target corpus, keyed so it accumulates across nightly runs
+      # instead of restarting exploration from zero every time (the whole
+      # point of a 600s nightly run). New key per run (so the post-job save
+      # step always writes a fresh entry); restore-keys falls back to the
+      # most recent previous entry for this target via prefix match.
+      - name: Cache fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
       # Build always runs (cheap regression guard against API drift in core).
       - name: Build target
         run: cargo +nightly fuzz build ${{ matrix.target }}
