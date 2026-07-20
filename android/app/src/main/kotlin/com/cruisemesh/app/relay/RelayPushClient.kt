@@ -116,9 +116,14 @@ class RelayPushClient(
         val config = desiredConfig ?: return
         val hints = hintsProvider?.invoke().orEmpty()
         if (hints.isEmpty()) {
-            // Nothing addressed to us yet (e.g. no contacts/groups). relayd
-            // rejects a hint-less subscribe with 400; just retry once hints
-            // might exist rather than treating this as a connection failure.
+            // Nothing addressed to us yet (e.g. no contacts/groups -- the
+            // fresh-onboarding state). relayd rejects a hint-less subscribe
+            // with 400, so there is no point opening a socket; retry once
+            // hints might exist. This is still a failure to connect from the
+            // backoff's point of view -- recordFailure() here is what makes
+            // that retry back off (to the 60s cap) instead of spinning at
+            // the 2s floor forever while onboarding.
+            backoff.recordFailure()
             scheduleReconnect()
             return
         }

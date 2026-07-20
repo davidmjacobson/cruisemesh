@@ -47,6 +47,21 @@ class RelayPushBackoffTest {
     }
 
     @Test
+    fun `empty relay hints (fresh onboarding, no contacts yet) back off to the cap like any other failure`() {
+        // FA13 regression: RelayPushClient.connect() treats an empty hint
+        // set (relayd would 400 a hint-less subscribe) as a failure and
+        // calls recordFailure() before scheduling the retry -- otherwise a
+        // freshly onboarded device with zero contacts/groups would retry at
+        // the 2s floor forever instead of backing off like any other
+        // dropped connection.
+        val backoff = RelayPushBackoff(initialBackoffMs = 2_000L, maxBackoffMs = 60_000L)
+
+        repeat(20) { backoff.recordFailure() }
+
+        assertEquals(60_000L, backoff.nextDelayMs())
+    }
+
+    @Test
     fun `a never-failed backoff reports zero consecutive failures worth of delay growth`() {
         // Sanity check that a brand new instance and a recordSuccess()-reset
         // instance are indistinguishable -- both start the reconnect loop at
