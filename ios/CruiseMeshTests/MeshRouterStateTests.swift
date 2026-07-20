@@ -144,4 +144,27 @@ final class MeshRouterStateTests: XCTestCase {
         XCTAssertEqual(routes[0].0, .peripheral)
         XCTAssertEqual(routes[0].1, "CC:DD")
     }
+
+    // FI6: connect/disconnect callbacks must be applied in the order the BLE
+    // queue actually raised them. These two tests pin down why — reversing
+    // the order for the same address flips the end state.
+
+    func testConnectThenDisconnectInEventOrderLeavesAddressUnrouted() {
+        let state = MeshRouterState()
+        state.onConnected(address: "AA:BB", transport: .central)
+        state.onDisconnected(address: "AA:BB")
+
+        XCTAssertNil(state.transportFor(address: "AA:BB"))
+    }
+
+    func testDisconnectAppliedBeforeItsConnectWronglyLeavesAddressRouted() {
+        let state = MeshRouterState()
+        // Documents the hazard a mixed sync/async callback hop could cause:
+        // if a disconnect is processed ahead of the connect that preceded it
+        // on the wire, the dead address ends up registered as a live route.
+        state.onDisconnected(address: "AA:BB")
+        state.onConnected(address: "AA:BB", transport: .central)
+
+        XCTAssertEqual(state.transportFor(address: "AA:BB"), .central)
+    }
 }
