@@ -170,7 +170,7 @@ private struct AdvancedSettingsView: View {
     @State private var lanError: String?
     @State private var showLanQR = false
     @State private var showLanScanner = false
-    @State private var metricsFile: ShareableFile?
+    @State private var shareFile: ShareableFile?
 
     var body: some View {
         Form {
@@ -237,8 +237,21 @@ private struct AdvancedSettingsView: View {
 
             Section("Diagnostics") {
                 Button {
+                    if let url = DiagnosticLogExport.writeLogFile() {
+                        shareFile = ShareableFile(url: url)
+                    } else {
+                        lanError = "No diagnostics captured this session yet"
+                    }
+                } label: {
+                    Label("Share diagnostics", systemImage: "ladybug")
+                }
+                Text("Shares this session's connection and delivery log to help debug mesh problems. Metadata only — no message content.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Button {
                     if let url = FieldMetricsExport.writeCSVFile() {
-                        metricsFile = ShareableFile(url: url)
+                        shareFile = ShareableFile(url: url)
                     } else {
                         lanError = "No field metrics captured yet"
                     }
@@ -269,7 +282,7 @@ private struct AdvancedSettingsView: View {
                 LanEndpointQRView(endpoint: endpoint)
             }
         }
-        .sheet(item: $metricsFile) { file in
+        .sheet(item: $shareFile) { file in
             ActivityShareView(items: [file.url])
         }
         .sheet(isPresented: $showLanScanner) {

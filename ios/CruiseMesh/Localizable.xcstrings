@@ -1171,6 +1171,26 @@
         }
       }
     },
+    "Share diagnostics": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Share diagnostics"
+          }
+        }
+      }
+    },
+    "Shares this session's connection and delivery log to help debug mesh problems. Metadata only — no message content.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shares this session's connection and delivery log to help debug mesh problems. Metadata only — no message content."
+          }
+        }
+      }
+    },
     "Shorten your name or relay settings to create a friend card.": {
       "localizations": {
         "en": {
