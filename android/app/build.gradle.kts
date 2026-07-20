@@ -28,7 +28,10 @@ android {
 
     defaultConfig {
         applicationId = "com.cruisemesh.app"
-        minSdk = 26
+        // minSdk 31 (S): mesh needs the API-31 BLUETOOTH_SCAN/ADVERTISE/CONNECT
+        // permission trio (see AndroidManifest.xml) with no legacy fallback —
+        // BLE mesh silently fails or crashes with SecurityException below API 31.
+        minSdk = 31
         // Play Console requires new releases to target API 35+.
         targetSdk = 35
         versionCode = 1784406677

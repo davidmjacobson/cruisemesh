@@ -133,12 +133,8 @@ object BackupService {
 
     private fun appVersionCode(context: Context): Int {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
-        @Suppress("DEPRECATION")
-        return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-            info.longVersionCode.toInt()
-        } else {
-            info.versionCode
-        }
+        // minSdk is 31, so longVersionCode (added in API 28) is always available.
+        return info.longVersionCode.toInt()
     }
 
     private fun readBackupBytes(context: Context, input: InputStream): ByteArray = try {

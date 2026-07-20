@@ -4,7 +4,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.view.HapticFeedbackConstants
 import android.widget.Toast
 import androidx.camera.core.CameraSelector
@@ -321,13 +320,8 @@ fun ScanScreen(
                                     frozenFrame = previewView.bitmap?.asImageBitmap()
                                     val outcome = onContactAdded(contact)
                                     added = outcome
-                                    view.performHapticFeedback(
-                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                            HapticFeedbackConstants.CONFIRM
-                                        } else {
-                                            HapticFeedbackConstants.LONG_PRESS
-                                        },
-                                    )
+                                    // minSdk is 31, so CONFIRM (added in API 30) is always available.
+                                    view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
                                 } catch (e: Exception) {
                                     status = "Not a CruiseMesh friend card"
                                 }
