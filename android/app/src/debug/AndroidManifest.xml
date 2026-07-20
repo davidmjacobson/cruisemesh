@@ -2,9 +2,23 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application
         android:usesCleartextTraffic="true">
+        <!--
+          exported="false": this receiver runs real mesh actions (SEND_TEXT seals and
+          sends an actual message as the signed-in user) and debug builds ship to the
+          test fleet in the field, so any co-installed app must not be able to trigger
+          it via an implicit broadcast. `adb shell am broadcast` from the shell uid can
+          still reach a non-exported component by targeting it explicitly, e.g.:
+
+            adb shell am broadcast -a com.cruisemesh.app.debug.SEND_TEXT
+              -n com.cruisemesh.app/com.cruisemesh.app.debug.DebugCommandReceiver
+              -e contact_user_id_hex (hex) -e text hello
+
+          Keep the component name (.debug.DebugCommandReceiver) and action strings
+          stable so existing adb recipes keep working with -n added.
+        -->
         <receiver
             android:name=".debug.DebugCommandReceiver"
-            android:exported="true">
+            android:exported="false">
             <intent-filter>
                 <action android:name="com.cruisemesh.app.debug.SEND_TEXT" />
                 <action android:name="com.cruisemesh.app.debug.REQUEST_RELAY_SYNC" />
