@@ -34,6 +34,9 @@ final class MeshController: ObservableObject {
     private var pausedForBluetoothAudio = false
     private var relayCancellable: AnyCancellable?
     private var lanHealthTimer: Timer?
+    // D8: periodic re-digest bookkeeping.
+    private var digestMaintenanceTimer: Timer?
+    private var lastDigestAtByAddress: [String: Int64] = [:]
     private var audioRouteObserver: NSObjectProtocol?
     private var relaySyncInFlight = false
     private var relaySyncPending = false
@@ -149,6 +152,7 @@ final class MeshController: ObservableObject {
         }
         lan.start(foregroundActive: appForeground)
         startLanHealthLoop()
+        startDigestMaintenanceLoop()
 
         transport.onFrame = { [weak self] address, frame in
             Task { @MainActor in self?.onFrameReceived(address: address, frame: frame) }
@@ -194,6 +198,9 @@ final class MeshController: ObservableObject {
         lanHealthTimer?.invalidate()
         lanHealthTimer = nil
         lanHealth.clear()
+        digestMaintenanceTimer?.invalidate()
+        digestMaintenanceTimer = nil
+        lastDigestAtByAddress.removeAll()
         currentLanEndpoint = nil
         currentLanInstanceToken = nil
         currentLanNetworkId = nil
@@ -499,6 +506,14 @@ final class MeshController: ObservableObject {
         sendLanEndpointHint(address: address)
         queueCurrentLanEndpoint(to: userId)
         drainCarriedEnvelopesTo(address: address, peerUserId: userId)
+        sendDigest(address: address, userId: userId, identity: identity)
+        refreshNearby()
+    }
+
+    /// Encode and send the §7.3 digest for `address` and record the time so
+    /// `checkDigestMaintenance` can re-run it on a long-lived link (D8). Called
+    /// at HELLO time and on the periodic re-digest tick.
+    private func sendDigest(address: String, userId: Data, identity: Identity) {
         let entries: [DigestEntry]
         if let contact = try? store.getContact(userId: userId) {
             entries = (try? store.chatDigest(chatId: contact.userId)) ?? []
@@ -520,7 +535,35 @@ final class MeshController: ObservableObject {
             return
         }
         MeshRouter.sendToAddress(address: address, frame: digest)
-        refreshNearby()
+        lastDigestAtByAddress[address] = Int64(Date().timeIntervalSince1970 * 1_000)
+    }
+
+    private func startDigestMaintenanceLoop() {
+        digestMaintenanceTimer?.invalidate()
+        digestMaintenanceTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.checkDigestMaintenance()
+            }
+        }
+    }
+
+    /// D8: re-run the digest exchange on links that have stayed up past their
+    /// jittered 3-5 min interval so a message/receipt that arrived after the
+    /// connect-time digest still converges without a reconnect. Digests are
+    /// idempotent, so over-calling is safe.
+    private func checkDigestMaintenance() {
+        guard let identity else { return }
+        let routes = MeshRouter.identifiedRoutes()
+        let active = Set(routes.map { $0.address })
+        lastDigestAtByAddress = lastDigestAtByAddress.filter { active.contains($0.key) }
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        for route in routes {
+            let last = lastDigestAtByAddress[route.address] ?? 0
+            let seed = UInt64(bitPattern: Int64(truncatingIfNeeded: route.address.hashValue))
+            if shouldRedigest(nowMs: now, lastDigestAtMs: last, jitterSeed: seed) {
+                sendDigest(address: route.address, userId: route.userId, identity: identity)
+            }
+        }
     }
 
     private func handleDigest(

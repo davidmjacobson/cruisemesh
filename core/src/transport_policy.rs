@@ -15,6 +15,32 @@ pub fn digest_is_expected_chat_id(digest_chat_id: Vec<u8>, hello_user_id: Option
     hello_user_id.is_some_and(|id| id == digest_chat_id)
 }
 
+/// Bounds of the periodic re-digest interval (D8). A link that stays up past a
+/// jittered point in this window re-runs the digest exchange, so a message that
+/// arrived (or a receipt that was authored) after the one-shot connect-time
+/// digest still converges without waiting for a reconnect.
+pub const REDIGEST_MIN_INTERVAL_MS: i64 = 3 * 60_000;
+pub const REDIGEST_MAX_INTERVAL_MS: i64 = 5 * 60_000;
+
+/// Whether a long-lived link is due to re-run its digest exchange (D8).
+///
+/// The interval is jittered per link across `[REDIGEST_MIN_INTERVAL_MS,
+/// REDIGEST_MAX_INTERVAL_MS]` using `jitter_seed` (e.g. a hash of the peer
+/// address) so many simultaneously-established links don't all re-digest on the
+/// same tick. Digests are idempotent, so an early or extra exchange is
+/// harmless -- this only bounds how often a quiet-but-live link bothers.
+///
+/// `last_digest_at_ms` is when this link last ran a digest (0 if it never has,
+/// which is due immediately). A `last_digest_at_ms` in the future (clock skew)
+/// simply isn't due yet.
+#[uniffi::export]
+pub fn should_redigest(now_ms: i64, last_digest_at_ms: i64, jitter_seed: u64) -> bool {
+    let span = (REDIGEST_MAX_INTERVAL_MS - REDIGEST_MIN_INTERVAL_MS) as u64;
+    let jitter = (jitter_seed % (span + 1)) as i64;
+    let interval = REDIGEST_MIN_INTERVAL_MS + jitter;
+    now_ms.saturating_sub(last_digest_at_ms) >= interval
+}
+
 #[uniffi::export]
 pub fn digest_through_lamport_for_sender(
     entries: Vec<DigestEntry>,
@@ -420,6 +446,39 @@ fn health_decision(action: CoreLanHealthAction, nonce: Option<u64>) -> CoreLanHe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redigest_waits_for_the_jittered_interval() {
+        // seed 0 -> the minimum interval (3 min).
+        assert!(!should_redigest(REDIGEST_MIN_INTERVAL_MS - 1, 0, 0));
+        assert!(should_redigest(REDIGEST_MIN_INTERVAL_MS, 0, 0));
+    }
+
+    #[test]
+    fn redigest_jitter_never_leaves_the_configured_window() {
+        for seed in [0u64, 1, 7, 42, 1_000, u64::MAX] {
+            // Just before the max bound: not every seed is due yet...
+            let before_max = should_redigest(REDIGEST_MAX_INTERVAL_MS - 1, 0, seed);
+            // ...but by the max bound, every seed must be due.
+            assert!(should_redigest(REDIGEST_MAX_INTERVAL_MS, 0, seed));
+            // And none is due before the min bound.
+            assert!(!should_redigest(REDIGEST_MIN_INTERVAL_MS - 1, 0, seed));
+            let _ = before_max;
+        }
+    }
+
+    #[test]
+    fn redigest_measures_from_the_last_digest() {
+        let last = 10_000_000i64;
+        assert!(!should_redigest(last + REDIGEST_MIN_INTERVAL_MS - 1, last, 0));
+        assert!(should_redigest(last + REDIGEST_MAX_INTERVAL_MS, last, 0));
+    }
+
+    #[test]
+    fn redigest_not_due_when_last_digest_is_in_the_future() {
+        // Clock skew: last_digest_at ahead of now must not trigger a redigest.
+        assert!(!should_redigest(0, 60_000, 0));
+    }
 
     #[test]
     fn router_rejects_identity_changes_and_prefers_lan() {

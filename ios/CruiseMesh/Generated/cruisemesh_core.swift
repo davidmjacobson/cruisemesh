@@ -11434,6 +11434,28 @@ public func sealMessage(sender: Identity, recipientAgreePk: Data, payload: Data)
     )
 })
 }
+/**
+ * Whether a long-lived link is due to re-run its digest exchange (D8).
+ *
+ * The interval is jittered per link across `[REDIGEST_MIN_INTERVAL_MS,
+ * REDIGEST_MAX_INTERVAL_MS]` using `jitter_seed` (e.g. a hash of the peer
+ * address) so many simultaneously-established links don't all re-digest on the
+ * same tick. Digests are idempotent, so an early or extra exchange is
+ * harmless -- this only bounds how often a quiet-but-live link bothers.
+ *
+ * `last_digest_at_ms` is when this link last ran a digest (0 if it never has,
+ * which is due immediately). A `last_digest_at_ms` in the future (clock skew)
+ * simply isn't due yet.
+ */
+public func shouldRedigest(nowMs: Int64, lastDigestAtMs: Int64, jitterSeed: UInt64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_should_redigest(
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterInt64.lower(lastDigestAtMs),
+        FfiConverterUInt64.lower(jitterSeed),$0
+    )
+})
+}
 public func shouldResendLanEndpoint(previousSignature: String?, previousSentAtMs: Int64?, currentSignature: String, nowMs: Int64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_should_resend_lan_endpoint(
@@ -11779,6 +11801,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_seal_message() != 58379) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_should_redigest() != 43848) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_should_resend_lan_endpoint() != 5099) {
