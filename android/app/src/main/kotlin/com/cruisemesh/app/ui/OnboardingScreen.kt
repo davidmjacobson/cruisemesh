@@ -222,13 +222,9 @@ fun OnboardingScreen(
 private fun WelcomeSlide(onRestore: () -> Unit) {
     SlideScaffold(
         eyebrow = "Nearby-first messaging",
-        title = "Welcome to CruiseMesh",
-        body = "CruiseMesh helps you communicate with friends and family nearby, even when you do not have Wi-Fi or cell service.",
+        title = "Messages that find a way through",
+        body = "CruiseMesh delivers messages to people nearby even without Wi-Fi or cell service — using Bluetooth, local Wi-Fi, or hopping phone to phone.",
     ) {
-        HighlightCard(
-            title = "Built for the moments when networks disappear",
-            detail = "Keep conversations moving on hikes, cruises, festivals, road trips, and anywhere coverage is unreliable.",
-        )
         TextButton(
             onClick = onRestore,
             modifier = Modifier.padding(top = 8.dp),
@@ -242,16 +238,12 @@ private fun WelcomeSlide(onRestore: () -> Unit) {
 private fun DeliverySlide() {
     SlideScaffold(
         eyebrow = "How it works",
-        title = "Messages can hop phone to phone",
-        body = "CruiseMesh uses your phone and other phones running CruiseMesh to help deliver messages, even when you are too far from your friend to connect to their phone directly over Bluetooth.",
+        title = "It uses whatever's around",
+        body = "Nearby, messages travel phone-to-phone over Bluetooth and Wi-Fi. Farther away, they hop between other CruiseMesh phones until they reach your friend.",
     ) {
         HighlightCard(
             title = "Private by default",
-            detail = "Your messages are encrypted end to end, so nearby relays help carry them without being able to read them.",
-        )
-        HighlightCard(
-            title = "Keep Wi-Fi on, even with no internet",
-            detail = "On a ship or anywhere Wi-Fi has no internet, leave it connected — CruiseMesh uses the local network to reach phones near you faster.",
+            detail = "Always end-to-end encrypted — even the phones that help carry a message can't read it.",
         )
     }
 }
@@ -264,15 +256,15 @@ private fun PermissionsSlide(
     onRequestBatteryExemption: () -> Unit,
 ) {
     SlideScaffold(
-        eyebrow = "Required for messaging",
-        title = "CruiseMesh needs these permissions to work",
-        body = "Without Nearby devices access, this app cannot scan, connect, send, or receive messages. It will not work as designed until you grant them.",
+        eyebrow = "Turn on a few permissions",
+        title = "Give CruiseMesh a way to reach people",
+        body = "Each of these opens up another way for your messages to get through.",
     ) {
         if (!meshPermissionsGranted) {
             Surface(
                 shape = RoundedCornerShape(18.dp),
-                color = MaterialTheme.colorScheme.errorContainer,
-                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                color = MaterialTheme.colorScheme.tertiaryContainer,
+                contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(bottom = 4.dp),
@@ -287,13 +279,13 @@ private fun PermissionsSlide(
         val items = listOf(
             PermissionItem(
                 title = "Nearby devices and notifications",
-                detail = "Required so CruiseMesh can scan, advertise, connect over Bluetooth, and notify you when messages arrive.",
+                detail = "Lets CruiseMesh scan for and connect to phones around you, and notify you when a message arrives.",
                 enabled = meshPermissionsGranted,
                 required = true,
             ),
             PermissionItem(
                 title = "Background activity",
-                detail = "Strongly recommended so the mesh can keep syncing while your phone is in your pocket.",
+                detail = "Keeps the mesh working while your phone is in your pocket.",
                 enabled = batteryExemptionGranted,
                 required = false,
             ),
@@ -336,11 +328,7 @@ private fun PermissionsSlide(
                 else R.string.ui_nearby_access_off_detail,
             ),
             style = MaterialTheme.typography.bodySmall,
-            color = if (meshPermissionsGranted) {
-                MaterialTheme.colorScheme.onSurfaceVariant
-            } else {
-                MaterialTheme.colorScheme.error
-            },
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 14.dp),
         )
     }
@@ -434,7 +422,7 @@ private fun PermissionStatusCard(item: PermissionItem) {
         shape = RoundedCornerShape(20.dp),
         color = when {
             item.enabled -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.75f)
-            missingRequired -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.85f)
+            missingRequired -> MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.85f)
             else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
         },
     ) {
@@ -452,13 +440,13 @@ private fun PermissionStatusCard(item: PermissionItem) {
             Text(
                 text = when {
                     item.enabled -> "Enabled"
-                    item.required -> "Required — mesh off without this"
+                    item.required -> "Needed to send messages"
                     else -> "Recommended"
                 },
                 style = MaterialTheme.typography.labelLarge,
                 color = when {
                     item.enabled -> MaterialTheme.colorScheme.primary
-                    item.required -> MaterialTheme.colorScheme.error
+                    item.required -> MaterialTheme.colorScheme.onTertiaryContainer
                     else -> MaterialTheme.colorScheme.onSurfaceVariant
                 },
                 modifier = Modifier.padding(top = 10.dp),
