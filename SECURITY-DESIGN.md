@@ -35,7 +35,10 @@ limits.
 - Strangers must not be able to forge messages or receipts from your
   contacts, or join your groups.
 - A compromised relay must yield only sealed envelopes and routing hints.
-- Key material must never leave the device.
+- Key material must never leave the device **unencrypted**. The one sanctioned
+  exception is the user-initiated, passphrase-encrypted `.cmbak` backup file
+  (see Identity, below) — its ciphertext is only as strong as the passphrase
+  protecting it.
 
 ### Out of scope (accepted limitations)
 
@@ -52,8 +55,18 @@ limits.
 ## Identity
 
 - An identity is an **Ed25519 signing keypair + X25519 encryption keypair**,
-  generated on device; private keys never leave it (no multi-device, no
-  cloud backup of keys in v1 — a lost phone means re-friending).
+  generated on device; private keys never leave it *unencrypted* — there is
+  still no multi-device support (a lost phone with no backup means
+  re-friending). What changed since v1: a user can now export the identity
+  (plus message history) inside a passphrase-protected `.cmbak` file
+  (`core/src/backup.rs`) to move accounts across a reinstall. The key bytes
+  are encrypted with AES-256-GCM under a key derived via
+  PBKDF2-HMAC-SHA256 (600,000 iterations by default; the format enforces
+  100,000–1,200,000) from a user passphrase (minimum 10 characters,
+  strength-rated before export), with a random 16-byte salt and 12-byte
+  nonce per file. This is a deliberate, user-driven trade-off — see
+  [LOCAL_BACKUP_RESTORE.md](LOCAL_BACKUP_RESTORE.md) — not an automatic or
+  cloud-synced export; the file is only as strong as its passphrase.
 - **UserID** = first 16 bytes of BLAKE2b(Ed25519 public key), shown base32
   for out-of-band sharing.
 - **Friending** exchanges names and both public keys via QR code or pasted

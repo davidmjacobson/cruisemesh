@@ -320,11 +320,20 @@ interrupt mid-transfer — reconnection just re-runs the digest exchange.
 
 ## 8. Media readiness (photos & audio memos, later)
 
+**Shipped:** small photo/audio attachments travel inline inside the sealed
+envelope itself — `core/src/content.rs`'s `CoreAttachmentPayload`, capped at
+`ATTACHMENT_MAX_BLOB_BYTES` (180 KiB) after encoding. Because they're just
+another envelope payload, they flow over **any transport**, including the
+internet relay (relayd's per-family storage quota is explicitly sized around
+inline photo/audio traffic — see `relayd/DEPLOY.md` §10). This covers the
+common case (a compressed cruise photo) without the manifest/chunk machinery
+below, which remains the design for media too large to inline.
+
 Profile photos are the one intentional exception to "no media in v1": they are
 small, durable contact metadata (§6.2.1), not chat attachments. Everything
-larger than that still follows the rules below.
+larger than the inline cap still follows the rules below.
 
-Decisions taken **now** so media doesn't force a redesign:
+Decisions taken **now** so larger media doesn't force a redesign:
 
 1. **Attachments are not messages.** A future photo message = a normal text-sized
    envelope carrying an *attachment manifest* (BLAKE2b content hash, size, mime,

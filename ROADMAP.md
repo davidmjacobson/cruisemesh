@@ -11,7 +11,7 @@ summary. Milestones are sequential because each one de-risks the next.
 | 3 | Internet relay | Self-hostable `relayd`, mixed BLE+relay delivery without duplicates | ✅ Done (see [relayd/DEPLOY.md](relayd/DEPLOY.md)) |
 | 4 | Groups + broadcast | Group keys and rotation, per-member ticks, public broadcast channel | 🔨 In progress |
 | 5 | 🚢 Field test | Everything, on an actual cruise ship, for a week — latency, battery, and delivery-mode data | ⏳ Upcoming |
-| 6 | Media attachments | Photos/audio via content-addressed chunks over direct links only | 📋 Designed, not started (DESIGN.md §8) |
+| 6 | Media attachments | Inline blobs (≤180 KiB) over any transport incl. relay — shipped; content-addressed chunk manifest for larger media — designed, not started | 🔨 Partially shipped (DESIGN.md §8) |
 
 ## Near-term focus
 

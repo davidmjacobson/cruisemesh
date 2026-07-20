@@ -1,8 +1,12 @@
 # Local Encrypted Backup & Restore — Design Spec
 
-Status: proposal (v1)
+Status: shipped (v1, both platforms)
 Audience: implementer (Claude / Sonnet), reviewer (David)
-Platform: Android first. iOS parity is a follow-up (identical bundle format).
+Platform: shipped on Android and iOS, sharing the same `.cmbak` bundle format
+and the Rust core's `seal_backup`/`open_backup`/`backup_to` (`core/src/backup.rs`,
+`core/src/store.rs`). The document below is the original design spec, kept as
+background — see the KDF note in §4 for where the shipped implementation
+differs from the original proposal.
 
 ---
 
@@ -88,6 +92,17 @@ restore rather than stored in the file.
 ---
 
 ## 4. File format `.cmbak`
+
+**As shipped, the KDF is PBKDF2-HMAC-SHA256** (`kdf_id = 3`), not the
+Argon2id/scrypt options this section originally proposed — see
+`core/src/backup.rs`: 600,000 iterations by default, with the format
+enforcing a 100,000–1,200,000 range on open so a corrupt/hostile
+`kdf_params` can't force an unbounded KDF. Cipher is AES-256-GCM as
+proposed, with a 16-byte salt and 12-byte nonce, header bytes as AAD.
+Minimum passphrase length is enforced at 10 characters
+(`backup_min_passphrase_length`), with a separate strength rating shown
+before export. The rest of this section is kept for context on the format's
+design rationale.
 
 Single binary file, all integers big-endian:
 
