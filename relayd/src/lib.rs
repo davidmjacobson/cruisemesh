@@ -139,6 +139,14 @@ pub const MAX_ENVELOPE_SEALED_BYTES: usize = 512 * 1024;
 /// this on any realistic itinerary while still bounding the $4 VPS's disk.
 pub const DEFAULT_FAMILY_QUOTA_BYTES: u64 = 256 * 1024 * 1024;
 
+/// FR4: build-time version identifiers, embedded via Cargo (`VERSION`) and
+/// `build.rs` (`GIT_SHA`) so `/healthz` and the startup log always reflect
+/// the exact commit running -- there was previously no way to ask a
+/// deployed relay which of master's several relayd-affecting changes
+/// (`/presence`, D7 quotas, T4-09 limits, ...) it was actually running.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const GIT_SHA: &str = env!("CRUISEMESH_GIT_SHA");
+
 #[derive(Clone)]
 pub struct AppState {
     store: RelayStore,
@@ -733,10 +741,16 @@ pub fn parse_family_quota_bytes(raw: &str) -> Result<u64, String> {
 #[derive(Serialize)]
 struct HealthzResponse {
     status: &'static str,
+    version: &'static str,
+    commit: &'static str,
 }
 
 async fn healthz() -> Json<HealthzResponse> {
-    Json(HealthzResponse { status: "ok" })
+    Json(HealthzResponse {
+        status: "ok",
+        version: VERSION,
+        commit: GIT_SHA,
+    })
 }
 
 #[derive(Deserialize)]

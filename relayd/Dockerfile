@@ -4,6 +4,13 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY core ./core
 COPY relayd ./relayd
+# FR4: the build context above deliberately does not include `.git`, so
+# `relayd/build.rs`'s `git rev-parse` fallback can't see the real commit
+# from inside this stage. Pass it in explicitly:
+#   docker compose build --build-arg GIT_SHA=$(git rev-parse --short HEAD)
+# Falls back to "unknown" (build.rs's own default) if not provided.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
 RUN cargo build --release -p cruisemesh-relayd
 
 FROM debian:bookworm-slim

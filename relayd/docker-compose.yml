@@ -12,6 +12,13 @@ services:
     build:
       context: ..
       dockerfile: relayd/Dockerfile
+      args:
+        # FR4: `.git` is not in the build context (see Dockerfile comment);
+        # pass the real commit through explicitly, e.g.:
+        #   export GIT_SHA=$(git rev-parse --short HEAD)
+        #   docker compose up -d --build
+        # Falls back to "unknown" if unset.
+        GIT_SHA: ${GIT_SHA:-unknown}
     environment:
       # Comma-separated family bearer tokens (required). Generate with:
       #   openssl rand -hex 32

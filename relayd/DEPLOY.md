@@ -44,10 +44,14 @@ Optional: put the exports in a root-only `.env` next to `docker-compose.yml`
 ## 3. Start
 
 ```sh
+# Optional but recommended: bakes the exact commit into the image so
+# /healthz reports what's actually running (FR4) instead of "unknown".
+export GIT_SHA=$(git rev-parse --short HEAD)
+
 docker compose up -d --build
 docker compose ps
 curl -fsS "https://${RELAY_DOMAIN}/healthz"
-# → {"status":"ok"}
+# → {"status":"ok","version":"0.1.0","commit":"abc1234"}
 ```
 
 Caddy obtains a Let's Encrypt cert for `RELAY_DOMAIN` on first start. If

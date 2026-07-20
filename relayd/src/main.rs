@@ -39,7 +39,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(parse_bind(&bind)?).await?;
     let store = RelayStore::open(&db_path)?;
     info!(
-        "relay server listening on {bind}, db={db_path}, family_quota_bytes={family_quota_bytes}"
+        version = cruisemesh_relayd::VERSION,
+        commit = cruisemesh_relayd::GIT_SHA,
+        bind = %bind,
+        db_path = %db_path,
+        family_quota_bytes,
+        "relay server listening"
     );
     axum::serve(
         listener,
