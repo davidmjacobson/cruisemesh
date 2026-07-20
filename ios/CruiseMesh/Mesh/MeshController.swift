@@ -1258,6 +1258,16 @@ final class MeshController: ObservableObject {
             throughLamport: receipt.lamport,
             viaTransport: arrival.transport
         )
+        // V2 field metric: stamp delivery latency + route on the messages this
+        // cumulative delivery receipt confirms.
+        if receipt.receiptType == ReceiptType.delivered {
+            try? store.recordDeliveredMetric(
+                chatId: envelopeSender,
+                throughLamport: receipt.lamport,
+                deliveredAtMs: arrival.receivedAt,
+                viaTransport: arrival.transport
+            )
+        }
         ChatEvents.notifyChatChanged(envelopeSender)
     }
 

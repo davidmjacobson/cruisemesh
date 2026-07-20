@@ -170,6 +170,7 @@ private struct AdvancedSettingsView: View {
     @State private var lanError: String?
     @State private var showLanQR = false
     @State private var showLanScanner = false
+    @State private var metricsFile: ShareableFile?
 
     var body: some View {
         Form {
@@ -233,6 +234,21 @@ private struct AdvancedSettingsView: View {
                     Text(error).font(.caption).foregroundStyle(.red)
                 }
             }
+
+            Section("Diagnostics") {
+                Button {
+                    if let url = FieldMetricsExport.writeCSVFile() {
+                        metricsFile = ShareableFile(url: url)
+                    } else {
+                        lanError = "No field metrics captured yet"
+                    }
+                } label: {
+                    Label("Export field metrics", systemImage: "square.and.arrow.up")
+                }
+                Text("Exports a CSV of delivery timings and the transports messages used, for cruise-test analysis. Metadata only — no message content or contact names.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .navigationTitle("Advanced settings")
         .navigationBarTitleDisplayMode(.inline)
@@ -252,6 +268,9 @@ private struct AdvancedSettingsView: View {
                let endpoint = parseLanManualEndpoint(endpointText) {
                 LanEndpointQRView(endpoint: endpoint)
             }
+        }
+        .sheet(item: $metricsFile) { file in
+            ActivityShareView(items: [file.url])
         }
         .sheet(isPresented: $showLanScanner) {
             QRScannerView { code in

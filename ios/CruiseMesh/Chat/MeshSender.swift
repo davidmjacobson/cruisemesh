@@ -74,6 +74,9 @@ final class RealMeshSender: MeshSender {
         }
         let chatId = authored.message.chatId
         let delivered = authored.acknowledgedDelivered
+        // V2 field metric: note the outbound send so its delivery latency and
+        // confirmation route can be measured on the cruise test.
+        try? store.recordSentMetric(chatId: chatId, lamport: authored.message.lamport, sentAtMs: timestamp)
         ChatEvents.notifyChatChanged(chatId)
         RelaySyncEvents.requestSync()
         // A pending kind-3 friend card must reach the peer before the first

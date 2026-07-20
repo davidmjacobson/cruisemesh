@@ -129,6 +129,11 @@ class RealMeshSender(
         val queued = try {
             val timestamp = System.currentTimeMillis()
             val authored = store.authorPairwiseMessage(identity, contact, kind, payload, replyToMsgId, timestamp)
+            // V2 field metric: note the outbound send so its delivery latency
+            // and confirmation route can be measured on the cruise test.
+            runCatching {
+                store.recordSentMetric(authored.message.chatId, authored.message.lamport, timestamp)
+            }
             authored.message.chatId to authored.acknowledgedDelivered
         } catch (e: Exception) {
             Log.e(TAG, "$logLabel: message was not stored for ${contact.name}", e)

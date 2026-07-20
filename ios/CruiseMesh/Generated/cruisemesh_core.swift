@@ -1846,6 +1846,15 @@ public protocol MessageStoreProtocol : AnyObject {
     func ensureAuthoredReceipt(identity: Identity, contact: Contact, ackedSenderUserId: Data, receiptType: UInt8, throughLamport: UInt64, timestampMs: Int64) throws  -> AuthoredReceipt
     
     /**
+     * V2 field metrics as CSV for the cruise-test export (metadata only). One
+     * row per sent/received message; `latency_ms` is the send->delivered gap
+     * for confirmed outbound messages. Transports use the
+     * [`MessageArrival::transport`] encoding (0/1 BLE direct/muled, 2 relay,
+     * 3/4 LAN direct/muled). Empty cells are unknown/not-applicable.
+     */
+    func exportDeliveryMetricsCsv() throws  -> String
+    
+    /**
      * Unexpired carried envelopes that were classified as family traffic
      * when received, oldest first. Used by relay upload so one phone with
      * internet can uplink ciphertext it is muling for known contacts.
@@ -2193,6 +2202,16 @@ public protocol MessageStoreProtocol : AnyObject {
     func recentConsumedMsgIds(limit: UInt64) throws  -> [Data]
     
     /**
+     * V2 field metric: stamp the delivery time and return route (T6
+     * `via_transport`) onto every outbound metric row in `chat_id` at or below
+     * the confirmed `through_lamport` that isn't already marked delivered.
+     * Cumulative receipts confirm a run of messages at once, so this covers
+     * them all; the first confirmation wins (a later, higher watermark still
+     * stamps the messages it newly covers). Metadata only.
+     */
+    func recordDeliveredMetric(chatId: Data, throughLamport: UInt64, deliveredAtMs: Int64, viaTransport: UInt8?) throws 
+    
+    /**
      * Attach first-arrival diagnostics to an already inserted incoming
      * message. A redundant mesh/relay copy never overwrites the original
      * route, hop count, or receive time.
@@ -2228,6 +2247,15 @@ public protocol MessageStoreProtocol : AnyObject {
      * when the return route isn't known.
      */
     func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws 
+    
+    /**
+     * V2 field metric: record that this device authored an outbound message
+     * at `lamport` in `chat_id` at `sent_at_ms`, so the cruise-test export can
+     * later measure delivery latency and the route a receipt returned on.
+     * Idempotent per (chat, lamport); metadata only -- the chat is stored as
+     * an 8-byte hash and no content is kept. See [`delivery_metrics`].
+     */
+    func recordSentMetric(chatId: Data, lamport: UInt64, sentAtMs: Int64) throws 
     
     /**
      * Drop a carried envelope by `msg_id` -- called once it's been handed to
@@ -2865,6 +2893,20 @@ open func ensureAuthoredReceipt(identity: Identity, contact: Contact, ackedSende
 }
     
     /**
+     * V2 field metrics as CSV for the cruise-test export (metadata only). One
+     * row per sent/received message; `latency_ms` is the send->delivered gap
+     * for confirmed outbound messages. Transports use the
+     * [`MessageArrival::transport`] encoding (0/1 BLE direct/muled, 2 relay,
+     * 3/4 LAN direct/muled). Empty cells are unknown/not-applicable.
+     */
+open func exportDeliveryMetricsCsv()throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_export_delivery_metrics_csv(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Unexpired carried envelopes that were classified as family traffic
      * when received, oldest first. Used by relay upload so one phone with
      * internet can uplink ciphertext it is muling for known contacts.
@@ -3456,6 +3498,24 @@ open func recentConsumedMsgIds(limit: UInt64)throws  -> [Data] {
 }
     
     /**
+     * V2 field metric: stamp the delivery time and return route (T6
+     * `via_transport`) onto every outbound metric row in `chat_id` at or below
+     * the confirmed `through_lamport` that isn't already marked delivered.
+     * Cumulative receipts confirm a run of messages at once, so this covers
+     * them all; the first confirmation wins (a later, higher watermark still
+     * stamps the messages it newly covers). Metadata only.
+     */
+open func recordDeliveredMetric(chatId: Data, throughLamport: UInt64, deliveredAtMs: Int64, viaTransport: UInt8?)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_record_delivered_metric(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterUInt64.lower(throughLamport),
+        FfiConverterInt64.lower(deliveredAtMs),
+        FfiConverterOptionUInt8.lower(viaTransport),$0
+    )
+}
+}
+    
+    /**
      * Attach first-arrival diagnostics to an already inserted incoming
      * message. A redundant mesh/relay copy never overwrites the original
      * route, hop count, or receive time.
@@ -3514,6 +3574,22 @@ open func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, th
         FfiConverterUInt8.lower(receiptType),
         FfiConverterUInt64.lower(throughLamport),
         FfiConverterOptionUInt8.lower(viaTransport),$0
+    )
+}
+}
+    
+    /**
+     * V2 field metric: record that this device authored an outbound message
+     * at `lamport` in `chat_id` at `sent_at_ms`, so the cruise-test export can
+     * later measure delivery latency and the route a receipt returned on.
+     * Idempotent per (chat, lamport); metadata only -- the chat is stored as
+     * an 8-byte hash and no content is kept. See [`delivery_metrics`].
+     */
+open func recordSentMetric(chatId: Data, lamport: UInt64, sentAtMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_record_sent_metric(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterUInt64.lower(lamport),
+        FfiConverterInt64.lower(sentAtMs),$0
     )
 }
 }
@@ -11879,6 +11955,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_ensure_authored_receipt() != 16297) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_export_delivery_metrics_csv() != 57937) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_family_carried_envelopes() != 49773) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11984,6 +12063,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_recent_consumed_msg_ids() != 58947) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_delivered_metric() != 16840) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_message_arrival() != 42850) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11991,6 +12073,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_receipt() != 46075) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_sent_metric() != 27687) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_remove_carried_envelope() != 52788) {

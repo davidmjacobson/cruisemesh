@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -43,6 +44,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.debug.DebugFileLog
+import com.cruisemesh.app.debug.FieldMetricsExport
 import com.cruisemesh.app.friending.encodeQrBitmap
 import com.cruisemesh.app.mesh.LanManualEndpoint
 import com.cruisemesh.app.mesh.LanSweepDisplayState
@@ -259,6 +261,23 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                 },
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             ) { Text(stringResource(R.string.ui_share_debug_log)) }
+
+            Text(stringResource(R.string.ui_export_field_metrics_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 12.dp),
+            )
+            OutlinedButton(
+                onClick = {
+                    val intent = FieldMetricsExport.shareIntent(context)
+                    if (intent != null) {
+                        context.startActivity(Intent.createChooser(intent, "Export field metrics"))
+                    } else {
+                        Toast.makeText(context, R.string.ui_no_field_metrics_yet, Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            ) { Text(stringResource(R.string.ui_export_field_metrics)) }
         }
     }
 

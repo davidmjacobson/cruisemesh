@@ -134,6 +134,9 @@
     <string name="ui_search_this_24_network">Search my local network</string>
     <string name="ui_share_card">Share card</string>
     <string name="ui_share_debug_log">Share debug log</string>
+    <string name="ui_export_field_metrics">Export field metrics</string>
+    <string name="ui_export_field_metrics_desc">Exports a CSV of delivery timings and the transports messages used, for cruise-test analysis. Metadata only — no message content or contact names.</string>
+    <string name="ui_no_field_metrics_yet">No field metrics captured yet</string>
     <string name="ui_show_address_qr">Show address QR</string>
     <string name="ui_show_my_friend_card">Show my friend card</string>
     <string name="ui_some_messages_are_still_making_their_way_across">Some messages are still making their way across the ship</string>

@@ -900,7 +900,129 @@ impl MessageStore {
                 ],
             )
             .map_err(store_err)?;
+        if changed > 0 {
+            // V2 field metric: log the inbound arrival alongside the diagnostic
+            // update, on the message's first arrival only. Best-effort and
+            // metadata-only; a metrics failure must not fail delivery.
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO delivery_metrics
+                    (chat_hash, lamport, direction, at_ms, arrival_transport, hop_count)
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+                params![
+                    metric_chat_hash(&chat_id),
+                    lamport as i64,
+                    arrival.received_at,
+                    arrival.transport as i64,
+                    arrival.hops_taken as i64,
+                ],
+            );
+        }
         Ok(changed > 0)
+    }
+
+    /// V2 field metric: record that this device authored an outbound message
+    /// at `lamport` in `chat_id` at `sent_at_ms`, so the cruise-test export can
+    /// later measure delivery latency and the route a receipt returned on.
+    /// Idempotent per (chat, lamport); metadata only -- the chat is stored as
+    /// an 8-byte hash and no content is kept. See [`delivery_metrics`].
+    pub fn record_sent_metric(
+        &self,
+        chat_id: Vec<u8>,
+        lamport: u64,
+        sent_at_ms: i64,
+    ) -> Result<(), CoreError> {
+        validate_sqlite_u64("metric lamport", lamport)?;
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "INSERT OR IGNORE INTO delivery_metrics
+                (chat_hash, lamport, direction, at_ms)
+             VALUES (?1, ?2, 0, ?3)",
+            params![metric_chat_hash(&chat_id), lamport as i64, sent_at_ms],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// V2 field metric: stamp the delivery time and return route (T6
+    /// `via_transport`) onto every outbound metric row in `chat_id` at or below
+    /// the confirmed `through_lamport` that isn't already marked delivered.
+    /// Cumulative receipts confirm a run of messages at once, so this covers
+    /// them all; the first confirmation wins (a later, higher watermark still
+    /// stamps the messages it newly covers). Metadata only.
+    pub fn record_delivered_metric(
+        &self,
+        chat_id: Vec<u8>,
+        through_lamport: u64,
+        delivered_at_ms: i64,
+        via_transport: Option<u8>,
+    ) -> Result<(), CoreError> {
+        validate_sqlite_u64("metric lamport", through_lamport)?;
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "UPDATE delivery_metrics
+             SET delivered_at_ms = ?3, via_transport = ?4
+             WHERE chat_hash = ?1 AND direction = 0
+               AND lamport <= ?2 AND delivered_at_ms IS NULL",
+            params![
+                metric_chat_hash(&chat_id),
+                through_lamport as i64,
+                delivered_at_ms,
+                via_transport.map(|t| t as i64),
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// V2 field metrics as CSV for the cruise-test export (metadata only). One
+    /// row per sent/received message; `latency_ms` is the send->delivered gap
+    /// for confirmed outbound messages. Transports use the
+    /// [`MessageArrival::transport`] encoding (0/1 BLE direct/muled, 2 relay,
+    /// 3/4 LAN direct/muled). Empty cells are unknown/not-applicable.
+    pub fn export_delivery_metrics_csv(&self) -> Result<String, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT chat_hash, lamport, direction, at_ms, delivered_at_ms,
+                        via_transport, arrival_transport, hop_count
+                 FROM delivery_metrics
+                 ORDER BY direction, chat_hash, lamport",
+            )
+            .map_err(store_err)?;
+        let mut out = String::from(
+            "direction,chat,lamport,at_ms,delivered_at_ms,latency_ms,via_transport,arrival_transport,hop_count\n",
+        );
+        let rows = stmt
+            .query_map([], |row| {
+                let chat_hash: Vec<u8> = row.get(0)?;
+                let lamport: i64 = row.get(1)?;
+                let direction: i64 = row.get(2)?;
+                let at_ms: i64 = row.get(3)?;
+                let delivered_at_ms: Option<i64> = row.get(4)?;
+                let via_transport: Option<i64> = row.get(5)?;
+                let arrival_transport: Option<i64> = row.get(6)?;
+                let hop_count: Option<i64> = row.get(7)?;
+                let latency_ms = match (direction, delivered_at_ms) {
+                    (0, Some(d)) => Some(d - at_ms),
+                    _ => None,
+                };
+                let dir = if direction == 0 { "sent" } else { "received" };
+                let cell = |v: Option<i64>| v.map(|n| n.to_string()).unwrap_or_default();
+                Ok(format!(
+                    "{dir},{},{lamport},{at_ms},{},{},{},{},{}\n",
+                    hex_lower(&chat_hash),
+                    cell(delivered_at_ms),
+                    cell(latency_ms),
+                    cell(via_transport),
+                    cell(arrival_transport),
+                    cell(hop_count),
+                ))
+            })
+            .map_err(store_err)?;
+        for row in rows {
+            out.push_str(&row.map_err(store_err)?);
+        }
+        Ok(out)
     }
 
     /// First-arrival diagnostics for one message, or `None` for locally
@@ -2483,6 +2605,33 @@ fn validate_carried_envelope(envelope: &CarriedEnvelope, now_ms: i64) -> Result<
     Ok(())
 }
 
+/// Length of the metadata-only chat hash used by [`delivery_metrics`]. Eight
+/// bytes is enough to keep distinct chats apart in an export without storing
+/// (or being reversible to) the raw contact/group id.
+const METRIC_CHAT_HASH_LEN: usize = 8;
+
+/// Lowercase hex, for rendering the metric chat hash in the CSV export.
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// A short, non-reversible tag for a chat id, used only to group field-metric
+/// rows in the export. Never a raw user/group id -- see [`delivery_metrics`].
+fn metric_chat_hash(chat_id: &[u8]) -> Vec<u8> {
+    let mut hasher =
+        Blake2bVar::new(METRIC_CHAT_HASH_LEN).expect("valid BLAKE2b digest length");
+    hasher.update(chat_id);
+    let mut digest = vec![0; METRIC_CHAT_HASH_LEN];
+    hasher
+        .finalize_variable(&mut digest)
+        .expect("digest output has configured length");
+    digest
+}
+
 fn carried_content_digest(recipient_hint: &[u8], sealed: &[u8]) -> Vec<u8> {
     let mut hasher =
         Blake2bVar::new(CARRIED_CONTENT_DIGEST_LEN).expect("valid BLAKE2b digest length");
@@ -3010,6 +3159,22 @@ CREATE TABLE IF NOT EXISTS outgoing_receipts (
     receipt_type    INTEGER NOT NULL,
     through_lamport INTEGER NOT NULL,
     PRIMARY KEY(chat_id, sender_user_id, receipt_type)
+);
+
+-- V2 field metrics: a local, metadata-only ledger for the cruise test.
+-- One row per message we sent or received, keyed by an 8-byte hash of the
+-- chat id (never the raw id) and our/their lamport. No message content is
+-- ever stored here. `direction` 0 = we sent it, 1 = we received it.
+CREATE TABLE IF NOT EXISTS delivery_metrics (
+    chat_hash         BLOB NOT NULL,
+    lamport           INTEGER NOT NULL,
+    direction         INTEGER NOT NULL,
+    at_ms             INTEGER NOT NULL,
+    delivered_at_ms   INTEGER,
+    via_transport     INTEGER,
+    arrival_transport INTEGER,
+    hop_count         INTEGER,
+    PRIMARY KEY(chat_hash, lamport, direction)
 );
 
 CREATE TABLE IF NOT EXISTS outgoing_receipt_envelopes (
@@ -5718,6 +5883,105 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    // --- delivery metrics / field export (V2) -----------------------------
+
+    #[test]
+    fn sent_then_delivered_metric_stamps_latency_and_route_for_the_covered_run() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for (lamport, at) in [(1u64, 1_000i64), (2, 1_100), (3, 1_200)] {
+            store
+                .record_sent_metric(b"alice".to_vec(), lamport, at)
+                .unwrap();
+        }
+        // A cumulative delivered receipt through lamport 2, returned over BLE
+        // direct (transport 0), stamps messages 1 and 2 -- not 3.
+        store
+            .record_delivered_metric(b"alice".to_vec(), 2, 1_500, Some(0))
+            .unwrap();
+
+        let csv = store.export_delivery_metrics_csv().unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "direction,chat,lamport,at_ms,delivered_at_ms,latency_ms,via_transport,arrival_transport,hop_count"
+        );
+        // Rows are ordered by direction then chat then lamport, so 1..=3 follow.
+        assert!(lines[1].starts_with("sent,"));
+        assert!(lines[1].ends_with(",1,1000,1500,500,0,,"));
+        assert!(lines[2].ends_with(",2,1100,1500,400,0,,"));
+        // Message 3 is beyond the watermark: no delivery yet.
+        assert!(lines[3].ends_with(",3,1200,,,,,"));
+    }
+
+    #[test]
+    fn delivered_metric_keeps_the_first_confirmation() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.record_sent_metric(b"alice".to_vec(), 1, 1_000).unwrap();
+        store
+            .record_delivered_metric(b"alice".to_vec(), 1, 1_500, Some(3))
+            .unwrap();
+        // A later receipt for the same message must not overwrite the first
+        // confirmation's time or route.
+        store
+            .record_delivered_metric(b"alice".to_vec(), 1, 1_900, Some(0))
+            .unwrap();
+
+        let csv = store.export_delivery_metrics_csv().unwrap();
+        let row = csv.lines().nth(1).unwrap();
+        assert!(row.ends_with(",1,1000,1500,500,3,,"), "row was: {row}");
+    }
+
+    #[test]
+    fn record_message_arrival_logs_an_inbound_metric_once() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.insert_message(msg(b"bob", b"bob", 5, "hi")).unwrap();
+        let first = MessageArrival {
+            transport: 2,
+            hops_taken: 3,
+            received_at: 1_700_000_000_777,
+        };
+        assert!(store
+            .record_message_arrival(b"bob".to_vec(), b"bob".to_vec(), 5, first)
+            .unwrap());
+        // A redundant later copy neither overwrites the arrival nor adds a row.
+        let redundant = MessageArrival {
+            transport: 0,
+            hops_taken: 1,
+            received_at: 1_700_000_009_999,
+        };
+        assert!(!store
+            .record_message_arrival(b"bob".to_vec(), b"bob".to_vec(), 5, redundant)
+            .unwrap());
+
+        let csv = store.export_delivery_metrics_csv().unwrap();
+        let received: Vec<&str> = csv.lines().filter(|l| l.starts_with("received,")).collect();
+        assert_eq!(received.len(), 1);
+        assert!(received[0].ends_with(",5,1700000000777,,,,2,3"), "row: {}", received[0]);
+    }
+
+    #[test]
+    fn metrics_export_hashes_the_chat_and_never_leaks_the_raw_id() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let chat = b"super-secret-contact-id".to_vec();
+        store.record_sent_metric(chat.clone(), 1, 1_000).unwrap();
+        let csv = store.export_delivery_metrics_csv().unwrap();
+        assert!(!csv.contains("super-secret-contact-id"));
+        // Same chat hashes stably to the same tag across calls.
+        store.record_sent_metric(chat.clone(), 2, 1_100).unwrap();
+        let tag1 = csv.lines().nth(1).unwrap().split(',').nth(1).unwrap().to_string();
+        let csv2 = store.export_delivery_metrics_csv().unwrap();
+        let tag2 = csv2.lines().nth(1).unwrap().split(',').nth(1).unwrap();
+        assert_eq!(tag1, tag2);
+    }
+
+    #[test]
+    fn empty_metrics_export_is_just_the_header() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let csv = store.export_delivery_metrics_csv().unwrap();
+        assert_eq!(csv.lines().count(), 1);
+        assert!(csv.starts_with("direction,chat,lamport,"));
     }
 
     // --- outgoing receipts (DESIGN.md §7.2, §7.3) -------------------------

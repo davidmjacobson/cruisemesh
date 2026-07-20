@@ -169,6 +169,10 @@ class GroupSender(
         val queued = try {
             val timestamp = System.currentTimeMillis()
             val authored = store.authorGroupMessage(identity, group, kind, payload, replyToMsgId, timestamp)
+            // V2 field metric: note the outbound group send for the cruise-test export.
+            runCatching {
+                store.recordSentMetric(authored.message.chatId, authored.message.lamport, timestamp)
+            }
             authored.message.chatId to authored
         } catch (e: Exception) {
             Log.e(TAG, "$logLabel: group message was not stored for ${group.name}", e)
