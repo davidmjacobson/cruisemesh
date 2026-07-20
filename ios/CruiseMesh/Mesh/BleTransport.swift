@@ -378,13 +378,20 @@ extension BleTransport: CBPeripheralManagerDelegate {
         _ peripheral: CBPeripheralManager,
         didReceiveWrite requests: [CBATTRequest]
     ) {
+        // CoreBluetooth requires exactly one respond(to:) per didReceiveWrite
+        // batch, made to the first request (FI10) — process every value,
+        // then send the single response for the whole batch.
+        guard let first = requests.first else { return }
+        var allValid = true
         for request in requests {
             let address = request.central.identifier.uuidString
             if let value = request.value {
                 handleFragment(address: address, fragment: value)
+            } else {
+                allValid = false
             }
-            peripheral.respond(to: request, withResult: .success)
         }
+        peripheral.respond(to: first, withResult: allValid ? .success : .invalidAttributeValueLength)
     }
 
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
