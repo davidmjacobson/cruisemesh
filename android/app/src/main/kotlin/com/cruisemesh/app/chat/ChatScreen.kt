@@ -184,6 +184,10 @@ fun ChatScreen(
     var readThrough by remember(contact.userId) {
         mutableStateOf(store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_READ))
     }
+    // T6: the transport a delivery receipt last returned on, for the Info pane.
+    var deliveredVia by remember(contact.userId) {
+        mutableStateOf(store.receiptViaTransport(currentContact.userId, ownUserId, RECEIPT_TYPE_DELIVERED))
+    }
     var draft by remember(contact.userId) { mutableStateOf(DraftStore.load(context, contact.userId)) }
     var isMuted by remember(contact.userId) { mutableStateOf(ChatMuteStore.isMuted(context, contact.userId)) }
     var replyingTo by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
@@ -204,6 +208,7 @@ fun ChatScreen(
         contactAvatar = store.contactAvatar(currentContact.userId)
         deliveredThrough = store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_DELIVERED)
         readThrough = store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_READ)
+        deliveredVia = store.receiptViaTransport(currentContact.userId, ownUserId, RECEIPT_TYPE_DELIVERED)
     }
 
     fun stagePhoto(jpeg: ByteArray?) {
@@ -320,6 +325,7 @@ fun ChatScreen(
         contactAvatar = contactAvatar,
         deliveredThrough = deliveredThrough,
         readThrough = readThrough,
+        deliveredVia = deliveredVia,
         replyingTo = replyingTo,
         onReplyingToChange = { replyingTo = it },
         arrivalFor = { message ->
@@ -429,6 +435,7 @@ private fun ConversationScreen(
     contactAvatar: ByteArray? = null,
     deliveredThrough: ULong,
     readThrough: ULong,
+    deliveredVia: UByte? = null,
     replyingTo: StoredMessage? = null,
     onReplyingToChange: (StoredMessage?) -> Unit = {},
     arrivalFor: (StoredMessage) -> MessageArrival? = { null },
@@ -752,6 +759,12 @@ private fun ConversationScreen(
         } else {
             arrivalFor(currentInfoMessage)
         }
+        // T6: an own message delivered through the current watermark shows the
+        // route the confirmation returned on (covers every acked message, not
+        // just the one at the exact watermark lamport).
+        val deliveredViaRoute = deliveredVia
+            ?.takeIf { infoIsOwn && currentInfoMessage.lamport <= deliveredThrough }
+            ?.let { transportRouteText(it.toInt()) }
         MessageInfoBottomSheet(
             onDismiss = { infoMessage = null },
             text = messageInfoText(
@@ -759,6 +772,7 @@ private fun ConversationScreen(
                     infoIsOwn,
                     infoTick,
                     infoArrival,
+                    deliveredViaRoute = deliveredViaRoute,
                     outboundExpiryMs = if (infoIsOwn) store?.outboundMessageExpiry(
                         currentInfoMessage.chatId,
                         currentInfoMessage.senderUserId,
@@ -1361,6 +1375,7 @@ fun messageInfoText(
     isOwn: Boolean,
     tick: TickStatus?,
     arrival: MessageArrival? = null,
+    deliveredViaRoute: String? = null,
     outboundExpiryMs: Long? = null,
     nowMs: Long = System.currentTimeMillis(),
 ): String {
@@ -1376,10 +1391,10 @@ fun messageInfoText(
             "\nStatus: Still trying — expires in ${expiryRemainingText(outboundExpiryMs - nowMs)}"
         else -> tick?.let { "\nStatus: ${tickLegendText(it)}" }.orEmpty()
     }
-    val arrivalLine = arrival?.let {
-        if (isOwn) "\n${messageDeliveryConfirmationText(it)}"
-        else "\n${messageArrivalText(it)}"
-    }.orEmpty()
+    val arrivalLine = when {
+        isOwn -> deliveredViaRoute?.let { "\nDelivery confirmed via $it" }.orEmpty()
+        else -> arrival?.let { "\n${messageArrivalText(it)}" }.orEmpty()
+    }
     return "$direction\nTime: $sentAt$status$arrivalLine"
 }
 
@@ -1416,8 +1431,8 @@ private fun expiryRemainingText(remainingMs: Long): String {
     }
 }
 
-private fun messageRouteText(arrival: MessageArrival): String =
-    when (arrival.transport.toInt()) {
+internal fun transportRouteText(transport: Int): String =
+    when (transport) {
         0 -> "direct BLE"
         1 -> "another device over BLE"
         2 -> "relay"
@@ -1425,6 +1440,9 @@ private fun messageRouteText(arrival: MessageArrival): String =
         4 -> "another device over local Wi-Fi"
         else -> "unknown route"
     }
+
+private fun messageRouteText(arrival: MessageArrival): String =
+    transportRouteText(arrival.transport.toInt())
 
 private fun messageArrivalText(arrival: MessageArrival): String {
     val route = messageRouteText(arrival)
@@ -1437,14 +1455,6 @@ private fun messageArrivalText(arrival: MessageArrival): String {
         java.util.Locale.getDefault(),
     ).format(java.util.Date(arrival.receivedAt))
     return "Arrived via $route · $hopLabel · $receivedAt"
-}
-
-private fun messageDeliveryConfirmationText(arrival: MessageArrival): String {
-    val confirmedAt = java.text.SimpleDateFormat(
-        "h:mm a",
-        java.util.Locale.getDefault(),
-    ).format(java.util.Date(arrival.receivedAt))
-    return "Delivery confirmed via ${messageRouteText(arrival)} · $confirmedAt"
 }
 
 @Composable

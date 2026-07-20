@@ -179,6 +179,7 @@ class ReceiptRelayRoundTripTest {
             senderUserId = recipient.userId,
             receiptType = receipt.receiptType,
             throughLamport = receipt.lamport,
+            viaTransport = 2u, // relay-carried in this round-trip
         )
     }
 

@@ -78,21 +78,40 @@ class MessageInfoTextTest {
             kind = 1u.toUByte(),
             payload = "hello".toByteArray(),
         )
-        val confirmation = MessageArrival(
-            transport = 3u,
-            hopsTaken = 0u,
-            receivedAt = 1_783_608_000_500L,
+
+        // T6: the route is resolved from the delivery receipt's watermark
+        // (transport -> route) by the caller and passed in.
+        val info = messageInfoText(
+            message,
+            isOwn = true,
+            tick = TickStatus.DELIVERED,
+            deliveredViaRoute = transportRouteText(3),
+        )
+
+        assertTrue(info.contains("Status: Delivered"))
+        assertTrue(info.contains("Delivery confirmed via local Wi-Fi"))
+        assertFalse(info.contains("Arrived via"))
+    }
+
+    @Test
+    fun outgoingMessageInfoOmitsConfirmationRouteWhenUnknown() {
+        val message = StoredMessage(
+            senderUserId = byteArrayOf(1),
+            chatId = byteArrayOf(2),
+            lamport = 3uL,
+            timestamp = 1_783_608_000_000L,
+            kind = 1u.toUByte(),
+            payload = "hello".toByteArray(),
         )
 
         val info = messageInfoText(
             message,
             isOwn = true,
             tick = TickStatus.DELIVERED,
-            arrival = confirmation,
+            deliveredViaRoute = null,
         )
 
         assertTrue(info.contains("Status: Delivered"))
-        assertTrue(info.contains("Delivery confirmed via local Wi-Fi ·"))
-        assertFalse(info.contains("Arrived via"))
+        assertFalse(info.contains("Delivery confirmed via"))
     }
 }
