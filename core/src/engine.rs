@@ -1155,12 +1155,7 @@ mod tests {
             CoreInboundGate::Rejected
         );
         assert_eq!(
-            core_inbound_gate(
-                true,
-                crate::DEFAULT_HOP_TTL,
-                10 + MAX_CARRY_FUTURE_MS,
-                10,
-            ),
+            core_inbound_gate(true, crate::DEFAULT_HOP_TTL, 10 + MAX_CARRY_FUTURE_MS, 10,),
             CoreInboundGate::Dispatch
         );
     }

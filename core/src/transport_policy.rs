@@ -470,7 +470,11 @@ mod tests {
     #[test]
     fn redigest_measures_from_the_last_digest() {
         let last = 10_000_000i64;
-        assert!(!should_redigest(last + REDIGEST_MIN_INTERVAL_MS - 1, last, 0));
+        assert!(!should_redigest(
+            last + REDIGEST_MIN_INTERVAL_MS - 1,
+            last,
+            0
+        ));
         assert!(should_redigest(last + REDIGEST_MAX_INTERVAL_MS, last, 0));
     }
 

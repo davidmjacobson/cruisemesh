@@ -7,20 +7,20 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use cruisemesh_core::{
-    compute_recipient_hint, default_expiry, encode_message_body, generate_identity, generate_msg_id,
-    seal_message, Identity, MessageBody, DEFAULT_HOP_TTL, KIND_TEXT,
+    compute_recipient_hint, default_expiry, encode_message_body, generate_identity,
+    generate_msg_id, seal_message, Identity, MessageBody, DEFAULT_HOP_TTL, KIND_TEXT,
 };
 use cruisemesh_relayd::{app, AppState, RelayStore, WS_MAX_INBOUND_MESSAGE_BYTES};
 use futures_util::{SinkExt, StreamExt};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
 use tower::util::ServiceExt;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -41,7 +41,12 @@ struct AuthoredEnvelope {
     expiry_ms: i64,
 }
 
-fn author_text(sender: &Identity, recipient: &Identity, text: &str, lamport: u64) -> AuthoredEnvelope {
+fn author_text(
+    sender: &Identity,
+    recipient: &Identity,
+    text: &str,
+    lamport: u64,
+) -> AuthoredEnvelope {
     let timestamp = now_ms();
     let body = MessageBody {
         kind: KIND_TEXT,
@@ -101,7 +106,9 @@ async fn get_envelopes_json(
 ) -> serde_json::Value {
     let hints_q = hints.iter().map(|h| b64(h)).collect::<Vec<_>>().join(",");
     let request = Request::builder()
-        .uri(format!("/envelopes?hints={hints_q}&after={after}&limit=100"))
+        .uri(format!(
+            "/envelopes?hints={hints_q}&after={after}&limit=100"
+        ))
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();

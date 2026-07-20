@@ -58,7 +58,12 @@ struct AuthoredEnvelope {
 
 /// Author a sealed text envelope the same way phones do: encode body → seal
 /// to recipient → public header fields from core helpers.
-fn author_text(sender: &Identity, recipient: &Identity, text: &str, lamport: u64) -> AuthoredEnvelope {
+fn author_text(
+    sender: &Identity,
+    recipient: &Identity,
+    text: &str,
+    lamport: u64,
+) -> AuthoredEnvelope {
     let timestamp = now_ms();
     // Wire chat_id = frame sender's own userId (MeshService convention).
     let body = MessageBody {
@@ -105,8 +110,12 @@ fn author_receipt(
         content,
     };
     let payload = encode_message_body(body).unwrap();
-    let sealed =
-        seal_message(receipt_sender.clone(), receipt_recipient.agree_pk.clone(), payload).unwrap();
+    let sealed = seal_message(
+        receipt_sender.clone(),
+        receipt_recipient.agree_pk.clone(),
+        payload,
+    )
+    .unwrap();
     AuthoredEnvelope {
         msg_id: generate_msg_id(),
         hop_ttl: DEFAULT_HOP_TTL,
@@ -146,7 +155,9 @@ async fn get_envelopes(
 ) -> serde_json::Value {
     let hints_q = hints.iter().map(|h| b64(h)).collect::<Vec<_>>().join(",");
     let request = Request::builder()
-        .uri(format!("/envelopes?hints={hints_q}&after={after}&limit=100"))
+        .uri(format!(
+            "/envelopes?hints={hints_q}&after={after}&limit=100"
+        ))
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
@@ -161,12 +172,14 @@ async fn ack(app: &Router, token: &str, ids: &[i64]) -> u64 {
         .uri("/envelopes/ack")
         .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({ "ids": ids }).to_string(),
-        ))
+        .body(Body::from(serde_json::json!({ "ids": ids }).to_string()))
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK, "POST /envelopes/ack failed");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "POST /envelopes/ack failed"
+    );
     let json = body_json(response).await;
     json["deleted"].as_u64().unwrap()
 }
@@ -192,7 +205,10 @@ async fn real_sealed_text_post_fetch_open_ack_gone() {
     let envelopes = fetched["envelopes"].as_array().unwrap();
     assert_eq!(envelopes.len(), 1);
     assert_eq!(envelopes[0]["msg_id"], b64(&env.msg_id));
-    assert_eq!(envelopes[0]["hop_ttl"].as_u64().unwrap(), DEFAULT_HOP_TTL as u64);
+    assert_eq!(
+        envelopes[0]["hop_ttl"].as_u64().unwrap(),
+        DEFAULT_HOP_TTL as u64
+    );
 
     let sealed = decode_sealed_field(&envelopes[0]["sealed"]);
     let opened = open_message(bob.clone(), sealed).unwrap();
@@ -283,7 +299,11 @@ async fn mixed_text_and_read_receipt_share_mailbox_without_kind_filter() {
 
     let page = get_envelopes(&app, "family-a", &[text.recipient_hint.clone()], 0).await;
     let envs = page["envelopes"].as_array().unwrap();
-    assert_eq!(envs.len(), 2, "server must return both kinds for the same hint");
+    assert_eq!(
+        envs.len(),
+        2,
+        "server must return both kinds for the same hint"
+    );
 
     let mut kinds = Vec::new();
     for env in envs {
@@ -402,20 +422,19 @@ async fn expiry_pruning_drops_stale_sealed_envelopes() {
     assert_eq!(body.content, b"still good");
 }
 
-
 async fn spawn_app_with_router(tokens: &[&str]) -> (NamedTempFile, Router, String) {
     let db = NamedTempFile::new().unwrap();
     let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
     let auth: HashSet<String> = tokens.iter().map(|t| (*t).to_string()).collect();
     let app = app(AppState::new(store, auth));
-    
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app_clone = app.clone();
     tokio::spawn(async move {
         axum::serve(listener, app_clone).await.unwrap();
     });
-    
+
     (db, app, format!("ws://{}", addr))
 }
 
@@ -426,9 +445,12 @@ async fn ws_live_push_after_connect() {
     let alice = generate_identity();
     let bob = generate_identity();
     let (_db, app, ws_url) = spawn_app_with_router(&["family-a"]).await;
-    
+
     let env1 = author_text(&alice, &bob, "hello 1", 1);
-    let url = format!("{ws_url}/ws?hints={}&token=family-a&after=0", b64(&env1.recipient_hint));
+    let url = format!(
+        "{ws_url}/ws?hints={}&token=family-a&after=0",
+        b64(&env1.recipient_hint)
+    );
     println!("TEST: connecting to {}", url);
     let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
     println!("TEST: connected");

@@ -115,9 +115,20 @@ async fn per_row_ack_leaves_sibling_fanout_rows_intact() {
     assert_eq!(c_ids.len(), 1);
     ack(&app, &c_ids).await;
 
-    assert!(fetch_ids(&app, &rows[2].1).await.is_empty(), "C's row acked away");
-    assert_eq!(fetch_ids(&app, &rows[0].1).await.len(), 1, "A's row survives");
-    assert_eq!(fetch_ids(&app, &rows[1].1).await.len(), 1, "B's row survives");
+    assert!(
+        fetch_ids(&app, &rows[2].1).await.is_empty(),
+        "C's row acked away"
+    );
+    assert_eq!(
+        fetch_ids(&app, &rows[0].1).await.len(),
+        1,
+        "A's row survives"
+    );
+    assert_eq!(
+        fetch_ids(&app, &rows[1].1).await.len(),
+        1,
+        "B's row survives"
+    );
 }
 
 /// A retried upload (author retry / second member mule) re-posts the same
@@ -128,7 +139,10 @@ async fn reposting_the_same_fanout_rows_dedupes() {
     let msg_id = vec![0x44u8; 16];
     let hint = vec![0x44u8; 8];
     for _ in 0..3 {
-        assert_eq!(post_row(&app, &msg_id, &hint).await.status(), StatusCode::OK);
+        assert_eq!(
+            post_row(&app, &msg_id, &hint).await.status(),
+            StatusCode::OK
+        );
     }
     assert_eq!(
         fetch_ids(&app, &hint).await.len(),

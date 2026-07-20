@@ -248,8 +248,8 @@ fn decode_opt_field(bytes: &[u8], pos: &mut usize) -> Result<Option<String>, Cor
                 read_binary_slice(bytes, pos, 1)?[0],
             ]) as usize;
             let value = read_binary_slice(bytes, pos, len)?;
-            let value =
-                std::str::from_utf8(value).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+            let value = std::str::from_utf8(value)
+                .map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
             Ok(Some(value.to_string()))
         }
         other => Err(CoreError::InvalidFriendCard(format!(

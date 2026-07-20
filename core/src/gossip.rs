@@ -78,7 +78,9 @@ impl SeenIds {
     /// Create an empty seen-set sized for DESIGN.md §5.3's ~50k entries.
     #[uniffi::constructor]
     pub fn new() -> Self {
-        SeenIds { inner: Mutex::new(Inner::new(DEFAULT_CAPACITY)) }
+        SeenIds {
+            inner: Mutex::new(Inner::new(DEFAULT_CAPACITY)),
+        }
     }
 
     /// Record that we've now handled `msg_id`, returning `true` if it was
@@ -141,7 +143,11 @@ impl SeenIds {
 
     /// Current number of retained ids (for tests/diagnostics).
     pub fn len(&self) -> u64 {
-        self.inner.lock().expect("seen-ids mutex poisoned").order.len() as u64
+        self.inner
+            .lock()
+            .expect("seen-ids mutex poisoned")
+            .order
+            .len() as u64
     }
 }
 
@@ -157,7 +163,9 @@ mod tests {
 
     /// Build a set with a small capacity so eviction is easy to exercise.
     fn with_capacity(capacity: usize) -> SeenIds {
-        SeenIds { inner: Mutex::new(Inner::new(capacity)) }
+        SeenIds {
+            inner: Mutex::new(Inner::new(capacity)),
+        }
     }
 
     #[test]

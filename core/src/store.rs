@@ -2667,8 +2667,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// Shared hash used for both the chat and sender tags in [`delivery_metrics`]
 /// rows: a short, non-reversible tag, never a raw user/group id.
 fn metric_hash8(id: &[u8]) -> Vec<u8> {
-    let mut hasher =
-        Blake2bVar::new(METRIC_CHAT_HASH_LEN).expect("valid BLAKE2b digest length");
+    let mut hasher = Blake2bVar::new(METRIC_CHAT_HASH_LEN).expect("valid BLAKE2b digest length");
     hasher.update(id);
     let mut digest = vec![0; METRIC_CHAT_HASH_LEN];
     hasher
@@ -6153,7 +6152,9 @@ mod tests {
     #[test]
     fn delivered_metric_keeps_the_first_confirmation() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        store.record_sent_metric(b"alice".to_vec(), 1, 1_000).unwrap();
+        store
+            .record_sent_metric(b"alice".to_vec(), 1, 1_000)
+            .unwrap();
         store
             .record_delivered_metric(b"alice".to_vec(), 1, 1_500, Some(3))
             .unwrap();
@@ -6239,8 +6240,12 @@ mod tests {
         let alice_sender = hex_lower(&metric_sender_hash(b"alice"));
         let carol_sender = hex_lower(&metric_sender_hash(b"carol"));
         assert_ne!(alice_sender, carol_sender);
-        assert!(received.iter().any(|r| r.contains(&format!(",1,{alice_sender},"))));
-        assert!(received.iter().any(|r| r.contains(&format!(",1,{carol_sender},"))));
+        assert!(received
+            .iter()
+            .any(|r| r.contains(&format!(",1,{alice_sender},"))));
+        assert!(received
+            .iter()
+            .any(|r| r.contains(&format!(",1,{carol_sender},"))));
     }
 
     #[test]
@@ -6252,7 +6257,14 @@ mod tests {
         assert!(!csv.contains("super-secret-contact-id"));
         // Same chat hashes stably to the same tag across calls.
         store.record_sent_metric(chat.clone(), 2, 1_100).unwrap();
-        let tag1 = csv.lines().nth(1).unwrap().split(',').nth(1).unwrap().to_string();
+        let tag1 = csv
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .nth(1)
+            .unwrap()
+            .to_string();
         let csv2 = store.export_delivery_metrics_csv().unwrap();
         let tag2 = csv2.lines().nth(1).unwrap().split(',').nth(1).unwrap();
         assert_eq!(tag1, tag2);
@@ -6279,8 +6291,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!("cruisemesh-delivery-metrics-migration-{unique}.sqlite"));
+        let path = std::env::temp_dir().join(format!(
+            "cruisemesh-delivery-metrics-migration-{unique}.sqlite"
+        ));
         let path_str = path.to_string_lossy().to_string();
         let conn = Connection::open(&path_str).unwrap();
         conn.execute_batch(
