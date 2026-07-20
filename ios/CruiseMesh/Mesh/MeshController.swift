@@ -1245,18 +1245,16 @@ final class MeshController: ObservableObject {
         guard (try? store.getContact(userId: envelopeSender)) != nil else { return }
         // T4-06: advancing the receipt watermark is the durable state here;
         // let a store failure propagate so a relay-fetched receipt is not
-        // acked away before it is recorded.
+        // acked away before it is recorded. T6: the receipt returned on the
+        // exact link that delivered the message -- record that route against
+        // the watermark so every acked message's Info pane can prove the
+        // BLE/LAN/relay round trip, not just the one at the watermark lamport.
         try store.recordReceipt(
             chatId: envelopeSender,
             senderUserId: identity.userId,
             receiptType: receipt.receiptType,
-            throughLamport: receipt.lamport
-        )
-        _ = try? store.recordMessageArrival(
-            chatId: envelopeSender,
-            senderUserId: identity.userId,
-            lamport: receipt.lamport,
-            arrival: arrival
+            throughLamport: receipt.lamport,
+            viaTransport: arrival.transport
         )
         ChatEvents.notifyChatChanged(envelopeSender)
     }

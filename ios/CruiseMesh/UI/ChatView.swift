@@ -664,11 +664,12 @@ private struct MessageBubbleView: View {
                 message: message,
                 isOwn: isOwn,
                 tick: tick,
-                arrival: try? AppStore.get().messageArrival(
+                arrival: isOwn ? nil : (try? AppStore.get().messageArrival(
                     chatId: message.chatId,
                     senderUserId: message.senderUserId,
                     lamport: message.lamport
-                ),
+                )),
+                deliveredViaRoute: isOwn ? deliveryConfirmationRoute(for: message) : nil,
                 outboundExpiryMs: outboundExpiry
             ))
         }
@@ -825,11 +826,34 @@ private func messageCopyText(_ message: StoredMessage) -> String {
     return String(data: message.payload, encoding: .utf8) ?? ""
 }
 
+/// The transport an own message's delivery receipt returned on (T6), resolved
+/// from the delivery watermark so it shows for every acknowledged message, not
+/// just the one at the exact watermark lamport. `nil` when the message isn't
+/// delivered yet or the return route wasn't recorded.
+func deliveryConfirmationRoute(for message: StoredMessage) -> String? {
+    let store = AppStore.get()
+    guard
+        let through = try? store.receiptThrough(
+            chatId: message.chatId,
+            senderUserId: message.senderUserId,
+            receiptType: ReceiptType.delivered
+        ),
+        message.lamport <= through,
+        let via = (try? store.receiptViaTransport(
+            chatId: message.chatId,
+            senderUserId: message.senderUserId,
+            receiptType: ReceiptType.delivered
+        )) ?? nil
+    else { return nil }
+    return transportRouteText(via)
+}
+
 func messageInfoText(
     message: StoredMessage,
     isOwn: Bool,
     tick: TickStatus?,
     arrival: MessageArrival? = nil,
+    deliveredViaRoute: String? = nil,
     outboundExpiryMs: Int64? = nil,
     nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
 ) -> String {
@@ -846,9 +870,12 @@ func messageInfoText(
     } else {
         status = tick.map { "\nStatus: \(tickLegendText($0))" } ?? ""
     }
-    let arrivalLine = arrival.map {
-        isOwn ? "\n\(messageDeliveryConfirmationText($0))" : "\n\(messageArrivalText($0))"
-    } ?? ""
+    let arrivalLine: String
+    if isOwn {
+        arrivalLine = deliveredViaRoute.map { "\nDelivery confirmed via \($0)" } ?? ""
+    } else {
+        arrivalLine = arrival.map { "\n\(messageArrivalText($0))" } ?? ""
+    }
     return "\(direction)\nTime: \(sentAt)\(status)\(arrivalLine)"
 }
 
@@ -861,8 +888,8 @@ private func expiryRemainingText(_ remainingMs: Int64) -> String {
     return "\(minutes) minutes"
 }
 
-private func messageRouteText(_ arrival: MessageArrival) -> String {
-    switch arrival.transport {
+func transportRouteText(_ transport: UInt8) -> String {
+    switch transport {
     case 0: return "direct BLE"
     case 1: return "another device over BLE"
     case 2: return "relay"
@@ -872,14 +899,14 @@ private func messageRouteText(_ arrival: MessageArrival) -> String {
     }
 }
 
+private func messageRouteText(_ arrival: MessageArrival) -> String {
+    transportRouteText(arrival.transport)
+}
+
 private func messageArrivalText(_ arrival: MessageArrival) -> String {
     let hops = Int(arrival.hopsTaken)
     let hopLabel = "~\(hops) \(hops == 1 ? "hop" : "hops")"
     return "Arrived via \(messageRouteText(arrival)) · \(hopLabel) · \(arrivalTime(arrival.receivedAt))"
-}
-
-private func messageDeliveryConfirmationText(_ arrival: MessageArrival) -> String {
-    "Delivery confirmed via \(messageRouteText(arrival)) · \(arrivalTime(arrival.receivedAt))"
 }
 
 private func arrivalTime(_ timestampMs: Int64) -> String {
