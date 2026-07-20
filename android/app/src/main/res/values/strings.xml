@@ -71,9 +71,9 @@
     <string name="ui_mute_notifications">Mute notifications</string>
     <string name="ui_my_friend_card">My friend card</string>
     <string name="ui_friend_card_too_large">Shorten your name or relay settings to create a friend card.</string>
-    <string name="ui_nearby_permissions_are_required_skipping_them_means_the">Nearby permissions are required. Skipping them means the mesh stays off.</string>
+    <string name="ui_nearby_permissions_are_required_skipping_them_means_the">Nearby devices access is what lets CruiseMesh reach phones around you — grant it to start messaging.</string>
     <string name="ui_nearby_access_enabled">Nearby access enabled</string>
-    <string name="ui_enable_nearby_access_required">Enable nearby access (required)</string>
+    <string name="ui_enable_nearby_access_required">Enable nearby access</string>
     <string name="ui_background_activity_enabled">Background activity enabled</string>
     <string name="ui_enable_background_activity">Enable background activity</string>
     <string name="ui_new_chat">New chat</string>
@@ -118,8 +118,8 @@
     <string name="ui_through_mutual_friends">Through %1$s</string>
     <string name="ui_voice_memo_duration">Voice memo · %1$s</string>
     <string name="ui_step_of">Step %1$d of %2$d</string>
-    <string name="ui_nearby_access_on_detail">Nearby access is on. Background exemption is optional but makes delivery more reliable when the app is not open.</string>
-    <string name="ui_nearby_access_off_detail">You can finish setup without granting access, but the home screen will keep warning you — and no messages will move over the mesh until you do.</string>
+    <string name="ui_nearby_access_on_detail">Nearby access is on. Background activity is optional but keeps messages moving while the app isn\'t open.</string>
+    <string name="ui_nearby_access_off_detail">You can finish setup without granting access — you can turn it on later in Settings when you\'re ready to start messaging.</string>
     <string name="ui_device_id">Device ID: %1$s</string>
     <string name="ui_minimum_passphrase_length">At least %1$d characters.</string>
     <string name="ui_remove_photo">Remove photo</string>

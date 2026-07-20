@@ -22,17 +22,17 @@ struct OnboardingView: View {
             TabView(selection: $page) {
                 OnboardingSlide(
                     systemImage: "antenna.radiowaves.left.and.right",
-                    title: "Welcome to CruiseMesh",
-                    bodyText: "CruiseMesh helps you communicate with friends and family nearby, even when you do not have Wi-Fi or cell service.",
-                    supportText: "Built for the moments when networks disappear. Keep conversations moving on hikes, cruises, festivals, road trips, and anywhere coverage is unreliable."
+                    title: "Messages that find a way through",
+                    bodyText: "CruiseMesh delivers messages to people nearby even without Wi-Fi or cell service — using Bluetooth, local Wi-Fi, or hopping phone to phone.",
+                    supportText: nil
                 )
                 .tag(0)
 
                 OnboardingSlide(
                     systemImage: "point.3.connected.trianglepath.dotted",
-                    title: "Messages can hop phone to phone",
-                    bodyText: "CruiseMesh uses your phone and other phones running CruiseMesh to help deliver messages, even when you are too far from your friend to connect directly over Bluetooth.",
-                    supportText: "Your messages are encrypted end to end, so nearby relays can help carry them without being able to read them."
+                    title: "It uses whatever's around",
+                    bodyText: "Nearby, messages travel phone-to-phone over Bluetooth and Wi-Fi. Farther away, they hop between other CruiseMesh phones until they reach your friend.",
+                    supportText: "Always end-to-end encrypted — even the phones that help carry a message can't read it."
                 )
                 .tag(1)
 
@@ -125,7 +125,7 @@ private struct OnboardingSlide: View {
     let systemImage: String
     let title: String
     let bodyText: String
-    let supportText: String
+    let supportText: String?
 
     var body: some View {
         VStack(spacing: 20) {
@@ -138,10 +138,12 @@ private struct OnboardingSlide: View {
             Text(bodyText)
                 .font(.title3)
                 .multilineTextAlignment(.center)
-            Text(supportText)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+            if let supportText {
+                Text(supportText)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
         }
         .padding(28)
     }
@@ -155,15 +157,15 @@ private struct PermissionsSlide: View {
             Image(systemName: "checkmark.shield")
                 .font(.system(size: 58, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
-            Text("Turn on the permissions that help the mesh")
+            Text("Turn on a few permissions")
                 .font(.largeTitle.weight(.bold))
                 .multilineTextAlignment(.center)
-            Text("CruiseMesh works best when iOS lets it use Bluetooth and show delivery notifications.")
+            Text("Each of these opens up another way for your messages to get through.")
                 .font(.title3)
                 .multilineTextAlignment(.center)
             Button("Enable Bluetooth and notifications", action: onEnable)
                 .buttonStyle(.borderedProminent)
-            Text("You can continue without these, but delivery is less reliable while the app is backgrounded.")
+            Text("You can turn these on later in Settings.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
