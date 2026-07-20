@@ -1451,12 +1451,16 @@ impl MessageStore {
     ///
     /// `via_transport` (T6) is the transport the receipt itself returned on
     /// (the [`MessageArrival::transport`] encoding), recorded so a message's
-    /// Info pane can prove *how* delivery was confirmed. It is only overwritten
-    /// when the watermark actually advances and the new receipt carries a known
-    /// transport: a re-sent receipt for the same watermark, a stale/replayed
-    /// one, or an advancing receipt whose route we couldn't determine all keep
-    /// the transport that first confirmed the current watermark. Pass `None`
-    /// when the return route isn't known.
+    /// Info pane can prove *how* delivery was confirmed. It is overwritten
+    /// when the watermark actually advances and the new receipt carries a
+    /// known transport, and (FC4) also filled in when the watermark merely
+    /// *matches* the stored one but the stored route is still unknown --
+    /// otherwise a first confirmation whose return route we couldn't
+    /// determine would permanently hide a later, more informative receipt at
+    /// the same watermark. A stale/replayed receipt (lower watermark) never
+    /// touches it, and a receipt with an unknown route (`via_transport =
+    /// None`) never clears an already-known one. Pass `None` when the return
+    /// route isn't known.
     pub fn record_receipt(
         &self,
         chat_id: Vec<u8>,
@@ -1472,8 +1476,12 @@ impl MessageStore {
                 VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(chat_id, sender_user_id, receipt_type) DO UPDATE SET
                 via_transport = CASE
-                    WHEN excluded.through_lamport > through_lamport
-                         AND excluded.via_transport IS NOT NULL
+                    WHEN excluded.via_transport IS NOT NULL
+                         AND (
+                             excluded.through_lamport > through_lamport
+                             OR (excluded.through_lamport = through_lamport
+                                 AND via_transport IS NULL)
+                         )
                     THEN excluded.via_transport
                     ELSE via_transport END,
                 through_lamport = MAX(through_lamport, excluded.through_lamport)",
@@ -5802,6 +5810,90 @@ mod tests {
                 )
                 .unwrap(),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn via_transport_backfills_from_null_at_the_same_watermark_but_never_clears_afterward() {
+        // FC4: the first receipt at a watermark can arrive with an unknown
+        // route (via_transport = None). A later receipt confirming the *same*
+        // watermark with a known route must fill the gap instead of being
+        // permanently ignored -- but once a route is known, a later
+        // unknown-route receipt (even a resend of the same watermark) must
+        // never clear it back to unknown.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .receipt_via_transport(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            None
+        );
+
+        // Same watermark, now with a known route (BLE direct, transport 0):
+        // fills the previously-unknown route.
+        store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9,
+                Some(0),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .receipt_through(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            9
+        );
+        assert_eq!(
+            store
+                .receipt_via_transport(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            Some(0)
+        );
+
+        // A later receipt at the same watermark with an unknown route must
+        // never clear the route that's now known.
+        store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .receipt_via_transport(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            Some(0)
         );
     }
 
