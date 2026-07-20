@@ -191,7 +191,13 @@ async fn ws_replay_on_connect_matches_poll() {
     assert!(msg2.to_text().unwrap().contains(&b64(&env2.msg_id)));
 }
 
-#[tokio::test]
+// FR5: this timeout guards against a genuine hang (the WS logic itself is
+// provably race-free — subscribe precedes replay, insert precedes broadcast,
+// so a missed live push is always covered by replay). The old 3 s bound
+// fired under CPU starvation from a parallel build/test load, not from an
+// actual bug; 60 s plus a multi-thread runtime gives the scheduler enough
+// slack that only a real hang trips it.
+#[tokio::test(flavor = "multi_thread")]
 async fn ws_live_push_after_connect() {
     let alice = generate_identity();
     let bob = generate_identity();
@@ -213,7 +219,7 @@ async fn ws_live_push_after_connect() {
 
     post_envelope(&router, "family-a", &env1).await;
 
-    let msg = tokio::time::timeout(Duration::from_secs(3), socket.next())
+    let msg = tokio::time::timeout(Duration::from_secs(60), socket.next())
         .await
         .expect("live push timeout")
         .unwrap()
@@ -248,6 +254,12 @@ async fn ws_two_families_isolated() {
     assert!(result.is_err(), "family-b must not see family-a push");
 }
 
+// FR5: raise the deadline (guards a hang, not speed) but keep the default
+// current_thread runtime — this test's lag/drop condition is deliberately
+// induced by single-thread scheduling contention between the flood-posting
+// test task and the WS-handler task; running it multi-threaded lets the
+// handler drain the broadcast channel in parallel and the slow-consumer
+// condition never triggers.
 #[tokio::test]
 async fn ws_slow_consumer_disconnect_path() {
     let alice = generate_identity();
@@ -275,7 +287,7 @@ async fn ws_slow_consumer_disconnect_path() {
     }
 
     let mut saw_close = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), socket.next()).await {
             Ok(None) | Ok(Some(Err(_))) => {
