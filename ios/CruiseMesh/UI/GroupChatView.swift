@@ -389,8 +389,9 @@ struct GroupChatView: View {
 
     private func senderName(_ userId: Data) -> String {
         if userId == identity.userId { return "You" }
-        if let contact = contactsById[userId], !contact.name.isEmpty {
-            return contact.name
+        if let contact = contactsById[userId] {
+            let name = coreContactDisplayName(contact: contact)
+            if !name.isEmpty { return name }
         }
         return formatUserId(userId: userId)
     }
@@ -607,7 +608,10 @@ private struct GroupDetailsSheet: View {
     private var availableContacts: [Contact] {
         contacts
             .filter { !group.memberUserIds.contains($0.userId) }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            .sorted {
+                coreContactDisplayName(contact: $0)
+                    .localizedCaseInsensitiveCompare(coreContactDisplayName(contact: $1)) == .orderedAscending
+            }
     }
 
     var body: some View {
@@ -702,12 +706,12 @@ private struct GroupDetailsSheet: View {
                                 ? "checkmark.circle.fill" : "circle")
                             AvatarView(
                                 userId: contact.userId,
-                                name: contact.name,
+                                name: coreContactDisplayName(contact: contact),
                                 size: 36,
                                 reachability: connectivity.level(for: contact.userId, nowMs: nowMs)
                             )
                             Text(ChatListLogic.displayNameOrId(
-                                name: contact.name,
+                                name: coreContactDisplayName(contact: contact),
                                 displayId: formatUserId(userId: contact.userId)
                             ))
                         }

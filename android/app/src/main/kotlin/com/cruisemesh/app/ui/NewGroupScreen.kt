@@ -32,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.formatUserId
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.pluralStringResource
@@ -118,14 +119,14 @@ fun NewGroupScreen(
                             Spacer(modifier = Modifier.width(8.dp))
                             AvatarBadge(
                                 userId = contact.userId,
-                                name = contact.name,
+                                name = coreContactDisplayName(contact),
                                 displayId = displayId,
                                 size = 40.dp,
                                 photoBytes = avatarBytesByUserId[displayId],
                             )
                             Spacer(modifier = Modifier.width(12.dp))
                             Text(
-                                ChatListLogic.displayNameOrId(contact.name, displayId),
+                                ChatListLogic.displayNameOrId(coreContactDisplayName(contact), displayId),
                                 style = MaterialTheme.typography.bodyLarge.copy(
                                     fontWeight = if (checked) FontWeight.Medium else FontWeight.Normal,
                                 ),

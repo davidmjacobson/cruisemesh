@@ -671,6 +671,16 @@
         }
       }
     },
+    "Nickname": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nickname"
+          }
+        }
+      }
+    },
     "No chats yet": {
       "localizations": {
         "en": {
@@ -717,6 +727,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "OK"
+          }
+        }
+      }
+    },
+    "Only you see this. It replaces the name they shared, just on your phone.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Only you see this. It replaces the name they shared, just on your phone."
           }
         }
       }
@@ -1007,6 +1027,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Safety words"
+          }
+        }
+      }
+    },
+    "Save": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Save"
           }
         }
       }

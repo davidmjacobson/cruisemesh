@@ -56,6 +56,7 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.ContactDiscoveryPolicy
 import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.CoreException
+import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.CoreInboundDisposition
 import uniffi.cruisemesh_core.CoreInboundGate
 import uniffi.cruisemesh_core.CoreRelayEnvelopeDisposition
@@ -2607,7 +2608,7 @@ class MeshService : Service() {
         if (isVisible) {
             store.recordOutgoingReceipt(group.id, senderUserId, RECEIPT_TYPE_READ, throughLamport)
         } else if (isVisibleChatKind(body.kind)) {
-            val senderName = store.getContact(senderUserId)?.name
+            val senderName = store.getContact(senderUserId)?.let(::coreContactDisplayName)
                 ?: UserIdHex.encode(senderUserId).take(8)
             val preview = if (body.kind == KIND_ATTACHMENT_MANIFEST) {
                 try {
@@ -2675,7 +2676,7 @@ class MeshService : Service() {
             // 1:1 chat. Skip wire receipts for invites; the group is what matters.
         }
         if (!ChatVisibility.isVisible(group.id)) {
-            val senderName = contact?.name ?: UserIdHex.encode(senderUserId).take(8)
+            val senderName = contact?.let(::coreContactDisplayName) ?: UserIdHex.encode(senderUserId).take(8)
             MessageNotifier.notifyIncomingGroupMessage(
                 this,
                 group,

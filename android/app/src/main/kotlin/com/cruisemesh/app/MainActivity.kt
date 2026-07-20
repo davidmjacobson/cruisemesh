@@ -103,6 +103,7 @@ import com.cruisemesh.app.ui.ProfileScreen
 import com.cruisemesh.app.ui.AdvancedSettingsScreen
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
+import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.generateIdentity
@@ -647,7 +648,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             val unreadCount = store.semanticUnreadCount(c.userId, identity.userId).toInt()
             ChatSummary(
                 chatId = c.userId,
-                title = c.name,
+                title = coreContactDisplayName(c),
                 isGroup = false,
                 contact = c,
                 lastMessage = ChatListLogic.lastVisibleMessage(messages),

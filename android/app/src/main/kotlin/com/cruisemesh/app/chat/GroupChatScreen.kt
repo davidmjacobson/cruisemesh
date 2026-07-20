@@ -80,6 +80,7 @@ import com.cruisemesh.app.ui.formatConversationTimestamp
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.MessageStore
+import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
 import kotlinx.coroutines.launch
@@ -219,7 +220,7 @@ fun GroupChatScreen(
     fun senderName(userId: ByteArray): String {
         if (userId.contentEquals(ownUserId)) return "You"
         val contact = contactsByUserId[UserIdHex.encode(userId)]
-        return contact?.name?.takeIf { it.isNotBlank() }
+        return contact?.let(::coreContactDisplayName)?.takeIf { it.isNotBlank() }
             ?: formatUserId(userId)
     }
 
@@ -609,13 +610,13 @@ fun GroupChatScreen(
                                 )
                                 AvatarBadge(
                                     userId = contact.userId,
-                                    name = contact.name,
+                                    name = coreContactDisplayName(contact),
                                     displayId = key,
                                     size = 36.dp,
                                     reachability = memberReachabilityByUserId[key],
                                 )
                                 Spacer(modifier = Modifier.width(10.dp))
-                                Text(ChatListLogic.displayNameOrId(contact.name, key))
+                                Text(ChatListLogic.displayNameOrId(coreContactDisplayName(contact), key))
                             }
                         }
                     }

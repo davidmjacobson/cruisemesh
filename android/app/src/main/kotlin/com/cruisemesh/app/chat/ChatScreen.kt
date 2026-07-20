@@ -128,6 +128,7 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.formatUserId
 import java.io.File
 import kotlinx.coroutines.delay
@@ -430,6 +431,11 @@ fun ChatScreen(
             ChatMuteStore.setMuted(context, currentContact.userId, it)
             ChatEvents.notifyChatChanged(currentContact.userId)
         },
+        onSetNickname = { nickname ->
+            store.setContactNickname(currentContact.userId, nickname)
+            reload()
+            ChatEvents.notifyChatChanged(currentContact.userId)
+        },
     )
 }
 
@@ -469,6 +475,7 @@ private fun ConversationScreen(
     reachabilityDetailsText: String = reachabilityStatusText,
     isMuted: Boolean = false,
     onMutedChange: (Boolean) -> Unit = {},
+    onSetNickname: (String?) -> Unit = {},
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
@@ -483,11 +490,14 @@ private fun ConversationScreen(
     val listState = rememberLazyListState()
     val scrollScope = rememberCoroutineScope()
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
-    val displayName = remember(contact.name, displayId) {
-        ChatListLogic.displayNameOrId(contact.name, displayId)
+    val resolvedName = remember(contact.name, contact.nickname) {
+        coreContactDisplayName(contact)
     }
-    val (contactColor, _) = remember(contact, displayId) {
-        ChatListLogic.avatarHueAndInitials(contact.userId, contact.name, displayId)
+    val displayName = remember(resolvedName, displayId) {
+        ChatListLogic.displayNameOrId(resolvedName, displayId)
+    }
+    val (contactColor, _) = remember(contact, resolvedName, displayId) {
+        ChatListLogic.avatarHueAndInitials(contact.userId, resolvedName, displayId)
     }
     val visibleMessages = remember(messages) { messages.filter { isVisibleChatKind(it.kind) } }
     val replyMetadata = remember(messages, ownUserId, displayName, store) {
@@ -674,6 +684,7 @@ private fun ConversationScreen(
             connectivityText = reachabilityDetailsText,
             isMuted = isMuted,
             onMutedChange = onMutedChange,
+            onSetNickname = onSetNickname,
             avatarBytes = contactAvatar,
             onDeleteContact = {
                 showContactDetails = false

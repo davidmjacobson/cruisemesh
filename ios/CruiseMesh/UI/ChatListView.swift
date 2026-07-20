@@ -271,7 +271,7 @@ struct ChatListView: View {
             )) ?? 0
             return ChatSummary(
                 chatId: c.userId,
-                title: c.name,
+                title: coreContactDisplayName(contact: c),
                 isGroup: false,
                 contact: c,
                 group: nil,

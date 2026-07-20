@@ -79,6 +79,11 @@
     <string name="ui_new_chat">New chat</string>
     <string name="ui_new_group">New group</string>
     <string name="ui_no_contacts_yet">No contacts yet</string>
+    <string name="ui_nickname">Nickname</string>
+    <string name="ui_add_a_nickname">Add a nickname</string>
+    <string name="ui_edit_nickname">Edit nickname</string>
+    <string name="ui_also_known_as">Also known as %1$s</string>
+    <string name="ui_nickname_is_only_shown_to_you">Only you see this. It replaces the name they shared, just on your phone.</string>
     <string name="ui_not_delivered">Not delivered</string>
     <string name="ui_open_advanced_settings">Open advanced settings</string>
     <string name="ui_open_the_app_when_you_sit_down_with">Open the app when you sit down with family so phones can sync over Bluetooth.</string>

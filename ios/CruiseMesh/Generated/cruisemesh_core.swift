@@ -2257,6 +2257,14 @@ public protocol MessageStoreProtocol : AnyObject {
     func setContactAvatar(userId: Data, avatar: Data?, epoch: Int64) throws  -> Bool
     
     /**
+     * Set (or clear) the local nickname for a contact (T16). A `None` or
+     * blank/whitespace value clears it, falling display back to the card
+     * `name`. Returns whether a row was updated (false = unknown contact).
+     * This never touches any wire-visible field; the nickname stays local.
+     */
+    func setContactNickname(userId: Data, nickname: String?) throws  -> Bool
+    
+    /**
      * State values: 0 available, 1 requested, 2 hidden.
      */
     func setFriendSuggestionState(candidateUserId: Data, state: UInt8) throws 
@@ -3570,6 +3578,21 @@ open func setContactAvatar(userId: Data, avatar: Data?, epoch: Int64)throws  -> 
 }
     
     /**
+     * Set (or clear) the local nickname for a contact (T16). A `None` or
+     * blank/whitespace value clears it, falling display back to the card
+     * `name`. Returns whether a row was updated (false = unknown contact).
+     * This never touches any wire-visible field; the nickname stays local.
+     */
+open func setContactNickname(userId: Data, nickname: String?)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_set_contact_nickname(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),
+        FfiConverterOptionString.lower(nickname),$0
+    )
+})
+}
+    
+    /**
      * State values: 0 available, 1 requested, 2 hidden.
      */
 open func setFriendSuggestionState(candidateUserId: Data, state: UInt8)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -4301,16 +4324,30 @@ public struct Contact {
     public var agreePk: Data
     public var relayUrl: String?
     public var relayToken: String?
+    /**
+     * A local-only nickname the user set for this contact (T16). Presentation
+     * only: it is NEVER written to a `FriendCard`, digest, or any wire format,
+     * and importing a friend card never overwrites it. `None`/blank means fall
+     * back to `name`. Defaulted so existing constructors need not pass it.
+     */
+    public var nickname: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(userId: Data, name: String, signPk: Data, agreePk: Data, relayUrl: String?, relayToken: String?) {
+    public init(userId: Data, name: String, signPk: Data, agreePk: Data, relayUrl: String?, relayToken: String?, 
+        /**
+         * A local-only nickname the user set for this contact (T16). Presentation
+         * only: it is NEVER written to a `FriendCard`, digest, or any wire format,
+         * and importing a friend card never overwrites it. `None`/blank means fall
+         * back to `name`. Defaulted so existing constructors need not pass it.
+         */nickname: String? = nil) {
         self.userId = userId
         self.name = name
         self.signPk = signPk
         self.agreePk = agreePk
         self.relayUrl = relayUrl
         self.relayToken = relayToken
+        self.nickname = nickname
     }
 }
 
@@ -4336,6 +4373,9 @@ extension Contact: Equatable, Hashable {
         if lhs.relayToken != rhs.relayToken {
             return false
         }
+        if lhs.nickname != rhs.nickname {
+            return false
+        }
         return true
     }
 
@@ -4346,6 +4386,7 @@ extension Contact: Equatable, Hashable {
         hasher.combine(agreePk)
         hasher.combine(relayUrl)
         hasher.combine(relayToken)
+        hasher.combine(nickname)
     }
 }
 
@@ -4362,7 +4403,8 @@ public struct FfiConverterTypeContact: FfiConverterRustBuffer {
                 signPk: FfiConverterData.read(from: &buf), 
                 agreePk: FfiConverterData.read(from: &buf), 
                 relayUrl: FfiConverterOptionString.read(from: &buf), 
-                relayToken: FfiConverterOptionString.read(from: &buf)
+                relayToken: FfiConverterOptionString.read(from: &buf), 
+                nickname: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -4373,6 +4415,7 @@ public struct FfiConverterTypeContact: FfiConverterRustBuffer {
         FfiConverterData.write(value.agreePk, into: &buf)
         FfiConverterOptionString.write(value.relayUrl, into: &buf)
         FfiConverterOptionString.write(value.relayToken, into: &buf)
+        FfiConverterOptionString.write(value.nickname, into: &buf)
     }
 }
 
@@ -10279,6 +10322,18 @@ public func coreConsumedSeenIsAckable(origin: MessageOrigin?, ownUserId: Data) -
     )
 })
 }
+/**
+ * The name to show for a contact: the local nickname when the user has set a
+ * non-blank one (T16), otherwise the card `name`. Kept in core so both shells
+ * resolve identically everywhere a contact name is displayed.
+ */
+public func coreContactDisplayName(contact: Contact) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_display_name(
+        FfiConverterTypeContact.lower(contact),$0
+    )
+})
+}
 public func coreFormatLanEndpoint(endpoint: CoreLanEndpoint) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_format_lan_endpoint(
@@ -11090,7 +11145,10 @@ public func makeFriendCard(name: String, identity: Identity, relayUrl: String?, 
 })
 }
 /**
- * Compact, chat-app-safe text form of a FriendCard.
+ * Compact, chat-app-safe text form of a FriendCard (T12). Emits the binary
+ * `CMFRIEND2:` form, which is ~half the size of the legacy JSON `CMFRIEND1:`
+ * form and so produces a much less dense QR code. `parse_friend_text` still
+ * accepts both forms, so cards already shared in the field keep working.
  */
 public func makeFriendLink(cardJson: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -11161,7 +11219,10 @@ public func parseFriendCard(json: String)throws  -> FriendCard {
 })
 }
 /**
- * Parse either the compact `CMFRIEND1:` link form or legacy raw FriendCard JSON.
+ * Parse a shared friend card in any form: the compact binary `CMFRIEND2:`
+ * link (what we emit now), the legacy `CMFRIEND1:` JSON link, either one
+ * embedded in a `https://cruisemesh.app/f#…` URL or surrounding prose, or a
+ * raw FriendCard JSON blob.
  */
 public func parseFriendText(text: String)throws  -> FriendCard {
     return try  FfiConverterTypeFriendCard.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -11366,6 +11427,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable() != 8907) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_display_name() != 41746) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_format_lan_endpoint() != 59419) {
@@ -11578,7 +11642,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_make_friend_card() != 28124) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 2265) {
+    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 33620) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 27474) {
@@ -11599,7 +11663,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_parse_friend_card() != 1373) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_parse_friend_text() != 17133) {
+    if (uniffi_cruisemesh_core_checksum_func_parse_friend_text() != 63241) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_build_fetch_path() != 4249) {
@@ -11942,6 +12006,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_set_contact_avatar() != 55497) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_set_contact_nickname() != 45779) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_set_friend_suggestion_state() != 34158) {

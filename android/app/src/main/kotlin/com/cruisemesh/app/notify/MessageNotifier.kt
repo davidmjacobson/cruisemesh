@@ -17,6 +17,7 @@ import com.cruisemesh.app.MainActivity
 import com.cruisemesh.app.chat.UserIdHex
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Group
+import uniffi.cruisemesh_core.coreContactDisplayName
 
 private const val TAG = "MessageNotifier"
 
@@ -78,7 +79,7 @@ object MessageNotifier {
         postChatNotification(
             context = context,
             chatId = contact.userId,
-            title = contact.name,
+            title = coreContactDisplayName(contact),
             text = text,
             deepLinkHex = UserIdHex.encode(contact.userId),
             isGroup = false,
