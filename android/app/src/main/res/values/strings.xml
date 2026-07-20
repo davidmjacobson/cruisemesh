@@ -2,6 +2,7 @@
     <string name="app_name">CruiseMesh</string>
     <string name="ui_10_0_0_42_45892">10.0.0.42:45892</string>
     <string name="ui_add_a_friend">Add a friend</string>
+    <string name="ui_added_you_to_group">Added you to %1$s</string>
     <string name="ui_add_a_friend_to_see_them_here">Add a friend to see them here.</string>
     <string name="ui_add_a_friend_to_start_messaging_over_bluetooth">Add a friend to start messaging over Bluetooth — no Wi-Fi needed.</string>
     <string name="ui_connected">You\'re connected</string>
