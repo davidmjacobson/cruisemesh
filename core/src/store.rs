@@ -324,6 +324,25 @@ impl MessageStore {
             [],
         )
         .map_err(store_err)?;
+        // FC7: supports the relay-upload query in `family_carried_envelopes`
+        // (`WHERE is_family = 1 AND from_relay = 0 AND expiry > ?1 ORDER BY
+        // received_at ASC, msg_id ASC`). Created here (after `from_relay` is
+        // ensured above) rather than in SCHEMA, since an older on-disk store
+        // won't have that column yet when SCHEMA's CREATE TABLE IF NOT EXISTS
+        // runs. `expiry` is deliberately left out of the index: it's a range
+        // predicate (>), and SQLite can use a leading index column for
+        // either a range filter or to satisfy ORDER BY, not both at once --
+        // putting it before `received_at` still leaves the ORDER BY needing
+        // a temp b-tree sort (verified empirically). With only the two
+        // equality columns leading, followed by both ORDER BY columns in
+        // their query order, the index hands back rows already fully sorted
+        // and `expiry > ?1` is applied as a cheap residual filter per row.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_carried_family_upload
+             ON carried_envelopes(is_family, from_relay, received_at, msg_id)",
+            [],
+        )
+        .map_err(store_err)?;
         ensure_column(&conn, "messages", "arrival_transport", "INTEGER")?;
         ensure_column(&conn, "receipts", "via_transport", "INTEGER")?;
         ensure_column(&conn, "messages", "hops_taken", "INTEGER")?;
@@ -4453,6 +4472,39 @@ mod tests {
         let rows = store.family_carried_envelopes(10, 2_000).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].msg_id, b"fam".to_vec());
+    }
+
+    #[test]
+    fn family_carried_envelopes_query_uses_the_supporting_index_with_no_temp_sort() {
+        // FC7: the relay-upload query filters on (is_family, from_relay,
+        // expiry) and orders by received_at; without a supporting index
+        // SQLite falls back to a full scan plus a temp b-tree for the ORDER
+        // BY. `idx_carried_family_upload` covers both.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
+                 FROM carried_envelopes
+                 WHERE is_family = 1 AND from_relay = 0 AND expiry > ?1
+                 ORDER BY received_at ASC, msg_id ASC
+                 LIMIT ?2",
+            )
+            .unwrap()
+            .query_map(params![2_000i64, 10i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let plan_text = plan.join("\n");
+        assert!(
+            plan_text.contains("idx_carried_family_upload"),
+            "plan did not use the index:\n{plan_text}"
+        );
+        assert!(
+            !plan_text.to_uppercase().contains("TEMP B-TREE"),
+            "plan required a temp sort:\n{plan_text}"
+        );
     }
 
     fn contact(user_id: &[u8], name: &str) -> Contact {
