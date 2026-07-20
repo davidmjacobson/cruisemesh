@@ -88,6 +88,7 @@ import uniffi.cruisemesh_core.decodeProfileSyncContent
 import uniffi.cruisemesh_core.decodeReceiptContent
 import uniffi.cruisemesh_core.defaultExpiry
 import uniffi.cruisemesh_core.encodeDigest
+import uniffi.cruisemesh_core.shouldRedigest
 import uniffi.cruisemesh_core.encodeEnvelopeFrame
 import uniffi.cruisemesh_core.encodeHello
 import uniffi.cruisemesh_core.encodeLanEndpoint
@@ -110,6 +111,10 @@ private const val NOTIFICATION_ID = 1
 private const val OPEN_APP_REQUEST_CODE = 1001
 private const val STOP_SERVICE_REQUEST_CODE = 1002
 private const val LAN_HEALTH_INTERVAL_MS = 30_000L
+// D8: how often to check whether a long-lived link is due for a re-digest. The
+// actual 3-5 min jittered gate lives in core `shouldRedigest`; this only sets
+// the polling granularity.
+private const val DIGEST_MAINTENANCE_INTERVAL_MS = 60_000L
 
 /** `kind` bytes from DESIGN.md §7.1. */
 private const val KIND_TEXT: UByte = 1u
@@ -373,6 +378,14 @@ class MeshService : Service() {
             relayMainHandler.postDelayed(this, LAN_HEALTH_INTERVAL_MS)
         }
     }
+    // D8: when this link last ran a digest exchange, keyed by peer address.
+    private val lastDigestAtByAddress = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val digestMaintenanceRunnable = object : Runnable {
+        override fun run() {
+            checkDigestMaintenance()
+            relayMainHandler.postDelayed(this, DIGEST_MAINTENANCE_INTERVAL_MS)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -464,6 +477,7 @@ class MeshService : Service() {
         scheduleRelayPolling()
         LanTransportDiagnostics.registerProbeRequester(::requestManualLanProbe)
         scheduleLanHealth()
+        scheduleDigestMaintenance()
         lan.start()
         // The mesh runs regardless of Bluetooth audio now (see
         // refreshBluetoothAudioStatus); start the roles unconditionally rather
@@ -493,6 +507,7 @@ class MeshService : Service() {
         cancelRelayPolling()
         relayPushClient.stop()
         cancelLanHealth()
+        cancelDigestMaintenance()
         LanTransportDiagnostics.unregisterProbeRequester()
         lanHealthTracker.clear()
         RelaySyncEvents.unregister()
@@ -1654,12 +1669,22 @@ class MeshService : Service() {
         drainCarriedEnvelopesTo(address, userId)
 
         val contact = store.getContact(userId)
-        val digestEntries = contact?.let { store.chatDigest(it.userId) } ?: emptyList()
         if (contact == null) {
             Log.i(TAG, "HELLO from unrecognized userId=${UserIdHex.encode(userId)}; sending carry-suppression digest only")
         } else {
             sendLanEndpointHintTo(address)
         }
+        sendDigestTo(address, userId, identity)
+    }
+
+    /**
+     * Encode and send the §7.3 digest for `address` (per-sender lamports for a
+     * known contact, or a carry-suppression digest for a stranger) and record
+     * the time so [checkDigestMaintenance] can re-run it on a long-lived link
+     * (D8). Called at HELLO time and on the periodic re-digest tick.
+     */
+    private fun sendDigestTo(address: String, userId: ByteArray, identity: Identity) {
+        val digestEntries = store.getContact(userId)?.let { store.chatDigest(it.userId) } ?: emptyList()
         val digestFrame = try {
             encodeDigest(identity.userId, digestEntries, store.coreDigestAdvertisedMsgIds())
         } catch (error: CoreException) {
@@ -1667,6 +1692,37 @@ class MeshService : Service() {
             return
         }
         MeshRouter.sendToAddress(address, digestFrame)
+        lastDigestAtByAddress[address] = System.currentTimeMillis()
+    }
+
+    private fun scheduleDigestMaintenance() {
+        relayMainHandler.removeCallbacks(digestMaintenanceRunnable)
+        relayMainHandler.postDelayed(digestMaintenanceRunnable, DIGEST_MAINTENANCE_INTERVAL_MS)
+    }
+
+    private fun cancelDigestMaintenance() {
+        relayMainHandler.removeCallbacks(digestMaintenanceRunnable)
+    }
+
+    /**
+     * D8: re-run the digest exchange on links that have stayed up past their
+     * jittered 3-5 min interval, so a message/receipt that landed after the
+     * connect-time digest still converges without a reconnect. Digests are
+     * idempotent, so this is safe to over-call.
+     */
+    private fun checkDigestMaintenance() {
+        val identity = this.identity ?: return
+        if (!running) return
+        val routes = MeshRouter.identifiedRoutes()
+        // Drop bookkeeping for links that have gone away.
+        lastDigestAtByAddress.keys.retainAll(routes.map { it.address }.toSet())
+        val now = System.currentTimeMillis()
+        for (route in routes) {
+            val last = lastDigestAtByAddress[route.address] ?: 0L
+            if (shouldRedigest(now, last, route.address.hashCode().toLong().toULong())) {
+                sendDigestTo(route.address, route.userId, identity)
+            }
+        }
     }
 
     /**

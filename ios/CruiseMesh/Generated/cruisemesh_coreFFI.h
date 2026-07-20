@@ -1452,6 +1452,11 @@ RustBuffer uniffi_cruisemesh_core_fn_func_seal_group_message(RustBuffer sender, 
 RustBuffer uniffi_cruisemesh_core_fn_func_seal_message(RustBuffer sender, RustBuffer recipient_agree_pk, RustBuffer payload, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_SHOULD_REDIGEST
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_SHOULD_REDIGEST
+int8_t uniffi_cruisemesh_core_fn_func_should_redigest(int64_t now_ms, int64_t last_digest_at_ms, uint64_t jitter_seed, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_SHOULD_RESEND_LAN_ENDPOINT
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_SHOULD_RESEND_LAN_ENDPOINT
 int8_t uniffi_cruisemesh_core_fn_func_should_resend_lan_endpoint(RustBuffer previous_signature, RustBuffer previous_sent_at_ms, RustBuffer current_signature, int64_t now_ms, RustCallStatus *_Nonnull out_status
@@ -2351,6 +2356,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_seal_group_message(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_SEAL_MESSAGE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_SEAL_MESSAGE
 uint16_t uniffi_cruisemesh_core_checksum_func_seal_message(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_SHOULD_REDIGEST
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_SHOULD_REDIGEST
+uint16_t uniffi_cruisemesh_core_checksum_func_should_redigest(void
     
 );
 #endif
