@@ -251,7 +251,7 @@ struct FriendsView: View {
             UINotificationFeedbackGenerator().notificationOccurred(.success)
             preview = FriendPreviewState(contact: contact, warning: warning)
         } catch {
-            self.error = text.contains("CMFRIEND1:")
+            self.error = text.contains("CMFRIEND")
                 ? "That looks like a friend card but part of it is missing. Copy the whole message and try again."
                 : "Not a CruiseMesh friend card"
         }
@@ -321,12 +321,12 @@ struct MyQRView: View {
                 let link = json.flatMap { try? makeFriendLink(cardJson: $0) }
                 let appLink = link.map { "https://cruisemesh.app/f#\($0)" }
                 if let appLink {
-                    if let image = QRCodeGenerator.image(from: appLink, size: 240) {
+                    if let image = QRCodeGenerator.image(from: appLink, size: 280) {
                         Image(uiImage: image)
                             .interpolation(.none)
                             .resizable()
                             .scaledToFit()
-                            .frame(width: 240, height: 240)
+                            .frame(width: 280, height: 280)
                             .padding()
                             .background(RoundedRectangle(cornerRadius: 16).fill(Color.white))
                     }
@@ -392,7 +392,10 @@ enum QRCodeGenerator {
         let data = Data(string.utf8)
         guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
         filter.setValue(data, forKey: "inputMessage")
-        filter.setValue("M", forKey: "inputCorrectionLevel")
+        // Level L (7% recovery) is plenty for screen-to-screen scanning and
+        // keeps the module count -- and so the density -- as low as possible,
+        // matching zxing's default on Android (T12).
+        filter.setValue("L", forKey: "inputCorrectionLevel")
         guard let output = filter.outputImage else { return nil }
         let scale = size / output.extent.width
         let scaled = output.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
