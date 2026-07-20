@@ -411,6 +411,16 @@
         }
       }
     },
+    "Each of these opens up another way for your messages to get through.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Each of these opens up another way for your messages to get through."
+          }
+        }
+      }
+    },
     "Enable Bluetooth and notifications": {
       "localizations": {
         "en": {
@@ -1361,6 +1371,16 @@
         }
       }
     },
+    "Turn on a few permissions": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turn on a few permissions"
+          }
+        }
+      }
+    },
     "Turn on the permissions that help the mesh": {
       "localizations": {
         "en": {
@@ -1457,6 +1477,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "You can continue without these, but delivery is less reliable while the app is backgrounded."
+          }
+        }
+      }
+    },
+    "You can turn these on later in Settings.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You can turn these on later in Settings."
           }
         }
       }
