@@ -21,7 +21,7 @@ use cruisemesh_core::{
     seal_message, Identity, MessageBody, ReceiptContent, DEFAULT_HOP_TTL, KIND_RECEIPT, KIND_TEXT,
     RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
-use cruisemesh_relayd::{app, AppState, RelayStore};
+use cruisemesh_relayd::{app, AppState, RelayStore, GIT_SHA, VERSION};
 use tempfile::NamedTempFile;
 use tower::util::ServiceExt;
 
@@ -357,6 +357,10 @@ async fn wrong_hint_sees_nothing_and_healthz_is_open() {
     assert_eq!(health.status(), StatusCode::OK);
     let json = body_json(health).await;
     assert_eq!(json["status"], "ok");
+    // FR4: /healthz reports the exact build so a deployed relay's version
+    // is queryable instead of guessed at.
+    assert_eq!(json["version"], VERSION);
+    assert_eq!(json["commit"], GIT_SHA);
 }
 
 #[tokio::test]

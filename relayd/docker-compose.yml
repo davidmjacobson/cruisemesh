@@ -12,6 +12,13 @@ services:
     build:
       context: ..
       dockerfile: relayd/Dockerfile
+      args:
+        # FR4: `.git` is not in the build context (see Dockerfile comment);
+        # pass the real commit through explicitly, e.g.:
+        #   export GIT_SHA=$(git rev-parse --short HEAD)
+        #   docker compose up -d --build
+        # Falls back to "unknown" if unset.
+        GIT_SHA: ${GIT_SHA:-unknown}
     environment:
       # Comma-separated family bearer tokens (required). Generate with:
       #   openssl rand -hex 32
@@ -21,6 +28,10 @@ services:
       # somewhere else than the file you were watching.)
       CRUISEMESH_RELAY_DB: /data/cruisemesh-relayd.sqlite
       CRUISEMESH_RELAY_BIND: 0.0.0.0:8080
+      # FR2: default to info-level logs so a field incident is debuggable
+      # without redeploying with an env var change first. Override with a
+      # more/less verbose value as needed (e.g. RUST_LOG=debug,tower_http=off).
+      RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - relay-data:/data
     restart: unless-stopped

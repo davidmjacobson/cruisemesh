@@ -10,4 +10,12 @@
 {$RELAY_DOMAIN} {
 	encode gzip
 	reverse_proxy relayd:8080
+	# FR2: access log so a field incident has a request trail even if the
+	# request never reaches relayd's own logging (bad TLS, wrong Host,
+	# proxy-level rejection). Written to stdout, picked up by
+	# `docker compose logs caddy`.
+	log {
+		output stdout
+		format console
+	}
 }

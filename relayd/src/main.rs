@@ -10,8 +10,17 @@ use cruisemesh_relayd::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // FR2: `from_default_env()` silently falls back to ERROR-only when
+    // RUST_LOG is unset -- combined with neither the Dockerfile nor
+    // docker-compose.yml setting it, the deployed container printed
+    // nothing, ever, including this file's own startup line. Default to
+    // "info" so a field incident is debuggable out of the box; an operator
+    // can still override via RUST_LOG.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
         .init();
 
     let bind = env::var("CRUISEMESH_RELAY_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
@@ -30,7 +39,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(parse_bind(&bind)?).await?;
     let store = RelayStore::open(&db_path)?;
     info!(
-        "relay server listening on {bind}, db={db_path}, family_quota_bytes={family_quota_bytes}"
+        version = cruisemesh_relayd::VERSION,
+        commit = cruisemesh_relayd::GIT_SHA,
+        bind = %bind,
+        db_path = %db_path,
+        family_quota_bytes,
+        "relay server listening"
     );
     axum::serve(
         listener,
@@ -40,6 +54,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             family_quota_bytes,
         )),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
+}
+
+/// FR3: `docker stop` sends SIGTERM; without graceful shutdown wired up,
+/// axum's default is to drop the listener immediately -- in-flight HTTP
+/// requests get an RST and WS clients get a hard TCP close instead of a
+/// clean Close frame. Waiting on either signal drains connections before
+/// the process actually exits.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    // SIGTERM is unix-only (there is no Windows equivalent tokio can hook);
+    // Ctrl+C alone still covers local/dev and Windows use.
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    info!("shutdown signal received, draining in-flight connections");
 }

@@ -67,6 +67,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 const RECIPIENT_HINT_LEN: usize = 8;
 const MSG_ID_LEN: usize = 16;
@@ -137,6 +138,14 @@ pub const MAX_ENVELOPE_SEALED_BYTES: usize = 512 * 1024;
 /// text/receipt traffic (which is tiny by comparison), stays well under
 /// this on any realistic itinerary while still bounding the $4 VPS's disk.
 pub const DEFAULT_FAMILY_QUOTA_BYTES: u64 = 256 * 1024 * 1024;
+
+/// FR4: build-time version identifiers, embedded via Cargo (`VERSION`) and
+/// `build.rs` (`GIT_SHA`) so `/healthz` and the startup log always reflect
+/// the exact commit running -- there was previously no way to ask a
+/// deployed relay which of master's several relayd-affecting changes
+/// (`/presence`, D7 quotas, T4-09 limits, ...) it was actually running.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const GIT_SHA: &str = env!("CRUISEMESH_GIT_SHA");
 
 #[derive(Clone)]
 pub struct AppState {
@@ -502,7 +511,14 @@ impl RelayStore {
     /// server retention ceiling (`created_at_ms + MAX_RETENTION_MS`).
     pub fn prune_expired(&self, now_ms: i64) -> Result<u64, String> {
         let conn = self.conn.lock().expect("relay store mutex poisoned");
-        prune_expired_on(&conn, now_ms)
+        let pruned = prune_expired_on(&conn, now_ms)?;
+        // FR2: only log when something actually happened -- this runs on
+        // every fetch/presence-sync call, so a zero-count line would be the
+        // dominant log entry and drown out everything else.
+        if pruned > 0 {
+            info!(pruned, "pruned expired envelope/presence rows");
+        }
+        Ok(pruned)
     }
 
     pub fn sync_presence(
@@ -725,10 +741,16 @@ pub fn parse_family_quota_bytes(raw: &str) -> Result<u64, String> {
 #[derive(Serialize)]
 struct HealthzResponse {
     status: &'static str,
+    version: &'static str,
+    commit: &'static str,
 }
 
 async fn healthz() -> Json<HealthzResponse> {
-    Json(HealthzResponse { status: "ok" })
+    Json(HealthzResponse {
+        status: "ok",
+        version: VERSION,
+        commit: GIT_SHA,
+    })
 }
 
 #[derive(Deserialize)]
@@ -772,6 +794,12 @@ async fn post_envelope(
     // DTN_TODOS.md D7: per-envelope size cap, checked before any storage
     // work (see MAX_ENVELOPE_SEALED_BYTES doc comment for the derivation).
     if sealed.len() > MAX_ENVELOPE_SEALED_BYTES {
+        warn!(
+            family = %token_prefix(&family_token),
+            bytes = sealed.len(),
+            cap = MAX_ENVELOPE_SEALED_BYTES,
+            "envelope rejected: over the per-envelope size cap (413)"
+        );
         return Err(ApiError::envelope_too_large(sealed.len()));
     }
     let now = now_ms();
@@ -794,12 +822,27 @@ async fn post_envelope(
     let id = match result {
         QuotaInsertResult::Stored { id } => id,
         QuotaInsertResult::QuotaExceeded { usage_bytes } => {
+            warn!(
+                family = %token_prefix(&family_token),
+                usage_bytes,
+                quota_bytes = state.family_quota_bytes,
+                "envelope rejected: family storage quota exceeded (507)"
+            );
             return Err(ApiError::family_quota_exceeded(
                 usage_bytes,
                 state.family_quota_bytes,
-            ))
+            ));
         }
     };
+    // FR2: never log envelope contents (msg_id/sealed bytes) -- only the
+    // family-token prefix (for correlation, not the full semi-public
+    // bearer token) and the stored size.
+    info!(
+        family = %token_prefix(&family_token),
+        bytes = sealed.len(),
+        id,
+        "envelope stored"
+    );
 
     let envelope = EnvelopeResponse {
         id,
@@ -1080,6 +1123,12 @@ async fn handle_ws(
     hints_base64: HashSet<String>,
     mut after: i64,
 ) {
+    // FR2: WS lifecycle logging. `family` is a short, non-secret prefix
+    // (see `token_prefix`) so log lines correlate a session across
+    // connect/disconnect without printing the bearer token.
+    let family = token_prefix(&family_token);
+    info!(family = %family, hints = hints.len(), after, "ws connect");
+
     // Subscribe before replay so POSTs that land during replay are not lost;
     // the live loop skips ids already covered by `after`.
     let mut rx = state.tx.subscribe();
@@ -1115,6 +1164,7 @@ async fn handle_ws(
                 return;
             };
             if !ws_send_text(&mut socket, msg).await {
+                info!(family = %family, "ws disconnect: write failed/timed out during replay");
                 return;
             }
         }
@@ -1138,24 +1188,29 @@ async fn handle_ws(
                                 break;
                             };
                             if !ws_send_text(&mut socket, msg).await {
+                                info!(family = %family, "ws disconnect: write failed/timed out during live push");
                                 break;
                             }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         // Bound memory: drop slow/dead consumers; reconnect
                         // + replay from cursor heals (module docs).
-
+                        warn!(family = %family, skipped, "ws lag-drop: consumer fell behind the broadcast buffer");
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!(family = %family, "ws disconnect: broadcast channel closed");
                         break;
                     }
                 }
             }
             msg = socket.recv() => {
                 match msg {
-                    None | Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
+                    None | Some(Ok(Message::Close(_))) | Some(Err(_)) => {
+                        info!(family = %family, "ws disconnect: client closed");
+                        break;
+                    }
                     Some(Ok(Message::Ping(payload))) => {
                         if tokio::time::timeout(
                             WS_WRITE_TIMEOUT,
@@ -1182,6 +1237,13 @@ fn decode_base64_field(value: &str, field: &str) -> Result<Vec<u8>, ApiError> {
 
 fn encode_base64_field(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Short, non-secret prefix of a family token for correlating log lines
+/// without printing the full bearer token (semi-public via QR friend cards,
+/// but still a credential -- FR2 asks for correlation, not disclosure).
+fn token_prefix(token: &str) -> String {
+    token.chars().take(6).collect()
 }
 
 fn bearer_token(headers: &HeaderMap, allowed_tokens: &HashSet<String>) -> Result<String, ApiError> {
@@ -1228,6 +1290,10 @@ impl ApiError {
     }
 
     fn unauthorized(message: String) -> Self {
+        // FR2: log every auth reject so a field incident (wrong token
+        // rolled out, QR card typo'd, family fleet locked out) is visible
+        // server-side instead of only as a client-side error toast.
+        warn!(reason = %message, "auth reject");
         Self {
             status: StatusCode::UNAUTHORIZED,
             message,
@@ -1235,10 +1301,14 @@ impl ApiError {
         }
     }
 
-    fn internal(message: String) -> Self {
+    /// FR2/FR8: log the real error server-side (may contain rusqlite text
+    /// or DB paths) and return a generic body -- clients must never see
+    /// internal error detail.
+    fn internal(detail: String) -> Self {
+        tracing::error!(detail = %detail, "internal error");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message,
+            message: "internal server error".to_string(),
             code: None,
         }
     }
