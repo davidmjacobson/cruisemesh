@@ -302,6 +302,7 @@ impl MessageStore {
     pub fn open(path: String) -> Result<Self, CoreError> {
         let mut conn = Connection::open(&path).map_err(store_err)?;
         conn.execute_batch(SCHEMA).map_err(store_err)?;
+        migrate_delivery_metrics_schema(&conn)?;
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
         ensure_contact_column(&conn, "avatar", "BLOB")?;
         ensure_contact_column(&conn, "avatar_epoch", "INTEGER NOT NULL DEFAULT 0")?;
@@ -906,11 +907,12 @@ impl MessageStore {
             // metadata-only; a metrics failure must not fail delivery.
             let _ = conn.execute(
                 "INSERT OR IGNORE INTO delivery_metrics
-                    (chat_hash, lamport, direction, at_ms, arrival_transport, hop_count)
-                 VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+                    (chat_hash, lamport, direction, sender_hash, at_ms, arrival_transport, hop_count)
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6)",
                 params![
                     metric_chat_hash(&chat_id),
                     lamport as i64,
+                    metric_sender_hash(&sender_user_id),
                     arrival.received_at,
                     arrival.transport as i64,
                     arrival.hops_taken as i64,
@@ -935,9 +937,14 @@ impl MessageStore {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
             "INSERT OR IGNORE INTO delivery_metrics
-                (chat_hash, lamport, direction, at_ms)
-             VALUES (?1, ?2, 0, ?3)",
-            params![metric_chat_hash(&chat_id), lamport as i64, sent_at_ms],
+                (chat_hash, lamport, direction, sender_hash, at_ms)
+             VALUES (?1, ?2, 0, ?3, ?4)",
+            params![
+                metric_chat_hash(&chat_id),
+                lamport as i64,
+                metric_sender_self(),
+                sent_at_ms,
+            ],
         )
         .map_err(store_err)?;
         Ok(())
@@ -983,33 +990,42 @@ impl MessageStore {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn
             .prepare(
-                "SELECT chat_hash, lamport, direction, at_ms, delivered_at_ms,
+                "SELECT chat_hash, lamport, direction, sender_hash, at_ms, delivered_at_ms,
                         via_transport, arrival_transport, hop_count
                  FROM delivery_metrics
-                 ORDER BY direction, chat_hash, lamport",
+                 ORDER BY direction, chat_hash, lamport, sender_hash",
             )
             .map_err(store_err)?;
         let mut out = String::from(
-            "direction,chat,lamport,at_ms,delivered_at_ms,latency_ms,via_transport,arrival_transport,hop_count\n",
+            "direction,chat,lamport,sender,at_ms,delivered_at_ms,latency_ms,via_transport,arrival_transport,hop_count\n",
         );
         let rows = stmt
             .query_map([], |row| {
                 let chat_hash: Vec<u8> = row.get(0)?;
                 let lamport: i64 = row.get(1)?;
                 let direction: i64 = row.get(2)?;
-                let at_ms: i64 = row.get(3)?;
-                let delivered_at_ms: Option<i64> = row.get(4)?;
-                let via_transport: Option<i64> = row.get(5)?;
-                let arrival_transport: Option<i64> = row.get(6)?;
-                let hop_count: Option<i64> = row.get(7)?;
+                let sender_hash: Vec<u8> = row.get(3)?;
+                let at_ms: i64 = row.get(4)?;
+                let delivered_at_ms: Option<i64> = row.get(5)?;
+                let via_transport: Option<i64> = row.get(6)?;
+                let arrival_transport: Option<i64> = row.get(7)?;
+                let hop_count: Option<i64> = row.get(8)?;
                 let latency_ms = match (direction, delivered_at_ms) {
                     (0, Some(d)) => Some(d - at_ms),
                     _ => None,
                 };
                 let dir = if direction == 0 { "sent" } else { "received" };
+                // "sent" rows always carry the fixed self sentinel (this
+                // device is the sole author of its own stream) -- leave the
+                // sender cell blank rather than print a meaningless constant.
+                let sender_cell = if direction == 1 {
+                    hex_lower(&sender_hash)
+                } else {
+                    String::new()
+                };
                 let cell = |v: Option<i64>| v.map(|n| n.to_string()).unwrap_or_default();
                 Ok(format!(
-                    "{dir},{},{lamport},{at_ms},{},{},{},{},{}\n",
+                    "{dir},{},{lamport},{sender_cell},{at_ms},{},{},{},{},{}\n",
                     hex_lower(&chat_hash),
                     cell(delivered_at_ms),
                     cell(latency_ms),
@@ -2605,12 +2621,14 @@ fn validate_carried_envelope(envelope: &CarriedEnvelope, now_ms: i64) -> Result<
     Ok(())
 }
 
-/// Length of the metadata-only chat hash used by [`delivery_metrics`]. Eight
-/// bytes is enough to keep distinct chats apart in an export without storing
-/// (or being reversible to) the raw contact/group id.
+/// Length of the metadata-only chat/sender hashes used by
+/// [`delivery_metrics`]. Eight bytes is enough to keep distinct chats (or
+/// senders) apart in an export without storing (or being reversible to) the
+/// raw contact/group/user id.
 const METRIC_CHAT_HASH_LEN: usize = 8;
 
-/// Lowercase hex, for rendering the metric chat hash in the CSV export.
+/// Lowercase hex, for rendering the metric chat/sender hash in the CSV
+/// export.
 fn hex_lower(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -2619,17 +2637,83 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// A short, non-reversible tag for a chat id, used only to group field-metric
-/// rows in the export. Never a raw user/group id -- see [`delivery_metrics`].
-fn metric_chat_hash(chat_id: &[u8]) -> Vec<u8> {
+/// Shared hash used for both the chat and sender tags in [`delivery_metrics`]
+/// rows: a short, non-reversible tag, never a raw user/group id.
+fn metric_hash8(id: &[u8]) -> Vec<u8> {
     let mut hasher =
         Blake2bVar::new(METRIC_CHAT_HASH_LEN).expect("valid BLAKE2b digest length");
-    hasher.update(chat_id);
+    hasher.update(id);
     let mut digest = vec![0; METRIC_CHAT_HASH_LEN];
     hasher
         .finalize_variable(&mut digest)
         .expect("digest output has configured length");
     digest
+}
+
+/// A short, non-reversible tag for a chat id, used only to group field-metric
+/// rows in the export. Never a raw user/group id -- see [`delivery_metrics`].
+fn metric_chat_hash(chat_id: &[u8]) -> Vec<u8> {
+    metric_hash8(chat_id)
+}
+
+/// FC1: a short, non-reversible tag for a sender's user id, added to the
+/// [`delivery_metrics`] primary key so that two group members who happen to
+/// share a lamport value (each member has an independent lamport stream) no
+/// longer collide and silently drop one arrival.
+fn metric_sender_hash(sender_user_id: &[u8]) -> Vec<u8> {
+    metric_hash8(sender_user_id)
+}
+
+/// Sentinel sender hash for locally authored ("sent") [`delivery_metrics`]
+/// rows. `record_sent_metric` has no sender argument -- this device is
+/// always the sole author of its own outbound stream, so there is no
+/// collision to resolve and a fixed placeholder is enough to satisfy the
+/// primary key.
+fn metric_sender_self() -> Vec<u8> {
+    vec![0u8; METRIC_CHAT_HASH_LEN]
+}
+
+/// FC1 migration: pre-existing on-disk stores have `delivery_metrics` keyed
+/// on `(chat_hash, lamport, direction)` only, which silently drops a group
+/// arrival whenever two senders share a lamport value at the same watermark
+/// (routine -- every group member has an independent lamport stream). This
+/// table is local, best-effort, pre-cruise diagnostics data (see the schema
+/// doc comment) with no cross-device meaning, so a row-preserving migration
+/// isn't worth it: drop and let it be recreated with the current schema. New
+/// arrivals repopulate it going forward.
+fn migrate_delivery_metrics_schema(conn: &Connection) -> Result<(), CoreError> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(delivery_metrics)")
+        .map_err(store_err)?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(store_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(store_err)?;
+    drop(stmt);
+    if names.is_empty() || names.iter().any(|c| c == "sender_hash") {
+        // Fresh store (SCHEMA already created the current shape) or already
+        // migrated on a previous open.
+        return Ok(());
+    }
+    conn.execute("DROP TABLE delivery_metrics", [])
+        .map_err(store_err)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS delivery_metrics (
+            chat_hash         BLOB NOT NULL,
+            lamport           INTEGER NOT NULL,
+            direction         INTEGER NOT NULL,
+            sender_hash       BLOB NOT NULL,
+            at_ms             INTEGER NOT NULL,
+            delivered_at_ms   INTEGER,
+            via_transport     INTEGER,
+            arrival_transport INTEGER,
+            hop_count         INTEGER,
+            PRIMARY KEY(chat_hash, lamport, direction, sender_hash)
+        );",
+    )
+    .map_err(store_err)?;
+    Ok(())
 }
 
 fn carried_content_digest(recipient_hint: &[u8], sealed: &[u8]) -> Vec<u8> {
@@ -3163,18 +3247,23 @@ CREATE TABLE IF NOT EXISTS outgoing_receipts (
 
 -- V2 field metrics: a local, metadata-only ledger for the cruise test.
 -- One row per message we sent or received, keyed by an 8-byte hash of the
--- chat id (never the raw id) and our/their lamport. No message content is
--- ever stored here. `direction` 0 = we sent it, 1 = we received it.
+-- chat id (never the raw id), an 8-byte hash of the sender (FC1: in a group,
+-- every member has an independent lamport stream, so two senders routinely
+-- share a lamport value in the same chat -- the sender hash keeps their
+-- arrivals from colliding on the primary key), and our/their lamport. No
+-- message content is ever stored here. `direction` 0 = we sent it, 1 = we
+-- received it.
 CREATE TABLE IF NOT EXISTS delivery_metrics (
     chat_hash         BLOB NOT NULL,
     lamport           INTEGER NOT NULL,
     direction         INTEGER NOT NULL,
+    sender_hash       BLOB NOT NULL,
     at_ms             INTEGER NOT NULL,
     delivered_at_ms   INTEGER,
     via_transport     INTEGER,
     arrival_transport INTEGER,
     hop_count         INTEGER,
-    PRIMARY KEY(chat_hash, lamport, direction)
+    PRIMARY KEY(chat_hash, lamport, direction, sender_hash)
 );
 
 CREATE TABLE IF NOT EXISTS outgoing_receipt_envelopes (
@@ -5905,14 +5994,16 @@ mod tests {
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(
             lines[0],
-            "direction,chat,lamport,at_ms,delivered_at_ms,latency_ms,via_transport,arrival_transport,hop_count"
+            "direction,chat,lamport,sender,at_ms,delivered_at_ms,latency_ms,via_transport,arrival_transport,hop_count"
         );
-        // Rows are ordered by direction then chat then lamport, so 1..=3 follow.
+        // Rows are ordered by direction then chat then lamport, so 1..=3
+        // follow. "sent" rows carry an empty sender cell (see
+        // `metric_sender_self`).
         assert!(lines[1].starts_with("sent,"));
-        assert!(lines[1].ends_with(",1,1000,1500,500,0,,"));
-        assert!(lines[2].ends_with(",2,1100,1500,400,0,,"));
+        assert!(lines[1].ends_with(",1,,1000,1500,500,0,,"));
+        assert!(lines[2].ends_with(",2,,1100,1500,400,0,,"));
         // Message 3 is beyond the watermark: no delivery yet.
-        assert!(lines[3].ends_with(",3,1200,,,,,"));
+        assert!(lines[3].ends_with(",3,,1200,,,,,"));
     }
 
     #[test]
@@ -5930,7 +6021,7 @@ mod tests {
 
         let csv = store.export_delivery_metrics_csv().unwrap();
         let row = csv.lines().nth(1).unwrap();
-        assert!(row.ends_with(",1,1000,1500,500,3,,"), "row was: {row}");
+        assert!(row.ends_with(",1,,1000,1500,500,3,,"), "row was: {row}");
     }
 
     #[test]
@@ -5958,7 +6049,54 @@ mod tests {
         let csv = store.export_delivery_metrics_csv().unwrap();
         let received: Vec<&str> = csv.lines().filter(|l| l.starts_with("received,")).collect();
         assert_eq!(received.len(), 1);
-        assert!(received[0].ends_with(",5,1700000000777,,,,2,3"), "row: {}", received[0]);
+        let bob_sender = hex_lower(&metric_sender_hash(b"bob"));
+        assert!(
+            received[0].ends_with(&format!(",5,{bob_sender},1700000000777,,,,2,3")),
+            "row: {}",
+            received[0]
+        );
+    }
+
+    #[test]
+    fn record_message_arrival_keys_on_sender_so_group_lamport_collisions_dont_drop_rows() {
+        // FC1: in a group, every member has an independent lamport stream,
+        // so two different senders routinely share `lamport = 1` in the same
+        // chat. Before FC1 the primary key omitted the sender and the
+        // second arrival silently vanished under INSERT OR IGNORE.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_message(msg(b"group-1", b"alice", 1, "hi"))
+            .unwrap();
+        store
+            .insert_message(msg(b"group-1", b"carol", 1, "hey"))
+            .unwrap();
+
+        let alice_arrival = MessageArrival {
+            transport: 0,
+            hops_taken: 1,
+            received_at: 1_700_000_001_000,
+        };
+        let carol_arrival = MessageArrival {
+            transport: 3,
+            hops_taken: 2,
+            received_at: 1_700_000_002_000,
+        };
+        assert!(store
+            .record_message_arrival(b"group-1".to_vec(), b"alice".to_vec(), 1, alice_arrival)
+            .unwrap());
+        assert!(store
+            .record_message_arrival(b"group-1".to_vec(), b"carol".to_vec(), 1, carol_arrival)
+            .unwrap());
+
+        let csv = store.export_delivery_metrics_csv().unwrap();
+        let received: Vec<&str> = csv.lines().filter(|l| l.starts_with("received,")).collect();
+        // Both arrivals landed as distinct rows -- neither dropped the other.
+        assert_eq!(received.len(), 2, "csv was:\n{csv}");
+        let alice_sender = hex_lower(&metric_sender_hash(b"alice"));
+        let carol_sender = hex_lower(&metric_sender_hash(b"carol"));
+        assert_ne!(alice_sender, carol_sender);
+        assert!(received.iter().any(|r| r.contains(&format!(",1,{alice_sender},"))));
+        assert!(received.iter().any(|r| r.contains(&format!(",1,{carol_sender},"))));
     }
 
     #[test]
@@ -5982,6 +6120,92 @@ mod tests {
         let csv = store.export_delivery_metrics_csv().unwrap();
         assert_eq!(csv.lines().count(), 1);
         assert!(csv.starts_with("direction,chat,lamport,"));
+    }
+
+    #[test]
+    fn open_migrates_an_old_delivery_metrics_table_to_add_the_sender_key() {
+        // FC1: pre-existing stores have `delivery_metrics` keyed on
+        // (chat_hash, lamport, direction) only. Opening such a store must
+        // not fail or panic; the disposable diagnostics table is dropped and
+        // recreated with the sender-aware primary key (see
+        // `migrate_delivery_metrics_schema`), and new arrivals -- including
+        // the group lamport-collision case the old key couldn't hold -- work
+        // afterward.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("cruisemesh-delivery-metrics-migration-{unique}.sqlite"));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE delivery_metrics (
+                chat_hash         BLOB NOT NULL,
+                lamport           INTEGER NOT NULL,
+                direction         INTEGER NOT NULL,
+                at_ms             INTEGER NOT NULL,
+                delivered_at_ms   INTEGER,
+                via_transport     INTEGER,
+                arrival_transport INTEGER,
+                hop_count         INTEGER,
+                PRIMARY KEY(chat_hash, lamport, direction)
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO delivery_metrics (chat_hash, lamport, direction, at_ms)
+             VALUES (?1, ?2, 0, ?3)",
+            params![vec![1u8; 8], 1i64, 1_000i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        // Old-shape data is local, best-effort diagnostics: it's fine for the
+        // pre-migration row to be gone, as long as the store opens cleanly
+        // and the export still works.
+        let csv = store.export_delivery_metrics_csv().unwrap();
+        assert_eq!(csv.lines().count(), 1, "csv was:\n{csv}");
+
+        // The migrated schema now tolerates a group lamport collision.
+        store
+            .insert_message(msg(b"group-1", b"alice", 1, "hi"))
+            .unwrap();
+        store
+            .insert_message(msg(b"group-1", b"carol", 1, "hey"))
+            .unwrap();
+        assert!(store
+            .record_message_arrival(
+                b"group-1".to_vec(),
+                b"alice".to_vec(),
+                1,
+                MessageArrival {
+                    transport: 0,
+                    hops_taken: 1,
+                    received_at: 1_700_000_001_000,
+                },
+            )
+            .unwrap());
+        assert!(store
+            .record_message_arrival(
+                b"group-1".to_vec(),
+                b"carol".to_vec(),
+                1,
+                MessageArrival {
+                    transport: 3,
+                    hops_taken: 2,
+                    received_at: 1_700_000_002_000,
+                },
+            )
+            .unwrap());
+        let csv = store.export_delivery_metrics_csv().unwrap();
+        let received = csv.lines().filter(|l| l.starts_with("received,")).count();
+        assert_eq!(received, 2, "csv was:\n{csv}");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     // --- outgoing receipts (DESIGN.md §7.2, §7.3) -------------------------
