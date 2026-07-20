@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    App-owned status-bar icon for MessageNotifier's chat notifications (FA9;
+    replaces android.R.drawable.stat_notify_chat). A plain speech-bubble
+    silhouette: notification small icons are rendered as a single-color
+    silhouette from this shape's alpha channel, so it must stay a flat,
+    opaque fill with no gradients or detail that would get lost.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M4,4L20,4L20,16L9,16L5,20L4,16Z" />
+</vector>

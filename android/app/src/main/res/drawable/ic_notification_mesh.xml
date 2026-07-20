@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    App-owned status-bar icon for MeshService's always-on foreground-service
+    notification (FA9; replaces android.R.drawable.stat_sys_data_bluetooth).
+    Three connected nodes, a simple mesh/hub glyph, kept as flat opaque
+    shapes since notification small icons render as a single-color
+    silhouette from this drawable's alpha channel.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.6"
+        android:pathData="M5,19L12,5L19,19L5,19Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M3,19A2,2 0 1,0 7,19A2,2 0 1,0 3,19Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M10,5A2,2 0 1,0 14,5A2,2 0 1,0 10,5Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M17,19A2,2 0 1,0 21,19A2,2 0 1,0 17,19Z" />
+</vector>

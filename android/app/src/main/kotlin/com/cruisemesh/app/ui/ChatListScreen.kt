@@ -49,6 +49,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.chat.tickStatusFor
 import com.cruisemesh.app.mesh.ReachabilityLevel
 import com.cruisemesh.app.mesh.WifiTipStore
@@ -203,7 +204,11 @@ fun ChatListScreen(
                 }
             } else {
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(summaries, key = { it.chatId.contentHashCode() }) { summary ->
+                    // FA9: contentHashCode() is an Int -- two distinct chatIds
+                    // can hash-collide, which LazyColumn's key must never do
+                    // (duplicate keys crash). The full hex encoding is
+                    // collision-free by construction.
+                    items(summaries, key = { UserIdHex.encode(it.chatId) }) { summary ->
                         var showDeleteDialog by remember { mutableStateOf(false) }
                         var showRowMenu by remember { mutableStateOf(false) }
 

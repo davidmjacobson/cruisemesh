@@ -14,6 +14,7 @@ import androidx.core.app.Person
 import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.MainActivity
+import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.UserIdHex
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Group
@@ -46,7 +47,7 @@ private const val MESSAGE_CHANNEL_ID = "cruisemesh_messages"
  *
  * Consequence of "notify on every newly stored, non-visible message": older
  * messages arriving in a burst via reconnect catch-up each notify too. Since
- * notifications collapse to one per chat (stable id, see below) that means
+ * notifications collapse to one per chat (stable tag, see below) that means
  * one notification showing the last message of the burst -- acceptable for
  * now; smarter batching/age cutoffs are a later refinement.
  */
@@ -66,6 +67,19 @@ object MessageNotifier {
     const val ACTION_REPLY = "com.cruisemesh.app.action.REPLY"
     const val ACTION_MARK_READ = "com.cruisemesh.app.action.MARK_READ"
     const val REMOTE_INPUT_REPLY = "com.cruisemesh.app.input.REPLY"
+
+    /**
+     * Fixed notification id shared by every chat notification -- the actual
+     * per-chat identity is the (tag, id) *pair* passed to
+     * [NotificationManager.notify]/[NotificationManager.cancel], and the tag
+     * is always [UserIdHex.encode] of the chatId (FA9). A raw `Int` id alone
+     * used to double as that identity via `chatId.contentHashCode()`, which
+     * two different chatIds can collide on.
+     */
+    private const val MESSAGE_NOTIFICATION_ID = 1
+
+    /** FA9: collision-free PendingIntent request codes, replacing the old `chatId.contentHashCode()` scheme. */
+    private val requestCodes = NotificationRequestCodes()
 
     /**
      * Posts (or updates -- one notification per chat, keyed by a stable id
@@ -129,7 +143,7 @@ object MessageNotifier {
      */
     fun cancel(context: Context, chatId: ByteArray) {
         context.getSystemService(NotificationManager::class.java)
-            ?.cancel(chatId.contentHashCode())
+            ?.cancel(UserIdHex.encode(chatId), MESSAGE_NOTIFICATION_ID)
     }
 
     private fun postChatNotification(
@@ -152,12 +166,13 @@ object MessageNotifier {
         val manager = context.getSystemService(NotificationManager::class.java)
         ensureChannel(manager)
 
-        // Stable per-chat id: the same chat always updates its one
-        // notification instead of stacking, and it doubles as the
-        // PendingIntent request code so intents for different chats never
-        // collide (same request code + FLAG_UPDATE_CURRENT would otherwise
-        // silently rewrite another chat's tap target).
-        val notificationId = chatId.contentHashCode()
+        // FA9: the notification's identity is the (tag, id) pair, not id
+        // alone -- deepLinkHex (already the routing key elsewhere) is a
+        // collision-free tag, so every chat gets its own notification slot
+        // under the one shared MESSAGE_NOTIFICATION_ID. PendingIntent request
+        // codes are unrelated to the notification id/tag and come from
+        // [requestCodes] instead of a hash, for the same collision reason.
+        val notificationTag = deepLinkHex
 
         val tapIntent = Intent(context, MainActivity::class.java).apply {
             putExtra(EXTRA_CHAT_USER_ID_HEX, deepLinkHex)
@@ -168,7 +183,7 @@ object MessageNotifier {
         }
         val contentIntent = PendingIntent.getActivity(
             context,
-            notificationId,
+            requestCodes.requestCodeFor(deepLinkHex, "content"),
             tapIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -181,7 +196,7 @@ object MessageNotifier {
             }
             return PendingIntent.getBroadcast(
                 context,
-                notificationId xor action.hashCode(),
+                requestCodes.requestCodeFor(deepLinkHex, action),
                 intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or if (mutable) PendingIntent.FLAG_MUTABLE else PendingIntent.FLAG_IMMUTABLE,
             )
@@ -200,7 +215,7 @@ object MessageNotifier {
         ).build()
 
         val notification = NotificationCompat.Builder(context, MESSAGE_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setSmallIcon(R.drawable.ic_notification_message)
             .setContentTitle(title)
             .setContentText(text)
             .setStyle(
@@ -216,7 +231,7 @@ object MessageNotifier {
             .setGroup("cruisemesh_conversations")
             .build()
 
-        manager.notify(notificationId, notification)
+        manager.notify(notificationTag, MESSAGE_NOTIFICATION_ID, notification)
     }
 
     /** Idempotent: `createNotificationChannel` is a no-op for an existing id. */
