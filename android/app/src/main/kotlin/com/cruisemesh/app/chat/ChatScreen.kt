@@ -15,7 +15,11 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -68,7 +72,11 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -88,6 +96,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.core.content.ContextCompat
@@ -107,6 +116,7 @@ import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ComposerCameraIcon
 import com.cruisemesh.app.ui.ComposerMicIcon
 import com.cruisemesh.app.ui.ComposerSendIcon
+import com.cruisemesh.app.ui.ReplyIcon
 import com.cruisemesh.app.ui.ContactDetailsSheet
 import com.cruisemesh.app.ui.ConversationMessageMeta
 import com.cruisemesh.app.ui.CruiseMeshTheme
@@ -121,6 +131,7 @@ import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
 import java.io.File
 import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
 import kotlinx.coroutines.launch
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
@@ -455,6 +466,12 @@ private fun ConversationScreen(
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     val density = LocalDensity.current
+    val composerFocus = remember { FocusRequester() }
+    // Swipe-to-reply (T1): start a reply to [message] and open the keyboard.
+    fun startReply(message: StoredMessage) {
+        onReplyingToChange(message)
+        composerFocus.requestFocus()
+    }
     val keyboardFreeze = rememberOverlayKeyboardFreeze()
     val listState = rememberLazyListState()
     val scrollScope = rememberCoroutineScope()
@@ -611,6 +628,7 @@ private fun ConversationScreen(
                             message.lamport,
                         ) else null,
                         onLongPress = { target, bounds -> openOverlay(target, bounds) },
+                        onSwipeReply = { startReply(message) },
                     )
                 }
             }
@@ -633,6 +651,7 @@ private fun ConversationScreen(
                 onSend = onSend,
                 hasPendingAttachment = pendingPhoto != null,
                 ownBubbleColor = MaterialTheme.colorScheme.primary,
+                focusRequester = composerFocus,
                 onPickGallery = onPickGallery,
                 onPickCamera = onPickCamera,
                 onStartVoice = onStartVoice,
@@ -850,6 +869,7 @@ internal fun MessageComposer(
     onSend: () -> Unit,
     hasPendingAttachment: Boolean,
     ownBubbleColor: Color,
+    focusRequester: FocusRequester = remember { FocusRequester() },
     onPickGallery: () -> Unit,
     onPickCamera: () -> Unit,
     onStartVoice: () -> Boolean,
@@ -944,7 +964,9 @@ internal fun MessageComposer(
                     unfocusedIndicatorColor = Color.Transparent,
                     disabledIndicatorColor = Color.Transparent,
                 ),
-                modifier = Modifier.weight(1f),
+                modifier = Modifier
+                    .weight(1f)
+                    .focusRequester(focusRequester),
             )
         }
 
@@ -1128,6 +1150,7 @@ private fun MessageBubble(
     onPhotoClick: (ByteArray) -> Unit = {},
     outboundExpiryMs: Long? = null,
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
+    onSwipeReply: () -> Unit = {},
 ) {
     var showLegend by remember { mutableStateOf(false) }
     var boundsInWindow by remember { mutableStateOf(Rect.Zero) }
@@ -1139,13 +1162,62 @@ private fun MessageBubble(
     }
     val photoBytes = remember(message.kind, message.payload) { messageImageBytes(message) }
 
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = topPadding, bottom = bottomPadding),
-        horizontalArrangement = if (isOwn) Arrangement.End else Arrangement.Start,
-    ) {
-        Column(horizontalAlignment = if (isOwn) Alignment.End else Alignment.Start) {
+    // Swipe-to-reply (T1): a rightward drag translates the bubble and reveals a
+    // reply arrow; releasing past the threshold starts a reply and opens the
+    // keyboard. Below threshold it just springs back. Vertical scrolling is
+    // untouched -- detectHorizontalDragGestures only claims horizontal-dominant
+    // drags, and a long-press (no movement) still opens the action overlay.
+    val density = LocalDensity.current
+    val thresholdPx = with(density) { 56.dp.toPx() }
+    val maxDragPx = with(density) { 80.dp.toPx() }
+    val offsetX = remember(target) { Animatable(0f) }
+    val swipeScope = rememberCoroutineScope()
+    val haptic = LocalHapticFeedback.current
+    var passedThreshold by remember(target) { mutableStateOf(false) }
+    val replyProgress = SwipeToReplyLogic.progress(offsetX.value, thresholdPx)
+
+    Box(modifier = Modifier.fillMaxWidth()) {
+        Icon(
+            imageVector = ReplyIcon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .padding(start = 20.dp)
+                .alpha(replyProgress)
+                .scale(0.7f + 0.3f * replyProgress),
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .offset { IntOffset(offsetX.value.roundToInt(), 0) }
+                .pointerInput(target) {
+                    detectHorizontalDragGestures(
+                        onDragEnd = {
+                            if (SwipeToReplyLogic.shouldReply(offsetX.value, thresholdPx)) {
+                                onSwipeReply()
+                            }
+                            passedThreshold = false
+                            swipeScope.launch { offsetX.animateTo(0f, spring()) }
+                        },
+                        onDragCancel = {
+                            passedThreshold = false
+                            swipeScope.launch { offsetX.animateTo(0f, spring()) }
+                        },
+                    ) { change, dragAmount ->
+                        change.consume()
+                        val next = SwipeToReplyLogic.clampOffset(offsetX.value + dragAmount, maxDragPx)
+                        swipeScope.launch { offsetX.snapTo(next) }
+                        if (!passedThreshold && next >= thresholdPx) {
+                            passedThreshold = true
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        }
+                    }
+                }
+                .padding(top = topPadding, bottom = bottomPadding),
+            horizontalArrangement = if (isOwn) Arrangement.End else Arrangement.Start,
+        ) {
+            Column(horizontalAlignment = if (isOwn) Alignment.End else Alignment.Start) {
             MessageBubbleVisual(
                 message = message,
                 isOwn = isOwn,
@@ -1186,6 +1258,7 @@ private fun MessageBubble(
                     modifier = Modifier.padding(horizontal = 12.dp),
                 )
             }
+        }
         }
     }
 

@@ -27,6 +27,7 @@ struct ChatView: View {
     @State private var voiceRecorder = VoiceRecorder()
     @State private var voiceRecording = false
     @State private var replyingTo: StoredMessage?
+    @FocusState private var composerFocused: Bool
     @State private var replyMetadata: [String: MessageReplyMetadata] = [:]
     @State private var viewedPhoto: ViewedPhoto?
     @State private var isMuted = false
@@ -105,6 +106,7 @@ struct ChatView: View {
                                     },
                                     onReply: {
                                         replyingTo = message
+                                        composerFocused = true
                                     },
                                     onPhotoTap: { jpeg in
                                         viewedPhoto = ViewedPhoto(jpeg: jpeg)
@@ -115,6 +117,10 @@ struct ChatView: View {
                                         }
                                     }
                                 )
+                                .swipeToReply {
+                                    replyingTo = message
+                                    composerFocused = true
+                                }
                                 .id(message.stableRowId)
                             }
                         }
@@ -162,6 +168,7 @@ struct ChatView: View {
 
                     TextField("Message", text: $draft, axis: .vertical)
                         .lineLimit(1...4)
+                        .focused($composerFocused)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
                         .background(

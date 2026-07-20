@@ -20,6 +20,7 @@ struct GroupChatView: View {
     @State private var confirmDelete = false
     @State private var cancellable: AnyCancellable?
     @State private var replyingTo: StoredMessage?
+    @FocusState private var composerFocused: Bool
     @State private var replyMetadata: [String: MessageReplyMetadata] = [:]
     @State private var photoItem: PhotosPickerItem?
     @State private var showCamera = false
@@ -94,6 +95,7 @@ struct GroupChatView: View {
                                     },
                                     onReply: {
                                         replyingTo = message
+                                        composerFocused = true
                                     },
                                     onPhotoTap: { jpeg in
                                         viewedPhoto = ViewedPhoto(jpeg: jpeg)
@@ -104,6 +106,10 @@ struct GroupChatView: View {
                                         }
                                     }
                                 )
+                                .swipeToReply {
+                                    replyingTo = message
+                                    composerFocused = true
+                                }
                                 .id(messageId(message))
                             }
                         }
@@ -148,6 +154,7 @@ struct GroupChatView: View {
 
                     TextField("Message", text: $draft, axis: .vertical)
                         .lineLimit(1...4)
+                        .focused($composerFocused)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
                         .background(
