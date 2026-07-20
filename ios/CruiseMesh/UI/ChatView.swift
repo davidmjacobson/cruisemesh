@@ -429,7 +429,6 @@ struct ChatView: View {
             senderUserId: identity.userId,
             receiptType: ReceiptType.read
         )) ?? 0
-        MeshController.shared.notifyChatViewed(chatId: contact.userId)
     }
 
     private func sendVoice(url: URL, durationMs: Int32) {
