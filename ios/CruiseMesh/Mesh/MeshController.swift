@@ -165,8 +165,14 @@ final class MeshController: ObservableObject {
             }
         }
         transport.onCentralDisconnected = { address in
-            MeshRouter.onDisconnected(address: address)
-            Task { @MainActor in MeshController.shared.refreshNearby() }
+            // Hop via the same Task { @MainActor } pattern as the connect
+            // callbacks above (FI6): task-enqueue order preserves the BLE
+            // queue's event order, so a fast connect->disconnect can't have
+            // its disconnect processed first and re-register a dead route.
+            Task { @MainActor in
+                MeshRouter.onDisconnected(address: address)
+                MeshController.shared.refreshNearby()
+            }
         }
         transport.onPeripheralSubscribed = { [weak self] address in
             Task { @MainActor in
@@ -176,8 +182,10 @@ final class MeshController: ObservableObject {
             }
         }
         transport.onPeripheralUnsubscribed = { address in
-            MeshRouter.onDisconnected(address: address)
-            Task { @MainActor in MeshController.shared.refreshNearby() }
+            Task { @MainActor in
+                MeshRouter.onDisconnected(address: address)
+                MeshController.shared.refreshNearby()
+            }
         }
 
         registerBluetoothAudioObserver()
