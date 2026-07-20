@@ -25,13 +25,8 @@ struct FriendIdentityBlock: View {
                 photo: (try? AppStore.get().contactAvatar(userId: contact.userId)).flatMap { UIImage(data: $0) }
             )
             Text(contact.name).font(.title2.bold())
-            Text(fingerprintWords(userId: contact.userId).joined(separator: " "))
-                .font(.body.monospaced())
-                .multilineTextAlignment(.center)
-            Text("Ask them to check these words match their card.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+            // Safety-word verification moved to the contact's details sheet
+            // ("Verify contact") to keep the first-run surface simple (T10).
         }
     }
 }

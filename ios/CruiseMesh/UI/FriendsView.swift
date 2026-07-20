@@ -341,11 +341,8 @@ struct MyQRView: View {
                 }
                 Text(formatUserId(userId: identity.userId))
                     .font(.footnote.monospaced())
-                Text(fingerprintWords(userId: identity.userId).joined(separator: " "))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
+                // Safety words moved off the card to a "Verify my identity" row
+                // in Profile; the friend verifies via "Verify contact" (T10).
                 if let appLink {
                     Button {
                         UIPasteboard.general.string = appLink

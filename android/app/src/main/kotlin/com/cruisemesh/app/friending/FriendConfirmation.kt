@@ -22,7 +22,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -31,7 +30,6 @@ import com.cruisemesh.app.ui.AvatarBadge
 import kotlinx.coroutines.delay
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.MessageStore
-import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
@@ -170,14 +168,6 @@ private fun FriendIdentityBlock(contact: Contact, avatar: ByteArray?) {
         size = 72.dp,
     )
     Text(contact.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-    Text(
-        fingerprintWords(contact.userId).joinToString(" "),
-        style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
-        textAlign = TextAlign.Center,
-    )
-    Text(stringResource(R.string.ui_ask_them_to_check_these_words_match_their),
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        textAlign = TextAlign.Center,
-    )
+    // Safety-word verification moved to the contact's details ("Verify
+    // contact") to keep the first-run surface simple (T10).
 }

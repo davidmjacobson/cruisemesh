@@ -19,7 +19,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -180,12 +183,31 @@ fun ProfileScreen(
                     style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
                     modifier = Modifier.padding(top = 16.dp),
                 )
-                Text(fingerprint.joinToString(" "), modifier = Modifier.padding(top = 8.dp))
-                Text(stringResource(R.string.ui_read_these_aloud_to_verify),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 4.dp),
-                )
+                var showVerification by remember { mutableStateOf(false) }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { showVerification = !showVerification }
+                        .padding(top = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        stringResource(R.string.ui_verify_my_identity),
+                        modifier = Modifier.weight(1f),
+                    )
+                    Icon(
+                        imageVector = if (showVerification) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                        contentDescription = null,
+                    )
+                }
+                if (showVerification) {
+                    Text(fingerprint.joinToString(" "), modifier = Modifier.padding(top = 8.dp))
+                    Text(stringResource(R.string.ui_verify_my_identity_explanation),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
             }
 
             SettingsSpacer()

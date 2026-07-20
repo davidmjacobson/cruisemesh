@@ -531,6 +531,16 @@
         }
       }
     },
+    "Have your friend match these words against your name in their contacts to confirm it's really you.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Have your friend match these words against your name in their contacts to confirm it's really you."
+          }
+        }
+      }
+    },
     "Hold to record a voice memo": {
       "localizations": {
         "en": {
@@ -627,6 +637,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Local Wi-Fi address"
+          }
+        }
+      }
+    },
+    "Match these words with your friend's screen to confirm it's really them.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Match these words with your friend's screen to confirm it's really them."
           }
         }
       }
@@ -1377,6 +1397,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "User ID"
+          }
+        }
+      }
+    },
+    "Verify contact": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Verify contact"
           }
         }
       }

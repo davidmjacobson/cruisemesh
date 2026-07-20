@@ -82,7 +82,6 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.FriendSuggestion
 import uniffi.cruisemesh_core.friendCardUserId
-import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.makeFriendCard
 import uniffi.cruisemesh_core.makeFriendLink
 import uniffi.cruisemesh_core.parseFriendText
@@ -103,7 +102,6 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
     var showAdvanced by remember { mutableStateOf(false) }
     var connectedFriend by remember { mutableStateOf<FriendAddedOutcome?>(null) }
     val pendingImports by FriendImportEvents.pendingImports.collectAsState()
-    val fingerprint = remember(identity.userId) { fingerprintWords(identity.userId) }
     val friendLink = remember(name, relayUrl, relayToken, identity) {
         runCatching {
             val cardJson = makeFriendCard(
@@ -179,11 +177,8 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                     style = MaterialTheme.typography.bodyMedium,
                 )
             }
-            Text(
-                fingerprint.joinToString(" "),
-                style = MaterialTheme.typography.bodyLarge,
-                modifier = Modifier.padding(horizontal = 8.dp),
-            )
+            // Safety words moved off the card to "Verify my identity" in
+            // Profile; friends verify via "Verify contact" in contact details (T10).
             OutlinedTextField(
                 value = name,
                 onValueChange = {
