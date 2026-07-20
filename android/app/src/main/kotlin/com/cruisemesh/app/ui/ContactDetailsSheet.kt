@@ -17,6 +17,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -57,7 +58,13 @@ fun ContactDetailsSheet(
     onMutedChange: (Boolean) -> Unit = {},
     onSetNickname: (String?) -> Unit = {},
 ) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    // skipPartiallyExpanded: expanding "Verify contact" grows the sheet's
+    // content height, which makes Material3 recompute the peek/full anchors.
+    // With the default two-state sheet, that recompute can snap the sheet
+    // back down to the (now-taller) peek anchor instead of staying open.
+    // Fixed-height content plus a single "expanded" anchor avoids the resnap.
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
         ContactDetailsSheetContent(
             contact = contact,
             avatarBytes = avatarBytes,
