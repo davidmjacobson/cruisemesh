@@ -381,6 +381,16 @@
         }
       }
     },
+    "Diagnostics": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostics"
+          }
+        }
+      }
+    },
     "Display name": {
       "localizations": {
         "en": {
@@ -407,6 +417,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Enable Bluetooth and notifications"
+          }
+        }
+      }
+    },
+    "Export field metrics": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Export field metrics"
+          }
+        }
+      }
+    },
+    "Exports a CSV of delivery timings and the transports messages used, for cruise-test analysis. Metadata only — no message content or contact names.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Exports a CSV of delivery timings and the transports messages used, for cruise-test analysis. Metadata only — no message content or contact names."
           }
         }
       }

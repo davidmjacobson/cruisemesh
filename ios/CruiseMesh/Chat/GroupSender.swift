@@ -151,6 +151,12 @@ final class GroupSender {
         ) else {
             return
         }
+        // V2 field metric: note the outbound group send for the cruise-test export.
+        try? store.recordSentMetric(
+            chatId: authored.message.chatId,
+            lamport: authored.message.lamport,
+            sentAtMs: timestamp
+        )
         ChatEvents.notifyChatChanged(authored.message.chatId)
         publishGroupFrame(label: label, authored: authored)
     }

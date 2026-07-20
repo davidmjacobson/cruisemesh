@@ -4,4 +4,6 @@
     <cache-path name="voice" path="voice/" />
     <!-- On-device log capture (DebugFileLog; opt-in outside debug builds), shared via the sheet. -->
     <external-files-path name="logs" path="logs/" />
+    <!-- V2 field-metrics CSV export, shared from Advanced settings. -->
+    <external-files-path name="metrics" path="metrics/" />
 </paths>

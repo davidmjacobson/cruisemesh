@@ -3232,6 +3232,19 @@ class MeshService : Service() {
             throughLamport = receipt.lamport,
             viaTransport = arrival.transport,
         )
+        // V2 field metric: stamp delivery latency + route on the messages this
+        // (cumulative) delivery receipt confirms. READ receipts imply delivery
+        // too, but the DELIVERED watermark is the one we measure against.
+        if (receipt.receiptType == RECEIPT_TYPE_DELIVERED) {
+            runCatching {
+                store.recordDeliveredMetric(
+                    chatId = envelopeSenderUserId,
+                    throughLamport = receipt.lamport,
+                    deliveredAtMs = arrival.receivedAt,
+                    viaTransport = arrival.transport,
+                )
+            }
+        }
         ChatEvents.notifyChatChanged(envelopeSenderUserId)
     }
 
