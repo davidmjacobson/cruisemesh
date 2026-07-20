@@ -29,6 +29,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.MainActivity
+import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
@@ -3571,7 +3572,8 @@ class MeshService : Service() {
                     else -> "Relaying messages nearby"
                 },
             )
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            // FA9: app-owned icon, was android.R.drawable.stat_sys_data_bluetooth.
+            .setSmallIcon(R.drawable.ic_notification_mesh)
             .setBadgeIconType(NotificationCompat.BADGE_ICON_NONE)
             .setContentIntent(contentIntent)
             .addAction(
