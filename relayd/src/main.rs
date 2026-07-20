@@ -49,6 +49,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             family_quota_bytes,
         )),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
+}
+
+/// FR3: `docker stop` sends SIGTERM; without graceful shutdown wired up,
+/// axum's default is to drop the listener immediately -- in-flight HTTP
+/// requests get an RST and WS clients get a hard TCP close instead of a
+/// clean Close frame. Waiting on either signal drains connections before
+/// the process actually exits.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    // SIGTERM is unix-only (there is no Windows equivalent tokio can hook);
+    // Ctrl+C alone still covers local/dev and Windows use.
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    info!("shutdown signal received, draining in-flight connections");
 }
