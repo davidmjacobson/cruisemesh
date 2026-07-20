@@ -11,6 +11,7 @@ struct ChatView: View {
     @ObservedObject private var connectivityClock = ConnectivityClock.shared
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @State private var messages: [StoredMessage] = []
     @State private var avatarData: Data?
     @State private var deliveredThrough: UInt64 = 0
@@ -255,6 +256,18 @@ struct ChatView: View {
         .onDisappear {
             ChatVisibility.clearVisible(contact.userId)
             voiceRecorder.cancel()
+        }
+        .onChange(of: scenePhase) { phase in
+            // Backgrounding leaves the view "appeared" (no onDisappear), so a
+            // locked phone would otherwise keep this chat marked visible —
+            // false read receipts and suppressed notifications while asleep
+            // (FI1). Mirrors Android's ON_STOP/ON_START ChatVisibility reset.
+            if phase == .background {
+                ChatVisibility.clearVisible(contact.userId)
+            } else if phase == .active {
+                ChatVisibility.setVisible(contact.userId)
+                MeshController.shared.notifyChatViewed(chatId: contact.userId)
+            }
         }
         .onChange(of: photoItem) { item in
             guard let item else { return }
