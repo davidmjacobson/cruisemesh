@@ -131,7 +131,7 @@
     <string name="ui_say_hi">Say hi</string>
     <string name="ui_scan_qr_code">Scan QR code</string>
     <string name="ui_scan_with_the_other_phone_s_camera_to">Scan with the other phone\'s camera to connect securely.</string>
-    <string name="ui_search_this_24_network">Search this /24 network</string>
+    <string name="ui_search_this_24_network">Search my local network</string>
     <string name="ui_share_card">Share card</string>
     <string name="ui_share_debug_log">Share debug log</string>
     <string name="ui_show_address_qr">Show address QR</string>
@@ -144,7 +144,7 @@
     <string name="ui_requested">Requested</string>
     <string name="ui_add">Add</string>
     <string name="ui_create_group">Create group</string>
-    <string name="ui_subnet_search_probes_only_tcp_45892_with_low">Subnet search probes only TCP 45892 with low concurrency and never expands to a /16.</string>
+    <string name="ui_subnet_search_probes_only_tcp_45892_with_low">Searches your local network for other CruiseMesh phones, probing a single port with low concurrency. It never scans beyond your immediate subnet.</string>
     <string name="ui_suggestions_appear_after_your_friends_phones_sync">Suggestions appear after your friends\' phones sync.</string>
     <string name="ui_take_photo">Take photo</string>
     <string name="ui_test_encrypted_lan_link">Test encrypted LAN link</string>

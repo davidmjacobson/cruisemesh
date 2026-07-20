@@ -3221,20 +3221,16 @@ class MeshService : Service() {
                 "throughLamport=${receipt.lamport} type=${receipt.receiptType}",
         )
         MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(envelopeSenderUserId), System.currentTimeMillis())
+        // The receipt returned on the exact link that delivered the message;
+        // record that route against the watermark (T6) so every acknowledged
+        // message's Info pane can prove LAN/BLE/relay delivery -- not just the
+        // one at the exact watermark lamport.
         store.recordReceipt(
             chatId = envelopeSenderUserId, // local convention: chat keyed by the other party -- see class KDoc
             senderUserId = identity.userId, // whose messages this receipt is about: ours
             receiptType = receipt.receiptType,
             throughLamport = receipt.lamport,
-        )
-        // A receipt is sent immediately back on the exact link that delivered
-        // the message. Keep the first confirmation route on the acknowledged
-        // outgoing message so its Info pane can prove LAN/BLE/relay delivery.
-        store.recordMessageArrival(
-            envelopeSenderUserId,
-            identity.userId,
-            receipt.lamport,
-            arrival,
+            viaTransport = arrival.transport,
         )
         ChatEvents.notifyChatChanged(envelopeSenderUserId)
     }

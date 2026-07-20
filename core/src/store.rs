@@ -325,6 +325,7 @@ impl MessageStore {
         )
         .map_err(store_err)?;
         ensure_column(&conn, "messages", "arrival_transport", "INTEGER")?;
+        ensure_column(&conn, "receipts", "via_transport", "INTEGER")?;
         ensure_column(&conn, "messages", "hops_taken", "INTEGER")?;
         ensure_column(&conn, "messages", "received_at", "INTEGER")?;
         ensure_column(&conn, "messages", "msg_id", "BLOB")?;
@@ -1309,25 +1310,41 @@ impl MessageStore {
     /// `through_lamport` at or above this one, it's left unchanged --
     /// receipts can arrive out of order or be replayed under DTN, and a
     /// stale/duplicate receipt must never regress what's already known.
+    ///
+    /// `via_transport` (T6) is the transport the receipt itself returned on
+    /// (the [`MessageArrival::transport`] encoding), recorded so a message's
+    /// Info pane can prove *how* delivery was confirmed. It is only overwritten
+    /// when the watermark actually advances and the new receipt carries a known
+    /// transport: a re-sent receipt for the same watermark, a stale/replayed
+    /// one, or an advancing receipt whose route we couldn't determine all keep
+    /// the transport that first confirmed the current watermark. Pass `None`
+    /// when the return route isn't known.
     pub fn record_receipt(
         &self,
         chat_id: Vec<u8>,
         sender_user_id: Vec<u8>,
         receipt_type: u8,
         through_lamport: u64,
+        via_transport: Option<u8>,
     ) -> Result<(), CoreError> {
         validate_receipt_watermark(receipt_type, through_lamport)?;
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
-            "INSERT INTO receipts (chat_id, sender_user_id, receipt_type, through_lamport)
-                VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO receipts (chat_id, sender_user_id, receipt_type, through_lamport, via_transport)
+                VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(chat_id, sender_user_id, receipt_type) DO UPDATE SET
+                via_transport = CASE
+                    WHEN excluded.through_lamport > through_lamport
+                         AND excluded.via_transport IS NOT NULL
+                    THEN excluded.via_transport
+                    ELSE via_transport END,
                 through_lamport = MAX(through_lamport, excluded.through_lamport)",
             params![
                 chat_id,
                 sender_user_id,
                 receipt_type as i64,
-                through_lamport as i64
+                through_lamport as i64,
+                via_transport.map(|t| t as i64)
             ],
         )
         .map_err(store_err)?;
@@ -1354,6 +1371,32 @@ impl MessageStore {
             .optional()
             .map_err(store_err)?;
         Ok(through.unwrap_or(0) as u64)
+    }
+
+    /// The transport a peer's `receipt_type` receipt returned on for the
+    /// highest watermark recorded so far (T6) -- the [`MessageArrival::transport`]
+    /// encoding. `None` if no such receipt exists yet or its return route was
+    /// unknown. Any message whose lamport is at or below
+    /// [`MessageStore::receipt_through`] for the same key was confirmed by this
+    /// route, so the Info pane can show it against every acknowledged message,
+    /// not just the one at the exact watermark.
+    pub fn receipt_via_transport(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        receipt_type: u8,
+    ) -> Result<Option<u8>, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let via: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT via_transport FROM receipts
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
+                params![chat_id, sender_user_id, receipt_type as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(via.flatten().map(|t| t as u8))
     }
 
     /// Record that *this device* has delivered/read messages authored by
@@ -2957,6 +3000,7 @@ CREATE TABLE IF NOT EXISTS receipts (
     sender_user_id  BLOB NOT NULL,
     receipt_type    INTEGER NOT NULL,
     through_lamport INTEGER NOT NULL,
+    via_transport   INTEGER,
     PRIMARY KEY(chat_id, sender_user_id, receipt_type)
 );
 
@@ -3599,10 +3643,11 @@ mod tests {
                 b"alice".to_vec(),
                 RECEIPT_TYPE_DELIVERED,
                 i64::MAX as u64 + 1,
+                None,
             )
             .is_err());
         assert!(store
-            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), 0xff, 1)
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), 0xff, 1, None)
             .is_err());
         assert!(store
             .upsert_outgoing_receipt_envelope(
@@ -3727,6 +3772,7 @@ mod tests {
                 b"self".to_vec(),
                 crate::RECEIPT_TYPE_READ,
                 2,
+                None,
             )
             .unwrap();
 
@@ -4782,6 +4828,7 @@ mod tests {
                 b"me".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 1,
+                None,
             )
             .unwrap();
         store
@@ -4881,6 +4928,7 @@ mod tests {
                 b"me".to_vec(),
                 RECEIPT_TYPE_DELIVERED,
                 1,
+                None,
             )
             .unwrap();
         store
@@ -4923,6 +4971,7 @@ mod tests {
                 b"me".to_vec(),
                 RECEIPT_TYPE_DELIVERED,
                 1,
+                None,
             )
             .unwrap();
         store
@@ -5109,6 +5158,7 @@ mod tests {
                 b"alice".to_vec(),
                 RECEIPT_TYPE_DELIVERED,
                 1,
+                None,
             )
             .unwrap();
         store
@@ -5155,6 +5205,7 @@ mod tests {
                 b"alice".to_vec(),
                 RECEIPT_TYPE_DELIVERED,
                 1,
+                None,
             )
             .unwrap();
         store
@@ -5191,6 +5242,7 @@ mod tests {
                 b"carol".to_vec(),
                 RECEIPT_TYPE_DELIVERED,
                 1,
+                None,
             )
             .unwrap();
         store
@@ -5307,6 +5359,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 5,
+                None,
             )
             .unwrap();
 
@@ -5329,6 +5382,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 5,
+                None,
             )
             .unwrap();
         store
@@ -5337,6 +5391,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
+                None,
             )
             .unwrap();
 
@@ -5359,6 +5414,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
+                None,
             )
             .unwrap();
         // A stale/replayed receipt (lower, or the same, value) must not undo progress.
@@ -5368,6 +5424,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 3,
+                None,
             )
             .unwrap();
         store
@@ -5376,6 +5433,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
+                None,
             )
             .unwrap();
 
@@ -5390,6 +5448,191 @@ mod tests {
     }
 
     #[test]
+    fn record_receipt_records_and_advances_via_transport() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // First confirmation returned over relay (transport 2).
+        store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                5,
+                Some(2),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .receipt_via_transport(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            Some(2)
+        );
+
+        // A later confirmation that advances the watermark over BLE direct
+        // (transport 0) updates the recorded route.
+        store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9,
+                Some(0),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .receipt_via_transport(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn via_transport_is_kept_when_the_watermark_does_not_advance_or_route_is_unknown() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9,
+                Some(3), // local Wi-Fi confirmed the watermark first
+            )
+            .unwrap();
+        // A re-sent receipt for the same watermark on a different link must not
+        // overwrite the transport that first confirmed it.
+        store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9,
+                Some(2),
+            )
+            .unwrap();
+        // A watermark-advancing receipt whose return route is unknown keeps the
+        // last known route rather than clearing it.
+        store
+            .record_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                12,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .receipt_through(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            12
+        );
+        assert_eq!(
+            store
+                .receipt_via_transport(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn receipt_via_transport_is_none_when_unrecorded() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert_eq!(
+            store
+                .receipt_via_transport(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn open_migrates_an_old_receipts_table_to_add_via_transport() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cruisemesh-receipts-migration-{unique}.sqlite"));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE receipts (
+                chat_id         BLOB NOT NULL,
+                sender_user_id  BLOB NOT NULL,
+                receipt_type    INTEGER NOT NULL,
+                through_lamport INTEGER NOT NULL,
+                PRIMARY KEY(chat_id, sender_user_id, receipt_type)
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO receipts (chat_id, sender_user_id, receipt_type, through_lamport)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![b"alice-id".to_vec(), b"me".to_vec(), 1i64, 3i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        // The pre-existing watermark survives the migration; its route is
+        // unknown (the column was just added, defaulting to NULL).
+        assert_eq!(
+            store
+                .receipt_through(b"alice-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            store
+                .receipt_via_transport(b"alice-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            None
+        );
+        // A newer confirmation that advances the watermark now records its route.
+        store
+            .record_receipt(
+                b"alice-id".to_vec(),
+                b"me".to_vec(),
+                RECEIPT_TYPE_DELIVERED,
+                5,
+                Some(0),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .receipt_via_transport(b"alice-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            Some(0)
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(&path_str);
+    }
+
+    #[test]
     fn receipt_types_are_independent() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store
@@ -5398,6 +5641,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
+                None,
             )
             .unwrap();
         store
@@ -5406,6 +5650,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_READ,
                 4,
+                None,
             )
             .unwrap();
 
@@ -5440,6 +5685,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
+                None,
             )
             .unwrap();
         store
@@ -5448,6 +5694,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 2,
+                None,
             )
             .unwrap();
 

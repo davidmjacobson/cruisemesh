@@ -56,3 +56,11 @@ val ComposerSendIcon: ImageVector by lazy {
         pathData = "M2.01,21L23,12 2.01,3 2,10l15,2 -15,2z",
     )
 }
+
+/** Filled "reply" glyph (used by swipe-to-reply, T1). */
+val ReplyIcon: ImageVector by lazy {
+    materialIcon(
+        name = "Reply",
+        pathData = "M10,9V5l-7,7 7,7v-4.1c5,0 8.5,1.6 11,5.1 -1,-5 -4,-10 -11,-11z",
+    )
+}

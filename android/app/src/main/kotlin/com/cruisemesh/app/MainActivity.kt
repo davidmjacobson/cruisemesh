@@ -982,7 +982,7 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
                     ImportFriendResult.Preview(FriendPreview(candidate, warning))
                 }
             } catch (_: Exception) {
-                if (text.contains("CMFRIEND1:")) {
+                if (text.contains("CMFRIEND")) {
                     ImportFriendResult.Error("That looks like a friend card but part of it is missing. Copy the whole message and try again.")
                 } else {
                     ImportFriendResult.Error("Not a CruiseMesh friend card")

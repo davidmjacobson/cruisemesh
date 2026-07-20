@@ -2144,6 +2144,17 @@ public protocol MessageStoreProtocol : AnyObject {
     func receiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8) throws  -> UInt64
     
     /**
+     * The transport a peer's `receipt_type` receipt returned on for the
+     * highest watermark recorded so far (T6) -- the [`MessageArrival::transport`]
+     * encoding. `None` if no such receipt exists yet or its return route was
+     * unknown. Any message whose lamport is at or below
+     * [`MessageStore::receipt_through`] for the same key was confirmed by this
+     * route, so the Info pane can show it against every acknowledged message,
+     * not just the one at the exact watermark.
+     */
+    func receiptViaTransport(chatId: Data, senderUserId: Data, receiptType: UInt8) throws  -> UInt8?
+    
+    /**
      * Up to `limit` recent message-stream `msg_id`s this device holds,
      * newest first: every `messages` row with a recorded envelope id, which
      * covers both *consumed* incoming messages (opened-and-stored via
@@ -2206,8 +2217,17 @@ public protocol MessageStoreProtocol : AnyObject {
      * `through_lamport` at or above this one, it's left unchanged --
      * receipts can arrive out of order or be replayed under DTN, and a
      * stale/duplicate receipt must never regress what's already known.
+     *
+     * `via_transport` (T6) is the transport the receipt itself returned on
+     * (the [`MessageArrival::transport`] encoding), recorded so a message's
+     * Info pane can prove *how* delivery was confirmed. It is only overwritten
+     * when the watermark actually advances and the new receipt carries a known
+     * transport: a re-sent receipt for the same watermark, a stale/replayed
+     * one, or an advancing receipt whose route we couldn't determine all keep
+     * the transport that first confirmed the current watermark. Pass `None`
+     * when the return route isn't known.
      */
-    func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64) throws 
+    func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws 
     
     /**
      * Drop a carried envelope by `msg_id` -- called once it's been handed to
@@ -3373,6 +3393,25 @@ open func receiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8)th
 }
     
     /**
+     * The transport a peer's `receipt_type` receipt returned on for the
+     * highest watermark recorded so far (T6) -- the [`MessageArrival::transport`]
+     * encoding. `None` if no such receipt exists yet or its return route was
+     * unknown. Any message whose lamport is at or below
+     * [`MessageStore::receipt_through`] for the same key was confirmed by this
+     * route, so the Info pane can show it against every acknowledged message,
+     * not just the one at the exact watermark.
+     */
+open func receiptViaTransport(chatId: Data, senderUserId: Data, receiptType: UInt8)throws  -> UInt8? {
+    return try  FfiConverterOptionUInt8.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_receipt_via_transport(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterUInt8.lower(receiptType),$0
+    )
+})
+}
+    
+    /**
      * Up to `limit` recent message-stream `msg_id`s this device holds,
      * newest first: every `messages` row with a recorded envelope id, which
      * covers both *consumed* incoming messages (opened-and-stored via
@@ -3458,13 +3497,23 @@ open func recordOutgoingReceipt(chatId: Data, senderUserId: Data, receiptType: U
      * `through_lamport` at or above this one, it's left unchanged --
      * receipts can arrive out of order or be replayed under DTN, and a
      * stale/duplicate receipt must never regress what's already known.
+     *
+     * `via_transport` (T6) is the transport the receipt itself returned on
+     * (the [`MessageArrival::transport`] encoding), recorded so a message's
+     * Info pane can prove *how* delivery was confirmed. It is only overwritten
+     * when the watermark actually advances and the new receipt carries a known
+     * transport: a re-sent receipt for the same watermark, a stale/replayed
+     * one, or an advancing receipt whose route we couldn't determine all keep
+     * the transport that first confirmed the current watermark. Pass `None`
+     * when the return route isn't known.
      */
-open func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+open func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_record_receipt(self.uniffiClonePointer(),
         FfiConverterData.lower(chatId),
         FfiConverterData.lower(senderUserId),
         FfiConverterUInt8.lower(receiptType),
-        FfiConverterUInt64.lower(throughLamport),$0
+        FfiConverterUInt64.lower(throughLamport),
+        FfiConverterOptionUInt8.lower(viaTransport),$0
     )
 }
 }
@@ -9006,6 +9055,30 @@ extension Frame: Equatable, Hashable {}
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt8: FfiConverterRustBuffer {
+    typealias SwiftType = UInt8?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt8.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt8.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
     typealias SwiftType = UInt32?
 
@@ -11899,6 +11972,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_receipt_through() != 17794) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_receipt_via_transport() != 15759) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_recent_consumed_msg_ids() != 58947) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11908,7 +11984,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_outgoing_receipt() != 8142) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_receipt() != 8550) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_receipt() != 46075) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_remove_carried_envelope() != 52788) {

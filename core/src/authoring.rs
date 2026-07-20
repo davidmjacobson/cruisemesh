@@ -747,6 +747,7 @@ mod tests {
                 alice.user_id.clone(),
                 RECEIPT_TYPE_READ,
                 9,
+                None,
             )
             .unwrap();
         let result = store
