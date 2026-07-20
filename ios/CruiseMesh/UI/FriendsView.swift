@@ -118,15 +118,10 @@ struct FriendsView: View {
                                     photo: (try? AppStore.get().contactAvatar(userId: contact.userId))
                                         .flatMap { UIImage(data: $0) }
                                 )
-                                VStack(alignment: .leading) {
-                                    Text(ChatListLogic.displayNameOrId(
-                                        name: contact.name,
-                                        displayId: formatUserId(userId: contact.userId)
-                                    ))
-                                    Text(formatUserId(userId: contact.userId))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
+                                Text(ChatListLogic.displayNameOrId(
+                                    name: contact.name,
+                                    displayId: formatUserId(userId: contact.userId)
+                                ))
                             }
                         }
                     }
@@ -339,8 +334,6 @@ struct MyQRView: View {
                         .foregroundStyle(.red)
                         .multilineTextAlignment(.center)
                 }
-                Text(formatUserId(userId: identity.userId))
-                    .font(.footnote.monospaced())
                 // Safety words moved off the card to a "Verify my identity" row
                 // in Profile; the friend verifies via "Verify contact" (T10).
                 if let appLink {

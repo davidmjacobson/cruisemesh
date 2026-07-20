@@ -206,10 +206,6 @@ private struct ProfileSetupSlide: View {
             PhotosPicker(selection: $photoItem, matching: .images) {
                 Label("Choose profile photo", systemImage: "photo")
             }
-            Text(formatUserId(userId: identity.userId))
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
         }
         .padding(28)
     }

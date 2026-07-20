@@ -120,7 +120,6 @@
     <string name="ui_step_of">Step %1$d of %2$d</string>
     <string name="ui_nearby_access_on_detail">Nearby access is on. Background activity is optional but keeps messages moving while the app isn\'t open.</string>
     <string name="ui_nearby_access_off_detail">You can finish setup without granting access — you can turn it on later in Settings when you\'re ready to start messaging.</string>
-    <string name="ui_device_id">Device ID: %1$s</string>
     <string name="ui_minimum_passphrase_length">At least %1$d characters.</string>
     <string name="ui_remove_photo">Remove photo</string>
     <string name="ui_removes_this_group_and_its_message_history_from">Removes this group and its message history from this device. Other members keep their copy.</string>
