@@ -2813,13 +2813,9 @@ class MeshService : Service() {
             // 1:1 chat. Skip wire receipts for invites; the group is what matters.
         }
         if (!ChatVisibility.isVisible(group.id)) {
-            val senderName = contact?.let(::coreContactDisplayName) ?: UserIdHex.encode(senderUserId).take(8)
-            MessageNotifier.notifyIncomingGroupMessage(
-                this,
-                group,
-                senderName,
-                "Added you to ${group.name}",
-            )
+            // FA8: a typed entry point, not a literal string sniffed by
+            // MessageNotifier's prefix check -- see notifyGroupInvite's KDoc.
+            MessageNotifier.notifyGroupInvite(this, group)
         }
     }
 

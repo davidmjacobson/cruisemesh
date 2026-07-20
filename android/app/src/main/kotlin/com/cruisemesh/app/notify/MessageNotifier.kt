@@ -14,6 +14,7 @@ import androidx.core.app.Person
 import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.MainActivity
+import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.UserIdHex
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Group
@@ -109,12 +110,30 @@ object MessageNotifier {
         senderName: String,
         text: String,
     ) {
-        val body = if (text.startsWith("Added you to ")) text else "$senderName: $text"
         postChatNotification(
             context = context,
             chatId = group.id,
             title = group.name,
-            text = body,
+            text = "$senderName: $text",
+            deepLinkHex = UserIdHex.encode(group.id),
+            isGroup = true,
+        )
+    }
+
+    /**
+     * Posts (or updates) a notification announcing that this device was just
+     * added to [group]. Distinct from [notifyIncomingGroupMessage] -- this is
+     * a system event, not a member's chat message, so it gets its own typed
+     * entry point rather than the two being told apart by sniffing [String]
+     * prefixes (FA8: a localized or genuinely message-shaped "Added you to "
+     * string used to collide with this).
+     */
+    fun notifyGroupInvite(context: Context, group: Group) {
+        postChatNotification(
+            context = context,
+            chatId = group.id,
+            title = group.name,
+            text = context.getString(R.string.ui_added_you_to_group, group.name),
             deepLinkHex = UserIdHex.encode(group.id),
             isGroup = true,
         )
