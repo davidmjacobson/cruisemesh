@@ -50,10 +50,11 @@ final class RealMeshSender: MeshSender {
     }
 
     func sendReaction(contact: Contact, target: MessageTarget, emoji: String) {
+        guard let payload = ReactionPayload(target: target, emoji: emoji).encode() else { return }
         enqueue(
             contact: contact,
             kind: ProtocolKind.reaction,
-            payload: ReactionPayload(target: target, emoji: emoji).encode(),
+            payload: payload,
             label: "sendReaction"
         )
     }

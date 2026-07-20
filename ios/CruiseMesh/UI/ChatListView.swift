@@ -38,6 +38,7 @@ struct ChatListView: View {
     @State private var cancellable: AnyCancellable?
     @State private var bluetoothAudioWarningDismissed = false
     @State private var publishedFriendDirectory = false
+    @State private var showStoreRecoveryNotice = false
     @State private var path = NavigationPath()
     @AppStorage("hideBluetoothAudioWarning") private var hideBluetoothAudioWarning = false
 
@@ -151,6 +152,20 @@ struct ChatListView: View {
             }
             .safeAreaInset(edge: .top) {
                 VStack(spacing: 0) {
+                    if showStoreRecoveryNotice {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            Text("Message history could not be read and was reset.")
+                                .font(.caption)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 0)
+                            Button("Dismiss") { showStoreRecoveryNotice = false }
+                                .font(.caption.weight(.semibold))
+                        }
+                        .padding(10)
+                        .background(Color.orange.opacity(0.16))
+                    }
                     if let warning = connectivityWarning {
                         ConnectivityWarningBanner(
                             warning: warning,
@@ -208,6 +223,7 @@ struct ChatListView: View {
                 reload()
                 cancellable = ChatEvents.subject.sink { _ in reload() }
                 appModel.startMeshIfEnabled()
+                if AppStore.consumeRecoveryNotice() { showStoreRecoveryNotice = true }
                 if !publishedFriendDirectory {
                     publishedFriendDirectory = true
                     ProfileSyncSender.queueToAllContacts(

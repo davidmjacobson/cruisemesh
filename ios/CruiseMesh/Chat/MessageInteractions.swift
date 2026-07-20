@@ -17,8 +17,10 @@ struct ReactionPayload: Equatable {
     let target: MessageTarget
     let emoji: String
 
-    func encode() -> Data {
-        try! encodeReactionPayload(payload: CoreReactionPayload(
+    /// `nil` on a (never-observed-in-practice) encode failure — callers
+    /// no-op rather than crash (FI9).
+    func encode() -> Data? {
+        try? encodeReactionPayload(payload: CoreReactionPayload(
             target: CoreMessageTarget(
                 senderUserId: target.senderUserId,
                 lamport: target.lamport,

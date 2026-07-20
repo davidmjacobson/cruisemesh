@@ -83,10 +83,11 @@ final class GroupSender {
 
     func sendReaction(group: Group, target: MessageTarget, emoji: String) {
         guard group.memberUserIds.contains(identity.userId) else { return }
+        guard let payload = ReactionPayload(target: target, emoji: emoji).encode() else { return }
         enqueueGroupMessage(
             group: group,
             kind: ProtocolKind.reaction,
-            payload: ReactionPayload(target: target, emoji: emoji).encode(),
+            payload: payload,
             label: "sendReaction"
         )
     }
