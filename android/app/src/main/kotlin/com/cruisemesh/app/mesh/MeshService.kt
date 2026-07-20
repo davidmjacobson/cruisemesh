@@ -234,9 +234,18 @@ private const val OWN_RECEIPT_SPRAY_BUDGET_BYTES: Long = 64L * 1024
  */
 class MeshService : Service() {
 
+    // @Volatile: read/written from the main thread (lifecycle, restarts) but
+    // also read from the receive-path threads below (central-GATT binder,
+    // peripheral-GATT binder, LanTransport's connectionExecutor, and the
+    // relay-sync thread) via processInboundEnvelope/status checks -- see the
+    // threading-model note on processInboundEnvelope. Plain fields here would
+    // let a receive-path thread observe a stale cached value.
+    @Volatile
     private var identity: Identity? = null
     private lateinit var store: MessageStore
+    @Volatile
     private var running = false
+    @Volatile
     private var meshRolesRunning = false
     private var bluetoothAudioConnected = false
     private var bluetoothAudioReceiverRegistered = false
@@ -245,6 +254,9 @@ class MeshService : Service() {
     private var lanTransport: LanTransport? = null
     private val lanHealthTracker = LanHealthTracker()
     private val lanProbeNonce = AtomicLong(System.nanoTime())
+
+    /** FA5: atomic per-msg_id admission gate across the four concurrent receive-path threads -- see [processInboundEnvelope]. */
+    private val inboundAdmission = InboundEnvelopeAdmission()
 
     /**
      * Holds a LAN endpoint hint that arrived on a link before that address's
@@ -1995,10 +2007,33 @@ class MeshService : Service() {
         identity: Identity,
     ): CoreInboundDisposition {
         val sourceLabel = sourceAddress ?: "relay"
+        // FA5: this function runs concurrently on up to four threads (central-
+        // GATT binder, peripheral-GATT binder, LanTransport's
+        // connectionExecutor, the relay-sync thread) -- see
+        // [InboundEnvelopeAdmission]'s KDoc for the full threading model.
+        // Claim this msg_id before touching the seen-set or dispatching
+        // anything: a rejected claim means another thread is already
+        // mid-flight on this exact msg_id right now (e.g. the same message
+        // arriving over BLE and LAN at once), so treat it exactly like an
+        // ordinary dedupe instead of double-delivering/double-flooding.
+        if (!inboundAdmission.tryBegin(envelope.msgId)) {
+            return CoreInboundDisposition.SEEN
+        }
+        // Every return below must go through this so the admission claim
+        // above is always released. `terminal = true` also runs
+        // GossipState.seenIds.record for this msg_id -- still under
+        // [InboundEnvelopeAdmission]'s lock, so no other thread can re-claim
+        // this msg_id between the record landing and the claim releasing.
+        fun finishAdmission(disposition: CoreInboundDisposition, terminal: Boolean): CoreInboundDisposition {
+            inboundAdmission.finish(envelope.msgId, terminal) { GossipState.seenIds.record(envelope.msgId) }
+            return disposition
+        }
+
         // DTN D4: a non-mutating check, not checkAndRecord -- see the KDoc
-        // above. `record` is only called once handling below actually
-        // reaches a terminal state, so a failure partway through leaves this
-        // msg_id re-presentable on the next copy instead of poisoned forever.
+        // above. `record` (via finishAdmission's terminal=true) is only
+        // called once handling below actually reaches a terminal state, so a
+        // failure partway through leaves this msg_id re-presentable on the
+        // next copy instead of poisoned forever.
         when (
             coreInboundGate(
                 !GossipState.seenIds.contains(envelope.msgId),
@@ -2007,17 +2042,19 @@ class MeshService : Service() {
                 System.currentTimeMillis(),
             )
         ) {
-            CoreInboundGate.SEEN -> return CoreInboundDisposition.SEEN
+            CoreInboundGate.SEEN -> {
+                // Already recorded by a prior, non-concurrent copy -- no
+                // record() needed, just release this claim.
+                return finishAdmission(CoreInboundDisposition.SEEN, terminal = false)
+            }
             CoreInboundGate.EXPIRED -> {
                 Log.i(TAG, "Dropping expired envelope from $sourceLabel (expiry=${envelope.expiry})")
                 // A deliberate drop is still a terminal handled state.
-                GossipState.seenIds.record(envelope.msgId)
-                return CoreInboundDisposition.EXPIRED
+                return finishAdmission(CoreInboundDisposition.EXPIRED, terminal = true)
             }
             CoreInboundGate.REJECTED -> {
                 Log.w(TAG, "Dropping envelope with invalid hop or expiry fields from $sourceLabel")
-                GossipState.seenIds.record(envelope.msgId)
-                return CoreInboundDisposition.REJECTED
+                return finishAdmission(CoreInboundDisposition.REJECTED, terminal = true)
             }
             CoreInboundGate.DISPATCH -> Unit
         }
@@ -2050,7 +2087,7 @@ class MeshService : Service() {
                     // absent members is skipped; the next re-presentation
                     // re-runs the whole branch.
                     Log.w(TAG, "Deferring group envelope from $sourceLabel: durable delivery failed (${e.message})")
-                    return CoreInboundDisposition.FAILED
+                    return finishAdmission(CoreInboundDisposition.FAILED, terminal = false)
                 }
                 // specs/group-relay-durability.md §4.3 no-reinjection rule:
                 // a relay-fetched group message addressed to OUR OWN hint is
@@ -2074,8 +2111,7 @@ class MeshService : Service() {
                 // failure, so reaching this line means we already have it --
                 // record regardless of whether the best-effort mule copy for
                 // absent members above was stored.
-                GossipState.seenIds.record(envelope.msgId)
-                return CoreInboundDisposition.CONSUMED
+                return finishAdmission(CoreInboundDisposition.CONSUMED, terminal = true)
             }
             // Not for us (or unopenable) -> foreign traffic. Two jobs, both
             // best-effort (DESIGN.md §5.3): flood it to whoever's connected
@@ -2095,10 +2131,7 @@ class MeshService : Service() {
             // re-gates as Dispatch and gets another chance to carry it,
             // instead of being silently dropped as Seen for the rest of the
             // process lifetime.
-            if (carried) {
-                GossipState.seenIds.record(envelope.msgId)
-            }
-            return CoreInboundDisposition.CARRIED
+            return finishAdmission(CoreInboundDisposition.CARRIED, terminal = carried)
         }
         val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
         try {
@@ -2112,12 +2145,11 @@ class MeshService : Service() {
             // msg_id stays unrecorded so the next copy re-dispatches, and
             // FAILED is never acked so the relay copy survives for that retry.
             Log.w(TAG, "Deferring envelope from $sourceLabel: durable delivery failed (${e.message})")
-            return CoreInboundDisposition.FAILED
+            return finishAdmission(CoreInboundDisposition.FAILED, terminal = false)
         }
         // DTN D4: reaching here means the message was durably stored -- safe,
         // and required, to record.
-        GossipState.seenIds.record(envelope.msgId)
-        return CoreInboundDisposition.CONSUMED
+        return finishAdmission(CoreInboundDisposition.CONSUMED, terminal = true)
     }
 
     private fun messageArrival(
@@ -2362,20 +2394,28 @@ class MeshService : Service() {
      * the mesh's other seen-ID sets stop longer loops once the recipients
      * record this `msg_id` themselves.
      *
-     * DTN D4 loop-hazard note: since [processInboundEnvelope] moved to
+     * DTN D4 / FA5 loop-hazard note: since [processInboundEnvelope] moved to
      * check-then-record, [GossipState.seenIds] is *not yet* updated for this
-     * `msg_id` at the moment this call happens (it's recorded after this
-     * function returns, once the whole terminal branch succeeds -- see
-     * [processInboundEnvelope]'s KDoc). That's still safe against
-     * self-re-ingestion: the arriving link is excluded from the fanout above
+     * `msg_id` at the moment this call happens (it's recorded, via
+     * [InboundEnvelopeAdmission.finish], after this function returns, once
+     * the whole terminal branch succeeds -- see [processInboundEnvelope]'s
+     * KDoc). This is still safe against self-re-ingestion, but *not* for the
+     * reason an earlier version of this note claimed:
+     * [processInboundEnvelope] does **not** run synchronously per received
+     * frame -- it is called concurrently from up to four receive-path
+     * threads (central-GATT binder, peripheral-GATT binder, LanTransport's
+     * `connectionExecutor`, and the relay-sync thread), and two copies of one
+     * `msg_id` arriving on different transports at once is routine for a
+     * nearby contact. What actually rules out same-node re-entrancy for
+     * *this* `msg_id` before the terminal record lands is
+     * [InboundEnvelopeAdmission]'s atomic in-flight claim: a concurrent
+     * second copy of this exact `msg_id`, on any thread, is rejected at the
+     * top of [processInboundEnvelope] before it ever reaches this function.
+     * Combined with the arriving link being excluded from the fanout above
      * (so this node can't hand the relayed frame straight back to itself),
-     * and [processInboundEnvelope] runs synchronously per received frame, so
-     * there is no way for this same `msg_id` to re-enter [processInboundEnvelope]
-     * on *this* node before the terminal `record` call a few lines below this
-     * one completes. A frame this node relays could only loop back from a
-     * third node's rebroadcast, which takes at least one more hop and one
-     * more link round-trip -- by then this node's record has long since
-     * happened.
+     * a frame this node relays could only loop back from a third node's
+     * rebroadcast, which takes at least one more hop and one more link
+     * round-trip -- by then this node's record has long since happened.
      */
     private fun relayForeignEnvelope(address: String?, envelope: Frame.Envelope) {
         val remainingHops = envelope.hopTtl.toInt()

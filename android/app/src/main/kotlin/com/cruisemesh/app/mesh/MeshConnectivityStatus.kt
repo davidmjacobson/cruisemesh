@@ -3,6 +3,7 @@ package com.cruisemesh.app.mesh
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 
 /** Health of our own relay path, as observed by the last sync attempt. */
 sealed class RelayHealth {
@@ -45,19 +46,25 @@ object MeshConnectivityStatus {
         _relay.value = health
     }
 
-    /** Records [seenAtMs] for [userIdHex], keeping the max if we already had a fresher one. */
+    /**
+     * Records [seenAtMs] for [userIdHex], keeping the max if we already had a
+     * fresher one. FA5: [MeshService] calls this from multiple concurrent
+     * receive-path threads (see [InboundEnvelopeAdmission]'s KDoc), so this
+     * must be a single atomic read-modify-write rather than a separate
+     * `.value` read followed by a `.value` write -- [MutableStateFlow.update]
+     * retries its lambda against the current value on a concurrent writer
+     * race instead of silently dropping one side's update.
+     */
     fun mergeLastSeen(userIdHex: String, seenAtMs: Long) {
-        val current = _contactLastSeen.value
-        if (seenAtMs > (current[userIdHex] ?: 0L)) {
-            _contactLastSeen.value = current + (userIdHex to seenAtMs)
+        _contactLastSeen.update { current ->
+            if (seenAtMs > (current[userIdHex] ?: 0L)) current + (userIdHex to seenAtMs) else current
         }
     }
 
-    /** Records relay-presence freshness for [userIdHex], keeping the freshest timestamp. */
+    /** Records relay-presence freshness for [userIdHex], keeping the freshest timestamp -- same atomicity note as [mergeLastSeen]. */
     fun mergePresenceLastSeen(userIdHex: String, seenAtMs: Long) {
-        val current = _presenceLastSeen.value
-        if (seenAtMs > (current[userIdHex] ?: 0L)) {
-            _presenceLastSeen.value = current + (userIdHex to seenAtMs)
+        _presenceLastSeen.update { current ->
+            if (seenAtMs > (current[userIdHex] ?: 0L)) current + (userIdHex to seenAtMs) else current
         }
     }
 

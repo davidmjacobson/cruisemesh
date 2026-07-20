@@ -24,9 +24,19 @@ import uniffi.cruisemesh_core.SeenIds
  *    re-relayed. [SeenIds.checkAndRecord] remains available for callers like
  *    this that have no "did handling fail" question to ask.
  *
- * The Rust [SeenIds] object is internally synchronized, so this needs no lock
- * of its own. It intentionally outlives any single [MeshService] start/stop
- * cycle: dedupe memory should survive a mesh restart within one process.
+ * The Rust [SeenIds] object is internally synchronized, so each individual
+ * [SeenIds.contains]/[SeenIds.record] call needs no lock of its own -- but
+ * that does NOT make the check-then-record *sequence* atomic, and
+ * `processInboundEnvelope` is called concurrently from up to four
+ * receive-path threads (central-GATT binder, peripheral-GATT binder,
+ * LanTransport's `connectionExecutor`, the relay-sync thread). Two threads
+ * can both observe "not seen yet" before either records it. [MeshService]
+ * closes that window with a separate atomic in-flight claim
+ * ([InboundEnvelopeAdmission], FA5) taken before the `contains` check and
+ * released only once handling reaches a terminal state -- see
+ * [InboundEnvelopeAdmission]'s KDoc for the full model. [seenIds] itself
+ * intentionally outlives any single [MeshService] start/stop cycle: dedupe
+ * memory should survive a mesh restart within one process.
  */
 object GossipState {
     val seenIds: SeenIds by lazy { SeenIds() }
