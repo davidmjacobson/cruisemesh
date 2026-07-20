@@ -37,3 +37,6 @@ android/app/src/main/jniLibs/
 
 # Editor swap files
 *.swp
+
+# Codex remote-session attachments — not project documentation
+/.codex-remote-attachments/
