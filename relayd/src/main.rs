@@ -10,8 +10,17 @@ use cruisemesh_relayd::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // FR2: `from_default_env()` silently falls back to ERROR-only when
+    // RUST_LOG is unset -- combined with neither the Dockerfile nor
+    // docker-compose.yml setting it, the deployed container printed
+    // nothing, ever, including this file's own startup line. Default to
+    // "info" so a field incident is debuggable out of the box; an operator
+    // can still override via RUST_LOG.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
         .init();
 
     let bind = env::var("CRUISEMESH_RELAY_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());

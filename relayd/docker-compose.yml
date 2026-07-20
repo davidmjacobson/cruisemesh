@@ -21,6 +21,10 @@ services:
       # somewhere else than the file you were watching.)
       CRUISEMESH_RELAY_DB: /data/cruisemesh-relayd.sqlite
       CRUISEMESH_RELAY_BIND: 0.0.0.0:8080
+      # FR2: default to info-level logs so a field incident is debuggable
+      # without redeploying with an env var change first. Override with a
+      # more/less verbose value as needed (e.g. RUST_LOG=debug,tower_http=off).
+      RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - relay-data:/data
     restart: unless-stopped
