@@ -226,7 +226,7 @@ class BleCentral(
             // a time and silently rejects (returns false) anything issued sooner.
         }
 
-        @Deprecated("Deprecated in Android API 33+; minSdk 26 still needs this overload")
+        @Deprecated("Deprecated in Android API 33+; minSdk 31 still needs this overload")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
@@ -263,7 +263,7 @@ class BleCentral(
             }
         }
 
-        @Deprecated("Deprecated in Android API 33+; minSdk 26 still needs this overload")
+        @Deprecated("Deprecated in Android API 33+; minSdk 31 still needs this overload")
         override fun onCharacteristicWrite(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,

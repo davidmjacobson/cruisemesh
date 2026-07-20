@@ -1013,10 +1013,8 @@ internal class LanTransport(
     private fun isEligibleWifiNetwork(network: Network): Boolean {
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
         if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return false
-        if (
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_WIFI_P2P)
-        ) {
+        // minSdk is 31 (S), so NET_CAPABILITY_WIFI_P2P (added in API 31) is always checkable.
+        if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_WIFI_P2P)) {
             return false
         }
         val interfaceName = connectivityManager.getLinkProperties(network)?.interfaceName.orEmpty()

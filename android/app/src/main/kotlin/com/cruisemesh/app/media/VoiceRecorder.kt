@@ -2,7 +2,6 @@ package com.cruisemesh.app.media
 
 import android.content.Context
 import android.media.MediaRecorder
-import android.os.Build
 import android.util.Log
 import java.io.File
 
@@ -24,12 +23,8 @@ class VoiceRecorder(private val context: Context) {
         val dir = File(context.cacheDir, "voice").apply { mkdirs() }
         val file = File(dir, "memo-${System.currentTimeMillis()}.m4a")
         return try {
-            val mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                MediaRecorder(context)
-            } else {
-                @Suppress("DEPRECATION")
-                MediaRecorder()
-            }
+            // minSdk is 31 (S), so the context-taking constructor always exists.
+            val mediaRecorder = MediaRecorder(context)
             mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC)
             mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)

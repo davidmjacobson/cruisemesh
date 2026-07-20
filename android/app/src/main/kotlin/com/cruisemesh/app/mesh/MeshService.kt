@@ -3487,31 +3487,27 @@ class MeshService : Service() {
     }
 
     private fun hasRequiredPermissions(): Boolean {
-        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            listOf(
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_ADVERTISE,
-                Manifest.permission.BLUETOOTH_CONNECT,
-            )
-        } else {
-            emptyList()
-        }
+        // minSdk is 31 (S), so BLUETOOTH_SCAN/ADVERTISE/CONNECT are always required.
+        val permissions = listOf(
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_ADVERTISE,
+            Manifest.permission.BLUETOOTH_CONNECT,
+        )
         return permissions.all {
             ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
         }
     }
 
     private fun buildNotification(): Notification {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                "CruiseMesh mesh sync",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                setShowBadge(false)
-            }
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        // minSdk is 31, so notification channels always exist (added in API 26).
+        val channel = NotificationChannel(
+            NOTIFICATION_CHANNEL_ID,
+            "CruiseMesh mesh sync",
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+            setShowBadge(false)
         }
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         val contentIntent = PendingIntent.getActivity(
             this,
             OPEN_APP_REQUEST_CODE,
@@ -3556,12 +3552,12 @@ class MeshService : Service() {
 
         /** Permissions MeshService needs before it will start its BLE roles. */
         fun requiredPermissions(): Array<String> {
-            val base = mutableListOf<String>()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                base += Manifest.permission.BLUETOOTH_SCAN
-                base += Manifest.permission.BLUETOOTH_ADVERTISE
-                base += Manifest.permission.BLUETOOTH_CONNECT
-            }
+            // minSdk is 31 (S), so the Bluetooth trio is always required.
+            val base = mutableListOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_ADVERTISE,
+                Manifest.permission.BLUETOOTH_CONNECT,
+            )
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 base += Manifest.permission.POST_NOTIFICATIONS
             }
