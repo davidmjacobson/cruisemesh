@@ -2293,6 +2293,35 @@ final class MeshController: ObservableObject {
                     )
                 })
             }
+            // FI2: also poll for mail addressed to contacts, not just this
+            // device -- relay proxy-polling (Android `relayProxyHints` twin).
+            // An internet-connected phone sitting near a BLE-only contact can
+            // fetch that contact's mailbox mail and carry it the rest of the
+            // way over BLE/LAN; without this, a 1:1 envelope addressed to a
+            // contact who never gets internet sits on the relay forever.
+            // `processInboundEnvelope` below already handles the resulting
+            // fetch correctly with NO change here: this device can't decrypt
+            // mail addressed to someone else, so `openMessage` fails and the
+            // envelope falls into the existing carry-foreign path, coming
+            // back as `.carried` rather than `.consumed`. The DTN ack
+            // invariant (TODO.md §3.6 / `coreRelayAckIdsWithConsumed`) is
+            // enforced core-side purely from that disposition -- a `.carried`
+            // envelope is never in the ack set, so this device carries the
+            // relay copy without ever acking it away. Only a `.consumed`
+            // (this device durably delivered it to itself) or `.expired`
+            // disposition acks; see `coreRelayAckIdsWithConsumed`'s doc.
+            hints.append(contentsOf: relayProxyHints(
+                contacts: contacts,
+                ownUserId: identity.userId,
+                nowMs: now
+            ))
+            // Dedupe by content: a contact hint can coincide with a group
+            // hint or another contact's hint on the same day (unlikely but
+            // not impossible), and there's no reason to fetch the same page
+            // twice. `Data` is `Hashable`, so this is just a `Set` round trip
+            // (Android's twin, `dedupeHints`, does the equivalent by hex
+            // string since `ByteArray` isn't `Hashable` in Kotlin).
+            hints = Array(Set(hints))
             var afterId: Int64 = 0
             let fetchBatchLimit = Int(relayFetchBatchLimit())
             while true {
@@ -2375,10 +2404,14 @@ final class MeshController: ObservableObject {
 /// the same reason `relaySyncBlocking` itself is `nonisolated` and
 /// duplicates this computation inline rather than calling the
 /// `@MainActor`-isolated `recentHintsFor`/`deliveryHintsForPeer` helpers.
-/// Unlike Android's `relayHintsForConfig`/`relayProxyHints`, there is no
-/// "proxy" hint set here (mail addressed to a BLE-only contact, fetched on
-/// their behalf) -- the iOS poll path doesn't compute those either, so there
-/// is nothing to mirror for that half yet.
+/// FI2: unlike this function, `relaySyncBlocking`'s own fetch ALSO includes
+/// `relayProxyHints` below (mail addressed to a contact, fetched on their
+/// behalf) -- deliberately not mirrored here. This hint set only decides
+/// which relay topics wake the push socket/reconnect; the proxy hint set
+/// scales with contact-list size (one subscription per contact per
+/// recent day), and the 60s poll already covers proxy-fetched mail without
+/// needing a push nudge for it. Revisit if proxy-fetch latency ever needs to
+/// beat the poll interval.
 private func relayPushHints(ownUserId: Data) -> [Data] {
     let store = AppStore.get()
     let now = Int64(Date().timeIntervalSince1970 * 1000)
@@ -2389,6 +2422,36 @@ private func relayPushHints(ownUserId: Data) -> [Data] {
     for group in groups where group.memberUserIds.contains(ownUserId) {
         hints.append(contentsOf: (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
             computeRecipientHint(recipientUserId: group.id, timestampMs: now - daysAgo * MeshDefaults.msPerDay)
+        })
+    }
+    return hints
+}
+
+/// Recent-day recipient hints for mail addressed to `contacts` -- NOT this
+/// device -- for relay proxy-polling (FI2, Android `relayProxyHints` twin in
+/// `MeshService.kt`). An internet-connected phone can fetch mail meant for a
+/// BLE-only contact out of the shared family-token relay partition and carry
+/// it the rest of the way over BLE/LAN via the existing carry-foreign path in
+/// `MeshController.processInboundEnvelope` -- this device can't decrypt mail
+/// addressed to someone else, so it always falls into that path and is never
+/// mistaken for its own mail.
+///
+/// A free, non-`private` pure function (no store/network access, no actor
+/// isolation) so it's both callable from `relaySyncBlocking` (which is
+/// itself `nonisolated`, see `relayPushHints`'s doc above for why) and
+/// directly unit-testable via `@testable import`.
+///
+/// Bounded by family size: this returns every contact's hints, so the fetch
+/// cost grows linearly with the contact list -- fine for this app's small
+/// family circles (mirrors the same caveat on the Android twin).
+func relayProxyHints(contacts: [Contact], ownUserId: Data, nowMs: Int64) -> [Data] {
+    var hints: [Data] = []
+    for contact in contacts where contact.userId != ownUserId {
+        hints.append(contentsOf: (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
+            computeRecipientHint(
+                recipientUserId: contact.userId,
+                timestampMs: nowMs - daysAgo * MeshDefaults.msPerDay
+            )
         })
     }
     return hints
