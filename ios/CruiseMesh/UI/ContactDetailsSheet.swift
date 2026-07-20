@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Contact detail sheet (Android `ContactDetailsSheet` parity): avatar, ID,
+/// Contact detail sheet (Android `ContactDetailsSheet` parity): avatar, name,
 /// safety-word fingerprint verification, and delete.
 struct ContactDetailsSheet: View {
     let contact: Contact
@@ -50,17 +50,12 @@ struct ContactDetailsSheet: View {
                             .padding(.top, 4)
                     }
 
-                    Text(displayId)
-                        .font(.body.monospaced())
-                        .multilineTextAlignment(.center)
-                        .padding(.top, 8)
-
                     Button(hasNickname ? "Edit nickname" : "Add a nickname") {
                         nicknameDraft = contact.nickname ?? ""
                         editingNickname = true
                     }
                     .buttonStyle(.bordered)
-                    .padding(.top, 12)
+                    .padding(.top, 16)
 
                     if let connectivityText {
                         VStack(alignment: .leading, spacing: 8) {

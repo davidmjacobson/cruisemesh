@@ -37,7 +37,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
@@ -373,16 +372,6 @@ private fun ProfileSlide(
             onChoosePhoto = onChoosePhoto,
             onRemovePhoto = onRemovePhoto,
             helperText = "Your photo is shared with friends after you connect.",
-        )
-
-        Text(
-            text = stringResource(R.string.ui_device_id, displayId),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 18.dp),
         )
     }
 }

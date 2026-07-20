@@ -34,7 +34,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
@@ -129,12 +128,6 @@ fun ContactDetailsSheetContent(
                 textAlign = TextAlign.Center,
             )
         }
-        Text(
-            text = displayId,
-            style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
-            modifier = Modifier.padding(top = 8.dp),
-            textAlign = TextAlign.Center,
-        )
         OutlinedButton(
             onClick = { editingNickname = true },
             modifier = Modifier.padding(top = 12.dp),

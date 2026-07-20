@@ -120,7 +120,6 @@
     <string name="ui_step_of">Step %1$d of %2$d</string>
     <string name="ui_nearby_access_on_detail">Nearby access is on. Background exemption is optional but makes delivery more reliable when the app is not open.</string>
     <string name="ui_nearby_access_off_detail">You can finish setup without granting access, but the home screen will keep warning you — and no messages will move over the mesh until you do.</string>
-    <string name="ui_device_id">Device ID: %1$s</string>
     <string name="ui_minimum_passphrase_length">At least %1$d characters.</string>
     <string name="ui_remove_photo">Remove photo</string>
     <string name="ui_removes_this_group_and_its_message_history_from">Removes this group and its message history from this device. Other members keep their copy.</string>

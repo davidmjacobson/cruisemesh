@@ -43,7 +43,6 @@ struct ProfileView: View {
                         }
                     }
                     TextField("Display name", text: $displayName)
-                    LabeledContent("User ID", value: formatUserId(userId: identity.userId))
                     DisclosureGroup("Verify my identity") {
                         Text(fingerprintWords(userId: identity.userId).joined(separator: " "))
                             .font(.body.monospaced())
