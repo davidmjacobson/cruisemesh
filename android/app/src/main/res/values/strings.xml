@@ -130,6 +130,10 @@
     <string name="ui_restore">Restore</string>
     <string name="ui_restore_from_backup">Restore from backup</string>
     <string name="ui_safety_words">Safety words</string>
+    <string name="ui_verify_contact">Verify contact</string>
+    <string name="ui_verify_contact_explanation">Match these words with your friend\'s screen to confirm it\'s really them.</string>
+    <string name="ui_verify_my_identity">Verify my identity</string>
+    <string name="ui_verify_my_identity_explanation">Have your friend match these words against your name in their contacts to confirm it\'s really you.</string>
     <string name="ui_save">Save</string>
     <string name="ui_save_your_identity_and_messages_to_an_encrypted">Save your identity and messages to an encrypted file.</string>
     <string name="ui_say_hi">Say hi</string>

@@ -17,6 +17,11 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -83,6 +88,7 @@ fun ContactDetailsSheetContent(
     val hasNickname = !contact.nickname.isNullOrBlank()
     val fingerprint = fingerprintWords(contact.userId)
     var editingNickname by remember(contact.userId) { mutableStateOf(false) }
+    var showVerification by remember(contact.userId) { mutableStateOf(false) }
 
     if (editingNickname) {
         NicknameEditDialog(
@@ -167,33 +173,52 @@ fun ContactDetailsSheetContent(
                 .padding(top = 24.dp),
             shape = RoundedCornerShape(24.dp),
         ) {
-            Column(modifier = Modifier.padding(20.dp)) {
-                Text(text = stringResource(R.string.ui_safety_words),
-                    style = MaterialTheme.typography.titleMedium,
-                )
-                Spacer(modifier = Modifier.height(12.dp))
+            Column(modifier = Modifier.fillMaxWidth()) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { showVerification = !showVerification }
+                        .padding(20.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    fingerprint.forEach { word ->
-                        OutlinedCard(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = word,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 12.dp),
-                                textAlign = TextAlign.Center,
-                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
-                            )
+                    Text(
+                        text = stringResource(R.string.ui_verify_contact),
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Icon(
+                        imageVector = if (showVerification) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                        contentDescription = null,
+                    )
+                }
+                if (showVerification) {
+                    Column(
+                        modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 20.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            fingerprint.forEach { word ->
+                                OutlinedCard(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = word,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 12.dp),
+                                        textAlign = TextAlign.Center,
+                                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                                    )
+                                }
+                            }
                         }
+                        Text(text = stringResource(R.string.ui_verify_contact_explanation),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 12.dp),
+                        )
                     }
                 }
-                Text(text = stringResource(R.string.ui_read_these_aloud_to_verify),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 12.dp),
-                )
             }
         }
 

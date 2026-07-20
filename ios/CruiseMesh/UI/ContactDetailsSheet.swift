@@ -14,6 +14,7 @@ struct ContactDetailsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var editingNickname = false
     @State private var nicknameDraft = ""
+    @State private var showVerification = false
 
     private var displayId: String { formatUserId(userId: contact.userId) }
     private var displayName: String {
@@ -84,27 +85,30 @@ struct ContactDetailsSheet: View {
                     ))
                     .padding(.top, 24)
 
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Safety words")
-                            .font(.title3.weight(.semibold))
-
-                        HStack(spacing: 8) {
-                            ForEach(fingerprint, id: \.self) { word in
-                                Text(word)
-                                    .font(.subheadline.weight(.medium))
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 12)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                            .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 1)
-                                    )
+                    DisclosureGroup(isExpanded: $showVerification) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack(spacing: 8) {
+                                ForEach(fingerprint, id: \.self) { word in
+                                    Text(word)
+                                        .font(.subheadline.weight(.medium))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 12)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                                .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 1)
+                                        )
+                                }
                             }
+                            Text("Match these words with your friend's screen to confirm it's really them.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
-
-                        Text("Read these aloud to verify.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        .padding(.top, 12)
+                    } label: {
+                        Label("Verify contact", systemImage: "checkmark.shield")
+                            .font(.headline)
                     }
+                    .tint(.primary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(20)
                     .background(

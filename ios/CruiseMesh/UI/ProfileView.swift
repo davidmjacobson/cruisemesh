@@ -44,13 +44,14 @@ struct ProfileView: View {
                     }
                     TextField("Display name", text: $displayName)
                     LabeledContent("User ID", value: formatUserId(userId: identity.userId))
-                    LabeledContent(
-                        "Safety words",
-                        value: fingerprintWords(userId: identity.userId).joined(separator: " ")
-                    )
-                    Text("Read these words aloud with your friend to verify keys.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    DisclosureGroup("Verify my identity") {
+                        Text(fingerprintWords(userId: identity.userId).joined(separator: " "))
+                            .font(.body.monospaced())
+                            .textSelection(.enabled)
+                        Text("Have your friend match these words against your name in their contacts to confirm it's really you.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 Section("My friend card") {
