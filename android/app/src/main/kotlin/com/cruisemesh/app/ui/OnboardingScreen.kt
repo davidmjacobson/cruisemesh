@@ -250,6 +250,10 @@ private fun DeliverySlide() {
             title = "Private by default",
             detail = "Your messages are encrypted end to end, so nearby relays help carry them without being able to read them.",
         )
+        HighlightCard(
+            title = "Keep Wi-Fi on, even with no internet",
+            detail = "On a ship or anywhere Wi-Fi has no internet, leave it connected — CruiseMesh uses the local network to reach phones near you faster.",
+        )
     }
 }
 
