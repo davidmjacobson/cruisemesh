@@ -18,7 +18,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
-import java.util.ArrayDeque
 
 private const val TAG = "BleCentral"
 private const val REQUESTED_MTU = 517
@@ -75,6 +74,25 @@ private const val CONNECT_TIMEOUT_MS = 12_000L
  * into the void. Frames already queued for a torn-down address are not
  * lost: they live in the persistent store and redeliver via digest sync the
  * next time that peer (or its readvertised address) reconnects.
+ *
+ * Thread-safety hardening (FA2, 2026-07-20): every map above is per-address
+ * shared state mutated from GATT binder threads (each callback below), the
+ * main thread ([scanCallback], the connect watchdog), and any caller thread
+ * via [sendFrame] (MeshRouter dispatches into this class from peripheral
+ * binder threads, LAN reader threads, and the relay-sync thread). This is
+ * the exact race [BlePeripheral] was already hardened against (see its
+ * `lock` doc comment) -- BleCentral never got the same fix, so e.g. the old
+ * check-then-act on the write-in-flight set could let two threads both
+ * observe "not in flight" and both issue a GATT write for the same address
+ * at once. [lock] now guards every read-modify-write of the per-address maps
+ * (mirrors [BlePeripheral]'s single-lock design); the write-queue/in-flight
+ * admission decision itself is extracted into [GattWriteQueue], a plain
+ * Android-import-free class unit-tested directly (TODO.md §3.4 pattern, same
+ * as [NotifyFailureTracker]/[ReconnectBackoffTracker]). GATT/binder calls
+ * (`connectGatt`, `writeCharacteristic`, `gatt.close()`, ...) are kept
+ * outside [lock] where possible -- decisions are computed under the lock,
+ * the framework call happens after -- so this class never holds a lock
+ * across a binder call.
  */
 @SuppressLint("MissingPermission")
 class BleCentral(
@@ -91,9 +109,21 @@ class BleCentral(
     private val backoff = ReconnectBackoffTracker()
     private val negotiatedMtu = mutableMapOf<String, Int>()
     private val reassemblers = mutableMapOf<String, FrameReassembler>()
-    private val writeQueues = mutableMapOf<String, ArrayDeque<ByteArray>>()
-    private val writeInFlight = mutableSetOf<String>()
+    private val writeQueue = GattWriteQueue()
     private val scanDiagnostics = mutableMapOf<String, ScanDiagnostics>()
+
+    // Guards every read-modify-write of the per-address state above
+    // (connections, negotiatedMtu, reassemblers, scanDiagnostics,
+    // fullyConnected, connectWatchdogs) -- see the FA2 hardening note in this
+    // class's doc comment. [GattWriteQueue] is its own leaf-synchronized
+    // class (mirrors [NotifyFailureTracker]), so it is safe to call with or
+    // without this lock held; call sites below take it anyway for a single
+    // consistent locking story. Lock ordering: only leaf locks
+    // ([GattWriteQueue]'s, [ReconnectBackoffTracker]'s underlying core
+    // mutex) are ever taken while holding this one, so callouts made after
+    // releasing it (onPeerConnected/onPeerDisconnected/onFrameReceived, all
+    // called outside the lock below) cannot deadlock against it.
+    private val lock = Any()
 
     // GATT callbacks arrive on a binder thread, but Handler.postDelayed's
     // callback runs on whichever Looper the Handler was built with -- use
@@ -103,7 +133,7 @@ class BleCentral(
 
     // Per-address pending "connect is taking too long" timer, keyed the same
     // way as [connections] so a watchdog can always be found and cancelled
-    // by address alone.
+    // by address alone. Guarded by [lock].
     private val connectWatchdogs = mutableMapOf<String, Runnable>()
 
     // Addresses that have completed the full connect -> MTU -> discover ->
@@ -111,7 +141,7 @@ class BleCentral(
     // watchdog only acts on an address that is tracked in [connections] but
     // missing from this set -- once setup completes, the connection is
     // healthy and the watchdog is cancelled (see onDescriptorWrite) rather
-    // than left to fire uselessly.
+    // than left to fire uselessly. Guarded by [lock].
     private val fullyConnected = mutableSetOf<String>()
 
     /**
@@ -145,20 +175,22 @@ class BleCentral(
                 deviceName = record?.deviceName,
                 hasServiceData = ownInstanceData != null,
             )
-            scanDiagnostics[device.address] = diagnostics
+            synchronized(lock) { scanDiagnostics[device.address] = diagnostics }
 
             if (ownInstanceData != null && ownInstanceData.contentEquals(MeshConstants.LOCAL_INSTANCE_ID)) {
                 Log.i(TAG, "Ignoring own advertisement from ${device.address} ($diagnostics)")
                 return
             }
 
-            if (connections.containsKey(device.address)) return
+            if (synchronized(lock) { connections.containsKey(device.address) }) return
             val now = System.currentTimeMillis()
             if (!backoff.canAttempt(device.address, now)) return
             Log.i(TAG, "Discovered peer ${device.address}, connecting ($diagnostics)")
             val gatt = device.connectGatt(context, false, gattClientCallback)
-            connections[device.address] = gatt
-            scheduleConnectWatchdog(device.address, gatt)
+            synchronized(lock) {
+                connections[device.address] = gatt
+                scheduleConnectWatchdogLocked(device.address, gatt)
+            }
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -187,7 +219,7 @@ class BleCentral(
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     val address = gatt.device.address
-                    val diagnostics = scanDiagnostics[address]
+                    val diagnostics = synchronized(lock) { scanDiagnostics[address] }
                     val failures = backoff.recordFailure(address, System.currentTimeMillis())
                     Log.i(
                         TAG,
@@ -209,7 +241,7 @@ class BleCentral(
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             val effective = if (status == BluetoothGatt.GATT_SUCCESS) mtu else FrameFraming.DEFAULT_ATT_MTU
             Log.i(TAG, "MTU negotiated for ${gatt.device.address}: $effective (status=$status)")
-            negotiatedMtu[gatt.device.address] = effective
+            synchronized(lock) { negotiatedMtu[gatt.device.address] = effective }
             gatt.discoverServices()
         }
 
@@ -233,7 +265,13 @@ class BleCentral(
         ) {
             if (characteristic.uuid != MeshConstants.OUTBOUND_CHARACTERISTIC_UUID) return
             val address = gatt.device.address
-            val reassembler = reassemblers.getOrPut(address) { FrameReassembler() }
+            // Only the map access needs the lock; reassembly and frame
+            // handling stay outside it so inbound processing never
+            // serializes against the send paths (mirrors BlePeripheral's
+            // onCharacteristicWriteRequest).
+            val reassembler = synchronized(lock) {
+                reassemblers.getOrPut(address) { FrameReassembler() }
+            }
             reassembler.accept(characteristic.value)?.let { onFrameReceived(address, it) }
         }
 
@@ -251,15 +289,18 @@ class BleCentral(
                 // interval; this only trades a little added latency on the
                 // occasional text frame for the phone's audio staying usable.
                 gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
+                val address = gatt.device.address
                 // Fully connected: clear this address's failure history so a
                 // peer that connects reliably never accumulates backoff.
-                backoff.recordSuccess(gatt.device.address)
+                backoff.recordSuccess(address)
                 // Setup is done -- the connect watchdog (1a) no longer has
                 // anything to guard against, and must not fire and tear
                 // down a perfectly healthy link.
-                fullyConnected += gatt.device.address
-                cancelConnectWatchdog(gatt.device.address)
-                onPeerConnected(gatt.device.address)
+                synchronized(lock) {
+                    fullyConnected += address
+                    cancelConnectWatchdogLocked(address)
+                }
+                onPeerConnected(address)
             }
         }
 
@@ -270,7 +311,7 @@ class BleCentral(
             status: Int,
         ) {
             Log.i(TAG, "Characteristic write for ${gatt.device.address} status=$status")
-            writeInFlight.remove(gatt.device.address)
+            writeQueue.completeWrite(gatt.device.address)
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 // A failed write on a link this class still believes is
                 // live is exactly the observed blackhole: the far side's
@@ -337,16 +378,22 @@ class BleCentral(
             Log.w(TAG, "stopScan during stop() failed (adapter likely off): ${e.message}")
         }
         scanner = null
-        connectWatchdogs.values.forEach { handler.removeCallbacks(it) }
-        connectWatchdogs.clear()
-        fullyConnected.clear()
-        connections.values.forEach { runCatching { it.close() } }
-        connections.clear()
-        negotiatedMtu.clear()
-        reassemblers.clear()
-        writeQueues.clear()
-        writeInFlight.clear()
-        scanDiagnostics.clear()
+        // gatt.close() is a binder call -- snapshot the connections under the
+        // lock, then close them after releasing it, mirroring BlePeripheral's
+        // notifyFrame() pattern of taking the lock only to copy state out.
+        val connectionsSnapshot = synchronized(lock) {
+            connectWatchdogs.values.forEach { handler.removeCallbacks(it) }
+            connectWatchdogs.clear()
+            fullyConnected.clear()
+            val snapshot = connections.values.toList()
+            connections.clear()
+            negotiatedMtu.clear()
+            reassemblers.clear()
+            scanDiagnostics.clear()
+            snapshot
+        }
+        connectionsSnapshot.forEach { runCatching { it.close() } }
+        writeQueue.clearAll()
     }
 
     /**
@@ -354,31 +401,44 @@ class BleCentral(
      * fragmenting per the peer's negotiated MTU if needed (DESIGN.md §5.2).
      */
     fun sendFrame(deviceAddress: String, frame: ByteArray) {
-        val gatt = connections[deviceAddress] ?: run {
+        val gatt = synchronized(lock) { connections[deviceAddress] } ?: run {
             Log.w(TAG, "sendFrame: no connection tracked for $deviceAddress")
             return
         }
-        val payloadSize = (negotiatedMtu[deviceAddress] ?: FrameFraming.DEFAULT_ATT_MTU) -
-            FrameFraming.ATT_HEADER_OVERHEAD
+        val mtu = synchronized(lock) { negotiatedMtu[deviceAddress] } ?: FrameFraming.DEFAULT_ATT_MTU
+        val payloadSize = mtu - FrameFraming.ATT_HEADER_OVERHEAD
         val fragments = FrameFraming.fragmentOrNull(frame, payloadSize) ?: run {
             Log.w(TAG, "sendFrame: dropping ${frame.size}-byte frame for $deviceAddress -- too large to fragment")
             return
         }
-        writeQueues.getOrPut(deviceAddress) { ArrayDeque() }.addAll(fragments)
+        writeQueue.enqueue(deviceAddress, fragments)
         Log.i(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
         sendNextQueuedFragment(gatt)
     }
 
+    /**
+     * Admits and writes this address's next queued fragment, unless one is
+     * already in flight (a GATT connection allows only one outstanding
+     * characteristic write at a time). [GattWriteQueue.admitNext] does the
+     * in-flight check, the FIFO pop, and the slot reservation atomically --
+     * see that class's doc comment for the race this closes. The reservation
+     * happens before the GATT call below, so a concurrent caller for the
+     * same address (another thread racing in via [sendFrame], or the async
+     * onCharacteristicWrite ack) can never observe the slot as free while a
+     * write is actually in flight, without this class having to hold [lock]
+     * across the binder call itself.
+     */
     private fun sendNextQueuedFragment(gatt: BluetoothGatt) {
         val address = gatt.device.address
-        if (address in writeInFlight) return
-        val fragment = writeQueues[address]?.poll() ?: return
+        val fragment = writeQueue.admitNext(address) ?: return
         val service = gatt.getService(MeshConstants.SERVICE_UUID) ?: run {
             Log.w(TAG, "sendNextQueuedFragment: service not found on $address")
+            writeQueue.completeWrite(address)
             return
         }
         val inbound = service.getCharacteristic(MeshConstants.INBOUND_CHARACTERISTIC_UUID) ?: run {
             Log.w(TAG, "sendNextQueuedFragment: inbound characteristic not found on $address")
+            writeQueue.completeWrite(address)
             return
         }
         inbound.value = fragment
@@ -391,15 +451,16 @@ class BleCentral(
             Log.w(TAG, "sendNextQueuedFragment: write threw for $address (${e.message}); dropping fragment")
             false
         }
-        if (written) {
-            writeInFlight += address
-        } else {
+        if (!written) {
             // Same reasoning as the onCharacteristicWrite failure branch: a
             // rejected write on a link we believe is established (the
             // in-flight guard above only lets one write through at a time,
             // so this is not a "too busy" rejection) means the link isn't
             // usable -- dead peer or stale gatt. Leaving it mapped would
-            // black-hole every future send to this address.
+            // black-hole every future send to this address. tearDownLink
+            // clears the write queue's reservation for us; on success the
+            // slot stays reserved until the async onCharacteristicWrite ack
+            // calls writeQueue.completeWrite.
             Log.w(TAG, "sendNextQueuedFragment: writeCharacteristic rejected for $address; tearing down link")
             backoff.recordFailure(address, System.currentTimeMillis())
             tearDownLink(gatt, "writeCharacteristic rejected")
@@ -416,10 +477,18 @@ class BleCentral(
      * dual-role mesh, one hung connect starves every other peer. Freeing
      * the slot at 12 s (instead of waiting out the stack's own timeout)
      * keeps the slot pool available for peers that can actually connect.
+     *
+     * Callers must hold [lock] (schedules [connectWatchdogs]); the watchdog
+     * [Runnable] itself fires later off the main looper and takes [lock]
+     * itself when it does, since by then the scheduling call has long since
+     * returned.
      */
-    private fun scheduleConnectWatchdog(address: String, gatt: BluetoothGatt) {
+    private fun scheduleConnectWatchdogLocked(address: String, gatt: BluetoothGatt) {
         val watchdog = Runnable {
-            if (address in fullyConnected || connections[address] !== gatt) {
+            val hung = synchronized(lock) {
+                !(address in fullyConnected || connections[address] !== gatt)
+            }
+            if (!hung) {
                 // Already completed setup, or superseded by a newer
                 // connection attempt for this address -- nothing to do.
                 return@Runnable
@@ -434,7 +503,8 @@ class BleCentral(
         handler.postDelayed(watchdog, CONNECT_TIMEOUT_MS)
     }
 
-    private fun cancelConnectWatchdog(address: String) {
+    /** Callers must hold [lock]; see [scheduleConnectWatchdogLocked]. */
+    private fun cancelConnectWatchdogLocked(address: String) {
         connectWatchdogs.remove(address)?.let { handler.removeCallbacks(it) }
     }
 
@@ -450,17 +520,24 @@ class BleCentral(
      * disconnect reason (status, failure count, diagnostics) log that
      * themselves before calling in, so [reason] only needs to identify
      * *which* call site triggered the teardown.
+     *
+     * Takes [lock] itself for the map cleanup, then calls out to
+     * [onPeerDisconnected] and `gatt.close()` (a binder call) after
+     * releasing it -- neither needs to run while other threads are blocked
+     * out of the maps, and this keeps a binder call from ever happening
+     * while [lock] is held.
      */
     private fun tearDownLink(gatt: BluetoothGatt, reason: String) {
         val address = gatt.device.address
         Log.i(TAG, "tearDownLink: $address ($reason)")
-        connections.remove(address)
-        negotiatedMtu.remove(address)
-        reassemblers.remove(address)
-        writeQueues.remove(address)
-        writeInFlight.remove(address)
-        fullyConnected.remove(address)
-        cancelConnectWatchdog(address)
+        synchronized(lock) {
+            connections.remove(address)
+            negotiatedMtu.remove(address)
+            reassemblers.remove(address)
+            fullyConnected.remove(address)
+            cancelConnectWatchdogLocked(address)
+        }
+        writeQueue.clear(address)
         onPeerDisconnected(address)
         gatt.close()
     }
