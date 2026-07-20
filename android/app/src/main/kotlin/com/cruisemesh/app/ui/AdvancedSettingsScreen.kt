@@ -223,6 +223,11 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
             )
+            Text(stringResource(R.string.ui_keep_wifi_guidance),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp),
+            )
 
             Spacer(modifier = Modifier.height(28.dp))
             Text(stringResource(R.string.ui_diagnostics), style = MaterialTheme.typography.titleMedium)

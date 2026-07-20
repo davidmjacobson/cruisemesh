@@ -561,6 +561,16 @@
         }
       }
     },
+    "Keep Wi-Fi connected even when it has no internet — CruiseMesh uses it to reach phones near you.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Keep Wi-Fi connected even when it has no internet — CruiseMesh uses it to reach phones near you."
+          }
+        }
+      }
+    },
     "Last peer": {
       "localizations": {
         "en": {

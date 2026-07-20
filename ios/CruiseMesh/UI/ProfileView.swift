@@ -185,6 +185,9 @@ private struct AdvancedSettingsView: View {
             }
 
             Section("Local Wi-Fi (experimental)") {
+                Text("Keep Wi-Fi connected even when it has no internet — CruiseMesh uses it to reach phones near you.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Text(lanDiagnostics.snapshot.state)
                 if let endpoint = lanDiagnostics.snapshot.localEndpoint {
                     LabeledContent("This phone", value: endpoint).font(.footnote.monospaced())

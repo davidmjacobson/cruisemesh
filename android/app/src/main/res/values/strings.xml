@@ -110,6 +110,10 @@
     <string name="ui_checked_addresses">Checked %1$d of %2$d addresses</string>
     <string name="ui_checking_this_network">Checking this network…</string>
     <string name="ui_wifi_appears_to_block_phone_to_phone_traffic">This Wi-Fi appears to block phone-to-phone traffic; nearby delivery will use Bluetooth.</string>
+    <string name="ui_keep_wifi_guidance">Keep Wi-Fi connected even when it has no internet — CruiseMesh uses it to reach phones near you.</string>
+    <string name="ui_keep_wifi_on_title">Keep Wi-Fi on for faster nearby delivery</string>
+    <string name="ui_keep_wifi_on_body">Your Wi-Fi keeps dropping while CruiseMesh is running. Leaving Wi-Fi on — even with no internet — lets messages reach nearby phones over the local network.</string>
+    <string name="ui_got_it">Got it</string>
     <string name="ui_local_wi_fi_probes_were_denied">Local Wi-Fi probes were denied, likely by a VPN or OS policy; nearby delivery will use Bluetooth.</string>
     <string name="ui_through_mutual_friends">Through %1$s</string>
     <string name="ui_voice_memo_duration">Voice memo · %1$s</string>

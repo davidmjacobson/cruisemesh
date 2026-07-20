@@ -270,6 +270,11 @@ class MeshService : Service() {
     private val connectivityManager by lazy {
         getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     }
+    // T15 phase 2/3: keeps an internet-less Wi‑Fi association alive so the LAN
+    // transport keeps reaching nearby phones on ship/captive Wi‑Fi, and reports
+    // when that association drops so we can nudge the user (see refreshWifiHold).
+    private val wifiHold by lazy { WifiAssociationHold(connectivityManager, ::onWifiAssociationLost) }
+    @Volatile private var meshJoinedAtMs: Long = 0L
     private val lanEndpointCache by lazy { LanEndpointCache(this) }
     private val a2dpAudioBackoff = A2dpAudioBackoff()
 
@@ -342,6 +347,8 @@ class MeshService : Service() {
             } else if (relayBindNetwork == network) {
                 relayBindNetwork = null
             }
+            // VPN can come or go under us; keep the Wi‑Fi hold's VPN gating current.
+            refreshWifiHold()
             updateRelayPushSubscription()
         }
 
@@ -350,6 +357,7 @@ class MeshService : Service() {
             if (!hasValidatedInternet()) {
                 MeshConnectivityStatus.setRelayHealth(RelayHealth.NoInternet)
             }
+            refreshWifiHold()
             updateRelayPushSubscription()
         }
     }
@@ -450,6 +458,9 @@ class MeshService : Service() {
         registerBluetoothAudioReceiver()
         registerBluetoothStateReceiver()
         registerRelayNetworkCallback()
+        meshJoinedAtMs = System.currentTimeMillis()
+        WifiTipStore.refresh(this)
+        refreshWifiHold()
         scheduleRelayPolling()
         LanTransportDiagnostics.registerProbeRequester(::requestManualLanProbe)
         scheduleLanHealth()
@@ -478,6 +489,7 @@ class MeshService : Service() {
         unregisterBluetoothAudioReceiver()
         unregisterBluetoothStateReceiver()
         unregisterRelayNetworkCallback()
+        wifiHold.stop()
         cancelRelayPolling()
         relayPushClient.stop()
         cancelLanHealth()
@@ -661,6 +673,35 @@ class MeshService : Service() {
     /** True when a usable validated internet path exists for relay traffic. */
     private fun hasValidatedInternet(): Boolean =
         isDefaultValidated() || (!isDefaultVpn() && relayBindNetwork != null)
+
+    /**
+     * T15 phase 2: start or stop the internet-less Wi‑Fi association hold to
+     * match [WifiHoldPolicy] -- held while the mesh is up and no VPN owns the
+     * default route, released otherwise. Idempotent; safe to call on every
+     * connectivity change.
+     */
+    private fun refreshWifiHold() {
+        if (!running) {
+            wifiHold.stop()
+            return
+        }
+        if (WifiHoldPolicy.shouldHold(isDefaultVpn())) wifiHold.start() else wifiHold.stop()
+    }
+
+    /**
+     * T15 phase 3: the held Wi‑Fi association actually dropped. If it happened
+     * soon after the mesh came up while cellular was still up, it reads as
+     * adaptive connectivity tearing down internet-less Wi‑Fi -- count it, and
+     * after it repeats the UI surfaces a "keep Wi‑Fi on" tip. Thresholds in
+     * [WifiDropPolicy] are first estimates pending Pixel field tuning.
+     */
+    private fun onWifiAssociationLost() {
+        val cellularUp = hasValidatedInternet()
+        if (WifiDropPolicy.isPrematureDrop(meshJoinedAtMs, System.currentTimeMillis(), cellularUp)) {
+            Log.i(TAG, "Wi‑Fi association dropped early with cellular still up; noting for keep-Wi‑Fi tip")
+            WifiTipStore.recordPrematureDrop(this)
+        }
+    }
 
     private fun publishInitialRelayHealth() {
         val contacts = try {

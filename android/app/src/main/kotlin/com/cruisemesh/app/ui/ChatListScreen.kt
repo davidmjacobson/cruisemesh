@@ -43,6 +43,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -50,6 +51,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.cruisemesh.app.chat.tickStatusFor
 import com.cruisemesh.app.mesh.ReachabilityLevel
+import com.cruisemesh.app.mesh.WifiTipStore
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.StoredMessage
@@ -153,6 +155,14 @@ fun ChatListScreen(
                 onClick = onMeshStatusClick,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
             )
+
+            // T15 phase 3: after Wi‑Fi has repeatedly dropped out from under a
+            // live mesh (see WifiDropPolicy), nudge the user to keep it on.
+            val tipContext = LocalContext.current
+            val showWifiTip by WifiTipStore.showTip.collectAsState()
+            if (showWifiTip) {
+                KeepWifiOnTip(onDismiss = { WifiTipStore.dismiss(tipContext) })
+            }
 
             if (summaries.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -406,6 +416,37 @@ fun ChatRow(
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+/** T15: dismissible "keep Wi‑Fi on for nearby delivery" tip (phase 3). */
+@Composable
+private fun KeepWifiOnTip(onDismiss: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.tertiaryContainer)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+    ) {
+        Column {
+            Text(
+                text = stringResource(R.string.ui_keep_wifi_on_title),
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+            Text(
+                text = stringResource(R.string.ui_keep_wifi_on_body),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.align(Alignment.End),
+            ) {
+                Text(stringResource(R.string.ui_got_it))
             }
         }
     }
