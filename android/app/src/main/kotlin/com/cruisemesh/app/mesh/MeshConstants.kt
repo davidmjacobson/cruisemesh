@@ -5,10 +5,15 @@ import kotlin.random.Random
 
 /** BLE GATT constants for the CruiseMesh mesh transport (DESIGN.md §5.2). */
 object MeshConstants {
-    // Placeholder UUID — regenerate a real random v4 UUID before any real deployment.
-    val SERVICE_UUID: UUID = UUID.fromString("6d657368-6372-7569-7365-6d657368a001")
-    val INBOUND_CHARACTERISTIC_UUID: UUID = UUID.fromString("6d657368-6372-7569-7365-6d657368a002")
-    val OUTBOUND_CHARACTERISTIC_UUID: UUID = UUID.fromString("6d657368-6372-7569-7365-6d657368a003")
+    // Frozen protocol surface: this is the fixed 128-bit UUID space CruiseMesh
+    // advertises/scans for over BLE, and iOS discovers/advertises the exact
+    // same values (see ios/CruiseMesh/Mesh/MeshConstants.swift). Changing any
+    // of these partitions the mesh -- old and new builds will not discover
+    // each other. Do not edit without a coordinated fleet upgrade on both
+    // platforms.
+    val SERVICE_UUID: UUID = UUID.fromString("a5987315-cdcf-4e09-b036-ce10af3c05d3")
+    val INBOUND_CHARACTERISTIC_UUID: UUID = UUID.fromString("a5987315-cdcf-4e09-b036-ce10af3c05d4")
+    val OUTBOUND_CHARACTERISTIC_UUID: UUID = UUID.fromString("a5987315-cdcf-4e09-b036-ce10af3c05d5")
     val CLIENT_CONFIG_DESCRIPTOR_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     /**
