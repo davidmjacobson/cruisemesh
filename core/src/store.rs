@@ -175,6 +175,23 @@ pub struct Contact {
     pub agree_pk: Vec<u8>,
     pub relay_url: Option<String>,
     pub relay_token: Option<String>,
+    /// A local-only nickname the user set for this contact (T16). Presentation
+    /// only: it is NEVER written to a `FriendCard`, digest, or any wire format,
+    /// and importing a friend card never overwrites it. `None`/blank means fall
+    /// back to `name`. Defaulted so existing constructors need not pass it.
+    #[uniffi(default = None)]
+    pub nickname: Option<String>,
+}
+
+/// The name to show for a contact: the local nickname when the user has set a
+/// non-blank one (T16), otherwise the card `name`. Kept in core so both shells
+/// resolve identically everywhere a contact name is displayed.
+#[uniffi::export]
+pub fn core_contact_display_name(contact: Contact) -> String {
+    match contact.nickname.as_deref().map(str::trim) {
+        Some(nickname) if !nickname.is_empty() => nickname.to_string(),
+        _ => contact.name.clone(),
+    }
 }
 
 /// The last authenticated friends-of-friends policy advertised by a contact.
@@ -288,6 +305,7 @@ impl MessageStore {
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
         ensure_contact_column(&conn, "avatar", "BLOB")?;
         ensure_contact_column(&conn, "avatar_epoch", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_contact_column(&conn, "nickname", "TEXT")?;
         // Relay proxy-polling (see enqueue_relay_carried_envelope): marks a
         // carried envelope as one we pulled FROM the relay rather than one we
         // received over BLE, so the relay-upload query can skip re-uploading
@@ -1498,6 +1516,28 @@ impl MessageStore {
         Ok(changed > 0)
     }
 
+    /// Set (or clear) the local nickname for a contact (T16). A `None` or
+    /// blank/whitespace value clears it, falling display back to the card
+    /// `name`. Returns whether a row was updated (false = unknown contact).
+    /// This never touches any wire-visible field; the nickname stays local.
+    pub fn set_contact_nickname(
+        &self,
+        user_id: Vec<u8>,
+        nickname: Option<String>,
+    ) -> Result<bool, CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let nickname = nickname
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let changed = conn
+            .execute(
+                "UPDATE contacts SET nickname = ?2 WHERE user_id = ?1",
+                params![user_id, nickname],
+            )
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
     /// The canonical JPEG avatar bytes for a contact, if one has been synced.
     pub fn contact_avatar(&self, user_id: Vec<u8>) -> Result<Option<Vec<u8>>, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
@@ -1615,7 +1655,7 @@ impl MessageStore {
     pub fn get_contact(&self, user_id: Vec<u8>) -> Result<Option<Contact>, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.query_row(
-            "SELECT user_id, name, sign_pk, agree_pk, relay_url, relay_token FROM contacts WHERE user_id = ?1",
+            "SELECT user_id, name, sign_pk, agree_pk, relay_url, relay_token, nickname FROM contacts WHERE user_id = ?1",
             params![user_id],
             row_to_contact,
         )
@@ -1627,7 +1667,7 @@ impl MessageStore {
     pub fn list_contacts(&self) -> Result<Vec<Contact>, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn
-            .prepare("SELECT user_id, name, sign_pk, agree_pk, relay_url, relay_token FROM contacts ORDER BY name ASC")
+            .prepare("SELECT user_id, name, sign_pk, agree_pk, relay_url, relay_token, nickname FROM contacts ORDER BY name ASC")
             .map_err(store_err)?;
         let rows = stmt.query_map([], row_to_contact).map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
@@ -2624,6 +2664,7 @@ fn row_to_contact(row: &rusqlite::Row) -> rusqlite::Result<Contact> {
         agree_pk: row.get(3)?,
         relay_url: row.get(4)?,
         relay_token: row.get(5)?,
+        nickname: row.get(6)?,
     })
 }
 
@@ -2854,7 +2895,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     relay_url TEXT,
     relay_token TEXT,
     avatar BLOB,
-    avatar_epoch INTEGER NOT NULL DEFAULT 0
+    avatar_epoch INTEGER NOT NULL DEFAULT 0,
+    nickname TEXT
 );
 
 CREATE TABLE IF NOT EXISTS contact_discovery_policy (
@@ -4210,6 +4252,7 @@ mod tests {
             agree_pk: vec![2u8; 32],
             relay_url: None,
             relay_token: None,
+            nickname: None,
         }
     }
 
@@ -4252,6 +4295,7 @@ mod tests {
                 agree_pk: alice.agree_pk.clone(),
                 relay_url: None,
                 relay_token: None,
+                nickname: None,
             })
             .unwrap();
         let ticket = create_introduction_ticket(
@@ -4428,6 +4472,77 @@ mod tests {
 
         drop(store);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn set_contact_nickname_round_trips_and_blank_clears() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+
+        assert!(store
+            .set_contact_nickname(b"alice-id".to_vec(), Some("  Mom  ".to_string()))
+            .unwrap());
+        // Whitespace is trimmed on the way in.
+        assert_eq!(
+            store
+                .get_contact(b"alice-id".to_vec())
+                .unwrap()
+                .unwrap()
+                .nickname,
+            Some("Mom".to_string())
+        );
+
+        // A blank value clears the nickname.
+        assert!(store
+            .set_contact_nickname(b"alice-id".to_vec(), Some("   ".to_string()))
+            .unwrap());
+        assert_eq!(
+            store
+                .get_contact(b"alice-id".to_vec())
+                .unwrap()
+                .unwrap()
+                .nickname,
+            None
+        );
+
+        // Unknown contact reports no change.
+        assert!(!store
+            .set_contact_nickname(b"nobody".to_vec(), Some("X".to_string()))
+            .unwrap());
+    }
+
+    #[test]
+    fn reimporting_a_friend_card_preserves_the_local_nickname() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        store
+            .set_contact_nickname(b"alice-id".to_vec(), Some("Mom".to_string()))
+            .unwrap();
+
+        // Re-importing the card (e.g. a re-scan) carries no nickname and must
+        // not erase the local one.
+        let mut card = contact(b"alice-id", "Alice iPhone");
+        card.relay_url = Some("https://relay.example".to_string());
+        card.relay_token = Some("family".to_string());
+        store.upsert_imported_contact(card).unwrap();
+
+        let after = store.get_contact(b"alice-id".to_vec()).unwrap().unwrap();
+        assert_eq!(after.nickname, Some("Mom".to_string()));
+        // The card name still updated; only the nickname is sticky.
+        assert_eq!(after.name, "Alice iPhone");
+    }
+
+    #[test]
+    fn contact_display_name_prefers_a_nonblank_nickname() {
+        let mut c = contact(b"alice-id", "Alice");
+        assert_eq!(core_contact_display_name(c.clone()), "Alice");
+
+        c.nickname = Some("Mom".to_string());
+        assert_eq!(core_contact_display_name(c.clone()), "Mom");
+
+        // A blank nickname falls back to the card name.
+        c.nickname = Some("   ".to_string());
+        assert_eq!(core_contact_display_name(c), "Alice");
     }
 
     #[test]

@@ -732,6 +732,7 @@ mod tests {
             agree_pk: identity.agree_pk.clone(),
             relay_url: None,
             relay_token: None,
+            nickname: None,
         }
     }
 

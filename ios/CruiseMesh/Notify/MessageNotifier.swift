@@ -35,7 +35,8 @@ enum MessageNotifier {
     static func notifyIncoming(contact: Contact, preview: String) {
         guard !ChatMuteStore.isMuted(contact.userId) else { return }
         let content = UNMutableNotificationContent()
-        content.title = contact.name.isEmpty ? formatUserId(userId: contact.userId) : contact.name
+        let name = coreContactDisplayName(contact: contact)
+        content.title = name.isEmpty ? formatUserId(userId: contact.userId) : name
         content.body = preview
         content.sound = .default
         content.userInfo = [chatUserIdKey: UserIdHex.encode(contact.userId), chatIsGroupKey: false]

@@ -1051,7 +1051,8 @@ final class MeshController: ObservableObject {
                 throughLamport: throughLamport
             )
         } else if isVisibleChatKind(body.kind) {
-            let senderName = (try? store.getContact(userId: senderUserId))?.name
+            let senderName = (try? store.getContact(userId: senderUserId))
+                .map { coreContactDisplayName(contact: $0) }
                 ?? String(UserIdHex.encode(senderUserId).prefix(8))
             let preview = body.kind == ProtocolKind.attachmentManifest
                 ? AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))
@@ -1105,7 +1106,8 @@ final class MeshController: ObservableObject {
         log.info("Imported group \(group.name, privacy: .public) from invite on \(sourceLabel, privacy: .public)")
 
         if !ChatVisibility.isVisible(group.id) {
-            let senderName = (try? store.getContact(userId: senderUserId))?.name
+            let senderName = (try? store.getContact(userId: senderUserId))
+                .map { coreContactDisplayName(contact: $0) }
                 ?? String(UserIdHex.encode(senderUserId).prefix(8))
             MessageNotifier.notifyIncomingGroupMessage(
                 group: group,

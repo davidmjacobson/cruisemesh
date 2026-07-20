@@ -30,9 +30,29 @@ struct ChatView: View {
     @State private var replyMetadata: [String: MessageReplyMetadata] = [:]
     @State private var viewedPhoto: ViewedPhoto?
     @State private var isMuted = false
+    @State private var localNickname: String?
+    @State private var nicknameEdited = false
 
     private let store = AppStore.get()
     private var sender: RealMeshSender { RealMeshSender(store: store, identity: identity) }
+
+    /// `contact` with any in-session nickname edit (incl. clearing) applied, so
+    /// the header and the open details sheet reflect a change immediately (T16).
+    /// `nicknameEdited` lets that win over the value `contact` was built with.
+    private var displayContact: Contact {
+        var c = contact
+        c.nickname = nicknameEdited ? localNickname : contact.nickname
+        return c
+    }
+
+    /// The name to show in the header/title: the local nickname when set,
+    /// otherwise the card name.
+    private var resolvedName: String {
+        ChatListLogic.displayNameOrId(
+            name: coreContactDisplayName(contact: displayContact),
+            displayId: formatUserId(userId: contact.userId)
+        )
+    }
 
     private var reachability: ReachabilityLevel {
         connectivity.level(for: contact.userId, nowMs: connectivityClock.nowMs)
@@ -190,10 +210,7 @@ struct ChatView: View {
             .padding(12)
             .background(.bar)
         }
-        .navigationTitle(ChatListLogic.displayNameOrId(
-            name: contact.name,
-            displayId: formatUserId(userId: contact.userId)
-        ))
+        .navigationTitle(resolvedName)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
@@ -201,16 +218,13 @@ struct ChatView: View {
                     HStack {
                         AvatarView(
                             userId: contact.userId,
-                            name: contact.name,
+                            name: resolvedName,
                             size: 32,
                             photo: avatarData.flatMap { UIImage(data: $0) },
                             reachability: reachability
                         )
                         VStack(alignment: .leading) {
-                            Text(ChatListLogic.displayNameOrId(
-                                name: contact.name,
-                                displayId: formatUserId(userId: contact.userId)
-                            ))
+                            Text(resolvedName)
                             .font(.headline)
                             Text(reachabilityText)
                                 .font(.caption2)
@@ -306,7 +320,7 @@ struct ChatView: View {
         }
         .sheet(isPresented: $showDetails) {
             ContactDetailsSheet(
-                contact: contact,
+                contact: displayContact,
                 avatarData: avatarData,
                 reachability: reachability,
                 connectivityText: ContactReachability.contactDetailsCopy(
@@ -319,6 +333,12 @@ struct ChatView: View {
                 onMutedChange: {
                     isMuted = $0
                     ChatMuteStore.setMuted($0, chatId: contact.userId)
+                    ChatEvents.notifyChatChanged(contact.userId)
+                },
+                onSetNickname: { nickname in
+                    _ = try? store.setContactNickname(userId: contact.userId, nickname: nickname)
+                    localNickname = nickname
+                    nicknameEdited = true
                     ChatEvents.notifyChatChanged(contact.userId)
                 }
             ) {

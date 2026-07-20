@@ -9,12 +9,18 @@ struct ContactDetailsSheet: View {
     var connectivityText: String? = nil
     var isMuted: Bool = false
     var onMutedChange: (Bool) -> Void = { _ in }
+    var onSetNickname: (String?) -> Void = { _ in }
     let onDelete: () -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var editingNickname = false
+    @State private var nicknameDraft = ""
 
     private var displayId: String { formatUserId(userId: contact.userId) }
     private var displayName: String {
-        ChatListLogic.displayNameOrId(name: contact.name, displayId: displayId)
+        ChatListLogic.displayNameOrId(name: coreContactDisplayName(contact: contact), displayId: displayId)
+    }
+    private var hasNickname: Bool {
+        !(contact.nickname ?? "").trimmingCharacters(in: .whitespaces).isEmpty
     }
     private var fingerprint: [String] { fingerprintWords(userId: contact.userId) }
 
@@ -24,7 +30,7 @@ struct ContactDetailsSheet: View {
                 VStack(spacing: 0) {
                     AvatarView(
                         userId: contact.userId,
-                        name: contact.name,
+                        name: displayName,
                         size: 72,
                         photo: avatarData.flatMap { UIImage(data: $0) },
                         reachability: reachability
@@ -35,10 +41,25 @@ struct ContactDetailsSheet: View {
                         .font(.title2.weight(.semibold))
                         .padding(.top, 16)
 
+                    if hasNickname {
+                        Text("Also known as \(contact.name)")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.top, 4)
+                    }
+
                     Text(displayId)
                         .font(.body.monospaced())
                         .multilineTextAlignment(.center)
                         .padding(.top, 8)
+
+                    Button(hasNickname ? "Edit nickname" : "Add a nickname") {
+                        nicknameDraft = contact.nickname ?? ""
+                        editingNickname = true
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.top, 12)
 
                     if let connectivityText {
                         VStack(alignment: .leading, spacing: 8) {
@@ -110,6 +131,16 @@ struct ContactDetailsSheet: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .alert("Nickname", isPresented: $editingNickname) {
+                TextField(contact.name, text: $nicknameDraft)
+                Button("Save") {
+                    let trimmed = nicknameDraft.trimmingCharacters(in: .whitespaces)
+                    onSetNickname(trimmed.isEmpty ? nil : trimmed)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Only you see this. It replaces the name they shared, just on your phone.")
             }
         }
     }

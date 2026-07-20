@@ -10,15 +10,23 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Switch
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -27,6 +35,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
 import androidx.compose.ui.res.stringResource
@@ -42,6 +51,7 @@ fun ContactDetailsSheet(
     connectivityText: String? = null,
     isMuted: Boolean = false,
     onMutedChange: (Boolean) -> Unit = {},
+    onSetNickname: (String?) -> Unit = {},
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         ContactDetailsSheetContent(
@@ -51,6 +61,7 @@ fun ContactDetailsSheet(
             connectivityText = connectivityText,
             isMuted = isMuted,
             onMutedChange = onMutedChange,
+            onSetNickname = onSetNickname,
             modifier = Modifier.padding(bottom = 24.dp),
         )
     }
@@ -65,10 +76,25 @@ fun ContactDetailsSheetContent(
     connectivityText: String? = null,
     isMuted: Boolean = false,
     onMutedChange: (Boolean) -> Unit = {},
+    onSetNickname: (String?) -> Unit = {},
 ) {
     val displayId = formatUserId(contact.userId)
-    val displayName = ChatListLogic.displayNameOrId(contact.name, displayId)
+    val displayName = ChatListLogic.displayNameOrId(coreContactDisplayName(contact), displayId)
+    val hasNickname = !contact.nickname.isNullOrBlank()
     val fingerprint = fingerprintWords(contact.userId)
+    var editingNickname by remember(contact.userId) { mutableStateOf(false) }
+
+    if (editingNickname) {
+        NicknameEditDialog(
+            initial = contact.nickname.orEmpty(),
+            cardName = contact.name,
+            onDismiss = { editingNickname = false },
+            onSave = { value ->
+                onSetNickname(value)
+                editingNickname = false
+            },
+        )
+    }
 
     Column(
         modifier = modifier
@@ -78,7 +104,7 @@ fun ContactDetailsSheetContent(
     ) {
         AvatarBadge(
             userId = contact.userId,
-            name = contact.name,
+            name = displayName,
             displayId = displayId,
             size = 72.dp,
             photoBytes = avatarBytes,
@@ -88,12 +114,31 @@ fun ContactDetailsSheetContent(
             style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.SemiBold),
             modifier = Modifier.padding(top = 16.dp),
         )
+        if (hasNickname) {
+            Text(
+                text = stringResource(R.string.ui_also_known_as, contact.name),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+                textAlign = TextAlign.Center,
+            )
+        }
         Text(
             text = displayId,
             style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
             modifier = Modifier.padding(top = 8.dp),
             textAlign = TextAlign.Center,
         )
+        OutlinedButton(
+            onClick = { editingNickname = true },
+            modifier = Modifier.padding(top = 12.dp),
+        ) {
+            Text(
+                stringResource(
+                    if (hasNickname) R.string.ui_edit_nickname else R.string.ui_add_a_nickname,
+                ),
+            )
+        }
 
         if (connectivityText != null) {
             OutlinedCard(
@@ -174,6 +219,48 @@ fun ContactDetailsSheetContent(
             Text(stringResource(R.string.ui_delete_contact))
         }
     }
+}
+
+@Composable
+private fun NicknameEditDialog(
+    initial: String,
+    cardName: String,
+    onDismiss: () -> Unit,
+    onSave: (String?) -> Unit,
+) {
+    var text by remember { mutableStateOf(initial) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.ui_nickname)) },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    singleLine = true,
+                    label = { Text(stringResource(R.string.ui_nickname)) },
+                    placeholder = { Text(cardName) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    text = stringResource(R.string.ui_nickname_is_only_shown_to_you),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(text.trim().ifBlank { null }) }) {
+                Text(stringResource(R.string.ui_save))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.ui_cancel))
+            }
+        },
+    )
 }
 
 @Preview(showBackground = true, name = "Contact Sheet")
