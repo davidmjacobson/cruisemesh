@@ -1,0 +1,79 @@
+name: Rust
+
+# FR1 (fable-todo.md): before this workflow, nothing ran cargo test, clippy,
+# fmt, or the Android unit tests on any PR/push -- a relayd-only PR (or a
+# core change that broke a UniFFI-generated binding) triggered zero
+# compile/test jobs. This closes that gap for the 330+ test Rust workspace
+# and the Android JVM unit tests.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy --workspace
+        # As of 2026-07-20 the workspace is NOT clippy-clean (pre-existing
+        # warnings in core/src/{engine,gossip,identity,store,transport_policy}.rs
+        # and relayd's tests/*.rs, none introduced by FR1). Non-blocking for
+        # now so this workflow is useful immediately instead of red from
+        # the first run; a follow-up PR should clear the backlog and drop
+        # `continue-on-error`.
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  android-units:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      # AGENTS.md "Android UniFFI Setup": fresh checkouts don't contain
+      # kotlin-gen/ or jniLibs/ (both gitignored). JVM unit tests only need
+      # the host cdylib + generated Kotlin bindings -- app/build.gradle.kts
+      # points JNA straight at target/debug/libcruisemesh_core.so, so unlike
+      # a real device/emulator build this does NOT need jniLibs/ or the
+      # Android NDK / cargo-ndk (that fuller path is core/build-android.sh,
+      # deliberately not used here).
+      - name: Build host cruisemesh-core library
+        run: cargo build -p cruisemesh-core --features cruisemesh-core/cli
+      - name: Generate Kotlin UniFFI bindings
+        run: |
+          cargo run -p cruisemesh-core --bin uniffi-bindgen --features cruisemesh-core/cli -- \
+            generate --library target/debug/libcruisemesh_core.so --language kotlin \
+            --out-dir android/app/src/main/kotlin-gen
+      # FR1: kotlin-gen is gitignored (never committed on current master), so
+      # this is a no-op today -- but it's a live tripwire against the "known
+      # 8-branch hazard" (TODO.md: several long-lived branches each carried
+      # their own committed, eventually-stale generated bindings). If
+      # kotlin-gen ever ends up committed again (accidental `git add -A`, or
+      # merging an old branch without regenerating), a stale copy now shows
+      # up as a red check here instead of a UniFFI ABI-mismatch crash on a
+      # phone.
+      - name: kotlin-gen drift check
+        run: git diff --exit-code android/app/src/main/kotlin-gen
+      - name: gradlew :app:testDebugUnitTest
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:testDebugUnitTest --rerun-tasks
