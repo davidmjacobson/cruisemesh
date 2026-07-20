@@ -69,6 +69,14 @@ pub fn core_tick_status_for(
     }
 }
 
+/// **1:1 chats only.** Compares every non-self sender's lamport against a
+/// single scalar `read_through` watermark, which is only correct when there
+/// is exactly one other sender in the chat. In a group, each member has an
+/// independent lamport stream with its own read watermark, so this
+/// undercounts (or miscounts entirely) group unread -- use
+/// [`MessageStore::semantic_unread_count`] instead, which reads the
+/// per-sender watermarks from `outgoing_receipts` and handles both cases
+/// correctly (FC8).
 #[uniffi::export]
 pub fn core_unread_count(
     messages: Vec<StoredMessage>,
