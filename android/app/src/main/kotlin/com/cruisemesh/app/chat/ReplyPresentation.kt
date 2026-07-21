@@ -18,6 +18,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -206,7 +207,8 @@ fun ReplyComposerPreview(
             )
             IconButton(
                 onClick = onCancel,
-                modifier = Modifier.size(40.dp),
+                // FA10: keep the 40dp visual size, restore a 48dp touch target.
+                modifier = Modifier.minimumInteractiveComponentSize().size(40.dp),
             ) {
                 Icon(Icons.Default.Close, contentDescription = "Cancel reply")
             }
