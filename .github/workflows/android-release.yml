@@ -1,0 +1,117 @@
+name: Android release
+
+# FR15 (fable-todo.md): before this workflow, APK builds were artisanal --
+# one workstation's NDK/cargo-ndk setup, versionCode a hand-bumped epoch
+# timestamp (android/app/build.gradle.kts), no CI job ever ran even
+# assembleDebug. Pushing an `android-v*` tag now cross-compiles the Rust
+# core for all three device ABIs, builds a release APK, and attaches it to
+# a GitHub Release.
+#
+# Signing gap (see also android/app/build.gradle.kts, keystore.properties.example):
+# there is no upload keystore checked into this repo or configured as a GitHub
+# secret. `assembleRelease` already falls back to the debug signing config
+# when app/keystore.properties is absent and the CRUISEMESH_RELEASE_STORE_FILE/
+# _STORE_PASSWORD/_KEY_ALIAS/_KEY_PASSWORD env vars aren't set (with a Gradle
+# warning printed at configure time) -- so this workflow builds and ships a
+# debug-signed "release" build type (minified/shrunk, but not upload-keyable).
+# That's fine for sideloading onto the test fleet; it is NOT Play-signable.
+# To close the gap: generate an upload keystore
+# (see android/app/keystore.properties.example), base64-encode it into a
+# CRUISEMESH_RELEASE_STORE_B64 GitHub secret alongside the three string
+# secrets above, add a decode-to-file step here before the gradlew invocation,
+# and point CRUISEMESH_RELEASE_STORE_FILE at the decoded path. Deliberately
+# not wired up yet -- no such secrets exist as of this writing, and inventing
+# names for secrets nobody has created yet would just be a second thing to
+# get wrong later.
+
+on:
+  push:
+    tags:
+      - "android-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # core/build-android.sh cross-compiles for these three ABIs via
+          # cargo-ndk (arm64-v8a, armeabi-v7a, x86_64 -- see that script's
+          # header comment for the authoritative list).
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      # Maintained action wrapping Google's ndk-bundle installer; sets
+      # ANDROID_NDK_HOME/ANDROID_NDK_ROOT for later steps, which is exactly
+      # what core/build-android.sh looks for (falls back to scanning
+      # $ANDROID_HOME/ndk otherwise).
+      - name: Install Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          local-cache: true
+
+      - name: Build core for Android (cross-compile + Kotlin bindings)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: bash core/build-android.sh
+
+      # FR15: versionCode must be unique and monotonically increasing for
+      # Play/adb installs to accept an upgrade over a previous build; a
+      # hand-bumped epoch timestamp doesn't guarantee that across concurrent
+      # branches. Commit count on the tagged ref is monotonic by construction
+      # for a linear history and always fits comfortably under the
+      # 2100000000 versionCode ceiling. versionName is just the tag with the
+      # "android-v" prefix stripped (e.g. tag `android-v1.2.3` -> "1.2.3").
+      - name: Derive version from tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version_name="${tag#android-v}"
+          version_code="$(git rev-list --count HEAD)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
+          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
+
+      - name: gradlew assembleRelease
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease \
+            -PversionCodeOverride=${{ steps.version.outputs.version_code }} \
+            -PversionNameOverride=${{ steps.version.outputs.version_name }}
+
+      - name: Rename APK for the release asset
+        id: apk
+        run: |
+          src="android/app/build/outputs/apk/release/app-release.apk"
+          dest="cruisemesh-${{ steps.version.outputs.tag }}.apk"
+          cp "$src" "$dest"
+          echo "path=$dest" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release and attach APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            "${{ steps.apk.outputs.path }}" \
+            --title "CruiseMesh Android ${{ steps.version.outputs.version_name }}" \
+            --notes "Automated build from ${{ github.sha }}. Debug-signed release build type -- see android-release.yml header comment for the signing gap; not Play-signable as-is." \
+            --generate-notes

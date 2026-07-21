@@ -22,6 +22,17 @@ val keystoreProperties = Properties().apply {
 fun signingProp(key: String, envVar: String): String? =
     keystoreProperties.getProperty(key) ?: System.getenv(envVar)
 
+// FR15: versionCode/versionName are normally the hardcoded fallbacks below —
+// bumping the epoch-timestamp versionCode by hand was the whole "artisanal
+// APK builds" problem. android-release.yml passes both as -P project
+// properties, derived from the triggering `android-v*` tag (versionCode from
+// `git rev-list --count HEAD` so it's always monotonically increasing across
+// commits, which is what Play/adb install require; versionName from the tag
+// text itself). Local builds pass neither, so `gradlew assembleDebug` and
+// friends are unaffected.
+val versionCodeOverride = (findProperty("versionCodeOverride") as String?)?.toIntOrNull()
+val versionNameOverride = findProperty("versionNameOverride") as String?
+
 android {
     namespace = "com.cruisemesh.app"
     compileSdk = 36
@@ -34,8 +45,8 @@ android {
         minSdk = 31
         // Play Console requires new releases to target API 35+.
         targetSdk = 35
-        versionCode = 1784406677
-        versionName = "1.0.0"
+        versionCode = versionCodeOverride ?: 1784406677
+        versionName = versionNameOverride ?: "1.0.0"
     }
 
     signingConfigs {
