@@ -27,6 +27,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -69,10 +70,11 @@ private const val SCRIM_ALPHA = 0.55f
 private const val ENTRANCE_MS = 150
 private const val EXIT_MS = 120
 
-// Rough pre-measurement estimate for the bar (6 circular 40dp reaction
-// buttons) and menu (three DropdownMenuItems) so the very first frame already
-// places them close to correct instead of snapping in from a zero-size guess.
-private val ESTIMATED_BAR_SIZE = DpSize(268.dp, 52.dp)
+// Rough pre-measurement estimate for the bar (6 circular 40dp-visual reaction
+// buttons, each with a 48dp touch target -- FA10) and menu (three
+// DropdownMenuItems) so the very first frame already places them close to
+// correct instead of snapping in from a zero-size guess.
+private val ESTIMATED_BAR_SIZE = DpSize(314.dp, 60.dp)
 private val ESTIMATED_MENU_SIZE = DpSize(180.dp, 144.dp)
 
 /**
@@ -246,6 +248,8 @@ private fun ReactionPickerBar(
                 val selected = emoji == selectedEmoji
                 Box(
                     modifier = Modifier
+                        // FA10: keep the 40dp visual circle, restore a 48dp touch target.
+                        .minimumInteractiveComponentSize()
                         .size(40.dp)
                         .clip(CircleShape)
                         .then(

@@ -50,6 +50,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -853,6 +854,9 @@ internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(4.dp)
+                    // FA10: 22dp visually, but the touch target itself grows
+                    // to the 48dp minimum via the invisible padding this adds.
+                    .minimumInteractiveComponentSize()
                     .size(22.dp)
                     .clip(CircleShape)
                     .background(Color.Black.copy(alpha = 0.55f))
@@ -933,6 +937,9 @@ internal fun MessageComposer(
     ) {
         Box(
             modifier = Modifier
+                // FA10: 44dp visually; minimumInteractiveComponentSize() pads
+                // the touch target up to the 48dp minimum.
+                .minimumInteractiveComponentSize()
                 .size(44.dp)
                 .clip(CircleShape)
                 .background(ownBubbleColor)
@@ -1428,7 +1435,11 @@ fun ReactionRow(
                 } else {
                     MaterialTheme.colorScheme.surfaceVariant
                 },
-                modifier = Modifier.clickable { onReact(reaction.emoji) },
+                // FA10: the pill itself stays ~24dp tall; minimumInteractiveComponentSize()
+                // pads its touch target up to the 48dp minimum.
+                modifier = Modifier
+                    .minimumInteractiveComponentSize()
+                    .clickable { onReact(reaction.emoji) },
             ) {
                 val reactionLabel = if (reaction.count > 1) "${reaction.emoji} ${reaction.count}" else reaction.emoji
                 Text(
@@ -1660,7 +1671,10 @@ private fun VoiceMemoPlayer(
                     }
                 }
             },
-            modifier = Modifier.size(40.dp),
+            // FA10: keep the 40dp visual size, but restore a 48dp touch target
+            // (a caller-supplied .size() below IconButton's own would otherwise
+            // shrink its built-in minimum back down).
+            modifier = Modifier.minimumInteractiveComponentSize().size(40.dp),
         ) {
             Icon(
                 imageVector = if (playing) Icons.Default.Close else Icons.Default.PlayArrow,
