@@ -692,7 +692,7 @@ private struct MessageBubbleView: View {
         }
         .animation(.easeInOut(duration: 0.2), value: showLegend)
         .sheet(isPresented: $showInfo) {
-            MessageInfoSheet(text: messageInfoText(
+            MessageInfoSheet(rows: messageInfoRows(
                 message: message,
                 isOwn: isOwn,
                 tick: tick,
@@ -880,7 +880,18 @@ func deliveryConfirmationRoute(for message: StoredMessage) -> String? {
     return transportRouteText(via)
 }
 
-func messageInfoText(
+/// A single row of the Message-info sheet: either a labeled field (rendered
+/// as `LabeledContent`) or a free-standing sentence (rendered as plain
+/// `Text`). Replaces building one big string and splitting each line on its
+/// first `:` to guess which rows had a label -- which corrupted any
+/// sentence that happened to contain a colon of its own, e.g. "Arrived via
+/// BLE · ~2 hops · 5:14 PM" split into "…· 5" / "14 PM".
+enum MessageInfoRow: Equatable {
+    case labeled(label: String, value: String)
+    case sentence(String)
+}
+
+func messageInfoRows(
     message: StoredMessage,
     isOwn: Bool,
     tick: TickStatus?,
@@ -888,27 +899,37 @@ func messageInfoText(
     deliveredViaRoute: String? = nil,
     outboundExpiryMs: Int64? = nil,
     nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
-) -> String {
+) -> [MessageInfoRow] {
     let f = DateFormatter()
     f.dateFormat = "MMMM d, yyyy h:mm a"
     f.locale = .current
     let sentAt = f.string(from: Date(timeIntervalSince1970: TimeInterval(message.timestamp) / 1000))
-    let direction = isOwn ? "Sent by you" : "Received"
-    let status: String
+
+    var rows: [MessageInfoRow] = [
+        .sentence(isOwn ? "Sent by you" : "Received"),
+        .labeled(label: "Time", value: sentAt),
+    ]
+
     if isOwn, tick == .sent, let expiry = outboundExpiryMs, expiry <= nowMs {
-        status = "\nStatus: Not delivered — expired"
+        rows.append(.labeled(label: "Status", value: "Not delivered — expired"))
     } else if isOwn, tick == .sent, let expiry = outboundExpiryMs {
-        status = "\nStatus: Still trying — expires in \(expiryRemainingText(expiry - nowMs))"
-    } else {
-        status = tick.map { "\nStatus: \(tickLegendText($0))" } ?? ""
+        rows.append(.labeled(
+            label: "Status",
+            value: "Still trying — expires in \(expiryRemainingText(expiry - nowMs))"
+        ))
+    } else if let tick {
+        rows.append(.labeled(label: "Status", value: tickLegendText(tick)))
     }
-    let arrivalLine: String
+
     if isOwn {
-        arrivalLine = deliveredViaRoute.map { "\nDelivery confirmed via \($0)" } ?? ""
-    } else {
-        arrivalLine = arrival.map { "\n\(messageArrivalText($0))" } ?? ""
+        if let deliveredViaRoute {
+            rows.append(.sentence("Delivery confirmed via \(deliveredViaRoute)"))
+        }
+    } else if let arrival {
+        rows.append(.sentence(messageArrivalText(arrival)))
     }
-    return "\(direction)\nTime: \(sentAt)\(status)\(arrivalLine)"
+
+    return rows
 }
 
 private func expiryRemainingText(_ remainingMs: Int64) -> String {
@@ -961,18 +982,17 @@ struct ViewedPhoto: Identifiable {
 }
 
 struct MessageInfoSheet: View {
-    let text: String
+    let rows: [MessageInfoRow]
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
-            List(Array(text.split(separator: "\n").enumerated()), id: \.offset) { entry in
-                let line = entry.element
-                let parts = line.split(separator: ":", maxSplits: 1).map(String.init)
-                if parts.count == 2 {
-                    LabeledContent(parts[0], value: parts[1].trimmingCharacters(in: .whitespaces))
-                } else {
-                    Text(String(line))
+            List(Array(rows.enumerated()), id: \.offset) { _, row in
+                switch row {
+                case .labeled(let label, let value):
+                    LabeledContent(label, value: value)
+                case .sentence(let text):
+                    Text(text)
                 }
             }
             .navigationTitle("Message info")
