@@ -93,6 +93,16 @@ private const val CONNECT_TIMEOUT_MS = 12_000L
  * outside [lock] where possible -- decisions are computed under the lock,
  * the framework call happens after -- so this class never holds a lock
  * across a binder call.
+ *
+ * Adaptive scan duty (battery, 2026-07-21): [setScanDutyMode] lets
+ * [MeshService] drive the scan's [ScanSettings] mode from [RadioPowerPolicy]
+ * instead of the old hardcoded always-BALANCED setting -- see that class's
+ * doc for the escalate/dwell rules and why this can never scan *more*
+ * aggressively than the status quo it replaces. [currentScanMode] defaults
+ * to LOW_POWER; [start] builds the scanner with whatever mode is current at
+ * that moment, and a later [setScanDutyMode] call restarts an already-active
+ * scan (stop then start, mirroring the SCAN_FAILED_ALREADY_STARTED note on
+ * [start] below) only when the mode actually changes.
  */
 @SuppressLint("MissingPermission")
 class BleCentral(
@@ -111,6 +121,15 @@ class BleCentral(
     private val reassemblers = mutableMapOf<String, FrameReassembler>()
     private val writeQueue = GattWriteQueue()
     private val scanDiagnostics = mutableMapOf<String, ScanDiagnostics>()
+
+    // Battery: which ScanSettings mode [start]/[restartScan] build with --
+    // see [setScanDutyMode] and RadioPowerPolicy's class doc. Volatile (not
+    // under [lock]): read only from [buildScanSettings] on whichever thread
+    // calls [start]/[restartScan] (always the main thread in practice, via
+    // MeshService), written only from [setScanDutyMode] (also main thread);
+    // a plain field is enough and keeps this off [lock]'s per-address-map
+    // contract.
+    @Volatile private var currentScanMode = RadioDutyMode.LOW_POWER
 
     // Guards every read-modify-write of the per-address state above
     // (connections, negotiatedMtu, reassemblers, scanDiagnostics,
@@ -351,21 +370,73 @@ class BleCentral(
             return
         }
         scanner = btAdapter.bluetoothLeScanner
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(MeshConstants.SERVICE_UUID))
-            .build()
-        val settings = ScanSettings.Builder()
-            // BALANCED (restored from LOW_POWER 2026-07-10): the LOW_POWER scan
-            // duty cycle was too small for the central to catch a peer's
-            // advertising window, so direct connects churned with status=133 and
-            // the initial connect was flaky/slow. Since the mesh no longer pauses
-            // for Bluetooth audio, connection reliability wins here -- re-verify
-            // earbud audio doesn't stutter at this higher scan duty. (Result
-            // batching via setReportDelay would help further but routes results
-            // to onBatchScanResults, which this callback doesn't implement.)
-            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
-            .build()
-        scanner?.startScan(listOf(filter), settings, scanCallback)
+        scanner?.startScan(listOf(buildScanFilter()), buildScanSettings(), scanCallback)
+    }
+
+    /**
+     * Battery (2026-07-21): [MeshService] calls this with [RadioPowerPolicy]'s
+     * latest decision. A no-op unless [mode] actually differs from
+     * [currentScanMode] -- callers are expected to call this unconditionally
+     * on every policy tick (see that class's doc), so this guard is what
+     * keeps a steady BALANCED or LOW_POWER decision from restarting the scan
+     * over and over. When the scan isn't running yet (or has been stopped),
+     * only the field updates -- [start] picks up whatever mode is current
+     * when it next builds the scanner.
+     */
+    fun setScanDutyMode(mode: RadioDutyMode) {
+        if (mode == currentScanMode) return
+        currentScanMode = mode
+        if (scanner != null) restartScan()
+    }
+
+    /**
+     * BALANCED (restored from LOW_POWER 2026-07-10; made adaptive again
+     * 2026-07-21): the LOW_POWER scan duty cycle was too small for the
+     * central to catch a peer's advertising window, so direct connects
+     * churned with status=133 and the initial connect was flaky/slow --
+     * that's why [RadioPowerPolicy] escalates to BALANCED whenever a fast
+     * discovery actually matters (screen on with no links, a link just
+     * changed, or mail is waiting for someone we can't reach) rather than
+     * running LOW_POWER unconditionally. Since the mesh no longer pauses for
+     * Bluetooth audio, BALANCED periods still favor connection reliability
+     * exactly as the 2026-07-10 fix intended; LOW_POWER periods are the new
+     * battery win. (Result batching via setReportDelay would help further
+     * but routes results to onBatchScanResults, which this callback doesn't
+     * implement.)
+     */
+    private fun buildScanSettings(): ScanSettings = ScanSettings.Builder()
+        .setScanMode(
+            when (currentScanMode) {
+                RadioDutyMode.LOW_POWER -> ScanSettings.SCAN_MODE_LOW_POWER
+                RadioDutyMode.BALANCED -> ScanSettings.SCAN_MODE_BALANCED
+            },
+        )
+        .build()
+
+    private fun buildScanFilter(): ScanFilter = ScanFilter.Builder()
+        .setServiceUuid(ParcelUuid(MeshConstants.SERVICE_UUID))
+        .build()
+
+    /**
+     * Applies a scan-mode change to an already-running scan. Per the comment
+     * on [start] (SCAN_FAILED_ALREADY_STARTED), `startScan` alone while a
+     * scan with different settings is already active does not swap the
+     * settings in place -- stop first, then start fresh with the new
+     * [buildScanSettings]. [setScanDutyMode]'s equality guard already keeps
+     * this from firing on every policy tick, so this only runs on a real
+     * mode change, keeping well under Android's 5-scans-per-30s throttle
+     * (see [RadioPowerPolicy]'s doc for the dwell math).
+     */
+    private fun restartScan() {
+        val activeScanner = scanner ?: return
+        try {
+            activeScanner.stopScan(scanCallback)
+        } catch (e: Exception) {
+            Log.w(TAG, "restartScan: stopScan failed (adapter likely off): ${e.message}")
+            return
+        }
+        activeScanner.startScan(listOf(buildScanFilter()), buildScanSettings(), scanCallback)
+        Log.i(TAG, "restartScan: applied scan duty mode $currentScanMode")
     }
 
     fun stop() {

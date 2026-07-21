@@ -23,6 +23,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -163,6 +164,10 @@ private const val PRESENCE_HINT_DAY_WINDOW: Long = 3
 private const val FOREIGN_CARRY_BUDGET_BYTES: Long = 5L * 1024 * 1024
 private const val RELAY_STORE_BATCH_LIMIT: ULong = 128uL
 private const val RELAY_POLL_INTERVAL_MS = 60_000L
+// Battery, 2026-07-21: how often RadioPowerPolicy's duty mode re-checks
+// itself for a quiet period elapsing with no new link event (see
+// radioPowerRunnable) -- separate from RELAY_POLL_INTERVAL_MS above.
+private const val RADIO_POWER_CHECK_INTERVAL_MS = 30_000L
 
 /**
  * Bound on how many of our own carried `msg_id`s [seedSeenIdsFromOwnHistory]
@@ -422,7 +427,7 @@ class MeshService : Service() {
      * class doc.
      */
     private val relayPushClient by lazy {
-        RelayPushClient(relayMainHandler) { requestRelaySync("relay push") }
+        RelayPushClient(relayMainHandler, onPush = { requestRelaySync("relay push") })
     }
 
     private val peripheral by lazy {
@@ -430,6 +435,45 @@ class MeshService : Service() {
     }
     private val central by lazy {
         BleCentral(this, ::onFrameReceived, ::onCentralPeerConnected, ::onCentralPeerDisconnected)
+    }
+
+    /**
+     * Battery, 2026-07-21: shared BLE scan/advertise duty-mode + relay-poll
+     * cadence decisions -- see [RadioPowerPolicy]'s class doc for the
+     * escalate/dwell rules. [evaluateRadioPower] gathers the inputs below and
+     * pushes the result to [central]/[peripheral] on every real change; both
+     * of their setters are idempotent, so this can (and does) get called
+     * unconditionally from every link-connect/disconnect callback plus
+     * [radioPowerRunnable]'s periodic tick (the only way to notice a quiet
+     * period elapsing with no new event).
+     */
+    private val radioPowerPolicy = RadioPowerPolicy()
+
+    /** Seeded from [PowerManager.isInteractive] when the screen receiver registers; kept current by [screenStateReceiver]. */
+    @Volatile private var screenInteractive: Boolean = true
+
+    /** Wall-clock time of the most recent link connect/disconnect across every transport (BLE central/peripheral, LAN); 0 = none yet this process. */
+    @Volatile private var lastLinkChangeAtMs: Long = 0L
+
+    /**
+     * T2's `carriedLen()` is the closest thing to "holding mail for someone
+     * we can't currently reach" the store exposes today -- see
+     * [RadioPowerPolicy]'s class doc for why this is an aggregate
+     * approximation, not a per-recipient one. Refreshed off [storeExecutor]
+     * by [refreshCarryQueueSignal] on every [radioPowerRunnable] tick.
+     */
+    @Volatile private var carryQueueHasUnlinkedMail: Boolean = false
+
+    private var screenStateReceiverRegistered = false
+    private val screenStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            screenInteractive = when (intent?.action) {
+                Intent.ACTION_SCREEN_ON -> true
+                Intent.ACTION_SCREEN_OFF -> false
+                else -> return
+            }
+            evaluateRadioPower("screen ${if (screenInteractive) "on" else "off"}")
+        }
     }
     private val bluetoothAudioReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -505,6 +549,22 @@ class MeshService : Service() {
         override fun run() {
             checkLanHealth()
             relayMainHandler.postDelayed(this, LAN_HEALTH_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * Battery, 2026-07-21: periodic catch-all for [RadioPowerPolicy]'s duty
+     * mode -- every other trigger ([screenStateReceiver], the six
+     * link-connect/disconnect callbacks) is event-driven and calls
+     * [evaluateRadioPower] directly, but a quiet period simply *elapsing*
+     * with no new event needs something to notice it, hence this tick. Also
+     * where [carryQueueHasUnlinkedMail] gets refreshed, since that requires
+     * a [storeExecutor] hop (see [refreshCarryQueueSignal]).
+     */
+    private val radioPowerRunnable = object : Runnable {
+        override fun run() {
+            refreshCarryQueueSignal()
+            if (running) relayMainHandler.postDelayed(this, RADIO_POWER_CHECK_INTERVAL_MS)
         }
     }
     // D8: when this link last ran a digest exchange, keyed by peer address.
@@ -646,6 +706,7 @@ class MeshService : Service() {
         registerBluetoothAudioReceiver()
         registerBluetoothStateReceiver()
         registerRelayNetworkCallback()
+        registerScreenStateReceiver()
         meshJoinedAtMs = System.currentTimeMillis()
         WifiTipStore.refresh(this)
         refreshWifiHold()
@@ -653,6 +714,14 @@ class MeshService : Service() {
         LanTransportDiagnostics.registerProbeRequester(::requestManualLanProbe)
         scheduleLanHealth()
         scheduleDigestMaintenance()
+        scheduleRadioPowerChecks()
+        // Seed the initial BLE duty mode before the roles below actually
+        // start scanning/advertising, so [startMeshRoles] picks up the right
+        // mode on its first start() call instead of defaulting to LOW_POWER
+        // and immediately restarting -- lastLinkChangeAtMs is still 0 here
+        // (no link has ever changed this process) so this is driven purely
+        // by [screenInteractive] and the carry queue's last-known state.
+        evaluateRadioPower("service start")
         lan.start()
         // The mesh runs regardless of Bluetooth audio now (see
         // refreshBluetoothAudioStatus); start the roles unconditionally rather
@@ -678,11 +747,13 @@ class MeshService : Service() {
         unregisterBluetoothAudioReceiver()
         unregisterBluetoothStateReceiver()
         unregisterRelayNetworkCallback()
+        unregisterScreenStateReceiver()
         wifiHold.stop()
         cancelRelayPolling()
         relayPushClient.stop()
         cancelLanHealth()
         cancelDigestMaintenance()
+        cancelRadioPowerChecks()
         // FA3: stop accepting new storeExecutor work only after every producer
         // that could submit some is already stopped above (relayPushClient.stop()
         // clears its hintsProvider and cancels any pending reconnect;
@@ -964,6 +1035,102 @@ class MeshService : Service() {
 
     private fun cancelRelayPolling() {
         relayMainHandler.removeCallbacks(relayPollRunnable)
+    }
+
+    private fun registerScreenStateReceiver() {
+        if (screenStateReceiverRegistered) return
+        val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        // One-time snapshot for the initial value; screenStateReceiver keeps
+        // it current from here (TODO.md task note: "prefer the receiver").
+        screenInteractive = powerManager?.isInteractive ?: true
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
+        // ACTION_SCREEN_ON/OFF cannot be declared in the manifest (system
+        // broadcasts, restricted since API 26) but registerReceiver here is
+        // exactly how every other app observes them; not exported since
+        // nothing outside this process should be able to spoof screen state.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(screenStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(screenStateReceiver, filter)
+        }
+        screenStateReceiverRegistered = true
+    }
+
+    private fun unregisterScreenStateReceiver() {
+        if (!screenStateReceiverRegistered) return
+        unregisterReceiver(screenStateReceiver)
+        screenStateReceiverRegistered = false
+    }
+
+    private fun scheduleRadioPowerChecks() {
+        relayMainHandler.removeCallbacks(radioPowerRunnable)
+        relayMainHandler.postDelayed(radioPowerRunnable, RADIO_POWER_CHECK_INTERVAL_MS)
+    }
+
+    private fun cancelRadioPowerChecks() {
+        relayMainHandler.removeCallbacks(radioPowerRunnable)
+    }
+
+    /**
+     * Off-[storeExecutor] refresh of [carryQueueHasUnlinkedMail] (see that
+     * field's doc for the aggregate-vs-per-recipient caveat), then hops back
+     * to the main thread to fold the new value into an [evaluateRadioPower]
+     * pass -- mirrors every other [store] read in this class (FA3).
+     */
+    private fun refreshCarryQueueSignal() {
+        runOnStoreExecutor("radio power carry-queue check") {
+            assertOffMainThreadForStore("refreshCarryQueueSignal")
+            val hasUnlinkedMail = try {
+                store.carriedLen() > 0uL
+            } catch (e: CoreException) {
+                Log.w(TAG, "Failed to read carriedLen for radio power policy: ${e.message}")
+                false
+            }
+            relayMainHandler.post {
+                carryQueueHasUnlinkedMail = hasUnlinkedMail
+                evaluateRadioPower("carry-queue check")
+            }
+        }
+    }
+
+    /**
+     * Gathers the current [RadioPowerInputs], asks [radioPowerPolicy] for the
+     * duty mode, and pushes it to [central]/[peripheral] -- both setters are
+     * idempotent, so this is safe (and expected) to call unconditionally
+     * from every link-change callback and [radioPowerRunnable]'s tick. Must
+     * run on the main thread: [central]/[peripheral] BLE calls expect it
+     * (see their own doc comments), same as [startMeshRoles]/[stopMeshRoles].
+     */
+    private fun evaluateRadioPower(reason: String) {
+        if (!running) return
+        val now = System.currentTimeMillis()
+        val inputs = RadioPowerInputs(
+            screenInteractive = screenInteractive,
+            // identifiedRoutes(), not the raw connected-socket count: a link
+            // that hasn't HELLO'd yet can't carry a message yet either, so it
+            // shouldn't count as "not lonely" for duty-mode purposes.
+            liveLinkCount = MeshRouter.identifiedRoutes().size,
+            msSinceLastLinkChange = if (lastLinkChangeAtMs == 0L) Long.MAX_VALUE / 2 else now - lastLinkChangeAtMs,
+            carryQueueHasUnlinkedMail = carryQueueHasUnlinkedMail,
+        )
+        val mode = radioPowerPolicy.evaluate(inputs, now)
+        central.setScanDutyMode(mode)
+        Log.i(TAG, "evaluateRadioPower ($reason): $inputs -> $mode")
+    }
+
+    /** Records a link topology change and re-evaluates duty mode -- called from every BLE/LAN connect/disconnect callback. */
+    private fun noteLinkChangeAndReevaluate(reason: String) {
+        lastLinkChangeAtMs = System.currentTimeMillis()
+        // The BLE callbacks that call this can arrive on a GATT binder
+        // thread (BleCentral/BlePeripheral invoke onPeerConnected/
+        // onCentralSubscribed etc. inline, not posted to the main looper) --
+        // hop to relayMainHandler so evaluateRadioPower's BLE calls happen on
+        // the same thread [startMeshRoles]/[stopMeshRoles] already use.
+        relayMainHandler.post { evaluateRadioPower(reason) }
     }
 
     /**
@@ -1581,23 +1748,27 @@ class MeshService : Service() {
     private fun onCentralPeerConnected(address: String) {
         MeshRouter.onConnected(address, MeshRouterState.Transport.CENTRAL)
         sendHello(address)
+        noteLinkChangeAndReevaluate("central peer connected")
     }
 
     private fun onCentralPeerDisconnected(address: String) {
         MeshRouter.onDisconnected(address)
         pendingLanHints.clear(address)
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+        noteLinkChangeAndReevaluate("central peer disconnected")
     }
 
     private fun onPeripheralCentralSubscribed(address: String) {
         MeshRouter.onConnected(address, MeshRouterState.Transport.PERIPHERAL)
         sendHello(address)
+        noteLinkChangeAndReevaluate("peripheral central subscribed")
     }
 
     private fun onPeripheralCentralDisconnected(address: String) {
         MeshRouter.onDisconnected(address)
         pendingLanHints.clear(address)
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+        noteLinkChangeAndReevaluate("peripheral central disconnected")
     }
 
     private fun onLanPeerAuthenticated(
@@ -1607,6 +1778,7 @@ class MeshService : Service() {
         networkId: String?,
     ) {
         MeshRouter.onConnected(address, MeshRouterState.Transport.LAN)
+        noteLinkChangeAndReevaluate("LAN peer authenticated")
         if (!MeshRouter.onHello(address, userId)) {
             Log.w(TAG, "Authenticated LAN link could not be registered")
             return
@@ -1642,6 +1814,7 @@ class MeshService : Service() {
         lanHealthTracker.remove(address)
         LanTransportDiagnostics.disconnected(address)
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+        noteLinkChangeAndReevaluate("LAN peer disconnected")
     }
 
     private fun onLanNetworkReady(hint: Frame.LanEndpoint, networkId: String?) {
