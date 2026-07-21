@@ -522,7 +522,7 @@ private struct GroupMessageRow: View {
             }
             .padding(.vertical, 2)
             .sheet(isPresented: $showInfo) {
-                MessageInfoSheet(text: messageInfoText(
+                MessageInfoSheet(rows: messageInfoRows(
                     message: message,
                     isOwn: isOwn,
                     tick: nil,

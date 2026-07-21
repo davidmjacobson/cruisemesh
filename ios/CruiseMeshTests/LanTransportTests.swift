@@ -145,19 +145,23 @@ final class LanTransportTests: XCTestCase {
         let direct = MessageArrival(transport: 3, hopsTaken: 0, receivedAt: timestamp)
 
         XCTAssertTrue(
-            messageInfoText(message: message, isOwn: false, tick: nil, arrival: direct)
-                .contains("Arrived via local Wi-Fi · ~0 hops")
+            messageInfoRows(message: message, isOwn: false, tick: nil, arrival: direct).contains {
+                if case .sentence(let text) = $0 { return text.contains("Arrived via local Wi-Fi · ~0 hops") }
+                return false
+            }
         )
         // T6: an own message's confirmation route is resolved from the delivery
         // receipt watermark (transport -> route) and passed in by the caller.
         XCTAssertTrue(
-            messageInfoText(
+            messageInfoRows(
                 message: message,
                 isOwn: true,
                 tick: .delivered,
                 deliveredViaRoute: transportRouteText(4)
-            )
-            .contains("Delivery confirmed via another device over local Wi-Fi")
+            ).contains {
+                if case .sentence(let text) = $0 { return text.contains("Delivery confirmed via another device over local Wi-Fi") }
+                return false
+            }
         )
     }
 }
