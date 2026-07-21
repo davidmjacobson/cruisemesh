@@ -810,9 +810,7 @@ final class MeshController: ObservableObject {
         } else {
             transport = 2
         }
-        let hopsTaken = MeshDefaults.hopTtl >= receivedHopTtl
-            ? MeshDefaults.hopTtl - receivedHopTtl
-            : 0
+        let hopsTaken = arrivalHopsTaken(receivedHopTtl: receivedHopTtl)
         return MessageArrival(
             transport: transport,
             hopsTaken: hopsTaken,
@@ -1891,6 +1889,16 @@ final class MeshController: ObservableObject {
     /// turns a thrown error into `nil`). DTN D4: `processInboundEnvelope`
     /// uses this return value to decide whether it's safe to mark the
     /// envelope's `msgId` seen -- see its doc comment.
+    ///
+    /// Also the only carry-ingest path on iOS today: relay proxy-fetched
+    /// envelopes (FI2, `sourceAddress == nil`) reach `processInboundEnvelope`
+    /// and fall into this same function -- there is no iOS twin of Android's
+    /// separate `carryRelayEnvelope`/`enqueueRelayCarriedEnvelope` yet, so
+    /// `carriedHopTtl` below covers both cases in one place.
+    ///
+    /// The stored `hopTtl` is `carriedHopTtl` of the received value, not the
+    /// value verbatim -- see its doc comment for the full rationale and the
+    /// zero-TTL saturation guarantee.
     private func carryForeign(
         msgId: Data,
         hopTtl: UInt8,
@@ -1904,7 +1912,7 @@ final class MeshController: ObservableObject {
         guard let stored = try? store.enqueueCarriedEnvelope(
             envelope: CarriedEnvelope(
                 msgId: msgId,
-                hopTtl: hopTtl,
+                hopTtl: carriedHopTtl(hopTtl),
                 expiry: expiry,
                 recipientHint: recipientHint,
                 sealed: sealed
@@ -1968,6 +1976,11 @@ final class MeshController: ObservableObject {
     /// `recipient_hint`s (`deliveryHintsForPeer`) and pull matching envelopes
     /// from the store, and send each on this link. Expired entries are
     /// pruned first.
+    ///
+    /// `env.hopTtl` here is forwarded verbatim -- it's already
+    /// `carriedHopTtl` of what this device originally received, decremented
+    /// once at `carryForeign` enqueue time, not the raw value the frame
+    /// arrived with. No further decrement happens here.
     ///
     /// DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): this function only
     /// ever *attempts* delivery -- it no longer calls

@@ -42,6 +42,42 @@ func isVisibleChatKind(_ kind: UInt8) -> Bool {
     coreIsVisibleChatKind(kind: kind)
 }
 
+/// The `hop_ttl` value to persist for a foreign envelope entering the carry
+/// queue (DESIGN.md §5.3 store-and-forward), Android `carriedHopTtl` twin.
+/// This device's carry of the envelope is itself a hop, consumed from the
+/// sender-authored budget the same way the flood/relay path
+/// (`MeshController.relayForeign`) already decrements on every re-flood;
+/// before this, the carry path stored `hopTtl` verbatim at every stage
+/// (enqueue, drain), so the displayed hop count
+/// (`MeshController.messageArrival`'s `hopsTaken`) under-counted a pure carry
+/// hand-off by exactly the muled leg -- a single-mule delivery showed "~0
+/// hops" instead of "~1 hop". Decrementing once here, at carry enqueue time
+/// (`MeshController.carryForeign`), keeps every downstream consumer (drain,
+/// re-flood, digest paths) consistent without touching them, since they all
+/// forward the already-decremented stored value.
+///
+/// Saturating: `hopTtl == 0` (this node is already the final carrier -- see
+/// `relayForeign`'s "hop budget exhausted" guard) stays `0` rather than
+/// underflowing. Carry/drop eligibility for a zero-TTL envelope is unchanged
+/// by this function; it only affects the stored value for envelopes that do
+/// get carried.
+func carriedHopTtl(_ authoredHopTtl: UInt8) -> UInt8 {
+    authoredHopTtl > 0 ? authoredHopTtl - 1 : 0
+}
+
+/// The hop count shown in Message info ("Arrived via another device ·
+/// ~N hops"): inferred as the sender-authored budget minus whatever
+/// `hop_ttl` this device received an envelope with. Android
+/// `arrivalHopsTaken` twin -- extracted out of `MeshController.messageArrival`
+/// so it's directly unit-testable, matching Android's pattern.
+/// Saturating both directions: a `receivedHopTtl` above `initialHopTtl`
+/// (shouldn't happen -- `coreInboundGate` rejects it -- but this function has
+/// no store access to rely on that) clamps to `0` hops taken rather than
+/// underflowing.
+func arrivalHopsTaken(receivedHopTtl: UInt8, initialHopTtl: UInt8 = MeshDefaults.hopTtl) -> UInt8 {
+    initialHopTtl >= receivedHopTtl ? initialHopTtl - receivedHopTtl : 0
+}
+
 func isAuthoredChatKind(_ kind: UInt8) -> Bool {
     kind == ProtocolKind.text
         || kind == ProtocolKind.friendRequest

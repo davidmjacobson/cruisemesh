@@ -2410,6 +2410,13 @@ class MeshService : Service() {
      * no-op. Reached only after [handleEnvelope]'s dedupe + expiry gates, so
      * we never carry a stale duplicate or an already-expired envelope.
      *
+     * The stored `hop_ttl` is [carriedHopTtl] of the received value, not the
+     * value verbatim: this device's carry of the envelope is itself a hop, so
+     * it must be counted like the flood path counts its own re-relays (see
+     * [relayForeignEnvelope]) -- otherwise [arrivalHopsTaken] under-counts a
+     * pure mule delivery by one. See [carriedHopTtl]'s KDoc for the full
+     * rationale and the zero-TTL saturation guarantee.
+     *
      * Returns `true` if the store operation completed (whether it newly
      * queued the envelope or found it already carried) and `false` if the
      * store call itself failed. DTN D4: [processInboundEnvelope] uses this
@@ -2423,7 +2430,7 @@ class MeshService : Service() {
             val stored = store.enqueueCarriedEnvelope(
                 CarriedEnvelope(
                     msgId = envelope.msgId,
-                    hopTtl = envelope.hopTtl,
+                    hopTtl = carriedHopTtl(envelope.hopTtl),
                     expiry = envelope.expiry,
                     recipientHint = envelope.recipientHint,
                     sealed = envelope.sealed,
@@ -2458,6 +2465,11 @@ class MeshService : Service() {
      * is belt-and-suspenders, but skipping the call here avoids scheduling a
      * pointless relay-sync pass. Idempotent on `msg_id` like its sibling.
      *
+     * Also mirrors [carryForeignEnvelope] in storing [carriedHopTtl] of the
+     * received `hop_ttl` rather than the raw value -- this device is muling
+     * the envelope the same as the BLE-sourced case, so the same hop must be
+     * counted.
+     *
      * Returns `true`/`false` on store success/failure -- see
      * [carryForeignEnvelope]'s KDoc for why [processInboundEnvelope] needs
      * this (DTN D4).
@@ -2468,7 +2480,7 @@ class MeshService : Service() {
             val stored = store.enqueueRelayCarriedEnvelope(
                 CarriedEnvelope(
                     msgId = envelope.msgId,
-                    hopTtl = envelope.hopTtl,
+                    hopTtl = carriedHopTtl(envelope.hopTtl),
                     expiry = envelope.expiry,
                     recipientHint = envelope.recipientHint,
                     sealed = envelope.sealed,
@@ -2494,6 +2506,11 @@ class MeshService : Service() {
      * own seen-ID set drops the duplicate harmlessly; if they didn't (the
      * whole point -- they were out of range when it flooded), this is how it
      * reaches them.
+     *
+     * `env.hopTtl` here is forwarded verbatim -- it's already [carriedHopTtl]
+     * of what this device originally received, decremented once at
+     * [carryForeignEnvelope]/[carryRelayEnvelope] enqueue time, not the raw
+     * value the frame arrived with. No further decrement happens here.
      *
      * DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): this function only ever
      * *attempts* delivery -- it no longer calls [MessageStore.removeCarriedEnvelope]
