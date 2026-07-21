@@ -16,6 +16,20 @@ private const val TAG = "RelayPushClient"
 private const val CONNECT_TIMEOUT_MS = 10_000L
 
 /**
+ * FA3: [RelayPushClient.connect] hands hint computation off to an async
+ * caller and resumes later in [RelayPushClient.finishConnect] -- by the time
+ * that reply lands, [stop] or a newer [RelayPushClient.start] may have
+ * already superseded the request that triggered it. Pure so the "is this
+ * reply still current" decision is directly unit-testable without an Android
+ * [Handler][android.os.Handler] or a real socket: apply the reply only while
+ * still running ([stopped] false) and still targeting the same config the
+ * reply was computed for ([desiredConfig] unchanged since the request went
+ * out).
+ */
+internal fun isPushHintReplyCurrent(stopped: Boolean, desiredConfig: RelayConfig?, replyConfig: RelayConfig): Boolean =
+    !stopped && desiredConfig == replyConfig
+
+/**
  * Idle read timeout. relayd pings on an interval well inside this; a value
  * this generous just guards against a socket that has gone silent without
  * either side noticing (see relayd/src/lib.rs `WS_WRITE_TIMEOUT`, the
@@ -47,6 +61,19 @@ private const val READ_TIMEOUT_MS = 90_000L
  * "reconnect and replay from your cursor," which for this class just means
  * "reconnect, and let the next push (if any) ask the poll path to sync."
  *
+ * ### Hints are computed asynchronously (FA3)
+ *
+ * [start]'s `hintsProvider` doesn't return a hint list directly -- it's
+ * handed a completion function and must call it exactly once, eventually,
+ * from any thread. [MeshService]'s implementation dispatches the actual
+ * computation (a `MessageStore` scan over every contact and group) onto its
+ * own background executor rather than blocking whichever thread called
+ * [connect] (originally [start] itself, or a delayed reconnect off
+ * [mainHandler]'s looper -- both were the main thread). [connect] just
+ * kicks the request off and returns; [finishConnect] resumes once the
+ * caller replies, re-checking [stopped] and [desiredConfig] first in case
+ * [stop] or a newer [start] landed while the computation was in flight.
+ *
  * ### Network binding
  *
  * Unlike [RelayClient]'s HTTP calls, this does **not** pin the socket to
@@ -73,7 +100,7 @@ class RelayPushClient(
     private val backoff = RelayPushBackoff()
 
     @Volatile private var desiredConfig: RelayConfig? = null
-    @Volatile private var hintsProvider: (() -> List<ByteArray>)? = null
+    @Volatile private var hintsProvider: (((List<ByteArray>) -> Unit) -> Unit)? = null
     @Volatile private var webSocket: WebSocket? = null
     @Volatile private var stopped = true
     private var reconnectRunnable: Runnable? = null
@@ -86,9 +113,13 @@ class RelayPushClient(
      * change-tracking. Safe to call repeatedly (e.g. from every
      * network-validation callback); a no-op if already started against an
      * equal [config].
+     *
+     * [hintsProvider] is handed a completion callback rather than returning a
+     * list directly -- see the class doc's "Hints are computed
+     * asynchronously" section. It must call that callback exactly once.
      */
     @Synchronized
-    fun start(config: RelayConfig, hintsProvider: () -> List<ByteArray>) {
+    fun start(config: RelayConfig, hintsProvider: (onReady: (List<ByteArray>) -> Unit) -> Unit) {
         if (!stopped && desiredConfig == config) return
         stop()
         stopped = false
@@ -110,11 +141,30 @@ class RelayPushClient(
         webSocket = null
     }
 
+    /**
+     * Kicks off hint computation for [desiredConfig] and returns immediately
+     * -- [finishConnect] does the actual connecting once [hintsProvider]
+     * replies, which may be on a different thread and some time later.
+     */
     @Synchronized
     private fun connect() {
         if (stopped) return
         val config = desiredConfig ?: return
-        val hints = hintsProvider?.invoke().orEmpty()
+        val provider = hintsProvider ?: return
+        provider.invoke { hints -> finishConnect(config, hints) }
+    }
+
+    /**
+     * Resumes [connect] once the async [hintsProvider] call it kicked off
+     * replies with [hints]. Re-checks [stopped] and that [desiredConfig]
+     * still matches [config] -- both [stop] and a newer [start] could have
+     * landed while the computation was in flight, in which case this reply
+     * is stale and must be dropped rather than opening a socket for a target
+     * we've already moved on from.
+     */
+    @Synchronized
+    private fun finishConnect(config: RelayConfig, hints: List<ByteArray>) {
+        if (!isPushHintReplyCurrent(stopped, desiredConfig, config)) return
         if (hints.isEmpty()) {
             // Nothing addressed to us yet (e.g. no contacts/groups -- the
             // fresh-onboarding state). relayd rejects a hint-less subscribe
