@@ -80,6 +80,8 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 | `CRUISEMESH_RELAY_DB` | `cruisemesh-relayd.sqlite` | **Use an absolute path.** Relative paths resolve against the process CWD, which is easy to get wrong under systemd/Docker/IDE launchers. |
 | `CRUISEMESH_RELAY_BIND` | `0.0.0.0:8080` | Inside Docker keep `0.0.0.0:8080`; Caddy is the public listener. |
 | `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` | `268435456` (256 MiB) | Per-family-token storage quota. See §11. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_WS_PER_TOKEN_MAX_CONNECTIONS` | `16` | Max concurrent `GET /ws` connections for a single family token. See §7. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_WS_GLOBAL_MAX_CONNECTIONS` | `256` | Max concurrent `GET /ws` connections across all family tokens combined. See §7. Must be a positive integer; unset uses the default. |
 | `RELAY_DOMAIN` | *(compose required)* | Hostname in the Caddyfile for TLS. |
 
 ### The `CRUISEMESH_RELAY_DB` path gotcha
@@ -135,6 +137,8 @@ wss://relay.example.com/ws?hints=<base64url,...>&after=<cursor>
 | On connect | Server **replays** every row poll would return for those hints since `after` (JSON pages shaped like the REST fetch body: `{ envelopes, next_cursor }`), then **streams** matching new POSTs the same way. |
 | Ack | Still REST-only (`POST /envelopes/ack`). WS never deletes rows. |
 | Slow clients | Bounded broadcast; lagging or stuck writers are **disconnected**. Reconnect with the last cursor and replay — that is what the cursor is for. |
+| Connection caps | Family tokens are semi-public (QR friend cards), so unbounded WS upgrades would let anyone who has seen a card hold arbitrarily many sockets open. Two independent caps apply at upgrade time: `CRUISEMESH_RELAY_WS_PER_TOKEN_MAX_CONNECTIONS` (default 16) per family token and `CRUISEMESH_RELAY_WS_GLOBAL_MAX_CONNECTIONS` (default 256) across all tokens. Either cap being saturated returns `HTTP 429 Too Many Requests` with `{ "error": "...", "code": "ws_connection_cap" }` instead of upgrading. |
+| Keepalive | The server pings every open socket roughly every 45 s. A peer that answers neither with a `Pong` nor any other client frame for 2 consecutive intervals is treated as dead and dropped — this is what reclaims the connection-cap slot for a phone that went silent (locked screen, killed app, lost network) without a clean close. |
 
 Caddy already proxies WebSocket upgrades on the compose stack (see `Caddyfile`
 comments). No extra port is required.
