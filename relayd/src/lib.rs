@@ -115,6 +115,11 @@ const DEFAULT_WS_PING_MISSED_LIMIT: u32 = 2;
 /// `DEFAULT_EXPIRY_MS`) is honored when tighter; this caps the rest.
 pub const MAX_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
+/// FR7: default cadence for the background maintenance task
+/// (`spawn_prune_task`) that prunes expired rows and reclaims disk
+/// independent of any client traffic.
+pub const DEFAULT_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 /// DTN_TODOS.md D7 (N2): hard cap on the *decoded* `sealed` ciphertext of a
 /// single envelope — the only thing standing between a client and unbounded
 /// per-row SQLite growth was previously axum's default 2 MiB request-body
@@ -341,6 +346,10 @@ impl RelayStore {
     pub fn open(path: &str) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+        // FR7: convert any pre-existing database to incremental
+        // auto-vacuum. See `ensure_incremental_auto_vacuum` for why this
+        // can't just be a pragma statement inside `SCHEMA`.
+        ensure_incremental_auto_vacuum(&conn)?;
         Ok(Self {
             conn: std::sync::Arc::new(Mutex::new(conn)),
         })
@@ -537,29 +546,42 @@ impl RelayStore {
         if hints.len() > MAX_FETCH_HINTS {
             return Err(format!("at most {MAX_FETCH_HINTS} hints are allowed"));
         }
-        self.prune_expired(now_ms)?;
+        // FR7: this used to eagerly `DELETE` expired rows before every
+        // fetch -- a write transaction on the hottest read path in the
+        // service (every `GET /envelopes` poll ran it). Physical deletion
+        // now happens only in the hourly background maintenance task
+        // (`spawn_prune_task`); the `expiry_ms > ?` predicate below is what
+        // keeps an already-expired-but-not-yet-purged row out of the
+        // response in the meantime. (The 30-day retention ceiling needs no
+        // separate predicate: `effective_expiry` clamps every stored
+        // `expiry_ms` to at most `created_at_ms + MAX_RETENTION_MS` at
+        // insert time, so `expiry_ms > now` already implies the row is
+        // also within the 30-day ceiling.)
         let conn = self.conn.lock().expect("relay store mutex poisoned");
         let hint_placeholders = (0..hints.len())
             .map(|index| format!("?{}", index + 3))
             .collect::<Vec<_>>()
             .join(",");
-        let limit_placeholder = hints.len() + 3;
+        let now_placeholder = hints.len() + 3;
+        let limit_placeholder = hints.len() + 4;
         // Content-agnostic: sealed is returned as-is; no kind/type filter.
         let sql = format!(
             "SELECT id, msg_id, hop_ttl, recipient_hint, sealed, expiry_ms, created_at_ms
              FROM envelopes
              WHERE family_token = ?1 AND id > ?2 AND recipient_hint IN ({hint_placeholders})
+                   AND expiry_ms > ?{now_placeholder}
              ORDER BY id ASC
              LIMIT ?{limit_placeholder}"
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let fetch_limit = limit.min(MAX_FETCH_LIMIT) as i64;
-        let mut bindings: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(hints.len() + 3);
+        let mut bindings: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(hints.len() + 4);
         bindings.push(&family_token);
         bindings.push(&after_id);
         for hint in &hints {
             bindings.push(hint);
         }
+        bindings.push(&now_ms);
         bindings.push(&fetch_limit);
         let rows = stmt
             .query_map(bindings.as_slice(), |row| {
@@ -607,16 +629,44 @@ impl RelayStore {
 
     /// Drop rows past either their per-envelope `expiry_ms` or the 30-day
     /// server retention ceiling (`created_at_ms + MAX_RETENTION_MS`).
+    ///
+    /// FR7: as of the background-maintenance change, callers are the
+    /// hourly `spawn_prune_task`, `sync_presence` (presence rows have their
+    /// own, much shorter, retention window -- see `PRESENCE_RETENTION_MS`
+    /// -- so pruning them on every presence sync is still cheap and
+    /// keeps that table small), and the quota-overflow path in
+    /// `insert_envelope_with_quota` (which needs an immediate prune-then-
+    /// recheck decision, not an hourly one). `fetch_envelopes` no longer
+    /// calls this -- see its doc comment.
     pub fn prune_expired(&self, now_ms: i64) -> Result<u64, String> {
         let conn = self.conn.lock().expect("relay store mutex poisoned");
         let pruned = prune_expired_on(&conn, now_ms)?;
-        // FR2: only log when something actually happened -- this runs on
-        // every fetch/presence-sync call, so a zero-count line would be the
+        // FR2: only log when something actually happened -- this runs
+        // hourly regardless of traffic, so a zero-count line would be the
         // dominant log entry and drown out everything else.
         if pruned > 0 {
             info!(pruned, "pruned expired envelope/presence rows");
         }
         Ok(pruned)
+    }
+
+    /// FR7: reclaim pages freed by deletes back to the OS (shrinks the file
+    /// on disk). Only takes effect once the database is in
+    /// `auto_vacuum = INCREMENTAL` mode -- guaranteed for every database
+    /// this process opens by `ensure_incremental_auto_vacuum` -- and is a
+    /// harmless no-op otherwise. Called from the hourly background
+    /// maintenance task (`spawn_prune_task`), never from a request path.
+    ///
+    /// Unbounded (no page-count argument): for the family-scale relay DB
+    /// this targets (single-digit families, a few hundred MiB ceiling
+    /// each), one hourly pass over the current free list is expected to be
+    /// fast. If relayd ever serves a scale where that stops being true,
+    /// bound it (`PRAGMA incremental_vacuum(N)`) to cap how long this
+    /// holds the store mutex.
+    pub fn incremental_vacuum(&self) -> Result<(), String> {
+        let conn = self.conn.lock().expect("relay store mutex poisoned");
+        conn.execute_batch("PRAGMA incremental_vacuum;")
+            .map_err(|e| e.to_string())
     }
 
     pub fn sync_presence(
@@ -719,13 +769,16 @@ impl RelayStore {
     }
 
     /// `EXPLAIN QUERY PLAN` for the fetch path. Used by tests to ensure the
-    /// family+hint+id index is used instead of a table scan.
+    /// family+hint+id index is used instead of a table scan. Mirrors
+    /// `fetch_envelopes`'s real query (including the FR7 `expiry_ms`
+    /// predicate) so the plan tested here is the plan that actually runs.
     pub fn explain_fetch_plan(
         &self,
         family_token: &str,
         hints: &[Vec<u8>],
         after_id: i64,
         limit: usize,
+        now_ms: i64,
     ) -> Result<String, String> {
         if hints.is_empty() {
             return Ok(String::new());
@@ -735,23 +788,26 @@ impl RelayStore {
             .map(|index| format!("?{}", index + 3))
             .collect::<Vec<_>>()
             .join(",");
-        let limit_placeholder = hints.len() + 3;
+        let now_placeholder = hints.len() + 3;
+        let limit_placeholder = hints.len() + 4;
         let sql = format!(
             "EXPLAIN QUERY PLAN
              SELECT id, msg_id, hop_ttl, recipient_hint, sealed, expiry_ms, created_at_ms
              FROM envelopes
              WHERE family_token = ?1 AND id > ?2 AND recipient_hint IN ({hint_placeholders})
+                   AND expiry_ms > ?{now_placeholder}
              ORDER BY id ASC
              LIMIT ?{limit_placeholder}"
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let fetch_limit = limit.min(MAX_FETCH_LIMIT) as i64;
-        let mut bindings: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(hints.len() + 3);
+        let mut bindings: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(hints.len() + 4);
         bindings.push(&family_token);
         bindings.push(&after_id);
         for hint in hints {
             bindings.push(hint);
         }
+        bindings.push(&now_ms);
         bindings.push(&fetch_limit);
         let mut lines = Vec::new();
         let rows = stmt
@@ -781,6 +837,40 @@ fn family_sealed_bytes_on(conn: &Connection, family_token: &str) -> Result<u64, 
     Ok(total.flatten().unwrap_or(0) as u64)
 }
 
+/// FR7: `SCHEMA`'s leading `PRAGMA auto_vacuum = INCREMENTAL` only takes
+/// effect on a database with *no tables yet* -- for a brand-new
+/// `RelayStore::open`, that pragma runs (as the first statement of the
+/// `execute_batch` call) before `CREATE TABLE`, and the mode sticks. Every
+/// relayd database created before this change defaulted to
+/// `auto_vacuum = NONE`; for those, the pragma statement in `SCHEMA` is a
+/// silent no-op once tables already exist. Converting an existing database
+/// requires re-running the pragma immediately followed by a full `VACUUM`
+/// -- SQLite's documented way to toggle auto-vacuum on an existing
+/// database (https://www.sqlite.org/pragma.html#pragma_auto_vacuum:
+/// "turning it from off to on requires a VACUUM ... to reorganize the
+/// database and initialize the pointer-map pages"). See DEPLOY.md for the
+/// deploy-facing version of this note.
+///
+/// We check the *current* mode first so the `VACUUM` -- which holds an
+/// exclusive lock and rewrites the whole file -- runs at most once per
+/// database, not on every process start: once converted, `PRAGMA
+/// auto_vacuum` reports `incremental` on every later `open()` and this
+/// becomes a single cheap read. (On a genuinely fresh database the SCHEMA
+/// pragma has already set the mode by the time we get here, so this is
+/// also a cheap no-op-VACUUM path for new installs, not just repeat opens
+/// of an existing one.)
+fn ensure_incremental_auto_vacuum(conn: &Connection) -> Result<(), String> {
+    const INCREMENTAL: i64 = 2;
+    let mode: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if mode != INCREMENTAL {
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn prune_expired_on(conn: &Connection, now_ms: i64) -> Result<u64, String> {
     let retention_floor = now_ms.saturating_sub(MAX_RETENTION_MS);
     let deleted = conn
@@ -798,6 +888,43 @@ fn prune_expired_on(conn: &Connection, now_ms: i64) -> Result<u64, String> {
         )
         .map_err(|e| e.to_string())?;
     Ok((deleted + deleted_presence) as u64)
+}
+
+/// FR7: hourly (by default) background maintenance -- expiry pruning used
+/// to run only inside request handlers (`fetch_envelopes` ran a `DELETE`
+/// on every poll, `sync_presence` and the quota-overflow path also
+/// pruned), so a mailbox nobody was actively polling would just grow
+/// forever, and there was no `VACUUM`/`incremental_vacuum` call anywhere,
+/// so the SQLite file never shrank even after mass expiry -- disk-full on
+/// the $4 VPS would have surfaced as an unlogged raw 500. This spawns a
+/// detached task that runs `prune_expired` + `incremental_vacuum` on
+/// `interval`, independent of client traffic.
+///
+/// `interval` is a parameter rather than a hardcoded constant so a test
+/// can use a millisecond-scale interval instead of waiting on the
+/// hour-scale production cadence (`DEFAULT_PRUNE_INTERVAL`); the returned
+/// `JoinHandle` lets a test `.abort()` the task during cleanup.
+pub fn spawn_prune_task(store: RelayStore, interval: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // `interval` fires its first tick immediately; skip it so the
+        // very first sweep happens one interval after startup, not the
+        // instant the task is spawned (racing schema/table setup).
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if let Err(detail) = store.prune_expired(now_ms()) {
+                // prune_expired already logs a nonzero deleted count (FR2
+                // style); a failure here is the only thing worth an extra
+                // log line.
+                tracing::error!(detail = %detail, "background maintenance: prune_expired failed");
+                continue;
+            }
+            if let Err(detail) = store.incremental_vacuum() {
+                tracing::error!(detail = %detail, "background maintenance: incremental_vacuum failed");
+            }
+        }
+    })
 }
 
 pub fn app(state: AppState) -> Router {
@@ -1578,6 +1705,7 @@ impl IntoResponse for ApiError {
 }
 
 const SCHEMA: &str = "
+PRAGMA auto_vacuum = INCREMENTAL;
 CREATE TABLE IF NOT EXISTS envelopes (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     family_token   TEXT NOT NULL,
@@ -1872,8 +2000,14 @@ mod tests {
         assert_eq!(json["envelopes"][0]["id"].as_i64().unwrap(), second_id);
     }
 
+    /// FR7: fetch is now purely a `SELECT` -- expired rows are filtered
+    /// out of the response (`expiry_ms > now` predicate) but are no longer
+    /// physically deleted by the act of fetching. Physical deletion is the
+    /// background maintenance task's job (`spawn_prune_task_reaps_...`
+    /// below); `count_for_family` here must therefore stay at 2, not drop
+    /// to 1 the way it did before FR7.
     #[tokio::test]
-    async fn expired_rows_are_pruned_before_fetch() {
+    async fn expired_rows_are_filtered_from_fetch_without_a_write() {
         let (_db, store) = test_store();
         let app = app(AppState::new(
             store.clone(),
@@ -1914,7 +2048,47 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         let json = body_json(response).await;
         assert_eq!(json["envelopes"].as_array().unwrap().len(), 1);
+        // Both rows are still on disk -- fetch did not delete the expired
+        // one. It's still filtered out of the *response* above.
+        assert_eq!(store.count_for_family("family-a").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn spawn_prune_task_reaps_expired_rows_with_no_client_fetch() {
+        let (_db, store) = test_store();
+        let now = now_ms();
+        store
+            .insert_envelope(
+                "family-a",
+                sample_msg_id(1),
+                7,
+                sample_hint(1),
+                sample_sealed(2),
+                now - 1,
+                now - 5_000,
+            )
+            .unwrap();
         assert_eq!(store.count_for_family("family-a").unwrap(), 1);
+
+        // Short interval so the test doesn't wait on the hour-scale
+        // production default (DEFAULT_PRUNE_INTERVAL).
+        let handle = spawn_prune_task(store.clone(), Duration::from_millis(20));
+
+        // No client ever calls GET /envelopes or POST /presence here --
+        // the row must disappear purely from the background task ticking.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if store.count_for_family("family-a").unwrap() == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "background prune task did not reap the expired row in time"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        handle.abort();
     }
 
     #[tokio::test]
@@ -2107,7 +2281,7 @@ mod tests {
         }
 
         let plan = store
-            .explain_fetch_plan("family-a", &[sample_hint(1)], 0, 50)
+            .explain_fetch_plan("family-a", &[sample_hint(1)], 0, 50, now)
             .unwrap();
         // Accept either a direct SEARCH on the composite index or a cover
         // that names it — reject a plain SCAN of envelopes with no index.
@@ -2148,7 +2322,7 @@ mod tests {
         store.insert_envelopes_batch(&rows).unwrap();
 
         let plan = store
-            .explain_fetch_plan("family-a", &[sample_hint(3)], 100, 100)
+            .explain_fetch_plan("family-a", &[sample_hint(3)], 100, 100, now)
             .unwrap();
         assert!(
             plan.contains("idx_envelopes_family_hint_id")

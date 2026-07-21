@@ -79,7 +79,7 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 | `CRUISEMESH_RELAY_TOKENS` | *(required)* | Comma-separated allowlist. Empty → process refuses to start. |
 | `CRUISEMESH_RELAY_DB` | `cruisemesh-relayd.sqlite` | **Use an absolute path.** Relative paths resolve against the process CWD, which is easy to get wrong under systemd/Docker/IDE launchers. |
 | `CRUISEMESH_RELAY_BIND` | `0.0.0.0:8080` | Inside Docker keep `0.0.0.0:8080`; Caddy is the public listener. |
-| `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` | `268435456` (256 MiB) | Per-family-token storage quota. See §11. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` | `268435456` (256 MiB) | Per-family-token storage quota. See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_WS_PER_TOKEN_MAX_CONNECTIONS` | `16` | Max concurrent `GET /ws` connections for a single family token. See §7. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_WS_GLOBAL_MAX_CONNECTIONS` | `256` | Max concurrent `GET /ws` connections across all family tokens combined. See §7. Must be a positive integer; unset uses the default. |
 | `RELAY_DOMAIN` | *(compose required)* | Hostname in the Caddyfile for TLS. |
@@ -108,10 +108,14 @@ named volume so this cannot silently drift.
 ## 6. Retention and API shape (ops notes)
 
 - **Per-envelope `expiry_ms`**: clients send this (core default is 7 days). Rows
-  with `expiry_ms <= now` are pruned on fetch.
+  with `expiry_ms <= now` are excluded from `GET /envelopes` responses
+  immediately, and physically deleted (freeing disk) by the hourly
+  background maintenance sweep — see §11. Fetch itself no longer deletes
+  anything, so polling never does a write.
 - **30-day server ceiling**: insert clamps `expiry_ms` to
-  `created_at_ms + 30 days`; prune also drops rows whose `created_at_ms` is
-  older than 30 days (belt-and-suspenders for any pre-clamp data).
+  `created_at_ms + 30 days`; the background sweep also drops rows whose
+  `created_at_ms` is older than 30 days (belt-and-suspenders for any
+  pre-clamp data).
 - **Dedupe**: unique on `(family_token, msg_id)`. Re-posts of the same msg_id
   (e.g. receipt envelopes re-uploaded every sync) are idempotent.
 - **Ack is delete**: `POST /envelopes/ack` with `{ "ids": [...] }` removes
@@ -249,7 +253,55 @@ queued locally for a later retry (harmless for the size cap, which never
 succeeds on retry without shrinking the payload; more useful for the quota
 error, which can resolve once the family drains their mailbox).
 
-## 11. Not in this deploy yet
+## 11. Background maintenance (FR7)
+
+`GET /envelopes` only ever `SELECT`s now — physical row deletion and disk
+reclamation happen in a detached background task, started once at process
+startup and running for the process's lifetime (default cadence: hourly,
+`DEFAULT_PRUNE_INTERVAL` in `relayd/src/lib.rs`):
+
+1. `prune_expired(now)` — deletes envelope rows past `expiry_ms` or the
+   30-day retention ceiling, and presence rows past their own retention
+   window. Only logs when it actually deletes something (same convention
+   as every other FR2-era log line — a zero-count line every hour would
+   just be noise).
+2. `PRAGMA incremental_vacuum` — reclaims the pages that delete just freed,
+   shrinking the file on disk. Only effective once the database is in
+   `auto_vacuum = INCREMENTAL` mode (next section); a harmless no-op
+   otherwise.
+
+Between sweeps, an expired-but-not-yet-deleted row is still excluded from
+`GET /envelopes` responses (an `expiry_ms > now` predicate on the fetch
+query does that filtering), so no client ever sees stale mail — only the
+physical delete + disk reclaim is deferred to the hourly sweep instead of
+running inline on every poll.
+
+### `auto_vacuum` migration note
+
+SQLite's `auto_vacuum` mode can only be set on a database that has no
+tables yet — running `PRAGMA auto_vacuum = INCREMENTAL` on a database that
+already has tables (i.e. every relayd database that existed before this
+change; the previous default was `NONE`) is a **silent no-op**. Converting
+an existing database requires that pragma immediately followed by a full
+`VACUUM`, which is SQLite's documented way to toggle auto-vacuum on an
+existing database.
+
+relayd handles this automatically and transparently: `RelayStore::open`
+checks the database's *current* `auto_vacuum` mode on every start, and if
+it isn't already `INCREMENTAL`, runs the pragma + `VACUUM` once. On every
+later start (including every restart after the first one post-upgrade)
+the check is a single cheap read and nothing else happens.
+
+**Practical effect for an operator upgrading an existing deployment**: the
+*first* start of relayd after this change holds an exclusive lock and
+rewrites the entire SQLite file (a full `VACUUM`) before the process
+starts accepting connections. For the family-scale deployment this targets
+(single-digit families, a few hundred MiB ceiling each) that is expected
+to take at most a few seconds; there is no separate migration step to run
+by hand. If you operate an unusually large relayd database, expect a
+one-time longer startup on the first upgrade.
+
+## 12. Not in this deploy yet
 
 - Multi-region / federation — single VPS is the intended family-scale deploy.
 - Android/iOS clients still primarily poll today; wiring the phone apps to

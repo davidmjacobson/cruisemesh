@@ -4,8 +4,9 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use cruisemesh_relayd::{
-    app, parse_bind, parse_family_quota_bytes, parse_tokens, parse_ws_connection_cap, AppState,
-    RelayStore, WsLimitsConfig, DEFAULT_FAMILY_QUOTA_BYTES,
+    app, parse_bind, parse_family_quota_bytes, parse_tokens, parse_ws_connection_cap,
+    spawn_prune_task, AppState, RelayStore, WsLimitsConfig, DEFAULT_FAMILY_QUOTA_BYTES,
+    DEFAULT_PRUNE_INTERVAL,
 };
 
 #[tokio::main]
@@ -47,6 +48,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(parse_bind(&bind)?).await?;
     let store = RelayStore::open(&db_path)?;
+    // FR7: hourly background prune + incremental_vacuum, independent of
+    // client traffic. Detached (never awaited/joined) -- it runs for the
+    // life of the process; graceful shutdown below only drains in-flight
+    // HTTP/WS connections, not this maintenance loop, which is fine since
+    // it does nothing destructive to a mid-flight request.
+    let _prune_task = spawn_prune_task(store.clone(), DEFAULT_PRUNE_INTERVAL);
     info!(
         version = cruisemesh_relayd::VERSION,
         commit = cruisemesh_relayd::GIT_SHA,
@@ -55,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         family_quota_bytes,
         ws_per_token_max_connections = ws_limits.per_token_max_connections,
         ws_global_max_connections = ws_limits.global_max_connections,
+        prune_interval_secs = DEFAULT_PRUNE_INTERVAL.as_secs(),
         "relay server listening"
     );
     axum::serve(
