@@ -2716,7 +2716,7 @@ impl MessageStore {
         now_ms: i64,
         budget_bytes: u64,
     ) -> Result<(Vec<OutboundEnvelope>, bool), CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut sql = String::from(
             "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, kind, lamport,
                     timestamp, hop_ttl, expiry, recipient_hint, sealed
