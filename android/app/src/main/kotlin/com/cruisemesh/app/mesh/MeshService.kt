@@ -1081,6 +1081,12 @@ class MeshService : Service() {
     private fun onRelayPushHealthChanged(healthy: Boolean) {
         Log.i(TAG, "Relay push health -> $healthy")
         reschedulePoll(healthy)
+        // Mirrors the signal for the Compose layer -- see MeshConnectivityStatus.pushHealthy
+        // and ContactReachability.selfRelayHealthy's pushHealthy param: without this, the
+        // "Online via relay" badge and the relay-health pill would falsely degrade after
+        // ~120-150s of push-healthy-but-quiet, since the poll (which used to be the only
+        // thing refreshing RelayHealth.Ok's lastSyncMs) now backs off to 900s while push is up.
+        MeshConnectivityStatus.setPushHealthy(healthy)
     }
 
     private fun registerScreenStateReceiver() {

@@ -443,6 +443,7 @@ private fun reachabilityLevelForUserId(
     contactLastSeen: Map<String, Long>,
     presenceLastSeen: Map<String, Long>,
     nowMs: Long,
+    pushHealthy: Boolean,
 ): ReachabilityLevel {
     val hex = UserIdHex.encode(userId)
     val presenceSeen = presenceLastSeen[hex]
@@ -450,7 +451,7 @@ private fun reachabilityLevelForUserId(
     return ContactReachability.compute(
         directLink = hex in nearbyPeerIds,
         presenceLastSeenMs = presenceSeen,
-        selfRelayHealthy = ContactReachability.selfRelayHealthy(relayHealth, nowMs),
+        selfRelayHealthy = ContactReachability.selfRelayHealthy(relayHealth, nowMs, pushHealthy),
         peerLastSeenMs = peerSeen,
         nearbyPeerCount = nearbyPeerIds.size,
         nowMs = nowMs,
@@ -466,9 +467,10 @@ private fun computeSummaryReachability(
     contactLastSeen: Map<String, Long>,
     presenceLastSeen: Map<String, Long>,
     nowMs: Long,
+    pushHealthy: Boolean,
 ): ReachabilityLevel {
     fun levelFor(userId: ByteArray) =
-        reachabilityLevelForUserId(userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, nowMs)
+        reachabilityLevelForUserId(userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, nowMs, pushHealthy)
 
     if (!summary.isGroup) {
         val contact = summary.contact ?: return ReachabilityLevel.OFFLINE
@@ -492,17 +494,18 @@ private fun groupReachableCounts(
     contactLastSeen: Map<String, Long>,
     presenceLastSeen: Map<String, Long>,
     nowMs: Long,
+    pushHealthy: Boolean,
 ): Pair<Int, Int> {
     val others = group.memberUserIds.filterNot { it.contentEquals(ownUserId) }
     val reachable = others.count { userId ->
-        val level = reachabilityLevelForUserId(userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, nowMs)
+        val level = reachabilityLevelForUserId(userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, nowMs, pushHealthy)
         level == ReachabilityLevel.NEARBY || level == ReachabilityLevel.ONLINE_RELAY
     }
     return reachable to others.size
 }
 
-private fun freshRelayHealthForDisplay(relayHealth: RelayHealth, nowMs: Long): RelayHealth =
-    if (relayHealth is RelayHealth.Ok && !ContactReachability.selfRelayHealthy(relayHealth, nowMs)) {
+private fun freshRelayHealthForDisplay(relayHealth: RelayHealth, nowMs: Long, pushHealthy: Boolean): RelayHealth =
+    if (relayHealth is RelayHealth.Ok && !ContactReachability.selfRelayHealthy(relayHealth, nowMs, pushHealthy)) {
         RelayHealth.Failing(relayHealth.lastSyncMs)
     } else {
         relayHealth
@@ -537,6 +540,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val bluetoothAudioConnected by MeshRuntimeStatus.bluetoothAudioConnected.collectAsState()
     val nearbyPeerIds by MeshConnectivityStatus.nearbyPeerIds.collectAsState()
     val relayHealth by MeshConnectivityStatus.relay.collectAsState()
+    val pushHealthy by MeshConnectivityStatus.pushHealthy.collectAsState()
     val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
     val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
     val connectivityNowMs = rememberConnectivityNowMs()
@@ -701,7 +705,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         onDispose { navController.removeOnDestinationChangedListener(listener) }
     }
 
-    val displaySummaries = remember(summaries, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs) {
+    val displaySummaries = remember(summaries, nearbyPeerIds, relayHealth, pushHealthy, contactLastSeen, presenceLastSeen, connectivityNowMs) {
         summaries.map { summary ->
             summary.copy(
                 reachability = computeSummaryReachability(
@@ -712,12 +716,13 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                     contactLastSeen,
                     presenceLastSeen,
                     connectivityNowMs,
+                    pushHealthy,
                 ),
             )
         }
     }
-    val displayRelayHealth = remember(relayHealth, connectivityNowMs) {
-        freshRelayHealthForDisplay(relayHealth, connectivityNowMs)
+    val displayRelayHealth = remember(relayHealth, pushHealthy, connectivityNowMs) {
+        freshRelayHealthForDisplay(relayHealth, connectivityNowMs, pushHealthy)
     }
     val pillStatus = remember(runtimeStatus, nearbyPeerIds, displayRelayHealth) {
         MeshStatusTextLogic.build(runtimeStatus, nearbyPeerIds.size, displayRelayHealth)
@@ -1157,11 +1162,12 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
         val sender = remember { RealMeshSender(store, identity) }
         val nearbyPeerIds by MeshConnectivityStatus.nearbyPeerIds.collectAsState()
         val relayHealth by MeshConnectivityStatus.relay.collectAsState()
+        val pushHealthy by MeshConnectivityStatus.pushHealthy.collectAsState()
         val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
         val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
         val connectivityNowMs = rememberConnectivityNowMs()
-        val reachability = remember(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs) {
-            reachabilityLevelForUserId(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs)
+        val reachability = remember(contact.userId, nearbyPeerIds, relayHealth, pushHealthy, contactLastSeen, presenceLastSeen, connectivityNowMs) {
+            reachabilityLevelForUserId(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs, pushHealthy)
         }
         val reachabilityStatusText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs) {
             val hex = UserIdHex.encode(contact.userId)
@@ -1246,16 +1252,18 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
         val sender = remember { GroupSender(store, identity) }
         val nearbyPeerIds by MeshConnectivityStatus.nearbyPeerIds.collectAsState()
         val relayHealth by MeshConnectivityStatus.relay.collectAsState()
+        val pushHealthy by MeshConnectivityStatus.pushHealthy.collectAsState()
         val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
         val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
         val connectivityNowMs = rememberConnectivityNowMs()
-        val reachableMemberCount = remember(group, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs) {
-            groupReachableCounts(group, identity.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs).first
+        val reachableMemberCount = remember(group, nearbyPeerIds, relayHealth, pushHealthy, contactLastSeen, presenceLastSeen, connectivityNowMs) {
+            groupReachableCounts(group, identity.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs, pushHealthy).first
         }
         val memberReachabilityByUserId = remember(
             contactsByUserId,
             nearbyPeerIds,
             relayHealth,
+            pushHealthy,
             contactLastSeen,
             presenceLastSeen,
             connectivityNowMs,
@@ -1268,6 +1276,7 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
                     contactLastSeen,
                     presenceLastSeen,
                     connectivityNowMs,
+                    pushHealthy,
                 )
             }
         }

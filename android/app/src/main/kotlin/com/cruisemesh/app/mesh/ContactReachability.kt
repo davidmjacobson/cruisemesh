@@ -104,8 +104,24 @@ object ContactReachability {
         ReachabilityLevel.OFFLINE -> null
     }
 
-    fun selfRelayHealthy(relayHealth: RelayHealth, nowMs: Long): Boolean =
-        relayHealth is RelayHealth.Ok && nowMs - relayHealth.lastSyncMs <= 2 * RELAY_POLL_INTERVAL_MS
+    /**
+     * @param pushHealthy `RelayPushClient`'s WS push socket is currently open
+     *   ([RadioPowerPolicy]'s battery work backs the poll off to a 900s
+     *   safety net while this is true, so a stale [RelayHealth.Ok.lastSyncMs]
+     *   no longer implies the relay path actually went unhealthy -- it may
+     *   just mean nothing new arrived to poll for). When true, freshness is
+     *   considered current regardless of how long ago [relayHealth]'s
+     *   `lastSyncMs` was -- an open push socket is itself live proof the self
+     *   relay path works. Still requires [relayHealth] to be
+     *   [RelayHealth.Ok] (the last actual sync attempt succeeded); this only
+     *   overrides the *staleness* check, not a genuine last-known failure.
+     *   Defaults to `false` so every existing call site (and the poll-driven
+     *   fallback while push is down or hasn't connected) keeps today's
+     *   lastSyncMs-age behavior unchanged.
+     */
+    fun selfRelayHealthy(relayHealth: RelayHealth, nowMs: Long, pushHealthy: Boolean = false): Boolean =
+        relayHealth is RelayHealth.Ok &&
+            (pushHealthy || nowMs - relayHealth.lastSyncMs <= 2 * RELAY_POLL_INTERVAL_MS)
 
     fun contactDetailsCopy(
         level: ReachabilityLevel,

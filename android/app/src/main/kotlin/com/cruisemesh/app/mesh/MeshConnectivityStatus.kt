@@ -28,6 +28,17 @@ object MeshConnectivityStatus {
     private val _relay = MutableStateFlow<RelayHealth>(RelayHealth.NoConfig)
     val relay: StateFlow<RelayHealth> = _relay.asStateFlow()
 
+    private val _pushHealthy = MutableStateFlow(false)
+
+    /**
+     * `RelayPushClient`'s WS push connection state, mirrored here so the
+     * Compose layer can feed [ContactReachability.selfRelayHealthy]'s
+     * `pushHealthy` parameter -- battery work backs the relay poll off to a
+     * 900s safety net while push is healthy, so relay-health freshness can
+     * no longer rely on lastSyncMs alone (see that function's doc).
+     */
+    val pushHealthy: StateFlow<Boolean> = _pushHealthy.asStateFlow()
+
     private val _contactLastSeen = MutableStateFlow<Map<String, Long>>(emptyMap())
 
     /** hex userId -> epoch ms we last had evidence the contact's device was alive. */
@@ -44,6 +55,11 @@ object MeshConnectivityStatus {
 
     fun setRelayHealth(health: RelayHealth) {
         _relay.value = health
+    }
+
+    /** [MeshService] calls this from [com.cruisemesh.app.relay.RelayPushClient]'s health-change callback. */
+    fun setPushHealthy(healthy: Boolean) {
+        _pushHealthy.value = healthy
     }
 
     /**
@@ -74,5 +90,6 @@ object MeshConnectivityStatus {
         _relay.value = RelayHealth.NoConfig
         _contactLastSeen.value = emptyMap()
         _presenceLastSeen.value = emptyMap()
+        _pushHealthy.value = false
     }
 }

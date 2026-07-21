@@ -85,6 +85,83 @@ class ContactReachabilityTest {
     }
 
     @Test
+    fun `a healthy push socket keeps own relay health current well past the two-poll staleness window`() {
+        // Battery: the relay poll backs off to a 900s safety net while
+        // RelayPushClient's WS push is healthy, so a live push socket -- not
+        // just a recent poll -- must be able to keep this current. 15+
+        // minutes of quiet (well past the old 2*60s=120s staleness window)
+        // must not degrade the reading while pushHealthy is true.
+        val fifteenMinutesOfQuiet = 15 * 60_000L
+        assertEquals(
+            true,
+            ContactReachability.selfRelayHealthy(
+                RelayHealth.Ok(0L),
+                fifteenMinutesOfQuiet,
+                pushHealthy = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `a down push socket falls back to today's stale-poll degradation`() {
+        // Same stale timing as the existing "stale own relay health" case,
+        // but explicit about pushHealthy=false (the default) to document the
+        // fallback path stays exactly as it was before the pushHealthy param
+        // existed.
+        val now = 2 * ContactReachability.RELAY_POLL_INTERVAL_MS + 1
+        assertEquals(
+            false,
+            ContactReachability.selfRelayHealthy(RelayHealth.Ok(0L), now, pushHealthy = false),
+        )
+    }
+
+    @Test
+    fun `a healthy push socket does not rescue a relay health that never actually succeeded`() {
+        // pushHealthy only overrides staleness, not a genuine last-known
+        // failure/no-config/no-internet state -- relayHealth must still be Ok.
+        assertEquals(
+            false,
+            ContactReachability.selfRelayHealthy(RelayHealth.Failing(0L), 999_999L, pushHealthy = true),
+        )
+        assertEquals(
+            false,
+            ContactReachability.selfRelayHealthy(RelayHealth.NoInternet, 999_999L, pushHealthy = true),
+        )
+    }
+
+    @Test
+    fun `ONLINE_RELAY survives 15 minutes of quiet with a healthy push socket`() {
+        val fifteenMinutesOfQuiet = 15 * 60_000L
+        val relayHealthy = ContactReachability.selfRelayHealthy(RelayHealth.Ok(0L), fifteenMinutesOfQuiet, pushHealthy = true)
+        val level = ContactReachability.compute(
+            directLink = false,
+            presenceLastSeenMs = fifteenMinutesOfQuiet,
+            selfRelayHealthy = relayHealthy,
+            peerLastSeenMs = null,
+            nearbyPeerCount = 0,
+            nowMs = fifteenMinutesOfQuiet,
+        )
+        assertEquals(true, relayHealthy)
+        assertEquals(ReachabilityLevel.ONLINE_RELAY, level)
+    }
+
+    @Test
+    fun `ONLINE_RELAY still degrades on stale poll data once the push socket is down`() {
+        val now = 2 * ContactReachability.RELAY_POLL_INTERVAL_MS + 1
+        val relayHealthy = ContactReachability.selfRelayHealthy(RelayHealth.Ok(0L), now, pushHealthy = false)
+        val level = ContactReachability.compute(
+            directLink = false,
+            presenceLastSeenMs = now,
+            selfRelayHealthy = relayHealthy,
+            peerLastSeenMs = null,
+            nearbyPeerCount = 0,
+            nowMs = now,
+        )
+        assertEquals(false, relayHealthy)
+        assertEquals(ReachabilityLevel.OFFLINE, level)
+    }
+
+    @Test
     fun `unhealthy relay does not suppress RECENT`() {
         val level = ContactReachability.compute(
             directLink = false,
