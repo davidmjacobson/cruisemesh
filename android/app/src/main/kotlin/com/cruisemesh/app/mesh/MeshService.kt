@@ -24,6 +24,9 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicLong
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -244,6 +247,119 @@ class MeshService : Service() {
     @Volatile
     private var identity: Identity? = null
     private lateinit var store: MessageStore
+
+    /** Cached once; avoids re-reading [android.content.pm.ApplicationInfo.flags] on every [assertOffMainThreadForStore] call. */
+    private val isDebuggableBuild: Boolean by lazy { DebugFileLog.isDebuggableBuild(this) }
+
+    /**
+     * FA3 accept criterion: debug-build assert that the three paths this fix
+     * moved onto [storeExecutor] (seeding, D8 digest maintenance, relay-push
+     * hint computation) never touch [MessageStore] from the main thread
+     * again. No-op in release builds -- [isDebuggableBuild] is a cached
+     * boolean, so the common-case cost there is one comparison against
+     * `false` before returning.
+     *
+     * Deliberately scoped to just those call sites rather than wrapping
+     * every [store] access in MeshService: [handleChatViewed] (registered
+     * with [ChatViewEvents], invoked synchronously from [MainActivity]'s UI
+     * thread for the read-receipt-on-view flow) calls `store` on the main
+     * thread today, via the same [sendReceiptOnAddress]/[store] plumbing the
+     * receive path also uses off-thread -- a pre-existing, out-of-scope call
+     * path FA3 does not touch. A blanket guard on [store] itself would trip
+     * on that legitimate path on every debug build, so this stays an
+     * explicit call at the top of each of the four functions below instead
+     * (the fallback this item's own acceptance note allows: "if a full guard
+     * is impractical, guard the three fixed paths and note it").
+     */
+    private fun assertOffMainThreadForStore(where: String) {
+        if (!isDebuggableBuild) return
+        check(Looper.myLooper() != Looper.getMainLooper()) {
+            "FA3: $where must not touch MessageStore on the main thread -- route it through storeExecutor"
+        }
+    }
+
+    /**
+     * FA3: single background thread MeshService uses for [MessageStore] work
+     * that used to run on the main thread -- seeding [GossipState.seenIds] at
+     * startup ([seedSeenIdsFromOwnHistory]), the initial relay-health publish
+     * ([publishInitialRelayHealth]), D8 digest maintenance
+     * ([checkDigestMaintenance]), and relay-push hint computation
+     * ([updateRelayPushSubscription]). One thread, not a pool: these call
+     * sites already ran serially on whichever thread invoked them before this
+     * fix (main-thread lifecycle/handler callbacks), MessageStore's SQLite
+     * backing gains nothing from parallel access here, and a single thread
+     * keeps this easy to reason about alongside the four *other* concurrent
+     * receive-path threads ([InboundEnvelopeAdmission]'s KDoc) that already
+     * call into [store] independently of this one.
+     *
+     * Results that reach outward from here -- [MeshRouter.sendToAddress] (via
+     * [checkDigestMaintenance]) and the [MutableStateFlow][kotlinx.coroutines.flow.MutableStateFlow]-backed
+     * [MeshConnectivityStatus]/[GossipState] writes -- are safe to call from
+     * any thread already (see each type's own thread-safety notes), so
+     * nothing here needs to post back to the main thread; only
+     * [computeRelayPushHints]'s result crosses back into [RelayPushClient],
+     * which is itself safe to drive from a background thread (its own state
+     * is `@Synchronized`).
+     *
+     * Stopped in [onDestroy] via [ExecutorService.shutdown] (graceful --
+     * finishes whatever task already started, e.g. an in-flight digest send,
+     * rather than [ExecutorService.shutdownNow]'s best-effort interrupt) once
+     * every producer that could submit new work is already stopped.
+     */
+    private val storeExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "MeshService-store").apply { isDaemon = true }
+    }
+
+    /**
+     * Submits [block] to [storeExecutor], catching both a thrown exception
+     * (logged rather than crashing the process the way an uncaught exception
+     * on this background thread otherwise would -- matching how the
+     * main-thread call sites this replaces already guarded their own
+     * [uniffi.cruisemesh_core.CoreException] cases) and
+     * [RejectedExecutionException] (the executor is already shut down, e.g. a
+     * late timer fire racing [onDestroy]). Fire-and-forget: use
+     * [computeRelayPushHints] instead for the one caller
+     * ([updateRelayPushSubscription]) that needs a result back.
+     */
+    private fun runOnStoreExecutor(label: String, block: () -> Unit) {
+        try {
+            storeExecutor.execute {
+                try {
+                    block()
+                } catch (e: Exception) {
+                    Log.e(TAG, "FA3: $label failed on storeExecutor", e)
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.w(TAG, "FA3: $label dropped; storeExecutor already shut down", e)
+        }
+    }
+
+    /**
+     * Same as [runOnStoreExecutor], but for a caller that has already
+     * promised someone else a reply ([computeRelayPushHints] promising
+     * [RelayPushClient] a hint list back): [onFailure] runs -- once, on
+     * whichever thread hit the problem -- if the task can't even be
+     * submitted ([RejectedExecutionException]) or if [block] itself throws
+     * something [block] didn't already catch. Never silently drops the
+     * caller's expected reply the way plain [runOnStoreExecutor] would.
+     */
+    private fun runOnStoreExecutorAlwaysReplying(label: String, onFailure: () -> Unit, block: () -> Unit) {
+        try {
+            storeExecutor.execute {
+                try {
+                    block()
+                } catch (e: Exception) {
+                    Log.e(TAG, "FA3: $label failed on storeExecutor", e)
+                    onFailure()
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.w(TAG, "FA3: $label dropped; storeExecutor already shut down", e)
+            onFailure()
+        }
+    }
+
     @Volatile
     private var running = false
     @Volatile
@@ -393,10 +509,40 @@ class MeshService : Service() {
     }
     // D8: when this link last ran a digest exchange, keyed by peer address.
     private val lastDigestAtByAddress = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * FA3: the actual [checkDigestMaintenance] pass (store.chatDigest +
+     * store.coreDigestAdvertisedMsgIds() per live link) now runs on
+     * [storeExecutor], not this [relayMainHandler]-driven Runnable directly.
+     * The re-arm (`postDelayed`) happens *inside* the executor task, after
+     * the pass completes, exactly mirroring the original ordering where
+     * `checkDigestMaintenance()` ran to completion before the next
+     * `postDelayed` -- so a slow pass still self-throttles instead of a fresh
+     * check queuing up behind an unfinished one every 60s regardless of how
+     * long the last one took. The re-arm is in a `finally` rather than a
+     * plain follow-on statement: [runOnStoreExecutor] catches and logs a
+     * thrown exception rather than crashing the process the way the old
+     * main-thread version would have -- without the `finally`, one bad pass
+     * would silently and permanently stop the recurring check instead of
+     * just failing that one pass, trading a loud crash for a quiet feature
+     * death, which is strictly worse. The `if (running)` guard on the re-arm
+     * closes the one race this executor hop introduces: [onDestroy] calling
+     * [cancelDigestMaintenance] can no longer reliably remove "the next
+     * pending callback" the way it could when this ran synchronously on the
+     * main thread, because by the time this task's `finally` runs,
+     * [onDestroy] may already have moved on -- so the re-arm itself checks
+     * [running] (already `false` by the time [onDestroy] reaches
+     * [cancelDigestMaintenance]) instead of relying on that call alone.
+     */
     private val digestMaintenanceRunnable = object : Runnable {
         override fun run() {
-            checkDigestMaintenance()
-            relayMainHandler.postDelayed(this, DIGEST_MAINTENANCE_INTERVAL_MS)
+            runOnStoreExecutor("digest maintenance") {
+                try {
+                    checkDigestMaintenance()
+                } finally {
+                    if (running) relayMainHandler.postDelayed(this, DIGEST_MAINTENANCE_INTERVAL_MS)
+                }
+            }
         }
     }
 
@@ -430,7 +576,7 @@ class MeshService : Service() {
             // makes that one redundant in the normal path but both stay, as
             // defense-in-depth).
             MeshRuntimeStatus.markActive()
-            publishInitialRelayHealth()
+            runOnStoreExecutor("initial relay health (repeat start)") { publishInitialRelayHealth() }
             Log.i(TAG, "onStartCommand: mesh already running; ignoring")
             return START_STICKY
         }
@@ -456,7 +602,23 @@ class MeshService : Service() {
         }
         identity = loadedIdentity
         store = AppStore.get(this)
-        seedSeenIdsFromOwnHistory(loadedIdentity)
+        // FA3: was a synchronous main-thread call here (full outbound-envelope
+        // scans for every contact/group plus carried ids) -- now dispatched to
+        // storeExecutor without blocking the mesh-role startup below on it.
+        // Ordering: this races GossipState.seenIds against the mesh roles
+        // coming up and receiving real traffic, but seedSeenIdsFromOwnHistory's
+        // own KDoc already establishes that an un-seeded msg_id is a harmless,
+        // not unsafe, gap -- worst case a mule handing back one of our own
+        // envelopes before it's seeded gets misclassified as foreign and
+        // re-carried/re-uploaded once (the relay and this store both dedupe by
+        // msg_id too, per that KDoc). D4's dedupe/admission invariant
+        // (InboundEnvelopeAdmission, processInboundEnvelope's KDoc) doesn't
+        // depend on the seed either: it protects "don't double-deliver a copy
+        // we're actively processing right now," which holds regardless of
+        // whether GossipState.seenIds already contains an old entry for it.
+        // So this is the "process anyway, dedupe idempotently" side of that
+        // tradeoff, not "block startup on the seed."
+        runOnStoreExecutor("seed seenIds from own history") { seedSeenIdsFromOwnHistory(loadedIdentity) }
 
         val lan = LanTransport(
             context = applicationContext,
@@ -480,7 +642,7 @@ class MeshService : Service() {
         RelaySyncEvents.register { requestRelaySync("queue changed") }
 
         running = true
-        publishInitialRelayHealth()
+        runOnStoreExecutor("initial relay health") { publishInitialRelayHealth() }
         registerBluetoothAudioReceiver()
         registerBluetoothStateReceiver()
         registerRelayNetworkCallback()
@@ -521,6 +683,15 @@ class MeshService : Service() {
         relayPushClient.stop()
         cancelLanHealth()
         cancelDigestMaintenance()
+        // FA3: stop accepting new storeExecutor work only after every producer
+        // that could submit some is already stopped above (relayPushClient.stop()
+        // clears its hintsProvider and cancels any pending reconnect;
+        // cancelDigestMaintenance() removes the only other recurring source).
+        // shutdown() (not shutdownNow()) -- graceful: whatever task is already
+        // running (e.g. an in-flight digest send) finishes normally instead of
+        // being interrupted mid-write; this MeshService instance is done either
+        // way, so there is nothing to await synchronously here.
+        storeExecutor.shutdown()
         LanTransportDiagnostics.unregisterProbeRequester()
         lanHealthTracker.clear()
         RelaySyncEvents.unregister()
@@ -546,10 +717,18 @@ class MeshService : Service() {
      * foreign traffic worth carrying. Harmless (the relay and this store both
      * dedupe by `msg_id` too) but wasteful, so every persisted `msg_id` we
      * authored -- our own outbound queue across every 1:1 chat and group,
-     * plus whatever we're currently muling for others -- is re-seeded here
-     * before the mesh roles come up.
+     * plus whatever we're currently muling for others -- is re-seeded here.
+     *
+     * FA3: runs on [storeExecutor] (full outbound-envelope scans for every
+     * contact and group, plus carried ids), dispatched from
+     * [onStartCommand] without blocking the mesh roles that follow it -- see
+     * the ordering note at that call site for why racing the seed against
+     * real inbound traffic is safe: the paragraph above already establishes
+     * that a not-yet-seeded `msg_id` is a harmless, one-time waste, never a
+     * correctness or dedupe problem.
      */
     private fun seedSeenIdsFromOwnHistory(identity: Identity) {
+        assertOffMainThreadForStore("seedSeenIdsFromOwnHistory")
         try {
             for (contact in store.listContacts()) {
                 for (envelope in store.outboundEnvelopesAfter(contact.userId, identity.userId, 0uL)) {
@@ -731,7 +910,9 @@ class MeshService : Service() {
         }
     }
 
+    /** FA3: runs on [storeExecutor] -- see the call sites in [onStartCommand]. */
     private fun publishInitialRelayHealth() {
+        assertOffMainThreadForStore("publishInitialRelayHealth")
         val contacts = try {
             store.listContacts()
         } catch (e: CoreException) {
@@ -800,6 +981,15 @@ class MeshService : Service() {
      * same as [pollRelayMailbox]'s doc) so a newly added contact or group is
      * picked up the next reconnect without this needing its own
      * change-tracking; until then the 60s poll already covers it.
+     *
+     * FA3: that recomputation used to run synchronously on the main thread
+     * inside [RelayPushClient.connect] (whichever thread called [start] or
+     * its own delayed reconnect, always [relayMainHandler]'s looper). It's
+     * now an async callback -- [RelayPushClient] hands us a completion
+     * function instead of expecting a return value, we compute the hints on
+     * [storeExecutor] via [computeRelayPushHints], and it resumes connecting
+     * once we call back. See [RelayPushClient]'s class doc for the resulting
+     * state machine.
      */
     private fun updateRelayPushSubscription() {
         val identity = this.identity
@@ -808,21 +998,33 @@ class MeshService : Service() {
             relayPushClient.stop()
             return
         }
-        relayPushClient.start(config) {
+        relayPushClient.start(config) { onReady -> computeRelayPushHints(identity, onReady) }
+    }
+
+    /**
+     * FA3: computes the relay-push hint set on [storeExecutor] and always
+     * invokes [onReady] exactly once -- with the hints, with `emptyList()` if
+     * the computation throws, or with `emptyList()` if [storeExecutor] has
+     * already been shut down ([onDestroy] racing a pending reconnect).
+     * [RelayPushClient.connect] depends on hearing back to decide whether to
+     * open a socket or back off and retry (empty hints reads as "nothing to
+     * subscribe to yet," same as before this fix); silently dropping the
+     * callback would strand it never reconnecting.
+     */
+    private fun computeRelayPushHints(identity: Identity, onReady: (List<ByteArray>) -> Unit) {
+        runOnStoreExecutorAlwaysReplying("relay push hint computation", { onReady(emptyList()) }) {
+            assertOffMainThreadForStore("relay push hint computation")
             val now = System.currentTimeMillis()
-            try {
+            val hints = try {
                 dedupeHints(
                     relayHintsForConfig(identity.userId, now),
                     relayProxyHints(store.listContacts(), identity.userId, now),
                 )
             } catch (e: CoreException) {
-                // Called on RelayPushClient's connect/reconnect path (main
-                // thread), not inside performRelaySyncPass's own try/catch --
-                // an uncaught exception here would crash the app instead of
-                // just failing this one (re)connect attempt.
                 Log.w(TAG, "Failed to compute relay push hints: ${e.message}")
                 emptyList()
             }
+            onReady(hints)
         }
     }
 
@@ -1722,8 +1924,15 @@ class MeshService : Service() {
      * jittered 3-5 min interval, so a message/receipt that landed after the
      * connect-time digest still converges without a reconnect. Digests are
      * idempotent, so this is safe to over-call.
+     *
+     * FA3: runs on [storeExecutor] (via [digestMaintenanceRunnable]), not
+     * [relayMainHandler]'s looper -- [sendDigestTo]'s
+     * [MeshRouter.sendToAddress] call is safe to make from here without
+     * posting back: it's the identical dispatch [processInboundEnvelope]
+     * already performs from the four concurrent receive-path threads.
      */
     private fun checkDigestMaintenance() {
+        assertOffMainThreadForStore("checkDigestMaintenance")
         val identity = this.identity ?: return
         if (!running) return
         val routes = MeshRouter.identifiedRoutes()
