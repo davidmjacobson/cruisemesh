@@ -38,6 +38,14 @@ final class LanTransport {
     private var scanConnections: [UUID: NWConnection] = [:]
     private var automaticScanWorkItem: DispatchWorkItem?
 
+    // FI7: track how long the browser/listener has been stuck `.waiting`
+    // so a denied Local Network permission (which iOS reports only as a
+    // silent, indefinite `.waiting`, never a distinct error state) can be
+    // surfaced instead of retrying forever with no user-visible signal.
+    private var browserWaitingSinceMs: Int64?
+    private var listenerWaitingSinceMs: Int64?
+    private var permissionWarningActive = false
+
     init(identity: Identity, trustedPeerForStaticKey: @escaping TrustedPeerLookup) {
         self.identity = identity
         self.trustedPeerForStaticKey = trustedPeerForStaticKey
@@ -95,6 +103,9 @@ final class LanTransport {
             bonjourServiceKeys.removeAll()
             outboundAddresses.removeAll()
             reconnectAttempts.removeAll()
+            browserWaitingSinceMs = nil
+            listenerWaitingSinceMs = nil
+            permissionWarningActive = false
             let active = Array(connections.values)
             connections.removeAll()
             active.forEach { $0.close(notifyOwner: false) }
@@ -209,6 +220,8 @@ final class LanTransport {
     ) {
         switch state {
         case .ready:
+            listenerWaitingSinceMs = nil
+            clearPermissionWarningIfNeeded()
             if let port = failedListener.port {
                 log.info("Listening for CruiseMesh LAN peers on TCP \(port.rawValue)")
                 if let network = localWifiIPv4Network() {
@@ -222,6 +235,7 @@ final class LanTransport {
             if listener === failedListener {
                 listener = nil
             }
+            listenerWaitingSinceMs = nil
             if started, usedDefaultPort, isAddressInUse(error) {
                 log.warning("TCP \(lanDefaultTcpPort()) is occupied; using an advertised fallback port")
                 startListener(preferDefaultPort: false)
@@ -229,7 +243,10 @@ final class LanTransport {
                 log.warning("LAN listener failed: \(String(describing: error), privacy: .public)")
             }
         case .waiting(let error):
-            log.debug("LAN listener waiting: \(String(describing: error), privacy: .public)")
+            log.debug(
+                "LAN listener waiting: \(String(describing: error), privacy: .public)\(Self.permissionErrorLogSuffix(error))"
+            )
+            noteWaiting(.listener, error: error)
         default:
             break
         }
@@ -247,15 +264,23 @@ final class LanTransport {
             }
         }
         newBrowser.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
             switch state {
+            case .ready:
+                browserWaitingSinceMs = nil
+                clearPermissionWarningIfNeeded()
             case .failed(let error):
-                self?.log.warning("LAN discovery failed: \(String(describing: error), privacy: .public)")
-                self?.diagnostics.connectionFailed(
+                browserWaitingSinceMs = nil
+                log.warning("LAN discovery failed: \(String(describing: error), privacy: .public)")
+                diagnostics.connectionFailed(
                     "Bonjour",
                     reason: "Local Wi-Fi discovery is unavailable; check Local Network permission"
                 )
             case .waiting(let error):
-                self?.log.debug("LAN discovery waiting: \(String(describing: error), privacy: .public)")
+                log.debug(
+                    "LAN discovery waiting: \(String(describing: error), privacy: .public)\(Self.permissionErrorLogSuffix(error))"
+                )
+                noteWaiting(.browser, error: error)
             default:
                 break
             }
@@ -313,6 +338,14 @@ final class LanTransport {
         scanPlanner.onNetworkLost()
         automaticScanWorkItem?.cancel()
         automaticScanWorkItem = nil
+        // `diagnostics.waitingForWifi()` below resets the published snapshot
+        // (including the permission-denied flag) to its default; keep this
+        // instance's own bookkeeping in sync so a still-stuck browser after
+        // Wi-Fi returns is re-evaluated instead of being silently skipped
+        // (FI7's flag would otherwise think it already warned).
+        browserWaitingSinceMs = nil
+        listenerWaitingSinceMs = nil
+        permissionWarningActive = false
         cancelRunningScan(updateDiagnostics: false)
         tearDownNetworkLinks()
         diagnostics.waitingForWifi()
@@ -615,6 +648,84 @@ final class LanTransport {
         scheduleAutomaticScan(after: Self.automaticScanRetryInterval)
     }
 
+    // MARK: - FI7: Local Network permission surfacing
+    //
+    // iOS never reports a denied Local Network permission as a distinct
+    // error the way it does Bluetooth authorization -- browsing/listening
+    // just sits in `.waiting` forever, optionally carrying a POSIX/DNS-SD
+    // error that isn't guaranteed to be present or stable. So the signal
+    // used here is behavioral: `.waiting` that persists for a while *while
+    // Wi-Fi itself is reachable* (ruling out the ordinary "no Wi-Fi yet"
+    // case, which the path monitor already reports separately via
+    // `waitingForWifi()`). The known error codes below are logged as a
+    // corroborating detail when present, but never gate the decision --
+    // this could not be exercised against a real denial on this build
+    // machine, so the detection is intentionally defensive.
+
+    private enum LanWaitTarget {
+        case browser
+        case listener
+    }
+
+    /// How long `.waiting` has to persist (with Wi-Fi reachable) before it
+    /// looks like a denied permission rather than an ordinary transient
+    /// wait (e.g. right after the interface comes up).
+    private static let permissionWarningThresholdMs: Int64 = 4_000
+
+    private func noteWaiting(_ target: LanWaitTarget, error: NWError) {
+        let now = Self.nowMs
+        switch target {
+        case .browser:
+            if browserWaitingSinceMs == nil { browserWaitingSinceMs = now }
+        case .listener:
+            if listenerWaitingSinceMs == nil { listenerWaitingSinceMs = now }
+        }
+        queue.asyncAfter(deadline: .now() + .milliseconds(Int(Self.permissionWarningThresholdMs))) { [weak self] in
+            self?.evaluatePermissionWarning()
+        }
+    }
+
+    private func evaluatePermissionWarning() {
+        guard started else { return }
+        let now = Self.nowMs
+        // Only meaningful once Wi-Fi is actually reachable -- otherwise this
+        // is the ordinary "no Wi-Fi" case, surfaced separately.
+        let wifiReachable = activeNetwork != nil || localWifiIPv4Network() != nil
+        let browserStuck = shouldWarnAboutLocalNetworkPermission(
+            waitingSinceMs: browserWaitingSinceMs,
+            nowMs: now,
+            thresholdMs: Self.permissionWarningThresholdMs,
+            wifiReachable: wifiReachable
+        )
+        let listenerStuck = shouldWarnAboutLocalNetworkPermission(
+            waitingSinceMs: listenerWaitingSinceMs,
+            nowMs: now,
+            thresholdMs: Self.permissionWarningThresholdMs,
+            wifiReachable: wifiReachable
+        )
+        guard browserStuck || listenerStuck else { return }
+        guard !permissionWarningActive else { return }
+        permissionWarningActive = true
+        log.warning(
+            "Local Network permission looks denied: LAN discovery/listening has been waiting \(Self.permissionWarningThresholdMs) ms while Wi-Fi is reachable"
+        )
+        diagnostics.localNetworkPermissionLikelyDenied()
+    }
+
+    private func clearPermissionWarningIfNeeded() {
+        guard permissionWarningActive else { return }
+        permissionWarningActive = false
+        diagnostics.localNetworkPermissionResolved()
+    }
+
+    /// Best-effort corroborating detail for the debug log only -- does not
+    /// gate `evaluatePermissionWarning()`. See the MARK above.
+    private static func permissionErrorLogSuffix(_ error: NWError) -> String {
+        isKnownLocalNetworkPermissionError(error)
+            ? " (matches a documented Local Network permission-denied error)"
+            : ""
+    }
+
     private func lanParameters() -> NWParameters {
         let parameters = NWParameters.tcp
         parameters.requiredInterfaceType = .wifi
@@ -871,6 +982,40 @@ func shouldRunAutomaticLanScan(
     scanRemaining: Int
 ) -> Bool {
     activeConnections == 0 && outboundAttempts == 0 && scanRemaining == 0
+}
+
+/// FI7: whether an `NWError` matches one of the documented signals for a
+/// denied Local Network permission. This is a corroborating detail only
+/// (surfaced in the debug log) -- it never gates the actual warning, since
+/// neither error is guaranteed to be present or stable across iOS versions
+/// (see `shouldWarnAboutLocalNetworkPermission`).
+func isKnownLocalNetworkPermissionError(_ error: NWError) -> Bool {
+    switch error {
+    // dns_sd.h: kDNSServiceErr_PolicyDenied = -65570. Referenced by raw
+    // value instead of `import dnssd` so this file doesn't take on a new
+    // module dependency for a log-only corroborating signal.
+    case .dns(let code):
+        return code == -65570
+    case .posix(let code):
+        return code == .EPERM
+    default:
+        return false
+    }
+}
+
+/// FI7: whether a browser/listener stuck `.waiting` since `waitingSinceMs`
+/// looks like a denied Local Network permission rather than an ordinary
+/// transient wait. iOS reports permission denial only as an indefinite,
+/// otherwise-unremarkable `.waiting` -- so the signal here is behavioral
+/// (sustained + Wi-Fi otherwise reachable), not a specific error code.
+func shouldWarnAboutLocalNetworkPermission(
+    waitingSinceMs: Int64?,
+    nowMs: Int64,
+    thresholdMs: Int64,
+    wifiReachable: Bool
+) -> Bool {
+    guard wifiReachable, let since = waitingSinceMs else { return false }
+    return nowMs - since >= thresholdMs
 }
 
 private func serviceKey(_ endpoint: NWEndpoint) -> String {

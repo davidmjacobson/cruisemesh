@@ -14,6 +14,11 @@ struct LanTransportSnapshot {
     var lastActivityAtMs: Int64?
     var scanProgress: Int?
     var scanTotal: Int?
+    /// FI7: the browser/listener has been stuck `.waiting` on reachable
+    /// Wi-Fi for long enough to look like a denied Local Network permission
+    /// rather than ordinary transient waiting. See
+    /// `LanTransport.evaluatePermissionWarning()`.
+    var localNetworkPermissionLikelyDenied = false
 }
 
 final class LanTransportDiagnostics: ObservableObject {
@@ -235,6 +240,26 @@ final class LanTransportDiagnostics: ObservableObject {
             var next = $0
             next.scanProgress = nil
             next.scanTotal = nil
+            return next
+        }
+    }
+
+    /// FI7: LAN discovery/listening has been stuck `.waiting` on reachable
+    /// Wi-Fi long enough to look like a denied Local Network permission.
+    func localNetworkPermissionLikelyDenied() {
+        publish {
+            var next = $0
+            next.localNetworkPermissionLikelyDenied = true
+            return next
+        }
+    }
+
+    /// FI7: the browser or listener reached `.ready`, so whatever was
+    /// blocking it (permission or otherwise) is no longer in the way.
+    func localNetworkPermissionResolved() {
+        publish {
+            var next = $0
+            next.localNetworkPermissionLikelyDenied = false
             return next
         }
     }

@@ -98,6 +98,40 @@ final class LanTransportTests: XCTestCase {
         )
     }
 
+    // FI7: Local Network permission surfacing.
+
+    func testKnownLocalNetworkPermissionErrorsAreRecognized() {
+        XCTAssertTrue(isKnownLocalNetworkPermissionError(.dns(-65_570)))
+        XCTAssertTrue(isKnownLocalNetworkPermissionError(.posix(.EPERM)))
+        XCTAssertFalse(isKnownLocalNetworkPermissionError(.dns(-1)))
+        XCTAssertFalse(isKnownLocalNetworkPermissionError(.posix(.ETIMEDOUT)))
+        XCTAssertFalse(isKnownLocalNetworkPermissionError(.tls(-9_800)))
+    }
+
+    func testLocalNetworkPermissionWarningOnlyFiresAfterSustainedWaitOnReachableWifi() {
+        // No Wi-Fi yet: never warn, no matter how long it's been waiting --
+        // that's the ordinary "waiting for Wi-Fi" case, reported elsewhere.
+        XCTAssertFalse(shouldWarnAboutLocalNetworkPermission(
+            waitingSinceMs: 0, nowMs: 100_000, thresholdMs: 4_000, wifiReachable: false
+        ))
+        // Wi-Fi reachable but not waiting at all.
+        XCTAssertFalse(shouldWarnAboutLocalNetworkPermission(
+            waitingSinceMs: nil, nowMs: 100_000, thresholdMs: 4_000, wifiReachable: true
+        ))
+        // Wi-Fi reachable, waiting, but under threshold: not yet.
+        XCTAssertFalse(shouldWarnAboutLocalNetworkPermission(
+            waitingSinceMs: 10_000, nowMs: 12_000, thresholdMs: 4_000, wifiReachable: true
+        ))
+        // Wi-Fi reachable, waiting past threshold: looks like a denial.
+        XCTAssertTrue(shouldWarnAboutLocalNetworkPermission(
+            waitingSinceMs: 10_000, nowMs: 14_000, thresholdMs: 4_000, wifiReachable: true
+        ))
+        // Exactly at the threshold counts.
+        XCTAssertTrue(shouldWarnAboutLocalNetworkPermission(
+            waitingSinceMs: 10_000, nowMs: 14_000, thresholdMs: 4_000, wifiReachable: true
+        ))
+    }
+
     func testMessageInfoShowsLanArrivalAndDeliveryConfirmation() {
         let timestamp: Int64 = 1_700_000_000_000
         let message = StoredMessage(
