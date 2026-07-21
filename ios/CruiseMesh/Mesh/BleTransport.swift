@@ -38,8 +38,24 @@ final class BleTransport: NSObject {
 
     override init() {
         super.init()
-        central = CBCentralManager(delegate: self, queue: queue)
-        peripheralManager = CBPeripheralManager(delegate: self, queue: queue)
+        // FI3: restoration identifiers let iOS relaunch the app in the
+        // background on a BLE event after jetsam/termination and redeliver
+        // this manager's prior state via `willRestoreState` below, instead
+        // of the mesh silently staying dead until the user reopens the app.
+        // `CruiseMeshApp`'s `AppDelegate.application(_:didFinishLaunchingWithOptions:)`
+        // touches `MeshController.shared` (and therefore this initializer)
+        // as early as possible on such a relaunch so these managers exist
+        // in time for the system to deliver the restore callback.
+        central = CBCentralManager(
+            delegate: self,
+            queue: queue,
+            options: [CBCentralManagerOptionRestoreIdentifierKey: MeshConstants.bleCentralRestoreIdentifier]
+        )
+        peripheralManager = CBPeripheralManager(
+            delegate: self,
+            queue: queue,
+            options: [CBPeripheralManagerOptionRestoreIdentifierKey: MeshConstants.blePeripheralRestoreIdentifier]
+        )
     }
 
     func start() {
@@ -65,6 +81,15 @@ final class BleTransport: NSObject {
                 self.peripheralManager.stopAdvertising()
                 self.peripheralManager.removeAllServices()
             }
+            // FI3: `startAdvertisingIfReady` now treats a non-nil
+            // inboundChar/outboundChar as "the service is still registered
+            // with the peripheral manager, just (re)start advertising" --
+            // true after a restore, but NOT true here, since
+            // `removeAllServices()` just unregistered it. Clear both so the
+            // next `start()` rebuilds the service instead of advertising
+            // with nothing behind it.
+            self.inboundChar = nil
+            self.outboundChar = nil
             self.peripheralsById.removeAll()
             self.writeChars.removeAll()
             self.notifyChars.removeAll()
@@ -159,24 +184,33 @@ final class BleTransport: NSObject {
 
     private func startAdvertisingIfReady() {
         guard running, peripheralManager.state == .poweredOn else { return }
-        let inbound = CBMutableCharacteristic(
-            type: MeshConstants.inboundCharacteristicUUID,
-            properties: [.write, .writeWithoutResponse],
-            value: nil,
-            permissions: [.writeable]
-        )
-        let outbound = CBMutableCharacteristic(
-            type: MeshConstants.outboundCharacteristicUUID,
-            properties: [.notify, .read],
-            value: nil,
-            permissions: [.readable]
-        )
-        inboundChar = inbound
-        outboundChar = outbound
-        let service = CBMutableService(type: MeshConstants.serviceUUID, primary: true)
-        service.characteristics = [inbound, outbound]
-        peripheralManager.removeAllServices()
-        peripheralManager.add(service)
+        // FI3: if `peripheralManager(_:willRestoreState:)` already re-adopted
+        // the mesh service's characteristics (both set below), the service
+        // is still registered with the peripheral manager from before the
+        // relaunch -- removing and re-adding it here would needlessly drop
+        // the `subscribedCentrals` state that was just restored onto
+        // `outboundChar`. Only build + register a fresh service when we
+        // don't already have one.
+        if inboundChar == nil || outboundChar == nil {
+            let inbound = CBMutableCharacteristic(
+                type: MeshConstants.inboundCharacteristicUUID,
+                properties: [.write, .writeWithoutResponse],
+                value: nil,
+                permissions: [.writeable]
+            )
+            let outbound = CBMutableCharacteristic(
+                type: MeshConstants.outboundCharacteristicUUID,
+                properties: [.notify, .read],
+                value: nil,
+                permissions: [.readable]
+            )
+            inboundChar = inbound
+            outboundChar = outbound
+            let service = CBMutableService(type: MeshConstants.serviceUUID, primary: true)
+            service.characteristics = [inbound, outbound]
+            peripheralManager.removeAllServices()
+            peripheralManager.add(service)
+        }
         peripheralManager.startAdvertising([
             CBAdvertisementDataServiceUUIDsKey: [MeshConstants.serviceUUID],
             CBAdvertisementDataLocalNameKey: "CruiseMesh",
@@ -222,6 +256,51 @@ final class BleTransport: NSObject {
 extension BleTransport: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         if central.state == .poweredOn { startScanIfReady() }
+    }
+
+    /// FI3: delivered on a background relaunch after jetsam/termination, for
+    /// a `CBCentralManager` created (in `init`) with a restore identifier
+    /// that matches a prior session's. `running` starts `false` on a fresh
+    /// process, so without this, `startScanIfReady`'s `guard running` would
+    /// silently no-op forever until something else calls `start()` -- there
+    /// is no guarantee any UI ever appears to do that on a background-only
+    /// relaunch. Restoration firing at all is itself proof the mesh was
+    /// active when the process died, so it's safe to resume unconditionally
+    /// here.
+    ///
+    /// Every other piece of connection state this transport tracks
+    /// (`writeChars`, `notifyChars`, `readyCentralAddresses`,
+    /// `centralMtuPayload`, ...) is in-memory only and does not survive the
+    /// relaunch, so it is deliberately NOT assumed valid for the restored
+    /// peripherals here -- rediscovering services on each one drives the
+    /// exact same `didDiscoverServices` -> `didDiscoverCharacteristicsFor`
+    /// -> `markCentralReadyIfPossible` chain a fresh connection would, which
+    /// re-populates all of it and fires `onCentralConnected` normally.
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        running = true
+        let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+        log.info("Central manager restoring state: \(peripherals.count) peripheral(s)")
+        for peripheral in peripherals {
+            let address = peripheral.identifier.uuidString
+            peripheral.delegate = self
+            peripheralsById[address] = peripheral
+            reassemblers[address] = FrameReassembler()
+            if peripheral.state == .connected {
+                peripheral.discoverServices([MeshConstants.serviceUUID])
+            }
+            // Not connected (`.connecting`/`.disconnecting`/`.disconnected`):
+            // nothing to rediscover yet -- `didFailToConnect`/
+            // `didDisconnectPeripheral` were never delivered for this
+            // process, so `scheduleReconnect`'s backoff bookkeeping also
+            // never ran; the scan restarted below is what picks it back up.
+        }
+        // Central.state may still be `.unknown` at this point (Apple
+        // delivers `willRestoreState` before the first
+        // `centralManagerDidUpdateState`) -- harmless either way, since
+        // `startScanIfReady` re-checks `.poweredOn` itself and
+        // `centralManagerDidUpdateState` will call it again once state
+        // actually changes.
+        startScanIfReady()
     }
 
     func centralManager(
@@ -347,6 +426,46 @@ extension BleTransport: CBPeripheralDelegate {
 extension BleTransport: CBPeripheralManagerDelegate {
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
         if peripheral.state == .poweredOn { startAdvertisingIfReady() }
+    }
+
+    /// FI3: twin of `centralManager(_:willRestoreState:)` for the peripheral
+    /// (advertiser) role. Re-adopts the mesh service's characteristics if
+    /// the system handed them back so `startAdvertisingIfReady` below can
+    /// skip rebuilding the service (see its doc), and re-seeds
+    /// `subscribedCentrals`/`peripheralMtuPayload` from
+    /// `CBMutableCharacteristic.subscribedCentrals` -- which the system DOES
+    /// restore onto the returned characteristic objects, unlike this
+    /// transport's own dictionaries -- so `sendAsPeripheral` can resume
+    /// writing to already-subscribed centrals without waiting for them to
+    /// resubscribe on their own. Fires `onPeripheralSubscribed` for each one,
+    /// same as a live `didSubscribeTo` -- `MeshController` needs that to
+    /// re-register the route with `MeshRouter` and re-send `Hello`.
+    func peripheralManager(_ peripheral: CBPeripheralManager, willRestoreState dict: [String: Any]) {
+        running = true
+        let services = dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService] ?? []
+        log.info("Peripheral manager restoring state: \(services.count) service(s)")
+        for service in services where service.uuid == MeshConstants.serviceUUID {
+            for characteristic in service.characteristics ?? [] {
+                guard let mutable = characteristic as? CBMutableCharacteristic else { continue }
+                if mutable.uuid == MeshConstants.inboundCharacteristicUUID {
+                    inboundChar = mutable
+                } else if mutable.uuid == MeshConstants.outboundCharacteristicUUID {
+                    outboundChar = mutable
+                    for central in mutable.subscribedCentrals ?? [] {
+                        let address = central.identifier.uuidString
+                        subscribedCentrals[address] = central
+                        reassemblers[address] = FrameReassembler()
+                        peripheralMtuPayload[address] = max(20, central.maximumUpdateValueLength)
+                        onPeripheralSubscribed?(address)
+                    }
+                }
+            }
+        }
+        // Peripheral.state may still be `.unknown` here for the same reason
+        // noted in the central twin -- `startAdvertisingIfReady` re-checks
+        // `.poweredOn` itself and `peripheralManagerDidUpdateState` will
+        // call it again once state actually changes.
+        startAdvertisingIfReady()
     }
 
     func peripheralManager(

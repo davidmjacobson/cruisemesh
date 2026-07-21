@@ -4,7 +4,10 @@ import SwiftUI
 
 @MainActor
 final class AppModel: ObservableObject {
-    private static let meshEnabledKey = "cruisemesh.mesh.enabled"
+    // FI3: not `private` so `AppDelegate` (CruiseMeshApp.swift) can check
+    // the same persisted preference before `AppModel` itself exists, on a
+    // background BLE-restoration relaunch.
+    static let meshEnabledKey = "cruisemesh.mesh.enabled"
 
     let identity: Identity
     @Published var displayName: String

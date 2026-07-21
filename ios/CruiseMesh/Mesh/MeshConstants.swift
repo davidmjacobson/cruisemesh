@@ -20,4 +20,17 @@ enum MeshConstants {
         _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
         return Data(bytes)
     }()
+
+    /// FI3: stable CoreBluetooth state-restoration identifiers. Passed to
+    /// `CBCentralManager`/`CBPeripheralManager` at creation
+    /// (`BleTransport.init`) so that when iOS relaunches the app in the
+    /// background after a BLE event (following jetsam or a manual kill --
+    /// `UIBackgroundModes` already declares both `bluetooth-central` and
+    /// `bluetooth-peripheral`), the system can correlate the new manager
+    /// instances back to the ones that were scanning/advertising/connected
+    /// before termination and deliver `willRestoreState`. Must stay stable
+    /// across app versions/launches -- the system keys restoration off this
+    /// exact string, not any in-memory identity.
+    static let bleCentralRestoreIdentifier = "com.cruisemesh.ble.central"
+    static let blePeripheralRestoreIdentifier = "com.cruisemesh.ble.peripheral"
 }
