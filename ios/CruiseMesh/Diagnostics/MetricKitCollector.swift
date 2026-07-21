@@ -3,16 +3,20 @@ import MetricKit
 import os.log
 
 /// Battery audit follow-up (2026-07-21): a minimal MetricKit subscriber.
-/// `start()` is called once at app launch (`CruiseMeshApp`'s `onAppear`,
-/// alongside the other one-time registrations); the OS then delivers a daily
+/// `start()` is called once at app launch, from
+/// `AppDelegate.application(_:didFinishLaunchingWithOptions:)`
+/// (`CruiseMeshApp.swift`) rather than a SwiftUI `onAppear` -- that method
+/// runs unconditionally on every launch, including a headless background BLE
+/// relaunch that never shows any UI, and MetricKit wants subscribers added
+/// as early as possible in every launch. The OS then delivers a daily
 /// `MXMetricPayload` roughly once every 24 hours (plus sometimes one shortly
 /// after launch covering the prior period) via `didReceive`.
 ///
 /// Each payload is reduced to a small JSON summary -- `cpuMetrics`,
 /// `applicationTimeMetrics`, and `networkTransferMetrics`, the battery/CPU/
 /// network fields the audit called out -- and written into
-/// `DiagnosticLogExport.metricKitDirectory()`, the same place T13's "Share
-/// diagnostics" flow (`ProfileView.swift`) already looks for files to attach.
+/// `DiagnosticLogExport.metricKitDirectory()`, the same place the existing
+/// "Share diagnostics" flow already looks for files to attach.
 /// That means this rides the existing share flow with zero new UI: no new
 /// screen, no new button, no new setting.
 ///
