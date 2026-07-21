@@ -1,7 +1,28 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::DigestEntry;
+
+/// FC6: recover from mutex poisoning instead of propagating it as a panic.
+/// `Mutex::lock` returns `Err` if some earlier locker panicked while
+/// holding the lock; the stdlib's default advice is to treat the protected
+/// data as possibly inconsistent, but every `Mutex` in this file only ever
+/// guards a plain `HashMap` of local scheduling state (peer routes, backoff
+/// timers, LAN health) -- there is no multi-step invariant that a panic
+/// mid-update could leave torn in a way that matters here. Without this, the
+/// first panic under any of these locks (a bug, an unexpected input) would
+/// poison the mutex permanently: every later call from the UniFFI boundary
+/// would itself panic natively, turning one bug into a crash loop until the
+/// process restarts.
+trait PoisonRecoverable<T> {
+    fn lock_recoverable(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> PoisonRecoverable<T> for Mutex<T> {
+    fn lock_recoverable(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 pub const SMALL_FRAME_RACE_MAX_BYTES: u32 = 8 * 1024;
 pub const DEFAULT_INITIAL_BACKOFF_MS: i64 = 5_000;
@@ -102,7 +123,7 @@ impl CoreMeshRouterState {
     }
 
     pub fn on_connected(&self, address: String, transport: CoreTransport) {
-        self.peers.lock().unwrap().insert(
+        self.peers.lock_recoverable().insert(
             address,
             Peer {
                 transport,
@@ -112,11 +133,11 @@ impl CoreMeshRouterState {
     }
 
     pub fn on_disconnected(&self, address: String) {
-        self.peers.lock().unwrap().remove(&address);
+        self.peers.lock_recoverable().remove(&address);
     }
 
     pub fn on_hello(&self, address: String, user_id: Vec<u8>) -> bool {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.lock_recoverable();
         let Some(peer) = peers.get_mut(&address) else {
             return false;
         };
@@ -129,24 +150,21 @@ impl CoreMeshRouterState {
 
     pub fn user_id_for(&self, address: String) -> Option<Vec<u8>> {
         self.peers
-            .lock()
-            .unwrap()
+            .lock_recoverable()
             .get(&address)
             .and_then(|peer| peer.user_id.clone())
     }
 
     pub fn transport_for(&self, address: String) -> Option<CoreTransport> {
         self.peers
-            .lock()
-            .unwrap()
+            .lock_recoverable()
             .get(&address)
             .map(|peer| peer.transport)
     }
 
     pub fn connected_routes(&self) -> Vec<CoreTransportRoute> {
         self.peers
-            .lock()
-            .unwrap()
+            .lock_recoverable()
             .iter()
             .map(|(address, peer)| CoreTransportRoute {
                 transport: peer.transport,
@@ -157,8 +175,7 @@ impl CoreMeshRouterState {
 
     pub fn identified_routes(&self) -> Vec<CoreIdentifiedRoute> {
         self.peers
-            .lock()
-            .unwrap()
+            .lock_recoverable()
             .iter()
             .filter_map(|(address, peer)| {
                 peer.user_id.as_ref().map(|user_id| CoreIdentifiedRoute {
@@ -172,8 +189,7 @@ impl CoreMeshRouterState {
 
     pub fn connected_user_count(&self) -> u32 {
         self.peers
-            .lock()
-            .unwrap()
+            .lock_recoverable()
             .values()
             .filter_map(|peer| peer.user_id.clone())
             .collect::<HashSet<_>>()
@@ -187,8 +203,7 @@ impl CoreMeshRouterState {
     pub fn routes_for(&self, user_id: Vec<u8>) -> Vec<CoreTransportRoute> {
         let mut routes: Vec<_> = self
             .peers
-            .lock()
-            .unwrap()
+            .lock_recoverable()
             .iter()
             .filter(|(_, peer)| peer.user_id.as_ref() == Some(&user_id))
             .map(|(address, peer)| CoreTransportRoute {
@@ -202,8 +217,7 @@ impl CoreMeshRouterState {
 
     pub fn helloed_user_ids(&self) -> Vec<Vec<u8>> {
         self.peers
-            .lock()
-            .unwrap()
+            .lock_recoverable()
             .values()
             .filter_map(|peer| peer.user_id.clone())
             .collect::<HashSet<_>>()
@@ -213,13 +227,12 @@ impl CoreMeshRouterState {
 
     pub fn clear_transports(&self, transports: Vec<CoreTransport>) {
         self.peers
-            .lock()
-            .unwrap()
+            .lock_recoverable()
             .retain(|_, peer| !transports.contains(&peer.transport));
     }
 
     pub fn clear(&self) {
-        self.peers.lock().unwrap().clear();
+        self.peers.lock_recoverable().clear();
     }
 }
 
@@ -275,8 +288,7 @@ impl CoreReconnectBackoffTracker {
 
     pub fn can_attempt(&self, address: String, now_ms: i64) -> bool {
         self.state
-            .lock()
-            .unwrap()
+            .lock_recoverable()
             .get(&address)
             .map_or(true, |state| {
                 state.consecutive_failures < self.max_consecutive_failures
@@ -290,21 +302,23 @@ impl CoreReconnectBackoffTracker {
 
     pub fn failure_count(&self, address: String) -> u32 {
         self.state
-            .lock()
-            .unwrap()
+            .lock_recoverable()
             .get(&address)
             .map_or(0, |state| state.consecutive_failures)
     }
 
     pub fn retry_delay_ms(&self, address: String, now_ms: i64) -> Option<i64> {
-        self.state.lock().unwrap().get(&address).and_then(|state| {
-            (state.consecutive_failures < self.max_consecutive_failures)
-                .then(|| state.next_eligible_at_ms.saturating_sub(now_ms).max(0))
-        })
+        self.state
+            .lock_recoverable()
+            .get(&address)
+            .and_then(|state| {
+                (state.consecutive_failures < self.max_consecutive_failures)
+                    .then(|| state.next_eligible_at_ms.saturating_sub(now_ms).max(0))
+            })
     }
 
     pub fn record_failure(&self, address: String, now_ms: i64) -> u32 {
-        let mut states = self.state.lock().unwrap();
+        let mut states = self.state.lock_recoverable();
         let failures = states
             .get(&address)
             .map_or(1, |state| state.consecutive_failures.saturating_add(1));
@@ -326,10 +340,10 @@ impl CoreReconnectBackoffTracker {
     }
 
     pub fn record_success(&self, address: String) {
-        self.state.lock().unwrap().remove(&address);
+        self.state.lock_recoverable().remove(&address);
     }
     pub fn clear(&self) {
-        self.state.lock().unwrap().clear();
+        self.state.lock_recoverable().clear();
     }
 }
 
@@ -372,7 +386,7 @@ impl CoreLanHealthTracker {
     }
 
     pub fn next(&self, address: String, now_ms: i64, nonce: u64) -> CoreLanHealthDecision {
-        let mut links = self.links.lock().unwrap();
+        let mut links = self.links.lock_recoverable();
         let Some(current) = links.get(&address).copied() else {
             links.insert(
                 address,
@@ -415,7 +429,7 @@ impl CoreLanHealthTracker {
     }
 
     pub fn response(&self, address: String, nonce: u64, now_ms: i64) -> Option<i64> {
-        let mut links = self.links.lock().unwrap();
+        let mut links = self.links.lock_recoverable();
         let current = links.get(&address).copied()?;
         if current.pending_nonce != Some(nonce) {
             return None;
@@ -432,10 +446,10 @@ impl CoreLanHealthTracker {
     }
 
     pub fn remove(&self, address: String) {
-        self.links.lock().unwrap().remove(&address);
+        self.links.lock_recoverable().remove(&address);
     }
     pub fn clear(&self) {
-        self.links.lock().unwrap().clear();
+        self.links.lock_recoverable().clear();
     }
 }
 
@@ -446,6 +460,30 @@ fn health_decision(action: CoreLanHealthAction, nonce: Option<u64>) -> CoreLanHe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn router_recovers_from_a_poisoned_mutex_instead_of_crash_looping() {
+        // FC6: before lock_recoverable, every method here did
+        // `self.peers.lock().unwrap()` -- one panic while holding the lock
+        // would poison the Mutex forever, and every later call would itself
+        // panic. Simulate that first panic (inside catch_unwind so the test
+        // process survives) and confirm a later call still succeeds.
+        let router = CoreMeshRouterState::new();
+        router.on_connected("ble".into(), CoreTransport::Central);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = router.peers.lock().unwrap();
+            panic!("FC6 test: simulated panic while holding the peers mutex");
+        }));
+        assert!(panicked.is_err(), "the closure above should have panicked");
+        assert!(router.peers.is_poisoned());
+
+        // A later call through the normal API must recover the guard and
+        // succeed, not panic -- and the state from before the panic (the
+        // "ble" peer) must still be there since the panic never touched it.
+        assert!(router.on_hello("ble".into(), vec![1]));
+        assert_eq!(router.connected_user_count(), 1);
+    }
 
     #[test]
     fn redigest_waits_for_the_jittered_interval() {

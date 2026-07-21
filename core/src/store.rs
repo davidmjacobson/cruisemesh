@@ -108,13 +108,30 @@ use blake2::Blake2bVar;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::groups::{canonicalize_members, validate_group};
 use crate::{
     verify_introduction_ticket, CoreError, FriendDirectoryContent, Group, IntroductionTicket,
     SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST,
 };
+
+/// FC6: recover from mutex poisoning instead of propagating it as a panic.
+/// `Mutex::lock` returns `Err` if a prior locker panicked while holding the
+/// lock; the stdlib's default guidance is that the protected data might be
+/// left in an inconsistent state. But every store write here runs inside a
+/// rusqlite transaction (`Connection::transaction`/`tx.commit()`), so a
+/// panic mid-write simply means the transaction was never committed --
+/// SQLite's own atomicity already leaves the connection in a state that's
+/// safe to keep using; there is nothing about a poisoned `Mutex<Connection>`
+/// that makes the connection itself unsafe. Without this, the first panic
+/// under the lock (a bug, an unexpected SQLite error path, an OOM) would
+/// poison the mutex permanently: every later store call from the UniFFI
+/// boundary would itself panic natively, turning one bug into a
+/// process-wide crash loop until the app restarts.
+fn lock_conn(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
+    conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 const MESSAGE_ID_LEN: usize = 16;
 const CARRIED_CONTENT_DIGEST_LEN: usize = 32;
@@ -447,10 +464,7 @@ impl MessageStore {
                 "backup destination parent is not a directory".into(),
             ));
         }
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| CoreError::Store("store lock is unavailable".into()))?;
+        let conn = lock_conn(&self.conn);
         conn.execute("VACUUM INTO ?1", params![destination.to_string_lossy()])
             .map_err(store_err)?;
         Ok(())
@@ -528,7 +542,7 @@ mod incoming_message_reference {
         reply_to_msg_id: Option<Vec<u8>>,
     ) -> Result<bool, CoreError> {
         validate_stored_message(&message)?;
-        let mut conn = store.conn.lock().expect("store mutex poisoned");
+        let mut conn = lock_conn(&store.conn);
         let tx = conn.transaction().map_err(store_err)?;
 
         let inserted = tx
@@ -706,7 +720,7 @@ mod outgoing_message_reference {
     ) -> Result<bool, CoreError> {
         validate_stored_message(&message)?;
         validate_sqlite_u64("envelope lamport", envelope.lamport)?;
-        let mut conn = store.conn.lock().expect("store mutex poisoned");
+        let mut conn = lock_conn(&store.conn);
         let tx = conn.transaction().map_err(store_err)?;
         tx.execute(
             "INSERT OR IGNORE INTO messages
@@ -788,7 +802,7 @@ impl MessageStore {
     /// counter is smaller. `id` is only a stable tie-breaker for equal
     /// timestamps.
     pub fn messages_for_chat(&self, chat_id: Vec<u8>) -> Result<Vec<StoredMessage>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
                 "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
@@ -809,7 +823,7 @@ impl MessageStore {
         sender_user_id: Vec<u8>,
         lamport: u64,
     ) -> Result<Option<MessageReference>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT msg_id, reply_to_msg_id
              FROM messages
@@ -835,7 +849,7 @@ impl MessageStore {
         sender_user_id: Vec<u8>,
         lamport: u64,
     ) -> Result<Option<i64>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT outbound_expiry FROM messages
              WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
@@ -854,7 +868,7 @@ impl MessageStore {
         chat_id: Vec<u8>,
         msg_id: Vec<u8>,
     ) -> Result<Option<StoredMessage>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
              FROM messages
@@ -899,7 +913,7 @@ impl MessageStore {
         &self,
         msg_id: Vec<u8>,
     ) -> Result<Option<MessageOrigin>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT chat_id, sender_user_id FROM messages
              WHERE msg_id = ?1 ORDER BY id ASC LIMIT 1",
@@ -931,7 +945,7 @@ impl MessageStore {
                 "invalid message arrival transport".to_string(),
             ));
         }
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let changed = conn
             .execute(
                 "UPDATE messages
@@ -981,7 +995,7 @@ impl MessageStore {
         sent_at_ms: i64,
     ) -> Result<(), CoreError> {
         validate_sqlite_u64("metric lamport", lamport)?;
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.execute(
             "INSERT OR IGNORE INTO delivery_metrics
                 (chat_hash, lamport, direction, sender_hash, at_ms)
@@ -1011,7 +1025,7 @@ impl MessageStore {
         via_transport: Option<u8>,
     ) -> Result<(), CoreError> {
         validate_sqlite_u64("metric lamport", through_lamport)?;
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.execute(
             "UPDATE delivery_metrics
              SET delivered_at_ms = ?3, via_transport = ?4
@@ -1034,7 +1048,7 @@ impl MessageStore {
     /// [`MessageArrival::transport`] encoding (0/1 BLE direct/muled, 2 relay,
     /// 3/4 LAN direct/muled). Empty cells are unknown/not-applicable.
     pub fn export_delivery_metrics_csv(&self) -> Result<String, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
                 "SELECT chat_hash, lamport, direction, sender_hash, at_ms, delivered_at_ms,
@@ -1096,7 +1110,7 @@ impl MessageStore {
         sender_user_id: Vec<u8>,
         lamport: u64,
     ) -> Result<Option<MessageArrival>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT arrival_transport, hops_taken, received_at
              FROM messages
@@ -1124,7 +1138,7 @@ impl MessageStore {
         chat_id: Vec<u8>,
         sender_user_id: Vec<u8>,
     ) -> Result<u64, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         highest_contiguous_lamport_locked(&conn, &chat_id, &sender_user_id)
     }
 
@@ -1167,7 +1181,7 @@ impl MessageStore {
         chat_id: Vec<u8>,
         sender_user_id: Vec<u8>,
     ) -> Result<u64, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT COALESCE(MAX(lamport), 0) FROM messages
              WHERE chat_id = ?1 AND sender_user_id = ?2",
@@ -1185,7 +1199,7 @@ impl MessageStore {
     /// docs for why this covers only the contiguous-lamport half of §7.3's
     /// digest (the recent-msg_id bloom filter is deferred).
     pub fn chat_digest(&self, chat_id: Vec<u8>) -> Result<Vec<DigestEntry>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
                 "SELECT DISTINCT sender_user_id FROM messages
@@ -1219,7 +1233,7 @@ impl MessageStore {
         sender_user_id: Vec<u8>,
         after_lamport: u64,
     ) -> Result<Vec<StoredMessage>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
                 "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
@@ -1249,7 +1263,7 @@ impl MessageStore {
         sender_user_id: Vec<u8>,
         after_lamport: u64,
     ) -> Result<Vec<OutboundEnvelope>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
                 "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, kind, lamport,
@@ -1275,7 +1289,7 @@ impl MessageStore {
         limit: u64,
         now_ms: i64,
     ) -> Result<Vec<OutboundEnvelope>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
                 "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, kind, lamport,
@@ -1299,7 +1313,7 @@ impl MessageStore {
         msg_id: Vec<u8>,
         posted_at_ms: i64,
     ) -> Result<bool, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let changed = conn
             .execute(
                 "UPDATE outbound_envelopes SET relay_posted_at = ?2 WHERE msg_id = ?1",
@@ -1313,7 +1327,7 @@ impl MessageStore {
     /// message history stays intact; this only prunes retry state whose public
     /// expiry window has elapsed.
     pub fn prune_expired_outbound_envelopes(&self, now_ms: i64) -> Result<u64, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let pruned = conn
             .execute(
                 "DELETE FROM outbound_envelopes WHERE expiry <= ?1",
@@ -1331,7 +1345,7 @@ impl MessageStore {
         sender_user_id: Vec<u8>,
         receipt_type: u8,
     ) -> Result<Option<OutgoingReceiptEnvelope>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, receipt_type,
                     through_lamport, timestamp, hop_ttl, expiry, recipient_hint, sealed
@@ -1354,7 +1368,7 @@ impl MessageStore {
         queued_at_ms: i64,
     ) -> Result<bool, CoreError> {
         validate_receipt_watermark(envelope.receipt_type, envelope.through_lamport)?;
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
         let existing: Option<i64> = tx
             .query_row(
@@ -1440,7 +1454,7 @@ impl MessageStore {
         limit: u64,
         now_ms: i64,
     ) -> Result<Vec<OutgoingReceiptEnvelope>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
                 "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, receipt_type,
@@ -1464,7 +1478,7 @@ impl MessageStore {
         msg_id: Vec<u8>,
         posted_at_ms: i64,
     ) -> Result<bool, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let changed = conn
             .execute(
                 "UPDATE outgoing_receipt_envelopes SET relay_posted_at = ?2 WHERE msg_id = ?1",
@@ -1478,7 +1492,7 @@ impl MessageStore {
     /// underlying outgoing receipt watermark remains in `outgoing_receipts`;
     /// this only prunes the persisted sealed retry artifact.
     pub fn prune_expired_outgoing_receipt_envelopes(&self, now_ms: i64) -> Result<u64, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let pruned = conn
             .execute(
                 "DELETE FROM outgoing_receipt_envelopes WHERE expiry <= ?1",
@@ -1517,7 +1531,7 @@ impl MessageStore {
         via_transport: Option<u8>,
     ) -> Result<(), CoreError> {
         validate_receipt_watermark(receipt_type, through_lamport)?;
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.execute(
             "INSERT INTO receipts (chat_id, sender_user_id, receipt_type, through_lamport, via_transport)
                 VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1553,7 +1567,7 @@ impl MessageStore {
         sender_user_id: Vec<u8>,
         receipt_type: u8,
     ) -> Result<u64, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let through: Option<i64> = conn
             .query_row(
                 "SELECT through_lamport FROM receipts
@@ -1579,7 +1593,7 @@ impl MessageStore {
         sender_user_id: Vec<u8>,
         receipt_type: u8,
     ) -> Result<Option<u8>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let via: Option<Option<i64>> = conn
             .query_row(
                 "SELECT via_transport FROM receipts
@@ -1606,7 +1620,7 @@ impl MessageStore {
         through_lamport: u64,
     ) -> Result<(), CoreError> {
         validate_receipt_watermark(receipt_type, through_lamport)?;
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.execute(
             "INSERT INTO outgoing_receipts (chat_id, sender_user_id, receipt_type, through_lamport)
                 VALUES (?1, ?2, ?3, ?4)
@@ -1633,7 +1647,7 @@ impl MessageStore {
         sender_user_id: Vec<u8>,
         receipt_type: u8,
     ) -> Result<u64, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let through: Option<i64> = conn
             .query_row(
                 "SELECT through_lamport FROM outgoing_receipts
@@ -1650,7 +1664,7 @@ impl MessageStore {
     /// FriendCard (e.g. after they update their display name) replaces the
     /// row rather than erroring or duplicating.
     pub fn upsert_contact(&self, contact: Contact) -> Result<(), CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.execute(
             "INSERT INTO contacts (user_id, name, sign_pk, agree_pk, relay_url, relay_token)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -1676,7 +1690,7 @@ impl MessageStore {
     /// Import a friend card without allowing an older/blank card to erase a
     /// complete relay configuration already known for that contact.
     pub fn upsert_imported_contact(&self, mut contact: Contact) -> Result<Contact, CoreError> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
         let incoming_has_relay = contact
             .relay_url
@@ -1739,7 +1753,7 @@ impl MessageStore {
         avatar: Option<Vec<u8>>,
         epoch: i64,
     ) -> Result<bool, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let avatar = avatar.filter(|bytes| !bytes.is_empty());
         let changed = conn
             .execute(
@@ -1761,7 +1775,7 @@ impl MessageStore {
         user_id: Vec<u8>,
         nickname: Option<String>,
     ) -> Result<bool, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let nickname = nickname
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
@@ -1776,7 +1790,7 @@ impl MessageStore {
 
     /// The canonical JPEG avatar bytes for a contact, if one has been synced.
     pub fn contact_avatar(&self, user_id: Vec<u8>) -> Result<Option<Vec<u8>>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT avatar FROM contacts WHERE user_id = ?1",
             params![user_id],
@@ -1789,7 +1803,7 @@ impl MessageStore {
 
     /// The newest avatar/display-name profile-sync epoch applied for a contact.
     pub fn contact_avatar_epoch(&self, user_id: Vec<u8>) -> Result<i64, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let epoch: Option<i64> = conn
             .query_row(
                 "SELECT avatar_epoch FROM contacts WHERE user_id = ?1",
@@ -1833,7 +1847,7 @@ impl MessageStore {
     /// Atomic (single transaction) and idempotent: deleting an unknown
     /// contact is a no-op. Returns `true` if a contact row was removed.
     pub fn delete_contact(&self, user_id: Vec<u8>) -> Result<bool, CoreError> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
         let removed = tx
             .execute("DELETE FROM contacts WHERE user_id = ?1", params![user_id])
@@ -1889,7 +1903,7 @@ impl MessageStore {
 
     /// Look up a single contact by UserID, or `None` if not a contact.
     pub fn get_contact(&self, user_id: Vec<u8>) -> Result<Option<Contact>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT user_id, name, sign_pk, agree_pk, relay_url, relay_token, nickname FROM contacts WHERE user_id = ?1",
             params![user_id],
@@ -1901,7 +1915,7 @@ impl MessageStore {
 
     /// All contacts, alphabetical by name.
     pub fn list_contacts(&self) -> Result<Vec<Contact>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare("SELECT user_id, name, sign_pk, agree_pk, relay_url, relay_token, nickname FROM contacts ORDER BY name ASC")
             .map_err(store_err)?;
@@ -1914,7 +1928,7 @@ impl MessageStore {
         &self,
         policy: ContactDiscoveryPolicy,
     ) -> Result<bool, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let changed = conn
             .execute(
                 "INSERT INTO contact_discovery_policy
@@ -1941,7 +1955,7 @@ impl MessageStore {
         &self,
         user_id: Vec<u8>,
     ) -> Result<Option<ContactDiscoveryPolicy>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT user_id, protocol_version, enabled, revision
              FROM contact_discovery_policy WHERE user_id = ?1",
@@ -1972,7 +1986,7 @@ impl MessageStore {
         if content.version != 1 || content.entries.len() > 64 {
             return Err(CoreError::Malformed("invalid friend directory".to_string()));
         }
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
         let introducer_sign_pk: Option<Vec<u8>> = tx
             .query_row(
@@ -2083,7 +2097,7 @@ impl MessageStore {
     }
 
     pub fn list_friend_suggestions(&self, now_ms: i64) -> Result<Vec<FriendSuggestion>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
                 "SELECT s.candidate_user_id, s.name, s.sign_pk, s.agree_pk,
@@ -2141,7 +2155,7 @@ impl MessageStore {
         if state > 2 {
             return Err(CoreError::Malformed("invalid suggestion state".to_string()));
         }
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.execute(
             "INSERT INTO friend_suggestion_state (candidate_user_id, state)
              VALUES (?1, ?2)
@@ -2153,7 +2167,7 @@ impl MessageStore {
     }
 
     pub fn remove_friend_suggestion(&self, candidate_user_id: Vec<u8>) -> Result<(), CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.execute(
             "DELETE FROM friend_suggestions WHERE candidate_user_id = ?1",
             params![candidate_user_id],
@@ -2168,7 +2182,7 @@ impl MessageStore {
     }
 
     pub fn clear_friend_suggestions(&self) -> Result<(), CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.execute_batch(
             "DELETE FROM friend_suggestions;
              DELETE FROM friend_directory_state;",
@@ -2185,7 +2199,7 @@ impl MessageStore {
                 "invalid contact provenance".to_string(),
             ));
         }
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.execute(
             "INSERT INTO contact_provenance
                 (user_id, source, introducer_user_id, introduced_at_ms)
@@ -2211,7 +2225,7 @@ impl MessageStore {
         &self,
         user_id: Vec<u8>,
     ) -> Result<Option<ContactProvenance>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT user_id, source, introducer_user_id, introduced_at_ms
              FROM contact_provenance WHERE user_id = ?1",
@@ -2234,7 +2248,7 @@ impl MessageStore {
     /// which is the v1 rotation path for membership changes.
     pub fn upsert_group(&self, group: Group) -> Result<(), CoreError> {
         validate_group(&group)?;
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
         upsert_group_tx(&tx, &group)?;
         tx.commit().map_err(store_err)?;
@@ -2243,7 +2257,7 @@ impl MessageStore {
 
     /// Look up one imported group by id, including its current member list.
     pub fn get_group(&self, group_id: Vec<u8>) -> Result<Option<Group>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let row: Option<GroupRow> = conn
             .query_row(
                 "SELECT group_id, name, group_key, metadata_revision, metadata_changed_by
@@ -2258,7 +2272,7 @@ impl MessageStore {
 
     /// All imported groups, alphabetical by name then id for stable ordering.
     pub fn list_groups(&self) -> Result<Vec<Group>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let raw = {
             let mut stmt = conn
                 .prepare(
@@ -2283,7 +2297,7 @@ impl MessageStore {
     /// just clutter: they re-arm the reset-stream trap fixed in fc6b9f9 and
     /// paint false read-ticks). Atomic and idempotent.
     pub fn delete_group(&self, group_id: Vec<u8>) -> Result<bool, CoreError> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
         tx.execute(
             "DELETE FROM group_members WHERE group_id = ?1",
@@ -2349,7 +2363,7 @@ impl MessageStore {
     ) -> Result<bool, CoreError> {
         validate_carried_envelope(&envelope, received_at_ms)?;
         let content_digest = carried_content_digest(&envelope.recipient_hint, &envelope.sealed);
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
         let size = envelope.sealed.len() as i64;
         let changed = tx
@@ -2417,7 +2431,7 @@ impl MessageStore {
     ) -> Result<bool, CoreError> {
         validate_carried_envelope(&envelope, now_ms)?;
         let content_digest = carried_content_digest(&envelope.recipient_hint, &envelope.sealed);
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
         let size = envelope.sealed.len() as i64;
         let changed = tx
@@ -2465,7 +2479,7 @@ impl MessageStore {
         if hints.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let placeholders = std::iter::repeat("?")
             .take(hints.len())
             .collect::<Vec<_>>()
@@ -2493,7 +2507,7 @@ impl MessageStore {
     /// a peer to say "I already carry these" so another mule doesn't blindly
     /// resend them on every reconnect.
     pub fn carried_msg_ids(&self, limit: u64) -> Result<Vec<Vec<u8>>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
                 "SELECT msg_id FROM carried_envelopes
@@ -2542,7 +2556,7 @@ impl MessageStore {
     /// predate envelope-id recording don't have one and are silently skipped
     /// by the `WHERE` clause.
     pub fn recent_consumed_msg_ids(&self, limit: u64) -> Result<Vec<Vec<u8>>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
                 "SELECT msg_id FROM messages
@@ -2577,7 +2591,7 @@ impl MessageStore {
         peer_known_msg_ids: Vec<Vec<u8>>,
         now_ms: i64,
     ) -> Result<Vec<CarriedEnvelope>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut sql = String::from(
             "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
              FROM carried_envelopes
@@ -2602,7 +2616,7 @@ impl MessageStore {
     /// its recipient (DESIGN.md §5.3: a mule's job is done on delivery).
     /// Returns `true` if a row was removed.
     pub fn remove_carried_envelope(&self, msg_id: Vec<u8>) -> Result<bool, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let removed = conn
             .execute(
                 "DELETE FROM carried_envelopes WHERE msg_id = ?1",
@@ -2616,7 +2630,7 @@ impl MessageStore {
     /// (DESIGN.md §5.3: "carriers drop the envelope past this time"). Returns
     /// how many were pruned.
     pub fn prune_expired_carried(&self, now_ms: i64) -> Result<u64, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let pruned = conn
             .execute(
                 "DELETE FROM carried_envelopes WHERE expiry <= ?1",
@@ -2628,7 +2642,7 @@ impl MessageStore {
 
     /// Number of envelopes currently in the carry queue (diagnostics/tests).
     pub fn carried_len(&self) -> Result<u64, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM carried_envelopes", [], |row| {
                 row.get(0)
@@ -2650,7 +2664,7 @@ impl MessageStore {
         limit: u64,
         now_ms: i64,
     ) -> Result<Vec<CarriedEnvelope>, CoreError> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
                 "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
@@ -4772,7 +4786,7 @@ mod tests {
         // SQLite falls back to a full scan plus a temp b-tree for the ORDER
         // BY. `idx_carried_family_upload` covers both.
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        let conn = store.conn.lock().unwrap();
+        let conn = lock_conn(&store.conn);
         let plan: Vec<String> = conn
             .prepare(
                 "EXPLAIN QUERY PLAN
@@ -7284,7 +7298,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut conn = store.conn.lock().unwrap();
+        let mut conn = lock_conn(&store.conn);
         let tx = conn.transaction().unwrap();
         enforce_carried_budgets(&tx, BIG_BUDGET, 200).unwrap();
         tx.commit().unwrap();
@@ -7293,7 +7307,7 @@ mod tests {
         let ids = store.carried_msg_ids(10).unwrap();
         assert_eq!(ids, vec![b"family-old".to_vec(), b"family-new".to_vec()]);
 
-        let mut conn = store.conn.lock().unwrap();
+        let mut conn = lock_conn(&store.conn);
         let tx = conn.transaction().unwrap();
         enforce_carried_budgets(&tx, BIG_BUDGET, 100).unwrap();
         tx.commit().unwrap();
@@ -7536,5 +7550,35 @@ mod tests {
         assert!(store.backup_to(path.to_string_lossy().to_string()).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"leave intact");
         fs::remove_file(path).unwrap();
+    }
+
+    // --- FC6: mutex poison recovery -----------------------------------------
+
+    #[test]
+    fn store_recovers_from_a_poisoned_mutex_instead_of_crash_looping() {
+        // Before FC6, every store method did `self.conn.lock().expect(...)`:
+        // once ANY panic happened while holding the lock (a bug, an
+        // unexpected SQLite error path), the stdlib marks the Mutex
+        // poisoned forever, and every later `.lock().expect(...)` call
+        // would itself panic -- turning one panic into a permanent
+        // process-wide store outage across the UniFFI boundary. Simulate
+        // that first panic here (inside `catch_unwind` so the test process
+        // itself survives) and confirm a later store call still succeeds
+        // instead of panicking.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.conn.lock().unwrap();
+            panic!("FC6 test: simulated panic while holding the store mutex");
+        }));
+        assert!(panicked.is_err(), "the closure above should have panicked");
+        assert!(store.conn.is_poisoned(), "the mutex should now be poisoned");
+
+        // A later call through the normal store API must recover the guard
+        // and succeed, not panic.
+        assert!(store
+            .insert_message(msg(b"chat", b"sender", 1, "still works"))
+            .unwrap());
+        assert_eq!(store.messages_for_chat(b"chat".to_vec()).unwrap().len(), 1);
     }
 }
