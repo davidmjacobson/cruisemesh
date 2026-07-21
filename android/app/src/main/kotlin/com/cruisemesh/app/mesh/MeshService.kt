@@ -1165,6 +1165,7 @@ class MeshService : Service() {
         )
         val mode = radioPowerPolicy.evaluate(inputs, now)
         central.setScanDutyMode(mode)
+        peripheral.setAdvertiseDutyMode(mode)
         Log.i(TAG, "evaluateRadioPower ($reason): $inputs -> $mode")
     }
 

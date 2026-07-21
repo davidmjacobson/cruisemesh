@@ -98,6 +98,17 @@ internal fun shouldPaceFrameStart(
  * frames are already queued for an address, so the on-HELLO spray itself is
  * less likely to saturate the controller in the first place -- see
  * [FRAME_PACING_DEEP_QUEUE_THRESHOLD].
+ *
+ * Adaptive advertise duty (battery, 2026-07-21): [setAdvertiseDutyMode] lets
+ * [MeshService] drive [AdvertiseSettings]' mode from the same
+ * [RadioPowerPolicy] decision [BleCentral] uses for scanning -- LOW_POWER
+ * once at least one link is up and the quiet period holds, BALANCED while
+ * lonely or right after a link change. TX power stays MEDIUM regardless
+ * (range, not coexistence). [beginAdvertising] already restarts advertising
+ * on every central connect (legacy advertising auto-stops on connect --
+ * PR#17) and after every teardown; [setAdvertiseDutyMode] reuses that exact
+ * restart path so a mode change while already advertising doesn't need a
+ * second one.
  */
 @SuppressLint("MissingPermission")
 class BlePeripheral(
@@ -137,6 +148,13 @@ class BlePeripheral(
     // can retry the same fragment instead of silently skipping it.
     private val inFlightFragment = mutableMapOf<String, ByteArray>()
     private val notifyFailures = NotifyFailureTracker()
+
+    // Battery: which AdvertiseSettings mode [beginAdvertising] builds with --
+    // see [setAdvertiseDutyMode]. Volatile, not under [lock]: read only from
+    // [beginAdvertising] and written only from [setAdvertiseDutyMode], both
+    // called from the main thread in practice (MeshService, or a GATT
+    // server callback that itself always runs [beginAdvertising] inline).
+    @Volatile private var currentAdvertiseMode = RadioDutyMode.LOW_POWER
 
     // Guards every read-modify-write of the per-address state above
     // (connectedDevices, negotiatedMtu, reassemblers, notifyQueues,
@@ -367,14 +385,24 @@ class BlePeripheral(
         if (gattServer == null) return
         val adv = advertiser ?: return
         val settings = AdvertiseSettings.Builder()
-            // BALANCED (restored from LOW_POWER 2026-07-10): the longer LOW_POWER
-            // advertising interval made this peer hard for a central to catch for
-            // a direct connect (status=133 churn / slow first connect). The mesh
-            // no longer pauses for Bluetooth audio, so favor a faster, more
-            // catchable advertisement -- re-verify earbud audio doesn't stutter.
+            // BALANCED (restored from LOW_POWER 2026-07-10) vs LOW_POWER, now
+            // adaptive per [currentAdvertiseMode] (battery, 2026-07-21): the
+            // longer LOW_POWER advertising interval made this peer hard for a
+            // central to catch for a direct connect (status=133 churn / slow
+            // first connect), which is exactly why [RadioPowerPolicy] favors
+            // BALANCED while lonely or right after a link change and only
+            // relaxes to LOW_POWER once a link is up and stays quiet -- see
+            // [setAdvertiseDutyMode]. The mesh no longer pauses for Bluetooth
+            // audio, so BALANCED periods still favor a faster, more catchable
+            // advertisement exactly as the 2026-07-10 fix intended.
             // TX power stays MEDIUM -- that governs range (ship-scale mesh); it's
             // the advertising *interval* (the mode) that drives coexistence.
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
+            .setAdvertiseMode(
+                when (currentAdvertiseMode) {
+                    RadioDutyMode.LOW_POWER -> AdvertiseSettings.ADVERTISE_MODE_LOW_POWER
+                    RadioDutyMode.BALANCED -> AdvertiseSettings.ADVERTISE_MODE_BALANCED
+                },
+            )
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
             .setConnectable(true)
             .build()
@@ -390,6 +418,32 @@ class BlePeripheral(
             .addServiceData(ParcelUuid(MeshConstants.SERVICE_UUID), MeshConstants.LOCAL_INSTANCE_ID)
             .build()
         adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
+    }
+
+    /**
+     * Battery (2026-07-21): [MeshService] calls this with [RadioPowerPolicy]'s
+     * latest decision -- see the class doc and [currentAdvertiseMode]. A
+     * no-op unless [mode] actually differs from what's already set, so
+     * callers can call this unconditionally on every policy tick without
+     * thrashing the advertiser. When not currently advertising, only the
+     * field updates -- the next [beginAdvertising] picks it up. When already
+     * advertising, this forces a stop-then-[beginAdvertising] restart (the
+     * same restart path a central connect already triggers for the
+     * legacy-advertising-stops-on-connect quirk, PR#17) so the new
+     * [AdvertiseSettings] mode actually takes effect.
+     */
+    fun setAdvertiseDutyMode(mode: RadioDutyMode) {
+        if (mode == currentAdvertiseMode) return
+        currentAdvertiseMode = mode
+        if (!advertising) return
+        try {
+            advertiser?.stopAdvertising(advertiseCallback)
+        } catch (e: Exception) {
+            Log.w(TAG, "setAdvertiseDutyMode: stopAdvertising failed (adapter likely off): ${e.message}")
+        }
+        advertising = false
+        beginAdvertising()
+        Log.i(TAG, "setAdvertiseDutyMode: applied advertise duty mode $mode")
     }
 
     fun stop() {
