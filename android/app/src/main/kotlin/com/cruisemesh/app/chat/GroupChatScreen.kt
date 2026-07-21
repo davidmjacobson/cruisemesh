@@ -752,7 +752,7 @@ fun GroupChatScreen(
         }
         MessageInfoBottomSheet(
             onDismiss = { infoMessage = null },
-            text = messageInfoText(
+            rows = messageInfoRows(
                 currentInfoMessage,
                 infoIsOwn,
                 null,

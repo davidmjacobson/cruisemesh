@@ -797,7 +797,7 @@ private fun ConversationScreen(
             ?.let { transportRouteText(it.toInt()) }
         MessageInfoBottomSheet(
             onDismiss = { infoMessage = null },
-            text = messageInfoText(
+            rows = messageInfoRows(
                     currentInfoMessage,
                     infoIsOwn,
                     infoTick,
@@ -1454,7 +1454,20 @@ internal fun messageImageBytes(message: StoredMessage): ByteArray? {
     return attachment.blob.takeIf { attachment.mediaType == AttachmentPayload.MediaType.IMAGE }
 }
 
-fun messageInfoText(
+/**
+ * One line of the Message-info sheet (fixes the colon-sniffing bug: the old
+ * renderer built a single string and split each line on its first ":" to
+ * fake "Label: value" styling, which misfired on the arrival line's own
+ * "5:14 PM" timestamp -- there's no label there, but it has a colon too).
+ * [messageInfoRows] returns each line pre-classified instead, so rendering
+ * never has to guess.
+ */
+sealed class MessageInfoRow {
+    data class LabelValue(val label: String, val value: String) : MessageInfoRow()
+    data class Sentence(val text: String) : MessageInfoRow()
+}
+
+fun messageInfoRows(
     message: StoredMessage,
     isOwn: Boolean,
     tick: TickStatus?,
@@ -1462,42 +1475,53 @@ fun messageInfoText(
     deliveredViaRoute: String? = null,
     outboundExpiryMs: Long? = null,
     nowMs: Long = System.currentTimeMillis(),
-): String {
+): List<MessageInfoRow> {
     val sentAt = java.text.SimpleDateFormat(
         "MMMM d, yyyy h:mm a",
         java.util.Locale.getDefault(),
     ).format(java.util.Date(message.timestamp))
-    val direction = if (isOwn) "Sent by you" else "Received"
-    val status = when {
+    val statusValue = when {
         isOwn && tick == TickStatus.SENT && outboundExpiryMs != null && outboundExpiryMs <= nowMs ->
-            "\nStatus: Not delivered — expired"
+            "Not delivered — expired"
         isOwn && tick == TickStatus.SENT && outboundExpiryMs != null ->
-            "\nStatus: Still trying — expires in ${expiryRemainingText(outboundExpiryMs - nowMs)}"
-        else -> tick?.let { "\nStatus: ${tickLegendText(it)}" }.orEmpty()
+            "Still trying — expires in ${expiryRemainingText(outboundExpiryMs - nowMs)}"
+        tick != null -> tickLegendText(tick)
+        else -> null
     }
-    val arrivalLine = when {
-        isOwn -> deliveredViaRoute?.let { "\nDelivery confirmed via $it" }.orEmpty()
-        else -> arrival?.let { "\n${messageArrivalText(it)}" }.orEmpty()
+    // "Delivery confirmed via ..." and "Arrived via ..." are always plain
+    // sentences -- neither is ever a genuine "Label: value" line, even
+    // though the arrival sentence embeds a "h:mm a" time that can itself
+    // contain a colon.
+    val arrivalRow = when {
+        isOwn -> deliveredViaRoute?.let { MessageInfoRow.Sentence("Delivery confirmed via $it") }
+        else -> arrival?.let { MessageInfoRow.Sentence(messageArrivalText(it)) }
     }
-    return "$direction\nTime: $sentAt$status$arrivalLine"
+    return listOfNotNull(
+        MessageInfoRow.Sentence(if (isOwn) "Sent by you" else "Received"),
+        MessageInfoRow.LabelValue("Time", sentAt),
+        statusValue?.let { MessageInfoRow.LabelValue("Status", it) },
+        arrivalRow,
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun MessageInfoBottomSheet(text: String, onDismiss: () -> Unit) {
+internal fun MessageInfoBottomSheet(rows: List<MessageInfoRow>, onDismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 24.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(stringResource(R.string.ui_message_info), style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
                 TextButton(onClick = onDismiss) { Text(stringResource(R.string.ui_done)) }
             }
-            text.lineSequence().forEach { line ->
-                val parts = line.split(":", limit = 2)
-                if (parts.size == 2) {
-                    Text(parts[0], style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 12.dp))
-                    Text(parts[1].trim(), style = MaterialTheme.typography.bodyLarge)
-                } else {
-                    Text(line, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(top = 12.dp))
+            for (row in rows) {
+                when (row) {
+                    is MessageInfoRow.LabelValue -> {
+                        Text(row.label, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 12.dp))
+                        Text(row.value, style = MaterialTheme.typography.bodyLarge)
+                    }
+                    is MessageInfoRow.Sentence -> {
+                        Text(row.text, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(top = 12.dp))
+                    }
                 }
             }
         }
