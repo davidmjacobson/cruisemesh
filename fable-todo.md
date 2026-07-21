@@ -11,6 +11,21 @@ IDs: `XP` = cross-platform, `FA` = Android, `FI` = iOS, `FC` = Rust core,
 `FR` = relayd/infra/docs. Severity: 🔴 field-impacting bug or missing safety
 net · 🟡 real cost, not urgent · 🟢 hygiene/polish.
 
+**Status 2026-07-20:** 50 of 54 items shipped to master the same day
+(implemented by Sonnet agents, merged + verified: Rust workspace, Android
+suite, iOS suite on the Mac host). Still open: **XP2** (localization
+migration — run last, touches everything), **FA15** and **FI4** (large
+refactors: MeshService split, iOS main-actor offload), **FR13** (stale-branch
+cleanup — needs David's push access + live-branch confirmation). Two field
+bugs found post-audit via screenshot were also fixed the same day: the
+carry/mule path never decremented `hop_ttl` ("via another device · ~0 hops"
+contradiction; fixed at carry-enqueue on both platforms, commit `3168b02b`),
+and the Message-info sheet split lines on the first `:`, breaking times like
+"5:14 PM" (replaced colon-sniffing with typed label/sentence rows on both
+platforms). David's `relay` hosted-family branch merged in the same window
+with three semantic integration fixes (lazy per-token WS semaphores, async
+`authorize_family` via `run_blocking`, per-family quota in the insert path).
+
 ---
 
 ## 0. How to work this file (read before writing code)
@@ -68,7 +83,7 @@ Decisions David must make before certain items start are collected in §7.
 
 ## 1. Cross-platform
 
-### XP1 🔴 Every keystroke triggers a full chat reload (and on iOS, a read receipt + relay sync) — both platforms, same root cause
+### XP1 🔴 Every keystroke triggers a full chat reload (and on iOS, a read receipt + relay sync) — both platforms, same root cause — ✅ merged 2026-07-20
 
 The draft autosave fires the chat-changed event, and the chat screen's own
 listener treats it like a new message.
@@ -139,7 +154,7 @@ listener treats it like a new message.
 
 ## 2. Android
 
-### FA1 🔴 Mesh is broken on Android 8–11: legacy Bluetooth permissions are missing entirely
+### FA1 🔴 Mesh is broken on Android 8–11: legacy Bluetooth permissions are missing entirely — ✅ merged 2026-07-20
 
 - **Evidence:** `android/app/src/main/AndroidManifest.xml:10-14` declares only
   API-31 permissions (`BLUETOOTH_SCAN/ADVERTISE/CONNECT`); there is no
@@ -162,7 +177,7 @@ listener treats it like a new message.
   advertises without SecurityException.
 - **Effort:** XS (minSdk) / S (legacy support).
 
-### FA2 🔴 `BleCentral`'s shared state is completely unsynchronized — the exact race `BlePeripheral` was already hardened against
+### FA2 🔴 `BleCentral`'s shared state is completely unsynchronized — the exact race `BlePeripheral` was already hardened against — ✅ merged 2026-07-20
 
 - **Evidence:** `mesh/BleCentral.kt:90-96` — `connections`, `negotiatedMtu`,
   `reassemblers`, `writeQueues`, `writeInFlight`, `fullyConnected`,
@@ -188,7 +203,7 @@ listener treats it like a new message.
   a unit test on the extracted admission logic covers the in-flight gate.
 - **Effort:** M.
 
-### FA3 🟡 MeshService does its heavy DB work on the main thread
+### FA3 🟡 MeshService does its heavy DB work on the main thread — ✅ merged 2026-07-20
 
 - **Evidence:** `MeshService.kt` — `onStartCommand` (main thread) runs
   `seedSeenIdsFromOwnHistory` (full outbound-envelope scans for every contact
@@ -208,7 +223,7 @@ listener treats it like a new message.
   (debug-build StrictMode-style assert passes).
 - **Effort:** M. Conflicts with FA5/FA8/FA15 (same file).
 
-### FA4 🟡 DB queries and full-size bitmap decodes inside composition on the chat list
+### FA4 🟡 DB queries and full-size bitmap decodes inside composition on the chat list — ✅ merged 2026-07-20
 
 - **Evidence:** `ChatScreen.kt:503-511` — `remember(messages,...)` executes
   `loadMessageReplyMetadata(store, ...)` during composition (same in
@@ -224,7 +239,7 @@ listener treats it like a new message.
   size.
 - **Effort:** M.
 
-### FA5 🟡 Seen-set check-then-record isn't atomic across the four concurrent receive paths — the D4 KDoc's "runs synchronously per received frame" claim is false
+### FA5 🟡 Seen-set check-then-record isn't atomic across the four concurrent receive paths — the D4 KDoc's "runs synchronously per received frame" claim is false — ✅ merged 2026-07-20
 
 - **Evidence:** `MeshService.kt:2002-2008` gates on
   `!GossipState.seenIds.contains(...)` and records only at terminal returns
@@ -248,7 +263,7 @@ listener treats it like a new message.
   is rejected; docs match reality.
 - **Effort:** S.
 
-### FA6 🟡 Notification direct-reply seals and sends on the main thread inside a BroadcastReceiver
+### FA6 🟡 Notification direct-reply seals and sends on the main thread inside a BroadcastReceiver — ✅ merged 2026-07-20
 
 - **Evidence:** `notify/NotificationActionReceiver.kt:22-32` runs
   `RealMeshSender.sendText` synchronously in `onReceive` — crypto sealing +
@@ -261,7 +276,7 @@ listener treats it like a new message.
   notification clears.
 - **Effort:** S.
 
-### FA7 🟡 New/backfilled messages yank the reader to the bottom while scrolled up
+### FA7 🟡 New/backfilled messages yank the reader to the bottom while scrolled up — ✅ merged 2026-07-20
 
 - **Evidence:** `ChatScreen.kt:566-571` and `GroupChatScreen.kt:292-297` —
   `LaunchedEffect(visibleMessages.size) { listState.scrollToItem(0) }` fires
@@ -277,7 +292,7 @@ listener treats it like a new message.
   own message still scrolls to it.
 - **Effort:** S.
 
-### FA8 🟡 "Added you to " string-prefix protocol between MeshService and MessageNotifier
+### FA8 🟡 "Added you to " string-prefix protocol between MeshService and MessageNotifier — ✅ merged 2026-07-20
 
 - **Evidence:** `MeshService.kt:2777-2782` passes the literal
   `"Added you to ${group.name}"`; `MessageNotifier.kt:112` branches on
@@ -289,7 +304,7 @@ listener treats it like a new message.
 - **Accept:** no string sniffing; both call sites use the typed API.
 - **Effort:** XS.
 
-### FA9 🟢 Notification ids, PendingIntent request codes, and chat-list keys all use `ByteArray.contentHashCode()` — Int collisions cross wires between chats
+### FA9 🟢 Notification ids, PendingIntent request codes, and chat-list keys all use `ByteArray.contentHashCode()` — Int collisions cross wires between chats — ✅ merged 2026-07-20
 
 - **Evidence:** `MessageNotifier.kt:160` (notification id =
   `chatId.contentHashCode()`, doubling as PendingIntent request code
@@ -303,7 +318,7 @@ listener treats it like a new message.
 - **Accept:** no `contentHashCode()` used anywhere user-routing depends on.
 - **Effort:** XS.
 
-### FA10 🟢 Touch targets below 48 dp on the chat screen
+### FA10 🟢 Touch targets below 48 dp on the chat screen — ✅ merged 2026-07-20
 
 - **Evidence:** `ChatScreen.kt:854-860` remove-pending-photo button is 22 dp;
   `:934-940` attach "+" is 44 dp; reaction chips (`:1423-1440`) ~24 dp tall.
@@ -313,7 +328,7 @@ listener treats it like a new message.
   conversation screen.
 - **Effort:** S.
 
-### FA11 🟢 Voice-memo playback leaks temp files and blocks the main thread
+### FA11 🟢 Voice-memo playback leaks temp files and blocks the main thread — ✅ merged 2026-07-20
 
 - **Evidence:** `ChatScreen.kt:1642-1653` — play path writes the whole blob
   to `cacheDir/play-<ts>.m4a` and calls `prepare()` synchronously in the
@@ -325,7 +340,7 @@ listener treats it like a new message.
 - **Accept:** cacheDir contains no `play-*.m4a` after stopping mid-playback.
 - **Effort:** XS–S.
 
-### FA12 🟢 Debug builds export a command receiver any co-installed app can invoke
+### FA12 🟢 Debug builds export a command receiver any co-installed app can invoke — ✅ merged 2026-07-20
 
 - **Evidence:** `android/app/src/debug/AndroidManifest.xml:5-13` —
   `DebugCommandReceiver` is `exported="true"` with implicit-action filters;
@@ -338,7 +353,7 @@ listener treats it like a new message.
   still work.
 - **Effort:** XS.
 
-### FA13 🟢 RelayPushClient retries every 2 s forever when the hint set is empty
+### FA13 🟢 RelayPushClient retries every 2 s forever when the hint set is empty — ✅ merged 2026-07-20
 
 - **Evidence:** `RelayPushClient.kt:117-124` — empty hints →
   `scheduleReconnect()` without `backoff.recordFailure()`, so
@@ -350,7 +365,7 @@ listener treats it like a new message.
 - **Accept:** with zero contacts, reconnect attempts back off to the cap.
 - **Effort:** XS.
 
-### FA14 🟡 Placeholder protocol UUID is still shipping
+### FA14 🟡 Placeholder protocol UUID is still shipping — ✅ merged 2026-07-20
 
 - **Evidence:** `MeshConstants.kt:8` — "Placeholder UUID — regenerate a real
   random v4 UUID before any real deployment". Every fielded build makes this
@@ -384,7 +399,7 @@ listener treats it like a new message.
 unreachable at audit time. It is back up as of 2026-07-20, so items marked
 *(Mac)* should be validated there before merging.)*
 
-### FI1 🔴 Open chat stays "visible" while the app is backgrounded → false read receipts + suppressed notifications
+### FI1 🔴 Open chat stays "visible" while the app is backgrounded → false read receipts + suppressed notifications — ✅ merged 2026-07-20
 
 - **Evidence:** `UI/ChatView.swift:245-258` and `UI/GroupChatView.swift:205-221`
   set/clear `ChatVisibility` only in `onAppear`/`onDisappear`; nothing
@@ -405,7 +420,7 @@ unreachable at audit time. It is back up as of 2026-07-20, so items marked
   receipt. *(Mac/device.)*
 - **Effort:** S.
 
-### FI2 🔴 iOS never proxy-fetches relay mail for nearby contacts (Android does)
+### FI2 🔴 iOS never proxy-fetches relay mail for nearby contacts (Android does) — ✅ merged 2026-07-20
 
 - **Evidence:** iOS relay fetch hints are self + own groups only
   (`Mesh/MeshController.swift:2269-2287`); the code says so itself
@@ -423,7 +438,7 @@ unreachable at audit time. It is back up as of 2026-07-20, so items marked
   mail to the Android via the iPhone. *(Mac + device pair.)*
 - **Effort:** M.
 
-### FI3 🔴 No BLE state restoration or background refresh — mesh dies silently on process termination
+### FI3 🔴 No BLE state restoration or background refresh — mesh dies silently on process termination — ✅ merged 2026-07-20
 
 - **Evidence:** `Mesh/BleTransport.swift:41-42` creates
   `CBCentralManager`/`CBPeripheralManager` without restore-identifier
@@ -466,7 +481,7 @@ unreachable at audit time. It is back up as of 2026-07-20, so items marked
   200-message ingest; UI still updates. *(Mac.)*
 - **Effort:** L incremental; the bubble-row query alone XS.
 
-### FI5 🟡 Hidden-kind handlers still ack on store failure — the T4-06 invariant isn't applied to friend requests / profile sync / directory / LAN hints
+### FI5 🟡 Hidden-kind handlers still ack on store failure — the T4-06 invariant isn't applied to friend requests / profile sync / directory / LAN hints — ✅ merged 2026-07-20
 
 - **Evidence:** T4-06 made chat/receipt/group paths propagate primary-store
   throws so `.failed` leaves the relay copy un-acked
@@ -489,7 +504,7 @@ unreachable at audit time. It is back up as of 2026-07-20, so items marked
   `.failed` and the relay copy is not acked. *(Mac for suite.)*
 - **Effort:** S.
 
-### FI6 🟡 BLE connect/disconnect callbacks race via mixed sync/async dispatch
+### FI6 🟡 BLE connect/disconnect callbacks race via mixed sync/async dispatch — ✅ merged 2026-07-20
 
 - **Evidence:** `Mesh/MeshController.swift:160-181` —
   `onCentralConnected`/`onPeripheralSubscribed` hop via `Task { @MainActor }`,
@@ -504,7 +519,7 @@ unreachable at audit time. It is back up as of 2026-07-20, so items marked
 - **Accept:** MeshRouterState ordering unit test.
 - **Effort:** XS.
 
-### FI7 🟡 Local Network permission denial is silent — LAN transport just never works
+### FI7 🟡 Local Network permission denial is silent — LAN transport just never works — ✅ merged 2026-07-20
 
 - **Evidence:** `Mesh/LanTransport.swift:249-262` — browser `.failed` posts a
   diagnostics hint, but a denied Local Network permission actually produces
@@ -522,7 +537,7 @@ unreachable at audit time. It is back up as of 2026-07-20, so items marked
   say so. *(Mac/device — the exact NWError must be observed.)*
 - **Effort:** S.
 
-### FI8 🟡 Chat thread body recomputation is O(n²) with per-row DateFormatter allocations
+### FI8 🟡 Chat thread body recomputation is O(n²) with per-row DateFormatter allocations — ✅ merged 2026-07-20
 
 - **Evidence:** `visible` is a computed filter over all messages
   (`UI/ChatView.swift:70-72`); `isNewDay`, `messageGrouping`, `scrollToLatest`
@@ -536,7 +551,7 @@ unreachable at audit time. It is back up as of 2026-07-20, so items marked
   count. *(Mac.)*
 - **Effort:** S–M.
 
-### FI9 🟡 `try!` crash points in launch/critical paths
+### FI9 🟡 `try!` crash points in launch/critical paths — ✅ merged 2026-07-20
 
 - **Evidence:** `Core/AppStore.swift:21` — `try! MessageStore.open(path:)` —
   a corrupt/unopenable DB is a **crash loop at launch** with no recovery
@@ -550,7 +565,7 @@ unreachable at audit time. It is back up as of 2026-07-20, so items marked
   (empty) app, not a crash loop. *(Mac.)*
 - **Effort:** S.
 
-### FI10 🟢 `didReceiveWrite` responds once per request in a batch
+### FI10 🟢 `didReceiveWrite` responds once per request in a batch — ✅ merged 2026-07-20
 
 - **Evidence:** `Mesh/BleTransport.swift:377-388` loops `requests` calling
   `peripheral.respond(to:withResult:)` for each. CoreBluetooth requires
@@ -560,7 +575,7 @@ unreachable at audit time. It is back up as of 2026-07-20, so items marked
 - **Accept:** no behavior change with Android centrals. *(Mac/device.)*
 - **Effort:** XS.
 
-### FI11 🟢 One-notification-per-chat replacement loses message count
+### FI11 🟢 One-notification-per-chat replacement loses message count — ✅ merged 2026-07-20
 
 - **Evidence:** `Notify/MessageNotifier.swift:45-47, 74-76` — the request
   identifier is the chat's userId hex, so each new message replaces the
@@ -570,7 +585,7 @@ unreachable at audit time. It is back up as of 2026-07-20, so items marked
   `threadIdentifier = chatId` for grouping.
 - **Effort:** XS.
 
-### FI12 🟢 ~300 lines duplicated between ChatView and GroupChatView, plus dead code
+### FI12 🟢 ~300 lines duplicated between ChatView and GroupChatView, plus dead code — ✅ merged 2026-07-20
 
 - **Evidence:** composer row, photo/camera/voice pipeline, voice-memo sheet
   near-identical (`UI/ChatView.swift:161-327, 383-457` vs
@@ -589,7 +604,7 @@ unreachable at audit time. It is back up as of 2026-07-20, so items marked
 `mesh_sim` integration tests, 0 failures. Any core change touching the
 UniFFI surface ⇒ regenerate bindings, both platforms.)*
 
-### FC1 🟡 Group field-metrics silently drop rows: `delivery_metrics` PK omits the sender
+### FC1 🟡 Group field-metrics silently drop rows: `delivery_metrics` PK omits the sender — ✅ merged 2026-07-20
 
 - **Evidence:** `core/src/store.rs:3168-3178` —
   `PRIMARY KEY(chat_hash, lamport, direction)`, inserted with
@@ -605,7 +620,7 @@ UniFFI surface ⇒ regenerate bindings, both platforms.)*
   one group yields two rows, both in the CSV.
 - **Effort:** S. **Land before the next cruise test.**
 
-### FC2 🟡 Digest spray materializes unbounded ciphertext every exchange
+### FC2 🟡 Digest spray materializes unbounded ciphertext every exchange — ✅ merged 2026-07-20
 
 - **Evidence:** `core/src/engine.rs:511-545` (`core_digest_spray_plan`) +
   `core/src/store.rs:2494-2520` (`carried_envelopes_for_peer_sync`). Every
@@ -629,7 +644,7 @@ UniFFI surface ⇒ regenerate bindings, both platforms.)*
   (row/size probe or benchmark).
 - **Effort:** M.
 
-### FC3 🟢 Carry-digest migration is O(n) round-trips under one transaction at store open
+### FC3 🟢 Carry-digest migration is O(n) round-trips under one transaction at store open — ✅ merged 2026-07-20
 
 - **Evidence:** `core/src/store.rs:2650-2698`
   (`migrate_carried_content_digests`) — a loop of
@@ -642,7 +657,7 @@ UniFFI surface ⇒ regenerate bindings, both platforms.)*
   dedupe/budget tests pass.
 - **Effort:** S.
 
-### FC4 🟢 First delivery confirmation with unknown transport permanently hides the route (T6 follow-up)
+### FC4 🟢 First delivery confirmation with unknown transport permanently hides the route (T6 follow-up) — ✅ merged 2026-07-20
 
 - **Evidence:** `core/src/store.rs:1457-1463` — `via_transport` is
   overwritten only `WHEN excluded.through_lamport > through_lamport AND
@@ -656,7 +671,7 @@ UniFFI surface ⇒ regenerate bindings, both platforms.)*
   a later `via=None` at N never clears it.
 - **Effort:** XS.
 
-### FC5 🟢 Fuzz coverage misses two untrusted decoders: backup file + LAN endpoint parsers
+### FC5 🟢 Fuzz coverage misses two untrusted decoders: backup file + LAN endpoint parsers — ✅ merged 2026-07-20
 
 - **Evidence:** `fuzz/fuzz_targets/*` cover frames, message/receipt/profile/
   LAN-content/group/attachment/reaction/friend decoders, relay wire, BLE
@@ -672,7 +687,7 @@ UniFFI surface ⇒ regenerate bindings, both platforms.)*
   finds no panics.
 - **Effort:** S.
 
-### FC6 🟢 Poisoned store mutex converts any one panic into a permanent process-wide store outage
+### FC6 🟢 Poisoned store mutex converts any one panic into a permanent process-wide store outage — ✅ merged 2026-07-20
 
 - **Evidence:** pervasive `self.conn.lock().expect("store mutex poisoned")`
   (`core/src/store.rs:483, 743, 1453, 2281`, etc.; `.lock().unwrap()` in
@@ -686,7 +701,7 @@ UniFFI surface ⇒ regenerate bindings, both platforms.)*
   gets `Err`/recovery, not a panic.
 - **Effort:** S.
 
-### FC7 🟢 `family_carried_envelopes` relay-upload query has no supporting index
+### FC7 🟢 `family_carried_envelopes` relay-upload query has no supporting index — ✅ merged 2026-07-20
 
 - **Evidence:** `core/src/store.rs:2569-2588` — `WHERE is_family = 1 AND
   from_relay = 0 AND expiry > ?1 ORDER BY received_at ASC`; only
@@ -699,7 +714,7 @@ UniFFI surface ⇒ regenerate bindings, both platforms.)*
   `USE TEMP B-TREE FOR ORDER BY`.
 - **Effort:** XS.
 
-### FC8 🟢 `core_unread_count` is 1:1-only but exported without that contract
+### FC8 🟢 `core_unread_count` is 1:1-only but exported without that contract — ✅ merged 2026-07-20
 
 - **Evidence:** `core/src/semantic.rs:72-86` compares every non-self
   sender's lamport against a single scalar `read_through` — correct only
@@ -710,7 +725,7 @@ UniFFI surface ⇒ regenerate bindings, both platforms.)*
   stating single-sender-only.
 - **Effort:** XS.
 
-### FC9 🟢 `insert_message` fork-recovery treats a reply-target mismatch as a stream reset
+### FC9 🟢 `insert_message` fork-recovery treats a reply-target mismatch as a stream reset — ✅ merged 2026-07-20
 
 - **Evidence:** `core/src/store.rs:527-533` — the true-duplicate test
   compares `(timestamp, kind, payload, reply_to_msg_id)`, but plain
@@ -726,7 +741,7 @@ UniFFI surface ⇒ regenerate bindings, both platforms.)*
   differing `reply_to_msg_id` is a merge, not a tail-delete.
 - **Effort:** S.
 
-### FC10 🟢 SQLite opened without WAL / `busy_timeout`; `VACUUM INTO` blocks all store calls
+### FC10 🟢 SQLite opened without WAL / `busy_timeout`; `VACUUM INTO` blocks all store calls — ✅ merged 2026-07-20
 
 - **Evidence:** `MessageStore::open` (`core/src/store.rs:302-388`) sets no
   pragmas; `backup_to` runs `VACUUM INTO` (`:418`) under the shared mutex —
@@ -744,7 +759,7 @@ UniFFI surface ⇒ regenerate bindings, both platforms.)*
 *(Reminder: relayd code changes land in the repo freely; **deploying** to
 the live relay needs David's go-ahead — §7.)*
 
-### FR1 🔴 No CI runs any test suite — the 330-test Rust workspace and Android units are entirely uncovered
+### FR1 🔴 No CI runs any test suite — the 330-test Rust workspace and Android units are entirely uncovered — ✅ merged 2026-07-20
 
 - **Evidence:** `.github/workflows/` contains exactly `fuzz-smoke.yml`
   (path-filtered to `core/**`+`fuzz/**`) and `ui-localization.yml` (string
@@ -765,7 +780,7 @@ the live relay needs David's go-ahead — §7.)*
   UniFFI surface without regenerated bindings, shows a red check.
 - **Effort:** S (+M later for an iOS smoke build when a Mac runner exists).
 
-### FR2 🔴 relayd emits effectively zero logs — a field incident is undebuggable
+### FR2 🔴 relayd emits effectively zero logs — a field incident is undebuggable — ✅ merged 2026-07-20
 
 - **Evidence:** the only log statement in the crate is the startup `info!`
   (`relayd/src/main.rs:32`). `ApiError::internal` (`relayd/src/lib.rs:1238`)
@@ -784,7 +799,7 @@ the live relay needs David's go-ahead — §7.)*
   request and per WS lifecycle event.
 - **Effort:** S.
 
-### FR3 🟡 No graceful shutdown — the tokio `signal` feature is enabled but never wired
+### FR3 🟡 No graceful shutdown — the tokio `signal` feature is enabled but never wired — ✅ merged 2026-07-20
 
 - **Evidence:** `relayd/src/main.rs:35` — plain `axum::serve(...)`, no
   `.with_graceful_shutdown(...)`; `relayd/Cargo.toml:14` enables tokio's
@@ -794,7 +809,7 @@ the live relay needs David's go-ahead — §7.)*
 - **Accept:** `docker stop` drains in-flight requests; WS closes cleanly.
 - **Effort:** XS. Bundle with FR2/FR4 in one relayd PR.
 
-### FR4 🟡 The deployed relay version is untrackable
+### FR4 🟡 The deployed relay version is untrackable — ✅ merged 2026-07-20
 
 - **Evidence:** `/healthz` returns only `{"status":"ok"}`
   (`relayd/src/lib.rs:730`); `Cargo.toml` frozen at 0.1.0; compose builds
@@ -807,7 +822,7 @@ the live relay needs David's go-ahead — §7.)*
 - **Accept:** `curl https://relay/healthz` reports the exact live commit.
 - **Effort:** XS.
 
-### FR5 🟡 `ws_live_push_after_connect` flake: logic is provably race-free — the 3 s wall-clock timeout is the whole problem
+### FR5 🟡 `ws_live_push_after_connect` flake: logic is provably race-free — the 3 s wall-clock timeout is the whole problem — ✅ merged 2026-07-20
 
 - **Evidence:** `relayd/tests/e2e_ws.rs:216` —
   `timeout(Duration::from_secs(3), socket.next())`. In `handle_ws`
@@ -824,7 +839,7 @@ the live relay needs David's go-ahead — §7.)*
   parallel build running, zero flakes.
 - **Effort:** XS.
 
-### FR6 🟡 No cap on concurrent WebSocket connections, and no server-side keepalive
+### FR6 🟡 No cap on concurrent WebSocket connections, and no server-side keepalive — ✅ merged 2026-07-20
 
 - **Evidence:** `ws_handler`/`handle_ws` (`relayd/src/lib.rs:1002-1176`)
   accept unbounded upgrades — T4-09 capped request *shapes*, not socket
@@ -839,7 +854,7 @@ the live relay needs David's go-ahead — §7.)*
   reaped within ~2 ping intervals.
 - **Effort:** S.
 
-### FR7 🟡 Mailbox maintenance is entirely fetch-driven: no background prune, no VACUUM, writes on every read
+### FR7 🟡 Mailbox maintenance is entirely fetch-driven: no background prune, no VACUUM, writes on every read — ✅ merged 2026-07-20
 
 - **Evidence:** `prune_expired` runs only inside `fetch_envelopes`
   (`relayd/src/lib.rs:433`), `sync_presence`, and the quota-overflow path —
@@ -854,7 +869,7 @@ the live relay needs David's go-ahead — §7.)*
   no writes; file shrinks after mass expiry.
 - **Effort:** S.
 
-### FR8 🟢 Blocking SQLite on tokio workers + internal error strings leaked to clients
+### FR8 🟢 Blocking SQLite on tokio workers + internal error strings leaked to clients — ✅ merged 2026-07-20
 
 - **Evidence:** every handler does `self.conn.lock()` + synchronous rusqlite
   in async context (`relayd/src/lib.rs:308, 434`) — no `spawn_blocking`, no
@@ -867,7 +882,7 @@ the live relay needs David's go-ahead — §7.)*
   reactor.
 - **Effort:** S.
 
-### FR9 🟢 Fuzz nightly never accumulates a corpus, and the workflow rebuilds cold every run
+### FR9 🟢 Fuzz nightly never accumulates a corpus, and the workflow rebuilds cold every run — ✅ merged 2026-07-20
 
 - **Evidence:** `fuzz-smoke.yml` — no `actions/cache` for `fuzz/corpus/`
   (every nightly 600 s run restarts exploration from zero, defeating the
@@ -882,7 +897,7 @@ the live relay needs David's go-ahead — §7.)*
   ~5 min warm.
 - **Effort:** S.
 
-### FR10 🟡 ROADMAP/DESIGN say media attachments are "not started" — they shipped
+### FR10 🟡 ROADMAP/DESIGN say media attachments are "not started" — they shipped — ✅ merged 2026-07-20
 
 - **Evidence:** `ROADMAP.md:14` — "Media attachments … 📋 Designed, not
   started". But `core/src/content.rs:6` has
@@ -897,7 +912,7 @@ the live relay needs David's go-ahead — §7.)*
   remains the design for larger media.
 - **Effort:** XS.
 
-### FR11 🟡 SECURITY-DESIGN.md's "key material never leaves the device" is no longer true; LOCAL_BACKUP_RESTORE.md still says "proposal"
+### FR11 🟡 SECURITY-DESIGN.md's "key material never leaves the device" is no longer true; LOCAL_BACKUP_RESTORE.md still says "proposal" — ✅ merged 2026-07-20
 
 - **Evidence:** SECURITY-DESIGN.md (Identity + In-scope): "private keys never
   leave it… Key material must never leave the device." But
@@ -912,7 +927,7 @@ the live relay needs David's go-ahead — §7.)*
   params); flip LOCAL_BACKUP_RESTORE.md to "shipped".
 - **Effort:** XS.
 
-### FR12 🟡 `AGENT-TODO.md` — the self-declared plan of record — is untracked; `.codex-remote-attachments/` is neither ignored nor tracked
+### FR12 🟡 `AGENT-TODO.md` — the self-declared plan of record — is untracked; `.codex-remote-attachments/` is neither ignored nor tracked — ✅ merged 2026-07-20
 
 - **Evidence:** `git status` shows both untracked; `git check-ignore`
   confirms no rule matches `.codex-remote-attachments/` (unlike `logs/`,
@@ -943,7 +958,7 @@ the live relay needs David's go-ahead — §7.)*
 - **Accept:** `git branch -r | wc -l` under ~15, all live.
 - **Effort:** S.
 
-### FR14 🟢 No CLAUDE.md — AGENTS.md's critical setup knowledge isn't surfaced to agent tooling
+### FR14 🟢 No CLAUDE.md — AGENTS.md's critical setup knowledge isn't surfaced to agent tooling — ✅ merged 2026-07-20
 
 - **Evidence:** no `CLAUDE.md` at root or in `.claude/`; `AGENTS.md` holds
   the fresh-worktree bindgen recipe and Mac runbook, TODO.md §3 the ground
@@ -953,7 +968,7 @@ the live relay needs David's go-ahead — §7.)*
   lines: worktree rule, bindgen recipe, commit email, test commands).
 - **Effort:** XS.
 
-### FR15 🟢 No release/versioning automation; APK builds are artisanal
+### FR15 🟢 No release/versioning automation; APK builds are artisanal — ✅ merged 2026-07-20
 
 - **Evidence:** tags exist (`v1.0.0`, `android-v1.0.0`,
   `jacobson-family-cruise-pre-release-2026-07-13`) but no release workflow;
