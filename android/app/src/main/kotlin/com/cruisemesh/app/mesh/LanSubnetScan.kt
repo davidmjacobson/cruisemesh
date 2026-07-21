@@ -3,12 +3,21 @@ package com.cruisemesh.app.mesh
 import java.net.Inet4Address
 import java.net.InetAddress
 
-// A cruise-ship LAN is commonly a single flat /16, so the scan follows the
-// network's own advertised prefix -- but never broader than a /16 (65,534
-// hosts), which bounds the sweep to something a phone can finish in the
-// background. A home /24 still scans just its 254 hosts; only genuinely huge
-// networks (e.g. a /8) get clamped down to a /16 around this phone's address.
+// A cruise-ship LAN is commonly a single flat /16 (or bigger), so the
+// user-initiated "Search my local network" action follows the network's own
+// advertised prefix -- but never broader than a /16 (65,534 hosts), which
+// bounds it to something a phone can finish in the background. A home /24
+// still scans just its 254 hosts; only genuinely huge networks (e.g. a /8)
+// get clamped down to a /16 around this phone's address. This ceiling is for
+// the manual button only, explicitly allowed to be big since the user asked.
 internal const val BROADEST_SCAN_PREFIX_LENGTH = 16
+
+// Ceiling for the *automatic* full-subnet fallback sweep: a /16 is up to
+// ~65k TCP probes, minutes of sustained radio at concurrency 64. A /20 is
+// ~4,094 hosts, a much smaller unattended background cost. Ship/hotel Wi-Fi
+// is exactly where the underlying network is a huge flat subnet, so the
+// automatic path stays narrower than the manual one.
+internal const val BROADEST_AUTOMATIC_SCAN_PREFIX_LENGTH = 20
 
 // /31 and /32 have no usable host addresses and /30 already yields only two;
 // clamp here so [subnetHosts] always has at least a couple of candidates.
@@ -20,6 +29,14 @@ internal const val DEFAULT_SCAN_PREFIX_LENGTH = 24
 /** The prefix length [subnetHosts] actually scans for a network-reported [prefixLength]. */
 internal fun effectiveScanPrefixLength(prefixLength: Int): Int =
     prefixLength.coerceIn(BROADEST_SCAN_PREFIX_LENGTH, NARROWEST_SCAN_PREFIX_LENGTH)
+
+/**
+ * Same clamp as [effectiveScanPrefixLength], but for the automatic
+ * full-subnet sweep, which is capped narrower (see
+ * [BROADEST_AUTOMATIC_SCAN_PREFIX_LENGTH]).
+ */
+internal fun effectiveAutomaticScanPrefixLength(prefixLength: Int): Int =
+    prefixLength.coerceIn(BROADEST_AUTOMATIC_SCAN_PREFIX_LENGTH, NARROWEST_SCAN_PREFIX_LENGTH)
 
 /**
  * Candidate hosts in the IPv4 subnet [localAddress] sits in, as defined by

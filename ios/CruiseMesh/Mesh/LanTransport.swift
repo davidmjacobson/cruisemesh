@@ -31,6 +31,12 @@ final class LanTransport {
     private var announcedNetworkId: String?
     private var connections: [String: LanConnection] = [:]
     private var discoveredEndpoints: [String: NWEndpoint] = [:]
+    /// Endpoint/service keys peer evidence has already been counted for on
+    /// this network join -- repeated evidence about the same key (an
+    /// already-connected/linked peer's Bonjour record refreshing, or a
+    /// resent endpoint hint) must not keep resetting the full-sweep
+    /// backoff. Reset alongside `discoveredEndpoints` on network change.
+    private var peerEvidenceSeenKeys = Set<String>()
     private var bonjourServiceKeys = Set<String>()
     private var outboundAddresses: [String: String] = [:]
     private var reconnectAttempts: [String: Int] = [:]
@@ -100,6 +106,7 @@ final class LanTransport {
             announcedEndpoint = nil
             announcedNetworkId = nil
             discoveredEndpoints.removeAll()
+            peerEvidenceSeenKeys.removeAll()
             bonjourServiceKeys.removeAll()
             outboundAddresses.removeAll()
             reconnectAttempts.removeAll()
@@ -124,8 +131,15 @@ final class LanTransport {
     func connect(_ endpoint: LanManualEndpoint, remoteInstanceToken: Data? = nil, manual: Bool = false) {
         queue.async { [weak self] in
             guard let self, started else { return }
+            let key = "endpoint:\(endpoint.display)"
             if let remoteInstanceToken {
-                scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
+                // Only genuinely NEW evidence about a peer resets the sweep
+                // backoff -- repeated evidence for a key already seen this
+                // network join (whether or not we ended up as the
+                // initiator) must not re-trigger it.
+                if peerEvidenceSeenKeys.insert(key).inserted {
+                    scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
+                }
                 if !shouldInitiateLanConnection(
                     localToken: instanceTokenString,
                     remoteToken: remoteInstanceToken.map { String(format: "%02x", $0) }.joined()
@@ -136,7 +150,6 @@ final class LanTransport {
                     return
                 }
             }
-            let key = "endpoint:\(endpoint.display)"
             let networkEndpoint = NWEndpoint.hostPort(
                 host: NWEndpoint.Host(endpoint.host),
                 port: NWEndpoint.Port(rawValue: endpoint.port) ?? .any
@@ -353,6 +366,7 @@ final class LanTransport {
 
     private func tearDownNetworkLinks() {
         discoveredEndpoints.removeAll()
+        peerEvidenceSeenKeys.removeAll()
         bonjourServiceKeys.removeAll()
         outboundAddresses.removeAll()
         reconnectAttempts.removeAll()
@@ -374,7 +388,14 @@ final class LanTransport {
                   case let .bonjour(txtRecord) = result.metadata,
                   let remoteToken = lanBonjourPeerToken(txtRecord.dictionary),
                   remoteToken != instanceTokenString else { continue }
-            scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
+            let key = serviceKey(result.endpoint)
+            // Only genuinely NEW evidence resets the sweep backoff -- an
+            // already-connected/linked peer's Bonjour record keeps
+            // reappearing here (TXT refreshes, periodic browse updates)
+            // and must not keep re-triggering full sweeps.
+            if peerEvidenceSeenKeys.insert(key).inserted {
+                scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
+            }
             guard shouldInitiateLanConnection(
                 localToken: instanceTokenString,
                 remoteToken: remoteToken
@@ -384,7 +405,6 @@ final class LanTransport {
                 )
                 continue
             }
-            let key = serviceKey(result.endpoint)
             current[key] = result.endpoint
             if discoveredEndpoints[key] == nil {
                 diagnostics.discovered(String(describing: result.endpoint))
@@ -516,7 +536,13 @@ final class LanTransport {
         let prefixLength = breadth == .fullSubnet
             ? network.prefixLength
             : max(network.prefixLength, defaultLanScanPrefixLength)
-        let effectivePrefix = effectiveLanScanPrefixLength(prefixLength)
+        // The automatic full-subnet sweep is capped at /20 (~4,094 hosts);
+        // the user-initiated "Search local subnet" action (automatic ==
+        // false) keeps the wider /16 (~65k hosts) ceiling since the user
+        // explicitly asked for it.
+        let effectivePrefix = automatic
+            ? effectiveAutomaticLanScanPrefixLength(prefixLength)
+            : effectiveLanScanPrefixLength(prefixLength)
         let candidates = lanSubnetHosts(
             localAddress: network.address,
             prefixLength: effectivePrefix
@@ -529,7 +555,8 @@ final class LanTransport {
             prefixLength: effectivePrefix,
             candidates: candidates,
             nextCandidateIndex: 0,
-            remaining: candidates.count
+            remaining: candidates.count,
+            foundPeer: false
         )
         log.info(
             "Scanning \(candidates.count) subnet hosts (/\(effectivePrefix)) for CruiseMesh peers"
@@ -571,12 +598,12 @@ final class LanTransport {
                     let key = "scan:\(host):\(lanDefaultTcpPort())"
                     self.discoveredEndpoints[key] = endpoint
                     self.connect(to: endpoint, serviceKey: key)
-                    self.scanCandidateCompleted(generation: generation)
+                    self.scanCandidateCompleted(generation: generation, foundPeer: true)
                 case .failed, .cancelled:
                     completed = true
                     connection.cancel()
                     self.scanConnections.removeValue(forKey: id)
-                    self.scanCandidateCompleted(generation: generation)
+                    self.scanCandidateCompleted(generation: generation, foundPeer: false)
                 default:
                     break
                 }
@@ -591,19 +618,21 @@ final class LanTransport {
             completed = true
             connection.cancel()
             scanConnections.removeValue(forKey: id)
-            scanCandidateCompleted(generation: generation)
+            scanCandidateCompleted(generation: generation, foundPeer: false)
         }
     }
 
-    private func scanCandidateCompleted(generation: UUID) {
+    private func scanCandidateCompleted(generation: UUID, foundPeer: Bool) {
         guard var scan = runningScan, scan.generation == generation else { return }
         scan.remaining = max(scan.remaining - 1, 0)
+        if foundPeer { scan.foundPeer = true }
         diagnostics.scanAdvanced()
         if scan.remaining == 0 {
             runningScan = nil
-            scanPlanner.onScanCompleted(scan.breadth)
+            scanPlanner.onScanCompleted(scan.breadth, nowMs: Self.nowMs, foundPeer: scan.foundPeer)
             log.info(
-                "Sweep complete (/\(scan.prefixLength)): \(scan.candidates.count) probed."
+                "Sweep complete (/\(scan.prefixLength)): \(scan.candidates.count) probed, " +
+                    "\(scan.foundPeer ? "peer found" : "empty")."
             )
             if scan.breadth == .local24 {
                 scheduleAutomaticScan(after: Self.escalateAutomaticScanDelay)
@@ -741,6 +770,11 @@ final class LanTransport {
     private static let scanTimeout: DispatchTimeInterval = .milliseconds(350)
     private static let initialAutomaticScanDelay: DispatchTimeInterval = .seconds(5)
     private static let reconnectAutomaticScanDelay: DispatchTimeInterval = .seconds(2)
+    // A prompt recheck after a /24 sweep completes, not an escalation
+    // trigger by itself: `LanScanPlanner` only arms the full-subnet tier on
+    // an empty /24 sweep and holds it off for
+    // `LanScanPlanner.emptyLocalSweepFullDelayMs` (60s) after that, so this
+    // recheck will usually find nothing due yet.
     private static let escalateAutomaticScanDelay: DispatchTimeInterval = .seconds(2)
     private static let automaticScanRetryInterval: DispatchTimeInterval = .seconds(5 * 60)
 
@@ -755,6 +789,10 @@ final class LanTransport {
         let candidates: [String]
         var nextCandidateIndex: Int
         var remaining: Int
+        /// Whether any candidate answered so far -- feeds `LanScanPlanner
+        /// .onScanCompleted`'s `foundPeer`, which decides whether an empty
+        /// /24 sweep arms the full-subnet tier.
+        var foundPeer: Bool
     }
 }
 
