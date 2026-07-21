@@ -76,7 +76,8 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CRUISEMESH_RELAY_TOKENS` | *(required)* | Comma-separated allowlist. Empty → process refuses to start. |
+| `CRUISEMESH_RELAY_TOKENS` | *(required unless admin API on)* | Comma-separated static allowlist. May be empty when `CRUISEMESH_RELAY_ADMIN_TOKEN` is set (families provisioned dynamically); if both are unset the process refuses to start. |
+| `CRUISEMESH_RELAY_ADMIN_TOKEN` | *(unset = admin API off)* | Bearer token for the `/admin/families` provisioning API (§12). Unset → admin routes answer 404. Self-hosted deploys don't need it. |
 | `CRUISEMESH_RELAY_DB` | `cruisemesh-relayd.sqlite` | **Use an absolute path.** Relative paths resolve against the process CWD, which is easy to get wrong under systemd/Docker/IDE launchers. |
 | `CRUISEMESH_RELAY_BIND` | `0.0.0.0:8080` | Inside Docker keep `0.0.0.0:8080`; Caddy is the public listener. |
 | `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` | `268435456` (256 MiB) | Per-family-token storage quota. See §10. Must be a positive integer; unset uses the default. |
@@ -309,7 +310,54 @@ to take at most a few seconds; there is no separate migration step to run
 by hand. If you operate an unusually large relayd database, expect a
 one-time longer startup on the first upgrade.
 
-## 12. Not in this deploy yet
+## 12. Hosted-family admin API (`/admin/families`)
+
+Off by default. Setting `CRUISEMESH_RELAY_ADMIN_TOKEN` (generate like a family
+token: `openssl rand -hex 32`) enables a small provisioning API used by the
+cruisemesh.app purchase flow ("Cruise Pass"); self-hosted deploys can ignore
+this section entirely — with the variable unset the routes answer 404 and
+behavior is identical to before.
+
+Provisioned families live in a `families` table next to the mailbox and are
+checked on every request alongside the static env allowlist (env tokens are
+implicit always-active families). Semantics:
+
+- **Expiry**: past `expires_ms` a family gets a 7-day read-only grace window
+  (fetch/ack/WS still work so queued messages aren't stranded; `POST
+  /envelopes` returns 403 `{code:"family_expired"}`). After the grace window
+  every request is 403 `family_expired`. `expires_ms` absent = never expires.
+- **Suspension**: `status:"suspended"` rejects everything with 403
+  `{code:"family_suspended"}`; PATCH back to `active` restores service.
+- **Per-family quota**: `quota_bytes` overrides
+  `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` for that family only.
+- **Revocation** (`DELETE`) removes the family **and purges its stored
+  envelopes and presence rows**.
+- All operations are idempotent — the billing webhook retries on failure.
+
+All routes require `Authorization: Bearer $CRUISEMESH_RELAY_ADMIN_TOKEN`:
+
+```sh
+# Provision (or re-provision / renew — reactivates a suspended family)
+curl -s -X POST https://relay.example.com/admin/families \
+  -H "authorization: Bearer $ADMIN" -H "content-type: application/json" \
+  -d '{"token":"<family-token>","plan":"cruise-pass-30d","expires_ms":1790000000000}'
+
+# Inspect (includes usage_bytes / envelope_count for support)
+curl -s https://relay.example.com/admin/families/<family-token> -H "authorization: Bearer $ADMIN"
+
+# Suspend / extend
+curl -s -X PATCH https://relay.example.com/admin/families/<family-token> \
+  -H "authorization: Bearer $ADMIN" -H "content-type: application/json" \
+  -d '{"status":"suspended"}'
+
+# Revoke + purge
+curl -s -X DELETE https://relay.example.com/admin/families/<family-token> -H "authorization: Bearer $ADMIN"
+```
+
+PATCH is merge-only (`null`/omitted fields keep their stored value); to clear
+a field, re-provision via POST.
+
+## 13. Not in this deploy yet
 
 - Multi-region / federation — single VPS is the intended family-scale deploy.
 - Android/iOS clients still primarily poll today; wiring the phone apps to

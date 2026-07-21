@@ -28,8 +28,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("CRUISEMESH_RELAY_DB").unwrap_or_else(|_| "cruisemesh-relayd.sqlite".to_string());
     let tokens = env::var("CRUISEMESH_RELAY_TOKENS").unwrap_or_default();
     let auth_tokens = parse_tokens(&tokens);
-    if auth_tokens.is_empty() {
-        return Err("set CRUISEMESH_RELAY_TOKENS to a comma-separated allowlist".into());
+    // Hosted-relay mode: with an admin token set, families are provisioned
+    // dynamically through /admin/families, so an empty static allowlist is
+    // legitimate. Self-hosted deploys keep the original requirement.
+    let admin_token = env::var("CRUISEMESH_RELAY_ADMIN_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    if auth_tokens.is_empty() && admin_token.is_none() {
+        return Err(
+            "set CRUISEMESH_RELAY_TOKENS to a comma-separated allowlist \
+                    (or CRUISEMESH_RELAY_ADMIN_TOKEN to provision families dynamically)"
+                .into(),
+        );
     }
     let family_quota_bytes = match env::var("CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES") {
         Ok(raw) => parse_family_quota_bytes(&raw)?,
@@ -63,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws_per_token_max_connections = ws_limits.per_token_max_connections,
         ws_global_max_connections = ws_limits.global_max_connections,
         prune_interval_secs = DEFAULT_PRUNE_INTERVAL.as_secs(),
+        admin_api = admin_token.is_some(),
         "relay server listening"
     );
     axum::serve(
@@ -73,7 +85,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cruisemesh_relayd::WS_BROADCAST_CAPACITY,
             family_quota_bytes,
             ws_limits,
-        )),
+        )
+        .with_admin_token(admin_token)),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;

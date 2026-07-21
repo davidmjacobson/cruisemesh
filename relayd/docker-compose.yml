@@ -20,9 +20,18 @@ services:
         # Falls back to "unknown" if unset.
         GIT_SHA: ${GIT_SHA:-unknown}
     environment:
-      # Comma-separated family bearer tokens (required). Generate with:
+      # Comma-separated family bearer tokens. Required for self-hosted use;
+      # a hosted deploy that provisions families via the admin API may set
+      # this to an empty string. Generate with:
       #   openssl rand -hex 32
-      CRUISEMESH_RELAY_TOKENS: ${CRUISEMESH_RELAY_TOKENS:?set CRUISEMESH_RELAY_TOKENS}
+      # (`?` not `:?`: the var must be exported, but an explicit empty string
+      # is allowed for hosted deploys; relayd itself still refuses to start
+      # when both the allowlist and the admin token are missing.)
+      CRUISEMESH_RELAY_TOKENS: ${CRUISEMESH_RELAY_TOKENS?set CRUISEMESH_RELAY_TOKENS}
+      # Optional: enables the /admin/families provisioning API (DEPLOY.md §12)
+      # used by the cruisemesh.app purchase flow. Leave unset for self-hosted
+      # deploys — the admin routes then answer 404.
+      CRUISEMESH_RELAY_ADMIN_TOKEN: ${CRUISEMESH_RELAY_ADMIN_TOKEN:-}
       # Absolute path inside the container — do NOT rely on the process CWD.
       # (Localtunnel-era footgun: a relative default silently wrote the DB
       # somewhere else than the file you were watching.)
