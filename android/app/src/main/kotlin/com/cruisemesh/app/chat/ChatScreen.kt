@@ -3,7 +3,6 @@ package com.cruisemesh.app.chat
 import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.Configuration
-import android.graphics.BitmapFactory
 import android.media.MediaPlayer
 import android.net.Uri
 import android.widget.Toast
@@ -67,6 +66,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -79,6 +79,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
@@ -101,6 +102,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.core.content.ContextCompat
 import com.cruisemesh.app.media.AttachmentPayload
+import com.cruisemesh.app.media.ChatImageDecoder
 import com.cruisemesh.app.media.ImageGallery
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import com.cruisemesh.app.media.MediaCompressor
@@ -131,9 +133,11 @@ import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.formatUserId
 import java.io.File
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
 
@@ -500,15 +504,22 @@ private fun ConversationScreen(
         ChatListLogic.avatarHueAndInitials(contact.userId, resolvedName, displayId)
     }
     val visibleMessages = remember(messages) { messages.filter { isVisibleChatKind(it.kind) } }
-    val replyMetadata = remember(messages, ownUserId, displayName, store) {
-        if (store == null) {
-            emptyMap()
+    // FA4: reply-quote metadata and outbound-expiry watermarks are per-message
+    // store reads; load them off the main thread whenever the visible list
+    // changes instead of querying the store during composition (see
+    // ChatExtras' item-lambda / info-sheet lookups below).
+    val chatExtras by produceState(ChatExtras(), visibleMessages, ownUserId, displayName, store) {
+        value = if (store == null) {
+            ChatExtras()
         } else {
-            loadMessageReplyMetadata(store, visibleMessages) { message ->
-                if (message.senderUserId.contentEquals(ownUserId)) "You" else displayName
+            withContext(Dispatchers.IO) {
+                loadChatExtras(store, visibleMessages, ownUserId) { message ->
+                    if (message.senderUserId.contentEquals(ownUserId)) "You" else displayName
+                }
             }
         }
     }
+    val replyMetadata = chatExtras.replyMetadata
     val replyingToPreview = remember(replyingTo, ownUserId, displayName) {
         replyingTo?.let { target ->
             quotedMessagePreview(target) { message ->
@@ -639,11 +650,7 @@ private fun ConversationScreen(
                             toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
                         },
                         onPhotoClick = { viewerPhoto = it },
-                        outboundExpiryMs = if (isOwn) store?.outboundMessageExpiry(
-                            message.chatId,
-                            message.senderUserId,
-                            message.lamport,
-                        ) else null,
+                        outboundExpiryMs = if (isOwn) chatExtras.outboundExpiryMs[messageStableKey(message)] else null,
                         onLongPress = { target, bounds -> openOverlay(target, bounds) },
                         onSwipeReply = { startReply(message) },
                     )
@@ -803,11 +810,11 @@ private fun ConversationScreen(
                     infoTick,
                     infoArrival,
                     deliveredViaRoute = deliveredViaRoute,
-                    outboundExpiryMs = if (infoIsOwn) store?.outboundMessageExpiry(
-                        currentInfoMessage.chatId,
-                        currentInfoMessage.senderUserId,
-                        currentInfoMessage.lamport,
-                    ) else null,
+                    outboundExpiryMs = if (infoIsOwn) {
+                        chatExtras.outboundExpiryMs[messageStableKey(currentInfoMessage)]
+                    } else {
+                        null
+                    },
                     nowMs = System.currentTimeMillis(),
                 ),
         )
@@ -829,8 +836,12 @@ private fun ConversationScreen(
  */
 @Composable
 internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
-    val bitmap = remember(bytes) {
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+    val density = LocalDensity.current
+    val previewPx = with(density) { 72.dp.toPx().roundToInt() }
+    val bitmap by produceState<ImageBitmap?>(null, bytes, previewPx) {
+        value = withContext(Dispatchers.IO) {
+            ChatImageDecoder.decodeSampled(bytes, previewPx, previewPx)?.asImageBitmap()
+        }
     }
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -839,9 +850,10 @@ internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
             .padding(bottom = 8.dp),
     ) {
         Box {
-            if (bitmap != null) {
+            val currentBitmap = bitmap
+            if (currentBitmap != null) {
                 Image(
-                    bitmap = bitmap,
+                    bitmap = currentBitmap,
                     contentDescription = "Photo to send",
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
@@ -1580,34 +1592,54 @@ internal fun AttachmentBubbleContent(
  */
 @Composable
 private fun ChatImageAttachment(jpeg: ByteArray) {
-    val decoded = remember(jpeg) {
-        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
-    }
-    val imageBitmap = remember(decoded) { decoded?.asImageBitmap() }
+    // Header-only decode (no pixel buffer) so layout size is known
+    // immediately; the actual pixels are decoded downsampled, off the main
+    // thread, below (FA4).
+    val bounds = remember(jpeg) { ChatImageDecoder.decodeBounds(jpeg) }
 
-    if (decoded == null || imageBitmap == null) {
+    if (bounds == null) {
         Text(stringResource(R.string.ui_photo_could_not_display))
         return
     }
+    val (sourceWidth, sourceHeight) = bounds
 
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
         val density = LocalDensity.current
         val maxWidthPx = with(density) { maxWidth.toPx() }
         val maxHeightPx = with(density) { 360.dp.toPx() }
-        val (widthPx, heightPx) = remember(decoded.width, decoded.height, maxWidthPx, maxHeightPx) {
-            ImageGallery.fitSize(decoded.width, decoded.height, maxWidthPx, maxHeightPx)
+        val (widthPx, heightPx) = remember(sourceWidth, sourceHeight, maxWidthPx, maxHeightPx) {
+            ImageGallery.fitSize(sourceWidth, sourceHeight, maxWidthPx, maxHeightPx)
         }
         val widthDp = with(density) { widthPx.toDp() }
         val heightDp = with(density) { heightPx.toDp() }
 
-        Image(
-            bitmap = imageBitmap,
-            contentDescription = "Photo — tap to view full screen",
-            contentScale = ContentScale.Fit,
-            modifier = Modifier
-                .size(widthDp, heightDp)
-                .clip(RoundedCornerShape(12.dp)),
-        )
+        val imageBitmap by produceState<ImageBitmap?>(null, jpeg, widthPx, heightPx) {
+            value = withContext(Dispatchers.IO) {
+                ChatImageDecoder.decodeSampled(jpeg, widthPx.roundToInt(), heightPx.roundToInt())
+                    ?.asImageBitmap()
+            }
+        }
+        val currentBitmap = imageBitmap
+
+        if (currentBitmap == null) {
+            // Reserve the final layout size while the downsampled decode runs
+            // in the background, so nothing jumps once it lands.
+            Box(
+                modifier = Modifier
+                    .size(widthDp, heightDp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+            )
+        } else {
+            Image(
+                bitmap = currentBitmap,
+                contentDescription = "Photo — tap to view full screen",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .size(widthDp, heightDp)
+                    .clip(RoundedCornerShape(12.dp)),
+            )
+        }
     }
 }
 
