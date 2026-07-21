@@ -261,24 +261,30 @@ async fn ws_two_families_isolated() {
     assert!(result.is_err(), "family-b must not see family-a push");
 }
 
-// FR5: raise the deadline (guards a hang, not speed) but keep the default
-// current_thread runtime — this test's lag/drop condition is deliberately
-// induced by single-thread scheduling contention between the flood-posting
-// test task and the WS-handler task; running it multi-threaded lets the
-// handler drain the broadcast channel in parallel and the slow-consumer
-// condition never triggers.
+// FR5: raise the deadline (guards a hang, not speed).
+//
+// FR8 note: this test used to flood via `POST /envelopes` on the default
+// current_thread runtime, relying on synchronous store calls hogging the
+// single reactor thread to starve the WS-handler task of any chance to
+// drain the broadcast channel. Once store calls moved onto
+// `spawn_blocking` (FR8), that starvation stopped happening -- the WS
+// handler now gets scheduled readily while a post's blocking-pool work is
+// in flight and reliably keeps up, so the old flood never lagged. This
+// version pushes directly onto the broadcast channel via
+// `AppState::test_broadcast_envelope`, a plain synchronous (non-`.await`)
+// call: a tight loop of N calls is guaranteed to run to completion without
+// ever yielding to the scheduler, so the WS handler task genuinely cannot
+// drain anything mid-loop and capacity (4) is deterministically exceeded,
+// independent of the relative speed of any async subsystem.
 #[tokio::test]
 async fn ws_slow_consumer_disconnect_path() {
     let alice = generate_identity();
     let bob = generate_identity();
     let db = NamedTempFile::new().unwrap();
     let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
-    let (router, ws_url) = spawn_router(AppState::with_hub_capacity(
-        store,
-        HashSet::from(["family-a".to_string()]),
-        4,
-    ))
-    .await;
+    let state = AppState::with_hub_capacity(store, HashSet::from(["family-a".to_string()]), 4);
+    let broadcaster = state.clone();
+    let (_router, ws_url) = spawn_router(state).await;
 
     let seed = author_text(&alice, &bob, "seed", 1);
     let url = format!(
@@ -286,11 +292,10 @@ async fn ws_slow_consumer_disconnect_path() {
         b64(&seed.recipient_hint)
     );
     let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    tokio::task::yield_now().await;
 
-    for i in 0..64u64 {
-        let mut env = author_text(&alice, &bob, &format!("flood {i}"), i + 1);
-        env.recipient_hint = seed.recipient_hint.clone();
-        post_envelope(&router, "family-a", &env).await;
+    for i in 0..64i64 {
+        broadcaster.test_broadcast_envelope("family-a", &seed.recipient_hint, i + 1);
     }
 
     let mut saw_close = false;

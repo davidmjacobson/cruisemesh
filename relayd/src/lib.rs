@@ -89,6 +89,12 @@ pub const WS_BROADCAST_CAPACITY: usize = 64;
 /// slow/dead and dropped (same heal path as lag: reconnect + replay).
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// FR8: how long a store call blocks waiting for SQLite's write lock
+/// before giving up with `SQLITE_BUSY`. Store calls already run on a
+/// `spawn_blocking` thread (`RelayStore::run_blocking`), so waiting here
+/// costs a blocking-pool thread, not a tokio reactor worker.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// DESIGN.md §9: hard upper bound on how long a row may live on the relay.
 /// Client-supplied `expiry_ms` (typically 7 days via core's
 /// `DEFAULT_EXPIRY_MS`) is honored when tighter; this caps the rest.
@@ -209,6 +215,42 @@ impl AppState {
             family_quota_bytes,
         }
     }
+
+    /// Test helper: push a synthetic envelope directly onto the WS fan-out
+    /// broadcast channel, bypassing `POST /envelopes` (and therefore the
+    /// store) entirely. `id`/`msg_id`/etc. are placeholders -- this exists
+    /// only to let a test overflow the broadcast buffer deterministically,
+    /// independent of the relative speed of HTTP/store handling vs. the WS
+    /// handler's drain loop.
+    ///
+    /// FR8 note: before store calls moved onto `spawn_blocking`, a test
+    /// could induce the same overflow indirectly by flooding
+    /// `POST /envelopes` on a single-threaded test runtime -- synchronous
+    /// DB work on the reactor thread starved the WS handler task of any
+    /// chance to drain the channel. Once store calls stopped blocking the
+    /// reactor, that trick stopped working (the WS handler now gets
+    /// scheduled readily between posts and keeps up). This is a plain,
+    /// synchronous, non-`.await`ing call -- a test loop that calls it N
+    /// times in a row is guaranteed to run to completion without yielding
+    /// to the scheduler even once, so the WS handler task genuinely cannot
+    /// drain anything mid-loop.
+    pub fn test_broadcast_envelope(&self, family_token: &str, recipient_hint: &[u8], id: i64) {
+        let recipient_hint = encode_base64_field(recipient_hint);
+        let envelope = EnvelopeResponse {
+            id,
+            msg_id: String::new(),
+            hop_ttl: 0,
+            recipient_hint: recipient_hint.clone(),
+            sealed: String::new(),
+            expiry_ms: 0,
+            created_at_ms: 0,
+        };
+        let _ = self.tx.send(std::sync::Arc::new(BroadcastEnvelope {
+            family_token: family_token.to_string(),
+            recipient_hint,
+            envelope,
+        }));
+    }
 }
 
 #[derive(Clone)]
@@ -242,10 +284,54 @@ pub enum QuotaInsertResult {
 impl RelayStore {
     pub fn open(path: &str) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
+        // FR8: default SQLite settings are journal_mode=DELETE (readers and
+        // the one writer block each other for the duration of a
+        // transaction) and busy_timeout=0 (a lock collision fails
+        // immediately with SQLITE_BUSY instead of waiting). Every store
+        // call now runs on a spawn_blocking thread (see `run_blocking`)
+        // rather than serialized onto whichever tokio worker happened to
+        // be running the handler, so concurrent store calls are a real
+        // possibility, not just a theoretical one -- WAL lets readers
+        // proceed while a write is in progress, and a nonzero busy_timeout
+        // makes a transient writer-vs-writer collision retry-and-block
+        // instead of surfacing as a bogus 500.
+        //
+        // Best-effort, not asserted: `:memory:` databases (used throughout
+        // this crate's own unit tests) cannot use WAL -- SQLite silently
+        // keeps them in "memory" journal mode -- so this deliberately does
+        // not verify the resulting mode the way `pragma_update_and_check`
+        // would; doing so would make every in-memory test fail.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| e.to_string())?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         Ok(Self {
             conn: std::sync::Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// FR8: run a synchronous rusqlite call -- every `RelayStore` method is
+    /// synchronous, guarded by `self.conn`'s `std::sync::Mutex` -- on a
+    /// dedicated blocking-pool thread instead of whatever tokio worker is
+    /// driving the calling handler. Before this, every request handler
+    /// called `self.conn.lock()` + rusqlite directly from async code: a
+    /// lock wait or a slow disk write would stall that worker thread and,
+    /// with it, every other task cooperatively scheduled on it (other
+    /// requests, WS keepalive pings, ...).
+    ///
+    /// Pattern: `RelayStore` is a cheap `Clone` (one `Arc` bump), so clone
+    /// it and move the closure (which gets a `&RelayStore` to call the
+    /// real, synchronous method on) into `spawn_blocking`.
+    async fn run_blocking<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&RelayStore) -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || f(&store))
+            .await
+            .map_err(|join_err| format!("blocking store task panicked: {join_err}"))?
     }
 
     /// Clamp client `expiry_ms` to the 30-day retention ceiling relative to
@@ -806,18 +892,31 @@ async fn post_envelope(
 
     // Dedupe, quota accounting, expiry pruning, and insertion are one store
     // transaction so concurrent posts cannot all pass the same usage check.
+    // FR8: off the tokio reactor via run_blocking; clone what the closure
+    // needs so `family_token`/`msg_id`/`recipient_hint`/`sealed` stay
+    // available below for logging, the response body, and the broadcast.
+    let insert_family = family_token.clone();
+    let insert_msg_id = msg_id.clone();
+    let insert_hint = recipient_hint.clone();
+    let insert_sealed = sealed.clone();
+    let hop_ttl = request.hop_ttl;
+    let expiry_ms_req = request.expiry_ms;
+    let family_quota_bytes = state.family_quota_bytes;
     let result = state
         .store
-        .insert_envelope_with_quota(
-            &family_token,
-            msg_id.clone(),
-            request.hop_ttl,
-            recipient_hint.clone(),
-            sealed.clone(),
-            request.expiry_ms,
-            now,
-            state.family_quota_bytes,
-        )
+        .run_blocking(move |store| {
+            store.insert_envelope_with_quota(
+                &insert_family,
+                insert_msg_id,
+                hop_ttl,
+                insert_hint,
+                insert_sealed,
+                expiry_ms_req,
+                now,
+                family_quota_bytes,
+            )
+        })
+        .await
         .map_err(ApiError::internal)?;
     let id = match result {
         QuotaInsertResult::Stored { id } => id,
@@ -904,9 +1003,14 @@ async fn get_envelopes(
         .limit
         .unwrap_or(DEFAULT_FETCH_LIMIT)
         .min(MAX_FETCH_LIMIT);
+    // FR8: off the tokio reactor -- this is the hottest read path in the
+    // service (every client poll).
+    let fetch_family = family_token.clone();
+    let now = now_ms();
     let rows = state
         .store
-        .fetch_envelopes(&family_token, hints, after, limit, now_ms())
+        .run_blocking(move |store| store.fetch_envelopes(&fetch_family, hints, after, limit, now))
+        .await
         .map_err(ApiError::internal)?;
     // next_cursor stays at `after` when the page is empty so clients can
     // keep polling without inventing a sentinel. Rows remain until ack —
@@ -960,7 +1064,8 @@ async fn ack_envelopes(
     ids.dedup();
     let deleted = state
         .store
-        .ack_envelopes(&family_token, ids)
+        .run_blocking(move |store| store.ack_envelopes(&family_token, ids))
+        .await
         .map_err(ApiError::internal)?;
     Ok(Json(AckResponse { deleted }))
 }
@@ -1004,7 +1109,8 @@ async fn sync_presence(
     let now = now_ms();
     let rows = state
         .store
-        .sync_presence(&family_token, &announce, &query, now)
+        .run_blocking(move |store| store.sync_presence(&family_token, &announce, &query, now))
+        .await
         .map_err(ApiError::internal)?;
     Ok(Json(PresenceResponse {
         now_ms: now,
@@ -1135,13 +1241,25 @@ async fn handle_ws(
 
     // --- Replay: same rows GET /envelopes would return ---
     loop {
-        let rows = match state.store.fetch_envelopes(
-            &family_token,
-            hints.clone(),
-            after,
-            DEFAULT_FETCH_LIMIT,
-            now_ms(),
-        ) {
+        // FR8: off the tokio reactor -- a fresh WS connection can replay
+        // an arbitrarily large backlog before the live-push loop even
+        // starts.
+        let replay_family = family_token.clone();
+        let replay_hints = hints.clone();
+        let replay_now = now_ms();
+        let rows = match state
+            .store
+            .run_blocking(move |store| {
+                store.fetch_envelopes(
+                    &replay_family,
+                    replay_hints,
+                    after,
+                    DEFAULT_FETCH_LIMIT,
+                    replay_now,
+                )
+            })
+            .await
+        {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -2229,5 +2347,79 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // --- FR8: WAL + busy_timeout + spawn_blocking ---
+
+    #[test]
+    fn open_enables_wal_journal_mode_for_a_file_backed_database() {
+        let db = NamedTempFile::new().unwrap();
+        let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
+        let mode: String = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+    }
+
+    #[test]
+    fn open_sets_the_configured_busy_timeout() {
+        let db = NamedTempFile::new().unwrap();
+        let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
+        let timeout_ms: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(timeout_ms, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    /// `:memory:` databases can't use WAL (SQLite silently keeps them in
+    /// "memory" journal mode) -- `RelayStore::open` must not error on that,
+    /// since the rest of this test module opens `:memory:` stores
+    /// throughout.
+    #[test]
+    fn open_does_not_error_on_an_in_memory_database() {
+        let store = RelayStore::open(":memory:").unwrap();
+        let mode: String = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(mode.to_ascii_lowercase(), "memory");
+    }
+
+    /// FR8: store calls run on a spawn_blocking thread, not the calling
+    /// task's own worker -- if `run_blocking` were accidentally a no-op
+    /// wrapper (e.g. calling `f` inline instead of inside
+    /// `spawn_blocking`), this test would still pass functionally but the
+    /// point of the change would be silently lost. Assert the closure
+    /// actually executes on a different OS thread than the caller.
+    #[tokio::test]
+    async fn run_blocking_executes_off_the_calling_thread() {
+        let (_db, store) = test_store();
+        let caller_thread = std::thread::current().id();
+        let worker_thread = store
+            .run_blocking(move |_store| Ok(std::thread::current().id()))
+            .await
+            .unwrap();
+        assert_ne!(
+            caller_thread, worker_thread,
+            "store call should run on a spawn_blocking thread, not the caller's"
+        );
+    }
+
+    /// FR8 (verifying FR2 already covers this): `ApiError::internal` must
+    /// never leak rusqlite error text (which can include the DB file path)
+    /// into a client-visible response body.
+    #[test]
+    fn internal_error_body_never_contains_the_raw_detail() {
+        let detail = "disk I/O error: unable to open database file /secret/path/db.sqlite";
+        let error = ApiError::internal(detail.to_string());
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!error.message.contains("secret"));
+        assert!(!error.message.contains("sqlite"));
+        assert_eq!(error.message, "internal server error");
     }
 }
