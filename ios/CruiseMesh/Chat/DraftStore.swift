@@ -9,12 +9,18 @@ enum DraftStore {
 
     static func save(chatId: Data, text: String) {
         let normalized = text.trimmingCharacters(in: .newlines)
+        let previous = load(chatId: chatId)
         if normalized.isEmpty {
             UserDefaults.standard.removeObject(forKey: key(chatId))
         } else {
             UserDefaults.standard.set(text, forKey: key(chatId))
         }
-        ChatEvents.notifyChatChanged(chatId)
+        // XP1: don't fire chat-changed (and, via ChatView's own sink, a
+        // reload) on every keystroke -- only the presence transition (a
+        // draft appearing/disappearing) needs to be announced.
+        if DraftChangeSignal.shouldNotify(previous: previous, next: text) {
+            ChatEvents.notifyChatChanged(chatId)
+        }
     }
 
     private static func key(_ chatId: Data) -> String {

@@ -448,7 +448,6 @@ struct GroupChatView: View {
         ) { message in
             senderName(message.senderUserId)
         }
-        MeshController.shared.notifyChatViewed(chatId: activeGroup.id)
         if let stored = try? store.getGroup(groupId: activeGroup.id) {
             updatedGroup = stored
         }
