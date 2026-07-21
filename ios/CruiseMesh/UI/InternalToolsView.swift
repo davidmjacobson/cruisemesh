@@ -112,10 +112,15 @@ struct InternalToolsView: View {
 
             Section("Diagnostics") {
                 Button {
-                    if let url = DiagnosticLogExport.writeLogFile() {
-                        shareFile = ShareableFile(url: url)
-                    } else {
+                    // Bundles any MetricKit payloads in alongside the log
+                    // file, riding this existing flow with zero new UI.
+                    var urls: [URL] = []
+                    if let url = DiagnosticLogExport.writeLogFile() { urls.append(url) }
+                    urls.append(contentsOf: DiagnosticLogExport.metricKitFileURLs())
+                    if urls.isEmpty {
                         lanError = "No diagnostics captured this session yet"
+                    } else {
+                        shareFile = ShareableFile(urls: urls)
                     }
                 } label: {
                     Label("Share diagnostics", systemImage: "ladybug")
@@ -158,7 +163,7 @@ struct InternalToolsView: View {
             }
         }
         .sheet(item: $shareFile) { file in
-            ActivityShareView(items: [file.url])
+            ActivityShareView(items: file.urls)
         }
         .sheet(isPresented: $showLanScanner) {
             QRScannerView { code in

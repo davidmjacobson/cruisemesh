@@ -109,6 +109,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        // Battery audit, 2026-07-21: registered unconditionally, here rather
+        // than in the SwiftUI `onAppear` below, for the same reason this
+        // method exists at all -- a background BLE relaunch may never show
+        // any UI, so MetricKit's "call this as early as possible in every
+        // launch" guidance needs a hook that always runs. See
+        // MetricKitCollector's doc.
+        MetricKitCollector.shared.start()
         let isBluetoothRelaunch = launchOptions?[.bluetoothCentrals] != nil
             || launchOptions?[.bluetoothPeripherals] != nil
         // Onboarding gates mesh startup deliberately (permissions are
