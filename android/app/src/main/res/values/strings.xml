@@ -79,6 +79,7 @@
     <string name="ui_enable_background_activity">Enable background activity</string>
     <string name="ui_new_chat">New chat</string>
     <string name="ui_new_group">New group</string>
+    <string name="ui_new_messages">New messages</string>
     <string name="ui_no_contacts_yet">No contacts yet</string>
     <string name="ui_nickname">Nickname</string>
     <string name="ui_add_a_nickname">Add a nickname</string>

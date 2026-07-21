@@ -53,6 +53,7 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
@@ -298,10 +299,35 @@ fun GroupChatScreen(
         }
     }
 
-    LaunchedEffect(visibleMessages.size) {
-        if (visibleMessages.isNotEmpty()) {
-            // reverseLayout start is the bottom; pin the newest message there.
-            listState.scrollToItem(0)
+    // FA7: only auto-scroll to the bottom when the reader is already there
+    // (or the arriving message is their own send) -- see ChatScrollLogic.
+    var newestMessageKey by remember(group.id) { mutableStateOf<String?>(null) }
+    var newMessagesAvailable by remember(group.id) { mutableStateOf(false) }
+    LaunchedEffect(visibleMessages) {
+        val currentNewestKey = visibleMessages.lastOrNull()?.let(::messageStableKey)
+        val isNewestOwn = visibleMessages.lastOrNull()?.senderUserId?.contentEquals(ownUserId) == true
+        when (
+            ChatScrollLogic.decide(
+                previousNewestKey = newestMessageKey,
+                currentNewestKey = currentNewestKey,
+                firstVisibleItemIndex = listState.firstVisibleItemIndex,
+                isNewestOwnMessage = isNewestOwn,
+            )
+        ) {
+            ChatScrollLogic.Decision.AUTO_SCROLL -> {
+                // reverseLayout start is the bottom; pin the newest message there.
+                listState.scrollToItem(0)
+                newMessagesAvailable = false
+            }
+            ChatScrollLogic.Decision.SHOW_NEW_MESSAGES_CHIP -> newMessagesAvailable = true
+            ChatScrollLogic.Decision.NONE -> {}
+        }
+        newestMessageKey = currentNewestKey ?: newestMessageKey
+    }
+    // Clear the chip once the reader scrolls back to the bottom themselves.
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex }.collect { index ->
+            if (index <= 1) newMessagesAvailable = false
         }
     }
 
@@ -334,12 +360,16 @@ fun GroupChatScreen(
                 .padding(bottom = with(density) { keyboardFreeze.extraBottomPx.toDp() })
                 .padding(horizontal = 16.dp),
         ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+            ) {
             LazyColumn(
                 state = listState,
                 reverseLayout = true,
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
+                    .fillMaxSize()
                     .padding(vertical = 8.dp),
             ) {
                 itemsIndexed(
@@ -368,6 +398,19 @@ fun GroupChatScreen(
                     )
                 }
             }
+
+            if (newMessagesAvailable) {
+                NewMessagesChip(
+                    onClick = {
+                        scrollScope.launch { listState.animateScrollToItem(0) }
+                        newMessagesAvailable = false
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 12.dp),
+                )
+            }
+            } // Box (LazyColumn + New messages chip)
 
             if (replyingToPreview != null) {
                 ReplyComposerPreview(
