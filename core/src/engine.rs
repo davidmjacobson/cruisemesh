@@ -513,7 +513,20 @@ impl MessageStore {
             self.carried_envelopes_for_peer_sync(peer_hints, peer_known_msg_ids.clone(), now_ms)?;
         let known: HashSet<Vec<u8>> = peer_known_msg_ids.into_iter().collect();
 
+        // FC2: fetch each contact's pending backlog with the exclusion
+        // (known_msg_ids/expiry) already applied in SQL, and only up to
+        // however much of the shared `own_outbound_budget_bytes` is still
+        // left after earlier contacts -- so once the budget is spent, later
+        // contacts' ciphertext is never pulled into memory at all, instead
+        // of (as before) fetching every pending envelope for every contact
+        // up front and only then discarding the ones the budget excludes.
+        // `select_own_outbound` below still re-runs its exact greedy
+        // selection over the assembled (now pre-bounded) result, so it
+        // remains the single source of truth for which envelopes are
+        // chosen and in what order -- this loop only changes how much
+        // ciphertext gets read to arrive at the same answer.
         let mut pending_by_recipient = Vec::new();
+        let mut remaining_outbound_budget = own_outbound_budget_bytes;
         for contact in self.list_contacts()? {
             if contact.user_id == peer_user_id {
                 continue;
@@ -523,11 +536,22 @@ impl MessageStore {
                 own_user_id.clone(),
                 RECEIPT_TYPE_DELIVERED,
             )?;
-            pending_by_recipient.push(self.outbound_envelopes_after(
+            let (contact_pending, exhausted) = self.outbound_envelopes_after_budgeted(
                 contact.user_id,
                 own_user_id.clone(),
                 delivered_through,
-            )?);
+                &known,
+                now_ms,
+                remaining_outbound_budget,
+            )?;
+            for envelope in &contact_pending {
+                remaining_outbound_budget =
+                    remaining_outbound_budget.saturating_sub(envelope.sealed.len() as u64);
+            }
+            pending_by_recipient.push(contact_pending);
+            if exhausted {
+                break;
+            }
         }
 
         let own_outbound = select_own_outbound(
@@ -1241,6 +1265,88 @@ mod tests {
                 .map(|item| item.msg_id[0])
                 .collect::<Vec<_>>(),
             vec![2]
+        );
+    }
+
+    #[test]
+    fn digest_spray_plan_bounds_outbound_fan_in_by_the_shared_budget_across_contacts() {
+        // FC2: the digest spray plan must stop fetching further contacts'
+        // pending backlog once the shared outbound budget for this exchange
+        // is already spent by an earlier contact -- not fetch every
+        // contact's ciphertext up front and truncate afterward. Contacts
+        // are visited alphabetically (`list_contacts`'s `ORDER BY name`),
+        // so Bob's own two-envelope backlog alone exhausting the budget
+        // must mean Carol's single envelope is never even queried.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let own_user_id = vec![1_u8; 16];
+        let peer_user_id = vec![9_u8; 16];
+        let bob = vec![2_u8; 16];
+        let carol = vec![3_u8; 16];
+        let now_ms = 1_700_000_000_000_i64;
+
+        for (user_id, name) in [(&bob, "Bob"), (&carol, "Carol")] {
+            store
+                .upsert_contact(crate::Contact {
+                    user_id: user_id.clone(),
+                    name: name.to_string(),
+                    sign_pk: vec![0; 32],
+                    agree_pk: vec![0; 32],
+                    relay_url: None,
+                    relay_token: None,
+                    nickname: None,
+                })
+                .unwrap();
+        }
+
+        let queue = |chat_id: &[u8], lamport: u64, msg_id: u8, sealed_len: usize| {
+            let message = crate::StoredMessage {
+                chat_id: chat_id.to_vec(),
+                sender_user_id: own_user_id.clone(),
+                lamport,
+                timestamp: now_ms,
+                kind: 1,
+                payload: b"hi".to_vec(),
+            };
+            let envelope = OutboundEnvelope {
+                msg_id: vec![msg_id; 16],
+                recipient_user_id: chat_id.to_vec(),
+                chat_id: chat_id.to_vec(),
+                sender_user_id: own_user_id.clone(),
+                kind: 1,
+                lamport,
+                timestamp: now_ms,
+                hop_ttl: 7,
+                expiry: now_ms + 60_000,
+                recipient_hint: b"hint".to_vec(),
+                sealed: vec![0xAB; sealed_len],
+            };
+            store
+                .insert_outgoing_message(message, envelope, now_ms)
+                .unwrap();
+        };
+
+        // Bob: two pending envelopes, 10 bytes each.
+        queue(&bob, 1, 1, 10);
+        queue(&bob, 2, 2, 10);
+        // Carol: one pending envelope. Bob's list alone should already
+        // exhaust a 15-byte budget, so Carol must never be queried.
+        queue(&carol, 1, 3, 10);
+
+        let plan = store
+            .core_digest_spray_plan(own_user_id, peer_user_id, vec![], vec![], now_ms, 15, 0, 0)
+            .unwrap();
+
+        assert_eq!(
+            plan.own_outbound_frames.len(),
+            1,
+            "only Bob's first envelope fits the 15-byte budget"
+        );
+        assert_eq!(
+            store.test_sealed_reads(),
+            2,
+            "Bob's two envelopes are decoded (one selected, one decoded \
+             only to learn it overflows the budget); Carol's envelope must \
+             never be fetched once the shared budget is already spent"
         );
     }
 

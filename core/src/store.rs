@@ -105,7 +105,8 @@
 
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -292,6 +293,19 @@ pub struct OutgoingReceiptEnvelope {
 #[derive(uniffi::Object)]
 pub struct MessageStore {
     pub(crate) conn: Mutex<Connection>,
+    /// FC2 test-only instrumentation: counts how many `sealed` envelope
+    /// blobs the digest-spray queries
+    /// ([`MessageStore::carried_envelopes_for_peer_sync`],
+    /// [`MessageStore::outbound_envelopes_after_budgeted`]) actually
+    /// materialize into Rust memory. Those queries push `known`/`expiry`
+    /// exclusion (and, for the outbound spray, the shared byte budget) into
+    /// the SQL `WHERE` clause so a row that's already known to the peer, or
+    /// that would overflow the budget, is never decoded -- this counter is
+    /// how the regression tests prove that rather than just asserting on
+    /// the (identical either way) final selection. Not exported via UniFFI;
+    /// compiled out of non-test builds.
+    #[cfg(test)]
+    pub(crate) sealed_reads: std::sync::atomic::AtomicU64,
 }
 
 #[uniffi::export]
@@ -404,6 +418,8 @@ impl MessageStore {
         .map_err(store_err)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            sealed_reads: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -487,6 +503,18 @@ impl MessageStore {
             validate_msg_id("reply_to_msg_id", reply_to_msg_id)?;
         }
         incoming_message_reference::insert(self, message, Some(msg_id), reply_to_msg_id)
+    }
+}
+
+/// Internal-only helpers, never exported over UniFFI: not wrapped in
+/// `#[uniffi::export]` because these are implementation details of the
+/// digest spray plan (FC2) rather than API the platform shells call
+/// directly.
+impl MessageStore {
+    /// FC2 test-only accessor for [`MessageStore::sealed_reads`].
+    #[cfg(test)]
+    pub(crate) fn test_sealed_reads(&self) -> u64 {
+        self.sealed_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -2534,6 +2562,15 @@ impl MessageStore {
     /// (`peer_known_msg_ids` from its digest), and not actually addressed to
     /// that peer (`peer_hints`, which the targeted-delivery path handles
     /// separately). Ordered oldest first.
+    ///
+    /// FC2: `peer_known_msg_ids`/`peer_hints` exclusion is pushed into the
+    /// SQL `WHERE` clause (as `NOT IN`) rather than fetched-then-filtered in
+    /// Rust, so a row the peer already has never has its `sealed` ciphertext
+    /// decoded at all -- with D8's periodic re-digest, this query now runs
+    /// every few minutes on every long-lived link, and the old
+    /// fetch-everything-then-filter shape meant every one of those ticks
+    /// paid to materialize up to the full 64 MiB carry budget regardless of
+    /// how little of it was actually new to the peer.
     pub fn carried_envelopes_for_peer_sync(
         &self,
         peer_hints: Vec<Vec<u8>>,
@@ -2541,25 +2578,24 @@ impl MessageStore {
         now_ms: i64,
     ) -> Result<Vec<CarriedEnvelope>, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
-        let mut stmt = conn
-            .prepare(
-                "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
-                 FROM carried_envelopes
-                 WHERE expiry > ?1
-                 ORDER BY received_at ASC, msg_id ASC",
-            )
-            .map_err(store_err)?;
+        let mut sql = String::from(
+            "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
+             FROM carried_envelopes
+             WHERE expiry > ?1",
+        );
+        let mut bind: Vec<Value> = vec![Value::Integer(now_ms)];
+        push_not_in(&mut sql, &mut bind, "msg_id", &peer_known_msg_ids);
+        push_not_in(&mut sql, &mut bind, "recipient_hint", &peer_hints);
+        sql.push_str(" ORDER BY received_at ASC, msg_id ASC");
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
         let rows = stmt
-            .query_map(params![now_ms], row_to_carried)
+            .query_map(params_from_iter(bind.iter()), row_to_carried)
             .map_err(store_err)?;
-        let known_msg_ids: HashSet<Vec<u8>> = peer_known_msg_ids.into_iter().collect();
-        let peer_hints: HashSet<Vec<u8>> = peer_hints.into_iter().collect();
-        let all = rows.collect::<Result<Vec<_>, _>>().map_err(store_err)?;
-        Ok(all
-            .into_iter()
-            .filter(|env| !known_msg_ids.contains(&env.msg_id))
-            .filter(|env| !peer_hints.contains(&env.recipient_hint))
-            .collect())
+        let selected = rows.collect::<Result<Vec<_>, _>>().map_err(store_err)?;
+        #[cfg(test)]
+        self.sealed_reads
+            .fetch_add(selected.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(selected)
     }
 
     /// Drop a carried envelope by `msg_id` -- called once it's been handed to
@@ -2629,6 +2665,111 @@ impl MessageStore {
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
+}
+
+/// Internal-only helper, never exported over UniFFI: implementation detail
+/// of `engine.rs::core_digest_spray_plan`'s per-contact outbound fan-in
+/// (FC2), not API either platform shell calls directly.
+impl MessageStore {
+    /// Budget-aware, exclusion-pushed-down variant of
+    /// [`MessageStore::outbound_envelopes_after`] used only by the digest
+    /// spray plan. Unlike the public method, this pushes both `expiry` and
+    /// `known_msg_ids` exclusion into the SQL `WHERE` clause -- so ciphertext
+    /// for an expired or already-peer-known row is never decoded -- and
+    /// stops stepping the query as soon as `budget_bytes` (this contact's
+    /// share of what's left of the shared spray budget) would be exceeded,
+    /// so a contact's entire remaining backlog is never pulled into memory
+    /// once the budget for this spray is already spent.
+    ///
+    /// Returns the selected envelopes (oldest first, already filtered and
+    /// budget-bounded) plus whether the budget ran out partway through this
+    /// contact's stream. The exact greedy selection order this preserves --
+    /// contacts in caller-supplied order, envelopes within a contact oldest
+    /// first, stop at the very first envelope that would overflow the
+    /// *shared* budget -- is [`crate::engine::select_own_outbound`]'s
+    /// algorithm; the caller (`core_digest_spray_plan`) still runs that
+    /// function over the assembled, now much smaller, result as the single
+    /// source of truth for the final selection, so this method only needs
+    /// to reproduce its budget arithmetic closely enough to avoid fetching
+    /// ciphertext that pass would discard anyway -- it does not need to be
+    /// the final word on what's included.
+    pub(crate) fn outbound_envelopes_after_budgeted(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        after_lamport: u64,
+        known_msg_ids: &HashSet<Vec<u8>>,
+        now_ms: i64,
+        budget_bytes: u64,
+    ) -> Result<(Vec<OutboundEnvelope>, bool), CoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut sql = String::from(
+            "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, kind, lamport,
+                    timestamp, hop_ttl, expiry, recipient_hint, sealed
+             FROM outbound_envelopes
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport > ?3 AND expiry > ?4",
+        );
+        let mut bind: Vec<Value> = vec![
+            Value::Blob(chat_id),
+            Value::Blob(sender_user_id),
+            Value::Integer(after_lamport as i64),
+            Value::Integer(now_ms),
+        ];
+        let known: Vec<Vec<u8>> = known_msg_ids.iter().cloned().collect();
+        push_not_in(&mut sql, &mut bind, "msg_id", &known);
+        sql.push_str(" ORDER BY lamport ASC");
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let mut rows = stmt
+            .query_map(params_from_iter(bind.iter()), row_to_outbound)
+            .map_err(store_err)?;
+        let mut selected = Vec::new();
+        let mut used = 0_u64;
+        let mut exhausted = false;
+        for row in &mut rows {
+            let envelope = row.map_err(store_err)?;
+            // Every iteration here is a `sealed` blob actually decoded --
+            // known/expired rows never reach this loop at all (excluded by
+            // the `WHERE` clause above), so counting per-decode (rather
+            // than per-selected) also captures the one row that trips the
+            // budget and gets decoded just to learn its size before being
+            // rejected.
+            #[cfg(test)]
+            self.sealed_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let size = envelope.sealed.len() as u64;
+            if used.saturating_add(size) > budget_bytes {
+                exhausted = true;
+                break;
+            }
+            used += size;
+            selected.push(envelope);
+        }
+        Ok((selected, exhausted))
+    }
+}
+
+/// Appends ` AND {column} NOT IN (?,?,...)` to `sql` and pushes the
+/// corresponding blob values onto `bind`, in order -- shared by the FC2
+/// digest-spray queries that need to exclude a caller-supplied set of
+/// msg_ids/hints in SQL rather than fetch-then-filter in Rust. A `NOT IN
+/// ()` with zero elements is invalid SQLite syntax, so an empty `values`
+/// leaves `sql`/`bind` untouched (no exclusion predicate at all, which is
+/// the correct behavior: nothing to exclude).
+fn push_not_in(sql: &mut String, bind: &mut Vec<Value>, column: &str, values: &[Vec<u8>]) {
+    if values.is_empty() {
+        return;
+    }
+    sql.push_str(" AND ");
+    sql.push_str(column);
+    sql.push_str(" NOT IN (");
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+        bind.push(Value::Blob(value.clone()));
+    }
+    sql.push(')');
 }
 
 fn validate_carried_envelope(envelope: &CarriedEnvelope, now_ms: i64) -> Result<(), CoreError> {
@@ -6896,6 +7037,88 @@ mod tests {
             .unwrap();
         let ids: Vec<Vec<u8>> = found.into_iter().map(|e| e.msg_id).collect();
         assert_eq!(ids, vec![b"spray".to_vec()]);
+    }
+
+    // --- FC2: digest spray pushes exclusion/budget into SQL ----------------
+
+    #[test]
+    fn peer_sync_never_decodes_sealed_ciphertext_for_rows_the_peer_already_knows() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for (id, hint) in [
+            (b"k1" as &[u8], b"hint-1" as &[u8]),
+            (b"k2", b"hint-2"),
+            (b"k3", b"hint-3"),
+        ] {
+            store
+                .enqueue_carried_envelope(carried(id, hint, 9_000, 4_096), false, 1_000, BIG_BUDGET)
+                .unwrap();
+        }
+
+        let known_ids = vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()];
+        let found = store
+            .carried_envelopes_for_peer_sync(vec![], known_ids, 5_000)
+            .unwrap();
+
+        assert!(found.is_empty());
+        assert_eq!(
+            store.test_sealed_reads(),
+            0,
+            "a row already known to the peer must never have its sealed ciphertext decoded"
+        );
+    }
+
+    #[test]
+    fn outbound_budgeted_excludes_known_ids_in_sql_and_stops_at_the_shared_budget() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+
+        let msg1 = msg(b"bob", b"alice", 1, "one");
+        let mut env1 = outbound_for(&msg1, b"bob", b"msg-000000000001");
+        env1.sealed = vec![1u8; 10];
+        env1.expiry = 1_700_000_100_000;
+        store
+            .insert_outgoing_message(msg1, env1.clone(), 1_700_000_000_100)
+            .unwrap();
+
+        let msg2 = msg(b"bob", b"alice", 2, "two");
+        let mut env2 = outbound_for(&msg2, b"bob", b"msg-000000000002");
+        env2.sealed = vec![2u8; 10];
+        env2.expiry = 1_700_000_100_000;
+        store
+            .insert_outgoing_message(msg2, env2.clone(), 1_700_000_000_200)
+            .unwrap();
+
+        let msg3 = msg(b"bob", b"alice", 3, "three");
+        let mut env3 = outbound_for(&msg3, b"bob", b"msg-000000000003");
+        env3.sealed = vec![3u8; 10];
+        env3.expiry = 1_700_000_100_000;
+        store
+            .insert_outgoing_message(msg3, env3.clone(), 1_700_000_000_300)
+            .unwrap();
+
+        // env1 is already known to the peer -- excluded in SQL, never
+        // decoded. Budget (15 bytes) fits env2 (10 bytes) alone but not
+        // env2+env3 (20 bytes), so env3 is the one that trips the budget.
+        let known: HashSet<Vec<u8>> = [env1.msg_id.clone()].into_iter().collect();
+        let (selected, exhausted) = store
+            .outbound_envelopes_after_budgeted(
+                b"bob".to_vec(),
+                b"alice".to_vec(),
+                0,
+                &known,
+                1_700_000_000_000,
+                15,
+            )
+            .unwrap();
+
+        assert_eq!(selected, vec![env2]);
+        assert!(exhausted, "the third envelope should overflow the budget");
+        assert_eq!(
+            store.test_sealed_reads(),
+            2,
+            "known env1 must never be decoded; env2 (selected) and env3 (the \
+             one that overflows the budget, decoded only to learn its size) \
+             account for the other two"
+        );
     }
 
     #[test]
