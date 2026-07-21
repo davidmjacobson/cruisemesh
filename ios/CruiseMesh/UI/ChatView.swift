@@ -154,64 +154,22 @@ struct ChatView: View {
                 }
             }
 
-            VStack(spacing: 8) {
-                if let replyingToPreview {
-                    ReplyComposerPreview(preview: replyingToPreview) {
-                        replyingTo = nil
-                    }
-                }
-                if let pendingPhoto {
-                    PendingPhotoPreview(jpeg: pendingPhoto) {
-                        self.pendingPhoto = nil
-                    }
-                }
-                HStack(alignment: .bottom, spacing: 8) {
-                    Menu {
-                        PhotosPicker(selection: $photoItem, matching: .images) {
-                            Label("Photo library", systemImage: "photo")
-                        }
-                        Button { showCamera = true } label: {
-                            Label("Take photo", systemImage: "camera")
-                        }
-                        Button { showVoice = true } label: {
-                            Label("Voice memo", systemImage: "mic")
-                        }
-                    } label: {
-                        Image(systemName: "plus.circle.fill")
-                            .font(.system(size: 28))
-                    }
-                    .accessibilityLabel("Attach")
-
-                    TextField("Message", text: $draft, axis: .vertical)
-                        .lineLimit(1...4)
-                        .focused($composerFocused)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill(Color(uiColor: .secondarySystemBackground))
-                        )
-
-                    if canSend {
-                        Button {
-                            sendCurrentDraft()
-                        } label: {
-                            Image(systemName: "arrow.up.circle.fill")
-                                .font(.system(size: 32, weight: .semibold))
-                        }
-                        .accessibilityLabel("Send")
-                    } else {
-                        HoldToRecordButton(
-                            recorder: voiceRecorder,
-                            onFinished: sendVoice,
-                            onError: { statusMessage = $0 },
-                            onAccessibilityFallback: { showVoice = true }
-                        )
-                    }
-                }
-            }
-            .padding(12)
-            .background(.bar)
+            ChatComposerBar(
+                replyingToPreview: replyingToPreview,
+                pendingPhoto: pendingPhoto,
+                draft: $draft,
+                photoItem: $photoItem,
+                showCamera: $showCamera,
+                showVoice: $showVoice,
+                composerFocused: $composerFocused,
+                voiceRecorder: voiceRecorder,
+                canSend: canSend,
+                onCancelReply: { replyingTo = nil },
+                onRemovePhoto: { pendingPhoto = nil },
+                onSend: sendCurrentDraft,
+                onVoiceFinished: sendVoice,
+                onVoiceError: { statusMessage = $0 }
+            )
         }
         .navigationTitle(resolvedName)
         .navigationBarTitleDisplayMode(.inline)
@@ -264,75 +222,17 @@ struct ChatView: View {
                 MeshController.shared.notifyChatViewed(chatId: contact.userId)
             }
         }
-        .onChange(of: photoItem) { item in
-            guard let item else { return }
-            Task {
-                if let data = try? await item.loadTransferable(type: Data.self),
-                   let jpeg = MediaCompressor.compressImage(data: data) {
-                    pendingPhoto = jpeg
-                } else {
-                    statusMessage = "Could not prepare photo"
-                }
-                photoItem = nil
-            }
-        }
         .onChange(of: draft) { DraftStore.save(chatId: contact.userId, text: $0) }
-        .sheet(isPresented: $showCamera) {
-            CameraPicker { image in
-                if let jpeg = MediaCompressor.compress(image: image) {
-                    pendingPhoto = jpeg
-                } else {
-                    statusMessage = "Could not prepare photo"
-                }
-            }
-        }
-        .sheet(isPresented: $showVoice, onDismiss: {
-            voiceRecorder.cancel()
-            voiceRecording = false
-        }) {
-            NavigationStack {
-                VStack(spacing: 24) {
-                    Image(systemName: voiceRecording ? "waveform.circle.fill" : "mic.circle")
-                        .font(.system(size: 72))
-                        .foregroundStyle(voiceRecording ? Color.red : Color.accentColor)
-                    Text(voiceRecording ? "Recording…" : "Voice memo")
-                        .font(.title2.weight(.semibold))
-                    Text("Voice memos stop automatically after \(Int(VoiceRecorder.maxDurationSeconds)) seconds.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                    if voiceRecording {
-                        Button("Stop and send") {
-                            if let (url, duration) = voiceRecorder.stop() {
-                                sendVoice(url: url, durationMs: duration)
-                            }
-                            voiceRecording = false
-                            showVoice = false
-                        }
-                        .buttonStyle(.borderedProminent)
-                    } else {
-                        Button("Start recording") {
-                            if voiceRecorder.start() {
-                                voiceRecording = true
-                            } else {
-                                statusMessage = "Microphone unavailable"
-                                showVoice = false
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                    Spacer()
-                }
-                .padding(24)
-                .navigationTitle("Voice memo")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") { showVoice = false }
-                    }
-                }
-            }
-        }
+        .chatAttachmentPipeline(
+            photoItem: $photoItem,
+            showCamera: $showCamera,
+            showVoice: $showVoice,
+            voiceRecording: $voiceRecording,
+            voiceRecorder: voiceRecorder,
+            onPhotoReady: { pendingPhoto = $0 },
+            onAttachmentError: { statusMessage = $0 },
+            onVoiceSend: sendVoice
+        )
         .sheet(isPresented: $showDetails) {
             ContactDetailsSheet(
                 contact: displayContact,
@@ -813,69 +713,6 @@ struct PendingPhotoPreview: View {
         )
     }
 
-}
-
-private struct ReactionActionBar: View {
-    let onReact: (String) -> Void
-
-    var body: some View {
-        HStack(spacing: 2) {
-            ForEach(reactionChoices, id: \.self) { emoji in
-                Button {
-                    onReact(emoji)
-                } label: {
-                    Text(emoji)
-                        .font(.title2)
-                        .frame(width: 38, height: 38)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(
-            Capsule(style: .continuous)
-                .fill(Color(uiColor: .secondarySystemBackground))
-                .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
-        )
-        .padding(.bottom, 4)
-    }
-}
-
-private struct MessageActionPanel: View {
-    let canCopy: Bool
-    let onCopy: () -> Void
-    let onInfo: () -> Void
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Button(action: onCopy) {
-                Label("Copy", systemImage: "doc.on.doc")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-            }
-            .disabled(!canCopy)
-
-            Divider().padding(.leading, 16)
-
-            Button(action: onInfo) {
-                Label("Info", systemImage: "info.circle")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-            }
-        }
-        .buttonStyle(.plain)
-        .frame(width: 190)
-        .foregroundStyle(Color.primary)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(uiColor: .secondarySystemBackground))
-                .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
-        )
-        .padding(.top, 4)
-    }
 }
 
 private func messageCopyText(_ message: StoredMessage) -> String {
