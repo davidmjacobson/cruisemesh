@@ -301,6 +301,27 @@ impl MessageStore {
     #[uniffi::constructor]
     pub fn open(path: String) -> Result<Self, CoreError> {
         let mut conn = Connection::open(&path).map_err(store_err)?;
+        // FC10: no pragmas were set before this, so every store opened with
+        // SQLite's rollback-journal default -- every write fsyncs the
+        // journal, and `backup_to`'s `VACUUM INTO` (which runs under the
+        // same `Mutex<Connection>` as every other store call) blocked the
+        // whole store for as long as the backup took. WAL lets readers
+        // proceed against the last-committed snapshot while a writer is
+        // mid-transaction and persists on the database file itself (so it
+        // survives reopen); `synchronous=NORMAL` is the mode SQLite's own
+        // docs call safe under WAL (fsync only at checkpoint, not every
+        // commit); `busy_timeout` gives a brief retry window instead of an
+        // immediate `SQLITE_BUSY` in the rare case something outside this
+        // `Mutex` (a manual DB inspection, a crashed prior process holding
+        // the lock a moment longer) contends for the same file. None of
+        // this applies to `:memory:` stores -- SQLite doesn't support WAL
+        // there and silently keeps the in-memory journal mode instead.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(store_err)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(store_err)?;
+        conn.pragma_update(None, "busy_timeout", 5_000)
+            .map_err(store_err)?;
         conn.execute_batch(SCHEMA).map_err(store_err)?;
         migrate_delivery_metrics_schema(&conn)?;
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
@@ -7151,6 +7172,75 @@ mod tests {
 
         drop(restored);
         fs::remove_file(path).unwrap();
+    }
+
+    // --- FC10: WAL / busy_timeout -------------------------------------------
+
+    fn journal_mode(store: &MessageStore) -> String {
+        store
+            .conn
+            .lock()
+            .expect("store mutex poisoned")
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap()
+            .to_lowercase()
+    }
+
+    #[test]
+    fn open_sets_wal_journal_mode_for_a_new_file_backed_store() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("cruisemesh-wal-{unique}.sqlite"));
+
+        let store = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(journal_mode(&store), "wal");
+
+        drop(store);
+        fs::remove_file(&path).unwrap();
+        // Best-effort: WAL's sidecar files are normally removed automatically
+        // when the last connection to the database closes, but don't fail
+        // the test if that didn't happen.
+        let _ = fs::remove_file(format!("{}-wal", path.to_string_lossy()));
+        let _ = fs::remove_file(format!("{}-shm", path.to_string_lossy()));
+    }
+
+    #[test]
+    fn backup_to_still_works_with_data_when_the_source_store_is_under_wal() {
+        // FC10: backup_to's VACUUM INTO runs under the same Mutex<Connection>
+        // as every other store call. Confirm a WAL-mode, file-backed source
+        // store with data can still back itself up, and that the resulting
+        // snapshot is itself a normal, reopenable, WAL-mode store.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let source_path =
+            std::env::temp_dir().join(format!("cruisemesh-wal-source-{unique}.sqlite"));
+        let dest_path = std::env::temp_dir().join(format!("cruisemesh-wal-backup-{unique}.sqlite"));
+
+        let store = MessageStore::open(source_path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(journal_mode(&store), "wal");
+        store
+            .insert_message(msg(b"chat", b"sender", 1, "backed up under wal"))
+            .unwrap();
+
+        store
+            .backup_to(dest_path.to_string_lossy().to_string())
+            .unwrap();
+
+        let restored = MessageStore::open(dest_path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(
+            restored.messages_for_chat(b"chat".to_vec()).unwrap().len(),
+            1
+        );
+        assert_eq!(journal_mode(&restored), "wal");
+
+        drop(store);
+        drop(restored);
+        fs::remove_file(&source_path).unwrap();
+        fs::remove_file(&dest_path).unwrap();
     }
 
     #[test]
