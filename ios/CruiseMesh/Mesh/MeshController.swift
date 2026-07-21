@@ -890,35 +890,35 @@ final class MeshController: ObservableObject {
                 arrival: arrival
             )
         case ProtocolKind.friendRequest:
-            handleIncomingFriendRequest(
+            try handleIncomingFriendRequest(
                 sourceAddress: sourceAddress,
                 senderUserId: opened.senderUserId,
                 body: body,
                 identity: identity
             )
         case ProtocolKind.profileSync:
-            handleIncomingProfileSync(
+            try handleIncomingProfileSync(
                 sourceAddress: sourceAddress,
                 senderUserId: opened.senderUserId,
                 body: body,
                 identity: identity
             )
         case ProtocolKind.friendDirectory:
-            handleIncomingFriendDirectory(
+            try handleIncomingFriendDirectory(
                 sourceAddress: sourceAddress,
                 senderUserId: opened.senderUserId,
                 body: body,
                 identity: identity
             )
         case ProtocolKind.introducedFriendRequest:
-            handleIncomingIntroducedFriendRequest(
+            try handleIncomingIntroducedFriendRequest(
                 sourceAddress: sourceAddress,
                 senderUserId: opened.senderUserId,
                 body: body,
                 identity: identity
             )
         case ProtocolKind.lanEndpointHint:
-            handleIncomingLanEndpointHint(
+            try handleIncomingLanEndpointHint(
                 sourceAddress: sourceAddress,
                 senderUserId: opened.senderUserId,
                 body: body,
@@ -1322,15 +1322,30 @@ final class MeshController: ObservableObject {
         ChatEvents.notifyChatChanged(envelopeSender)
     }
 
+    // FI5: throws now (was fully swallowed) -- matches the T4-06 discipline
+    // already used by handleIncomingChat/handleIncomingReceipt/
+    // handleIncomingGroupInvite in this file. `deliverOpened`'s catch turns
+    // this into `.failed`, leaving the relay copy un-acked and the envelope
+    // re-presentable, instead of a transient store failure (disk-full, busy)
+    // permanently destroying a friend request. The two store writes below
+    // that matter for that guarantee -- `upsertImportedContact` (durably
+    // adds the contact; the actual effect of "processing a friend request")
+    // and `insertMessage` (the dedup gate, same shape as every other
+    // handler here) -- now propagate; everything else (provenance,
+    // suggestion cleanup, outbound profile-sync queueing, receipts) stays
+    // best-effort `try?`, same as before.
     private func handleIncomingFriendRequest(
         sourceAddress: String?,
         senderUserId: Data,
         body: MessageBody,
         identity: Identity
-    ) {
+    ) throws {
         let pending = ((try? store.listFriendSuggestions(
             nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
         )) ?? []).first { $0.state == 1 && $0.candidate.userId == senderUserId }
+        // Deterministic reject: undecodable/mismatched friend card from a
+        // verified sender. Not a store failure -- stays a swallowed terminal
+        // state.
         guard let json = String(data: body.content, encoding: .utf8),
               let card = try? parseFriendCard(json: json),
               friendCardUserId(card: card) == senderUserId else { return }
@@ -1343,7 +1358,7 @@ final class MeshController: ObservableObject {
             relayUrl: card.relayUrl,
             relayToken: card.relayToken
         )
-        _ = try? store.upsertImportedContact(contact: contact)
+        _ = try store.upsertImportedContact(contact: contact)
         if let sourceAddress {
             sendLanEndpointHint(address: sourceAddress)
         }
@@ -1361,14 +1376,14 @@ final class MeshController: ObservableObject {
             displayName: ProfileStore.loadDisplayName(),
             epoch: ProfileStore.loadOwnAvatarEpoch()
         )
-        let inserted = (try? store.insertMessage(message: StoredMessage(
+        let inserted = try store.insertMessage(message: StoredMessage(
             chatId: senderUserId,
             senderUserId: senderUserId,
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.friendRequest,
             payload: body.content
-        ))) ?? false
+        ))
         guard inserted else { return }
         ChatEvents.notifyChatChanged(senderUserId)
         let through = (try? store.highestContiguousLamport(chatId: senderUserId, senderUserId: senderUserId)) ?? 0
@@ -1396,12 +1411,19 @@ final class MeshController: ObservableObject {
         log.info("Imported contact \(contact.name, privacy: .public) from friend request")
     }
 
+    // FI5: throws now -- see handleIncomingFriendRequest's doc for the
+    // general rationale. `insertMessage` is the only MessageStore write in
+    // this handler (the LAN endpoint cache/connect calls above it are a
+    // separate, best-effort local cache, not the durable record this
+    // envelope's ack decision is gated on), so it's the primary write here.
     private func handleIncomingLanEndpointHint(
         sourceAddress: String?,
         senderUserId: Data,
         body: MessageBody,
         identity: Identity
-    ) {
+    ) throws {
+        // Deterministic reject: unknown sender or undecodable hint. Not a
+        // store failure -- stays a swallowed terminal state.
         guard let contact = try? store.getContact(userId: senderUserId),
               let hint = try? decodeLanEndpointContent(bytes: body.content),
               let networkId = String(data: hint.networkId, encoding: .utf8) else { return }
@@ -1418,14 +1440,14 @@ final class MeshController: ObservableObject {
             lanTransport?.connect(endpoint, remoteInstanceToken: hint.instanceToken)
         }
 
-        let inserted = (try? store.insertMessage(message: StoredMessage(
+        let inserted = try store.insertMessage(message: StoredMessage(
             chatId: senderUserId,
             senderUserId: senderUserId,
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.lanEndpointHint,
             payload: body.content
-        ))) ?? false
+        ))
         if inserted {
             acknowledgeHiddenMessage(
                 sourceAddress: sourceAddress,
@@ -1436,22 +1458,28 @@ final class MeshController: ObservableObject {
         }
     }
 
+    // FI5: throws now -- see handleIncomingFriendRequest's doc for the
+    // general rationale. `insertMessage` is the dedup gate here, same shape
+    // as every other handler in this file; the profile-content writes below
+    // it (avatar/name/policy) stay best-effort `try?`, unchanged.
     private func handleIncomingProfileSync(
         sourceAddress: String?,
         senderUserId: Data,
         body: MessageBody,
         identity: Identity
-    ) {
+    ) throws {
+        // Deterministic reject: unknown sender or undecodable content. Not a
+        // store failure -- stays a swallowed terminal state.
         guard let existing = try? store.getContact(userId: senderUserId),
               let content = try? decodeProfileSyncContent(bytes: body.content) else { return }
-        let inserted = (try? store.insertMessage(message: StoredMessage(
+        let inserted = try store.insertMessage(message: StoredMessage(
             chatId: senderUserId,
             senderUserId: senderUserId,
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.profileSync,
             payload: body.content
-        ))) ?? false
+        ))
         guard inserted else { return }
 
         let policyChanged = (try? store.upsertContactDiscoveryPolicy(policy: ContactDiscoveryPolicy(
@@ -1510,22 +1538,31 @@ final class MeshController: ObservableObject {
         }
     }
 
+    // FI5: throws now -- see handleIncomingFriendRequest's doc for the
+    // general rationale. `insertMessage` is the dedup gate here, same shape
+    // as every other handler in this file. `applyFriendDirectory` below
+    // stays `try?` deliberately: its throw conflates a store failure with a
+    // deterministic fail-closed ticket-check reject (see its doc comment),
+    // and reclassifying an unrecoverable ticket rejection as `.failed` would
+    // make it retry forever instead of being a swallowed terminal state.
     private func handleIncomingFriendDirectory(
         sourceAddress: String?,
         senderUserId: Data,
         body: MessageBody,
         identity: Identity
-    ) {
+    ) throws {
+        // Deterministic reject: unknown sender or undecodable content. Not a
+        // store failure -- stays a swallowed terminal state.
         guard let contact = try? store.getContact(userId: senderUserId),
               let content = try? decodeFriendDirectoryContent(bytes: body.content) else { return }
-        let inserted = (try? store.insertMessage(message: StoredMessage(
+        let inserted = try store.insertMessage(message: StoredMessage(
             chatId: senderUserId,
             senderUserId: senderUserId,
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.friendDirectory,
             payload: body.content
-        ))) ?? false
+        ))
         guard inserted else { return }
         if FriendsOfFriendsStore.isEnabled() {
             guard (try? store.applyFriendDirectory(
@@ -1544,12 +1581,19 @@ final class MeshController: ObservableObject {
         )
     }
 
+    // FI5: throws now -- see handleIncomingFriendRequest's doc for the
+    // general rationale; same two primary writes (`upsertImportedContact`,
+    // `insertMessage`) propagate here for the same reason.
     private func handleIncomingIntroducedFriendRequest(
         sourceAddress: String?,
         senderUserId: Data,
         body: MessageBody,
         identity: Identity
-    ) {
+    ) throws {
+        // Deterministic reject: feature disabled, undecodable request, or a
+        // ticket that fails verification (fail-closed by design -- an
+        // invalid/expired/mismatched ticket should never be retried into
+        // success). Not a store failure -- stays a swallowed terminal state.
         guard FriendsOfFriendsStore.isEnabled(),
               let request = try? decodeIntroducedFriendRequest(bytes: body.content),
               let card = try? parseFriendCard(json: request.friendCardJson),
@@ -1573,7 +1617,7 @@ final class MeshController: ObservableObject {
             relayUrl: card.relayUrl,
             relayToken: card.relayToken
         )
-        _ = try? store.upsertImportedContact(contact: contact)
+        _ = try store.upsertImportedContact(contact: contact)
         if let sourceAddress {
             sendLanEndpointHint(address: sourceAddress)
         }
@@ -1584,7 +1628,7 @@ final class MeshController: ObservableObject {
             introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
         ))
         try? store.removeFriendSuggestion(candidateUserId: senderUserId)
-        _ = try? store.insertMessage(message: StoredMessage(
+        _ = try store.insertMessage(message: StoredMessage(
             chatId: senderUserId,
             senderUserId: senderUserId,
             lamport: body.lamport,
