@@ -57,7 +57,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -139,6 +139,19 @@ pub const MAX_ENVELOPE_SEALED_BYTES: usize = 512 * 1024;
 /// this on any realistic itinerary while still bounding the $4 VPS's disk.
 pub const DEFAULT_FAMILY_QUOTA_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Hosted-relay (Cruise Pass) expiry grace: after a provisioned family's
+/// `expires_ms` passes, the family may still FETCH and ACK queued envelopes
+/// for this window (so nobody's last messages are stranded mid-cruise), but
+/// may no longer POST new ones. Past the grace window every request is
+/// rejected. Distinct `code` values (`family_expired`) let clients show
+/// "renew your pass" instead of a generic auth failure.
+pub const FAMILY_EXPIRY_GRACE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Upper bound on a provisioned family token's length. Matches core's
+/// friend-card `relay_token` validation cap (`core/src/identity.rs`), so any
+/// token the admin API accepts is guaranteed to fit in a friend card.
+pub const MAX_FAMILY_TOKEN_LEN: usize = 1024;
+
 /// FR4: build-time version identifiers, embedded via Cargo (`VERSION`) and
 /// `build.rs` (`GIT_SHA`) so `/healthz` and the startup log always reflect
 /// the exact commit running -- there was previously no way to ask a
@@ -153,6 +166,10 @@ pub struct AppState {
     auth_tokens: HashSet<String>,
     tx: tokio::sync::broadcast::Sender<std::sync::Arc<BroadcastEnvelope>>,
     family_quota_bytes: u64,
+    /// Bearer token for the `/admin/families` provisioning API
+    /// (`CRUISEMESH_RELAY_ADMIN_TOKEN`). `None` disables the admin routes
+    /// entirely (they answer 404), which is the self-hosted default.
+    admin_token: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -207,7 +224,14 @@ impl AppState {
             auth_tokens,
             tx,
             family_quota_bytes,
+            admin_token: None,
         }
+    }
+
+    /// Builder: enable the `/admin/families` API with this bearer token.
+    pub fn with_admin_token(mut self, admin_token: Option<String>) -> Self {
+        self.admin_token = admin_token;
+        self
     }
 }
 
@@ -237,6 +261,23 @@ pub struct StoredPresence {
 pub enum QuotaInsertResult {
     Stored { id: i64 },
     QuotaExceeded { usage_bytes: u64 },
+}
+
+/// A provisioned (hosted / Cruise Pass) family, stored in the `families`
+/// table. Static env-var tokens (`CRUISEMESH_RELAY_TOKENS`) never appear
+/// here — they behave as implicit always-active families.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FamilyRow {
+    pub token: String,
+    /// `active` or `suspended`. Revoked families are deleted outright.
+    pub status: String,
+    pub plan: Option<String>,
+    /// Per-family override of the server-wide sealed-byte quota.
+    pub quota_bytes: Option<u64>,
+    pub created_ms: i64,
+    /// `None` = never expires. Expiry semantics: see `FAMILY_EXPIRY_GRACE_MS`.
+    pub expires_ms: Option<i64>,
+    pub note: Option<String>,
 }
 
 impl RelayStore {
@@ -620,6 +661,104 @@ impl RelayStore {
         Ok(found.is_some())
     }
 
+    /// Provision (or re-provision) a family. Idempotent by design: the
+    /// billing webhook retries on failure, so posting the same token again
+    /// must converge on the same row. A re-provision refreshes plan, quota,
+    /// expiry, and note, and reactivates a suspended family (renewal after
+    /// a lapsed pass takes this path).
+    pub fn upsert_family(
+        &self,
+        token: &str,
+        plan: Option<&str>,
+        quota_bytes: Option<u64>,
+        expires_ms: Option<i64>,
+        note: Option<&str>,
+        now_ms: i64,
+    ) -> Result<FamilyRow, String> {
+        let conn = self.conn.lock().expect("relay store mutex poisoned");
+        conn.execute(
+            "INSERT INTO families (token, status, plan, quota_bytes, created_ms, expires_ms, note)
+             VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(token) DO UPDATE SET
+                status = 'active',
+                plan = excluded.plan,
+                quota_bytes = excluded.quota_bytes,
+                expires_ms = excluded.expires_ms,
+                note = excluded.note",
+            params![
+                token,
+                plan,
+                quota_bytes.map(|q| q as i64),
+                now_ms,
+                expires_ms,
+                note,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        get_family_on(&conn, token)?.ok_or_else(|| "family vanished after upsert".to_string())
+    }
+
+    pub fn get_family(&self, token: &str) -> Result<Option<FamilyRow>, String> {
+        let conn = self.conn.lock().expect("relay store mutex poisoned");
+        get_family_on(&conn, token)
+    }
+
+    /// Partial update: `Some` fields are applied, `None` fields keep their
+    /// stored value (no way to clear a field — re-provision for that).
+    /// Returns the updated row, or `None` if the family does not exist.
+    pub fn patch_family(
+        &self,
+        token: &str,
+        status: Option<&str>,
+        plan: Option<&str>,
+        quota_bytes: Option<u64>,
+        expires_ms: Option<i64>,
+        note: Option<&str>,
+    ) -> Result<Option<FamilyRow>, String> {
+        let conn = self.conn.lock().expect("relay store mutex poisoned");
+        conn.execute(
+            "UPDATE families SET
+                status = COALESCE(?2, status),
+                plan = COALESCE(?3, plan),
+                quota_bytes = COALESCE(?4, quota_bytes),
+                expires_ms = COALESCE(?5, expires_ms),
+                note = COALESCE(?6, note)
+             WHERE token = ?1",
+            params![
+                token,
+                status,
+                plan,
+                quota_bytes.map(|q| q as i64),
+                expires_ms,
+                note,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        get_family_on(&conn, token)
+    }
+
+    /// Revoke a family and purge everything it stored (envelopes and
+    /// presence). Returns `false` if no such family existed.
+    pub fn delete_family(&self, token: &str) -> Result<bool, String> {
+        let mut conn = self.conn.lock().expect("relay store mutex poisoned");
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM envelopes WHERE family_token = ?1",
+            params![token],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM presence WHERE family_token = ?1",
+            params![token],
+        )
+        .map_err(|e| e.to_string())?;
+        let deleted = tx
+            .execute("DELETE FROM families WHERE token = ?1", params![token])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(deleted > 0)
+    }
+
     /// `EXPLAIN QUERY PLAN` for the fetch path. Used by tests to ensure the
     /// family+hint+id index is used instead of a table scan.
     pub fn explain_fetch_plan(
@@ -670,6 +809,27 @@ impl RelayStore {
     }
 }
 
+fn get_family_on(conn: &Connection, token: &str) -> Result<Option<FamilyRow>, String> {
+    conn.query_row(
+        "SELECT token, status, plan, quota_bytes, created_ms, expires_ms, note
+         FROM families WHERE token = ?1",
+        params![token],
+        |row| {
+            Ok(FamilyRow {
+                token: row.get(0)?,
+                status: row.get(1)?,
+                plan: row.get(2)?,
+                quota_bytes: row.get::<_, Option<i64>>(3)?.map(|q| q as u64),
+                created_ms: row.get(4)?,
+                expires_ms: row.get(5)?,
+                note: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
 fn family_sealed_bytes_on(conn: &Connection, family_token: &str) -> Result<u64, String> {
     // SUM() over zero matching rows returns one row with a SQL NULL.
     let total: Option<Option<i64>> = conn
@@ -709,6 +869,13 @@ pub fn app(state: AppState) -> Router {
         .route("/envelopes", post(post_envelope).get(get_envelopes))
         .route("/envelopes/ack", post(ack_envelopes))
         .route("/presence", post(sync_presence))
+        .route("/admin/families", post(admin_provision_family))
+        .route(
+            "/admin/families/{token}",
+            get(admin_get_family)
+                .patch(admin_patch_family)
+                .delete(admin_delete_family),
+        )
         .with_state(state)
 }
 
@@ -772,7 +939,8 @@ async fn post_envelope(
     headers: HeaderMap,
     Json(request): Json<PostEnvelopeRequest>,
 ) -> Result<Json<PostEnvelopeResponse>, ApiError> {
-    let family_token = bearer_token(&headers, &state.auth_tokens)?;
+    let access = authorize_bearer(&state, &headers, FamilyOp::Post)?;
+    let family_token = access.token.clone();
     let msg_id = decode_base64_field(&request.msg_id, "msg_id")?;
     if msg_id.len() != MSG_ID_LEN {
         return Err(ApiError::bad_request(format!(
@@ -816,7 +984,7 @@ async fn post_envelope(
             sealed.clone(),
             request.expiry_ms,
             now,
-            state.family_quota_bytes,
+            access.quota_bytes,
         )
         .map_err(ApiError::internal)?;
     let id = match result {
@@ -825,12 +993,12 @@ async fn post_envelope(
             warn!(
                 family = %token_prefix(&family_token),
                 usage_bytes,
-                quota_bytes = state.family_quota_bytes,
+                quota_bytes = access.quota_bytes,
                 "envelope rejected: family storage quota exceeded (507)"
             );
             return Err(ApiError::family_quota_exceeded(
                 usage_bytes,
-                state.family_quota_bytes,
+                access.quota_bytes,
             ));
         }
     };
@@ -892,7 +1060,7 @@ async fn get_envelopes(
     headers: HeaderMap,
     Query(query): Query<GetEnvelopesQuery>,
 ) -> Result<Json<GetEnvelopesResponse>, ApiError> {
-    let family_token = bearer_token(&headers, &state.auth_tokens)?;
+    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)?.token;
     let (hints, _) = decode_fetch_hints(&query.hints)?;
     let after = query.after.unwrap_or(0);
     if after < 0 {
@@ -944,7 +1112,7 @@ async fn ack_envelopes(
     headers: HeaderMap,
     Json(request): Json<AckRequest>,
 ) -> Result<Json<AckResponse>, ApiError> {
-    let family_token = bearer_token(&headers, &state.auth_tokens)?;
+    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)?.token;
     if request.ids.len() > MAX_ACK_IDS {
         return Err(ApiError::bad_request(format!(
             "ids must contain at most {MAX_ACK_IDS} entries"
@@ -988,7 +1156,7 @@ async fn sync_presence(
     headers: HeaderMap,
     Json(request): Json<PresenceRequest>,
 ) -> Result<Json<PresenceResponse>, ApiError> {
-    let family_token = bearer_token(&headers, &state.auth_tokens)?;
+    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)?.token;
     if request.announce.len() > MAX_PRESENCE_ANNOUNCE {
         return Err(ApiError::bad_request(format!(
             "announce must contain at most {MAX_PRESENCE_ANNOUNCE} hints"
@@ -1035,6 +1203,196 @@ fn decode_presence_hints(values: &[String], field: &str) -> Result<Vec<Vec<u8>>,
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Admin API — hosted-relay ("Cruise Pass") provisioning. Every route requires
+// `Authorization: Bearer <CRUISEMESH_RELAY_ADMIN_TOKEN>` and answers 404 when
+// no admin token is configured (the self-hosted default). The caller is the
+// cruisemesh.app purchase Worker; all operations are idempotent because
+// Stripe webhooks retry on failure.
+
+#[derive(Deserialize)]
+struct ProvisionFamilyRequest {
+    token: String,
+    plan: Option<String>,
+    quota_bytes: Option<u64>,
+    expires_ms: Option<i64>,
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PatchFamilyRequest {
+    status: Option<String>,
+    plan: Option<String>,
+    quota_bytes: Option<u64>,
+    expires_ms: Option<i64>,
+    note: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FamilyResponse {
+    token: String,
+    status: String,
+    plan: Option<String>,
+    /// Per-family override, if any (`null` = server default applies).
+    quota_bytes: Option<u64>,
+    /// The quota actually enforced (override or server default).
+    effective_quota_bytes: u64,
+    created_ms: i64,
+    expires_ms: Option<i64>,
+    note: Option<String>,
+    usage_bytes: u64,
+    envelope_count: u64,
+}
+
+fn family_response(state: &AppState, row: FamilyRow) -> Result<FamilyResponse, ApiError> {
+    let usage_bytes = state
+        .store
+        .family_sealed_bytes(&row.token)
+        .map_err(ApiError::internal)?;
+    let envelope_count = state
+        .store
+        .count_for_family(&row.token)
+        .map_err(ApiError::internal)?;
+    Ok(FamilyResponse {
+        effective_quota_bytes: row.quota_bytes.unwrap_or(state.family_quota_bytes),
+        token: row.token,
+        status: row.status,
+        plan: row.plan,
+        quota_bytes: row.quota_bytes,
+        created_ms: row.created_ms,
+        expires_ms: row.expires_ms,
+        note: row.note,
+        usage_bytes,
+        envelope_count,
+    })
+}
+
+fn validate_quota_bytes(quota_bytes: Option<u64>) -> Result<(), ApiError> {
+    if quota_bytes == Some(0) {
+        return Err(ApiError::bad_request(
+            "quota_bytes must be greater than 0 (omit it for the server default)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn admin_provision_family(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProvisionFamilyRequest>,
+) -> Result<Json<FamilyResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let token = request.token.trim();
+    if token.is_empty() || token.len() > MAX_FAMILY_TOKEN_LEN {
+        return Err(ApiError::bad_request(format!(
+            "token must be 1..={MAX_FAMILY_TOKEN_LEN} characters"
+        )));
+    }
+    if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ApiError::bad_request(
+            "token must not contain whitespace or control characters".to_string(),
+        ));
+    }
+    // A family token that shadows an operator credential would let a paying
+    // customer call the admin API (or vice versa) — never allow the overlap.
+    if state.admin_token.as_deref() == Some(token) || state.auth_tokens.contains(token) {
+        return Err(ApiError::bad_request(
+            "token collides with a server-configured token".to_string(),
+        ));
+    }
+    validate_quota_bytes(request.quota_bytes)?;
+    let row = state
+        .store
+        .upsert_family(
+            token,
+            request.plan.as_deref(),
+            request.quota_bytes,
+            request.expires_ms,
+            request.note.as_deref(),
+            now_ms(),
+        )
+        .map_err(ApiError::internal)?;
+    info!(
+        family = %token_prefix(&row.token),
+        plan = row.plan.as_deref().unwrap_or("-"),
+        expires_ms = row.expires_ms.unwrap_or(0),
+        "family provisioned"
+    );
+    Ok(Json(family_response(&state, row)?))
+}
+
+async fn admin_get_family(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Result<Json<FamilyResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let row = state
+        .store
+        .get_family(&token)
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(family_response(&state, row)?))
+}
+
+async fn admin_patch_family(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    Json(request): Json<PatchFamilyRequest>,
+) -> Result<Json<FamilyResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    if let Some(status) = request.status.as_deref() {
+        if status != "active" && status != "suspended" {
+            return Err(ApiError::bad_request(
+                "status must be \"active\" or \"suspended\"".to_string(),
+            ));
+        }
+    }
+    validate_quota_bytes(request.quota_bytes)?;
+    let row = state
+        .store
+        .patch_family(
+            &token,
+            request.status.as_deref(),
+            request.plan.as_deref(),
+            request.quota_bytes,
+            request.expires_ms,
+            request.note.as_deref(),
+        )
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
+    info!(
+        family = %token_prefix(&row.token),
+        status = %row.status,
+        expires_ms = row.expires_ms.unwrap_or(0),
+        "family updated"
+    );
+    Ok(Json(family_response(&state, row)?))
+}
+
+#[derive(Serialize)]
+struct DeleteFamilyResponse {
+    deleted: bool,
+}
+
+async fn admin_delete_family(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Result<Json<DeleteFamilyResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let deleted = state
+        .store
+        .delete_family(&token)
+        .map_err(ApiError::internal)?;
+    if !deleted {
+        return Err(ApiError::not_found());
+    }
+    info!(family = %token_prefix(&token), "family revoked and purged");
+    Ok(Json(DeleteFamilyResponse { deleted: true }))
+}
+
 #[derive(Deserialize)]
 struct WsQuery {
     hints: String,
@@ -1049,19 +1407,17 @@ async fn ws_handler(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     // Prefer Authorization header when present (native clients); fall back to
-    // ?token= for browsers that cannot set WS handshake headers.
-    let token = if let Ok(t) = bearer_token(&headers, &state.auth_tokens) {
-        t
+    // ?token= for browsers that cannot set WS handshake headers. WS is
+    // delivery-only, so it counts as a Read op for expiry-grace purposes.
+    let token = if let Ok(access) = authorize_bearer(&state, &headers, FamilyOp::Read) {
+        access.token
     } else {
         let Some(t) = query.token.as_deref().filter(|t| !t.is_empty()) else {
             return Err(ApiError::unauthorized(
                 "missing family token (Authorization: Bearer or ?token=)".to_string(),
             ));
         };
-        if !state.auth_tokens.contains(t) {
-            return Err(ApiError::unauthorized("unknown family token".to_string()));
-        }
-        t.to_string()
+        authorize_family(&state, t, FamilyOp::Read, now_ms())?.token
     };
     let (hints, hints_base64) = decode_fetch_hints(&query.hints)?;
     let after = query.after.unwrap_or(0);
@@ -1246,7 +1602,7 @@ fn token_prefix(token: &str) -> String {
     token.chars().take(6).collect()
 }
 
-fn bearer_token(headers: &HeaderMap, allowed_tokens: &HashSet<String>) -> Result<String, ApiError> {
+fn raw_bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
     let auth = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -1254,10 +1610,87 @@ fn bearer_token(headers: &HeaderMap, allowed_tokens: &HashSet<String>) -> Result
     let token = auth.strip_prefix("Bearer ").ok_or_else(|| {
         ApiError::unauthorized("Authorization must be Bearer <token>".to_string())
     })?;
-    if !allowed_tokens.contains(token) {
-        return Err(ApiError::unauthorized("unknown family token".to_string()));
-    }
     Ok(token.to_string())
+}
+
+/// What a family request is trying to do; expiry grace treats them
+/// differently (see `FAMILY_EXPIRY_GRACE_MS`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FamilyOp {
+    /// Store a new envelope (`POST /envelopes`).
+    Post,
+    /// Fetch/ack/presence/WS — draining the mailbox.
+    Read,
+}
+
+/// The result of authenticating a family bearer token: the token itself
+/// plus the quota that applies to it (per-family override or server default).
+struct FamilyAccess {
+    token: String,
+    quota_bytes: u64,
+}
+
+/// Resolve a family token against the static env allowlist first (implicit
+/// always-active families, the self-hosted path — zero behavior change), then
+/// the provisioned `families` table (status + expiry + per-family quota).
+fn authorize_family(
+    state: &AppState,
+    token: &str,
+    op: FamilyOp,
+    now_ms: i64,
+) -> Result<FamilyAccess, ApiError> {
+    if state.auth_tokens.contains(token) {
+        return Ok(FamilyAccess {
+            token: token.to_string(),
+            quota_bytes: state.family_quota_bytes,
+        });
+    }
+    let Some(family) = state.store.get_family(token).map_err(ApiError::internal)? else {
+        return Err(ApiError::unauthorized("unknown family token".to_string()));
+    };
+    if family.status != "active" {
+        return Err(ApiError::family_suspended(&family.token));
+    }
+    if let Some(expires_ms) = family.expires_ms {
+        if now_ms > expires_ms.saturating_add(FAMILY_EXPIRY_GRACE_MS) {
+            return Err(ApiError::family_expired(&family.token, false));
+        }
+        if now_ms > expires_ms && op == FamilyOp::Post {
+            return Err(ApiError::family_expired(&family.token, true));
+        }
+    }
+    Ok(FamilyAccess {
+        token: family.token,
+        quota_bytes: family.quota_bytes.unwrap_or(state.family_quota_bytes),
+    })
+}
+
+fn authorize_bearer(
+    state: &AppState,
+    headers: &HeaderMap,
+    op: FamilyOp,
+) -> Result<FamilyAccess, ApiError> {
+    let token = raw_bearer_token(headers)?;
+    authorize_family(state, &token, op, now_ms())
+}
+
+/// Constant-time string comparison for the admin bearer token.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Admin routes answer 404 when no admin token is configured — the
+/// self-hosted default neither exposes nor advertises the provisioning API.
+fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(expected) = state.admin_token.as_deref() else {
+        return Err(ApiError::not_found());
+    };
+    let provided = raw_bearer_token(headers)?;
+    if !constant_time_eq(&provided, expected) {
+        return Err(ApiError::unauthorized("unknown admin token".to_string()));
+    }
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -1310,6 +1743,50 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "internal server error".to_string(),
             code: None,
+        }
+    }
+
+    fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: "not found".to_string(),
+            code: None,
+        }
+    }
+
+    /// Hosted-relay pass expired. `read_only_grace` distinguishes "you can
+    /// still drain the mailbox" (POST rejected during the grace window)
+    /// from "everything is locked" (grace window over). Same 403 + `code`
+    /// either way so clients need exactly one renewal UX.
+    fn family_expired(token: &str, read_only_grace: bool) -> Self {
+        warn!(
+            family = %token_prefix(token),
+            read_only_grace,
+            "family reject: pass expired (403 family_expired)"
+        );
+        let message = if read_only_grace {
+            "relay pass expired: fetching queued envelopes still works during \
+             the grace window, but new envelopes are rejected until renewal"
+        } else {
+            "relay pass expired"
+        };
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.to_string(),
+            code: Some("family_expired"),
+        }
+    }
+
+    /// Family administratively suspended (payment dispute, abuse, …).
+    fn family_suspended(token: &str) -> Self {
+        warn!(
+            family = %token_prefix(token),
+            "family reject: suspended (403 family_suspended)"
+        );
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: "family is suspended".to_string(),
+            code: Some("family_suspended"),
         }
     }
 
@@ -1377,6 +1854,15 @@ CREATE TABLE IF NOT EXISTS presence (
     PRIMARY KEY(family_token, hint)
 );
 CREATE INDEX IF NOT EXISTS idx_presence_last_seen ON presence(last_seen_ms);
+CREATE TABLE IF NOT EXISTS families (
+    token        TEXT PRIMARY KEY,
+    status       TEXT NOT NULL DEFAULT 'active',
+    plan         TEXT,
+    quota_bytes  INTEGER,
+    created_ms   INTEGER NOT NULL,
+    expires_ms   INTEGER,
+    note         TEXT
+);
 ";
 
 #[cfg(test)]
@@ -1420,6 +1906,419 @@ mod tests {
     async fn body_json(response: Response) -> serde_json::Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    const ADMIN_TOKEN: &str = "admin-secret";
+
+    /// Router with the admin API enabled plus one static env-style token
+    /// ("family-a") so static/provisioned interplay is covered.
+    fn admin_app() -> Router {
+        let store = RelayStore::open(":memory:").unwrap();
+        app(
+            AppState::new(store, HashSet::from(["family-a".to_string()]))
+                .with_admin_token(Some(ADMIN_TOKEN.to_string())),
+        )
+    }
+
+    fn admin_json(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn admin_bare(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn envelope_request(token: &str, msg_byte: u8, sealed_len: usize) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/envelopes")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "msg_id": encode_base64_field(&sample_msg_id(msg_byte)),
+                    "hop_ttl": 3,
+                    "recipient_hint": encode_base64_field(&sample_hint(1)),
+                    "sealed": encode_base64_field(&vec![7u8; sealed_len]),
+                    "expiry_ms": now_ms() + 60_000,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn fetch_request(token: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!(
+                "/envelopes?hints={}",
+                encode_base64_field(&sample_hint(1))
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_routes_hidden_without_admin_token() {
+        let app = test_app();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/admin/families")
+            .header("authorization", "Bearer anything")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"token": "fam-pass"}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_rejects_wrong_and_family_bearer_tokens() {
+        let app = admin_app();
+        for bearer in ["wrong", "family-a"] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/admin/families")
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"token": "fam-pass"}).to_string(),
+                ))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "bearer {bearer:?} must not reach the admin API"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_provision_validation() {
+        let app = admin_app();
+        for (body, why) in [
+            (serde_json::json!({"token": ""}), "empty token"),
+            (serde_json::json!({"token": "has space"}), "whitespace"),
+            (serde_json::json!({"token": ADMIN_TOKEN}), "admin collision"),
+            (serde_json::json!({"token": "family-a"}), "static collision"),
+            (
+                serde_json::json!({"token": "fam-pass", "quota_bytes": 0}),
+                "zero quota",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(admin_json("POST", "/admin/families", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{why}");
+        }
+    }
+
+    #[tokio::test]
+    async fn provisioned_family_lifecycle() {
+        let app = admin_app();
+
+        // Unknown before provisioning.
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request("fam-pass", 1, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Provision → posting works; the admin token itself is not a family.
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "POST",
+                "/admin/families",
+                serde_json::json!({"token": "fam-pass", "plan": "cruise-pass-30d"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let family = body_json(response).await;
+        assert_eq!(family["status"], "active");
+        assert_eq!(family["plan"], "cruise-pass-30d");
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request("fam-pass", 1, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request(ADMIN_TOKEN, 2, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Usage shows up on GET.
+        let response = app
+            .clone()
+            .oneshot(admin_bare("GET", "/admin/families/fam-pass"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let family = body_json(response).await;
+        assert_eq!(family["usage_bytes"], 48);
+        assert_eq!(family["envelope_count"], 1);
+
+        // Suspend → both post and fetch are 403 with a stable code.
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PATCH",
+                "/admin/families/fam-pass",
+                serde_json::json!({"status": "suspended"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(envelope_request("fam-pass", 3, 48))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "family_suspended");
+        assert_eq!(
+            app.clone()
+                .oneshot(fetch_request("fam-pass"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Reactivate → works again.
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PATCH",
+                "/admin/families/fam-pass",
+                serde_json::json!({"status": "active"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request("fam-pass", 4, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Revoke → token dead, data purged, admin GET is 404.
+        let response = app
+            .clone()
+            .oneshot(admin_bare("DELETE", "/admin/families/fam-pass"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request("fam-pass", 5, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(admin_bare("GET", "/admin/families/fam-pass"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(admin_bare("DELETE", "/admin/families/fam-pass"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // Re-provisioning the same token starts from an empty, purged mailbox.
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "POST",
+                "/admin/families",
+                serde_json::json!({"token": "fam-pass"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.oneshot(fetch_request("fam-pass")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await["envelopes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_family_is_read_only_then_locked() {
+        let app = admin_app();
+        let now = now_ms();
+
+        // Expired 1s ago: inside the grace window → read-only.
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "POST",
+                "/admin/families",
+                serde_json::json!({"token": "fam-pass", "expires_ms": now - 1_000}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(envelope_request("fam-pass", 1, 48))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "family_expired");
+        assert_eq!(
+            app.clone()
+                .oneshot(fetch_request("fam-pass"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+            "grace window must keep the mailbox drainable"
+        );
+
+        // Past the grace window → everything is locked.
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PATCH",
+                "/admin/families/fam-pass",
+                serde_json::json!({"expires_ms": now - FAMILY_EXPIRY_GRACE_MS - 10_000}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.oneshot(fetch_request("fam-pass")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "family_expired");
+    }
+
+    #[tokio::test]
+    async fn renewal_extends_an_expired_family() {
+        let app = admin_app();
+        let now = now_ms();
+        for _ in 0..2 {
+            // Provisioning twice (webhook retry) must be a clean no-op.
+            let response = app
+                .clone()
+                .oneshot(admin_json(
+                    "POST",
+                    "/admin/families",
+                    serde_json::json!({"token": "fam-pass", "expires_ms": now - 1_000}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request("fam-pass", 1, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        // Renewal = PATCH the expiry forward.
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PATCH",
+                "/admin/families/fam-pass",
+                serde_json::json!({"expires_ms": now + 60_000}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            app.oneshot(envelope_request("fam-pass", 1, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn per_family_quota_override_is_enforced() {
+        let app = admin_app();
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "POST",
+                "/admin/families",
+                serde_json::json!({"token": "fam-small", "quota_bytes": 100}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request("fam-small", 1, 60))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let response = app
+            .clone()
+            .oneshot(envelope_request("fam-small", 2, 60))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(body_json(response).await["code"], "family_quota_exceeded");
+
+        // The static env family still gets the (default) server quota.
+        assert_eq!(
+            app.oneshot(envelope_request("family-a", 1, 60 + 60))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
