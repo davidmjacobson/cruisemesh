@@ -74,6 +74,20 @@ private const val READ_TIMEOUT_MS = 90_000L
  * caller replies, re-checking [stopped] and [desiredConfig] first in case
  * [stop] or a newer [start] landed while the computation was in flight.
  *
+ * ### Health signal (battery, 2026-07-21)
+ *
+ * [isHealthy] and the [onHealthChanged] callback exist purely so
+ * `MeshService.RadioPowerPolicy` can back its relay-poll cadence off while
+ * this socket is doing the low-latency job instead: [onHealthChanged] fires
+ * `true` on [onOpen] and `false` on [handleDisconnect] (a real drop --
+ * write-timeout eviction, lagged-consumer disconnect, or network loss), but
+ * deliberately *not* from [stop] -- an intentional teardown (mesh stopping,
+ * or [start] reconfiguring to a new [RelayConfig]) isn't the "something went
+ * wrong, catch up sooner" signal the transition exists for. [isHealthy]
+ * additionally folds in [stopped] so a caller polling it directly (rather
+ * than listening to the callback) never sees "healthy" for a socket this
+ * class isn't actually trying to keep open.
+ *
  * ### Network binding
  *
  * Unlike [RelayClient]'s HTTP calls, this does **not** pin the socket to
@@ -96,6 +110,7 @@ class RelayPushClient(
         .retryOnConnectionFailure(false) // we drive our own backoff/reconnect below
         .build(),
     private val onPush: () -> Unit,
+    private val onHealthChanged: (Boolean) -> Unit = {},
 ) {
     private val backoff = RelayPushBackoff()
 
@@ -103,7 +118,11 @@ class RelayPushClient(
     @Volatile private var hintsProvider: (((List<ByteArray>) -> Unit) -> Unit)? = null
     @Volatile private var webSocket: WebSocket? = null
     @Volatile private var stopped = true
+    @Volatile private var connected = false
     private var reconnectRunnable: Runnable? = null
+
+    /** Whether the push socket is open and this class isn't tearing down -- see the class doc's "Health signal" section. */
+    fun isHealthy(): Boolean = connected && !stopped
 
     /**
      * (Re)starts the push subscription against [config], computing the
@@ -139,6 +158,10 @@ class RelayPushClient(
         reconnectRunnable = null
         webSocket?.cancel()
         webSocket = null
+        // No onHealthChanged callback here -- see the class doc's "Health
+        // signal" section: an intentional stop is not the transition the
+        // callback exists to catch.
+        connected = false
     }
 
     /**
@@ -191,6 +214,8 @@ class RelayPushClient(
         override fun onOpen(webSocket: WebSocket, response: Response) {
             Log.i(TAG, "Relay push socket open")
             backoff.recordSuccess()
+            connected = true
+            onHealthChanged(true)
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
@@ -219,6 +244,9 @@ class RelayPushClient(
     private fun handleDisconnect() {
         if (stopped) return
         webSocket = null
+        val wasConnected = connected
+        connected = false
+        if (wasConnected) onHealthChanged(false)
         backoff.recordFailure()
         scheduleReconnect()
     }

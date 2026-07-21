@@ -8,9 +8,11 @@ package com.cruisemesh.app.relay
  * but simpler: a relay endpoint doesn't go stale or rotate addresses the way
  * a BLE peer does, so there is no give-up threshold here. Every dropped
  * connection just doubles the wait (capped at [maxBackoffMs]); a successful
- * connect resets it back to [initialBackoffMs]. The 60s poll
- * (`RELAY_POLL_INTERVAL_MS` in `MeshService`) is the correctness backstop no
- * matter how long this backs off, so there is nothing worth giving up into.
+ * connect resets it back to [initialBackoffMs]. `MeshService`'s poll (cadence
+ * from `RadioPowerPolicy.relayPollIntervalMs` -- 60s while this class isn't
+ * connected, same as before this backoff had a battery-aware poll cadence to
+ * back) is the correctness backstop no matter how long this backs off, so
+ * there is nothing worth giving up into.
  */
 class RelayPushBackoff(
     private val initialBackoffMs: Long = INITIAL_BACKOFF_MS,

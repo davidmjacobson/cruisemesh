@@ -163,10 +163,12 @@ private const val PRESENCE_HINT_DAY_WINDOW: Long = 3
 /** DESIGN.md §5.3: the bounded budget (~5 MB) of *foreign* muled envelopes; family (known-recipient) traffic is exempt. */
 private const val FOREIGN_CARRY_BUDGET_BYTES: Long = 5L * 1024 * 1024
 private const val RELAY_STORE_BATCH_LIMIT: ULong = 128uL
-private const val RELAY_POLL_INTERVAL_MS = 60_000L
-// Battery, 2026-07-21: how often RadioPowerPolicy's duty mode re-checks
-// itself for a quiet period elapsing with no new link event (see
-// radioPowerRunnable) -- separate from RELAY_POLL_INTERVAL_MS above.
+// Battery, 2026-07-21: the relay poll cadence itself now comes from
+// RadioPowerPolicy.relayPollIntervalMs (900s while RelayPushClient's WS push
+// is healthy, 60s otherwise, 5s right after a healthy->down transition) --
+// see scheduleRelayPolling/relayPollRunnable/onRelayPushHealthChanged. This
+// constant is now only how often the duty-mode policy re-checks itself for a
+// quiet period elapsing with no new link event (see radioPowerRunnable).
 private const val RADIO_POWER_CHECK_INTERVAL_MS = 30_000L
 
 /**
@@ -418,16 +420,24 @@ class MeshService : Service() {
     private val a2dpAudioBackoff = A2dpAudioBackoff()
 
     /**
-     * DTN audit finding F1: the 60s [RELAY_POLL_INTERVAL_MS] poll is
-     * correctness-authoritative but slow. When validated internet is up,
-     * this opens relayd's `GET /ws` push socket (relayd/src/lib.rs) and, on
-     * every pushed envelope, calls [requestRelaySync] immediately instead of
-     * waiting for the next poll tick -- see [updateRelayPushSubscription].
-     * It never processes envelope content itself; see [RelayPushClient]'s
-     * class doc.
+     * DTN audit finding F1: the 60s poll is correctness-authoritative but
+     * slow. When validated internet is up, this opens relayd's `GET /ws`
+     * push socket (relayd/src/lib.rs) and, on every pushed envelope, calls
+     * [requestRelaySync] immediately instead of waiting for the next poll
+     * tick -- see [updateRelayPushSubscription]. It never processes envelope
+     * content itself; see [RelayPushClient]'s class doc.
+     *
+     * Battery, 2026-07-21: also reports its connection health via
+     * [onRelayPushHealthChanged], which [relayPollRunnable] and
+     * [scheduleRelayPolling] use (through [RadioPowerPolicy.relayPollIntervalMs])
+     * to slow the poll down to a safety net while push is healthy.
      */
     private val relayPushClient by lazy {
-        RelayPushClient(relayMainHandler, onPush = { requestRelaySync("relay push") })
+        RelayPushClient(
+            relayMainHandler,
+            onPush = { requestRelaySync("relay push") },
+            onHealthChanged = ::onRelayPushHealthChanged,
+        )
     }
 
     private val peripheral by lazy {
@@ -463,6 +473,9 @@ class MeshService : Service() {
      * by [refreshCarryQueueSignal] on every [radioPowerRunnable] tick.
      */
     @Volatile private var carryQueueHasUnlinkedMail: Boolean = false
+
+    /** Health [relayPushClient] reported at the last poll-interval decision; null before the first one. See [onRelayPushHealthChanged]/[relayPollRunnable]. */
+    @Volatile private var lastKnownPushHealthy: Boolean? = null
 
     private var screenStateReceiverRegistered = false
     private val screenStateReceiver = object : BroadcastReceiver() {
@@ -539,10 +552,16 @@ class MeshService : Service() {
             updateRelayPushSubscription()
         }
     }
+    /**
+     * Battery, 2026-07-21: reposts itself at [RadioPowerPolicy.relayPollIntervalMs]
+     * instead of a fixed interval -- see [reschedulePoll]. The poll call
+     * itself ([requestRelaySync]) is unchanged and stays
+     * correctness-authoritative; only how often it fires changes.
+     */
     private val relayPollRunnable = object : Runnable {
         override fun run() {
             requestRelaySync("poll interval")
-            relayMainHandler.postDelayed(this, RELAY_POLL_INTERVAL_MS)
+            reschedulePoll(relayPushClient.isHealthy())
         }
     }
     private val lanHealthRunnable = object : Runnable {
@@ -1029,12 +1048,39 @@ class MeshService : Service() {
     }
 
     private fun scheduleRelayPolling() {
+        // Push health is unknown at this point (RelayPushClient hasn't been
+        // (re)started for this session yet) -- start at the unhealthy/safety
+        // cadence; the first real health report reschedules from there via
+        // [onRelayPushHealthChanged].
+        lastKnownPushHealthy = null
         relayMainHandler.removeCallbacks(relayPollRunnable)
-        relayMainHandler.postDelayed(relayPollRunnable, RELAY_POLL_INTERVAL_MS)
+        relayMainHandler.postDelayed(relayPollRunnable, RadioPowerPolicy.RELAY_POLL_UNHEALTHY_MS)
     }
 
     private fun cancelRelayPolling() {
         relayMainHandler.removeCallbacks(relayPollRunnable)
+    }
+
+    /**
+     * Recomputes the poll interval from [RadioPowerPolicy.relayPollIntervalMs]
+     * given [currentlyHealthy] and re-arms [relayPollRunnable] with it,
+     * cancelling whatever was previously scheduled. Called both from
+     * [relayPollRunnable] itself (every tick decides its own next interval)
+     * and from [onRelayPushHealthChanged] (so a health transition reschedules
+     * immediately rather than waiting out whatever long interval is already
+     * pending).
+     */
+    private fun reschedulePoll(currentlyHealthy: Boolean) {
+        val interval = RadioPowerPolicy.relayPollIntervalMs(lastKnownPushHealthy, currentlyHealthy)
+        lastKnownPushHealthy = currentlyHealthy
+        relayMainHandler.removeCallbacks(relayPollRunnable)
+        relayMainHandler.postDelayed(relayPollRunnable, interval)
+    }
+
+    /** [RelayPushClient]'s health-change callback -- see [relayPushClient]'s doc and [RadioPowerPolicy]'s "Relay poll cadence" section. */
+    private fun onRelayPushHealthChanged(healthy: Boolean) {
+        Log.i(TAG, "Relay push health -> $healthy")
+        reschedulePoll(healthy)
     }
 
     private fun registerScreenStateReceiver() {
