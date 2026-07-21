@@ -1,5 +1,6 @@
 import Combine
 import SwiftUI
+import UIKit
 
 struct ChatSummary: Identifiable {
     var id: Data { chatId }
@@ -30,7 +31,9 @@ struct ChatListView: View {
     @ObservedObject private var runtime = MeshRuntimeStatus.shared
     @ObservedObject private var connectivity = MeshConnectivityStatus.shared
     @ObservedObject private var connectivityClock = ConnectivityClock.shared
+    @ObservedObject private var lanDiagnostics = LanTransportDiagnostics.shared
     @State private var summaries: [ChatSummary] = []
+    @State private var hasContacts = false
     @State private var showFriends = false
     @State private var showProfile = false
     @State private var showNewGroup = false
@@ -59,6 +62,19 @@ struct ChatListView: View {
                 severity: .blocking
             )
         }
+        // FI7: a denied Local Network permission leaves LAN discovery
+        // silently dead (Bluetooth mesh still works). Only worth surfacing
+        // once there's someone to reach over Wi-Fi.
+        if isLocalNetworkWarningActive {
+            return ConnectivityWarning(
+                title: String(localized: "Local network access is off"),
+                body: String(
+                    localized: "CruiseMesh can't reach nearby phones over Wi-Fi without it. Enable Local Network access in Settings — Bluetooth delivery still works."
+                ),
+                actionLabel: String(localized: "Open Settings"),
+                severity: .caution
+            )
+        }
         if case .pausedForBluetoothAudio = runtime.state,
            !bluetoothAudioWarningDismissed,
            !hideBluetoothAudioWarning {
@@ -71,6 +87,13 @@ struct ChatListView: View {
             )
         }
         return nil
+    }
+
+    /// FI7: whether the LAN-permission branch of `connectivityWarning` is
+    /// the one currently showing, so the banner's button dispatches to
+    /// Settings instead of the (unrelated) Bluetooth-audio dismiss action.
+    private var isLocalNetworkWarningActive: Bool {
+        hasContacts && lanDiagnostics.snapshot.localNetworkPermissionLikelyDenied
     }
 
     var body: some View {
@@ -172,11 +195,13 @@ struct ChatListView: View {
                             onAction: {
                                 if warning.severity == .blocking {
                                     bluetooth.openSystemSettings()
+                                } else if isLocalNetworkWarningActive {
+                                    openSystemSettings()
                                 } else {
                                     bluetoothAudioWarningDismissed = true
                                 }
                             },
-                            onSecondaryAction: warning.severity == .caution ? {
+                            onSecondaryAction: warning.severity == .caution && !isLocalNetworkWarningActive ? {
                                 hideBluetoothAudioWarning = true
                                 bluetoothAudioWarningDismissed = true
                             } : nil
@@ -269,6 +294,7 @@ struct ChatListView: View {
     private func reload() {
         let store = AppStore.get()
         let contacts = (try? store.listContacts()) ?? []
+        hasContacts = !contacts.isEmpty
         let direct: [ChatSummary] = contacts.map { c in
             let messages = (try? store.messagesForChat(chatId: c.userId)) ?? []
             let readThrough = (try? store.receiptThrough(
@@ -516,4 +542,13 @@ private struct StatusDot: View {
 
 private func unreadBadgeText(_ count: Int) -> String {
     count > 99 ? "99+" : "\(max(0, count))"
+}
+
+/// FI7: deep-links to this app's Settings page, where the Local Network
+/// toggle lives alongside Bluetooth/Notifications — the same destination
+/// `BluetoothAccess.openSystemSettings()` uses, kept as its own free
+/// function here since this isn't a Bluetooth concern.
+private func openSystemSettings() {
+    guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+    UIApplication.shared.open(url)
 }

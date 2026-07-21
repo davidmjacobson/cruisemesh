@@ -311,6 +311,16 @@
         }
       }
     },
+    "CruiseMesh can't reach nearby phones over Wi-Fi without it. Enable Local Network access in Settings — Bluetooth delivery still works.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CruiseMesh can't reach nearby phones over Wi-Fi without it. Enable Local Network access in Settings — Bluetooth delivery still works."
+          }
+        }
+      }
+    },
     "CruiseMesh will request each connection through the mutual friends shown in the list.": {
       "localizations": {
         "en": {
@@ -651,6 +661,16 @@
         }
       }
     },
+    "Local network access is off": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Local network access is off"
+          }
+        }
+      }
+    },
     "Match these words with your friend's screen to confirm it's really them.": {
       "localizations": {
         "en": {
@@ -807,6 +827,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Only you see this. It replaces the name they shared, just on your phone."
+          }
+        }
+      }
+    },
+    "Open Settings": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open Settings"
           }
         }
       }
