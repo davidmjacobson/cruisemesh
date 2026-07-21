@@ -165,13 +165,21 @@ compose + Caddy path above instead.
 
 ## 9. Backup
 
-The SQLite file is the entire mailbox state:
+The SQLite file is the entire mailbox state. **FR8: relayd runs SQLite in
+WAL mode**, so recently-written rows can live in a `cruisemesh-relayd.sqlite-wal`
+sidecar file rather than the main file until SQLite checkpoints it back in
+— a plain `cp` of only the `.sqlite` file while the process is live can
+produce a backup that's missing the most recent writes or is internally
+inconsistent. Copy the `-wal` and `-shm` sidecars alongside the main file
+(they'll be adjacent in the same `/data/` volume), or stop the container
+for the copy, or use SQLite's own [online backup](https://www.sqlite.org/backup.html)
+/ the `.backup` CLI command instead of a raw file copy for a live database.
 
 ```sh
 docker compose exec relayd ls -la /data/
-# Copy the volume, or:
+# Copy the volume (all three files if -wal/-shm are present), or:
 docker run --rm -v relayd_relay-data:/data -v "${PWD}:/backup" alpine \
-  cp /data/cruisemesh-relayd.sqlite /backup/relayd-backup.sqlite
+  sh -c 'cp /data/cruisemesh-relayd.sqlite* /backup/'
 ```
 
 Volume name may be prefixed with the compose project name (`relayd_relay-data`
