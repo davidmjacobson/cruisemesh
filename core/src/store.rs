@@ -530,26 +530,36 @@ mod incoming_message_reference {
 
         // Conflict: a row already exists at this (chat_id, sender_user_id,
         // lamport). Figure out whether it's the same message or a fork.
-        let existing: Option<(i64, i64, Vec<u8>, Option<Vec<u8>>)> = tx
+        //
+        // FC9: `reply_to_msg_id` is deliberately NOT part of this
+        // comparison. It used to be, but the plain `insert_message` path
+        // (used for kinds that don't carry an envelope id/reply target)
+        // always passes `None` here -- so the same logical message arriving
+        // once through that path and once through
+        // `insert_incoming_message` with a reply target set would differ
+        // only in `reply_to_msg_id` and get misclassified as a fork,
+        // deleting the tail and wiping `outgoing_receipts` for no reason.
+        // `reply_to_msg_id` is reconciled via `COALESCE` below instead, the
+        // same way `msg_id` already is.
+        let existing: Option<(i64, i64, Vec<u8>)> = tx
             .query_row(
-                "SELECT timestamp, kind, payload, reply_to_msg_id FROM messages
+                "SELECT timestamp, kind, payload FROM messages
                  WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
                 params![
                     message.chat_id,
                     message.sender_user_id,
                     message.lamport as i64
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(store_err)?;
 
         let is_true_duplicate = match &existing {
-            Some((timestamp, kind, payload, existing_reply_to_msg_id)) => {
+            Some((timestamp, kind, payload)) => {
                 *timestamp == message.timestamp
                     && *kind == message.kind as i64
                     && *payload == message.payload
-                    && *existing_reply_to_msg_id == reply_to_msg_id
             }
             // Shouldn't happen (we just failed to insert on a conflict), but
             // if the row vanished under us, treat it as nothing to recover.
@@ -560,15 +570,18 @@ mod incoming_message_reference {
         };
 
         if is_true_duplicate {
-            if msg_id.is_some() {
+            if msg_id.is_some() || reply_to_msg_id.is_some() {
                 tx.execute(
-                    "UPDATE messages SET msg_id = COALESCE(msg_id, ?4)
+                    "UPDATE messages
+                     SET msg_id = COALESCE(msg_id, ?4),
+                         reply_to_msg_id = COALESCE(reply_to_msg_id, ?5)
                      WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
                     params![
                         message.chat_id,
                         message.sender_user_id,
                         message.lamport as i64,
                         msg_id,
+                        reply_to_msg_id,
                     ],
                 )
                 .map_err(store_err)?;
@@ -3946,6 +3959,84 @@ mod tests {
             .messages_for_chat(b"chat-a".to_vec())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn insert_message_a_reply_target_mismatch_alone_is_a_merge_not_a_fork() {
+        // FC9: the fork discriminator used to include `reply_to_msg_id`,
+        // but the plain `insert_message` path (used here) always passes
+        // `None` for it. Before the fix, the same logical message arriving
+        // once with a reply target set (via `insert_incoming_message`) and
+        // once without (via `insert_message`) differed only in
+        // `reply_to_msg_id` and got misclassified as a fork -- deleting the
+        // tail at and above this lamport and wiping `outgoing_receipts`.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+
+        // A watermark that a genuine fork recovery would incorrectly wipe.
+        store
+            .insert_message(msg(b"chat-a", b"alice", 1, "hi"))
+            .unwrap();
+        store
+            .record_outgoing_receipt(
+                b"chat-a".to_vec(),
+                b"alice".to_vec(),
+                crate::RECEIPT_TYPE_READ,
+                1,
+            )
+            .unwrap();
+
+        let quoted_id = vec![9; MESSAGE_ID_LEN];
+        let same_message = msg(b"chat-a", b"alice", 2, "same content");
+
+        // First arrival: known reply target, via insert_incoming_message.
+        let own_id = vec![2; MESSAGE_ID_LEN];
+        assert!(store
+            .insert_incoming_message(
+                same_message.clone(),
+                own_id.clone(),
+                Some(quoted_id.clone()),
+            )
+            .unwrap());
+
+        // Second arrival: identical (chat, sender, lamport, timestamp,
+        // kind, payload), but through the plain path that always passes
+        // `reply_to_msg_id = None`. Must be recognized as the same message
+        // (a merge/no-op), not a fork.
+        assert!(!store.insert_message(same_message.clone()).unwrap());
+
+        // The row survived (wasn't deleted as a "stale tail"), still has
+        // its lamport-1 predecessor, and its reply target/msg_id were
+        // reconciled via COALESCE rather than cleared.
+        let remaining = store.messages_for_chat(b"chat-a".to_vec()).unwrap();
+        assert_eq!(remaining.len(), 2, "no tail deletion should have occurred");
+        assert_eq!(
+            store
+                .message_reference(
+                    same_message.chat_id.clone(),
+                    same_message.sender_user_id.clone(),
+                    same_message.lamport,
+                )
+                .unwrap(),
+            Some(MessageReference {
+                msg_id: own_id,
+                reply_to_msg_id: Some(quoted_id),
+            }),
+            "reply target and msg_id must be preserved, not wiped"
+        );
+
+        // The unrelated watermark from before must survive too -- a real
+        // fork recovery would have cleared it; a merge must not.
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    crate::RECEIPT_TYPE_READ,
+                )
+                .unwrap(),
+            1,
+            "a reply-target-only difference must not trigger fork recovery's receipt wipe"
+        );
     }
 
     #[test]
