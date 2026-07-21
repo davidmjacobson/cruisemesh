@@ -24,7 +24,10 @@ services:
       # a hosted deploy that provisions families via the admin API may set
       # this to an empty string. Generate with:
       #   openssl rand -hex 32
-      CRUISEMESH_RELAY_TOKENS: ${CRUISEMESH_RELAY_TOKENS:?set CRUISEMESH_RELAY_TOKENS}
+      # (`?` not `:?`: the var must be exported, but an explicit empty string
+      # is allowed for hosted deploys; relayd itself still refuses to start
+      # when both the allowlist and the admin token are missing.)
+      CRUISEMESH_RELAY_TOKENS: ${CRUISEMESH_RELAY_TOKENS?set CRUISEMESH_RELAY_TOKENS}
       # Optional: enables the /admin/families provisioning API (DEPLOY.md §11)
       # used by the cruisemesh.app purchase flow. Leave unset for self-hosted
       # deploys — the admin routes then answer 404.
