@@ -50,6 +50,38 @@ fun messageStableKey(message: StoredMessage): String =
     MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey
 
 /**
+ * Per-message store lookups the chat screens need alongside the message list
+ * itself (FA4): reply-quote previews and, for the sender's own messages, the
+ * outbound-expiry watermark used to render "Not delivered". Both used to be
+ * queried directly from `LazyColumn` item lambdas / composition-time
+ * `remember` blocks -- see [loadChatExtras] for the off-main-thread load that
+ * replaces those call sites.
+ */
+data class ChatExtras(
+    val replyMetadata: Map<String, MessageReplyMetadata> = emptyMap(),
+    val outboundExpiryMs: Map<String, Long?> = emptyMap(),
+)
+
+/**
+ * Loads [ChatExtras] for [messages] in one store pass. Callers run this off
+ * the main thread (`produceState` + `Dispatchers.IO`) whenever the message
+ * list changes, and look up results from the returned maps during
+ * composition/recomposition instead of calling [store] there directly.
+ */
+fun loadChatExtras(
+    store: MessageStore,
+    messages: List<StoredMessage>,
+    ownUserId: ByteArray,
+    senderLabelFor: (StoredMessage) -> String,
+): ChatExtras {
+    val replyMetadata = loadMessageReplyMetadata(store, messages, senderLabelFor)
+    val outboundExpiryMs = messages
+        .filter { it.senderUserId.contentEquals(ownUserId) }
+        .associate { messageStableKey(it) to store.outboundMessageExpiry(it.chatId, it.senderUserId, it.lamport) }
+    return ChatExtras(replyMetadata, outboundExpiryMs)
+}
+
+/**
  * Loads stable envelope IDs and resolves reply targets once per message-list
  * refresh, rather than reopening ciphertext or querying the store during each
  * bubble recomposition.

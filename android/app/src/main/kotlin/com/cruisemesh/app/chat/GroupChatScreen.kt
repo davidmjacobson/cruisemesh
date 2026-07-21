@@ -49,6 +49,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -83,7 +84,9 @@ import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.core.content.ContextCompat
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.pluralStringResource
@@ -239,9 +242,15 @@ fun GroupChatScreen(
     val listState = rememberLazyListState()
     val scrollScope = rememberCoroutineScope()
     val visibleMessages = remember(messages) { messages.filter { isVisibleChatKind(it.kind) } }
-    val replyMetadata = remember(messages, ownUserId, contactsByUserId) {
-        loadMessageReplyMetadata(store, visibleMessages) { message -> senderName(message.senderUserId) }
+    // FA4: same off-main-thread load as ChatScreen -- reply-quote metadata and
+    // own-message expiry watermarks, queried once per visible-list change
+    // instead of during composition/recomposition.
+    val chatExtras by produceState(ChatExtras(), visibleMessages, ownUserId, contactsByUserId) {
+        value = withContext(Dispatchers.IO) {
+            loadChatExtras(store, visibleMessages, ownUserId) { message -> senderName(message.senderUserId) }
+        }
     }
+    val replyMetadata = chatExtras.replyMetadata
     val replyingToPreview = remember(replyingTo, ownUserId, contactsByUserId) {
         replyingTo?.let { target ->
             quotedMessagePreview(target) { message -> senderName(message.senderUserId) }
@@ -757,11 +766,11 @@ fun GroupChatScreen(
                 infoIsOwn,
                 null,
                 infoArrival,
-                outboundExpiryMs = if (infoIsOwn) store.outboundMessageExpiry(
-                    currentInfoMessage.chatId,
-                    currentInfoMessage.senderUserId,
-                    currentInfoMessage.lamport,
-                ) else null,
+                outboundExpiryMs = if (infoIsOwn) {
+                    chatExtras.outboundExpiryMs[messageStableKey(currentInfoMessage)]
+                } else {
+                    null
+                },
                 nowMs = System.currentTimeMillis(),
             ),
         )
