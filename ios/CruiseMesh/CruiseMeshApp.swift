@@ -1,8 +1,15 @@
 import SwiftUI
+import UIKit
 import UserNotifications
 
 @main
 struct CruiseMeshApp: App {
+    // FI3: registers `AppDelegate` below so its
+    // `application(_:didFinishLaunchingWithOptions:)` runs before SwiftUI
+    // builds this struct's own view/state graph -- see that method's doc for
+    // why a background BLE relaunch needs `MeshController` touched that
+    // early.
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var appModel = AppModel()
     @State private var onboardingCompleted = OnboardingStore.isCompleted()
@@ -38,6 +45,56 @@ struct CruiseMeshApp: App {
                 appModel.setAppForeground(phase == .active)
             }
         }
+    }
+}
+
+/// FI3: bridges `UIApplicationDelegate`'s launch-options callback into the
+/// SwiftUI app lifecycle purely to catch a background BLE-triggered relaunch
+/// as early as possible.
+///
+/// On an ordinary user-initiated launch (tapping the app icon, or a system
+/// launch for any other reason) `launchOptions` never carries the Bluetooth
+/// keys checked below, so this does nothing and `AppModel`'s own
+/// onboarding-gated startup (`ChatListView`'s `onAppear` ->
+/// `appModel.startMeshIfEnabled()`) is unaffected -- this is not a
+/// replacement for that path, only a fast-path for the one scenario it
+/// can't cover.
+///
+/// A BLE-triggered relaunch, though, may never show any UI at all (the
+/// process can be woken, do its background work, and get suspended again
+/// without `ChatListView` ever appearing), so waiting for that path is not
+/// safe. `BleTransport`'s `CBCentralManager`/`CBPeripheralManager` were
+/// created with restoration identifiers (FI3) specifically so the system
+/// can redeliver `willRestoreState` to them -- but that only helps once
+/// `MeshController.shared` (and therefore `BleTransport`) actually exists,
+/// and `MeshController.start()` has run far enough to wire its frame/
+/// connection callbacks (see `MeshController.start()`'s callback
+/// assignments) -- otherwise a restored peripheral's frames arrive at
+/// `BleTransport.onFrame`, which is still `nil`, and are silently dropped.
+/// Both only happen today when something calls into `MeshController`, which
+/// this provides for the background-relaunch case specifically.
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    @MainActor
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        let isBluetoothRelaunch = launchOptions?[.bluetoothCentrals] != nil
+            || launchOptions?[.bluetoothPeripherals] != nil
+        // Onboarding gates mesh startup deliberately (permissions are
+        // requested as part of that flow, not before it) -- a fresh install
+        // can never be a Bluetooth relaunch anyway (nothing was ever
+        // scanning/advertising/connected to restore), but guard explicitly
+        // rather than relying on that.
+        guard isBluetoothRelaunch, OnboardingStore.isCompleted() else { return true }
+        let identity = IdentityStore.loadOrCreate()
+        MeshController.shared.configure(identity: identity)
+        let meshEnabled = UserDefaults.standard.object(forKey: AppModel.meshEnabledKey) == nil
+            || UserDefaults.standard.bool(forKey: AppModel.meshEnabledKey)
+        if meshEnabled {
+            MeshController.shared.start()
+        }
+        return true
     }
 }
 
