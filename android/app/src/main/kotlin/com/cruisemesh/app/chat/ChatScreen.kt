@@ -70,6 +70,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -563,10 +564,37 @@ private fun ConversationScreen(
         }
     }
 
-    LaunchedEffect(visibleMessages.size) {
-        if (visibleMessages.isNotEmpty()) {
-            // reverseLayout start is the bottom; pin the newest message there.
-            listState.scrollToItem(0)
+    // FA7: only auto-scroll to the bottom when the reader is already there
+    // (or the arriving message is their own send) -- otherwise a history
+    // backfill or an incoming message while reading up-thread would yank the
+    // view. See ChatScrollLogic for the pure decision.
+    var newestMessageKey by remember(contact.userId) { mutableStateOf<String?>(null) }
+    var newMessagesAvailable by remember(contact.userId) { mutableStateOf(false) }
+    LaunchedEffect(visibleMessages) {
+        val currentNewestKey = visibleMessages.lastOrNull()?.let(::messageStableKey)
+        val isNewestOwn = visibleMessages.lastOrNull()?.senderUserId?.contentEquals(ownUserId) == true
+        when (
+            ChatScrollLogic.decide(
+                previousNewestKey = newestMessageKey,
+                currentNewestKey = currentNewestKey,
+                firstVisibleItemIndex = listState.firstVisibleItemIndex,
+                isNewestOwnMessage = isNewestOwn,
+            )
+        ) {
+            ChatScrollLogic.Decision.AUTO_SCROLL -> {
+                // reverseLayout start is the bottom; pin the newest message there.
+                listState.scrollToItem(0)
+                newMessagesAvailable = false
+            }
+            ChatScrollLogic.Decision.SHOW_NEW_MESSAGES_CHIP -> newMessagesAvailable = true
+            ChatScrollLogic.Decision.NONE -> {}
+        }
+        newestMessageKey = currentNewestKey ?: newestMessageKey
+    }
+    // Clear the chip once the reader scrolls back to the bottom themselves.
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex }.collect { index ->
+            if (index <= 1) newMessagesAvailable = false
         }
     }
 
@@ -602,12 +630,16 @@ private fun ConversationScreen(
                 .padding(bottom = with(density) { keyboardFreeze.extraBottomPx.toDp() })
                 .padding(horizontal = 16.dp)
         ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+            ) {
             LazyColumn(
                 state = listState,
                 reverseLayout = true,
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
+                    .fillMaxSize()
                     .padding(vertical = 8.dp),
             ) {
                 itemsIndexed(
@@ -649,6 +681,19 @@ private fun ConversationScreen(
                     )
                 }
             }
+
+            if (newMessagesAvailable) {
+                NewMessagesChip(
+                    onClick = {
+                        scrollScope.launch { listState.animateScrollToItem(0) }
+                        newMessagesAvailable = false
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 12.dp),
+                )
+            }
+            } // Box (LazyColumn + New messages chip)
 
             if (pendingPhoto != null) {
                 PendingPhotoCard(bytes = pendingPhoto, onRemove = onClearPendingPhoto)
@@ -1149,6 +1194,29 @@ private fun GapIndicator() {
         Text(text = stringResource(R.string.ui_some_messages_are_still_making_their_way_across),
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+        )
+    }
+}
+
+/**
+ * Floating pill shown over the message list (FA7) when a new message arrived
+ * while the reader was scrolled up; tapping it scrolls down to the newest
+ * message. Shared between [ChatScreen] and [GroupChatScreen].
+ */
+@Composable
+internal fun NewMessagesChip(onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.primary,
+        contentColor = MaterialTheme.colorScheme.onPrimary,
+        shadowElevation = 4.dp,
+        modifier = modifier,
+    ) {
+        Text(
+            text = stringResource(R.string.ui_new_messages),
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
         )
     }
 }
