@@ -46,6 +46,28 @@ final class LanSubnetScanTests: XCTestCase {
         XCTAssertNil(ipv4PrefixLength(netmask: 0xff00_ff00))
     }
 
+    func testAutomaticPrefixClampsToSlash20WhileManualStaysAtSlash16() {
+        // A huge flat network (e.g. a cruise-ship /8 or /12) must clamp the
+        // *automatic* sweep to /20 (~4,094 hosts), not the manual ceiling.
+        XCTAssertEqual(effectiveAutomaticLanScanPrefixLength(8), 20)
+        XCTAssertEqual(effectiveAutomaticLanScanPrefixLength(16), 20)
+        XCTAssertEqual(effectiveAutomaticLanScanPrefixLength(20), 20)
+        // Narrower actual networks are respected, same as the manual clamp.
+        XCTAssertEqual(effectiveAutomaticLanScanPrefixLength(22), 22)
+        XCTAssertEqual(effectiveAutomaticLanScanPrefixLength(32), 30)
+        // The manual "Search local subnet" clamp is unchanged: still /16.
+        XCTAssertEqual(effectiveLanScanPrefixLength(8), 16)
+    }
+
+    func testAutomaticSlash20HostCountIsFourThousandNinetyThree() {
+        let hosts = lanSubnetHosts(
+            localAddress: "10.20.30.40",
+            prefixLength: effectiveAutomaticLanScanPrefixLength(8)
+        )
+        // 2^12 - 2 usable hosts in a /20, minus this phone.
+        XCTAssertEqual(hosts.count, 4_093)
+    }
+
     func testAutomaticScanLonelinessGateMatchesAndroid() {
         XCTAssertTrue(shouldRunAutomaticLanScan(activeConnections: 0, outboundAttempts: 0, scanRemaining: 0))
         XCTAssertFalse(shouldRunAutomaticLanScan(activeConnections: 1, outboundAttempts: 0, scanRemaining: 0))

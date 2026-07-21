@@ -68,4 +68,26 @@ class LanSubnetScanTest {
         assertEquals(24, effectiveScanPrefixLength(24))
         assertEquals(30, effectiveScanPrefixLength(32))
     }
+
+    @Test
+    fun effectiveAutomaticScanPrefixClampsToSlash20WhileManualStaysAtSlash16() {
+        // A huge flat network (e.g. a cruise-ship /8 or /12) must clamp the
+        // *automatic* sweep to /20 (~4,094 hosts), not the manual ceiling.
+        assertEquals(20, effectiveAutomaticScanPrefixLength(8))
+        assertEquals(20, effectiveAutomaticScanPrefixLength(16))
+        assertEquals(20, effectiveAutomaticScanPrefixLength(20))
+        // Narrower actual networks are respected, same as the manual clamp.
+        assertEquals(22, effectiveAutomaticScanPrefixLength(22))
+        assertEquals(30, effectiveAutomaticScanPrefixLength(32))
+        // The manual "Search my local network" clamp is unchanged: still /16.
+        assertEquals(16, effectiveScanPrefixLength(8))
+    }
+
+    @Test
+    fun automaticSlash20HostCountIsFourThousandNinetyThree() {
+        val local = InetAddress.getByName("10.20.30.40") as Inet4Address
+        val hosts = subnetHosts(local, effectiveAutomaticScanPrefixLength(8))
+        // 2^12 - 2 usable hosts in a /20, minus this phone.
+        assertEquals(4_093, hosts.size)
+    }
 }

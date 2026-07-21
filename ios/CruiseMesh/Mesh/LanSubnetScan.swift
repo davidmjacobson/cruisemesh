@@ -1,6 +1,14 @@
 import Foundation
 
+/// Ceiling breadth for the user-initiated "Search local subnet" action --
+/// explicitly allowed to be big since the user asked for it.
 let broadestLanScanPrefixLength = 16
+/// Ceiling breadth for the *automatic* full-subnet fallback sweep. A /16 is
+/// ~65k hosts, minutes of sustained radio at concurrency 64; a /20 is
+/// ~4,094 hosts, a much smaller background cost. Ship/hotel Wi-Fi is
+/// exactly where the underlying network is a huge flat subnet, so the
+/// unattended path stays narrower than the manual one.
+let broadestAutomaticLanScanPrefixLength = 20
 let narrowestLanScanPrefixLength = 30
 let defaultLanScanPrefixLength = 24
 
@@ -11,6 +19,13 @@ struct LocalWifiIPv4Network: Equatable {
 
 func effectiveLanScanPrefixLength(_ prefixLength: Int) -> Int {
     min(max(prefixLength, broadestLanScanPrefixLength), narrowestLanScanPrefixLength)
+}
+
+/// Same clamp as `effectiveLanScanPrefixLength`, but for the automatic
+/// full-subnet sweep, which is capped narrower (see
+/// `broadestAutomaticLanScanPrefixLength`).
+func effectiveAutomaticLanScanPrefixLength(_ prefixLength: Int) -> Int {
+    min(max(prefixLength, broadestAutomaticLanScanPrefixLength), narrowestLanScanPrefixLength)
 }
 
 /// Candidate hosts in the selected IPv4 subnet, excluding this phone plus the

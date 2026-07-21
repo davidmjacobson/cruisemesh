@@ -99,6 +99,13 @@ internal class LanTransport(
     private val reconnectTargets = ConcurrentHashMap<String, ReconnectTarget>()
     private val resolvedServices = ConcurrentHashMap<String, NsdServiceInfo>()
 
+    // Peer instance tokens peer evidence has already been counted for on
+    // this network join -- repeated evidence about the same token (an
+    // already-connected/linked peer's NSD record refreshing, or a resent
+    // endpoint hint) must not keep resetting the full-sweep backoff. Cleared
+    // alongside the other per-network state in teardownNetworkSession.
+    private val knownPeerInstanceTokens = ConcurrentHashMap.newKeySet<String>()
+
     @Volatile
     private var started = false
 
@@ -139,7 +146,7 @@ internal class LanTransport(
         ) {
             scanPlanner.takeDueScan(System.currentTimeMillis())?.let { breadth ->
                 Log.i(TAG, "Starting automatic local Wi-Fi fallback search (${breadth.name})")
-                startSubnetScan(breadth)
+                startSubnetScan(breadth, automatic = true)
             }
         }
         scheduleAutomaticSubnetScan(AUTO_SCAN_RETRY_INTERVAL_MS)
@@ -236,7 +243,10 @@ internal class LanTransport(
         connections[address]?.close()
     }
 
-    fun startSubnetScan(breadth: LanScanBreadth = LanScanBreadth.FULL_SUBNET): String? {
+    fun startSubnetScan(
+        breadth: LanScanBreadth = LanScanBreadth.FULL_SUBNET,
+        automatic: Boolean = false,
+    ): String? {
         if (!started) return "Start the mesh before searching the local subnet"
         if ((runningSweep?.outcomes?.remainingCandidates() ?: 0) > 0) {
             return "A local subnet search is already running"
@@ -253,12 +263,21 @@ internal class LanTransport(
             // at our /24 without widening a network that is narrower than one.
             LanScanBreadth.LOCAL_24 -> maxOf(networkPrefixLength, DEFAULT_SCAN_PREFIX_LENGTH)
         }
-        val candidates = subnetHosts(local, prefixLength).shuffled()
+        // The automatic full-subnet sweep is capped at /20 (~4,094 hosts);
+        // the user-initiated "Search my local network" button (automatic ==
+        // false) keeps the wider /16 (~65k hosts) ceiling since the user
+        // explicitly asked for it.
+        val effectivePrefix = if (automatic) {
+            effectiveAutomaticScanPrefixLength(prefixLength)
+        } else {
+            effectiveScanPrefixLength(prefixLength)
+        }
+        val candidates = subnetHosts(local, effectivePrefix).shuffled()
         val generation = scanGeneration.incrementAndGet()
         val sweep = RunningSweep(
             outcomes = SweepOutcomes(generation, candidates.size),
             breadth = breadth,
-            prefixLength = effectiveScanPrefixLength(prefixLength),
+            prefixLength = effectivePrefix,
         )
         runningSweep = sweep
         Log.i(
@@ -331,17 +350,19 @@ internal class LanTransport(
 
     /**
      * Every candidate of the running sweep has been probed. Runs on whichever
-     * scan worker retired the last candidate. A completed local-tier sweep
-     * makes the full sweep eligible ([LanScanPlanner.onScanCompleted]) and
-     * pulls the next check forward so escalation doesn't wait out the periodic
-     * interval -- the check's loneliness gate still applies, so if this sweep
-     * (or NSD) produced a connection, no escalation happens.
+     * scan worker retired the last candidate. A completed, EMPTY local-tier
+     * sweep is what arms the full sweep ([LanScanPlanner.onScanCompleted]'s
+     * `foundPeer`) -- a /24 sweep that found a peer leaves the full tier
+     * disarmed. Also pulls the next check forward so escalation doesn't wait
+     * out the periodic interval -- the check's loneliness gate still
+     * applies, so if this sweep (or NSD) produced a connection, no
+     * escalation happens.
      */
     private fun onScanCompleted(sweep: RunningSweep, summary: SweepOutcomeSummary) {
         if (runningSweep !== sweep || sweep.outcomes.generation != scanGeneration.get()) return
         runningSweep = null
         Log.i(TAG, summary.logLine(sweep.prefixLength))
-        scanPlanner.onScanCompleted(sweep.breadth)
+        scanPlanner.onScanCompleted(sweep.breadth, System.currentTimeMillis(), summary.connected > 0)
         val verdict = lanSweepVerdict(summary)
         LanTransportDiagnostics.sweepCompleted(summary)
         when (verdict) {
@@ -364,8 +385,13 @@ internal class LanTransport(
             val endpoint = LanManualEndpoint(hint.host, hint.port.toInt())
             onEndpointObserved(expectedUserId, endpoint, currentNetworkId)
             if (!started) return@post
-            scanPlanner.onPeerEvidence(System.currentTimeMillis())
-            LanTransportDiagnostics.peerEvidence()
+            // Only genuinely NEW evidence resets the sweep backoff -- a
+            // token already seen this network join (already connected, or
+            // already hinted before) must not re-trigger it.
+            if (knownPeerInstanceTokens.add(remoteToken)) {
+                scanPlanner.onPeerEvidence(System.currentTimeMillis())
+                LanTransportDiagnostics.peerEvidence()
+            }
             if (!shouldInitiateLanConnection(instanceToken, remoteToken)) {
                 Log.i(
                     TAG,
@@ -902,8 +928,15 @@ internal class LanTransport(
                                 serviceInfo.network == wifiNetwork
                             )
                     ) {
-                        scanPlanner.onPeerEvidence(System.currentTimeMillis())
-                        LanTransportDiagnostics.peerEvidence()
+                        // Only genuinely NEW evidence resets the sweep
+                        // backoff -- an already-connected/linked peer's NSD
+                        // record keeps reappearing here (re-resolves,
+                        // periodic discovery updates) and must not keep
+                        // re-triggering full sweeps.
+                        if (knownPeerInstanceTokens.add(token)) {
+                            scanPlanner.onPeerEvidence(System.currentTimeMillis())
+                            LanTransportDiagnostics.peerEvidence()
+                        }
                         if (shouldInitiateLanConnection(instanceToken, token)) {
                             connectToService(serviceInfo)
                         } else {
@@ -947,6 +980,7 @@ internal class LanTransport(
         requestedServiceName = null
         registeredServiceName = null
         resolvedServices.clear()
+        knownPeerInstanceTokens.clear()
         reconnectTargets.clear()
         outboundServiceKeys.clear()
         serverSocket?.closeQuietly()
@@ -1080,16 +1114,24 @@ internal class LanTransport(
         private const val CONNECT_TIMEOUT_MS = 3_000
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
         private const val SCAN_CONNECT_TIMEOUT_MS = 350
-        // Sized for the /16 case: at 64-way parallelism a fully unresponsive
-        // /16 finishes its ~65k probes in roughly six minutes worst case
-        // (SCAN_CONNECT_TIMEOUT_MS per dead host), and far faster in practice
-        // since unallocated addresses fail fast. A /24 still finishes in
-        // seconds. Threads reap between scans -- see scanExecutor.
+        // Sized for the manual /16 case: at 64-way parallelism a fully
+        // unresponsive /16 finishes its ~65k probes in roughly six minutes
+        // worst case (SCAN_CONNECT_TIMEOUT_MS per dead host), and far faster
+        // in practice since unallocated addresses fail fast. The automatic
+        // full sweep is capped at /20 (~4,094 hosts, well under 30s worst
+        // case); a /24 still finishes in seconds. Threads reap between
+        // scans -- see scanExecutor.
         private const val SCAN_CONCURRENCY = 64
         private const val SCAN_THREAD_KEEPALIVE_SECONDS = 10L
         private const val RECONNECT_SLOT_DELAY_MS = 5_000L
         private const val AUTO_SCAN_INITIAL_DELAY_MS = 5_000L
         private const val AUTO_SCAN_RECONNECT_DELAY_MS = 2_000L
+
+        // A prompt recheck after a /24 sweep completes, not an escalation
+        // trigger by itself: LanScanPlanner only arms the full-subnet tier
+        // on an empty /24 sweep and holds it off for
+        // LanScanPlanner.EMPTY_LOCAL_SWEEP_FULL_DELAY_MS (60s) after that,
+        // so this recheck will usually find nothing due yet.
         private const val AUTO_SCAN_ESCALATE_DELAY_MS = 2_000L
         private const val AUTO_SCAN_RETRY_INTERVAL_MS = 5 * 60_000L
         private const val MAX_PACKET_SIZE = 65_535
