@@ -105,7 +105,8 @@
 
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -2757,6 +2758,21 @@ fn carried_content_digest(recipient_hint: &[u8], sealed: &[u8]) -> Vec<u8> {
 /// Backfill the content-level dedupe key for existing stores and collapse
 /// pre-migration duplicates deterministically, keeping the oldest row. No
 /// deletion here is a delivery signal; this is local queue compaction only.
+///
+/// FC3: this used to be a `SELECT ... LIMIT 1` + single-row `UPDATE`/`DELETE`
+/// pair per legacy (NULL-digest) row, run synchronously in
+/// [`MessageStore::open`] -- for K legacy rows that's O(K) round trips, each
+/// re-scanning the shrinking `WHERE content_digest IS NULL` set from
+/// scratch. Instead: one bulk `SELECT` reads every legacy row up front
+/// (oldest first, matching the original loop's iteration order so the
+/// "collision keeps the oldest row" tie-break is unchanged, including
+/// against rows a prior migration already assigned a digest to -- those are
+/// seeded into `seen` first, exactly as before), the BLAKE2b digest is
+/// still computed per row in Rust (SQLite has no built-in BLAKE2b), and then
+/// the writes are batched into at most one `UPDATE` (via a `VALUES`
+/// pseudo-table joined by `rowid`) and one `DELETE ... WHERE rowid IN
+/// (...)` -- a constant number of statements regardless of K, instead of
+/// 2*K+1.
 fn migrate_carried_content_digests(conn: &mut Connection) -> Result<(), CoreError> {
     let tx = conn.transaction().map_err(store_err)?;
     let mut seen: HashSet<Vec<u8>> = {
@@ -2773,36 +2789,75 @@ fn migrate_carried_content_digests(conn: &mut Connection) -> Result<(), CoreErro
             .map_err(store_err)?;
         collected
     };
-    loop {
-        let row: Option<(i64, Vec<u8>, Vec<u8>)> = tx
-            .query_row(
+
+    let legacy: Vec<(i64, Vec<u8>, Vec<u8>)> = {
+        let mut stmt = tx
+            .prepare(
                 "SELECT rowid, recipient_hint, sealed
                  FROM carried_envelopes
                  WHERE content_digest IS NULL
-                 ORDER BY received_at ASC, msg_id ASC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                 ORDER BY received_at ASC, msg_id ASC",
             )
-            .optional()
             .map_err(store_err)?;
-        let Some((rowid, recipient_hint, sealed)) = row else {
-            break;
-        };
+        let collected = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(store_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(store_err)?;
+        collected
+    };
+
+    let mut update_pairs: Vec<Value> = Vec::with_capacity(legacy.len() * 2);
+    let mut update_rowids: Vec<Value> = Vec::with_capacity(legacy.len());
+    let mut delete_rowids: Vec<Value> = Vec::new();
+    for (rowid, recipient_hint, sealed) in legacy {
         let digest = carried_content_digest(&recipient_hint, &sealed);
         if seen.insert(digest.clone()) {
-            tx.execute(
-                "UPDATE carried_envelopes SET content_digest = ?1 WHERE rowid = ?2",
-                params![digest, rowid],
-            )
-            .map_err(store_err)?;
+            update_pairs.push(Value::Integer(rowid));
+            update_pairs.push(Value::Blob(digest));
+            update_rowids.push(Value::Integer(rowid));
         } else {
-            tx.execute(
-                "DELETE FROM carried_envelopes WHERE rowid = ?1",
-                params![rowid],
-            )
-            .map_err(store_err)?;
+            delete_rowids.push(Value::Integer(rowid));
         }
     }
+
+    if !update_rowids.is_empty() {
+        let values_clause = std::iter::repeat("(?,?)")
+            .take(update_rowids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let in_clause = std::iter::repeat("?")
+            .take(update_rowids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            // The bundled SQLite rejects `AS v(rid, digest)`-style derived
+            // table column renaming here, so this relies on the default
+            // `column1`/`column2` names SQLite assigns to a bare `VALUES`
+            // row constructor.
+            "UPDATE carried_envelopes
+             SET content_digest = (
+                 SELECT v.column2 FROM (VALUES {values_clause}) AS v
+                 WHERE v.column1 = carried_envelopes.rowid
+             )
+             WHERE rowid IN ({in_clause})"
+        );
+        let mut bind = update_pairs;
+        bind.extend(update_rowids);
+        tx.execute(&sql, params_from_iter(bind.iter()))
+            .map_err(store_err)?;
+    }
+
+    if !delete_rowids.is_empty() {
+        let in_clause = std::iter::repeat("?")
+            .take(delete_rowids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM carried_envelopes WHERE rowid IN ({in_clause})");
+        tx.execute(&sql, params_from_iter(delete_rowids.iter()))
+            .map_err(store_err)?;
+    }
+
     enforce_carried_budgets(&tx, i64::MAX, DEFAULT_TOTAL_CARRY_BUDGET_BYTES)?;
     tx.commit().map_err(store_err)
 }
@@ -7125,6 +7180,98 @@ mod tests {
             .carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 2_000)
             .unwrap();
         assert_eq!(found, vec![env]);
+
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn open_batch_migrates_many_legacy_carried_rows_keeping_the_oldest_per_duplicate_group() {
+        // FC3: migrate_carried_content_digests used to be one SELECT-LIMIT-1
+        // + single-row UPDATE/DELETE pair per legacy row. This exercises it
+        // at a scale (multiple duplicate groups of different sizes, plus a
+        // singleton) that would have meant dozens of round trips under the
+        // old per-row loop, and checks the batched rewrite keeps the exact
+        // same tie-break: within a group of rows whose (recipient_hint,
+        // sealed) collide, the one with the earliest `received_at` survives.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cruisemesh-store-migration-carried-batch-{unique}.sqlite"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE carried_envelopes (
+                msg_id         BLOB PRIMARY KEY,
+                hop_ttl        INTEGER NOT NULL,
+                expiry         INTEGER NOT NULL,
+                recipient_hint BLOB NOT NULL,
+                sealed         BLOB NOT NULL,
+                is_family      INTEGER NOT NULL,
+                received_at    INTEGER NOT NULL,
+                size_bytes     INTEGER NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        // Group A: 4 rows sharing (hint, sealed) -- a1 (received_at=100) is
+        // the oldest and must survive.
+        for (msg_id, received_at) in [("a1", 100), ("a2", 200), ("a3", 300), ("a4", 400)] {
+            conn.execute(
+                "INSERT INTO carried_envelopes
+                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family, received_at, size_bytes)
+                 VALUES (?1, 7, 9000, ?2, ?3, 1, ?4, 4)",
+                params![msg_id.as_bytes(), b"hint-a".as_slice(), b"same-a".as_slice(), received_at],
+            )
+            .unwrap();
+        }
+        // Group B: 2 rows sharing (hint, sealed) -- b1 (received_at=150) is
+        // the oldest.
+        for (msg_id, received_at) in [("b1", 150), ("b2", 250)] {
+            conn.execute(
+                "INSERT INTO carried_envelopes
+                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family, received_at, size_bytes)
+                 VALUES (?1, 7, 9000, ?2, ?3, 1, ?4, 4)",
+                params![msg_id.as_bytes(), b"hint-b".as_slice(), b"same-b".as_slice(), received_at],
+            )
+            .unwrap();
+        }
+        // Singleton: nothing to dedupe against.
+        conn.execute(
+            "INSERT INTO carried_envelopes
+                (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family, received_at, size_bytes)
+             VALUES (?1, 7, 9000, ?2, ?3, 1, 50, 4)",
+            params![b"c1".as_slice(), b"hint-c".as_slice(), b"unique-c".as_slice()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        assert_eq!(
+            store.carried_len().unwrap(),
+            3,
+            "one survivor per duplicate group plus the singleton"
+        );
+
+        let mut surviving_ids: Vec<Vec<u8>> = store
+            .carried_envelopes_for_hints(
+                vec![b"hint-a".to_vec(), b"hint-b".to_vec(), b"hint-c".to_vec()],
+                1_000,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|e| e.msg_id)
+            .collect();
+        surviving_ids.sort();
+        assert_eq!(
+            surviving_ids,
+            vec![b"a1".to_vec(), b"b1".to_vec(), b"c1".to_vec()],
+            "the oldest row (by received_at) in each duplicate group must be the one kept"
+        );
 
         drop(store);
         fs::remove_file(path).unwrap();
