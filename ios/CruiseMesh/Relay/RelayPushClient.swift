@@ -42,12 +42,14 @@ import os.log
 /// `bluetooth-central`/`bluetooth-peripheral` background modes the mesh's BLE
 /// transport uses); when the app is suspended, iOS tears the connection down
 /// without necessarily running any delegate callback here to say so. There is no
-/// way to keep this doorbell alive in the background, so `MeshController`'s 60s
-/// poll (`runRelaySync`, driven by `relayTimer`) is not just a fallback for a
+/// way to keep this doorbell alive in the background, so `MeshController`'s poll
+/// (`runRelaySync`, driven by `relayTimer`) is not just a fallback for a
 /// dropped socket -- it is the *only* relay-delivery path that survives
 /// backgrounding at all. This is exactly why decision §3.3 requires the push
 /// path to carry no state of its own: losing it silently degrades latency, never
-/// correctness.
+/// correctness. Battery, 2026-07-21: it's also exactly why `RelayPollPolicy`
+/// pins the poll back to its fast 60s cadence the moment the app backgrounds,
+/// regardless of this socket's health -- see that type's doc.
 ///
 /// ### Network binding
 ///
@@ -58,6 +60,25 @@ import os.log
 /// system currently prefers -- there is no analogous per-socket network pinning
 /// here, and `NWPathMonitor`-driven path selection has not exhibited that
 /// Android-specific failure mode. Nothing to mirror on this axis.
+///
+/// ### Health signal (battery, 2026-07-21)
+///
+/// `isHealthy()` and the `onHealthChanged` callback exist purely so
+/// `MeshController` can back `relayTimer`'s poll cadence off
+/// (`RelayPollPolicy.relayPollIntervalMs`) while this socket is doing the
+/// low-latency job instead: `onHealthChanged` fires `true` on a real open
+/// (`didOpenWithProtocol`) and `false` on a real drop (`handleDisconnectLocked`
+/// -- receive failure, server close, or task completion error), but
+/// deliberately *not* from `stop()` -- an intentional teardown (mesh
+/// stopping, or `start` reconfiguring to a new `RelayConfig`) isn't the
+/// "something went wrong, catch up sooner" signal the transition exists for.
+/// Mirrors Android's `RelayPushClient.kt` exactly (same class-doc section,
+/// same rationale).
+///
+/// `isHealthy()` is read synchronously from `MeshController`'s main-actor
+/// relay-poll tick, unlike the rest of this class's state which is confined
+/// to `queue` -- so it's backed by its own lock rather than round-tripping
+/// through `queue.async`.
 final class RelayPushClient: NSObject {
     private static let connectTimeout: TimeInterval = 10
     private static let log = Logger(subsystem: "com.cruisemesh", category: "RelayPushClient")
@@ -65,6 +86,7 @@ final class RelayPushClient: NSObject {
     private let backoff = RelayPushBackoff()
     private let queue = DispatchQueue(label: "com.cruisemesh.relaypush")
     private let onPush: () -> Void
+    private let onHealthChanged: (Bool) -> Void
 
     private var urlSession: URLSession?
     private var webSocketTask: URLSessionWebSocketTask?
@@ -73,9 +95,27 @@ final class RelayPushClient: NSObject {
     private var stopped = true
     private var reconnectWorkItem: DispatchWorkItem?
 
-    init(onPush: @escaping () -> Void) {
+    private let healthLock = NSLock()
+    private var healthyLocked = false
+
+    init(onPush: @escaping () -> Void, onHealthChanged: @escaping (Bool) -> Void = { _ in }) {
         self.onPush = onPush
+        self.onHealthChanged = onHealthChanged
         super.init()
+    }
+
+    /// Whether the push socket is currently open -- see the class doc's
+    /// "Health signal" section. Thread-safe; safe to call from any queue.
+    func isHealthy() -> Bool {
+        healthLock.lock()
+        defer { healthLock.unlock() }
+        return healthyLocked
+    }
+
+    private func setHealthy(_ healthy: Bool) {
+        healthLock.lock()
+        healthyLocked = healthy
+        healthLock.unlock()
     }
 
     /// (Re)starts the push subscription against `config`, computing the
@@ -109,6 +149,10 @@ final class RelayPushClient: NSObject {
         webSocketTask = nil
         urlSession?.invalidateAndCancel()
         urlSession = nil
+        // No onHealthChanged callback here -- see the class doc's "Health
+        // signal" section: an intentional stop is not the transition the
+        // callback exists to catch.
+        setHealthy(false)
     }
 
     private func connectLocked() {
@@ -169,6 +213,9 @@ final class RelayPushClient: NSObject {
         webSocketTask = nil
         urlSession?.invalidateAndCancel()
         urlSession = nil
+        let wasHealthy = isHealthy()
+        setHealthy(false)
+        if wasHealthy { onHealthChanged(false) }
         backoff.recordFailure()
         scheduleReconnectLocked()
     }
@@ -232,6 +279,8 @@ extension RelayPushClient: URLSessionWebSocketDelegate {
             guard self.webSocketTask === webSocketTask else { return }
             Self.log.info("Relay push socket open")
             backoff.recordSuccess()
+            setHealthy(true)
+            onHealthChanged(true)
         }
     }
 

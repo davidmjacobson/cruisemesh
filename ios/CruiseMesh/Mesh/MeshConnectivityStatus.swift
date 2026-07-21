@@ -100,9 +100,23 @@ enum ContactReachability {
         return .offline
     }
 
-    static func selfRelayHealthy(_ health: RelayHealth, nowMs: Int64) -> Bool {
+    /// - Parameter pushHealthy: `RelayPushClient`'s WS push socket is
+    ///   currently open (battery, 2026-07-21: `RelayPollPolicy` backs the poll
+    ///   off to a 900s safety net while this is true and the app is
+    ///   foregrounded, so a stale `RelayHealth.ok`'s `lastSyncMs` no longer
+    ///   implies the relay path actually went unhealthy -- it may just mean
+    ///   nothing new arrived to poll for). When `true`, freshness is
+    ///   considered current regardless of how long ago `lastSyncMs` was -- an
+    ///   open push socket is itself live proof the self relay path works.
+    ///   Still requires `health` to be `.ok` (the last actual sync attempt
+    ///   succeeded); this only overrides the *staleness* check, not a genuine
+    ///   last-known failure. Defaults to `false` so every existing call site
+    ///   (and the poll-driven fallback while push is down, backgrounded, or
+    ///   never connected) keeps today's lastSyncMs-age behavior unchanged.
+    ///   Mirrors Android's `ContactReachability.selfRelayHealthy`.
+    static func selfRelayHealthy(_ health: RelayHealth, nowMs: Int64, pushHealthy: Bool = false) -> Bool {
         guard case .ok(let lastSyncMs) = health else { return false }
-        return nowMs - lastSyncMs <= 2 * relayPollIntervalMs
+        return pushHealthy || nowMs - lastSyncMs <= 2 * relayPollIntervalMs
     }
 
     static func chatHeaderCopy(
@@ -193,6 +207,14 @@ final class MeshConnectivityStatus: ObservableObject {
     /// live, instead of a person discovering it from device logs as happened
     /// in the field. Mirrors MeshConnectivityStatus.kt's staleRelayContacts.
     @Published private(set) var staleRelayContacts: Set<Data> = []
+    /// `RelayPushClient`'s WS push connection state, mirrored here so
+    /// `level(for:)` can feed `ContactReachability.selfRelayHealthy`'s
+    /// `pushHealthy` parameter -- battery work backs the relay poll off to a
+    /// 900s safety net while push is healthy and foregrounded, so relay-health
+    /// freshness can no longer rely on `lastSyncMs` alone (see that function's
+    /// doc). `MeshController` is the sole writer, mirroring every other
+    /// signal here. Mirrors Android's `MeshConnectivityStatus.pushHealthy`.
+    @Published private(set) var pushHealthy: Bool = false
     @Published private(set) var contactLastSeen: [Data: Int64] = [:]
     @Published private(set) var presenceLastSeen: [Data: Int64] = [:]
 
@@ -215,6 +237,9 @@ final class MeshConnectivityStatus: ObservableObject {
     /// Replaces the whole set each sync pass -- a repaired card must clear as
     /// promptly as a broken one appears.
     func setStaleRelayContacts(_ userIds: Set<Data>) { staleRelayContacts = userIds }
+    /// `MeshController` calls this from `RelayPushClient`'s health-change
+    /// callback.
+    func setPushHealthy(_ healthy: Bool) { pushHealthy = healthy }
 
     func mergeLastSeen(userId: Data, seenAtMs: Int64) {
         if seenAtMs > (contactLastSeen[userId] ?? 0) { contactLastSeen[userId] = seenAtMs }
@@ -231,7 +256,7 @@ final class MeshConnectivityStatus: ObservableObject {
         ContactReachability.compute(
             directLink: nearbyPeerIds.contains(userId),
             presenceLastSeenMs: presenceLastSeen[userId],
-            selfRelayHealthy: ContactReachability.selfRelayHealthy(relay, nowMs: nowMs),
+            selfRelayHealthy: ContactReachability.selfRelayHealthy(relay, nowMs: nowMs, pushHealthy: pushHealthy),
             peerLastSeenMs: contactLastSeen[userId],
             nearbyPeerCount: nearbyPeerIds.count,
             nowMs: nowMs
@@ -243,6 +268,7 @@ final class MeshConnectivityStatus: ObservableObject {
         directPaths = [:]
         relay = .noConfig
         staleRelayContacts = []
+        pushHealthy = false
         contactLastSeen = [:]
         presenceLastSeen = [:]
     }
