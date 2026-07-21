@@ -51,9 +51,9 @@
 //!    replay heals the gap — that is what the cursor is for. Bounded memory
 //!    beats trying to buffer forever for a phone that went to sea.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -67,6 +67,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
 const RECIPIENT_HINT_LEN: usize = 8;
@@ -88,6 +89,26 @@ pub const WS_BROADCAST_CAPACITY: usize = 64;
 /// If a WS write cannot complete within this window the peer is treated as
 /// slow/dead and dropped (same heal path as lag: reconnect + replay).
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// FR6: default max concurrent WS connections held by a single family
+/// token. Family tokens are semi-public (baked into QR friend cards), so
+/// without a cap, anyone who has seen a card could open unboundedly many
+/// sockets against the $4 VPS.
+pub const DEFAULT_WS_PER_TOKEN_MAX_CONNECTIONS: usize = 16;
+
+/// FR6: default max concurrent WS connections across all family tokens
+/// combined -- the coarser backstop behind the per-token cap.
+pub const DEFAULT_WS_GLOBAL_MAX_CONNECTIONS: usize = 256;
+
+/// FR6: server-side keepalive cadence. A `Ping` is sent on this interval;
+/// see `DEFAULT_WS_PING_MISSED_LIMIT`.
+const DEFAULT_WS_PING_INTERVAL: Duration = Duration::from_secs(45);
+
+/// FR6: a peer that answers neither with a `Pong` nor any other client
+/// frame within this many consecutive ping intervals is treated as dead
+/// and dropped -- same heal path as a lag-drop (reconnect + replay), and it
+/// frees the connection-cap permit the dead socket was holding.
+const DEFAULT_WS_PING_MISSED_LIMIT: u32 = 2;
 
 /// DESIGN.md §9: hard upper bound on how long a row may live on the relay.
 /// Client-supplied `expiry_ms` (typically 7 days via core's
@@ -147,12 +168,42 @@ pub const DEFAULT_FAMILY_QUOTA_BYTES: u64 = 256 * 1024 * 1024;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GIT_SHA: &str = env!("CRUISEMESH_GIT_SHA");
 
+/// FR6: tunable WS admission-control knobs, pulled out of `AppState`'s
+/// constructor parameter list so a test can shrink the connection caps or
+/// the ping cadence without changing every other constructor's signature.
+#[derive(Clone, Copy, Debug)]
+pub struct WsLimitsConfig {
+    pub per_token_max_connections: usize,
+    pub global_max_connections: usize,
+    pub ping_interval: Duration,
+    pub ping_missed_limit: u32,
+}
+
+impl Default for WsLimitsConfig {
+    fn default() -> Self {
+        Self {
+            per_token_max_connections: DEFAULT_WS_PER_TOKEN_MAX_CONNECTIONS,
+            global_max_connections: DEFAULT_WS_GLOBAL_MAX_CONNECTIONS,
+            ping_interval: DEFAULT_WS_PING_INTERVAL,
+            ping_missed_limit: DEFAULT_WS_PING_MISSED_LIMIT,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     store: RelayStore,
     auth_tokens: HashSet<String>,
     tx: tokio::sync::broadcast::Sender<std::sync::Arc<BroadcastEnvelope>>,
     family_quota_bytes: u64,
+    /// FR6: global concurrent-WS-connection admission gate.
+    ws_global: Arc<Semaphore>,
+    /// FR6: per-family-token connection gate -- one `Semaphore` per allowed
+    /// token, built once at construction time (the token allowlist is
+    /// fixed for the life of the process).
+    ws_per_token: Arc<HashMap<String, Arc<Semaphore>>>,
+    ws_ping_interval: Duration,
+    ws_ping_missed_limit: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -195,18 +246,65 @@ impl AppState {
         )
     }
 
+    /// FR6 test helper: custom WS admission-control knobs (default hub
+    /// capacity + family quota) -- lets a test shrink the connection caps
+    /// or the ping cadence instead of waiting on production-sized defaults.
+    pub fn with_ws_limits(
+        store: RelayStore,
+        auth_tokens: HashSet<String>,
+        ws_limits: WsLimitsConfig,
+    ) -> Self {
+        Self::with_full_config(
+            store,
+            auth_tokens,
+            WS_BROADCAST_CAPACITY,
+            DEFAULT_FAMILY_QUOTA_BYTES,
+            ws_limits,
+        )
+    }
+
     pub fn with_config(
         store: RelayStore,
         auth_tokens: HashSet<String>,
         hub_capacity: usize,
         family_quota_bytes: u64,
     ) -> Self {
+        Self::with_full_config(
+            store,
+            auth_tokens,
+            hub_capacity,
+            family_quota_bytes,
+            WsLimitsConfig::default(),
+        )
+    }
+
+    /// FR6: the one real constructor; everything above delegates here.
+    pub fn with_full_config(
+        store: RelayStore,
+        auth_tokens: HashSet<String>,
+        hub_capacity: usize,
+        family_quota_bytes: u64,
+        ws_limits: WsLimitsConfig,
+    ) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(hub_capacity.max(1));
+        let ws_per_token = auth_tokens
+            .iter()
+            .map(|token| {
+                (
+                    token.clone(),
+                    Arc::new(Semaphore::new(ws_limits.per_token_max_connections)),
+                )
+            })
+            .collect();
         Self {
             store,
             auth_tokens,
             tx,
             family_quota_bytes,
+            ws_global: Arc::new(Semaphore::new(ws_limits.global_max_connections)),
+            ws_per_token: Arc::new(ws_per_token),
+            ws_ping_interval: ws_limits.ping_interval,
+            ws_ping_missed_limit: ws_limits.ping_missed_limit,
         }
     }
 }
@@ -738,6 +836,21 @@ pub fn parse_family_quota_bytes(raw: &str) -> Result<u64, String> {
     Ok(value)
 }
 
+/// FR6: parse `CRUISEMESH_RELAY_WS_PER_TOKEN_MAX_CONNECTIONS` /
+/// `CRUISEMESH_RELAY_WS_GLOBAL_MAX_CONNECTIONS` (see `DEPLOY.md`). `0` is
+/// rejected for the same reason as the family quota above -- it would mean
+/// "no client can ever open a websocket", never what an operator means;
+/// unset the env var to keep the default.
+pub fn parse_ws_connection_cap(raw: &str) -> Result<usize, String> {
+    let value: usize = raw
+        .parse()
+        .map_err(|_| format!("not a valid connection count: {raw:?}"))?;
+    if value == 0 {
+        return Err("websocket connection cap must be greater than 0".to_string());
+    }
+    Ok(value)
+}
+
 #[derive(Serialize)]
 struct HealthzResponse {
     status: &'static str,
@@ -1071,10 +1184,53 @@ async fn ws_handler(
         ));
     }
 
+    // FR6: admission control before the upgrade -- reject fast under both
+    // the coarse global cap and the per-token cap. Acquiring *owned*
+    // permits lets them move into the socket task and live exactly as long
+    // as that task; whichever path ends the connection (client close,
+    // lag-drop, write-timeout, keepalive reap) drops the permit and frees
+    // the slot automatically.
+    let global_permit = match state.ws_global.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!(
+                family = %token_prefix(&token),
+                "ws upgrade rejected: global connection cap reached (429)"
+            );
+            return Err(ApiError::too_many_ws_connections("global"));
+        }
+    };
+    let per_token_semaphore = state
+        .ws_per_token
+        .get(&token)
+        .expect("ws token was already validated against auth_tokens above")
+        .clone();
+    let per_token_permit = match per_token_semaphore.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!(
+                family = %token_prefix(&token),
+                "ws upgrade rejected: per-token connection cap reached (429)"
+            );
+            return Err(ApiError::too_many_ws_connections("token"));
+        }
+    };
+
     Ok(ws
         .max_message_size(WS_MAX_INBOUND_MESSAGE_BYTES)
         .max_frame_size(WS_MAX_INBOUND_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_ws(socket, state, token, hints, hints_base64, after))
+        .on_upgrade(move |socket| {
+            handle_ws(
+                socket,
+                state,
+                token,
+                hints,
+                hints_base64,
+                after,
+                global_permit,
+                per_token_permit,
+            )
+        })
         .into_response())
 }
 
@@ -1115,6 +1271,20 @@ async fn ws_send_text(socket: &mut WebSocket, text: String) -> bool {
     )
 }
 
+/// FR6: server-initiated keepalive ping. Reuses the same write-timeout as
+/// every other socket write, so a peer that can't even accept a ping is
+/// dropped through the existing write-timeout path, not a bespoke one.
+async fn ws_send_ping(socket: &mut WebSocket) -> bool {
+    matches!(
+        tokio::time::timeout(
+            WS_WRITE_TIMEOUT,
+            socket.send(Message::Ping(Vec::new().into())),
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
 async fn handle_ws(
     mut socket: WebSocket,
     state: AppState,
@@ -1122,6 +1292,11 @@ async fn handle_ws(
     hints: Vec<Vec<u8>>,
     hints_base64: HashSet<String>,
     mut after: i64,
+    // FR6: RAII connection-cap permits -- held for the socket's whole
+    // lifetime; dropped (and the slot freed) whenever this function
+    // returns, on any disconnect path.
+    _global_permit: OwnedSemaphorePermit,
+    _per_token_permit: OwnedSemaphorePermit,
 ) {
     // FR2: WS lifecycle logging. `family` is a short, non-secret prefix
     // (see `token_prefix`) so log lines correlate a session across
@@ -1174,8 +1349,32 @@ async fn handle_ws(
     }
 
     // --- Live push ---
+    // FR6: server-side keepalive. Without this, a silently-dead phone's
+    // socket lingers until the next broadcast happens to hit the write
+    // timeout -- for an idle family that can be hours or days. `interval`
+    // fires its first tick immediately on creation; consume that tick so a
+    // freshly-opened connection isn't pinged the instant it connects.
+    let mut ping_timer = tokio::time::interval(state.ws_ping_interval);
+    ping_timer.tick().await;
+    let mut missed_pings: u32 = 0;
+
     loop {
         tokio::select! {
+            _ = ping_timer.tick() => {
+                if missed_pings >= state.ws_ping_missed_limit {
+                    warn!(
+                        family = %family,
+                        missed_pings,
+                        "ws disconnect: missed keepalive pings"
+                    );
+                    break;
+                }
+                if !ws_send_ping(&mut socket).await {
+                    info!(family = %family, "ws disconnect: keepalive ping write failed/timed out");
+                    break;
+                }
+                missed_pings += 1;
+            }
             res = rx.recv() => {
                 match res {
                     Ok(broadcast) => {
@@ -1212,6 +1411,9 @@ async fn handle_ws(
                         break;
                     }
                     Some(Ok(Message::Ping(payload))) => {
+                        // FR6: a client-initiated ping still proves the
+                        // peer is alive -- counts toward keepalive too.
+                        missed_pings = 0;
                         if tokio::time::timeout(
                             WS_WRITE_TIMEOUT,
                             socket.send(Message::Pong(payload)),
@@ -1222,8 +1424,15 @@ async fn handle_ws(
                             break;
                         }
                     }
-                    // Client→server traffic ignored (acks are REST-only).
-                    Some(Ok(_)) => {}
+                    Some(Ok(Message::Pong(_))) => {
+                        // FR6: keepalive answer -- peer is alive.
+                        missed_pings = 0;
+                    }
+                    // Other client->server traffic ignored (acks are
+                    // REST-only) but still counts as liveness.
+                    Some(Ok(_)) => {
+                        missed_pings = 0;
+                    }
                 }
             }
         }
@@ -1310,6 +1519,20 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "internal server error".to_string(),
             code: None,
+        }
+    }
+
+    /// FR6: WS upgrade admission control -- either the per-token or the
+    /// global concurrent-connection cap was already saturated. 429 Too Many
+    /// Requests is the standard status for "this resource is temporarily
+    /// exhausted, retry later" -- deliberately distinct from the D7 507
+    /// (that one means the family's *mailbox storage* is full; this one
+    /// means the family/server's *live connection* budget is full).
+    fn too_many_ws_connections(scope: &'static str) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!("too many concurrent websocket connections ({scope} cap reached)"),
+            code: Some("ws_connection_cap"),
         }
     }
 

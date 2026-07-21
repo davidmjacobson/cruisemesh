@@ -16,7 +16,7 @@ use cruisemesh_core::{
     compute_recipient_hint, default_expiry, encode_message_body, generate_identity,
     generate_msg_id, seal_message, Identity, MessageBody, DEFAULT_HOP_TTL, KIND_TEXT,
 };
-use cruisemesh_relayd::{app, AppState, RelayStore, WS_MAX_INBOUND_MESSAGE_BYTES};
+use cruisemesh_relayd::{app, AppState, RelayStore, WsLimitsConfig, WS_MAX_INBOUND_MESSAGE_BYTES};
 use futures_util::{SinkExt, StreamExt};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
@@ -310,4 +310,141 @@ async fn ws_slow_consumer_disconnect_path() {
         }
     }
     assert!(saw_close, "slow consumer must be disconnected");
+}
+
+// --- FR6: connection caps + keepalive ---
+
+#[tokio::test]
+async fn ws_over_per_token_cap_upgrade_is_refused() {
+    let db = NamedTempFile::new().unwrap();
+    let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
+    let ws_limits = WsLimitsConfig {
+        per_token_max_connections: 1,
+        global_max_connections: 10,
+        ..WsLimitsConfig::default()
+    };
+    let (_router, ws_url) = spawn_router(AppState::with_ws_limits(
+        store,
+        HashSet::from(["family-a".to_string()]),
+        ws_limits,
+    ))
+    .await;
+    let url = format!("{ws_url}/ws?hints={}&token=family-a", b64(&[1u8; 8]));
+
+    // First upgrade consumes the family's only permit; hold it open.
+    let (first_socket, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("first upgrade must succeed");
+
+    // Second upgrade for the same token must be refused with 429, not hang
+    // or silently queue.
+    match tokio_tungstenite::connect_async(&url).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        other => panic!("expected an HTTP 429 handshake rejection, got {other:?}"),
+    }
+
+    drop(first_socket);
+}
+
+#[tokio::test]
+async fn ws_over_global_cap_upgrade_is_refused_even_for_different_tokens() {
+    let db = NamedTempFile::new().unwrap();
+    let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
+    let ws_limits = WsLimitsConfig {
+        per_token_max_connections: 10,
+        global_max_connections: 1,
+        ..WsLimitsConfig::default()
+    };
+    let (_router, ws_url) = spawn_router(AppState::with_ws_limits(
+        store,
+        HashSet::from(["family-a".to_string(), "family-b".to_string()]),
+        ws_limits,
+    ))
+    .await;
+    let hint = b64(&[1u8; 8]);
+    let url_a = format!("{ws_url}/ws?hints={hint}&token=family-a");
+    let url_b = format!("{ws_url}/ws?hints={hint}&token=family-b");
+
+    let (first_socket, _) = tokio_tungstenite::connect_async(&url_a)
+        .await
+        .expect("first upgrade must succeed");
+
+    // A *different* family token still gets refused -- the global cap, not
+    // the per-token cap, is what's saturated here.
+    match tokio_tungstenite::connect_async(&url_b).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        other => panic!("expected an HTTP 429 handshake rejection, got {other:?}"),
+    }
+
+    drop(first_socket);
+}
+
+// FR6: simulates a "silently-dead phone" -- a client that completes the WS
+// handshake and then never reads or writes again (unlike a real dead
+// socket, the TCP connection itself stays fully open; only the WS peer
+// goes silent). The server's keepalive ping still goes out on the wire
+// (the OS write succeeds even though nobody reads it), but with nobody to
+// answer, `missed_pings` should cross `ping_missed_limit` and the server
+// should reap the connection -- freeing its per-token permit. A tiny ping
+// interval keeps this test fast instead of waiting on the 45 s production
+// default.
+#[tokio::test]
+async fn ws_dead_peer_is_reaped_by_keepalive_and_frees_its_permit() {
+    let alice = generate_identity();
+    let bob = generate_identity();
+    let db = NamedTempFile::new().unwrap();
+    let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
+    let ws_limits = WsLimitsConfig {
+        per_token_max_connections: 1,
+        global_max_connections: 10,
+        ping_interval: Duration::from_millis(50),
+        ping_missed_limit: 2,
+    };
+    let (_router, ws_url) = spawn_router(AppState::with_ws_limits(
+        store,
+        HashSet::from(["family-a".to_string()]),
+        ws_limits,
+    ))
+    .await;
+
+    let env = author_text(&alice, &bob, "keepalive", 1);
+    let url = format!(
+        "{ws_url}/ws?hints={}&token=family-a&after=0",
+        b64(&env.recipient_hint)
+    );
+
+    // Connect and immediately stop touching the socket -- never call
+    // .next() again, so this client never reads (and thus never answers)
+    // the server's pings. Holding the value alive keeps the TCP connection
+    // open without polling it.
+    let (dead_socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // While the dead connection holds the family's only permit, a fresh
+    // upgrade attempt for the same token must be refused.
+    match tokio_tungstenite::connect_async(&url).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        other => panic!("expected an HTTP 429 handshake rejection, got {other:?}"),
+    }
+
+    // Give the keepalive loop time to send `ping_missed_limit` unanswered
+    // pings and reap the dead connection (well under the 60 s CI budget
+    // used elsewhere in this file).
+    tokio::time::sleep(Duration::from_millis(50 * 6)).await;
+
+    // The permit should be free again now.
+    let reconnect = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(&url),
+    )
+    .await
+    .expect("reconnect attempt timed out")
+    .expect("permit should have been freed by the keepalive reap");
+    drop(reconnect);
+    drop(dead_socket);
 }

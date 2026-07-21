@@ -4,8 +4,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use cruisemesh_relayd::{
-    app, parse_bind, parse_family_quota_bytes, parse_tokens, AppState, RelayStore,
-    DEFAULT_FAMILY_QUOTA_BYTES,
+    app, parse_bind, parse_family_quota_bytes, parse_tokens, parse_ws_connection_cap, AppState,
+    RelayStore, WsLimitsConfig, DEFAULT_FAMILY_QUOTA_BYTES,
 };
 
 #[tokio::main]
@@ -35,6 +35,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => DEFAULT_FAMILY_QUOTA_BYTES,
     };
 
+    // FR6: WS connection admission-control knobs, both optional overrides
+    // of sensible defaults (see DEPLOY.md).
+    let mut ws_limits = WsLimitsConfig::default();
+    if let Ok(raw) = env::var("CRUISEMESH_RELAY_WS_PER_TOKEN_MAX_CONNECTIONS") {
+        ws_limits.per_token_max_connections = parse_ws_connection_cap(&raw)?;
+    }
+    if let Ok(raw) = env::var("CRUISEMESH_RELAY_WS_GLOBAL_MAX_CONNECTIONS") {
+        ws_limits.global_max_connections = parse_ws_connection_cap(&raw)?;
+    }
+
     let listener = TcpListener::bind(parse_bind(&bind)?).await?;
     let store = RelayStore::open(&db_path)?;
     info!(
@@ -43,14 +53,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind = %bind,
         db_path = %db_path,
         family_quota_bytes,
+        ws_per_token_max_connections = ws_limits.per_token_max_connections,
+        ws_global_max_connections = ws_limits.global_max_connections,
         "relay server listening"
     );
     axum::serve(
         listener,
-        app(AppState::with_family_quota_bytes(
+        app(AppState::with_full_config(
             store,
             auth_tokens,
+            cruisemesh_relayd::WS_BROADCAST_CAPACITY,
             family_quota_bytes,
+            ws_limits,
         )),
     )
     .with_graceful_shutdown(shutdown_signal())
