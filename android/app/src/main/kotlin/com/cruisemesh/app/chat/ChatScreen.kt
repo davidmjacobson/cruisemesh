@@ -131,9 +131,12 @@ import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.formatUserId
 import java.io.File
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
 
@@ -1618,45 +1621,84 @@ private fun VoiceMemoPlayer(
     contentColor: Color,
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var playing by remember { mutableStateOf(false) }
+    // Guards against a double-tap starting a second load (and a second temp
+    // file / MediaPlayer) while the first one is still preparing.
+    var loading by remember { mutableStateOf(false) }
     var player by remember { mutableStateOf<MediaPlayer?>(null) }
+    // FA11: the play-<ts>.m4a temp file this player is backed by, if any --
+    // tracked so every exit path (manual stop, dispose, completion) can
+    // delete it instead of only the completion listener doing so.
+    var tempFile by remember { mutableStateOf<File?>(null) }
+
+    fun stopAndCleanup() {
+        player?.let { mp ->
+            try {
+                mp.stop()
+            } catch (_: IllegalStateException) {
+                // Already stopped/released elsewhere -- nothing more to do to the player.
+            }
+            mp.release()
+        }
+        player = null
+        playing = false
+        tempFile?.delete()
+        tempFile = null
+    }
 
     DisposableEffect(blob) {
-        onDispose {
-            player?.release()
-            player = null
-            playing = false
-        }
+        onDispose { stopAndCleanup() }
     }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
         IconButton(
             onClick = {
-                if (playing) {
-                    player?.stop()
-                    player?.release()
-                    player = null
-                    playing = false
-                } else {
-                    try {
-                        val temp = File(context.cacheDir, "play-${System.currentTimeMillis()}.m4a")
-                        temp.writeBytes(blob)
-                        val mp = MediaPlayer().apply {
-                            setDataSource(temp.absolutePath)
-                            setOnCompletionListener {
+                when {
+                    playing -> stopAndCleanup()
+                    loading -> Unit
+                    else -> {
+                        loading = true
+                        scope.launch {
+                            // FA11: writing the blob to disk and MediaPlayer.prepare()
+                            // (a blocking decode of the audio headers) both used to
+                            // run synchronously on the main thread in this click handler.
+                            val prepared = withContext(Dispatchers.IO) {
+                                try {
+                                    val temp = File(context.cacheDir, "play-${System.currentTimeMillis()}.m4a")
+                                    temp.writeBytes(blob)
+                                    val mp = MediaPlayer()
+                                    mp.setDataSource(temp.absolutePath)
+                                    mp.prepare()
+                                    temp to mp
+                                } catch (_: Exception) {
+                                    null
+                                }
+                            }
+                            loading = false
+                            if (prepared == null) {
+                                Toast.makeText(context, "Could not play voice memo", Toast.LENGTH_SHORT).show()
+                                return@launch
+                            }
+                            val (temp, mp) = prepared
+                            if (!isActive) {
+                                // The screen was left mid-load -- don't leak the player or its temp file.
+                                mp.release()
+                                temp.delete()
+                                return@launch
+                            }
+                            mp.setOnCompletionListener {
                                 playing = false
-                                release()
+                                it.release()
                                 player = null
                                 temp.delete()
+                                tempFile = null
                             }
-                            prepare()
-                            start()
+                            tempFile = temp
+                            player = mp
+                            playing = true
+                            mp.start()
                         }
-                        player = mp
-                        playing = true
-                    } catch (_: Exception) {
-                        playing = false
-                        Toast.makeText(context, "Could not play voice memo", Toast.LENGTH_SHORT).show()
                     }
                 }
             },
