@@ -13,6 +13,7 @@ struct ChatView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @State private var messages: [StoredMessage] = []
+    @State private var rows: [ChatRowModel] = []
     @State private var avatarData: Data?
     @State private var deliveredThrough: UInt64 = 0
     @State private var readThrough: UInt64 = 0
@@ -68,10 +69,6 @@ struct ChatView: View {
         )
     }
 
-    private var visible: [StoredMessage] {
-        messages.filter { isVisibleChatKind($0.kind) }
-    }
-
     private var reactions: [String: [ReactionSummary]] {
         reactionSummariesByTarget(messages: messages, ownUserId: identity.userId)
     }
@@ -90,9 +87,10 @@ struct ChatView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 4) {
-                            ForEach(Array(visible.enumerated()), id: \.element.stableRowId) { index, message in
-                                if isNewDay(index) {
-                                    Text(dayLabel(message.timestamp))
+                            ForEach(rows, id: \.rowId) { row in
+                                let message = row.message
+                                if row.showDayBreak {
+                                    Text(row.dayLabel)
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                         .frame(maxWidth: .infinity)
@@ -115,12 +113,9 @@ struct ChatView: View {
                                     ).0,
                                     quoted: replyMetadata[replyMessageKey(message)]?.quoted,
                                     canReply: replyMetadata[replyMessageKey(message)]?.msgId != nil,
-                                    reactions: reactions[MessageTarget(
-                                        senderUserId: message.senderUserId,
-                                        lamport: message.lamport,
-                                        kind: message.kind
-                                    ).stableKey] ?? [],
-                                    grouping: messageGrouping(at: index),
+                                    reactions: row.reactions,
+                                    grouping: row.grouping,
+                                    timeLabel: row.timeLabel,
                                     onStatus: { statusMessage = $0 },
                                     onReact: { emoji in
                                         sendReaction(to: message, emoji: emoji)
@@ -142,7 +137,7 @@ struct ChatView: View {
                                     replyingTo = message
                                     composerFocused = true
                                 }
-                                .id(message.stableRowId)
+                                .id(row.rowId)
                             }
                         }
                         .padding(.horizontal, 12)
@@ -150,7 +145,7 @@ struct ChatView: View {
                         .frame(minHeight: geo.size.height, alignment: .bottom)
                     }
                     .scrollDismissesKeyboard(.interactively)
-                    .onChange(of: visible.count) { _ in
+                    .onChange(of: rows.count) { _ in
                         scrollToLatest(proxy: proxy)
                     }
                     .onAppear {
@@ -426,6 +421,7 @@ struct ChatView: View {
     private func reload() {
         let loadedMessages = (try? store.messagesForChat(chatId: contact.userId)) ?? []
         messages = loadedMessages
+        rows = ChatRowModel.build(from: loadedMessages, ownUserId: identity.userId)
         replyMetadata = loadMessageReplyMetadata(
             store: store,
             messages: loadedMessages.filter { isVisibleChatKind($0.kind) },
@@ -489,32 +485,85 @@ struct ChatView: View {
         )
     }
 
-    private func isNewDay(_ index: Int) -> Bool {
-        let cal = Calendar.current
-        let current = Date(timeIntervalSince1970: TimeInterval(visible[index].timestamp) / 1000)
-        guard index > 0 else { return true }
-        let previous = Date(timeIntervalSince1970: TimeInterval(visible[index - 1].timestamp) / 1000)
-        return !cal.isDate(current, inSameDayAs: previous)
+    private func scrollToLatest(proxy: ScrollViewProxy, animated: Bool = true) {
+        guard let last = rows.last else { return }
+        if animated {
+            withAnimation { proxy.scrollTo(last.rowId, anchor: .bottom) }
+        } else {
+            proxy.scrollTo(last.rowId, anchor: .bottom)
+        }
     }
+}
 
-    private func dayLabel(_ timestampMs: Int64) -> String {
+struct MessageGrouping: Equatable {
+    let joinsPrevious: Bool
+    let joinsNext: Bool
+
+    var showTimestamp: Bool { !joinsNext }
+}
+
+/// A single row of a 1:1 chat thread, precomputed once per `reload()` (FI8):
+/// the day-break flag/label, message grouping, and reaction summary used to
+/// be recomputed per row per SwiftUI body pass (each recomputation itself
+/// O(n) over the message list), making the whole body O(n^2) for an
+/// n-message thread. `build(from:ownUserId:)` computes all of it in one O(n)
+/// pass over the (already-loaded) messages so the view body just reads
+/// precomputed fields.
+struct ChatRowModel: Equatable {
+    let message: StoredMessage
+    let rowId: String
+    let showDayBreak: Bool
+    let dayLabel: String
+    let grouping: MessageGrouping
+    let timeLabel: String
+    let reactions: [ReactionSummary]
+
+    private static let dayFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "MMMM d, yyyy"
         f.locale = .current
-        return f.string(from: Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000))
+        return f
+    }()
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "h:mm a"
+        f.locale = .current
+        return f
+    }()
+
+    static func build(from messages: [StoredMessage], ownUserId: Data) -> [ChatRowModel] {
+        let visible = messages.filter { isVisibleChatKind($0.kind) }
+        let reactionsByTarget = reactionSummariesByTarget(messages: messages, ownUserId: ownUserId)
+        let cal = Calendar.current
+        var rows: [ChatRowModel] = []
+        rows.reserveCapacity(visible.count)
+        for (index, message) in visible.enumerated() {
+            let date = Date(timeIntervalSince1970: TimeInterval(message.timestamp) / 1000)
+            let showDayBreak: Bool
+            if index == 0 {
+                showDayBreak = true
+            } else {
+                let previousDate = Date(timeIntervalSince1970: TimeInterval(visible[index - 1].timestamp) / 1000)
+                showDayBreak = !cal.isDate(date, inSameDayAs: previousDate)
+            }
+            let joinsPrevious = index > 0 && shouldGroup(visible[index - 1], message)
+            let joinsNext = index + 1 < visible.count && shouldGroup(message, visible[index + 1])
+            let target = MessageTarget(senderUserId: message.senderUserId, lamport: message.lamport, kind: message.kind)
+            rows.append(ChatRowModel(
+                message: message,
+                rowId: message.stableRowId,
+                showDayBreak: showDayBreak,
+                dayLabel: showDayBreak ? dayFormatter.string(from: date) : "",
+                grouping: MessageGrouping(joinsPrevious: joinsPrevious, joinsNext: joinsNext),
+                timeLabel: timeFormatter.string(from: date),
+                reactions: reactionsByTarget[target.stableKey] ?? []
+            ))
+        }
+        return rows
     }
 
-    private func messageGrouping(at index: Int) -> MessageGrouping {
-        let current = visible[index]
-        let previous = index > 0 ? visible[index - 1] : nil
-        let next = index + 1 < visible.count ? visible[index + 1] : nil
-        return MessageGrouping(
-            joinsPrevious: previous.map { shouldGroup($0, current) } ?? false,
-            joinsNext: next.map { shouldGroup(current, $0) } ?? false
-        )
-    }
-
-    private func shouldGroup(_ first: StoredMessage, _ second: StoredMessage) -> Bool {
+    private static func shouldGroup(_ first: StoredMessage, _ second: StoredMessage) -> Bool {
         guard first.senderUserId == second.senderUserId else { return false }
         let gap = second.timestamp - first.timestamp
         guard gap >= 0 && gap <= 5 * 60 * 1000 else { return false }
@@ -523,22 +572,6 @@ struct ChatView: View {
         let b = Date(timeIntervalSince1970: TimeInterval(second.timestamp) / 1000)
         return cal.isDate(a, inSameDayAs: b)
     }
-
-    private func scrollToLatest(proxy: ScrollViewProxy, animated: Bool = true) {
-        guard let last = visible.last else { return }
-        if animated {
-            withAnimation { proxy.scrollTo(last.stableRowId, anchor: .bottom) }
-        } else {
-            proxy.scrollTo(last.stableRowId, anchor: .bottom)
-        }
-    }
-}
-
-private struct MessageGrouping {
-    let joinsPrevious: Bool
-    let joinsNext: Bool
-
-    var showTimestamp: Bool { !joinsNext }
 }
 
 private struct ChatBubbleShape: Shape {
@@ -577,6 +610,7 @@ private struct MessageBubbleView: View {
     let canReply: Bool
     let reactions: [ReactionSummary]
     let grouping: MessageGrouping
+    let timeLabel: String
     var onStatus: (String) -> Void = { _ in }
     var onReact: (String) -> Void = { _ in }
     var onReply: () -> Void = {}
@@ -667,7 +701,7 @@ private struct MessageBubbleView: View {
                 }
 
                 if grouping.showTimestamp {
-                    Text(timeLabel(message.timestamp))
+                    Text(timeLabel)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -732,13 +766,6 @@ private struct MessageBubbleView: View {
         } else {
             Text(String(data: message.payload, encoding: .utf8) ?? "")
         }
-    }
-
-    private func timeLabel(_ ms: Int64) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        f.locale = .current
-        return f.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000))
     }
 
     private var bubbleShape: ChatBubbleShape {

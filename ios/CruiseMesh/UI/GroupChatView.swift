@@ -15,6 +15,7 @@ struct GroupChatView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @State private var messages: [StoredMessage] = []
+    @State private var rows: [GroupChatRowModel] = []
     @State private var contactsById: [Data: Contact] = [:]
     @State private var draft = ""
     @State private var showDetails = false
@@ -47,10 +48,6 @@ struct GroupChatView: View {
         return "\(count) of \(others.count) reachable"
     }
 
-    private var visible: [StoredMessage] {
-        messages.filter { isVisibleChatKind($0.kind) }
-    }
-
     private var reactions: [String: [ReactionSummary]] {
         reactionSummariesByTarget(messages: messages, ownUserId: identity.userId)
     }
@@ -69,7 +66,8 @@ struct GroupChatView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(Array(visible.enumerated()), id: \.element.stableGroupRowId) { index, message in
+                            ForEach(rows, id: \.rowId) { row in
+                                let message = row.message
                                 let messageSenderName = senderName(message.senderUserId)
                                 let messageColor = ChatListLogic.avatarHueAndInitials(
                                     userId: message.senderUserId,
@@ -77,20 +75,16 @@ struct GroupChatView: View {
                                     displayId: formatUserId(userId: message.senderUserId)
                                 ).0
                                 let replyKey = replyMessageKey(message)
-                                let reactionKey = MessageTarget(
-                                    senderUserId: message.senderUserId,
-                                    lamport: message.lamport,
-                                    kind: message.kind
-                                ).stableKey
                                 GroupMessageRow(
                                     message: message,
                                     isOwn: message.senderUserId == identity.userId,
                                     groupName: activeGroup.name,
-                                    senderLabel: senderLabel(at: index),
+                                    senderLabel: row.senderLabel,
                                     contactColor: messageColor,
                                     quoted: replyMetadata[replyKey]?.quoted,
                                     canReply: replyMetadata[replyKey]?.msgId != nil,
-                                    reactions: reactions[reactionKey] ?? [],
+                                    reactions: row.reactions,
+                                    timeLabel: row.timeLabel,
                                     onReact: { emoji in
                                         sendReaction(to: message, emoji: emoji)
                                     },
@@ -111,7 +105,7 @@ struct GroupChatView: View {
                                     replyingTo = message
                                     composerFocused = true
                                 }
-                                .id(messageId(message))
+                                .id(row.rowId)
                             }
                         }
                         .padding(.horizontal, 12)
@@ -119,7 +113,7 @@ struct GroupChatView: View {
                         .frame(minHeight: geo.size.height, alignment: .bottom)
                     }
                     .scrollDismissesKeyboard(.interactively)
-                    .onChange(of: visible.count) { _ in
+                    .onChange(of: rows.count) { _ in
                         scrollToLatest(proxy: proxy)
                     }
                     .onAppear {
@@ -414,24 +408,12 @@ struct GroupChatView: View {
     }
 
     private func scrollToLatest(proxy: ScrollViewProxy, animated: Bool = true) {
-        guard let last = visible.last else { return }
-        let id = messageId(last)
+        guard let last = rows.last else { return }
         if animated {
-            withAnimation { proxy.scrollTo(id, anchor: .bottom) }
+            withAnimation { proxy.scrollTo(last.rowId, anchor: .bottom) }
         } else {
-            proxy.scrollTo(id, anchor: .bottom)
+            proxy.scrollTo(last.rowId, anchor: .bottom)
         }
-    }
-
-    /// Show a sender label above a non-own message when it starts a new run
-    /// (different sender than the previous visible message).
-    private func senderLabel(at index: Int) -> String? {
-        let message = visible[index]
-        guard message.senderUserId != identity.userId else { return nil }
-        if index > 0, visible[index - 1].senderUserId == message.senderUserId {
-            return nil
-        }
-        return senderName(message.senderUserId)
     }
 
     private func loadContacts() {
@@ -442,6 +424,7 @@ struct GroupChatView: View {
     private func reload() {
         let loadedMessages = (try? store.messagesForChat(chatId: activeGroup.id)) ?? []
         messages = loadedMessages
+        rows = GroupChatRowModel.build(from: loadedMessages, ownUserId: identity.userId, senderLabel: senderName)
         replyMetadata = loadMessageReplyMetadata(
             store: store,
             messages: loadedMessages.filter { isVisibleChatKind($0.kind) }
@@ -467,6 +450,60 @@ struct GroupChatView: View {
     }
 }
 
+/// A single row of a group chat thread, precomputed once per `reload()`
+/// (FI8's twin of `ChatRowModel`): sender-label run detection and the
+/// reaction summary used to be recomputed per row per SwiftUI body pass
+/// (each recomputation itself O(n) over the message list — `visible` /
+/// `reactions` were computed properties re-filtering/re-scanning all
+/// messages on every access), making the whole body O(n^2) for an
+/// n-message thread. `build(from:ownUserId:senderLabel:)` computes all of
+/// it in one O(n) pass over the (already-loaded) messages.
+struct GroupChatRowModel: Equatable {
+    let message: StoredMessage
+    let rowId: String
+    let senderLabel: String?
+    let timeLabel: String
+    let reactions: [ReactionSummary]
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "h:mm a"
+        f.locale = .current
+        return f
+    }()
+
+    static func build(
+        from messages: [StoredMessage],
+        ownUserId: Data,
+        senderLabel: (Data) -> String
+    ) -> [GroupChatRowModel] {
+        let visible = messages.filter { isVisibleChatKind($0.kind) }
+        let reactionsByTarget = reactionSummariesByTarget(messages: messages, ownUserId: ownUserId)
+        var rows: [GroupChatRowModel] = []
+        rows.reserveCapacity(visible.count)
+        for (index, message) in visible.enumerated() {
+            let label: String?
+            if message.senderUserId == ownUserId {
+                label = nil
+            } else if index > 0 && visible[index - 1].senderUserId == message.senderUserId {
+                label = nil
+            } else {
+                label = senderLabel(message.senderUserId)
+            }
+            let date = Date(timeIntervalSince1970: TimeInterval(message.timestamp) / 1000)
+            let target = MessageTarget(senderUserId: message.senderUserId, lamport: message.lamport, kind: message.kind)
+            rows.append(GroupChatRowModel(
+                message: message,
+                rowId: message.stableGroupRowId,
+                senderLabel: label,
+                timeLabel: timeFormatter.string(from: date),
+                reactions: reactionsByTarget[target.stableKey] ?? []
+            ))
+        }
+        return rows
+    }
+}
+
 private struct GroupMessageRow: View {
     let message: StoredMessage
     let isOwn: Bool
@@ -476,6 +513,7 @@ private struct GroupMessageRow: View {
     let quoted: QuotedMessagePreview?
     let canReply: Bool
     let reactions: [ReactionSummary]
+    let timeLabel: String
     let onReact: (String) -> Void
     let onReply: () -> Void
     let onPhotoTap: (Data) -> Void
@@ -567,7 +605,7 @@ private struct GroupMessageRow: View {
                     if !reactions.isEmpty {
                         ReactionPillRow(reactions: reactions, isOwn: isOwn, onReact: onReact)
                     }
-                    Text(timeLabel(message.timestamp))
+                    Text(timeLabel)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -588,13 +626,6 @@ private struct GroupMessageRow: View {
                 ))
             }
         }
-    }
-
-    private func timeLabel(_ ms: Int64) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        f.locale = .current
-        return f.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000))
     }
 }
 
