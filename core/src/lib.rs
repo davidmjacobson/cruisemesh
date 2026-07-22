@@ -16,6 +16,7 @@ mod lan_session;
 mod lan_util;
 mod limits;
 mod protocol;
+mod recipient_hints;
 mod relay_wire;
 mod semantic;
 mod store;
@@ -79,6 +80,7 @@ pub use protocol::{
     KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION,
     KIND_RECEIPT, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
+pub use recipient_hints::{dedupe_hints, recent_hints_for, recent_presence_hints_for};
 pub use relay_wire::{
     normalize_relay_url, relay_build_fetch_path, relay_decode_fetch_page,
     relay_decode_post_response, relay_decode_presence_page, relay_encode_ack_request,

@@ -27,14 +27,14 @@ const DIGEST_ADVERTISED_MSG_IDS_LIMIT: u64 = 512;
 /// How many recent day-numbers to hash a peer's UserID against when scoping
 /// carried envelopes to them for D2's confirm-before-delete check
 /// (DTN_TODOS.md §3.2; DESIGN.md §5.3 carry queue, §6.4 `recipient_hint`).
-/// Mirrors the Kotlin/Swift shells' own `CARRY_HINT_DAY_WINDOW` (kept there
-/// for their own, unrelated envelope-selection hint sets) and the same
-/// rationale: `recipient_hint` is `BLAKE2b-8(UserID || day-number)` where
+/// Single-sourced from [`crate::recipient_hints`] since the shells moved
+/// their hint aggregation into core (FA15 follow-up); the rationale lives on
+/// that module: `recipient_hint` is `BLAKE2b-8(UserID || day-number)` where
 /// day-number is the envelope's *creation* day, and an unexpired envelope
 /// was created at most [`crate::DEFAULT_EXPIRY_MS`] (7 days) ago, so hashing
 /// today back through 7 days covers every day-salt a still-carried envelope
 /// for this peer could use.
-const CARRY_HINT_DAY_WINDOW_DAYS: i64 = 7;
+use crate::recipient_hints::CARRY_HINT_DAY_WINDOW_DAYS;
 
 /// Relayd already clamps accepted envelopes to 30 days. Apply the same
 /// ceiling before a P2P envelope can be opened, flooded, or persisted so an
