@@ -829,54 +829,60 @@ private fun GroupConversationTopBar(
     onBack: () -> Unit,
     onOpenDetails: () -> Unit,
 ) {
-    TopAppBar(
-        navigationIcon = {
-            IconButton(onClick = onBack) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-            }
-        },
-        title = {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                AvatarBadge(
-                    userId = group.id,
-                    name = group.name,
-                    displayId = group.name,
-                    size = 36.dp,
-                    isGroup = true,
-                )
-                Spacer(modifier = Modifier.width(12.dp))
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(end = 8.dp),
-                ) {
-                    Text(
-                        text = group.name,
-                        style = MaterialTheme.typography.titleMedium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    val subtitle = if (reachableMemberCount != null) {
-                        "$reachableMemberCount of $memberCount reachable"
-                    } else {
-                        "$memberCount members · tap for details"
-                    }
-                    Text(
-                        text = subtitle,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 0.dp),
-                    )
+    // T8: same treatment as ConversationTopBar -- the group's name + photo
+    // already live in Scaffold's topBar slot (pinned above the message
+    // LazyColumn), so a persistent elevation just reinforces visually that
+    // they stay above the scrolling conversation.
+    Surface(tonalElevation = 2.dp, shadowElevation = 2.dp) {
+        TopAppBar(
+            navigationIcon = {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                 }
-            }
-        },
-        actions = {
-            TextButton(onClick = onOpenDetails) { Text(stringResource(R.string.ui_info)) }
-        },
-    )
+            },
+            title = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    AvatarBadge(
+                        userId = group.id,
+                        name = group.name,
+                        displayId = group.name,
+                        size = 36.dp,
+                        isGroup = true,
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp),
+                    ) {
+                        Text(
+                            text = group.name,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        val subtitle = if (reachableMemberCount != null) {
+                            "$reachableMemberCount of $memberCount reachable"
+                        } else {
+                            "$memberCount members · tap for details"
+                        }
+                        Text(
+                            text = subtitle,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 0.dp),
+                        )
+                    }
+                }
+            },
+            actions = {
+                TextButton(onClick = onOpenDetails) { Text(stringResource(R.string.ui_info)) }
+            },
+        )
+    }
 }
 
 @Composable
