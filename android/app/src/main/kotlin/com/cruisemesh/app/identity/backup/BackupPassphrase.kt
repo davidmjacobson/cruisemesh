@@ -5,7 +5,7 @@ import uniffi.cruisemesh_core.backupMinPassphraseLength
 import uniffi.cruisemesh_core.backupPassphraseStrength
 
 /**
- * Passphrase policy for account backups (LOCAL_BACKUP_RESTORE.md §2.1). The
+ * Passphrase policy for account backups. The
  * backup file *is* the account, so a weak passphrase is a stolen identity —
  * this gates the export button and drives a strength meter. Pure logic, no
  * Android types, so it unit-tests directly.

@@ -23,7 +23,7 @@ import kotlin.io.path.absolutePathString
 import kotlin.io.path.isRegularFile
 
 /**
- * BLE_1TO1_MULING.md Hook A: when [RealMeshSender] has no direct link to the
+ * Muling hook A: when [RealMeshSender] has no direct link to the
  * recipient, it must spray the sealed envelope to every other connected link
  * instead of leaving it purely local. Exercises the real seal/store round
  * trip (same native-library harness as [ReceiptRelayRoundTripTest]) against

@@ -9,7 +9,7 @@ enum class MeshStatusDotColor { GREEN, BLUE, AMBER, NEUTRAL }
 data class MeshStatusPillStatus(val text: String, val dot: MeshStatusDotColor?)
 
 /**
- * Pure builder for the CONNECTIVITY_INDICATOR.md §3.2 mesh status pill: text
+ * Pure builder for the mesh status pill: text
  * composed from three axes (mesh runtime state x nearby peer count x relay
  * health), kept out of [MeshStatusPill] itself so it's unit-testable without
  * a Compose host, same pattern as [ChatListLogic].

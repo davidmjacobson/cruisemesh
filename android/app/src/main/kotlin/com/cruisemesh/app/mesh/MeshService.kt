@@ -186,7 +186,7 @@ private const val RADIO_POWER_CHECK_INTERVAL_MS = 30_000L
 private const val SEEN_ID_SEED_CARRIED_LIMIT: ULong = 512uL
 
 /**
- * BLE_1TO1_MULING.md Hook B: bounded per-digest-exchange budget (sealed-byte
+ * Muling hook B: bounded per-digest-exchange budget (sealed-byte
  * size) for spraying our own still-undelivered 1:1 outbound envelopes to a
  * non-recipient mule. Same order of magnitude as [FOREIGN_CARRY_BUDGET_BYTES]
  * is generous for storage, but this budget bounds one GATT exchange's worth
@@ -195,7 +195,7 @@ private const val SEEN_ID_SEED_CARRIED_LIMIT: ULong = 512uL
 private const val OWN_OUTBOUND_SPRAY_BUDGET_BYTES: Long = 256L * 1024
 
 /**
- * BLE_1TO1_MULING.md §6 follow-up: bounded per-digest-exchange budget
+ * Bounded per-digest-exchange budget
  * (sealed-byte size) for spraying our own still-undelivered outgoing receipt
  * envelopes to a mule so it can carry them back toward the original message
  * senders. Receipts are tiny (a fixed cumulative watermark, no message body),
@@ -798,7 +798,7 @@ class MeshService : Service() {
     }
 
     /**
-     * BLE_1TO1_MULING.md §5 restart hardening: [GossipState.seenIds] is an
+     * Restart hardening: [GossipState.seenIds] is an
      * in-memory dedupe set that does not survive a process restart (see its
      * KDoc), while [store] is durable. Without this, a cold app start forgets
      * every `msg_id` we ever authored, so a mule handing one of our own
