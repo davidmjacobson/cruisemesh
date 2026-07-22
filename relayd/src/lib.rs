@@ -1406,7 +1406,9 @@ async fn get_envelopes(
     headers: HeaderMap,
     Query(query): Query<GetEnvelopesQuery>,
 ) -> Result<Json<GetEnvelopesResponse>, ApiError> {
-    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read).await?.token;
+    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)
+        .await?
+        .token;
     let (hints, _) = decode_fetch_hints(&query.hints)?;
     let after = query.after.unwrap_or(0);
     if after < 0 {
@@ -1463,7 +1465,9 @@ async fn ack_envelopes(
     headers: HeaderMap,
     Json(request): Json<AckRequest>,
 ) -> Result<Json<AckResponse>, ApiError> {
-    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read).await?.token;
+    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)
+        .await?
+        .token;
     if request.ids.len() > MAX_ACK_IDS {
         return Err(ApiError::bad_request(format!(
             "ids must contain at most {MAX_ACK_IDS} entries"
@@ -1508,7 +1512,9 @@ async fn sync_presence(
     headers: HeaderMap,
     Json(request): Json<PresenceRequest>,
 ) -> Result<Json<PresenceResponse>, ApiError> {
-    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read).await?.token;
+    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)
+        .await?
+        .token;
     if request.announce.len() > MAX_PRESENCE_ANNOUNCE {
         return Err(ApiError::bad_request(format!(
             "announce must contain at most {MAX_PRESENCE_ANNOUNCE} hints"
@@ -1770,7 +1776,9 @@ async fn ws_handler(
                 "missing family token (Authorization: Bearer or ?token=)".to_string(),
             ));
         };
-        authorize_family(&state, t, FamilyOp::Read, now_ms()).await?.token
+        authorize_family(&state, t, FamilyOp::Read, now_ms())
+            .await?
+            .token
     };
     let (hints, hints_base64) = decode_fetch_hints(&query.hints)?;
     let after = query.after.unwrap_or(0);
