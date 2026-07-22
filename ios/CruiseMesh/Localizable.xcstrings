@@ -381,6 +381,16 @@
         }
       }
     },
+    "Dismiss": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dismiss"
+          }
+        }
+      }
+    },
     "Details": {
       "localizations": {
         "en": {
@@ -667,6 +677,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Local network access is off"
+          }
+        }
+      }
+    },
+    "Message history could not be read and was reset.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Message history could not be read and was reset."
           }
         }
       }
