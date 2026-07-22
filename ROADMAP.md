@@ -16,8 +16,11 @@ summary. Milestones are sequential because each one de-risks the next.
 ## Near-term focus
 
 - Finish Milestone 4 (groups, broadcast).
-- Field-test the authenticated same-LAN TCP transport across Android and iOS,
-  including permissive and client-isolated captive Wi-Fi.
+- Same-LAN transport: field-validated on a real sailing (Norwegian Jade — a
+  non-isolated ship network, giving instant cross-ship delivery; see
+  DESIGN.md §5.4). Next: gather client-isolation reports across more ships and
+  cruise lines, so families know before sailing how well the app will work
+  (the field-report issue template asks for this).
 - **Notification reliability as a release gate:** background delivery must
   produce a timely local notification on real devices (screen off, battery
   saver, hours idle) before the app is offered to anyone beyond the
@@ -25,7 +28,7 @@ summary. Milestones are sequential because each one de-risks the next.
   "the message arrived and nobody knew" — this project refuses to ship that.
 - Milestone 5 field instrumentation: local-only logs measuring
   time-to-first-path, delivery latency, notification latency, and
-  delivery-mode mix (direct / mule / relay). No telemetry — logs stay on
+  delivery-mode mix (direct / LAN / mule / relay). No telemetry — logs stay on
   the test devices.
 
 ## Deliberately deferred

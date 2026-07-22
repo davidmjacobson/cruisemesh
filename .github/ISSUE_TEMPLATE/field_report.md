@@ -19,6 +19,15 @@ No need to identify yourself or your travel dates precisely. -->
 - Mix: <!-- e.g. 3 Android, 2 iPhone, models if known -->
 - Relay configured? <!-- yes (self-hosted) / no -->
 
+**Ship / venue Wi-Fi**
+
+- Cruise line and ship (if a cruise):
+- Could two phones on the ship Wi-Fi message each other instantly, without an
+  internet package? <!-- yes / no / didn't try. In the app: Advanced settings
+  shows a verdict like "This Wi-Fi appears to block phone-to-phone traffic". -->
+- Did phones stay connected to the Wi-Fi, or get kicked off after a while?
+  <!-- e.g. "dropped roughly every hour and had to rejoin" -->
+
 **What worked**
 
 **What didn't**

@@ -70,21 +70,31 @@ consistent: BLE gets 10–30 m line-of-sight, roughly one room otherwise, and a
 ship-wide hobbyist mesh never reaches critical mass because everyone just buys Wi-Fi.
 
 **Design consequence:** with only ~4–10 family installs on board, "mesh" is not a
-connected graph. It is three delivery modes, in order of how often they'll fire:
+connected graph. It is four delivery modes, and which one carries the traffic
+depends on the ship:
 
-1. **Direct contact** — you're within BLE range of the recipient. Instant.
-2. **Data mule (store-carry-forward)** — a family member's phone picks up your queued
+1. **Same-LAN over ship Wi-Fi** — the one radio network that already blankets
+   every deck is the ship's own Wi-Fi, and phones can associate to it without
+   buying an internet package. Where the network doesn't isolate clients from
+   each other, two associated phones reach each other directly over TCP —
+   instant, cross-ship, and free. This sidesteps the BLE physics entirely by
+   riding the ship's existing solution to the propagation problem.
+   Field-validated; see §5.4.
+2. **Direct contact** — you're within BLE range of the recipient. Instant.
+3. **Data mule (store-carry-forward)** — a family member's phone picks up your queued
    message when you cross paths and physically carries it until it meets the
    recipient. This is classic delay-tolerant networking (DTN), and on a ship where
    everyone orbits the same buffet, it works better than it sounds.
-3. **Internet relay** — any phone with a Wi-Fi package (or in port) syncs the whole
+4. **Internet relay** — any phone with a Wi-Fi package (or in port) syncs the whole
    family's queue through the relay server. One paid Wi-Fi device becomes the
    family's uplink.
 
-Multi-hop flooding through *strangers'* phones (mode 4) is designed in (TTL-limited
+Multi-hop flooding through *strangers'* phones (mode 5) is designed in (TTL-limited
 gossip, same as bitchat) and costs nothing, but we must not depend on it for the
 family use case. Every protocol decision below assumes hours-scale worst-case
-latency, out-of-order arrival, and duplicate delivery.
+latency, out-of-order arrival, and duplicate delivery — and treats anything
+faster (a non-isolated LAN, a direct BLE link) as a welcome upgrade, not an
+assumption.
 
 ---
 
@@ -132,12 +142,9 @@ such as Wi-Fi Aware can do the same.
 - **Wi-Fi Direct / Wi-Fi Aware**: Android-only in practice; cross-OS pairing is a
   known tarpit (Berty maintains three separate transports because of this). Revisit
   only as a media-transfer fast path (§8).
-- **Ship Wi-Fi LAN (no internet package)**: some ship networks allow associated
-  clients to communicate locally without paid internet. CruiseMesh discovers peers
-  with Bonjour/NSD, authenticates accepted contacts with Noise XX, and carries the
-  existing mesh frames over TCP. Client-isolated networks simply leave this path
-  unavailable; BLE and relay continue normally. See
-  [`specs/same-lan-transport.md`](specs/same-lan-transport.md).
+- **Ship Wi-Fi LAN (no internet package)**: where the ship network lets
+  associated clients talk to each other, this is the best transport on board —
+  promoted to its own section, §5.4.
 
 ### 5.2 BLE roles and link protocol
 
@@ -165,6 +172,36 @@ disqualifying for multi-hop media (§8).
   for altruistic muling. Family messages always win eviction fights.
 - No routing tables, no path discovery. At family scale, epidemic flooding with
   dedupe is strictly better than anything cleverer.
+
+### 5.4 Same-LAN transport over ship Wi-Fi (field-validated)
+
+The BLE-centric analysis in §3 has one loophole in the app's favor: the ship
+already solved the propagation problem. Access points cover every deck, and a
+phone can associate to ship Wi-Fi without paying for internet. Where the network
+does not isolate clients from each other, two associated CruiseMesh phones talk
+directly: peers are discovered with Bonjour/NSD plus a bounded subnet sweep,
+accepted contacts authenticate with Noise XX, and the existing sealed mesh
+frames run over TCP. Crypto, storage, receipts, dedupe, and mule behavior are
+unchanged — the LAN is just another link under the §4 seam.
+[`specs/same-lan-transport.md`](specs/same-lan-transport.md) has the protocol
+detail.
+
+**Field results (Norwegian Jade, 2026):** clients on the ship network were
+*not* isolated, which turned the LAN into effectively instant cross-ship
+delivery between any two associated phones — the dominant transport for the
+sailing. Two caveats from the same trip:
+
+- **Holding the association is the hard part.** Some phones dropped the
+  internet-less Wi-Fi after roughly an hour (captive-portal session timeouts;
+  Android's adaptive connectivity preferring mobile data). BLE earned its keep
+  as the always-on supplement precisely when a phone fell off the LAN.
+- **Client isolation is a per-ship roll of the dice.** Whether associated
+  devices can reach each other will vary by cruise line — and probably ship to
+  ship within a line. CruiseMesh probes this automatically (the subnet-sweep
+  verdict surfaced in Advanced settings) and falls back to BLE + relay on
+  isolated networks. Collecting isolation reports across ships and lines — so
+  a family knows before sailing how well the app will work — is an open
+  project goal; the 🚢 field-report issue template asks for exactly this.
 
 ---
 
@@ -417,8 +454,9 @@ designed around (iOS background BLE) before any real investment.
    down"). If backgrounded-iPhone↔backgrounded-iPhone sync degrades on some
    device generation, the app survives — that pair just syncs on foreground —
    but expectations must be set.
-2. **Steel ship RF** — already priced in (§3): the design leans on mule + relay, not
-   range. Field test measures which mode actually delivers.
+2. **Steel ship RF** — already priced in (§3): the design leans on the ship's
+   own Wi-Fi (§5.4), mule, and relay — not BLE range. Field data so far says the
+   LAN dominates where it's available and BLE covers the gaps.
 3. **App distribution** — TestFlight + sideload/Play internal testing is fine for
    family; store review (Apple may poke at BLE background modes) only matters if
    this is ever distributed beyond family.
