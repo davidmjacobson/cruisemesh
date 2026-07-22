@@ -1513,6 +1513,13 @@ final class MeshController: ObservableObject {
             receiptType: ReceiptType.delivered,
             throughLamport: through
         )
+        _ = queueOutgoingReceiptForRelay(
+            identity: identity,
+            contact: contact,
+            receiptType: ReceiptType.delivered,
+            ackedSenderUserId: senderUserId,
+            throughLamport: through
+        )
         if let sourceAddress {
             sendReceiptOnAddress(
                 identity: identity,
@@ -1534,6 +1541,7 @@ final class MeshController: ObservableObject {
         if policyChanged {
             FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
         }
+        RelaySyncEvents.requestSync()
     }
 
     // FI5: throws now -- see handleIncomingFriendRequest's doc for the
