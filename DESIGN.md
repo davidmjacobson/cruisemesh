@@ -403,7 +403,7 @@ crypto/protocol logic that must behave identically on both platforms.
 | 3 | **Relay** | `relayd` on a VPS, internet flush, mixed BLE+relay delivery with dedupe | Message delivered city-to-city; duplicates never render twice | ✅ Done |
 | 4 | **Groups + broadcast** | Group keys, rotation, per-member ticks; public channel | 4-person family group; broadcast between two unfriended installs | 🔨 In progress |
 | 5 | **🚢 Field test** | Everything, on an actual cruise | Family uses it for a week; log delivery latency, battery, mode mix (direct/mule/relay); probe ship-LAN client isolation while aboard | ⏳ Upcoming |
-| 6 | Media (per §8) | — | after the field test says the foundation holds | 📋 Designed |
+| 6 | Media (per §8) | — | after the field test says the foundation holds | 🔨 Inline attachments shipped; chunked media designed |
 
 Milestone 0 was the go/no-go gate: it de-risked the only thing that couldn't be
 designed around (iOS background BLE) before any real investment.

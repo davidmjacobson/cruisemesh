@@ -1,6 +1,6 @@
 name: Android release
 
-# FR15 (fable-todo.md): before this workflow, APK builds were artisanal --
+# Before this workflow, APK builds were artisanal --
 # one workstation's NDK/cargo-ndk setup, versionCode a hand-bumped epoch
 # timestamp (android/app/build.gradle.kts), no CI job ever ran even
 # assembleDebug. Pushing an `android-v*` tag now cross-compiles the Rust

@@ -1,7 +1,6 @@
 # CLAUDE.md
 
-Load-bearing session knowledge. Full detail: `AGENTS.md`, `TODO.md` §3,
-`AGENT-TODO.md` (plan of record), `fable-todo.md` (audit backlog).
+Load-bearing session knowledge. Build/bindgen detail: `AGENTS.md`.
 
 - **Worktree per task, never the main checkout**: `git worktree add
   ../CruiseMesh-<slug>`, one branch per item (`agent/<slug>`), off `master`.
@@ -13,9 +12,21 @@ Load-bearing session knowledge. Full detail: `AGENTS.md`, `TODO.md` §3,
   `14227840+davidmjacobson@users.noreply.github.com` or the push is rejected.
 - **Tests**: core `cargo test -p cruisemesh-core`; workspace
   `cargo test --workspace`; Android `cd android && ./gradlew
-  :app:testDebugUnitTest --rerun-tasks`; iOS on the Mac validation host (see
-  `AGENTS.md` for the SSH/worktree runbook — check reachability first).
+  :app:testDebugUnitTest --rerun-tasks`; iOS builds/tests need a Mac (setup
+  notes live outside the repo — ask before starting iOS work).
+- **Core-first**: shared behavior lives in the Rust core (`core/src/`),
+  exported via UniFFI; never fix it in one platform's shell. Pure
+  schedule/policy logic = plain classes with no Android imports, unit-tested
+  directly.
 - **Strings in resources**: user-facing copy goes in `strings.xml` /
-  `Localizable.xcstrings`; CI rejects hardcoded literals.
-- **Endpoint privacy invariant**: TODO.md §3.5.
-- **DTN ack safety invariant**: TODO.md §3.6.
+  `Localizable.xcstrings`; CI rejects hardcoded literals. Sentence case,
+  literal status/error copy, no protocol jargon.
+- **Endpoint privacy invariant**: each phone advertises ONLY its own endpoint,
+  sealed pairwise per contact. Discovered or third-party IPs are never
+  forwarded to anyone.
+- **DTN ack safety invariant**: never ack a relay copy unless this device was
+  the envelope's sole true endpoint consumer; a carried 1:1 envelope is
+  removed only on digest-proof of receipt, never on dispatch. When in doubt,
+  don't ack.
+- **Product bar**: obvious for family members on the surface; capability for
+  power users behind Advanced. When in tension, simplicity wins the surface.

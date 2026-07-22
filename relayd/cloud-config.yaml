@@ -2,8 +2,8 @@
 # First-boot configuration for the CruiseMesh hosted relay (Ubuntu 24.04, Hetzner).
 # Paste into the "Cloud config" field when creating the server (or pass via
 # --user-data). It hardens the box and installs Docker; the relay itself is
-# deployed afterward with provision-hetzner.sh (once DNS points here and the
-# `relay` branch is pushed). See DEPLOY.md.
+# deployed afterward with provision-hetzner.sh (once DNS points here). See
+# DEPLOY.md.
 #
 # Approach mirrors https://community.hetzner.com/tutorials/basic-cloud-config
 # with the relay's SSH key baked in.
@@ -67,11 +67,11 @@ runcmd:
   - systemctl restart ssh || systemctl restart sshd
   - systemctl enable --now fail2ban
 
-  # --- OPTIONAL: auto-deploy the relay at first boot. Only uncomment if the
-  #     `relay` branch is already pushed AND DNS relay.cruisemesh.app already
-  #     points at this box (else the clone or the TLS cert will fail). Prints
-  #     the generated admin token into /var/log/cloud-init-output.log.
-  # - curl -fsSL https://raw.githubusercontent.com/davidmjacobson/cruisemesh/relay/relayd/provision-hetzner.sh -o /root/provision.sh
+  # --- OPTIONAL: auto-deploy the relay at first boot. Only uncomment if DNS
+  #     relay.cruisemesh.app already points at this box (else the TLS cert
+  #     will fail). Prints the generated admin token into
+  #     /var/log/cloud-init-output.log.
+  # - curl -fsSL https://raw.githubusercontent.com/davidmjacobson/cruisemesh/master/relayd/provision-hetzner.sh -o /root/provision.sh
   # - bash /root/provision.sh
 
 final_message: "CruiseMesh relay box ready after $UPTIME s. SSH in and run provision-hetzner.sh."

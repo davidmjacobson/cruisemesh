@@ -11,8 +11,8 @@
 #      "DNS only" (grey cloud). Caddy terminates TLS itself; Cloudflare's proxy
 #      would break the ACME certificate challenge. Add an AAAA (DNS only) too
 #      if the box has IPv6.
-#   2. The `relay` branch must be pushed to the REPO_URL below so this box can
-#      clone it (`git push origin relay` from your dev machine).
+#   2. The BRANCH below (default: master) must be pushed to the REPO_URL so
+#      this box can clone it.
 #
 # Usage (as root on the fresh box):
 #   bash provision-hetzner.sh
@@ -21,7 +21,7 @@ set -euo pipefail
 ### ---- Settings (override via env before running if needed) ----
 RELAY_DOMAIN="${RELAY_DOMAIN:-relay.cruisemesh.app}"
 REPO_URL="${REPO_URL:-https://github.com/davidmjacobson/cruisemesh.git}"
-BRANCH="${BRANCH:-relay}"
+BRANCH="${BRANCH:-master}"
 APP_DIR="${APP_DIR:-/opt/cruisemesh}"
 ### -------------------------------------------------------------
 

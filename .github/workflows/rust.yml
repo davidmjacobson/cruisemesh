@@ -1,6 +1,6 @@
 name: Rust
 
-# FR1 (fable-todo.md): before this workflow, nothing ran cargo test, clippy,
+# Before this workflow, nothing ran cargo test, clippy,
 # fmt, or the Android unit tests on any PR/push -- a relayd-only PR (or a
 # core change that broke a UniFFI-generated binding) triggered zero
 # compile/test jobs. This closes that gap for the 330+ test Rust workspace
@@ -62,10 +62,10 @@ jobs:
           cargo run -p cruisemesh-core --bin uniffi-bindgen --features cruisemesh-core/cli -- \
             generate --library target/debug/libcruisemesh_core.so --language kotlin \
             --out-dir android/app/src/main/kotlin-gen
-      # FR1: kotlin-gen is gitignored (never committed on current master), so
-      # this is a no-op today -- but it's a live tripwire against the "known
-      # 8-branch hazard" (TODO.md: several long-lived branches each carried
-      # their own committed, eventually-stale generated bindings). If
+      # kotlin-gen is gitignored (never committed on current master), so
+      # this is a no-op today -- but it's a live tripwire: several long-lived
+      # branches once each carried their own committed, eventually-stale
+      # generated bindings. If
       # kotlin-gen ever ends up committed again (accidental `git add -A`, or
       # merging an old branch without regenerating), a stale copy now shows
       # up as a red check here instead of a UniFFI ABI-mismatch crash on a
