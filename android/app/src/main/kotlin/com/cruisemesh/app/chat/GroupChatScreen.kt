@@ -9,11 +9,9 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -21,9 +19,7 @@ import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -35,8 +31,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -46,14 +40,12 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
@@ -61,7 +53,6 @@ import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -86,7 +77,6 @@ import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.core.content.ContextCompat
 import androidx.compose.ui.res.stringResource
@@ -111,8 +101,6 @@ fun GroupChatScreen(
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
-    val density = LocalDensity.current
-    val keyboardFreeze = rememberOverlayKeyboardFreeze()
     var currentGroup by remember(group.id) { mutableStateOf(group) }
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
     var draft by remember(group.id) { mutableStateOf(DraftStore.load(context, group.id)) }
@@ -126,8 +114,6 @@ fun GroupChatScreen(
     var selectedAddMemberIds by remember { mutableStateOf(setOf<String>()) }
     var groupActionError by remember { mutableStateOf<String?>(null) }
     var confirmDelete by remember { mutableStateOf(false) }
-    var focused by remember(group.id) { mutableStateOf<FocusedMessage?>(null) }
-    var infoMessage by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
     var replyingTo by remember(group.id) { mutableStateOf<StoredMessage?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
@@ -138,31 +124,12 @@ fun GroupChatScreen(
         store.getGroup(currentGroup.id)?.let { currentGroup = it }
     }
 
-    fun showSendFailure() {
-        coroutineScope.launch {
-            snackbarHostState.showSnackbar("Couldn't send. Your message is still here.")
-        }
-    }
+    fun showSendFailure() = showSendFailureSnackbar(coroutineScope, snackbarHostState)
 
-    fun stagePhoto(jpeg: ByteArray?) {
-        if (jpeg == null) {
-            Toast.makeText(context, "Could not prepare photo (too large or unreadable)", Toast.LENGTH_SHORT).show()
-        } else {
-            pendingPhoto = jpeg
-        }
-    }
+    fun stagePhoto(jpeg: ByteArray?) = stagePhotoOrWarn(context, jpeg) { pendingPhoto = it }
 
     fun sendVoiceFile(file: java.io.File, durationMs: Int) {
-        val bytes = try { file.readBytes() } catch (_: Exception) { null }
-        file.delete()
-        if (bytes == null || bytes.isEmpty()) {
-            Toast.makeText(context, "Could not save voice memo", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (bytes.size > AttachmentPayload.MAX_BLOB_BYTES) {
-            Toast.makeText(context, "Voice memo is too large to send over the mesh", Toast.LENGTH_SHORT).show()
-            return
-        }
+        val bytes = readVoiceMemoBytes(context, file) ?: return
         val replyId = replyingTo?.let {
             store.messageReference(it.chatId, it.senderUserId, it.lamport)?.msgId
         }
@@ -240,8 +207,7 @@ fun GroupChatScreen(
         DraftStore.save(context, group.id, draft)
     }
 
-    val listState = rememberLazyListState()
-    val scrollScope = rememberCoroutineScope()
+    val host = rememberConversationHost(group.id)
     val visibleMessages = remember(messages) { messages.filter { isVisibleChatKind(it.kind) } }
     // FA4: same off-main-thread load as ChatScreen -- reply-quote metadata and
     // own-message expiry watermarks, queried once per visible-list change
@@ -267,73 +233,23 @@ fun GroupChatScreen(
     val displayMessages = remember(visibleMessages) { visibleMessages.asReversed() }
 
     fun toggleReaction(target: MessageTarget, emoji: String) {
-        val existingOwn = reactions[target.stableKey].orEmpty().firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
-        sender.sendReaction(currentGroup, target, if (existingOwn != null) "" else emoji)
+        sender.sendReaction(currentGroup, target, resolveReactionToggle(reactions, target, emoji))
         reload()
     }
 
-    fun scrollToMessage(message: StoredMessage) {
-        val oldestFirstIndex = visibleMessages.indexOfFirst { messageStableKey(it) == messageStableKey(message) }
-        if (oldestFirstIndex < 0) return
-        val displayIndex = visibleMessages.lastIndex - oldestFirstIndex
-        scrollScope.launch { listState.animateScrollToItem(displayIndex) }
-    }
+    fun scrollToMessage(message: StoredMessage) = host.scrollToMessage(visibleMessages, message)
 
     // The overlay takes over the full screen, so drop the keyboard while it's
     // open and bring it back once closed. OverlayKeyboardFreeze keeps the
     // conversation pixel-frozen while the keyboard animates, Signal-style.
-    fun openOverlay(target: MessageTarget, bounds: Rect) {
-        keyboardFreeze.onOverlayOpened()
-        focused = FocusedMessage(target, bounds)
-    }
+    fun openOverlay(target: MessageTarget, bounds: Rect) = host.openOverlay(target, bounds)
 
-    fun closeOverlay() {
-        focused = null
-        keyboardFreeze.onOverlayClosed()
-    }
+    fun closeOverlay() = host.closeOverlay()
 
-    val overlayOpen = focused != null
-    LaunchedEffect(overlayOpen) {
-        if (!overlayOpen) {
-            keyboardFreeze.releaseWhenKeyboardReturns()
-        }
-    }
+    ConversationHostEffects(host, visibleMessages, ownUserId)
 
-    // FA7: only auto-scroll to the bottom when the reader is already there
-    // (or the arriving message is their own send) -- see ChatScrollLogic.
-    var newestMessageKey by remember(group.id) { mutableStateOf<String?>(null) }
-    var newMessagesAvailable by remember(group.id) { mutableStateOf(false) }
-    LaunchedEffect(visibleMessages) {
-        val currentNewestKey = visibleMessages.lastOrNull()?.let(::messageStableKey)
-        val isNewestOwn = visibleMessages.lastOrNull()?.senderUserId?.contentEquals(ownUserId) == true
-        when (
-            ChatScrollLogic.decide(
-                previousNewestKey = newestMessageKey,
-                currentNewestKey = currentNewestKey,
-                firstVisibleItemIndex = listState.firstVisibleItemIndex,
-                isNewestOwnMessage = isNewestOwn,
-            )
-        ) {
-            ChatScrollLogic.Decision.AUTO_SCROLL -> {
-                // reverseLayout start is the bottom; pin the newest message there.
-                listState.scrollToItem(0)
-                newMessagesAvailable = false
-            }
-            ChatScrollLogic.Decision.SHOW_NEW_MESSAGES_CHIP -> newMessagesAvailable = true
-            ChatScrollLogic.Decision.NONE -> {}
-        }
-        newestMessageKey = currentNewestKey ?: newestMessageKey
-    }
-    // Clear the chip once the reader scrolls back to the bottom themselves.
-    LaunchedEffect(listState) {
-        snapshotFlow { listState.firstVisibleItemIndex }.collect { index ->
-            if (index <= 1) newMessagesAvailable = false
-        }
-    }
-
-    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-    val viewportHeightPx = with(density) { maxHeight.toPx() }
-    Scaffold(
+    ConversationScaffold(
+        host = host,
         topBar = {
             GroupConversationTopBar(
                 group = currentGroup,
@@ -343,75 +259,35 @@ fun GroupChatScreen(
                 onOpenDetails = { showDetails = true },
             )
         },
-        snackbarHost = { SnackbarHost(snackbarHostState) },
-    ) { innerPadding ->
-        // This device uses adjustResize, so the viewport already excludes the
-        // IME. Track its usable bottom edge rather than adding IME padding a
-        // second time; OverlayKeyboardFreeze pins that edge while the keyboard
-        // animates away and back.
-        val bottomInsetPx = with(density) { innerPadding.calculateBottomPadding().toPx() }
-        val contentBottomPx = viewportHeightPx - bottomInsetPx
-        val imeVisible = WindowInsets.ime.getBottom(density) > 0
-        SideEffect { keyboardFreeze.trackLiveContentBottom(contentBottomPx, imeVisible) }
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .padding(bottom = with(density) { keyboardFreeze.extraBottomPx.toDp() })
-                .padding(horizontal = 16.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-            ) {
-            LazyColumn(
-                state = listState,
-                reverseLayout = true,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(vertical = 8.dp),
-            ) {
-                itemsIndexed(
-                    displayMessages,
-                    key = { _, message -> "${message.senderUserId.contentHashCode()}:${message.lamport}" },
-                ) { revIndex, message ->
-                    val index = visibleMessages.lastIndex - revIndex
-                    val isOwn = message.senderUserId.contentEquals(ownUserId)
-                    GroupMessageBubble(
-                        message = message,
-                        isOwn = isOwn,
-                        senderLabel = if (!isOwn && !grouping[index].joinsPrevious) {
-                            senderName(message.senderUserId)
-                        } else {
-                            null
-                        },
-                        groupName = currentGroup.name,
-                        grouping = grouping[index],
-                        quoted = replyMetadata[messageStableKey(message)]?.quoted,
-                        onQuotedClick = { target -> scrollToMessage(target) },
-                        reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
-                        onReact = { emoji ->
-                            toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
-                        },
-                        onLongPress = { target, bounds -> openOverlay(target, bounds) },
-                    )
-                }
-            }
-
-            if (newMessagesAvailable) {
-                NewMessagesChip(
-                    onClick = {
-                        scrollScope.launch { listState.animateScrollToItem(0) }
-                        newMessagesAvailable = false
+        snackbarHostState = snackbarHostState,
+        listContent = {
+            itemsIndexed(
+                displayMessages,
+                key = { _, message -> messageItemKey(message) },
+            ) { revIndex, message ->
+                val index = visibleMessages.lastIndex - revIndex
+                val isOwn = message.senderUserId.contentEquals(ownUserId)
+                GroupMessageBubble(
+                    message = message,
+                    isOwn = isOwn,
+                    senderLabel = if (!isOwn && !grouping[index].joinsPrevious) {
+                        senderName(message.senderUserId)
+                    } else {
+                        null
                     },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 12.dp),
+                    groupName = currentGroup.name,
+                    grouping = grouping[index],
+                    quoted = replyMetadata[messageStableKey(message)]?.quoted,
+                    onQuotedClick = { target -> scrollToMessage(target) },
+                    reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
+                    onReact = { emoji ->
+                        toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
+                    },
+                    onLongPress = { target, bounds -> openOverlay(target, bounds) },
                 )
             }
-            } // Box (LazyColumn + New messages chip)
-
+        },
+        belowList = {
             if (replyingToPreview != null) {
                 ReplyComposerPreview(
                     preview = replyingToPreview,
@@ -490,10 +366,9 @@ fun GroupChatScreen(
                 },
                 onCancelVoice = { voiceRecorder.cancel() },
             )
-        }
-    }
-
-    if (showDetails) {
+        },
+        overlays = {
+        if (showDetails) {
         AlertDialog(
             onDismissRequest = { showDetails = false },
             title = { Text(currentGroup.name) },
@@ -727,11 +602,9 @@ fun GroupChatScreen(
         )
     }
 
-    val currentFocused = focused
+    val currentFocused = host.focused
     if (currentFocused != null) {
-        val focusedMessage = visibleMessages.firstOrNull {
-            MessageTarget(it.senderUserId, it.lamport, it.kind).stableKey == currentFocused.target.stableKey
-        }
+        val focusedMessage = host.resolveFocusedMessage(visibleMessages)
         // focusedMessage is null only if the message vanished from under us
         // (e.g. deleted) while the overlay was open; just render nothing.
         if (focusedMessage != null) {
@@ -768,7 +641,7 @@ fun GroupChatScreen(
                     closeOverlay()
                 },
                 onInfo = {
-                    infoMessage = focusedMessage
+                    host.infoMessage = focusedMessage
                     closeOverlay()
                 },
             ) {
@@ -788,9 +661,10 @@ fun GroupChatScreen(
             }
         }
     }
-    } // Box
+        },
+    )
 
-    val currentInfoMessage = infoMessage
+    val currentInfoMessage = host.infoMessage
     if (currentInfoMessage != null) {
         val infoIsOwn = currentInfoMessage.senderUserId.contentEquals(ownUserId)
         val infoArrival = if (infoIsOwn) {
@@ -803,7 +677,7 @@ fun GroupChatScreen(
             )
         }
         MessageInfoBottomSheet(
-            onDismiss = { infoMessage = null },
+            onDismiss = { host.infoMessage = null },
             rows = messageInfoRows(
                 currentInfoMessage,
                 infoIsOwn,

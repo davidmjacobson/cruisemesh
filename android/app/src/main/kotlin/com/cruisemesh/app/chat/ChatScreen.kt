@@ -25,7 +25,6 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -34,9 +33,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -51,8 +48,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -63,7 +58,6 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -71,7 +65,6 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -230,35 +223,13 @@ fun ChatScreen(
         deliveredVia = store.receiptViaTransport(currentContact.userId, ownUserId, RECEIPT_TYPE_DELIVERED)
     }
 
-    fun stagePhoto(jpeg: ByteArray?) {
-        if (jpeg == null) {
-            Toast.makeText(context, "Could not prepare photo (too large or unreadable)", Toast.LENGTH_SHORT).show()
-            return
-        }
-        pendingPhoto = jpeg
-    }
+    fun stagePhoto(jpeg: ByteArray?) = stagePhotoOrWarn(context, jpeg) { pendingPhoto = it }
 
-    fun showSendFailure(message: String = "Couldn't send. Your message is still here.") {
-        coroutineScope.launch {
-            snackbarHostState.showSnackbar(message)
-        }
-    }
+    fun showSendFailure(message: String = SEND_FAILURE_MESSAGE) =
+        showSendFailureSnackbar(coroutineScope, snackbarHostState, message)
 
     fun sendVoiceFile(file: File, durationMs: Int) {
-        val bytes = try {
-            file.readBytes()
-        } catch (_: Exception) {
-            null
-        }
-        file.delete()
-        if (bytes == null || bytes.isEmpty()) {
-            Toast.makeText(context, "Could not save voice memo", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (bytes.size > AttachmentPayload.MAX_BLOB_BYTES) {
-            Toast.makeText(context, "Voice memo is too large to send over the mesh", Toast.LENGTH_SHORT).show()
-            return
-        }
+        val bytes = readVoiceMemoBytes(context, file) ?: return
         val result = sender.sendAttachment(
             currentContact,
             AttachmentPayload(
@@ -486,16 +457,13 @@ private fun ConversationScreen(
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
-    val density = LocalDensity.current
     val composerFocus = remember { FocusRequester() }
     // Swipe-to-reply (T1): start a reply to [message] and open the keyboard.
     fun startReply(message: StoredMessage) {
         onReplyingToChange(message)
         composerFocus.requestFocus()
     }
-    val keyboardFreeze = rememberOverlayKeyboardFreeze()
-    val listState = rememberLazyListState()
-    val scrollScope = rememberCoroutineScope()
+    val host = rememberConversationHost(contact.userId)
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
     val resolvedName = remember(contact.name, contact.nickname) {
         coreContactDisplayName(contact)
@@ -538,82 +506,27 @@ private fun ConversationScreen(
     }
     var showContactDetails by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
-    var focused by remember(contact.userId) { mutableStateOf<FocusedMessage?>(null) }
-    var infoMessage by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
     var viewerPhoto by remember(contact.userId) { mutableStateOf<ByteArray?>(null) }
     // Newest-first for reverseLayout LazyColumn: index 0 sits at the bottom
     // edge (just above the composer / keyboard), empty space stays above.
     val displayMessages = remember(visibleMessages) { visibleMessages.asReversed() }
 
-    fun toggleReaction(target: MessageTarget, emoji: String) {
-        val existingOwn = reactions[target.stableKey].orEmpty().firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
-        onReact(target, if (existingOwn != null) "" else emoji)
-    }
+    fun toggleReaction(target: MessageTarget, emoji: String) =
+        onReact(target, resolveReactionToggle(reactions, target, emoji))
 
-    fun scrollToMessage(message: StoredMessage) {
-        val oldestFirstIndex = visibleMessages.indexOfFirst { messageStableKey(it) == messageStableKey(message) }
-        if (oldestFirstIndex < 0) return
-        val displayIndex = visibleMessages.lastIndex - oldestFirstIndex
-        scrollScope.launch { listState.animateScrollToItem(displayIndex) }
-    }
+    fun scrollToMessage(message: StoredMessage) = host.scrollToMessage(visibleMessages, message)
 
     // The overlay takes over the full screen, so drop the keyboard while it's
     // open and bring it back once closed. OverlayKeyboardFreeze keeps the
     // conversation pixel-frozen while the keyboard animates, Signal-style.
-    fun openOverlay(target: MessageTarget, bounds: Rect) {
-        keyboardFreeze.onOverlayOpened()
-        focused = FocusedMessage(target, bounds)
-    }
+    fun openOverlay(target: MessageTarget, bounds: Rect) = host.openOverlay(target, bounds)
 
-    fun closeOverlay() {
-        focused = null
-        keyboardFreeze.onOverlayClosed()
-    }
+    fun closeOverlay() = host.closeOverlay()
 
-    val overlayOpen = focused != null
-    LaunchedEffect(overlayOpen) {
-        if (!overlayOpen) {
-            keyboardFreeze.releaseWhenKeyboardReturns()
-        }
-    }
+    ConversationHostEffects(host, visibleMessages, ownUserId)
 
-    // FA7: only auto-scroll to the bottom when the reader is already there
-    // (or the arriving message is their own send) -- otherwise a history
-    // backfill or an incoming message while reading up-thread would yank the
-    // view. See ChatScrollLogic for the pure decision.
-    var newestMessageKey by remember(contact.userId) { mutableStateOf<String?>(null) }
-    var newMessagesAvailable by remember(contact.userId) { mutableStateOf(false) }
-    LaunchedEffect(visibleMessages) {
-        val currentNewestKey = visibleMessages.lastOrNull()?.let(::messageStableKey)
-        val isNewestOwn = visibleMessages.lastOrNull()?.senderUserId?.contentEquals(ownUserId) == true
-        when (
-            ChatScrollLogic.decide(
-                previousNewestKey = newestMessageKey,
-                currentNewestKey = currentNewestKey,
-                firstVisibleItemIndex = listState.firstVisibleItemIndex,
-                isNewestOwnMessage = isNewestOwn,
-            )
-        ) {
-            ChatScrollLogic.Decision.AUTO_SCROLL -> {
-                // reverseLayout start is the bottom; pin the newest message there.
-                listState.scrollToItem(0)
-                newMessagesAvailable = false
-            }
-            ChatScrollLogic.Decision.SHOW_NEW_MESSAGES_CHIP -> newMessagesAvailable = true
-            ChatScrollLogic.Decision.NONE -> {}
-        }
-        newestMessageKey = currentNewestKey ?: newestMessageKey
-    }
-    // Clear the chip once the reader scrolls back to the bottom themselves.
-    LaunchedEffect(listState) {
-        snapshotFlow { listState.firstVisibleItemIndex }.collect { index ->
-            if (index <= 1) newMessagesAvailable = false
-        }
-    }
-
-    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-    val viewportHeightPx = with(density) { maxHeight.toPx() }
-    Scaffold(
+    ConversationScaffold(
+        host = host,
         topBar = {
             ConversationTopBar(
                 contact = contact,
@@ -626,84 +539,44 @@ private fun ConversationScreen(
                 onOpenDetails = { showContactDetails = true },
             )
         },
-        snackbarHost = { SnackbarHost(snackbarHostState) },
-    ) { innerPadding ->
-        // This device uses adjustResize, so the viewport already excludes the
-        // IME. Track its usable bottom edge rather than adding IME padding a
-        // second time; OverlayKeyboardFreeze pins that edge while the keyboard
-        // animates away and back.
-        val bottomInsetPx = with(density) { innerPadding.calculateBottomPadding().toPx() }
-        val contentBottomPx = viewportHeightPx - bottomInsetPx
-        val imeVisible = WindowInsets.ime.getBottom(density) > 0
-        SideEffect { keyboardFreeze.trackLiveContentBottom(contentBottomPx, imeVisible) }
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .padding(bottom = with(density) { keyboardFreeze.extraBottomPx.toDp() })
-                .padding(horizontal = 16.dp)
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-            ) {
-            LazyColumn(
-                state = listState,
-                reverseLayout = true,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(vertical = 8.dp),
-            ) {
-                itemsIndexed(
-                    displayMessages,
-                    key = { _, message -> "${message.senderUserId.contentHashCode()}:${message.lamport}" },
-                ) { revIndex, message ->
-                    // Map back to oldest-first index for gap / day / grouping logic.
-                    val index = visibleMessages.lastIndex - revIndex
-                    val isOwn = message.senderUserId.contentEquals(ownUserId)
+        snackbarHostState = snackbarHostState,
+        listContent = {
+            itemsIndexed(
+                displayMessages,
+                key = { _, message -> messageItemKey(message) },
+            ) { revIndex, message ->
+                // Map back to oldest-first index for gap / day / grouping logic.
+                val index = visibleMessages.lastIndex - revIndex
+                val isOwn = message.senderUserId.contentEquals(ownUserId)
 
-                    if (isNewDay(visibleMessages, index)) {
-                        DaySeparator(message.timestamp)
-                    }
-
-                    if (gaps.contains(index)) {
-                        GapIndicator()
-                    }
-
-                    MessageBubble(
-                        message = message,
-                        isOwn = isOwn,
-                        tick = if (isOwn) tickStatusFor(message.lamport, deliveredThrough, readThrough) else null,
-                        contactColor = if (isOwn) null else contactColor,
-                        grouping = grouping[index],
-                        quoted = replyMetadata[messageStableKey(message)]?.quoted,
-                        onQuotedClick = { target -> scrollToMessage(target) },
-                        reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
-                        onReact = { emoji ->
-                            toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
-                        },
-                        onPhotoClick = { viewerPhoto = it },
-                        outboundExpiryMs = if (isOwn) chatExtras.outboundExpiryMs[messageStableKey(message)] else null,
-                        onLongPress = { target, bounds -> openOverlay(target, bounds) },
-                        onSwipeReply = { startReply(message) },
-                    )
+                if (isNewDay(visibleMessages, index)) {
+                    DaySeparator(message.timestamp)
                 }
-            }
 
-            if (newMessagesAvailable) {
-                NewMessagesChip(
-                    onClick = {
-                        scrollScope.launch { listState.animateScrollToItem(0) }
-                        newMessagesAvailable = false
+                if (gaps.contains(index)) {
+                    GapIndicator()
+                }
+
+                MessageBubble(
+                    message = message,
+                    isOwn = isOwn,
+                    tick = if (isOwn) tickStatusFor(message.lamport, deliveredThrough, readThrough) else null,
+                    contactColor = if (isOwn) null else contactColor,
+                    grouping = grouping[index],
+                    quoted = replyMetadata[messageStableKey(message)]?.quoted,
+                    onQuotedClick = { target -> scrollToMessage(target) },
+                    reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
+                    onReact = { emoji ->
+                        toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
                     },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 12.dp),
+                    onPhotoClick = { viewerPhoto = it },
+                    outboundExpiryMs = if (isOwn) chatExtras.outboundExpiryMs[messageStableKey(message)] else null,
+                    onLongPress = { target, bounds -> openOverlay(target, bounds) },
+                    onSwipeReply = { startReply(message) },
                 )
             }
-            } // Box (LazyColumn + New messages chip)
-
+        },
+        belowList = {
             if (pendingPhoto != null) {
                 PendingPhotoCard(bytes = pendingPhoto, onRemove = onClearPendingPhoto)
             }
@@ -729,112 +602,110 @@ private fun ConversationScreen(
                 onStopVoice = onStopVoice,
                 onCancelVoice = onCancelVoice,
             )
-        }
-    }
-
-    if (showContactDetails) {
-        ContactDetailsSheet(
-            contact = contact,
-            connectivityText = reachabilityDetailsText,
-            isMuted = isMuted,
-            onMutedChange = onMutedChange,
-            onSetNickname = onSetNickname,
-            avatarBytes = contactAvatar,
-            onDeleteContact = {
-                showContactDetails = false
-                confirmDelete = true
-            },
-            onDismiss = { showContactDetails = false },
-        )
-    }
-
-    if (confirmDelete) {
-        AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text(stringResource(R.string.ui_delete_named, displayName)) },
-            text = { Text(stringResource(R.string.ui_this_removes_the_contact_and_deletes_your_chat)) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        confirmDelete = false
-                        onDeleteContact()
+        },
+        overlays = {
+            if (showContactDetails) {
+                ContactDetailsSheet(
+                    contact = contact,
+                    connectivityText = reachabilityDetailsText,
+                    isMuted = isMuted,
+                    onMutedChange = onMutedChange,
+                    onSetNickname = onSetNickname,
+                    avatarBytes = contactAvatar,
+                    onDeleteContact = {
+                        showContactDetails = false
+                        confirmDelete = true
                     },
-                ) {
-                    Text(stringResource(R.string.ui_delete))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDelete = false }) {
-                    Text(stringResource(R.string.ui_cancel))
-                }
-            },
-        )
-    }
-
-    val currentFocused = focused
-    if (currentFocused != null) {
-        val focusedMessage = visibleMessages.firstOrNull {
-            MessageTarget(it.senderUserId, it.lamport, it.kind).stableKey == currentFocused.target.stableKey
-        }
-        // focusedMessage is null only if the message vanished from under us
-        // (e.g. deleted) while the overlay was open; just render nothing.
-        if (focusedMessage != null) {
-            val focusedIsOwn = focusedMessage.senderUserId.contentEquals(ownUserId)
-            val focusedIndex = visibleMessages.indexOf(focusedMessage)
-            val focusedGrouping = grouping.getOrNull(focusedIndex) ?: BubbleGrouping(joinsPrevious = false, joinsNext = false)
-            val focusedShape = bubbleShapeFor(focusedIsOwn, focusedGrouping)
-            val focusedTick = if (focusedIsOwn) tickStatusFor(focusedMessage.lamport, deliveredThrough, readThrough) else null
-            val focusedReactions = reactions[currentFocused.target.stableKey].orEmpty()
-            val focusedCopyText = remember(focusedMessage.payload, focusedMessage.kind) { messageCopyText(focusedMessage) }
-            val focusedOwnReaction = focusedReactions.firstOrNull { it.reactedByOwnUser }?.emoji
-            val focusedReplyMetadata = replyMetadata[messageStableKey(focusedMessage)]
-
-            MessageFocusOverlay(
-                focused = currentFocused,
-                isOwn = focusedIsOwn,
-                canReply = focusedReplyMetadata?.msgId != null,
-                canCopy = focusedCopyText.isNotBlank(),
-                ownReactionEmoji = focusedOwnReaction,
-                onDismiss = { closeOverlay() },
-                onReact = { emoji ->
-                    toggleReaction(currentFocused.target, emoji)
-                    closeOverlay()
-                },
-                onReply = {
-                    onReplyingToChange(focusedMessage)
-                    closeOverlay()
-                },
-                onCopy = {
-                    if (focusedCopyText.isNotBlank()) {
-                        clipboard.setText(AnnotatedString(focusedCopyText))
-                        Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
-                    }
-                    closeOverlay()
-                },
-                onInfo = {
-                    infoMessage = focusedMessage
-                    closeOverlay()
-                },
-            ) {
-                MessageBubbleVisual(
-                    message = focusedMessage,
-                    isOwn = focusedIsOwn,
-                    tick = focusedTick,
-                    contactColor = if (focusedIsOwn) null else contactColor,
-                    shape = focusedShape,
-                    reactions = focusedReactions,
-                    onReact = { emoji ->
-                        toggleReaction(currentFocused.target, emoji)
-                        closeOverlay()
-                    },
-                    quoted = focusedReplyMetadata?.quoted,
+                    onDismiss = { showContactDetails = false },
                 )
             }
-        }
-    }
-    } // Box
 
-    val currentInfoMessage = infoMessage
+            if (confirmDelete) {
+                AlertDialog(
+                    onDismissRequest = { confirmDelete = false },
+                    title = { Text(stringResource(R.string.ui_delete_named, displayName)) },
+                    text = { Text(stringResource(R.string.ui_this_removes_the_contact_and_deletes_your_chat)) },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                confirmDelete = false
+                                onDeleteContact()
+                            },
+                        ) {
+                            Text(stringResource(R.string.ui_delete))
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { confirmDelete = false }) {
+                            Text(stringResource(R.string.ui_cancel))
+                        }
+                    },
+                )
+            }
+
+            val currentFocused = host.focused
+            if (currentFocused != null) {
+                val focusedMessage = host.resolveFocusedMessage(visibleMessages)
+                // focusedMessage is null only if the message vanished from under us
+                // (e.g. deleted) while the overlay was open; just render nothing.
+                if (focusedMessage != null) {
+                    val focusedIsOwn = focusedMessage.senderUserId.contentEquals(ownUserId)
+                    val focusedIndex = visibleMessages.indexOf(focusedMessage)
+                    val focusedGrouping = grouping.getOrNull(focusedIndex) ?: BubbleGrouping(joinsPrevious = false, joinsNext = false)
+                    val focusedShape = bubbleShapeFor(focusedIsOwn, focusedGrouping)
+                    val focusedTick = if (focusedIsOwn) tickStatusFor(focusedMessage.lamport, deliveredThrough, readThrough) else null
+                    val focusedReactions = reactions[currentFocused.target.stableKey].orEmpty()
+                    val focusedCopyText = remember(focusedMessage.payload, focusedMessage.kind) { messageCopyText(focusedMessage) }
+                    val focusedOwnReaction = focusedReactions.firstOrNull { it.reactedByOwnUser }?.emoji
+                    val focusedReplyMetadata = replyMetadata[messageStableKey(focusedMessage)]
+
+                    MessageFocusOverlay(
+                        focused = currentFocused,
+                        isOwn = focusedIsOwn,
+                        canReply = focusedReplyMetadata?.msgId != null,
+                        canCopy = focusedCopyText.isNotBlank(),
+                        ownReactionEmoji = focusedOwnReaction,
+                        onDismiss = { closeOverlay() },
+                        onReact = { emoji ->
+                            toggleReaction(currentFocused.target, emoji)
+                            closeOverlay()
+                        },
+                        onReply = {
+                            onReplyingToChange(focusedMessage)
+                            closeOverlay()
+                        },
+                        onCopy = {
+                            if (focusedCopyText.isNotBlank()) {
+                                clipboard.setText(AnnotatedString(focusedCopyText))
+                                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                            }
+                            closeOverlay()
+                        },
+                        onInfo = {
+                            host.infoMessage = focusedMessage
+                            closeOverlay()
+                        },
+                    ) {
+                        MessageBubbleVisual(
+                            message = focusedMessage,
+                            isOwn = focusedIsOwn,
+                            tick = focusedTick,
+                            contactColor = if (focusedIsOwn) null else contactColor,
+                            shape = focusedShape,
+                            reactions = focusedReactions,
+                            onReact = { emoji ->
+                                toggleReaction(currentFocused.target, emoji)
+                                closeOverlay()
+                            },
+                            quoted = focusedReplyMetadata?.quoted,
+                        )
+                    }
+                }
+            }
+        },
+    )
+
+    val currentInfoMessage = host.infoMessage
     if (currentInfoMessage != null) {
         val infoIsOwn = currentInfoMessage.senderUserId.contentEquals(ownUserId)
         val infoTick = if (infoIsOwn) tickStatusFor(currentInfoMessage.lamport, deliveredThrough, readThrough) else null
@@ -850,7 +721,7 @@ private fun ConversationScreen(
             ?.takeIf { infoIsOwn && currentInfoMessage.lamport <= deliveredThrough }
             ?.let { transportRouteText(it.toInt()) }
         MessageInfoBottomSheet(
-            onDismiss = { infoMessage = null },
+            onDismiss = { host.infoMessage = null },
             rows = messageInfoRows(
                     currentInfoMessage,
                     infoIsOwn,
