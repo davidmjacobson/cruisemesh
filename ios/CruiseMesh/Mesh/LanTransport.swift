@@ -631,8 +631,7 @@ final class LanTransport {
             runningScan = nil
             scanPlanner.onScanCompleted(scan.breadth, nowMs: Self.nowMs, foundPeer: scan.foundPeer)
             log.info(
-                "Sweep complete (/\(scan.prefixLength)): \(scan.candidates.count) probed, " +
-                    "\(scan.foundPeer ? "peer found" : "empty")."
+                "Sweep complete (/\(scan.prefixLength)): \(scan.candidates.count) probed, \(scan.foundPeer ? "peer found" : "empty")."
             )
             if scan.breadth == .local24 {
                 scheduleAutomaticScan(after: Self.escalateAutomaticScanDelay)
