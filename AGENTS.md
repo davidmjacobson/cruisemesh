@@ -25,7 +25,12 @@ usually `target/debug/libcruisemesh_core.dylib` or
 
 Use `core/build-android.sh` instead when Android packaging/native ABI outputs are
 needed. That full path also creates `android/app/src/main/jniLibs/`, but requires
-Android NDK setup and `cargo-ndk`.
+Android NDK setup and `cargo-ndk`. It stamps both `kotlin-gen/` and `jniLibs/`
+with a matching `.cruisemesh-native-stamp` value on success; Gradle's
+`verifyNativeBindingsSync` task (wired into `preBuild`) fails `assembleDebug`
+and friends if the two dirs are missing, unstamped, or stamped from different
+runs — the quick host-only bindgen command above does NOT write a stamp, so it
+alone is enough for JVM unit tests but not for building/running the app.
 
 ## iOS
 

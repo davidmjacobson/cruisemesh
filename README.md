@@ -29,7 +29,9 @@ core/build-android.sh
 ```
 
 Run this after changing anything in `core/`; it regenerates
-`android/app/src/main/kotlin-gen` and `android/app/src/main/jniLibs`.
+`android/app/src/main/kotlin-gen` and `android/app/src/main/jniLibs` together
+and stamps both so Gradle can detect (and refuse to build with) a stale or
+partial regeneration.
 
 **Core for iOS + Swift bindings** (macOS + Xcode required):
 

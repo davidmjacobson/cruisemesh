@@ -41,5 +41,14 @@ cargo ndk \
     -o "$android_app/jniLibs" \
     build --release -p cruisemesh-core
 
+# Stamp both output dirs with a value unique to this run, so Gradle
+# (verifyNativeBindingsSync in android/app/build.gradle.kts) can fail the
+# build fast if kotlin-gen/ and jniLibs/ ever drift apart (e.g. one
+# regenerated without the other) instead of shipping an APK that crashes at
+# launch with a UniFFI checksum mismatch.
+stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+echo "$stamp" > "$android_app/kotlin-gen/.cruisemesh-native-stamp"
+echo "$stamp" > "$android_app/jniLibs/.cruisemesh-native-stamp"
+
 echo "==> Done. Kotlin bindings: $android_app/kotlin-gen"
 echo "              Native libs: $android_app/jniLibs"
