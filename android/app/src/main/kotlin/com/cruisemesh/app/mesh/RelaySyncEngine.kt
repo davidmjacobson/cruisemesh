@@ -21,7 +21,9 @@ import uniffi.cruisemesh_core.CoreRelayEnvelopeDisposition
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.coreGroupFanoutRows
+import uniffi.cruisemesh_core.dedupeHints
 import uniffi.cruisemesh_core.coreGroupFanoutRowsForCarried
+import uniffi.cruisemesh_core.recentPresenceHintsFor
 import uniffi.cruisemesh_core.relayFetchBatchLimit
 
 // Deliberately MeshService's tag, not this class's name: this code moved here
@@ -51,13 +53,12 @@ private const val TAG = "MeshService"
 internal class RelaySyncEngine(
     private val context: Context,
     private val store: MessageStore,
-    private val hints: RecipientHints,
     private val handler: Handler,
     private val connectivityManager: ConnectivityManager,
     private val identityProvider: () -> Identity?,
     private val isRunning: () -> Boolean,
     private val processRelayEnvelope: (RelayFetchedEnvelope, Identity) -> CoreInboundDisposition,
-    private val backfillOutgoingReceipts: (Identity, List<Contact>, Long) -> Unit,
+    private val backfillOutgoingReceipts: (Identity, Long) -> Unit,
     private val onRelayNetworkChanged: () -> Unit,
     private val assertOffMainThreadForStore: (String) -> Unit,
     private val runOnStoreExecutorAlwaysReplying: (String, () -> Unit, () -> Unit) -> Unit,
@@ -288,9 +289,9 @@ internal class RelaySyncEngine(
      * succeed in.
      *
      * The hint set passed to [RelayPushClient.start] is recomputed on every
-     * (re)connect from [RecipientHints.relayHintsForConfig] (mail addressed
-     * to us) and [RecipientHints.relayProxyHints] (mail addressed to a
-     * contact we can proxy-fetch for, same as [pollRelayMailbox]'s doc) so a
+     * (re)connect from [MessageStore.relayFetchHints] (mail addressed to us,
+     * plus mail addressed to a contact we can proxy-fetch for, same as
+     * [pollRelayMailbox]'s doc) so a
      * newly added contact or group is picked up the next reconnect without
      * this needing its own change-tracking; until then the 60s poll already
      * covers it.
@@ -329,10 +330,7 @@ internal class RelaySyncEngine(
             assertOffMainThreadForStore("relay push hint computation")
             val now = System.currentTimeMillis()
             val computed = try {
-                hints.dedupeHints(
-                    hints.relayHintsForConfig(identity.userId, now),
-                    hints.relayProxyHints(store.listContacts(), identity.userId, now),
-                )
+                store.relayFetchHints(identity.userId, now)
             } catch (e: CoreException) {
                 Log.w(TAG, "Failed to compute relay push hints: ${e.message}")
                 emptyList()
@@ -388,7 +386,7 @@ internal class RelaySyncEngine(
         // trusted (associated-but-dead Wi‑Fi, no VPN); otherwise null = use the
         // default (normal networks and VPN tunnels route themselves).
         val network = relayBindTarget()
-        backfillOutgoingReceipts(identity, contacts, now)
+        backfillOutgoingReceipts(identity, now)
         uploadPendingOutgoingReceiptEnvelopes(contacts, fallbackConfig, now, network)
         uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now, network)
         uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now, network)
@@ -402,7 +400,7 @@ internal class RelaySyncEngine(
         var ownRelaySucceeded = fallbackConfig == null
         for (config in configs) {
             try {
-                pollRelayMailbox(config, identity, contacts, fallbackConfig, now, network)
+                pollRelayMailbox(config, identity, now, network)
                 syncRelayPresence(config, identity, contacts, fallbackConfig, now, network)
                 anyRelaySucceeded = true
                 if (config == fallbackConfig) ownRelaySucceeded = true
@@ -540,7 +538,7 @@ internal class RelaySyncEngine(
         network: Network?,
     ) {
         for (envelope in store.familyCarriedEnvelopes(RELAY_STORE_BATCH_LIMIT, now)) {
-            val contact = hints.contactMatchingHint(contacts, envelope.recipientHint, now)
+            val contact = store.contactMatchingHint(envelope.recipientHint, now)
             if (contact == null) {
                 // Group-hinted carried envelope: previously skipped entirely
                 // (no contact match). A member mule can now decompose it into
@@ -550,7 +548,7 @@ internal class RelaySyncEngine(
                 // carried rows -- re-posts every pass dedupe server-side via
                 // the deterministic fan-out ids. Non-member mules still can't
                 // recognize the hint and still skip, unchanged.
-                val group = hints.groupMatchingHint(envelope.recipientHint, now) ?: continue
+                val group = store.groupMatchingHint(envelope.recipientHint, now) ?: continue
                 val config = relayConfigForGroupRecipient(group.id, contacts, fallbackConfig) ?: continue
                 val rows = coreGroupFanoutRowsForCarried(
                     envelope.msgId,
@@ -587,8 +585,8 @@ internal class RelaySyncEngine(
      *
      * The fetch itself covers two disjoint concerns, combined into one hint
      * set so they ride the same paginated fetch:
-     * [RecipientHints.relayHintsForConfig] (mail addressed to us, pairwise or
-     * via a group we belong to) and [RecipientHints.relayProxyHints] (mail
+     * [MessageStore.relaySelfHints] (mail addressed to us, pairwise or
+     * via a group we belong to) and [MessageStore.relayProxyHints] (mail
      * addressed to a *contact*, fetched on their behalf -- relay
      * proxy-polling, see that function's doc for why this is the fix for "a
      * 1:1 message to a WiFi-less recipient never bridges across BLE
@@ -619,7 +617,7 @@ internal class RelaySyncEngine(
      *    across passes instead of restarting at 0) would let us skip
      *    re-fetching already-seen-but-still-CARRIED envelopes on every pass,
      *    at the cost of a bit more state to persist and reconcile.
-     *  - [RecipientHints.relayProxyHints] fetches every contact's hints on
+     *  - [MessageStore.relayProxyHints] fetches every contact's hints on
      *    every pass, so its cost scales with contact-list size. Fine for this
      *    app's small family circles; would need a smarter server-side "for
      *    this family token" fan-out if that ever became a large flat social
@@ -628,14 +626,10 @@ internal class RelaySyncEngine(
     private fun pollRelayMailbox(
         config: RelayConfig,
         identity: Identity,
-        contacts: List<Contact>,
-        fallbackConfig: RelayConfig?,
         now: Long,
         network: Network?,
     ) {
-        val selfHints = hints.relayHintsForConfig(identity.userId, now)
-        val proxyHints = hints.relayProxyHints(contacts, identity.userId, now)
-        val fetchHints = hints.dedupeHints(selfHints, proxyHints)
+        val fetchHints = store.relayFetchHints(identity.userId, now)
         if (fetchHints.isEmpty()) return
         var after = 0L
         val fetchBatchLimit = relayFetchBatchLimit().toInt()
@@ -703,18 +697,17 @@ internal class RelaySyncEngine(
         }
         if (contactsForConfig.isEmpty()) return
         val announce = if (RelayConfigStore.shareOnline(context)) {
-            hints.recentPresenceHintsFor(identity.userId, now)
+            recentPresenceHintsFor(identity.userId, now)
         } else {
             emptyList()
         }
-        val query = hints.dedupeHints(
-            emptyList(),
-            contactsForConfig.flatMap { contact -> hints.recentPresenceHintsFor(contact.userId, now) },
+        val query = dedupeHints(
+            contactsForConfig.flatMap { contact -> recentPresenceHintsFor(contact.userId, now) },
         )
         if (announce.isEmpty() && query.isEmpty()) return
         val contactByHint = HashMap<String, Contact>(query.size)
         for (contact in contactsForConfig) {
-            for (hint in hints.recentPresenceHintsFor(contact.userId, now)) {
+            for (hint in recentPresenceHintsFor(contact.userId, now)) {
                 contactByHint[UserIdHex.encode(hint)] = contact
             }
         }

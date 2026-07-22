@@ -53,6 +53,7 @@ import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.openGroupMessage
 import uniffi.cruisemesh_core.openMessage
 import uniffi.cruisemesh_core.parseFriendCard
+import uniffi.cruisemesh_core.recentHintsFor
 import uniffi.cruisemesh_core.verifyIntroductionTicket
 
 // Deliberately MeshService's tag, not this class's name: this code moved here
@@ -123,7 +124,6 @@ private const val OWN_RECEIPT_SPRAY_BUDGET_BYTES: Long = 64L * 1024
 internal class InboundEnvelopeProcessor(
     private val context: Context,
     private val store: MessageStore,
-    private val hints: RecipientHints,
     private val identityProvider: () -> Identity?,
     private val requestRelaySync: (String) -> Unit,
     private val lan: LanHooks,
@@ -441,8 +441,7 @@ internal class InboundEnvelopeProcessor(
         sealed: ByteArray,
     ): Pair<Group, OpenedMessage>? {
         val now = System.currentTimeMillis()
-        for (group in store.listGroups()) {
-            if (!hints.recentHintsFor(group.id, now).any { it.contentEquals(recipientHint) }) continue
+        for (group in store.groupsMatchingHint(recipientHint, now)) {
             try {
                 return group to openGroupMessage(group, sealed)
             } catch (_: CoreException) {
@@ -455,7 +454,7 @@ internal class InboundEnvelopeProcessor(
     /**
      * Adds a foreign envelope to the persistent carry queue (DESIGN.md §5.3
      * store-and-forward). Classifies it as "family" -- addressed to someone we
-     * know -- when its `recipient_hint` matches a contact ([RecipientHints.hintMatchesKnownTarget]);
+     * know -- when its `recipient_hint` matches a contact ([MessageStore.hintMatchesKnownTarget]);
      * family envelopes win eviction fights, while foreign ones share a bounded
      * [FOREIGN_CARRY_BUDGET_BYTES] budget and the core bounds the whole queue.
      * Idempotent on `msg_id`, so re-seeing an envelope we already carry is a
@@ -478,7 +477,7 @@ internal class InboundEnvelopeProcessor(
     private fun carryForeignEnvelope(envelope: Frame.Envelope, forceFamily: Boolean = false): Boolean {
         val now = System.currentTimeMillis()
         return try {
-            val isFamily = forceFamily || hints.hintMatchesKnownTarget(envelope.recipientHint, now)
+            val isFamily = forceFamily || store.hintMatchesKnownTarget(envelope.recipientHint, now)
             val stored = store.enqueueCarriedEnvelope(
                 CarriedEnvelope(
                     msgId = envelope.msgId,
@@ -506,7 +505,7 @@ internal class InboundEnvelopeProcessor(
 
     /**
      * Relay-sourced twin of [carryForeignEnvelope]: adds an envelope we
-     * fetched FROM the relay (relay proxy-polling, [RecipientHints.relayProxyHints]) to the
+     * fetched FROM the relay (relay proxy-polling, [MessageStore.relayProxyHints]) to the
      * persistent carry queue for BLE delivery to its real recipient. Unlike
      * [carryForeignEnvelope], this deliberately does NOT call
      * [requestRelaySync] -- the envelope is already sitting on the relay (that
@@ -552,7 +551,7 @@ internal class InboundEnvelopeProcessor(
     /**
      * Hands over every carried envelope destined for the peer that just
      * HELLO'd on [address] (DESIGN.md §5.3): we compute the peer's recent-day
-     * `recipient_hint`s ([RecipientHints.recentHintsFor]) and pull matching envelopes from
+     * `recipient_hint`s ([recentHintsFor]) and pull matching envelopes from
      * the store, and send each on this link. Expired entries are pruned
      * first. If the peer already saw an envelope via an earlier flood, their
      * own seen-ID set drops the duplicate harmlessly; if they didn't (the
@@ -587,7 +586,7 @@ internal class InboundEnvelopeProcessor(
             store.pruneExpiredCarried(now)
             // Peer userId hints plus every group that peer is a member of
             // (DESIGN.md §6.5: members mule for the whole group).
-            val deliveryHints = hints.deliveryHintsForPeer(peerUserId, now)
+            val deliveryHints = store.deliveryHintsForPeer(peerUserId, now)
             val toDeliver = store.carriedEnvelopesForHints(deliveryHints, now)
             if (toDeliver.isEmpty()) return
             var delivered = 0
@@ -1630,37 +1629,18 @@ internal class InboundEnvelopeProcessor(
         return existing == null || existing.throughLamport < authored.envelope.throughLamport
     }
 
-    /** [RelaySyncEngine.performRelaySyncPass]'s pre-upload receipt backfill: persist the current watermarks for every contact so the upload pass has fresh envelopes. */
-    fun backfillRelayOutgoingReceiptEnvelopes(
-        identity: Identity,
-        contacts: List<Contact>,
-        now: Long,
-    ) {
-        for (contact in contacts) {
-            queueOutgoingReceiptForRelay(
-                identity = identity,
-                contact = contact,
-                receiptType = RECEIPT_TYPE_DELIVERED,
-                ackedSenderUserId = contact.userId,
-                throughLamport = store.outgoingReceiptThrough(
-                    contact.userId,
-                    contact.userId,
-                    RECEIPT_TYPE_DELIVERED,
-                ),
-                timestamp = now,
-            )
-            queueOutgoingReceiptForRelay(
-                identity = identity,
-                contact = contact,
-                receiptType = RECEIPT_TYPE_READ,
-                ackedSenderUserId = contact.userId,
-                throughLamport = store.outgoingReceiptThrough(
-                    contact.userId,
-                    contact.userId,
-                    RECEIPT_TYPE_READ,
-                ),
-                timestamp = now,
-            )
+    /**
+     * [RelaySyncEngine.performRelaySyncPass]'s pre-upload receipt backfill,
+     * now computed in core ([MessageStore.backfillOutgoingReceiptEnvelopes]):
+     * core refreshes every contact's DELIVERED/READ receipt envelopes for the
+     * current watermarks and returns their msg_ids, which are recorded into
+     * the in-memory seen-set here for the same reason every shell-side
+     * receipt authoring records there -- our own receipt envelope coming back
+     * off the relay must dedupe, not get re-carried as foreign mail.
+     */
+    fun backfillRelayOutgoingReceiptEnvelopes(identity: Identity, now: Long) {
+        for (msgId in store.backfillOutgoingReceiptEnvelopes(identity, now)) {
+            GossipState.seenIds.record(msgId)
         }
     }
 
@@ -1773,7 +1753,7 @@ internal class InboundEnvelopeProcessor(
             val plan = store.coreDigestSprayPlan(
                 ownUserId = identity.userId,
                 peerUserId = peerUserId,
-                peerHints = hints.recentHintsFor(peerUserId, now),
+                peerHints = recentHintsFor(peerUserId, now),
                 peerKnownMsgIds = peerKnownMsgIds,
                 nowMs = now,
                 ownOutboundBudgetBytes = OWN_OUTBOUND_SPRAY_BUDGET_BYTES.toULong(),
