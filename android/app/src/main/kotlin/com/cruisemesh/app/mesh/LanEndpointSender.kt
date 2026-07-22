@@ -11,7 +11,7 @@ import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.encodeLanEndpointContent
 
 private const val TAG = "LanEndpointSender"
-private const val KIND_LAN_ENDPOINT_HINT: UByte = 8u
+// KIND_LAN_ENDPOINT_HINT comes from MeshWireConstants.kt (FA15).
 private const val HINT_LIFETIME_MS = 15 * 60 * 1_000L
 
 internal object LanEndpointSender {
