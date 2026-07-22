@@ -205,6 +205,11 @@ val verifyNativeBindingsSync = tasks.register("verifyNativeBindingsSync") {
     }
 }
 
-tasks.named("preBuild") {
+// Gate the check on the tasks that actually package jniLibs into an APK/AAB,
+// not preBuild: JVM unit tests load the host cdylib via the libraryOverride
+// above and never touch jniLibs/, and CI's android-units job (rust.yml)
+// deliberately provisions only kotlin-gen + the host library on a fresh
+// checkout where jniLibs/ has never existed.
+tasks.matching { it.name.matches(Regex("merge\\w*JniLibFolders")) }.configureEach {
     dependsOn(verifyNativeBindingsSync)
 }
