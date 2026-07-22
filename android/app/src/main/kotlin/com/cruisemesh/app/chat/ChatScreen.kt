@@ -1137,51 +1137,58 @@ private fun ConversationTopBar(
     onBack: () -> Unit,
     onOpenDetails: () -> Unit,
 ) {
-    TopAppBar(
-        navigationIcon = {
-            IconButton(onClick = onBack) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Back",
-                )
-            }
-        },
-        title = {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable(onClick = onOpenDetails)
-                    .semantics {
-                        role = Role.Button
-                        contentDescription = "Contact details for $displayName"
-                    },
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                AvatarBadge(
-                    userId = contact.userId,
-                    name = contact.name,
-                    displayId = displayId,
-                    size = 36.dp,
-                    reachability = reachability,
-                    photoBytes = avatarBytes,
-                )
-                Spacer(modifier = Modifier.width(12.dp))
-                Column {
-                    Text(
-                        text = displayName,
-                        style = MaterialTheme.typography.titleMedium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        text = statusText,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    // T8: the contact's name + photo already live in Scaffold's topBar slot
+    // (pinned above the message LazyColumn, never inside it), so they stay
+    // visible while the conversation scrolls. A small persistent elevation
+    // reinforces that visually, matching the tonalElevation/shadowElevation
+    // this app already uses for content that floats above other surfaces.
+    Surface(tonalElevation = 2.dp, shadowElevation = 2.dp) {
+        TopAppBar(
+            navigationIcon = {
+                IconButton(onClick = onBack) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Back",
                     )
                 }
-            }
-        },
-    )
+            },
+            title = {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onOpenDetails)
+                        .semantics {
+                            role = Role.Button
+                            contentDescription = "Contact details for $displayName"
+                        },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    AvatarBadge(
+                        userId = contact.userId,
+                        name = contact.name,
+                        displayId = displayId,
+                        size = 36.dp,
+                        reachability = reachability,
+                        photoBytes = avatarBytes,
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column {
+                        Text(
+                            text = displayName,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = statusText,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            },
+        )
+    }
 }
 
 @Composable
