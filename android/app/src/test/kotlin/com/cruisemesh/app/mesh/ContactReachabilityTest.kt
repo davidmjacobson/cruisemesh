@@ -285,4 +285,70 @@ class ContactReachabilityTest {
             assert(ContactReachability.contentDescriptionSuffix(level) != null) { "expected non-null suffix for $level" }
         }
     }
+
+    // Finding #5: NEARBY copy must reflect the live route's actual transport
+    // (BLE vs LAN) instead of hardcoding "Bluetooth" -- a direct link over
+    // ship Wi-Fi with both radios' BLE off must not say "via Bluetooth".
+
+    @Test
+    fun `chatHeaderCopy says Bluetooth for a NEARBY contact reached over BLE`() {
+        assertEquals(
+            "Nearby via Bluetooth",
+            ContactReachability.chatHeaderCopy(ReachabilityLevel.NEARBY, null, 0L, MeshRouterState.Transport.CENTRAL),
+        )
+        assertEquals(
+            "Nearby via Bluetooth",
+            ContactReachability.chatHeaderCopy(ReachabilityLevel.NEARBY, null, 0L, MeshRouterState.Transport.PERIPHERAL),
+        )
+    }
+
+    @Test
+    fun `chatHeaderCopy says Wi-Fi for a NEARBY contact reached over LAN`() {
+        assertEquals(
+            "Nearby via Wi-Fi",
+            ContactReachability.chatHeaderCopy(ReachabilityLevel.NEARBY, null, 0L, MeshRouterState.Transport.LAN),
+        )
+    }
+
+    @Test
+    fun `chatHeaderCopy falls back to transport-neutral Nearby when the transport is unknown`() {
+        assertEquals(
+            "Nearby",
+            ContactReachability.chatHeaderCopy(ReachabilityLevel.NEARBY, null, 0L),
+        )
+        assertEquals(
+            "Nearby",
+            ContactReachability.chatHeaderCopy(ReachabilityLevel.NEARBY, null, 0L, transport = null),
+        )
+    }
+
+    @Test
+    fun `contentDescriptionSuffix mirrors chatHeaderCopy's transport wording for NEARBY`() {
+        assertEquals(
+            "Nearby via Bluetooth",
+            ContactReachability.contentDescriptionSuffix(ReachabilityLevel.NEARBY, MeshRouterState.Transport.CENTRAL),
+        )
+        assertEquals(
+            "Nearby via Wi-Fi",
+            ContactReachability.contentDescriptionSuffix(ReachabilityLevel.NEARBY, MeshRouterState.Transport.LAN),
+        )
+        assertEquals(
+            "Nearby",
+            ContactReachability.contentDescriptionSuffix(ReachabilityLevel.NEARBY),
+        )
+    }
+
+    @Test
+    fun `contactDetailsCopy threads transport into its NEARBY base copy`() {
+        assertEquals(
+            "Nearby via Wi-Fi",
+            ContactReachability.contactDetailsCopy(
+                ReachabilityLevel.NEARBY,
+                peerLastSeenMs = null,
+                presenceLastSeenMs = null,
+                nowMs = 0L,
+                transport = MeshRouterState.Transport.LAN,
+            ),
+        )
+    }
 }

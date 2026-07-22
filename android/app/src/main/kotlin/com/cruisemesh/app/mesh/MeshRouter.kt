@@ -92,6 +92,15 @@ object MeshRouter {
     /** The live transport backing [address], if it is still connected. */
     fun transportFor(address: String): MeshRouterState.Transport? = state.transportFor(address)
 
+    /**
+     * The route a send to [userId] would actually take right now (highest
+     * [MeshRouterState.Transport.routePriority] among its HELLO'd links, so
+     * LAN wins over BLE) -- e.g. so UI copy can say which transport a
+     * [ReachabilityLevel.NEARBY] contact is actually nearby over instead of
+     * assuming BLE.
+     */
+    fun routeFor(userId: ByteArray): Pair<MeshRouterState.Transport, String>? = state.routeFor(userId)
+
     /** Distinct HELLO'd peer userIds, hex-encoded; see [MeshRouterState.helloedUserIds]. */
     fun helloedUserIds(): Set<String> = state.helloedUserIds()
 

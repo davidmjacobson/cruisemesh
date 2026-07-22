@@ -9,7 +9,7 @@ package com.cruisemesh.app.mesh
  * levels (e.g. a group's member levels) can just compare `ordinal`.
  */
 enum class ReachabilityLevel {
-    /** Direct BLE link to this contact, HELLO'd, right now. */
+    /** Direct link (BLE or LAN) to this contact, HELLO'd, right now. */
     NEARBY,
 
     /** Their device synced with the relay very recently AND our relay path works. */
@@ -53,7 +53,8 @@ object ContactReachability {
     /**
      * @param directLink `MeshRouter.routeFor(userId) != null` -- must come
      *   from the same lookup the send path uses, so NEARBY means "a send
-     *   right now would take the BLE path."
+     *   right now would take a direct BLE-or-LAN link" (see
+     *   [chatHeaderCopy]'s `transport` param for which one).
      * @param presenceLastSeenMs relay-presence last-seen for this contact.
      *   Relay presence is kept separate from
      *   general last-seen evidence so only actual relay presence can light up
@@ -83,9 +84,30 @@ object ContactReachability {
         else -> ReachabilityLevel.OFFLINE
     }
 
-    /** §3.3 chat header copy. Probabilistic wording only -- never "delivered instantly". */
-    fun chatHeaderCopy(level: ReachabilityLevel, peerLastSeenMs: Long?, nowMs: Long): String = when (level) {
-        ReachabilityLevel.NEARBY -> "Nearby via Bluetooth"
+    /** NEARBY copy for the live transport a send to this contact would actually take; null when unknown. */
+    private fun nearbyViaCopy(transport: MeshRouterState.Transport?): String = when (transport) {
+        MeshRouterState.Transport.LAN -> "Nearby via Wi-Fi"
+        MeshRouterState.Transport.CENTRAL, MeshRouterState.Transport.PERIPHERAL -> "Nearby via Bluetooth"
+        null -> "Nearby"
+    }
+
+    /**
+     * §3.3 chat header copy. Probabilistic wording only -- never "delivered
+     * instantly".
+     *
+     * @param transport the live route's transport for [ReachabilityLevel.NEARBY]
+     *   (e.g. `MeshRouter.routeFor(userId)?.first`) -- the direct link may be
+     *   BLE or LAN, so this must not be assumed. Null falls back to a
+     *   transport-neutral "Nearby" (unknown transport, or non-NEARBY levels
+     *   where it's unused).
+     */
+    fun chatHeaderCopy(
+        level: ReachabilityLevel,
+        peerLastSeenMs: Long?,
+        nowMs: Long,
+        transport: MeshRouterState.Transport? = null,
+    ): String = when (level) {
+        ReachabilityLevel.NEARBY -> nearbyViaCopy(transport)
         ReachabilityLevel.ONLINE_RELAY -> "Online via relay"
         ReachabilityLevel.RECENT -> {
             val minutes = peerLastSeenMs?.let { ((nowMs - it) / 60_000L).coerceAtLeast(0L) } ?: 0L
@@ -95,9 +117,12 @@ object ContactReachability {
         ReachabilityLevel.OFFLINE -> "Offline — will deliver when reachable"
     }
 
-    /** §3.1 avatar contentDescription suffix; null means "append nothing" (offline is the silent default). */
-    fun contentDescriptionSuffix(level: ReachabilityLevel): String? = when (level) {
-        ReachabilityLevel.NEARBY -> "Nearby via Bluetooth"
+    /**
+     * §3.1 avatar contentDescription suffix; null means "append nothing"
+     * (offline is the silent default). See [chatHeaderCopy]'s [transport] doc.
+     */
+    fun contentDescriptionSuffix(level: ReachabilityLevel, transport: MeshRouterState.Transport? = null): String? = when (level) {
+        ReachabilityLevel.NEARBY -> nearbyViaCopy(transport)
         ReachabilityLevel.ONLINE_RELAY -> "Online via relay"
         ReachabilityLevel.RECENT -> "Recently active"
         ReachabilityLevel.MESH_CARRY -> "Reachable through the mesh"
@@ -128,8 +153,9 @@ object ContactReachability {
         peerLastSeenMs: Long?,
         presenceLastSeenMs: Long?,
         nowMs: Long,
+        transport: MeshRouterState.Transport? = null,
     ): String {
-        val base = chatHeaderCopy(level, peerLastSeenMs, nowMs)
+        val base = chatHeaderCopy(level, peerLastSeenMs, nowMs, transport)
         return when {
             presenceLastSeenMs != null -> "$base · Last seen via relay ${ageText(presenceLastSeenMs, nowMs)} ago"
             peerLastSeenMs != null -> "$base · Last seen ${ageText(peerLastSeenMs, nowMs)} ago"
