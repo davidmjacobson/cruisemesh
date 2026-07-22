@@ -76,6 +76,7 @@ import com.cruisemesh.app.mesh.ChatViewEvents
 import com.cruisemesh.app.mesh.ContactReachability
 import com.cruisemesh.app.mesh.LanTransportDiagnostics
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
+import com.cruisemesh.app.mesh.MeshRouter
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
 import com.cruisemesh.app.mesh.MeshService
@@ -1169,21 +1170,30 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
         val reachability = remember(contact.userId, nearbyPeerIds, relayHealth, pushHealthy, contactLastSeen, presenceLastSeen, connectivityNowMs) {
             reachabilityLevelForUserId(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs, pushHealthy)
         }
-        val reachabilityStatusText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs) {
+        // nearbyPeerIds only proves *some* link HELLO'd, not which transport;
+        // for NEARBY copy, ask the router which link a send would actually
+        // take right now (MeshRouterState is backed by the thread-safe Rust
+        // core, so this is safe to call straight from the composable).
+        val nearbyTransport = remember(reachability, nearbyPeerIds, contact.userId) {
+            if (reachability == ReachabilityLevel.NEARBY) MeshRouter.routeFor(contact.userId)?.first else null
+        }
+        val reachabilityStatusText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs, nearbyTransport) {
             val hex = UserIdHex.encode(contact.userId)
             ContactReachability.chatHeaderCopy(
                 reachability,
                 listOfNotNull(contactLastSeen[hex], presenceLastSeen[hex]).maxOrNull(),
                 connectivityNowMs,
+                nearbyTransport,
             )
         }
-        val reachabilityDetailsText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs) {
+        val reachabilityDetailsText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs, nearbyTransport) {
             val hex = UserIdHex.encode(contact.userId)
             ContactReachability.contactDetailsCopy(
                 reachability,
                 listOfNotNull(contactLastSeen[hex], presenceLastSeen[hex]).maxOrNull(),
                 presenceLastSeen[hex],
                 connectivityNowMs,
+                nearbyTransport,
             )
         }
         ChatScreen(
