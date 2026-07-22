@@ -823,9 +823,8 @@ final class MeshController: ObservableObject {
     /// or nil. `openGroupMessage` does not check membership of the signer;
     /// callers must enforce that before trusting the body.
     private func tryOpenGroupMessage(recipientHint: Data, sealed: Data, now: Int64) -> (Group, OpenedMessage)? {
-        let groups = (try? store.listGroups()) ?? []
+        let groups = (try? store.groupsMatchingHint(hint: recipientHint, nowMs: now)) ?? []
         for group in groups {
-            guard recentHintsFor(userId: group.id, now: now).contains(where: { $0 == recipientHint }) else { continue }
             if let opened = try? openGroupMessage(group: group, sealed: sealed) {
                 return (group, opened)
             }
@@ -1719,7 +1718,7 @@ final class MeshController: ObservableObject {
 
     private func deliverCarriedMessagesForImportedGroup(group: Group, identity: Identity) {
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
-        let hints = recentHintsFor(userId: group.id, now: now)
+        let hints = recentHintsFor(userId: group.id, nowMs: now)
         let carried = (try? store.carriedEnvelopesForHints(hints: hints, nowMs: now)) ?? []
         for envelope in carried {
             guard let opened = try? openGroupMessage(group: group, sealed: envelope.sealed) else { continue }
@@ -1916,7 +1915,7 @@ final class MeshController: ObservableObject {
         forceFamily: Bool = false
     ) -> Bool {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let isFamily = forceFamily || hintMatchesAnyContact(hint: recipientHint, now: now)
+        let isFamily = forceFamily || ((try? store.hintMatchesKnownTarget(hint: recipientHint, nowMs: now)) ?? false)
         guard let stored = try? store.enqueueCarriedEnvelope(
             envelope: CarriedEnvelope(
                 msgId: msgId,
@@ -2008,7 +2007,7 @@ final class MeshController: ObservableObject {
     private func drainCarriedEnvelopesTo(address: String, peerUserId: Data) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         try? store.pruneExpiredCarried(nowMs: now)
-        let hints = deliveryHintsForPeer(peerUserId: peerUserId, now: now)
+        let hints = (try? store.deliveryHintsForPeer(peerUserId: peerUserId, nowMs: now)) ?? []
         let toDeliver = (try? store.carriedEnvelopesForHints(hints: hints, nowMs: now)) ?? []
         var delivered = 0
         for env in toDeliver {
@@ -2050,7 +2049,7 @@ final class MeshController: ObservableObject {
         guard let plan = try? store.coreDigestSprayPlan(
             ownUserId: identity.userId,
             peerUserId: peerUserId,
-            peerHints: recentHintsFor(userId: peerUserId, now: now),
+            peerHints: recentHintsFor(userId: peerUserId, nowMs: now),
             peerKnownMsgIds: peerKnownIds,
             nowMs: now,
             ownOutboundBudgetBytes: MeshDefaults.ownOutboundSprayBudgetBytes,
@@ -2066,37 +2065,10 @@ final class MeshController: ObservableObject {
         }
     }
 
-    private func hintMatchesAnyContact(hint: Data, now: Int64) -> Bool {
-        let contacts = (try? store.listContacts()) ?? []
-        for c in contacts {
-            if recentHintsFor(userId: c.userId, now: now).contains(where: { $0 == hint }) {
-                return true
-            }
-        }
-        return recognizesGroupHint(hint, now: now)
-    }
-
-    private func deliveryHintsForPeer(peerUserId: Data, now: Int64) -> [Data] {
-        var hints = recentHintsFor(userId: peerUserId, now: now)
-        let groups = (try? store.listGroups()) ?? []
-        for group in groups where group.memberUserIds.contains(peerUserId) {
-            hints.append(contentsOf: recentHintsFor(userId: group.id, now: now))
-        }
-        return hints
-    }
-
-    private func recognizesGroupHint(_ hint: Data, now: Int64) -> Bool {
-        let groups = (try? store.listGroups()) ?? []
-        return groups.contains { group in
-            recentHintsFor(userId: group.id, now: now).contains(hint)
-        }
-    }
-
-    private func recentHintsFor(userId: Data, now: Int64) -> [Data] {
-        (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
-            computeRecipientHint(recipientUserId: userId, timestampMs: now - daysAgo * MeshDefaults.msPerDay)
-        }
-    }
+    // Hint aggregation (recent/delivery/known-target/group matching) moved
+    // into the Rust core (FA15 follow-up) -- see core/src/recipient_hints.rs.
+    // MeshService.kt made the same move, so both shells share one window and
+    // one implementation.
 
     // MARK: - Relay
 
@@ -2192,23 +2164,16 @@ final class MeshController: ObservableObject {
     }
 
     private func backfillRelayReceipts(identity: Identity) {
-        let contacts = (try? store.listContacts()) ?? []
-        for contact in contacts {
-            for receiptType in [ReceiptType.delivered, ReceiptType.read] {
-                let through = (try? store.outgoingReceiptThrough(
-                    chatId: contact.userId,
-                    senderUserId: contact.userId,
-                    receiptType: receiptType
-                )) ?? 0
-                guard through > 0 else { continue }
-                _ = queueOutgoingReceiptForRelay(
-                    identity: identity,
-                    contact: contact,
-                    receiptType: receiptType,
-                    ackedSenderUserId: contact.userId,
-                    throughLamport: through
-                )
-            }
+        // Core refreshes every contact's DELIVERED/READ receipt envelopes for
+        // the current watermarks (was an inline loop here and in
+        // MeshService.kt); the returned msg_ids seed the in-memory seen-set
+        // for the same reason queueOutgoingReceiptForRelay records there --
+        // our own receipt envelope coming back off the relay must dedupe,
+        // not get re-carried as foreign mail.
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let msgIds = (try? store.backfillOutgoingReceiptEnvelopes(identity: identity, nowMs: now)) ?? []
+        for msgId in msgIds {
+            GossipState.seenIds.record(msgId: msgId)
         }
     }
 
@@ -2236,18 +2201,6 @@ final class MeshController: ObservableObject {
             let groupsById = Dictionary(
                 uniqueKeysWithValues: importedGroups.map { ($0.id, $0) }
             )
-            // Recent-day hints per imported group, for recognizing
-            // group-hinted carried envelopes below (same window every other
-            // hint check uses).
-            let groupHintSets: [(group: Group, hints: Set<Data>)] = importedGroups.map { group in
-                let hints = (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
-                    computeRecipientHint(
-                        recipientUserId: group.id,
-                        timestampMs: now - daysAgo * MeshDefaults.msPerDay
-                    )
-                }
-                return (group, Set(hints))
-            }
             for env in outbound {
                 if let group = groupsById[env.recipientUserId] {
                     // Group-addressed: per-member fan-out instead of one
@@ -2288,10 +2241,10 @@ final class MeshController: ObservableObject {
                 // group (specs/group-relay-durability.md §4.2); re-posts on
                 // later passes dedupe server-side via the deterministic ids.
                 // Everything else posts unchanged.
-                if let match = groupHintSets.first(where: { $0.hints.contains(env.recipientHint) }) {
+                if let group = (try? store.groupMatchingHint(hint: env.recipientHint, nowMs: now)) ?? nil {
                     let rows = coreGroupFanoutRowsForCarried(
                         originalMsgId: env.msgId,
-                        memberUserIds: match.group.memberUserIds,
+                        memberUserIds: group.memberUserIds,
                         hopTtl: env.hopTtl,
                         expiry: env.expiry,
                         sealed: env.sealed
@@ -2306,12 +2259,7 @@ final class MeshController: ObservableObject {
 
             let contacts = try store.listContacts()
             let presenceHints: (Data, Int64) -> [Data] = { userId, timestamp in
-                (0...3).map { daysAgo in
-                    computeRecipientHint(
-                        recipientUserId: userId,
-                        timestampMs: timestamp - Int64(daysAgo) * MeshDefaults.msPerDay
-                    )
-                }
+                recentPresenceHintsFor(userId: userId, nowMs: timestamp)
             }
             let announce = RelayConfigStore.shareOnline()
                 ? presenceHints(identity.userId, now)
@@ -2339,54 +2287,14 @@ final class MeshController: ObservableObject {
                 }
             }
 
-            var hints: [Data] = [computeRecipientHint(
-                recipientUserId: identity.userId,
-                timestampMs: Int64(Date().timeIntervalSince1970 * 1000)
-            )]
-            for day in 1...MeshDefaults.carryHintDayWindow {
-                hints.append(computeRecipientHint(
-                    recipientUserId: identity.userId,
-                    timestampMs: Int64(Date().timeIntervalSince1970 * 1000) - day * MeshDefaults.msPerDay
-                ))
-            }
-            let groups = try store.listGroups()
-            for group in groups where group.memberUserIds.contains(identity.userId) {
-                hints.append(contentsOf: (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
-                    computeRecipientHint(
-                        recipientUserId: group.id,
-                        timestampMs: now - daysAgo * MeshDefaults.msPerDay
-                    )
-                })
-            }
-            // FI2: also poll for mail addressed to contacts, not just this
-            // device -- relay proxy-polling (Android `relayProxyHints` twin).
-            // An internet-connected phone sitting near a BLE-only contact can
-            // fetch that contact's mailbox mail and carry it the rest of the
-            // way over BLE/LAN; without this, a 1:1 envelope addressed to a
-            // contact who never gets internet sits on the relay forever.
-            // `processInboundEnvelope` below already handles the resulting
-            // fetch correctly with NO change here: this device can't decrypt
-            // mail addressed to someone else, so `openMessage` fails and the
-            // envelope falls into the existing carry-foreign path, coming
-            // back as `.carried` rather than `.consumed`. The DTN ack
-            // invariant (TODO.md §3.6 / `coreRelayAckIdsWithConsumed`) is
-            // enforced core-side purely from that disposition -- a `.carried`
-            // envelope is never in the ack set, so this device carries the
-            // relay copy without ever acking it away. Only a `.consumed`
-            // (this device durably delivered it to itself) or `.expired`
-            // disposition acks; see `coreRelayAckIdsWithConsumed`'s doc.
-            hints.append(contentsOf: relayProxyHints(
-                contacts: contacts,
-                ownUserId: identity.userId,
-                nowMs: now
-            ))
-            // Dedupe by content: a contact hint can coincide with a group
-            // hint or another contact's hint on the same day (unlikely but
-            // not impossible), and there's no reason to fetch the same page
-            // twice. `Data` is `Hashable`, so this is just a `Set` round trip
-            // (Android's twin, `dedupeHints`, does the equivalent by hex
-            // string since `ByteArray` isn't `Hashable` in Kotlin).
-            hints = Array(Set(hints))
+            // FI2 proxy-polling included: core's relayFetchHints is self +
+            // member-group + every contact's recent-day hints, deduped
+            // (core/src/recipient_hints.rs). Proxy-fetched mail this device
+            // can't decrypt falls into the carry-foreign path and comes back
+            // `.carried`, never `.consumed`, so coreRelayAckIdsWithConsumed
+            // keeps the DTN ack invariant exactly as before: a carried relay
+            // copy is never acked away.
+            let hints = try store.relayFetchHints(ownUserId: identity.userId, nowMs: now)
             var afterId: Int64 = 0
             let fetchBatchLimit = Int(relayFetchBatchLimit())
             while true {
@@ -2467,8 +2375,8 @@ final class MeshController: ObservableObject {
 /// main-actor isolation: `RelayPushClient` (DTN_TODOS.md D3) invokes its
 /// `hintsProvider` closure from its own private queue, off the main actor,
 /// the same reason `relaySyncBlocking` itself is `nonisolated` and
-/// duplicates this computation inline rather than calling the
-/// `@MainActor`-isolated `recentHintsFor`/`deliveryHintsForPeer` helpers.
+/// calls the store (safe off-actor) rather than any `@MainActor`-isolated
+/// controller member.
 /// FI2: unlike this function, `relaySyncBlocking`'s own fetch ALSO includes
 /// `relayProxyHints` below (mail addressed to a contact, fetched on their
 /// behalf) -- deliberately not mirrored here. This hint set only decides
@@ -2480,44 +2388,9 @@ final class MeshController: ObservableObject {
 private func relayPushHints(ownUserId: Data) -> [Data] {
     let store = AppStore.get()
     let now = Int64(Date().timeIntervalSince1970 * 1000)
-    var hints = (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
-        computeRecipientHint(recipientUserId: ownUserId, timestampMs: now - daysAgo * MeshDefaults.msPerDay)
-    }
-    let groups = (try? store.listGroups()) ?? []
-    for group in groups where group.memberUserIds.contains(ownUserId) {
-        hints.append(contentsOf: (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
-            computeRecipientHint(recipientUserId: group.id, timestampMs: now - daysAgo * MeshDefaults.msPerDay)
-        })
-    }
-    return hints
+    // Core's relaySelfHints = own + member-group hints; on a store error
+    // fall back to just our own hints, matching the old inline loop.
+    return (try? store.relaySelfHints(ownUserId: ownUserId, nowMs: now))
+        ?? recentHintsFor(userId: ownUserId, nowMs: now)
 }
 
-/// Recent-day recipient hints for mail addressed to `contacts` -- NOT this
-/// device -- for relay proxy-polling (FI2, Android `relayProxyHints` twin in
-/// `MeshService.kt`). An internet-connected phone can fetch mail meant for a
-/// BLE-only contact out of the shared family-token relay partition and carry
-/// it the rest of the way over BLE/LAN via the existing carry-foreign path in
-/// `MeshController.processInboundEnvelope` -- this device can't decrypt mail
-/// addressed to someone else, so it always falls into that path and is never
-/// mistaken for its own mail.
-///
-/// A free, non-`private` pure function (no store/network access, no actor
-/// isolation) so it's both callable from `relaySyncBlocking` (which is
-/// itself `nonisolated`, see `relayPushHints`'s doc above for why) and
-/// directly unit-testable via `@testable import`.
-///
-/// Bounded by family size: this returns every contact's hints, so the fetch
-/// cost grows linearly with the contact list -- fine for this app's small
-/// family circles (mirrors the same caveat on the Android twin).
-func relayProxyHints(contacts: [Contact], ownUserId: Data, nowMs: Int64) -> [Data] {
-    var hints: [Data] = []
-    for contact in contacts where contact.userId != ownUserId {
-        hints.append(contentsOf: (0...MeshDefaults.carryHintDayWindow).map { daysAgo in
-            computeRecipientHint(
-                recipientUserId: contact.userId,
-                timestampMs: nowMs - daysAgo * MeshDefaults.msPerDay
-            )
-        })
-    }
-    return hints
-}

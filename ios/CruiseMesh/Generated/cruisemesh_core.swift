@@ -1579,6 +1579,18 @@ public protocol MessageStoreProtocol : AnyObject {
     func authorReceipt(identity: Identity, contact: Contact, ackedSenderUserId: Data, receiptType: UInt8, throughLamport: UInt64, timestampMs: Int64) throws  -> AuthoredReceipt?
     
     /**
+     * Pre-upload receipt backfill for a relay sync pass: for every contact,
+     * refresh the durable relay-uploadable receipt envelope for the current
+     * DELIVERED and READ watermarks (skipping empty streams), exactly the
+     * loop both shells previously ran one `ensure_authored_receipt` call at
+     * a time. Returns the affected envelopes' `msg_id`s so the shell can
+     * record them in its in-memory seen-set (the same reason the shells'
+     * own receipt authoring records there: our own receipt envelope coming
+     * back off the relay must dedupe, not get re-carried as foreign mail).
+     */
+    func backfillOutgoingReceiptEnvelopes(identity: Identity, nowMs: Int64) throws  -> [Data]
+    
+    /**
      * Seal and persist an envelope for a legacy authored message that was
      * stored before the outbound queue existed. Repeated calls return the
      * already-persisted envelope instead of generating a new msg id.
@@ -1609,6 +1621,15 @@ public protocol MessageStoreProtocol : AnyObject {
      * (`peer_known_msg_ids` from its digest), and not actually addressed to
      * that peer (`peer_hints`, which the targeted-delivery path handles
      * separately). Ordered oldest first.
+     *
+     * FC2: `peer_known_msg_ids`/`peer_hints` exclusion is pushed into the
+     * SQL `WHERE` clause (as `NOT IN`) rather than fetched-then-filtered in
+     * Rust, so a row the peer already has never has its `sealed` ciphertext
+     * decoded at all -- with D8's periodic re-digest, this query now runs
+     * every few minutes on every long-lived link, and the old
+     * fetch-everything-then-filter shape meant every one of those ticks
+     * paid to materialize up to the full 64 MiB carry budget regardless of
+     * how little of it was actually new to the peer.
      */
     func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64) throws  -> [CarriedEnvelope]
     
@@ -1646,6 +1667,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * The newest avatar/display-name profile-sync epoch applied for a contact.
      */
     func contactAvatarEpoch(userId: Data) throws  -> Int64
+    
+    /**
+     * The contact whose recent-day hints include `hint`; failing that, for a
+     * group-addressed hint, the first group member who is a contact (group
+     * carries upload via any member's relay config).
+     */
+    func contactMatchingHint(hint: Data, nowMs: Int64) throws  -> Contact?
     
     /**
      * Confirm-before-delete muling (DTN_TODOS.md §3.2, D2
@@ -1797,6 +1825,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func deleteGroup(groupId: Data) throws  -> Bool
     
     /**
+     * `recipient_hint`s the peer can open: their own userId over recent
+     * days, plus every imported group they belong to (DESIGN.md §6.5:
+     * members mule for the whole group). Drives the HELLO-time carry drain.
+     */
+    func deliveryHintsForPeer(peerUserId: Data, nowMs: Int64) throws  -> [Data]
+    
+    /**
      * Store a foreign envelope for later store-and-forward delivery
      * (DESIGN.md §5.3 carry queue). Keyed on `msg_id`, so re-enqueuing an
      * envelope we're already carrying is a no-op (returns `false`); a fresh
@@ -1881,6 +1916,21 @@ public protocol MessageStoreProtocol : AnyObject {
     func getGroup(groupId: Data) throws  -> Group?
     
     /**
+     * The imported group whose recent-day hints include `hint`, if any --
+     * used by the group fan-out upload path
+     * (specs/group-relay-durability.md §4.2), which needs the member list.
+     */
+    func groupMatchingHint(hint: Data, nowMs: Int64) throws  -> Group?
+    
+    /**
+     * Every imported group whose recent-day hints include `hint`, in
+     * [`MessageStore::list_groups`] order -- the group-open candidates an
+     * inbound sealed envelope is tried against (a hint collision between two
+     * groups is unlikely but not impossible, so callers try each).
+     */
+    func groupsMatchingHint(hint: Data, nowMs: Int64) throws  -> [Group]
+    
+    /**
      * The highest lamport value N such that every message `1..=N` from this
      * sender in this chat is present -- the point up to which there's no
      * gap (DESIGN.md §7.3: "message 12 arrived, 11 hasn't -- keep
@@ -1925,6 +1975,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * sender to drop an undelivered message of their own.
      */
     func highestLamport(chatId: Data, senderUserId: Data) throws  -> UInt64
+    
+    /**
+     * True if `hint` matches a known contact or imported group -- the
+     * family-vs-foreign classification the carry queue's eviction policy
+     * keys on (DESIGN.md §5.3).
+     */
+    func hintMatchesKnownTarget(hint: Data, nowMs: Int64) throws  -> Bool
     
     /**
      * Insert an opened incoming message together with the envelope id used
@@ -2239,12 +2296,16 @@ public protocol MessageStoreProtocol : AnyObject {
      *
      * `via_transport` (T6) is the transport the receipt itself returned on
      * (the [`MessageArrival::transport`] encoding), recorded so a message's
-     * Info pane can prove *how* delivery was confirmed. It is only overwritten
-     * when the watermark actually advances and the new receipt carries a known
-     * transport: a re-sent receipt for the same watermark, a stale/replayed
-     * one, or an advancing receipt whose route we couldn't determine all keep
-     * the transport that first confirmed the current watermark. Pass `None`
-     * when the return route isn't known.
+     * Info pane can prove *how* delivery was confirmed. It is overwritten
+     * when the watermark actually advances and the new receipt carries a
+     * known transport, and (FC4) also filled in when the watermark merely
+     * *matches* the stored one but the stored route is still unknown --
+     * otherwise a first confirmation whose return route we couldn't
+     * determine would permanently hide a later, more informative receipt at
+     * the same watermark. A stale/replayed receipt (lower watermark) never
+     * touches it, and a receipt with an unknown route (`via_transport =
+     * None`) never clears an already-known one. Pass `None` when the return
+     * route isn't known.
      */
     func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws 
     
@@ -2256,6 +2317,31 @@ public protocol MessageStoreProtocol : AnyObject {
      * an 8-byte hash and no content is kept. See [`delivery_metrics`].
      */
     func recordSentMetric(chatId: Data, lamport: UInt64, sentAtMs: Int64) throws 
+    
+    /**
+     * The full deduped hint set a relay mailbox poll fetches: self + groups
+     * ([`relay_self_hints`]) plus proxy ([`relay_proxy_hints`]).
+     */
+    func relayFetchHints(ownUserId: Data, nowMs: Int64) throws  -> [Data]
+    
+    /**
+     * Relay proxy-polling hints: the recent-day hints of every contact that
+     * isn't us, so an internet-connected phone in a BLE-only contact's
+     * cluster can fetch mail addressed to *them* out of the shared
+     * family-token partition and mule it the rest of the way. Cost scales
+     * linearly with contact-list size -- fine at family scale.
+     */
+    func relayProxyHints(ownUserId: Data, nowMs: Int64) throws  -> [Data]
+    
+    /**
+     * Mail addressed to us: our own hints, plus every imported group we
+     * belong to (DESIGN.md §6.5). NOT deduped -- callers that combine this
+     * with other sets go through [`relay_fetch_hints`] / [`dedupe_hints`].
+     * This narrower set is what the relay *push* subscription uses on iOS
+     * (deliberately without proxy hints -- see `MeshController`'s
+     * `relayPushHints` doc for that platform decision).
+     */
+    func relaySelfHints(ownUserId: Data, nowMs: Int64) throws  -> [Data]
     
     /**
      * Drop a carried envelope by `msg_id` -- called once it's been handed to
@@ -2491,6 +2577,25 @@ open func authorReceipt(identity: Identity, contact: Contact, ackedSenderUserId:
 }
     
     /**
+     * Pre-upload receipt backfill for a relay sync pass: for every contact,
+     * refresh the durable relay-uploadable receipt envelope for the current
+     * DELIVERED and READ watermarks (skipping empty streams), exactly the
+     * loop both shells previously ran one `ensure_authored_receipt` call at
+     * a time. Returns the affected envelopes' `msg_id`s so the shell can
+     * record them in its in-memory seen-set (the same reason the shells'
+     * own receipt authoring records there: our own receipt envelope coming
+     * back off the relay must dedupe, not get re-carried as foreign mail).
+     */
+open func backfillOutgoingReceiptEnvelopes(identity: Identity, nowMs: Int64)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_backfill_outgoing_receipt_envelopes(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * Seal and persist an envelope for a legacy authored message that was
      * stored before the outbound queue existed. Repeated calls return the
      * already-persisted envelope instead of generating a new msg id.
@@ -2542,6 +2647,15 @@ open func carriedEnvelopesForHints(hints: [Data], nowMs: Int64)throws  -> [Carri
      * (`peer_known_msg_ids` from its digest), and not actually addressed to
      * that peer (`peer_hints`, which the targeted-delivery path handles
      * separately). Ordered oldest first.
+     *
+     * FC2: `peer_known_msg_ids`/`peer_hints` exclusion is pushed into the
+     * SQL `WHERE` clause (as `NOT IN`) rather than fetched-then-filtered in
+     * Rust, so a row the peer already has never has its `sealed` ciphertext
+     * decoded at all -- with D8's periodic re-digest, this query now runs
+     * every few minutes on every long-lived link, and the old
+     * fetch-everything-then-filter shape meant every one of those ticks
+     * paid to materialize up to the full 64 MiB carry budget regardless of
+     * how little of it was actually new to the peer.
      */
 open func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64)throws  -> [CarriedEnvelope] {
     return try  FfiConverterSequenceTypeCarriedEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -2617,6 +2731,20 @@ open func contactAvatarEpoch(userId: Data)throws  -> Int64 {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_contact_avatar_epoch(self.uniffiClonePointer(),
         FfiConverterData.lower(userId),$0
+    )
+})
+}
+    
+    /**
+     * The contact whose recent-day hints include `hint`; failing that, for a
+     * group-addressed hint, the first group member who is a contact (group
+     * carries upload via any member's relay config).
+     */
+open func contactMatchingHint(hint: Data, nowMs: Int64)throws  -> Contact? {
+    return try  FfiConverterOptionTypeContact.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_contact_matching_hint(self.uniffiClonePointer(),
+        FfiConverterData.lower(hint),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -2817,6 +2945,20 @@ open func deleteGroup(groupId: Data)throws  -> Bool {
 }
     
     /**
+     * `recipient_hint`s the peer can open: their own userId over recent
+     * days, plus every imported group they belong to (DESIGN.md §6.5:
+     * members mule for the whole group). Drives the HELLO-time carry drain.
+     */
+open func deliveryHintsForPeer(peerUserId: Data, nowMs: Int64)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_delivery_hints_for_peer(self.uniffiClonePointer(),
+        FfiConverterData.lower(peerUserId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * Store a foreign envelope for later store-and-forward delivery
      * (DESIGN.md §5.3 carry queue). Keyed on `msg_id`, so re-enqueuing an
      * envelope we're already carrying is a no-op (returns `false`); a fresh
@@ -2964,6 +3106,35 @@ open func getGroup(groupId: Data)throws  -> Group? {
 }
     
     /**
+     * The imported group whose recent-day hints include `hint`, if any --
+     * used by the group fan-out upload path
+     * (specs/group-relay-durability.md §4.2), which needs the member list.
+     */
+open func groupMatchingHint(hint: Data, nowMs: Int64)throws  -> Group? {
+    return try  FfiConverterOptionTypeGroup.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_group_matching_hint(self.uniffiClonePointer(),
+        FfiConverterData.lower(hint),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Every imported group whose recent-day hints include `hint`, in
+     * [`MessageStore::list_groups`] order -- the group-open candidates an
+     * inbound sealed envelope is tried against (a hint collision between two
+     * groups is unlikely but not impossible, so callers try each).
+     */
+open func groupsMatchingHint(hint: Data, nowMs: Int64)throws  -> [Group] {
+    return try  FfiConverterSequenceTypeGroup.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_groups_matching_hint(self.uniffiClonePointer(),
+        FfiConverterData.lower(hint),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * The highest lamport value N such that every message `1..=N` from this
      * sender in this chat is present -- the point up to which there's no
      * gap (DESIGN.md §7.3: "message 12 arrived, 11 hasn't -- keep
@@ -3019,6 +3190,20 @@ open func highestLamport(chatId: Data, senderUserId: Data)throws  -> UInt64 {
     uniffi_cruisemesh_core_fn_method_messagestore_highest_lamport(self.uniffiClonePointer(),
         FfiConverterData.lower(chatId),
         FfiConverterData.lower(senderUserId),$0
+    )
+})
+}
+    
+    /**
+     * True if `hint` matches a known contact or imported group -- the
+     * family-vs-foreign classification the carry queue's eviction policy
+     * keys on (DESIGN.md §5.3).
+     */
+open func hintMatchesKnownTarget(hint: Data, nowMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_hint_matches_known_target(self.uniffiClonePointer(),
+        FfiConverterData.lower(hint),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -3560,12 +3745,16 @@ open func recordOutgoingReceipt(chatId: Data, senderUserId: Data, receiptType: U
      *
      * `via_transport` (T6) is the transport the receipt itself returned on
      * (the [`MessageArrival::transport`] encoding), recorded so a message's
-     * Info pane can prove *how* delivery was confirmed. It is only overwritten
-     * when the watermark actually advances and the new receipt carries a known
-     * transport: a re-sent receipt for the same watermark, a stale/replayed
-     * one, or an advancing receipt whose route we couldn't determine all keep
-     * the transport that first confirmed the current watermark. Pass `None`
-     * when the return route isn't known.
+     * Info pane can prove *how* delivery was confirmed. It is overwritten
+     * when the watermark actually advances and the new receipt carries a
+     * known transport, and (FC4) also filled in when the watermark merely
+     * *matches* the stored one but the stored route is still unknown --
+     * otherwise a first confirmation whose return route we couldn't
+     * determine would permanently hide a later, more informative receipt at
+     * the same watermark. A stale/replayed receipt (lower watermark) never
+     * touches it, and a receipt with an unknown route (`via_transport =
+     * None`) never clears an already-known one. Pass `None` when the return
+     * route isn't known.
      */
 open func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_record_receipt(self.uniffiClonePointer(),
@@ -3592,6 +3781,52 @@ open func recordSentMetric(chatId: Data, lamport: UInt64, sentAtMs: Int64)throws
         FfiConverterInt64.lower(sentAtMs),$0
     )
 }
+}
+    
+    /**
+     * The full deduped hint set a relay mailbox poll fetches: self + groups
+     * ([`relay_self_hints`]) plus proxy ([`relay_proxy_hints`]).
+     */
+open func relayFetchHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_relay_fetch_hints(self.uniffiClonePointer(),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Relay proxy-polling hints: the recent-day hints of every contact that
+     * isn't us, so an internet-connected phone in a BLE-only contact's
+     * cluster can fetch mail addressed to *them* out of the shared
+     * family-token partition and mule it the rest of the way. Cost scales
+     * linearly with contact-list size -- fine at family scale.
+     */
+open func relayProxyHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_relay_proxy_hints(self.uniffiClonePointer(),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Mail addressed to us: our own hints, plus every imported group we
+     * belong to (DESIGN.md §6.5). NOT deduped -- callers that combine this
+     * with other sets go through [`relay_fetch_hints`] / [`dedupe_hints`].
+     * This narrower set is what the relay *push* subscription uses on iOS
+     * (deliberately without proxy hints -- see `MeshController`'s
+     * `relayPushHints` doc for that platform decision).
+     */
+open func relaySelfHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_relay_self_hints(self.uniffiClonePointer(),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
 }
     
     /**
@@ -10699,6 +10934,16 @@ public func coreTransportSendPlan(routes: [CoreTransportRoute], frameSize: UInt3
     )
 })
 }
+/**
+ * **1:1 chats only.** Compares every non-self sender's lamport against a
+ * single scalar `read_through` watermark, which is only correct when there
+ * is exactly one other sender in the chat. In a group, each member has an
+ * independent lamport stream with its own read watermark, so this
+ * undercounts (or miscounts entirely) group unread -- use
+ * [`MessageStore::semantic_unread_count`] instead, which reads the
+ * per-sender watermarks from `outgoing_receipts` and handles both cases
+ * correctly (FC8).
+ */
 public func coreUnreadCount(messages: [StoredMessage], ownUserId: Data, readThrough: UInt64) -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_unread_count(
@@ -10867,6 +11112,18 @@ public func decodeReceiptContent(bytes: Data)throws  -> ReceiptContent {
     return try  FfiConverterTypeReceiptContent.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_decode_receipt_content(
         FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
+ * Order-preserving content dedupe: a contact hint can coincide with a group
+ * hint (or another contact's) on the same day; there's no reason to fetch
+ * the same relay page twice.
+ */
+public func dedupeHints(hints: [Data]) -> [Data] {
+    return try!  FfiConverterSequenceData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_dedupe_hints(
+        FfiConverterSequenceData.lower(hints),$0
     )
 })
 }
@@ -11307,6 +11564,30 @@ public func parseFriendText(text: String)throws  -> FriendCard {
     )
 })
 }
+/**
+ * The `recipient_hint`s `user_id` could match for a still-carriable envelope
+ * (today back through [`CARRY_HINT_DAY_WINDOW_DAYS`] days).
+ */
+public func recentHintsFor(userId: Data, nowMs: Int64) -> [Data] {
+    return try!  FfiConverterSequenceData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_recent_hints_for(
+        FfiConverterData.lower(userId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * Presence-announcement variant of [`recent_hints_for`] over the shorter
+ * [`PRESENCE_HINT_DAY_WINDOW_DAYS`] window.
+ */
+public func recentPresenceHintsFor(userId: Data, nowMs: Int64) -> [Data] {
+    return try!  FfiConverterSequenceData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_recent_presence_hints_for(
+        FfiConverterData.lower(userId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
 public func relayBuildFetchPath(hints: [Data], afterId: Int64, limit: UInt32)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_relay_build_fetch_path(
@@ -11590,7 +11871,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_transport_send_plan() != 40925) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_unread_count() != 27709) {
+    if (uniffi_cruisemesh_core_checksum_func_core_unread_count() != 12034) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_visible_chat_messages() != 48182) {
@@ -11642,6 +11923,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_decode_receipt_content() != 40419) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_dedupe_hints() != 40661) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_default_expiry() != 43648) {
@@ -11762,6 +12046,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_parse_friend_text() != 63241) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_recent_hints_for() != 41465) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_recent_presence_hints_for() != 51395) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_build_fetch_path() != 4249) {
@@ -11923,6 +12213,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_author_receipt() != 8018) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_outgoing_receipt_envelopes() != 46042) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_envelope() != 41114) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11932,7 +12225,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints() != 43270) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_peer_sync() != 8162) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_peer_sync() != 29079) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_len() != 13406) {
@@ -11953,6 +12246,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_avatar_epoch() != 49788) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_matching_hint() != 11008) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 38296) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11969,6 +12265,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_group() != 30648) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_delivery_hints_for_peer() != 55681) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_carried_envelope() != 15186) {
@@ -11998,10 +12297,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_get_group() != 20599) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_group_matching_hint() != 19074) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_groups_matching_hint() != 61300) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 43009) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 22726) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_hint_matches_known_target() != 15933) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message() != 46727) {
@@ -12097,10 +12405,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_outgoing_receipt() != 8142) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_receipt() != 46075) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_receipt() != 38794) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_sent_metric() != 27687) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_hints() != 37028) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_proxy_hints() != 50484) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_self_hints() != 38105) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_remove_carried_envelope() != 52788) {
