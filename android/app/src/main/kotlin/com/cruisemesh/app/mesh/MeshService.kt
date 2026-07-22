@@ -497,11 +497,9 @@ class MeshService : Service() {
         // (identity, running, the LAN transport, the FA3 executor) crosses as
         // small injected functions so the visibility/threading semantics stay
         // exactly what they were when this was one class.
-        val hintDirectory = RecipientHints(store)
         val processor = InboundEnvelopeProcessor(
             context = this,
             store = store,
-            hints = hintDirectory,
             identityProvider = { identity },
             requestRelaySync = { reason -> relaySync?.requestRelaySync(reason) },
             lan = object : InboundEnvelopeProcessor.LanHooks {
@@ -522,7 +520,6 @@ class MeshService : Service() {
         relaySync = RelaySyncEngine(
             context = this,
             store = store,
-            hints = hintDirectory,
             handler = relayMainHandler,
             connectivityManager = connectivityManager,
             identityProvider = { identity },
