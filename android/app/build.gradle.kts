@@ -90,6 +90,12 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            // Sync-check marker (see verifyNativeBindingsSync below) — lives at
+            // the jniLibs root, not inside an ABI dir, so AGP wouldn't normally
+            // package it, but exclude it explicitly to be safe.
+            excludes += "/.cruisemesh-native-stamp"
+        }
     }
     sourceSets {
         // Kotlin bindings generated from core/ via `uniffi-bindgen` — see
@@ -149,4 +155,56 @@ tasks.withType<Test>().configureEach {
     if (hostLibrary.isFile) {
         systemProperty("uniffi.component.cruisemesh_core.libraryOverride", hostLibrary.absolutePath)
     }
+}
+
+// Fails the build fast (instead of at app launch with an UnsatisfiedLinkError/
+// UniFFI checksum mismatch) if kotlin-gen/ and jniLibs/ weren't produced by the
+// same core/build-android.sh run — each run stamps both dirs with a matching
+// .cruisemesh-native-stamp value; see that script.
+val verifyNativeBindingsSync = tasks.register("verifyNativeBindingsSync") {
+    val kotlinGenDir = layout.projectDirectory.dir("src/main/kotlin-gen")
+    val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
+    val kotlinStamp = kotlinGenDir.file(".cruisemesh-native-stamp")
+    val jniStamp = jniLibsDir.file(".cruisemesh-native-stamp")
+
+    // Not real task inputs/outputs (this is a fast sanity check, not a
+    // cacheable transform) — always re-run so a stale UP-TO-DATE never masks
+    // a drift introduced by a later build-android.sh run.
+    outputs.upToDateWhen { false }
+
+    doFirst {
+        val fixIt = "run core/build-android.sh to regenerate both together"
+
+        val missingDirs = listOf(kotlinGenDir.asFile, jniLibsDir.asFile).filterNot { it.isDirectory }
+        if (missingDirs.isNotEmpty()) {
+            throw GradleException(
+                "Native libs and UniFFI bindings are out of sync (or missing) — $fixIt.\n" +
+                    "Missing director" + (if (missingDirs.size == 1) "y" else "ies") + ": " +
+                    missingDirs.joinToString { it.path }
+            )
+        }
+
+        val kotlinStampFile = kotlinStamp.asFile
+        val jniStampFile = jniStamp.asFile
+        val missingStamps = listOf(kotlinStampFile, jniStampFile).filterNot { it.isFile }
+        if (missingStamps.isNotEmpty()) {
+            throw GradleException(
+                "Native libs and UniFFI bindings are out of sync (or missing) — $fixIt.\n" +
+                    "Missing stamp file(s): " + missingStamps.joinToString { it.path }
+            )
+        }
+
+        val kotlinValue = kotlinStampFile.readText().trim()
+        val jniValue = jniStampFile.readText().trim()
+        if (kotlinValue.isEmpty() || jniValue.isEmpty() || kotlinValue != jniValue) {
+            throw GradleException(
+                "Native libs and UniFFI bindings are out of sync (or missing) — $fixIt.\n" +
+                    "Stamp mismatch: kotlin-gen=$kotlinValue jniLibs=$jniValue"
+            )
+        }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn(verifyNativeBindingsSync)
 }
