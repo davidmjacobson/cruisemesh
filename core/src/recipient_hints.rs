@@ -51,7 +51,10 @@ pub fn recent_presence_hints_for(user_id: Vec<u8>, now_ms: i64) -> Vec<Vec<u8>> 
 #[uniffi::export]
 pub fn dedupe_hints(hints: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(hints.len());
-    hints.into_iter().filter(|h| seen.insert(h.clone())).collect()
+    hints
+        .into_iter()
+        .filter(|h| seen.insert(h.clone()))
+        .collect()
 }
 
 #[uniffi::export]
@@ -70,7 +73,11 @@ impl MessageStore {
         let mut hints = hints_over_window(&own_user_id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS);
         for group in self.list_groups()? {
             if group.member_user_ids.iter().any(|m| *m == own_user_id) {
-                hints.extend(hints_over_window(&group.id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS));
+                hints.extend(hints_over_window(
+                    &group.id,
+                    now_ms,
+                    CARRY_HINT_DAY_WINDOW_DAYS,
+                ));
             }
         }
         Ok(hints)
@@ -91,7 +98,11 @@ impl MessageStore {
             if contact.user_id == own_user_id {
                 continue;
             }
-            hints.extend(hints_over_window(&contact.user_id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS));
+            hints.extend(hints_over_window(
+                &contact.user_id,
+                now_ms,
+                CARRY_HINT_DAY_WINDOW_DAYS,
+            ));
         }
         Ok(hints)
     }
@@ -119,7 +130,11 @@ impl MessageStore {
         let mut hints = hints_over_window(&peer_user_id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS);
         for group in self.list_groups()? {
             if group.member_user_ids.iter().any(|m| *m == peer_user_id) {
-                hints.extend(hints_over_window(&group.id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS));
+                hints.extend(hints_over_window(
+                    &group.id,
+                    now_ms,
+                    CARRY_HINT_DAY_WINDOW_DAYS,
+                ));
             }
         }
         Ok(hints)
@@ -128,11 +143,7 @@ impl MessageStore {
     /// True if `hint` matches a known contact or imported group -- the
     /// family-vs-foreign classification the carry queue's eviction policy
     /// keys on (DESIGN.md §5.3).
-    pub fn hint_matches_known_target(
-        &self,
-        hint: Vec<u8>,
-        now_ms: i64,
-    ) -> Result<bool, CoreError> {
+    pub fn hint_matches_known_target(&self, hint: Vec<u8>, now_ms: i64) -> Result<bool, CoreError> {
         for contact in self.list_contacts()? {
             if hints_over_window(&contact.user_id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS)
                 .iter()
@@ -280,7 +291,12 @@ mod tests {
 
     #[test]
     fn dedupe_preserves_first_occurrence_order() {
-        let deduped = dedupe_hints(vec![b"b".to_vec(), b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        let deduped = dedupe_hints(vec![
+            b"b".to_vec(),
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+        ]);
         assert_eq!(deduped, vec![b"b".to_vec(), b"a".to_vec(), b"c".to_vec()]);
     }
 
@@ -289,7 +305,9 @@ mod tests {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let me = generate_identity();
         let friend = generate_identity();
-        store.upsert_contact(contact_for(&friend, "Friend")).unwrap();
+        store
+            .upsert_contact(contact_for(&friend, "Friend"))
+            .unwrap();
         let group = Group {
             id: b"group-id-0123456".to_vec(),
             name: "Fam".to_string(),
@@ -322,7 +340,9 @@ mod tests {
         let me = generate_identity();
         let friend = generate_identity();
         store.upsert_contact(contact_for(&me, "Me")).unwrap();
-        store.upsert_contact(contact_for(&friend, "Friend")).unwrap();
+        store
+            .upsert_contact(contact_for(&friend, "Friend"))
+            .unwrap();
 
         let proxy = store.relay_proxy_hints(me.user_id.clone(), NOW).unwrap();
         assert_eq!(proxy.len(), 8); // friend only
@@ -334,16 +354,29 @@ mod tests {
     fn known_target_and_matching_lookups_agree_on_the_window_edge() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let friend = generate_identity();
-        store.upsert_contact(contact_for(&friend, "Friend")).unwrap();
+        store
+            .upsert_contact(contact_for(&friend, "Friend"))
+            .unwrap();
 
-        let oldest_valid =
-            compute_recipient_hint(friend.user_id.clone(), NOW - CARRY_HINT_DAY_WINDOW_DAYS * MS_PER_DAY);
-        let expired =
-            compute_recipient_hint(friend.user_id.clone(), NOW - (CARRY_HINT_DAY_WINDOW_DAYS + 1) * MS_PER_DAY);
-        assert!(store.hint_matches_known_target(oldest_valid.clone(), NOW).unwrap());
-        assert!(!store.hint_matches_known_target(expired.clone(), NOW).unwrap());
+        let oldest_valid = compute_recipient_hint(
+            friend.user_id.clone(),
+            NOW - CARRY_HINT_DAY_WINDOW_DAYS * MS_PER_DAY,
+        );
+        let expired = compute_recipient_hint(
+            friend.user_id.clone(),
+            NOW - (CARRY_HINT_DAY_WINDOW_DAYS + 1) * MS_PER_DAY,
+        );
+        assert!(store
+            .hint_matches_known_target(oldest_valid.clone(), NOW)
+            .unwrap());
+        assert!(!store
+            .hint_matches_known_target(expired.clone(), NOW)
+            .unwrap());
         assert_eq!(
-            store.contact_matching_hint(oldest_valid, NOW).unwrap().map(|c| c.user_id),
+            store
+                .contact_matching_hint(oldest_valid, NOW)
+                .unwrap()
+                .map(|c| c.user_id),
             Some(friend.user_id.clone()),
         );
         assert!(store.contact_matching_hint(expired, NOW).unwrap().is_none());
@@ -353,7 +386,9 @@ mod tests {
     fn group_hint_resolves_group_and_falls_back_to_member_contact() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let member = generate_identity();
-        store.upsert_contact(contact_for(&member, "Member")).unwrap();
+        store
+            .upsert_contact(contact_for(&member, "Member"))
+            .unwrap();
         let group = Group {
             id: b"group-id-0123456".to_vec(),
             name: "Fam".to_string(),
@@ -366,14 +401,28 @@ mod tests {
 
         let group_hint = compute_recipient_hint(group.id.clone(), NOW - 2 * MS_PER_DAY);
         assert_eq!(
-            store.group_matching_hint(group_hint.clone(), NOW).unwrap().map(|g| g.id),
+            store
+                .group_matching_hint(group_hint.clone(), NOW)
+                .unwrap()
+                .map(|g| g.id),
             Some(group.id.clone()),
         );
-        assert_eq!(store.groups_matching_hint(group_hint.clone(), NOW).unwrap().len(), 1);
-        assert!(store.hint_matches_known_target(group_hint.clone(), NOW).unwrap());
+        assert_eq!(
+            store
+                .groups_matching_hint(group_hint.clone(), NOW)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .hint_matches_known_target(group_hint.clone(), NOW)
+            .unwrap());
         // Group-addressed hint resolves to a member contact for config lookup.
         assert_eq!(
-            store.contact_matching_hint(group_hint, NOW).unwrap().map(|c| c.user_id),
+            store
+                .contact_matching_hint(group_hint, NOW)
+                .unwrap()
+                .map(|c| c.user_id),
             Some(member.user_id),
         );
     }
@@ -383,7 +432,9 @@ mod tests {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let me = generate_identity();
         let friend = generate_identity();
-        store.upsert_contact(contact_for(&friend, "Friend")).unwrap();
+        store
+            .upsert_contact(contact_for(&friend, "Friend"))
+            .unwrap();
 
         // Nothing recorded yet: nothing authored.
         assert!(store
@@ -399,12 +450,16 @@ mod tests {
                 3,
             )
             .unwrap();
-        let first = store.backfill_outgoing_receipt_envelopes(me.clone(), NOW).unwrap();
+        let first = store
+            .backfill_outgoing_receipt_envelopes(me.clone(), NOW)
+            .unwrap();
         assert_eq!(first.len(), 1); // DELIVERED only; READ stream is still empty.
 
         // Same watermark on a later pass reuses the stored envelope
         // byte-for-byte (stable msg_id), so re-posts dedupe server-side.
-        let second = store.backfill_outgoing_receipt_envelopes(me, NOW + 60_000).unwrap();
+        let second = store
+            .backfill_outgoing_receipt_envelopes(me, NOW + 60_000)
+            .unwrap();
         assert_eq!(first, second);
     }
 }
