@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -71,6 +72,8 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
         RelayConfigStore.save(context, relayUrl, relayToken)
         onBack()
     }
+
+    BackHandler(onBack = ::saveAndBack)
 
     Scaffold(
         topBar = {
