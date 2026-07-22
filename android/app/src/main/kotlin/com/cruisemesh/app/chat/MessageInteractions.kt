@@ -71,5 +71,24 @@ fun reactionSummariesByTarget(
 fun visibleGapIndices(messages: List<StoredMessage>, visibleMessages: List<StoredMessage>): Set<Int> =
     coreVisibleGapIndices(messages).mapTo(mutableSetOf()) { it.toInt() }
 
+/**
+ * "" clears an existing own reaction of [emoji] on [target]; any other value
+ * (including [emoji] itself when there's no existing own reaction) sets it.
+ * Shared tap-to-toggle rule for [ChatScreen] and [GroupChatScreen]'s reaction
+ * picker and long-press bar.
+ */
+fun resolveReactionToggle(
+    reactions: Map<String, List<ReactionSummary>>,
+    target: MessageTarget,
+    emoji: String,
+): String {
+    val existingOwn = reactions[target.stableKey].orEmpty().firstOrNull { it.emoji == emoji && it.reactedByOwnUser }
+    return if (existingOwn != null) "" else emoji
+}
+
+/** Stable [androidx.compose.foundation.lazy.LazyColumn] item key for a message row -- shared by [ChatScreen] and [GroupChatScreen]. */
+fun messageItemKey(message: StoredMessage): String =
+    "${message.senderUserId.contentHashCode()}:${message.lamport}"
+
 private fun hex(bytes: ByteArray): String =
     bytes.joinToString(separator = "") { "%02x".format(it) }
