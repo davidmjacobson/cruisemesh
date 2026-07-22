@@ -3,22 +3,37 @@
     <application
         android:usesCleartextTraffic="true">
         <!--
-          exported="false": this receiver runs real mesh actions (SEND_TEXT seals and
-          sends an actual message as the signed-in user) and debug builds ship to the
-          test fleet in the field, so any co-installed app must not be able to trigger
-          it via an implicit broadcast. `adb shell am broadcast` from the shell uid can
-          still reach a non-exported component by targeting it explicitly, e.g.:
+          exported="true" + permission="android.permission.DUMP": this receiver runs
+          real mesh actions (SEND_TEXT seals and sends an actual message as the
+          signed-in user) and debug builds ship to the test fleet in the field, so
+          any co-installed app must still be unable to trigger it. DUMP is a
+          signature|privileged|development platform permission: the adb shell
+          identity holds it, but an ordinary co-installed app cannot acquire it
+          (the OS refuses to grant it to a normal app at install time), so a
+          malicious app's broadcast is rejected with a SecurityException while
+          `adb shell am broadcast` still gets through. Keep this receiver
+          debug-only (it lives entirely in src/debug, class included) so it never
+          ships in a release build.
+
+          Previously this was exported="false" on the theory that `adb shell am
+          broadcast -n <component>` (explicit, targeted by component name) can reach
+          a non-exported component because the shell uid is privileged. That held on
+          older releases, but on Android 16/17 it no longer does: the broadcast
+          enqueues (result=0) and onReceive never fires. Empirically, exported="true"
+          is required for adb to reach a manifest-declared receiver on current OS
+          versions; the permission gate keeps that exposure adb-only:
 
             adb shell am broadcast -a com.cruisemesh.app.debug.SEND_TEXT
               -n com.cruisemesh.app/com.cruisemesh.app.debug.DebugCommandReceiver
               -e contact_user_id_hex (hex) -e text hello
 
           Keep the component name (.debug.DebugCommandReceiver) and action strings
-          stable so existing adb recipes keep working with -n added.
+          stable so existing adb recipes keep working.
         -->
         <receiver
             android:name=".debug.DebugCommandReceiver"
-            android:exported="false">
+            android:exported="true"
+            android:permission="android.permission.DUMP">
             <intent-filter>
                 <action android:name="com.cruisemesh.app.debug.SEND_TEXT" />
                 <action android:name="com.cruisemesh.app.debug.REQUEST_RELAY_SYNC" />
