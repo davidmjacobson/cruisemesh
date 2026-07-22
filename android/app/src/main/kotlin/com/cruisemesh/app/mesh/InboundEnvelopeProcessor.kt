@@ -1110,38 +1110,7 @@ internal class InboundEnvelopeProcessor(
         if (!inserted) return
         ChatEvents.notifyChatChanged(senderUserId)
 
-        // highestLamport (plain MAX), not highestContiguousLamport: this is
-        // a watermark over the peer's stream, and after the lamport ratchet
-        // that stream can legitimately start above 1, where the contiguous
-        // count would stall at 0 forever.
-        val throughLamport = store.highestLamport(senderUserId, senderUserId)
-        store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
-        var relayQueueChanged = queueOutgoingReceiptForRelay(
-            identity = identity,
-            contact = contact,
-            receiptType = RECEIPT_TYPE_DELIVERED,
-            ackedSenderUserId = senderUserId,
-            throughLamport = throughLamport,
-        )
-        val isVisible = ChatVisibility.isVisible(senderUserId)
-        if (isVisible) {
-            store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_READ, throughLamport)
-            relayQueueChanged = queueOutgoingReceiptForRelay(
-                identity = identity,
-                contact = contact,
-                receiptType = RECEIPT_TYPE_READ,
-                ackedSenderUserId = senderUserId,
-                throughLamport = throughLamport,
-            ) || relayQueueChanged
-        }
-        if (relayQueueChanged) {
-            RelaySyncEvents.requestSync()
-        }
-
-        sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
-        if (isVisible) {
-            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
-        }
+        acknowledgePeerStream(identity, contact, address, senderUserId, markRead = ChatVisibility.isVisible(senderUserId))
         if (!wasKnown) {
             FriendImportEvents.notifyImported(contact, directBle)
             MessageNotifier.notifyFriendAdded(context, contact)
@@ -1198,34 +1167,7 @@ internal class InboundEnvelopeProcessor(
         ChatEvents.notifyChatChanged(senderUserId)
 
         val contact = store.getContact(senderUserId) ?: existing
-        val throughLamport = store.highestLamport(senderUserId, senderUserId)
-        store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
-        var relayQueueChanged = queueOutgoingReceiptForRelay(
-            identity = identity,
-            contact = contact,
-            receiptType = RECEIPT_TYPE_DELIVERED,
-            ackedSenderUserId = senderUserId,
-            throughLamport = throughLamport,
-        )
-        val isVisible = ChatVisibility.isVisible(senderUserId)
-        if (isVisible) {
-            store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_READ, throughLamport)
-            relayQueueChanged = queueOutgoingReceiptForRelay(
-                identity = identity,
-                contact = contact,
-                receiptType = RECEIPT_TYPE_READ,
-                ackedSenderUserId = senderUserId,
-                throughLamport = throughLamport,
-            ) || relayQueueChanged
-        }
-        if (relayQueueChanged) {
-            RelaySyncEvents.requestSync()
-        }
-
-        sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
-        if (isVisible) {
-            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
-        }
+        acknowledgePeerStream(identity, contact, address, senderUserId, markRead = ChatVisibility.isVisible(senderUserId))
         if (policyChanged) {
             FriendDirectorySender.queueToAllContacts(context, store, identity)
         }
@@ -1370,30 +1312,62 @@ internal class InboundEnvelopeProcessor(
         }
     }
 
+    /** Hidden-kind rows (endpoint hints, directories, introductions) are never on screen, so they ack DELIVERED only -- never READ. */
     private fun acknowledgeHiddenMessage(
         address: String,
         senderUserId: ByteArray,
         identity: Identity,
         contact: Contact,
+    ) = acknowledgePeerStream(identity, contact, address, senderUserId, markRead = false)
+
+    /**
+     * The receipt handshake every consumed inbound peer-stream message ends
+     * with, in one place (FA15 follow-up -- this was spelled out verbatim in
+     * the friend-request, profile-sync, and hidden-message handlers, and D9's
+     * group receipts will extend exactly this sequence): persist the
+     * cumulative DELIVERED watermark (plus READ when [markRead] -- the chat
+     * is on screen), refresh the relay-uploadable receipt envelope(s), kick a
+     * relay sync if a watermark advanced, and send the receipt(s) back on the
+     * link the message arrived on.
+     *
+     * `highestLamport` (plain MAX), not `highestContiguousLamport`: this is
+     * a watermark over the peer's stream, and after the lamport ratchet that
+     * stream can legitimately start above 1, where the contiguous count
+     * would stall at 0 forever.
+     */
+    private fun acknowledgePeerStream(
+        identity: Identity,
+        contact: Contact,
+        address: String,
+        senderUserId: ByteArray,
+        markRead: Boolean,
     ) {
         val throughLamport = store.highestLamport(senderUserId, senderUserId)
         store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
-        val queued = queueOutgoingReceiptForRelay(
+        var relayQueueChanged = queueOutgoingReceiptForRelay(
             identity = identity,
             contact = contact,
             receiptType = RECEIPT_TYPE_DELIVERED,
             ackedSenderUserId = senderUserId,
             throughLamport = throughLamport,
         )
-        if (queued) RelaySyncEvents.requestSync()
-        sendReceiptOnAddress(
-            identity,
-            contact,
-            address,
-            RECEIPT_TYPE_DELIVERED,
-            senderUserId,
-            throughLamport,
-        )
+        if (markRead) {
+            store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_READ, throughLamport)
+            relayQueueChanged = queueOutgoingReceiptForRelay(
+                identity = identity,
+                contact = contact,
+                receiptType = RECEIPT_TYPE_READ,
+                ackedSenderUserId = senderUserId,
+                throughLamport = throughLamport,
+            ) || relayQueueChanged
+        }
+        if (relayQueueChanged) {
+            RelaySyncEvents.requestSync()
+        }
+        sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
+        if (markRead) {
+            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
+        }
     }
 
     /**
