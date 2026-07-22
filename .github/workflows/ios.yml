@@ -1,0 +1,89 @@
+name: iOS
+
+# iOS had no CI. Nothing built the app or ran the XCTest suite on a PR/push,
+# so a single bad line -- e.g. an os.Logger String-vs-OSLogMessage break in
+# LanTransport (#121) -- failed every iOS build and merged to master
+# unnoticed, only caught by hand on the Mac validation host. Android and the
+# Rust workspace already gate on every PR (rust.yml); this closes the iOS gap
+# using the free macOS runners public repos get.
+#
+# Path-filtered to iOS- and core-touching changes (a core change regenerates
+# the Swift bindings the app links against), plus this workflow itself.
+
+on:
+  pull_request:
+    paths:
+      - "ios/**"
+      - "core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ios.yml"
+  push:
+    branches: [master]
+    paths:
+      - "ios/**"
+      - "core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ios.yml"
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Rust stable + iOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # Builds the host lib, regenerates the Swift UniFFI bindings under
+      # ios/CruiseMesh/Generated, cross-compiles the core for device +
+      # simulator archs, and packages the xcframework -- the exact steps the
+      # Mac validation runbook uses.
+      - name: Build core + Swift bindings + xcframework
+        run: bash core/build-ios.sh
+
+      # The committed bindings under ios/CruiseMesh/Generated are generated
+      # from the pinned uniffi version, so a fresh generation must match what's
+      # in the tree. Mirrors rust.yml's kotlin-gen drift check. Non-blocking
+      # for now: swiftformat isn't run by either generator host, so trivial
+      # formatting could differ between a dev's machine and the runner --
+      # tighten to a hard failure once the diff is confirmed empty on macOS.
+      - name: Generated Swift bindings drift check
+        continue-on-error: true
+        run: git diff --stat --exit-code -- ios/CruiseMesh/Generated
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Pick an available iPhone simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; c=[x for k,v in d.items() if 'iOS' in k for x in v if x.get('isAvailable') and 'iPhone' in x['name']]; print(c[0]['udid'])")
+          test -n "$UDID"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          echo "Using simulator $UDID"
+
+      - name: Build & test on the iOS Simulator
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project CruiseMesh.xcodeproj \
+            -scheme CruiseMesh \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO
