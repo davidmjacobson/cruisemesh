@@ -76,7 +76,7 @@ private val ESTIMATED_BAR_SIZE = DpSize(268.dp, 52.dp)
 private val ESTIMATED_MENU_SIZE = DpSize(180.dp, 144.dp)
 
 /**
- * MESSAGE_LONGPRESS_OVERLAY.md: full-screen scrim over everything (list, top
+ * Full-screen scrim over everything (list, top
  * bar, composer) with the pressed bubble re-drawn undimmed at its original
  * screen position via [bubbleContent], plus a floating reaction bar above it
  * and an action menu below -- as overlay layers, not inserted into the

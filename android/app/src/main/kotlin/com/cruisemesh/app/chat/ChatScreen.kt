@@ -1307,7 +1307,7 @@ private fun MessageBubble(
  * The bubble's visual only -- Surface with its content plus the reaction
  * chips below, no click handling. Used both by the list item ([MessageBubble])
  * and by [MessageFocusOverlay]'s undimmed floating copy, so the two render
- * pixel-identically (MESSAGE_LONGPRESS_OVERLAY.md §4).
+ * pixel-identically.
  */
 @Composable
 fun MessageBubbleVisual(

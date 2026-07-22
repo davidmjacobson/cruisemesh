@@ -10,7 +10,7 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 
 /**
- * CONNECTIVITY_INDICATOR.md §3.1: semantic colors for [ReachabilityLevel]
+ * Semantic colors for [ReachabilityLevel]
  * dots/badges, kept separate from the Material3 [MaterialTheme.colorScheme]
  * tokens since they carry a fixed meaning (green=nearby, blue=relay,
  * amber=recent/mesh-carry) that must not shift with the app's primary hue.

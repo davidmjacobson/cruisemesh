@@ -13,8 +13,8 @@ sealed class RelayHealth {
 }
 
 /**
- * Process-wide observable connectivity signals (CONNECTIVITY_INDICATOR.md
- * §4), same object/StateFlow pattern as [MeshRuntimeStatus]. [MeshService]
+ * Process-wide observable connectivity signals, same object/StateFlow
+ * pattern as [MeshRuntimeStatus]. [MeshService]
  * is the sole writer -- every event here already flows through it -- and the
  * Compose layer ([ContactReachability] callers) is the sole reader.
  */

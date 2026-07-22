@@ -160,7 +160,7 @@ class RealMeshSender(
                 if (!MeshRouter.sendToUserId(contact.userId, frame)) {
                     // No direct link to the recipient right now -- give the sealed
                     // envelope to whoever IS connected so it can mule to the
-                    // recipient later (BLE_1TO1_MULING.md Hook A).
+                    // recipient later (muling hook A).
                     val muled = MeshRouter.relayToAll(frame)
                     Log.i(
                         TAG,

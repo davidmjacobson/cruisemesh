@@ -54,7 +54,7 @@ private sealed interface BackupUiState {
 }
 
 /**
- * Export flow (LOCAL_BACKUP_RESTORE.md §6): set a passphrase, then pick a
+ * Export flow: set a passphrase, then pick a
  * destination via the system file picker and write the encrypted `.cmbak`.
  * Self-contained — hosts its own SAF launcher and calls [BackupService]
  * directly so the navigation host only needs to add a route.
@@ -159,7 +159,7 @@ fun BackupExportScreen(onBack: () -> Unit) {
 }
 
 /**
- * Restore flow (LOCAL_BACKUP_RESTORE.md §7): pick a `.cmbak`, enter the
+ * Restore flow: pick a `.cmbak`, enter the
  * passphrase, install the identity + message store, then relaunch so
  * everything is re-read from the restored state. Meant for the onboarding
  * "Restore from backup" branch (fresh install, no store open yet).

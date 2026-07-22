@@ -402,7 +402,7 @@ private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplet
 }
 
 /**
- * CONNECTIVITY_INDICATOR.md §3.5: reachability levels decay purely with time
+ * Reachability levels decay purely with time
  * (a contact drifts ONLINE_RELAY -> RECENT -> OFFLINE with no event firing),
  * so the UI needs a clock tick to re-evaluate on, not just flow updates. Ticks
  * every 30 s, and only while the activity is RESUMED -- no background work.
@@ -435,7 +435,7 @@ private fun rememberConnectivityNowMs(): Long {
     return nowMs
 }
 
-/** CONNECTIVITY_INDICATOR.md §2.2: reachability for one userId from a snapshot of [MeshConnectivityStatus]. */
+/** Reachability for one userId from a snapshot of [MeshConnectivityStatus]. */
 private fun reachabilityLevelForUserId(
     userId: ByteArray,
     nearbyPeerIds: Set<String>,

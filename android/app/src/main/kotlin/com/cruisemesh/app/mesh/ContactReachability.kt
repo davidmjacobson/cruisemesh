@@ -1,7 +1,7 @@
 package com.cruisemesh.app.mesh
 
 /**
- * CONNECTIVITY_INDICATOR.md §2.1: how likely a message to this contact is to
+ * How likely a message to this contact is to
  * be delivered promptly, at a glance. Precedence is declaration order --
  * [ReachabilityLevel.NEARBY] beats [ReachabilityLevel.ONLINE_RELAY] beats
  * [ReachabilityLevel.RECENT] beats [ReachabilityLevel.MESH_CARRY] beats
@@ -26,8 +26,8 @@ enum class ReachabilityLevel {
 }
 
 /**
- * Pure, unit-testable reachability computation (CONNECTIVITY_INDICATOR.md
- * §2.2), same no-Android-deps pattern as [ReconnectBackoffTracker] /
+ * Pure, unit-testable reachability computation, same no-Android-deps
+ * pattern as [ReconnectBackoffTracker] /
  * [MeshRouterState]. Callers (Compose layer) supply a snapshot of
  * [MeshConnectivityStatus] plus an injected clock; this class holds no state
  * of its own.
@@ -44,7 +44,7 @@ object ContactReachability {
 
     /**
      * Gates [ReachabilityLevel.MESH_CARRY]. Off until 1:1 BLE muling
-     * (BLE_1TO1_MULING.md) actually ships -- otherwise "some peer nearby"
+     * actually ships -- otherwise "some peer nearby"
      * doesn't move a 1:1 message and the tier would be a lie. That fix
      * shipped 2026-07-11 (agent/ble-1to1-muling), so this is on.
      */
@@ -54,8 +54,8 @@ object ContactReachability {
      * @param directLink `MeshRouter.routeFor(userId) != null` -- must come
      *   from the same lookup the send path uses, so NEARBY means "a send
      *   right now would take the BLE path."
-     * @param presenceLastSeenMs relay-presence last-seen for this contact
-     *   (CONNECTIVITY_INDICATOR.md §6). Relay presence is kept separate from
+     * @param presenceLastSeenMs relay-presence last-seen for this contact.
+     *   Relay presence is kept separate from
      *   general last-seen evidence so only actual relay presence can light up
      *   [ReachabilityLevel.ONLINE_RELAY].
      * @param selfRelayHealthy our own last relay sync pass succeeded

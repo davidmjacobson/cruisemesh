@@ -1,8 +1,8 @@
 package com.cruisemesh.app.chat
 
 /**
- * Pure placement math for [MessageFocusOverlay]
- * (MESSAGE_LONGPRESS_OVERLAY.md §5): keeps the reaction bar above and the
+ * Pure placement math for [MessageFocusOverlay]:
+ * keeps the reaction bar above and the
  * action menu below the focused bubble when there is room. The bubble itself
  * stays anchored at the long-press position; when an edge is tight, the bar
  * and menu move around that fixed anchor. Kept free of Compose/Android types

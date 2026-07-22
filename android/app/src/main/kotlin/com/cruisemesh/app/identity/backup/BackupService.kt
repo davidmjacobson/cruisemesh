@@ -17,7 +17,7 @@ import java.io.InputStream
 import uniffi.cruisemesh_core.backupMaxFileBytes
 
 /**
- * Android glue for account backup/restore (LOCAL_BACKUP_RESTORE.md §6/§7):
+ * Android glue for account backup/restore:
  * gathers the identity + message-store snapshot, seals them with
  * [BackupCrypto], and reads/writes the resulting `.cmbak` through the Storage
  * Access Framework. All calls do KDF + crypto + file I/O and MUST run off the

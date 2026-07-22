@@ -7,7 +7,7 @@ summary. Milestones are sequential because each one de-risks the next.
 |---|---|---|---|
 | 0 | Radio spike | iPhone↔Android background BLE is viable at all (the go/no-go gate) | ✅ Done |
 | 1 | Core + 1:1 direct | Rust core, identity, QR friending, sealed text, ✓/✓✓/read over direct BLE | ✅ Done |
-| 2 | Delay-tolerant delivery | Carry queue, sync digests, dedupe, cumulative receipts, mule delivery | ✅ Done (see [BLE_1TO1_MULING.md](BLE_1TO1_MULING.md)) |
+| 2 | Delay-tolerant delivery | Carry queue, sync digests, dedupe, cumulative receipts, mule delivery | ✅ Done |
 | 3 | Internet relay | Self-hostable `relayd`, mixed BLE+relay delivery without duplicates | ✅ Done (see [relayd/DEPLOY.md](relayd/DEPLOY.md)) |
 | 4 | Groups + broadcast | Group keys and rotation, per-member ticks, public broadcast channel | 🔨 In progress |
 | 5 | 🚢 Field test | Everything, on an actual cruise ship, for a week — latency, battery, and delivery-mode data | ⏳ Upcoming |

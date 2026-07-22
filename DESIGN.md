@@ -1,9 +1,12 @@
-# CruiseMesh — Design & Plan
+# CruiseMesh — Design
 
 *Offline-first family messaging for cruise ships. Delay-tolerant BLE mesh with an
 optional internet relay, end-to-end encrypted.*
 
-Status: draft v0.1 (2026-07-09)
+This document explains the architecture and the reasoning behind it. For current
+implementation status, see [ROADMAP.md](ROADMAP.md).
+
+Last updated: 2026-07-21
 
 ---
 
@@ -41,7 +44,7 @@ text each other "meet at the buffet at 6" and know whether the message got throu
 
 ---
 
-## 2. Prior art — and should we build at all?
+## 2. Prior art — and why build at all?
 
 | Project | What it is | Why it isn't the answer |
 |---|---|---|
@@ -51,12 +54,12 @@ text each other "meet at the buffet at 6" and know whether the message got throu
 | **Bridgefy** | Commercial BLE mesh SDK + app; the "broadcast mode" inspiration. | Repeatedly broken by academic cryptanalysis ("Breaking Bridgefy, again" — misused libsignal), closed source. A cautionary tale: **use crypto libraries whole, don't assemble primitives.** |
 | **Meshtastic** | LoRa mesh texting via ~$30 radio nodes + phone app. | **Actually works well on cruise ships** — LoRa penetrates where BLE dies. But it requires everyone to carry extra hardware and its default channels aren't E2EE to the phone. |
 
-**Honest recommendation:** if the requirement were only "family texting on the next
-cruise, minimum effort," the answer is **buy Meshtastic nodes** (or just pay for the
-cruise line's messaging add-on). Nothing app-only does the full list (persistent
-friends + receipts + groups + E2EE + iOS + relay server), which is exactly why
-CruiseMesh is worth building — with bitchat as the transport-layer reference and
-Bridgefy as the crypto anti-pattern.
+**The honest assessment before writing any code:** if the requirement had only been
+"family texting on the next cruise, minimum effort," the answer was to buy
+Meshtastic nodes (or just pay for the cruise line's messaging add-on). But nothing
+app-only does the full list — persistent friends + receipts + groups + E2EE + iOS +
+relay server — which is why CruiseMesh exists, with bitchat as the transport-layer
+reference and Bridgefy as the crypto anti-pattern.
 
 ---
 
@@ -346,7 +349,7 @@ Nothing else about media gets designed today.
 
 A deliberately dumb mailbox:
 
-- Single Go or Rust binary + SQLite, Docker image, runs on a $4/mo VPS.
+- A single Rust binary + SQLite, shipped as a Docker image; runs on a $4/mo VPS.
 - API (HTTPS + WebSocket): `POST /envelopes` and `GET /envelopes?hints=...`
   move the full **public** envelope header shape (`msg_id`, `hop_ttl`, `expiry`,
   `recipient_hint`, `sealed`) rather than plaintext message metadata; relay-side
@@ -366,7 +369,7 @@ A deliberately dumb mailbox:
 Constraint: iOS + Android from day one (family reality), one developer, heavy
 crypto/protocol logic that must behave identically on both platforms.
 
-**Recommendation: Rust core + thin native shells.**
+**Architecture: a Rust core with thin native shells.**
 
 - **Core crate** (identity, sealing, store/SQLite, sync engine, framing) compiled for
   both platforms via **UniFFI**. One implementation of every subtle thing; testable
@@ -379,26 +382,22 @@ crypto/protocol logic that must behave identically on both platforms.
 - Precedent: Berty runs a Go core under native shells; bitchat is native Swift with
   a separate Android port (and its divergence bugs show why the shared core matters).
 
-Alternative if Rust is unappealing: Kotlin Multiplatform (shared Kotlin core, same
-native-BLE stance). Flutter/React Native are the fallback only if UI velocity
-matters more than radio reliability — for this app it doesn't.
-
 ---
 
 ## 11. Milestones
 
-| # | Milestone | Proves | Exit test |
-|---|---|---|---|
-| 0 | **Radio spike** (2 throwaway apps) | iPhone↔Android BLE exchange incl. both-backgrounded; range in steel buildings | 1 KB/min sustained with both apps backgrounded, 3 days battery sane |
-| 1 | **Core + 1:1 direct** | Rust core, identity, QR friending, sealed text, ✓/✓✓/read over direct BLE | Two-phone family dogfood in the house |
-| 2 | **DTN** | Carry queue, digests, dedupe, cumulative receipts, 3-phone mule delivery | Phone C carries A→B message between rooms; simulated 50-node churn test passes |
-| 3 | **Relay** | `relayd` on a VPS, internet flush, mixed BLE+relay delivery with dedupe | Message delivered city-to-city; duplicates never render twice |
-| 4 | **Groups + broadcast** | Group keys, rotation, per-member ticks; public channel | 4-person family group; broadcast between two unfriended installs |
-| 5 | **🚢 Field test** | Everything, on an actual cruise | Family uses it for a week; log delivery latency, battery, mode mix (direct/mule/relay); probe ship-LAN client isolation while aboard |
-| 6 | Media (per §8) | — | after the field test says the foundation holds |
+| # | Milestone | Proves | Exit test | Status |
+|---|---|---|---|---|
+| 0 | **Radio spike** (2 throwaway apps) | iPhone↔Android BLE exchange incl. both-backgrounded; range in steel buildings | 1 KB/min sustained with both apps backgrounded, 3 days battery sane | ✅ Done |
+| 1 | **Core + 1:1 direct** | Rust core, identity, QR friending, sealed text, ✓/✓✓/read over direct BLE | Two-phone family dogfood in the house | ✅ Done |
+| 2 | **DTN** | Carry queue, digests, dedupe, cumulative receipts, 3-phone mule delivery | Phone C carries A→B message between rooms; simulated 50-node churn test passes | ✅ Done |
+| 3 | **Relay** | `relayd` on a VPS, internet flush, mixed BLE+relay delivery with dedupe | Message delivered city-to-city; duplicates never render twice | ✅ Done |
+| 4 | **Groups + broadcast** | Group keys, rotation, per-member ticks; public channel | 4-person family group; broadcast between two unfriended installs | 🔨 In progress |
+| 5 | **🚢 Field test** | Everything, on an actual cruise | Family uses it for a week; log delivery latency, battery, mode mix (direct/mule/relay); probe ship-LAN client isolation while aboard | ⏳ Upcoming |
+| 6 | Media (per §8) | — | after the field test says the foundation holds | 📋 Designed |
 
-Milestone 0 is the go/no-go gate: it de-risks the only thing we can't design around
-(iOS background BLE) before any real investment.
+Milestone 0 was the go/no-go gate: it de-risked the only thing that couldn't be
+designed around (iOS background BLE) before any real investment.
 
 ## 12. Top risks
 
@@ -406,15 +405,16 @@ Milestone 0 is the go/no-go gate: it de-risks the only thing we can't design aro
    a specific service UUID and accept connections, but slowly, and iOS may kill the
    app anyway. Mitigations: state restoration, both-role operation so Android
    centrals can wake iOS peripherals, and UX honesty ("open the app when you sit
-   down"). If M0 shows backgrounded-iPhone↔backgrounded-iPhone fails, the app
-   survives — that pair just syncs on foreground — but expectations must be set.
+   down"). If backgrounded-iPhone↔backgrounded-iPhone sync degrades on some
+   device generation, the app survives — that pair just syncs on foreground —
+   but expectations must be set.
 2. **Steel ship RF** — already priced in (§3): the design leans on mule + relay, not
    range. Field test measures which mode actually delivers.
 3. **App distribution** — TestFlight + sideload/Play internal testing is fine for
    family; store review (Apple may poke at BLE background modes) only matters if
    this is ever distributed beyond family.
 4. **Battery** — duty-cycle scanning (e.g. 10 s scan / 50 s idle when on battery,
-   aggressive when charging). Budget: <5%/day radio overhead, measured in M0.
+   aggressive when charging). Budget: <5%/day radio overhead.
 5. **Crypto review** — before any non-family distribution, pay for a design review.
    Bridgefy shipped first and got dissected twice.
 
@@ -428,13 +428,12 @@ Milestone 0 is the go/no-go gate: it de-risks the only thing we can't design aro
 
 ---
 
-## 14. UI / UX plan (Android v1)
+## 14. UI / UX
 
-The current home screen is a Milestone-1 debug artifact — an identity card with
-stacked buttons. This section is the target UI. The model is **Signal**: the home
-screen is the conversation list, because opening a conversation is the only thing a
-user launches this app to do. Identity, friending, and mesh plumbing all move behind
-it. Material 3 components, Signal's information architecture.
+The model is **Signal**: the home screen is the conversation list, because opening
+a conversation is the only thing a user launches this app to do. Identity,
+friending, and mesh plumbing all live behind it. Material 3 components on Android,
+SwiftUI equivalents on iOS — same information architecture on both.
 
 ### 14.1 Navigation map
 
@@ -483,8 +482,8 @@ below the top bar: `Mesh off` / `Starting…` / `Meshing · N nearby` /
 `Paused — Bluetooth audio` / `Syncing via relay`. Tapping it starts the mesh
 (running the existing permission + battery-exemption flow) or explains the current
 state in a sheet. The mesh **auto-starts on app open** once permissions have been
-granted before — the giant "Start mesh" button dies. Honest copy matters here
-(§12.1): the pill is where "open the app when you sit down" expectations get set.
+granted. Honest copy matters here (§12): the pill is where "open the app when you
+sit down" expectations get set.
 
 ### 14.4 Profile & settings (top-left avatar, like Signal)
 
@@ -493,11 +492,11 @@ photo picker, my QR friend card, UserID + fingerprint words (with the "read
 these aloud to verify" hint), mesh on/off, relay configuration status. Nothing
 here is daily-use, which is exactly why it lives behind the avatar.
 
-### 14.5 Chat screen (already mostly built — polish only)
+### 14.5 Chat screen
 
-Keep the current push-based screen. Polish list: day separators, the §7.1
-lamport-gap indicator ("some messages may still be in transit" — subtle, not an
-error), tick-state legend on tap, bubble palette coherent with the avatar hue.
+Push-based message list with day separators, the §7.1 lamport-gap indicator
+("some messages may still be in transit" — subtle, not an error), a tick-state
+legend on tap, and a bubble palette coherent with the avatar hue.
 
 ### 14.6 Later, designed for now
 
