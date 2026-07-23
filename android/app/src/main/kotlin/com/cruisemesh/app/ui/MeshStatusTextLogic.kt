@@ -28,6 +28,7 @@ object MeshStatusTextLogic {
             RelayHealth.NoInternet -> "no internet"
             RelayHealth.NoConfig -> "no relay set up"
             is RelayHealth.Failing -> "relay unreachable"
+            is RelayHealth.TokenRejected -> "relay token rejected"
         }
         val text = when {
             relayHealth == RelayHealth.NoInternet && nearbyCount == 0 -> "Mesh on · offline"

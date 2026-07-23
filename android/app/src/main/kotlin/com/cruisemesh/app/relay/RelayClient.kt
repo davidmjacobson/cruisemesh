@@ -39,6 +39,9 @@ data class RelayFetchPage(
     val nextCursor: Long,
 )
 
+/** Relay HTTP failure carrying its status code so sync can tell an auth reject (401/403) from transport noise. */
+class RelayHttpException(val code: Int, message: String) : IOException(message)
+
 data class RelayPresence(
     val hint: ByteArray,
     val lastSeenMs: Long,
@@ -215,7 +218,7 @@ object RelayClient {
             val body = stream?.use { it.readBounded(maxBytes) } ?: ByteArray(0)
             if (code !in 200..299) {
                 val preview = String(body, 0, minOf(body.size, 2_048), StandardCharsets.UTF_8)
-                throw IOException("Relay request failed ($code): $preview")
+                throw RelayHttpException(code, "Relay request failed ($code): $preview")
             }
             block(body)
         } finally {

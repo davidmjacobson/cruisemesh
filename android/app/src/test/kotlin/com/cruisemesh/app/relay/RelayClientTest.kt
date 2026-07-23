@@ -49,6 +49,24 @@ class RelayClientTest {
     }
 
     @Test
+    fun `auth reject surfaces as RelayHttpException with its status code`() {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":"unknown family token"}"""))
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "stale-token")
+            try {
+                RelayClient.postOutboundEnvelope(config, sampleOutboundEnvelope())
+                org.junit.Assert.fail("expected RelayHttpException")
+            } catch (e: RelayHttpException) {
+                assertEquals(401, e.code)
+            }
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun `post receipt envelope uses the same relay contract`() {
         val server = MockWebServer()
         server.enqueue(MockResponse().setResponseCode(200).setBody("""{"id":11}"""))

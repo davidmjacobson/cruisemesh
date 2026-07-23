@@ -43,6 +43,13 @@ class MeshStatusTextLogicTest {
     }
 
     @Test
+    fun `active with own token rejected names the cause instead of generic unreachable`() {
+        val status = MeshStatusTextLogic.build(MeshRuntimeState.ACTIVE, 0, RelayHealth.TokenRejected(0L))
+        assertEquals("Mesh on · relay token rejected", status.text)
+        assertEquals(MeshStatusDotColor.AMBER, status.dot)
+    }
+
+    @Test
     fun `active with no relay configured`() {
         val status = MeshStatusTextLogic.build(MeshRuntimeState.ACTIVE, 0, RelayHealth.NoConfig)
         assertEquals("Mesh on · no relay set up", status.text)

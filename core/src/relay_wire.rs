@@ -90,6 +90,39 @@ struct PresenceResponse {
     presence: Vec<PresenceWire>,
 }
 
+/// Which relay mailbox serves an envelope addressed to a contact: the
+/// contact's own mailbox from their friend card when complete, else the
+/// device's saved fallback config. relayd scopes every row per family token,
+/// so cross-family delivery only works when the envelope lands in the
+/// *recipient's* mailbox — posting to the sender's own mailbox strands it
+/// (T11). Shared here so both shells route identically.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct RelayEndpoint {
+    pub url: String,
+    pub token: String,
+}
+
+#[uniffi::export]
+pub fn resolved_contact_relay(
+    contact_relay_url: Option<String>,
+    contact_relay_token: Option<String>,
+    fallback_url: Option<String>,
+    fallback_token: Option<String>,
+) -> Option<RelayEndpoint> {
+    relay_endpoint_from(contact_relay_url, contact_relay_token)
+        .or_else(|| relay_endpoint_from(fallback_url, fallback_token))
+}
+
+fn relay_endpoint_from(url: Option<String>, token: Option<String>) -> Option<RelayEndpoint> {
+    let url = normalize_relay_url(url.unwrap_or_default());
+    let token = token.unwrap_or_default().trim().to_string();
+    if url.is_empty() || token.is_empty() {
+        None
+    } else {
+        Some(RelayEndpoint { url, token })
+    }
+}
+
 #[uniffi::export]
 pub fn normalize_relay_url(value: String) -> String {
     let trimmed = value.trim().trim_end_matches('/');
@@ -340,6 +373,41 @@ mod tests {
             normalize_relay_url("http://127.0.0.1:8080/".into()),
             "http://127.0.0.1:8080"
         );
+    }
+
+    #[test]
+    fn contact_relay_wins_over_fallback() {
+        let resolved = resolved_contact_relay(
+            Some(" dana.relay.example/ ".into()),
+            Some(" token-dana ".into()),
+            Some("https://own.relay.example".into()),
+            Some("token-own".into()),
+        )
+        .unwrap();
+        assert_eq!(resolved.url, "https://dana.relay.example");
+        assert_eq!(resolved.token, "token-dana");
+    }
+
+    #[test]
+    fn incomplete_contact_relay_falls_back_to_own_config() {
+        let resolved = resolved_contact_relay(
+            Some("dana.relay.example".into()),
+            None,
+            Some("https://own.relay.example/".into()),
+            Some("token-own".into()),
+        )
+        .unwrap();
+        assert_eq!(resolved.url, "https://own.relay.example");
+        assert_eq!(resolved.token, "token-own");
+    }
+
+    #[test]
+    fn no_usable_relay_resolves_to_none() {
+        assert_eq!(
+            resolved_contact_relay(None, None, Some("".into()), Some("  ".into())),
+            None
+        );
+        assert_eq!(resolved_contact_relay(None, None, None, None), None);
     }
 
     #[test]

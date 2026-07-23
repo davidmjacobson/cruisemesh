@@ -408,6 +408,32 @@ A deliberately dumb mailbox:
   including envelopes they're muling for family members, which is how one phone with
   a Wi-Fi package uplinks the whole family.
 
+### 9.1 Mailbox routing (which relay serves which envelope)
+
+Relay config belongs to the **relationship, not the device**. Every friend
+card can carry its owner's relay URL + family token — "the post-office box
+where mail for me gets dropped" — and a phone's own saved config is just its
+family's default box. Both shells share one core policy
+(`resolved_contact_relay`): an envelope addressed to a contact goes to **that
+contact's** card relay when the card has one, else to the sender's own config.
+On the fetch side, a phone polls **every distinct mailbox it knows about** —
+its own plus each contact's resolved card relay — because mail addressed to it
+doesn't always reach its own box (a sender may only have had a fallback
+config, or an older build that posted to its own family mailbox).
+
+No family ever configures two relays; multi-mailbox behavior is *emergent*
+from two real situations. (1) **Token rotation**: during a family's token
+change, old- and new-token phones are effectively on different mailboxes —
+cross-polling lets the fleet self-heal instead of silently splitting. (2)
+**Friendships that span families**: two families who met aboard each hold
+their own token, so staying in touch after the cruise requires posting into
+the *recipient's* family mailbox (relayd scopes every row per token). Within
+one family everything collapses back to a single relay — every contact
+resolves to the same config and the distinct set dedupes to one, so there is
+no extra traffic. A 401/403 from the phone's *own* saved token is surfaced as
+"relay token rejected" rather than a generic failure, because a stale rotated
+token is otherwise indistinguishable from an outage.
+
 ---
 
 ## 10. Client tech stack

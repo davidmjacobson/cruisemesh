@@ -12,8 +12,8 @@ import com.cruisemesh.app.relay.RelayClient
 import com.cruisemesh.app.relay.RelayConfig
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.relay.RelayFetchedEnvelope
+import com.cruisemesh.app.relay.RelayHttpException
 import com.cruisemesh.app.relay.RelayPushClient
-import com.cruisemesh.app.relay.normalizeRelayUrl
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.CoreInboundDisposition
@@ -25,6 +25,7 @@ import uniffi.cruisemesh_core.dedupeHints
 import uniffi.cruisemesh_core.coreGroupFanoutRowsForCarried
 import uniffi.cruisemesh_core.recentPresenceHintsFor
 import uniffi.cruisemesh_core.relayFetchBatchLimit
+import uniffi.cruisemesh_core.resolvedContactRelay
 
 // Deliberately MeshService's tag, not this class's name: this code moved here
 // verbatim in the FA15 extraction, and field tooling (logcat filters, the
@@ -386,6 +387,7 @@ internal class RelaySyncEngine(
         // trusted (associated-but-dead Wi‑Fi, no VPN); otherwise null = use the
         // default (normal networks and VPN tunnels route themselves).
         val network = relayBindTarget()
+        sawOwnTokenReject = false
         backfillOutgoingReceipts(identity, now)
         uploadPendingOutgoingReceiptEnvelopes(contacts, fallbackConfig, now, network)
         uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now, network)
@@ -409,11 +411,16 @@ internal class RelaySyncEngine(
                 // friend card. That relay failing must not abort polling of
                 // the remaining relays or declare our own configured relay
                 // unreachable when it succeeded.
+                noteRelayAuthFailure(config, fallbackConfig, e)
                 Log.w(TAG, "Relay sync failed for ${config.relayUrl}: ${e.message}")
             }
         }
         if (ownRelaySucceeded && anyRelaySucceeded) {
             MeshConnectivityStatus.setRelayHealth(RelayHealth.Ok(now))
+        } else if (sawOwnTokenReject) {
+            // T11: a stale/rotated family token used to look like a generic
+            // relay outage while friend requests queued forever. Surface it.
+            MeshConnectivityStatus.setRelayHealth(RelayHealth.TokenRejected(now))
         } else {
             MeshConnectivityStatus.setRelayHealth(RelayHealth.Failing(now))
         }
@@ -439,6 +446,7 @@ internal class RelaySyncEngine(
                     "Uploaded receipt envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
+                noteRelayAuthFailure(config, fallbackConfig, e)
                 Log.w(TAG, "Failed to upload receipt envelope to relay ${config.relayUrl}: ${e.message}")
             }
         }
@@ -470,6 +478,7 @@ internal class RelaySyncEngine(
                         RelayClient.postOutboundEnvelope(config, envelope, network)
                         store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
                     } catch (e: Exception) {
+                        noteRelayAuthFailure(config, fallbackConfig, e)
                         Log.w(TAG, "Failed to upload outbound envelope to relay ${config.relayUrl}: ${e.message}")
                     }
                     continue
@@ -491,6 +500,7 @@ internal class RelaySyncEngine(
                         RelayClient.postFanoutRow(config, row, network)
                         posted++
                     } catch (e: Exception) {
+                        noteRelayAuthFailure(config, fallbackConfig, e)
                         Log.w(TAG, "Failed to upload fan-out row to relay ${config.relayUrl}: ${e.message}")
                     }
                 }
@@ -512,6 +522,7 @@ internal class RelaySyncEngine(
                     "Uploaded outbound envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
+                noteRelayAuthFailure(config, fallbackConfig, e)
                 Log.w(TAG, "Failed to upload outbound envelope to relay ${config.relayUrl}: ${e.message}")
             }
         }
@@ -561,6 +572,7 @@ internal class RelaySyncEngine(
                     try {
                         RelayClient.postFanoutRow(config, row, network)
                     } catch (e: Exception) {
+                        noteRelayAuthFailure(config, fallbackConfig, e)
                         Log.w(TAG, "Failed to upload carried fan-out row to relay ${config.relayUrl}: ${e.message}")
                     }
                 }
@@ -574,6 +586,7 @@ internal class RelaySyncEngine(
                     "Uploaded carried envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
+                noteRelayAuthFailure(config, fallbackConfig, e)
                 Log.w(TAG, "Failed to upload carried envelope to relay ${config.relayUrl}: ${e.message}")
             }
         }
@@ -675,13 +688,22 @@ internal class RelaySyncEngine(
             }
         }
 
-    private fun resolvedRelayConfig(contact: Contact, fallbackConfig: RelayConfig?): RelayConfig? {
-        val relayUrl = normalizeRelayUrl(contact.relayUrl.orEmpty())
-        val relayToken = contact.relayToken?.trim().orEmpty()
-        if (relayUrl.isNotEmpty() && relayToken.isNotEmpty()) {
-            return RelayConfig(relayUrl, relayToken)
-        }
-        return fallbackConfig
+    /** Core owns the mailbox-routing policy (T11) so both shells resolve identically. */
+    private fun resolvedRelayConfig(contact: Contact, fallbackConfig: RelayConfig?): RelayConfig? =
+        resolvedContactRelay(
+            contact.relayUrl,
+            contact.relayToken,
+            fallbackConfig?.relayUrl,
+            fallbackConfig?.relayToken,
+        )?.let { RelayConfig(it.url, it.token) }
+
+    /** Set while a sync pass observes our own saved config being auth-rejected; drives [RelayHealth.TokenRejected]. */
+    private var sawOwnTokenReject = false
+
+    private fun noteRelayAuthFailure(config: RelayConfig, fallbackConfig: RelayConfig?, error: Exception) {
+        if (config != fallbackConfig) return
+        val code = (error as? RelayHttpException)?.code ?: return
+        if (code == 401 || code == 403) sawOwnTokenReject = true
     }
 
     private fun syncRelayPresence(

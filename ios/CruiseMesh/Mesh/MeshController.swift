@@ -2128,10 +2128,10 @@ final class MeshController: ObservableObject {
 
     private func runRelaySync() {
         guard isRunning, let identity else { return }
-        guard let config = RelayConfigStore.load() else {
-            MeshConnectivityStatus.shared.setRelayHealth(.noConfig)
-            return
-        }
+        // No own config is no longer a hard stop: contacts' friend cards can
+        // carry relays worth polling (Android parity). relaySyncBlocking
+        // reports .noConfig when there is truly nowhere to sync.
+        let config = RelayConfigStore.load()
         guard pathMonitor?.currentPath.status == .satisfied else {
             MeshConnectivityStatus.shared.setRelayHealth(.noInternet)
             return
@@ -2177,21 +2177,85 @@ final class MeshController: ObservableObject {
         }
     }
 
-    private nonisolated func relaySyncBlocking(identity: Identity, config: RelayConfig) async {
+    /// Core owns the mailbox-routing policy (T11): an envelope addressed to a
+    /// contact goes to THAT contact's relay mailbox (from their friend card),
+    /// falling back to our own saved config. relayd scopes rows per family
+    /// token, so posting a cross-family friend request to our own mailbox
+    /// strands it where the recipient can never fetch it. Mirrors
+    /// RelaySyncEngine.kt's resolvedRelayConfig.
+    nonisolated static func resolvedRelayConfig(
+        contact: Contact?,
+        fallback: RelayConfig?
+    ) -> RelayConfig? {
+        resolvedContactRelay(
+            contactRelayUrl: contact?.relayUrl,
+            contactRelayToken: contact?.relayToken,
+            fallbackUrl: fallback?.relayUrl,
+            fallbackToken: fallback?.relayToken
+        ).map { RelayConfig(relayUrl: $0.url, relayToken: $0.token) }
+    }
+
+    /// Every distinct mailbox this device should poll: its own saved config
+    /// first, then each contact's resolved card relay (mirrors
+    /// RelaySyncEngine.kt's distinctRelayConfigs).
+    nonisolated static func distinctRelayConfigs(
+        contacts: [Contact],
+        fallback: RelayConfig?
+    ) -> [RelayConfig] {
+        var result: [RelayConfig] = []
+        func add(_ cfg: RelayConfig?) {
+            guard let cfg else { return }
+            if !result.contains(where: { $0.relayUrl == cfg.relayUrl && $0.relayToken == cfg.relayToken }) {
+                result.append(cfg)
+            }
+        }
+        add(fallback)
+        for contact in contacts {
+            add(Self.resolvedRelayConfig(contact: contact, fallback: fallback))
+        }
+        return result
+    }
+
+    private nonisolated func relaySyncBlocking(identity: Identity, config: RelayConfig?) async {
         let store = AppStore.get()
+        // T11: a stale/rotated family token used to look like a generic relay
+        // outage while queued envelopes retried forever. Track 401/403 from
+        // our OWN saved config and surface it as .tokenRejected.
+        var sawOwnTokenReject = false
+        func noteFailure(_ error: Error, usedConfig: RelayConfig) {
+            guard let own = config,
+                  usedConfig.relayUrl == own.relayUrl,
+                  usedConfig.relayToken == own.relayToken else { return }
+            let ns = error as NSError
+            if ns.domain == "RelayClient", ns.code == 401 || ns.code == 403 {
+                sawOwnTokenReject = true
+            }
+        }
         do {
-            // Upload receipts first, then authored, then family carry.
+            // Upload receipts first, then authored, then family carry --
+            // each to the recipient's resolved mailbox, and each post in its
+            // own catch so one dead contact relay can't stall the pass
+            // (mirrors RelaySyncEngine.kt).
             let now = Int64(Date().timeIntervalSince1970 * 1000)
             _ = try store.pruneExpiredOutgoingReceiptEnvelopes(nowMs: now)
             _ = try store.pruneExpiredOutboundEnvelopes(nowMs: now)
             _ = try store.pruneExpiredCarried(nowMs: now)
+            let contacts = try store.listContacts()
+            let contactsById = Dictionary(
+                uniqueKeysWithValues: contacts.map { ($0.userId, $0) }
+            )
             let receipts = try store.pendingRelayOutgoingReceiptEnvelopes(
                 limit: MeshDefaults.relayStoreBatchLimit,
                 nowMs: now
             )
             for env in receipts {
-                _ = try RelayClient.postReceiptEnvelope(config: config, envelope: env)
-                _ = try store.markOutgoingReceiptEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                guard let contact = contactsById[env.recipientUserId],
+                      let cfg = Self.resolvedRelayConfig(contact: contact, fallback: config)
+                else { continue }
+                do {
+                    _ = try RelayClient.postReceiptEnvelope(config: cfg, envelope: env)
+                    _ = try store.markOutgoingReceiptEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                } catch { noteFailure(error, usedConfig: cfg) }
             }
             let outbound = try store.pendingRelayOutboundEnvelopes(
                 limit: MeshDefaults.relayStoreBatchLimit,
@@ -2201,14 +2265,35 @@ final class MeshController: ObservableObject {
             let groupsById = Dictionary(
                 uniqueKeysWithValues: importedGroups.map { ($0.id, $0) }
             )
+            func relayConfigForGroupRecipient(_ groupId: Data) -> RelayConfig? {
+                guard let group = groupsById[groupId] else { return config }
+                for member in group.memberUserIds {
+                    if let contact = contactsById[member],
+                       let resolved = Self.resolvedRelayConfig(contact: contact, fallback: config) {
+                        return resolved
+                    }
+                }
+                return config
+            }
             for env in outbound {
-                if let group = groupsById[env.recipientUserId] {
+                guard let contact = contactsById[env.recipientUserId] else {
+                    guard let cfg = relayConfigForGroupRecipient(env.recipientUserId) else { continue }
+                    guard let group = groupsById[env.recipientUserId] else {
+                        // Recipient is neither contact nor imported group
+                        // (e.g. a group deleted mid-queue); keep the legacy
+                        // single post so the envelope isn't stranded.
+                        do {
+                            _ = try RelayClient.postOutboundEnvelope(config: cfg, envelope: env)
+                            _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                        } catch { noteFailure(error, usedConfig: cfg) }
+                        continue
+                    }
                     // Group-addressed: per-member fan-out instead of one
                     // shared group-hint row (specs/group-relay-durability.md
                     // §4.2). Mark relay-posted only after ALL member rows
                     // post; a partial failure retries the whole set next
                     // pass, and the deterministic fan-out msg_ids dedupe
-                    // server-side. Mirrors MeshService.kt.
+                    // server-side. Mirrors RelaySyncEngine.kt.
                     let rows = coreGroupFanoutRows(
                         originalMsgId: env.msgId,
                         memberUserIds: group.memberUserIds,
@@ -2219,29 +2304,42 @@ final class MeshController: ObservableObject {
                     )
                     var posted = 0
                     for row in rows {
-                        if (try? RelayClient.postFanoutRow(config: config, row: row)) != nil {
+                        do {
+                            _ = try RelayClient.postFanoutRow(config: cfg, row: row)
                             posted += 1
-                        }
+                        } catch { noteFailure(error, usedConfig: cfg) }
                     }
                     if posted == rows.count {
                         _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
                     }
                     continue
                 }
-                _ = try RelayClient.postOutboundEnvelope(config: config, envelope: env)
-                _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                guard let cfg = Self.resolvedRelayConfig(contact: contact, fallback: config) else { continue }
+                do {
+                    _ = try RelayClient.postOutboundEnvelope(config: cfg, envelope: env)
+                    _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                } catch { noteFailure(error, usedConfig: cfg) }
             }
             let family = try store.familyCarriedEnvelopes(
                 limit: MeshDefaults.relayStoreBatchLimit,
                 nowMs: now
             )
             for env in family {
-                // Group-hinted carried envelopes decompose into per-member
-                // fan-out rows so a member mule's uplink serves the whole
-                // group (specs/group-relay-durability.md §4.2); re-posts on
-                // later passes dedupe server-side via the deterministic ids.
-                // Everything else posts unchanged.
+                // Carried mail goes to the mailbox its recipient actually
+                // polls: a contact hint posts to that contact's resolved
+                // relay; a group hint decomposes into per-member fan-out rows
+                // (specs/group-relay-durability.md §4.2, re-posts dedupe
+                // server-side); unrecognizable hints are skipped. Mirrors
+                // RelaySyncEngine.kt.
+                if let contact = (try? store.contactMatchingHint(hint: env.recipientHint, nowMs: now)) ?? nil {
+                    guard let cfg = Self.resolvedRelayConfig(contact: contact, fallback: config) else { continue }
+                    do {
+                        _ = try RelayClient.postCarriedEnvelope(config: cfg, envelope: env)
+                    } catch { noteFailure(error, usedConfig: cfg) }
+                    continue
+                }
                 if let group = (try? store.groupMatchingHint(hint: env.recipientHint, nowMs: now)) ?? nil {
+                    guard let cfg = relayConfigForGroupRecipient(group.id) else { continue }
                     let rows = coreGroupFanoutRowsForCarried(
                         originalMsgId: env.msgId,
                         memberUserIds: group.memberUserIds,
@@ -2250,109 +2348,161 @@ final class MeshController: ObservableObject {
                         sealed: env.sealed
                     )
                     for row in rows {
-                        _ = try? RelayClient.postFanoutRow(config: config, row: row)
+                        do { _ = try RelayClient.postFanoutRow(config: cfg, row: row) }
+                        catch { noteFailure(error, usedConfig: cfg) }
                     }
                     continue
                 }
-                _ = try RelayClient.postCarriedEnvelope(config: config, envelope: env)
             }
 
-            let contacts = try store.listContacts()
+            // Fetch-side parity with RelaySyncEngine.kt: poll every distinct
+            // mailbox we know about -- our own plus each contact's card
+            // relay. Mail addressed to us doesn't always reach our own
+            // mailbox (a sender may only have had a fallback config, or an
+            // older build posted to its own family mailbox), so checking one
+            // box quietly loses cross-token mail.
+            let distinctConfigs = Self.distinctRelayConfigs(contacts: contacts, fallback: config)
+            guard !distinctConfigs.isEmpty else {
+                await MainActor.run {
+                    MeshConnectivityStatus.shared.setRelayHealth(.noConfig)
+                }
+                return
+            }
             let presenceHints: (Data, Int64) -> [Data] = { userId, timestamp in
                 recentPresenceHintsFor(userId: userId, nowMs: timestamp)
             }
-            let announce = RelayConfigStore.shareOnline()
-                ? presenceHints(identity.userId, now)
-                : []
-            let query = Array(Set(contacts.flatMap { presenceHints($0.userId, now) }))
-            if !announce.isEmpty || !query.isEmpty {
-                let contactByHint = Dictionary(uniqueKeysWithValues: contacts.flatMap { contact in
-                    presenceHints(contact.userId, now).map { ($0, contact.userId) }
-                })
-                let page = try RelayClient.syncPresence(
-                    config: config,
-                    announce: announce,
-                    query: query
-                )
-                let localNow = Int64(Date().timeIntervalSince1970 * 1_000)
-                await MainActor.run {
-                    for item in page.presence {
-                        guard let userId = contactByHint[item.hint] else { continue }
-                        let localSeenAt = localNow - max(0, page.nowMs - item.lastSeenMs)
-                        MeshConnectivityStatus.shared.mergePresenceLastSeen(
-                            userId: userId,
-                            seenAtMs: localSeenAt
-                        )
-                    }
-                }
-            }
-
-            // FI2 proxy-polling included: core's relayFetchHints is self +
-            // member-group + every contact's recent-day hints, deduped
-            // (core/src/recipient_hints.rs). Proxy-fetched mail this device
-            // can't decrypt falls into the carry-foreign path and comes back
-            // `.carried`, never `.consumed`, so coreRelayAckIdsWithConsumed
-            // keeps the DTN ack invariant exactly as before: a carried relay
-            // copy is never acked away.
-            let hints = try store.relayFetchHints(ownUserId: identity.userId, nowMs: now)
-            var afterId: Int64 = 0
+            let fetchHints = try store.relayFetchHints(ownUserId: identity.userId, nowMs: now)
             let fetchBatchLimit = Int(relayFetchBatchLimit())
-            while true {
-                let page = try RelayClient.fetchEnvelopes(
-                    config: config,
-                    hints: hints,
-                    afterId: afterId,
-                    limit: fetchBatchLimit
-                )
-                guard !page.envelopes.isEmpty else { break }
-                var dispositions: [CoreRelayEnvelopeDisposition] = []
-                for env in page.envelopes {
-                    let disposition = await MainActor.run {
-                        MeshController.shared.processInboundEnvelope(
-                            sourceAddress: nil,
-                            msgId: env.msgId,
-                            hopTtl: env.hopTtl,
-                            expiry: env.expiryMs,
-                            recipientHint: env.recipientHint,
-                            sealed: env.sealed,
-                            identity: identity
-                        )
+            var anyRelaySucceeded = false
+            var ownRelaySucceeded = config == nil
+            for cfg in distinctConfigs {
+                // Presence rides each mailbox for the contacts resolved to
+                // it; own presence is announced everywhere so contacts on
+                // other relays still see us (mirrors syncRelayPresence in
+                // RelaySyncEngine.kt). Presence failure is never fatal.
+                let contactsForConfig = contacts.filter { contact in
+                    guard let resolved = Self.resolvedRelayConfig(contact: contact, fallback: config)
+                    else { return false }
+                    return resolved.relayUrl == cfg.relayUrl && resolved.relayToken == cfg.relayToken
+                }
+                if !contactsForConfig.isEmpty {
+                    let announce = RelayConfigStore.shareOnline()
+                        ? presenceHints(identity.userId, now)
+                        : []
+                    let query = Array(Set(contactsForConfig.flatMap { presenceHints($0.userId, now) }))
+                    if !announce.isEmpty || !query.isEmpty {
+                        let contactByHint = Dictionary(uniqueKeysWithValues: contactsForConfig.flatMap { contact in
+                            presenceHints(contact.userId, now).map { ($0, contact.userId) }
+                        })
+                        do {
+                            let page = try RelayClient.syncPresence(
+                                config: cfg,
+                                announce: announce,
+                                query: query
+                            )
+                            let localNow = Int64(Date().timeIntervalSince1970 * 1_000)
+                            await MainActor.run {
+                                for item in page.presence {
+                                    guard let userId = contactByHint[item.hint] else { continue }
+                                    let localSeenAt = localNow - max(0, page.nowMs - item.lastSeenMs)
+                                    MeshConnectivityStatus.shared.mergePresenceLastSeen(
+                                        userId: userId,
+                                        seenAtMs: localSeenAt
+                                    )
+                                }
+                            }
+                        } catch { noteFailure(error, usedConfig: cfg) }
                     }
-                    dispositions.append(CoreRelayEnvelopeDisposition(
-                        relayId: env.id,
-                        msgId: env.msgId,
-                        disposition: disposition,
-                        recipientHint: env.recipientHint
-                    ))
                 }
-                // Consumed/Expired ack unconditionally; a SEEN envelope is
-                // acked only if this device durably consumed it as a 1:1
-                // message from someone else (DTN_TODOS.md §3.1); a legacy
-                // shared-mailbox group-hint row is never acked at all
-                // (specs/group-relay-durability.md §5.2) -- see
-                // CoreRelayEnvelopeDisposition's doc comment in engine.rs.
-                let acks = try store.coreRelayAckIdsWithConsumed(
-                    items: dispositions,
-                    ownUserId: identity.userId,
-                    nowMs: now
-                )
-                if !acks.isEmpty {
-                    try RelayClient.ackEnvelopes(config: config, ids: acks)
+                // FI2 proxy-polling included: core's relayFetchHints is self +
+                // member-group + every contact's recent-day hints, deduped
+                // (core/src/recipient_hints.rs). Proxy-fetched mail this device
+                // can't decrypt falls into the carry-foreign path and comes back
+                // `.carried`, never `.consumed`, so coreRelayAckIdsWithConsumed
+                // keeps the DTN ack invariant exactly as before: a carried relay
+                // copy is never acked away.
+                do {
+                    var afterId: Int64 = 0
+                    while true {
+                        let page = try RelayClient.fetchEnvelopes(
+                            config: cfg,
+                            hints: fetchHints,
+                            afterId: afterId,
+                            limit: fetchBatchLimit
+                        )
+                        guard !page.envelopes.isEmpty else { break }
+                        var dispositions: [CoreRelayEnvelopeDisposition] = []
+                        for env in page.envelopes {
+                            let disposition = await MainActor.run {
+                                MeshController.shared.processInboundEnvelope(
+                                    sourceAddress: nil,
+                                    msgId: env.msgId,
+                                    hopTtl: env.hopTtl,
+                                    expiry: env.expiryMs,
+                                    recipientHint: env.recipientHint,
+                                    sealed: env.sealed,
+                                    identity: identity
+                                )
+                            }
+                            dispositions.append(CoreRelayEnvelopeDisposition(
+                                relayId: env.id,
+                                msgId: env.msgId,
+                                disposition: disposition,
+                                recipientHint: env.recipientHint
+                            ))
+                        }
+                        // Consumed/Expired ack unconditionally; a SEEN envelope is
+                        // acked only if this device durably consumed it as a 1:1
+                        // message from someone else (DTN_TODOS.md §3.1); a legacy
+                        // shared-mailbox group-hint row is never acked at all
+                        // (specs/group-relay-durability.md §5.2) -- see
+                        // CoreRelayEnvelopeDisposition's doc comment in engine.rs.
+                        let acks = try store.coreRelayAckIdsWithConsumed(
+                            items: dispositions,
+                            ownUserId: identity.userId,
+                            nowMs: now
+                        )
+                        if !acks.isEmpty {
+                            try RelayClient.ackEnvelopes(config: cfg, ids: acks)
+                        }
+                        afterId = page.nextCursor
+                        if page.envelopes.count < fetchBatchLimit { break }
+                    }
+                    anyRelaySucceeded = true
+                    if let own = config, cfg.relayUrl == own.relayUrl, cfg.relayToken == own.relayToken {
+                        ownRelaySucceeded = true
+                    }
+                } catch {
+                    // A contact can carry stale relay credentials from an
+                    // older friend card. That mailbox failing must not abort
+                    // polling of the remaining relays or declare our own
+                    // configured relay unreachable when it succeeded.
+                    noteFailure(error, usedConfig: cfg)
                 }
-                afterId = page.nextCursor
-                if page.envelopes.count < fetchBatchLimit { break }
             }
+            let syncedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
+            let tokenRejected = sawOwnTokenReject
+            let healthy = ownRelaySucceeded && anyRelaySucceeded
             await MainActor.run {
-                MeshConnectivityStatus.shared.setRelayHealth(.ok(
-                    lastSyncMs: Int64(Date().timeIntervalSince1970 * 1_000)
-                ))
+                MeshConnectivityStatus.shared.setRelayHealth(
+                    healthy
+                        ? .ok(lastSyncMs: syncedAtMs)
+                        : (tokenRejected
+                            ? .tokenRejected(lastAttemptMs: syncedAtMs)
+                            : .failing(lastAttemptMs: syncedAtMs))
+                )
             }
         } catch {
+            if let config { noteFailure(error, usedConfig: config) }
             let message = error.localizedDescription
+            let tokenRejected = sawOwnTokenReject
             await MainActor.run {
-                MeshConnectivityStatus.shared.setRelayHealth(.failing(
-                    lastAttemptMs: Int64(Date().timeIntervalSince1970 * 1_000)
-                ))
+                let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
+                MeshConnectivityStatus.shared.setRelayHealth(
+                    tokenRejected
+                        ? .tokenRejected(lastAttemptMs: nowMs)
+                        : .failing(lastAttemptMs: nowMs)
+                )
                 log.warning("Relay sync failed: \(message, privacy: .public)")
             }
         }

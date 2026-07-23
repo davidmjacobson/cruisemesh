@@ -1550,6 +1550,16 @@
           }
         }
       }
+    },
+    "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone."
+          }
+        }
+      }
     }
   },
   "version": "1.0"

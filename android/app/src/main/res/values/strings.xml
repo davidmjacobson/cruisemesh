@@ -166,6 +166,7 @@
     <string name="ui_this_removes_the_contact_and_deletes_your_chat_f3fb0a50">This removes the contact and deletes your chat history with them. It can\'t be undone.</string>
     <string name="ui_this_backup_file_is_too_large">This backup file is too large.</string>
     <string name="ui_unsupported_attachment">Unsupported attachment</string>
+    <string name="ui_relay_token_rejected">The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.</string>
     <string name="ui_when_any_family_phone_has_internet_queued_messages">When any family phone has internet, queued messages flush through this mailbox.</string>
     <string name="ui_your_name">Your name</string>
     <plurals name="ui_member_count">
