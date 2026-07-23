@@ -38,40 +38,73 @@ object OverlayPlacement {
         margin: Float,
         isOwn: Boolean,
     ): Result {
-        val bubbleTop = bubbleBounds.top
-        val naturalBarTop = bubbleBounds.top - spacing - barHeight
-        val naturalMenuTop = bubbleBounds.bottom + spacing
-        val barFitsAbove = naturalBarTop >= screenTop
-        val menuFitsBelow = naturalMenuTop + menuHeight <= screenBottom
+        // The bubble can be taller than the viewport or partly scrolled past an
+        // edge, so free space is measured around its on-screen portion.
+        val anchorTop = bubbleBounds.top.coerceIn(screenTop, screenBottom)
+        val anchorBottom = bubbleBounds.bottom.coerceIn(screenTop, screenBottom)
+        val aboveRoom = anchorTop - screenTop
+        val belowRoom = screenBottom - anchorBottom
+        val barNeed = barHeight + spacing
+        val menuNeed = menuHeight + spacing
+        val stackNeed = barNeed + menuNeed
+        val barFitsAbove = aboveRoom >= barNeed
+        val menuFitsBelow = belowRoom >= menuNeed
 
-        var barTop = if (barFitsAbove) {
-            naturalBarTop
-        } else {
-            naturalMenuTop
-        }
-
-        var menuTop = if (menuFitsBelow) {
-            naturalMenuTop
-        } else {
-            bubbleBounds.top - spacing - menuHeight
-        }
-
-        val overlap = barTop < menuTop + menuHeight && menuTop < barTop + barHeight
-        if (overlap) {
-            if (barTop >= bubbleBounds.bottom) {
-                menuTop = barTop + barHeight + spacing
-            } else {
-                barTop = menuTop - spacing - barHeight
+        var barTop: Float
+        var menuTop: Float
+        when {
+            // Natural: bar above the bubble, menu below it.
+            barFitsAbove && menuFitsBelow -> {
+                barTop = anchorTop - barNeed
+                menuTop = anchorBottom + spacing
+            }
+            // Menu can't go below: stack bar-then-menu above when both fit...
+            barFitsAbove && aboveRoom >= stackNeed -> {
+                menuTop = anchorTop - menuNeed
+                barTop = menuTop - barNeed
+            }
+            // ...or split them around the bubble (menu above, bar below).
+            barFitsAbove && aboveRoom >= menuNeed && belowRoom >= barNeed -> {
+                menuTop = anchorTop - menuNeed
+                barTop = anchorBottom + spacing
+            }
+            // Menu fits nowhere around the bubble: bar keeps its natural spot,
+            // menu pins to the bottom edge over the bubble.
+            barFitsAbove -> {
+                barTop = anchorTop - barNeed
+                menuTop = screenBottom - menuHeight
+            }
+            // Bar can't go above: stack bar-then-menu below when both fit.
+            menuFitsBelow && belowRoom >= stackNeed -> {
+                barTop = anchorBottom + spacing
+                menuTop = barTop + barNeed
+            }
+            // Menu keeps its natural spot below; bar pins to the top edge over the bubble.
+            menuFitsBelow -> {
+                barTop = screenTop
+                menuTop = anchorBottom + spacing
+            }
+            // No room on either side (bubble fills the viewport): pin both over
+            // the bubble at opposite edges.
+            else -> {
+                barTop = screenTop
+                menuTop = screenBottom - menuHeight
             }
         }
 
+        // Safety net for viewports smaller than the controls themselves: stay
+        // on-screen, and never overlap each other -- overlapping controls are
+        // worse than controls crowding the bubble, so the overlap check runs
+        // last (a clamp can push an element back onto the other).
         fun clampVerticalTop(value: Float, elementHeight: Float): Float {
             val maxTop = (screenBottom - elementHeight).coerceAtLeast(screenTop)
             return value.coerceIn(screenTop, maxTop)
         }
-
         barTop = clampVerticalTop(barTop, barHeight)
         menuTop = clampVerticalTop(menuTop, menuHeight)
+        if (barTop < menuTop + menuHeight && menuTop < barTop + barHeight) {
+            menuTop = barTop + barNeed
+        }
 
         fun horizontalLeft(elementWidth: Float): Float {
             val raw = if (isOwn) bubbleBounds.right - elementWidth else bubbleBounds.left
@@ -81,7 +114,7 @@ object OverlayPlacement {
         }
 
         return Result(
-            bubbleTop = bubbleTop,
+            bubbleTop = bubbleBounds.top,
             barTop = barTop,
             menuTop = menuTop,
             barLeft = horizontalLeft(barWidth),
