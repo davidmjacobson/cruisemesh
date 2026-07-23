@@ -340,6 +340,17 @@ pub fn seal_group_message(
 
 /// Open a group-authored envelope with the imported group key and verify the
 /// embedded sender signature.
+///
+/// SECURITY CONTRACT: this verifies only that the payload was sealed with the
+/// group key and signed by the key embedded in it — it does NOT check that
+/// the signer is a group member. Anyone holding the group key (an invite
+/// leak, a removed member before rotation) can produce an envelope that opens
+/// successfully under any identity they mint. Every caller MUST verify
+/// `sender_user_id ∈ group.member_user_ids` before trusting the body; both
+/// shells do this in `deliverOpenedGroupEnvelope`
+/// (InboundEnvelopeProcessor.kt / MeshController.swift), and
+/// `outsider_with_group_key_opens_but_is_not_a_member` pins this contract so
+/// a change here is deliberate, not accidental.
 #[uniffi::export]
 pub fn open_group_message(
     group: Group,
@@ -538,6 +549,28 @@ mod tests {
             metadata_revision: 0,
             metadata_changed_by: Vec::new(),
         }
+    }
+
+    /// Pins open_group_message's SECURITY CONTRACT (see its doc comment):
+    /// possession of the group key is sufficient to seal an envelope that
+    /// opens successfully — membership of the signer is deliberately NOT
+    /// checked here, because rejection at this layer would push the envelope
+    /// into the shells' carry-foreign path and spread it through the mesh.
+    /// The membership guard lives in both shells' deliverOpenedGroupEnvelope
+    /// (drop-with-log, terminal). If this test starts failing because a
+    /// membership check was added here, make sure the shells' disposition
+    /// semantics were reworked to match — do not just delete the test.
+    #[test]
+    fn outsider_with_group_key_opens_but_is_not_a_member() {
+        let outsider = generate_identity();
+        let group = create_group("Family".to_string(), vec![user(1), user(2)]).unwrap();
+        assert!(!group.member_user_ids.contains(&outsider.user_id));
+
+        let sealed =
+            seal_group_message(outsider.clone(), group.clone(), b"injected".to_vec()).unwrap();
+        let opened = open_group_message(group, sealed).unwrap();
+        assert_eq!(opened.sender_user_id, outsider.user_id);
+        assert_eq!(opened.payload, b"injected");
     }
 
     #[test]
