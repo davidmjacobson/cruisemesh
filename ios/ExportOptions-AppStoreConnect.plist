@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Export options for the automated TestFlight release (ios-release.yml).
+
+  Uses automatic (cloud) signing: with "xcodebuild -exportArchive
+  -allowProvisioningUpdates" and an App Store Connect API key, Xcode provisions a
+  distribution profile and signs with the cloud-managed Apple Distribution
+  certificate whose private key lives on Apple's servers. So CI needs no local
+  .p12 certificate or provisioning profile (only the API key), which is why the
+  fragile locked signing keychains on the interactive Mac are irrelevant to this
+  path. The sibling ExportOptions-TestFlight.plist uses manual signing and is
+  kept for hand-driven exports where a distribution cert is installed.
+
+  manageAppVersionAndBuildNumber is false so the CFBundleVersion the workflow
+  stamps in (epoch seconds) is preserved rather than auto-managed by Xcode.
+-->
+<plist version="1.0">
+<dict>
+	<key>method</key>
+	<string>app-store-connect</string>
+	<key>teamID</key>
+	<string>DDS64SNDZH</string>
+	<key>signingStyle</key>
+	<string>automatic</string>
+	<key>destination</key>
+	<string>export</string>
+	<key>manageAppVersionAndBuildNumber</key>
+	<false/>
+	<key>uploadSymbols</key>
+	<true/>
+	<key>stripSwiftSymbols</key>
+	<true/>
+</dict>
+</plist>
