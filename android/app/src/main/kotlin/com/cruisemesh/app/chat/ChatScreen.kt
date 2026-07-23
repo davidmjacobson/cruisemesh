@@ -79,7 +79,6 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -1144,7 +1143,7 @@ private fun MessageBubble(
     onSwipeReply: () -> Unit = {},
 ) {
     var showLegend by remember { mutableStateOf(false) }
-    var boundsInWindow by remember { mutableStateOf(Rect.Zero) }
+    var boundsInRoot by remember { mutableStateOf(Rect.Zero) }
     val topPadding = if (grouping.joinsPrevious) 2.dp else 10.dp
     val bottomPadding = if (grouping.joinsNext) 2.dp else 6.dp
     val shape = bubbleShapeFor(isOwn, grouping)
@@ -1220,7 +1219,7 @@ private fun MessageBubble(
                 quoted = quoted,
                 onQuotedClick = quoted?.target?.let { target -> { onQuotedClick(target) } },
                 modifier = Modifier
-                    .onGloballyPositioned { coords -> boundsInWindow = coords.boundsInWindow() }
+                    .onGloballyPositioned { coords -> boundsInRoot = coords.unclippedBoundsInRoot() }
                     .messageActions(
                         onClick = {
                             if (photoBytes != null) {
@@ -1229,7 +1228,7 @@ private fun MessageBubble(
                                 showLegend = true
                             }
                         },
-                        onLongClick = { onLongPress(target, boundsInWindow) },
+                        onLongClick = { onLongPress(target, boundsInRoot) },
                     ),
             )
             if (grouping.showTimestamp) {

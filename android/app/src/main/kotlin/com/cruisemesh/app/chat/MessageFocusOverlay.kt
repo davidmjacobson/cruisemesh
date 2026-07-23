@@ -42,9 +42,10 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -52,15 +53,24 @@ import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.toSize
 import kotlinx.coroutines.launch
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
 
-/** Captured at long-press time: which message and where its bubble sits on screen (window coords). */
+/** Captured at long-press time: which message and where its bubble sits on screen (root coords, unclipped). */
 data class FocusedMessage(
     val target: MessageTarget,
     val bounds: Rect,
 )
+
+/**
+ * Bubble bounds for [FocusedMessage]. `boundsInWindow()` clips to the
+ * ancestors' visible area, so a bubble partly scrolled under the header or
+ * composer reports its clipped sliver and the overlay copy lands displaced
+ * from the real one; position + size never clips.
+ */
+fun LayoutCoordinates.unclippedBoundsInRoot(): Rect = Rect(positionInRoot(), size.toSize())
 
 private val OVERLAY_SPACING = 8.dp
 private val OVERLAY_MARGIN = 16.dp
@@ -130,12 +140,12 @@ fun MessageFocusOverlay(
     }
     var barSize by remember { mutableStateOf(estimatedBarSize) }
     var menuSize by remember { mutableStateOf(estimatedMenuSize) }
-    var overlayBoundsInWindow by remember { mutableStateOf(Rect.Zero) }
+    var overlayBoundsInRoot by remember { mutableStateOf(Rect.Zero) }
 
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .onGloballyPositioned { coords -> overlayBoundsInWindow = coords.boundsInWindow() }
+            .onGloballyPositioned { coords -> overlayBoundsInRoot = coords.unclippedBoundsInRoot() }
             .background(Color.Black.copy(alpha = SCRIM_ALPHA * entrance.value))
             .pointerInput(Unit) { detectTapGestures { dismiss() } }
             .semantics { contentDescription = "Dismiss message options" },
@@ -150,10 +160,10 @@ fun MessageFocusOverlay(
         val spacingPx = with(density) { OVERLAY_SPACING.toPx() }
         val marginPx = with(density) { OVERLAY_MARGIN.toPx() }
         val bubbleBounds = Rect(
-            left = focused.bounds.left - overlayBoundsInWindow.left,
-            top = focused.bounds.top - overlayBoundsInWindow.top,
-            right = focused.bounds.right - overlayBoundsInWindow.left,
-            bottom = focused.bounds.bottom - overlayBoundsInWindow.top,
+            left = focused.bounds.left - overlayBoundsInRoot.left,
+            top = focused.bounds.top - overlayBoundsInRoot.top,
+            right = focused.bounds.right - overlayBoundsInRoot.left,
+            bottom = focused.bounds.bottom - overlayBoundsInRoot.top,
         )
 
         val placement = OverlayPlacement.compute(
