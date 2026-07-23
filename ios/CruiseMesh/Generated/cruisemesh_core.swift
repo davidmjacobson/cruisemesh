@@ -1605,6 +1605,17 @@ public protocol MessageStoreProtocol : AnyObject {
     func backupTo(destination: String) throws 
     
     /**
+     * Block an identity (specs/friends-of-friends.md "dismissal-block
+     * tombstone"): inbound envelopes from it are dropped by both shells, it
+     * never appears as a friend suggestion, and a replayed friend request
+     * cannot re-create the contact. Silent — the blocked party is never
+     * notified. The contact row and chat history are kept; only a deliberate
+     * re-import of their card ([MessageStore::upsert_imported_contact])
+     * clears the block.
+     */
+    func blockUser(userId: Data, nowMs: Int64) throws 
+    
+    /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
      * that haven't expired as of `now_ms`, oldest first (DESIGN.md §5.3).
      * The caller passes the set of hints a just-met peer could match --
@@ -2040,6 +2051,10 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func insertOutgoingReply(message: StoredMessage, envelope: OutboundEnvelope, replyToMsgId: Data, queuedAtMs: Int64) throws  -> Bool
     
+    func isUserBlocked(userId: Data) throws  -> Bool
+    
+    func listBlockedUsers() throws  -> [Data]
+    
     /**
      * All contacts, alphabetical by name.
      */
@@ -2383,6 +2398,8 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func setFriendSuggestionState(candidateUserId: Data, state: UInt8) throws 
     
+    func unblockUser(userId: Data) throws  -> Bool
+    
     /**
      * Add or update a contact, keyed on `user_id` -- re-scanning the same
      * FriendCard (e.g. after they update their display name) replaces the
@@ -2619,6 +2636,23 @@ open func backfillPairwiseEnvelope(identity: Identity, contact: Contact, message
 open func backupTo(destination: String)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_backup_to(self.uniffiClonePointer(),
         FfiConverterString.lower(destination),$0
+    )
+}
+}
+    
+    /**
+     * Block an identity (specs/friends-of-friends.md "dismissal-block
+     * tombstone"): inbound envelopes from it are dropped by both shells, it
+     * never appears as a friend suggestion, and a replayed friend request
+     * cannot re-create the contact. Silent — the blocked party is never
+     * notified. The contact row and chat history are kept; only a deliberate
+     * re-import of their card ([MessageStore::upsert_imported_contact])
+     * clears the block.
+     */
+open func blockUser(userId: Data, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_block_user(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),
+        FfiConverterInt64.lower(nowMs),$0
     )
 }
 }
@@ -3296,6 +3330,21 @@ open func insertOutgoingReply(message: StoredMessage, envelope: OutboundEnvelope
 })
 }
     
+open func isUserBlocked(userId: Data)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_is_user_blocked(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
+    )
+})
+}
+    
+open func listBlockedUsers()throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_list_blocked_users(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
     /**
      * All contacts, alphabetical by name.
      */
@@ -3912,6 +3961,14 @@ open func setFriendSuggestionState(candidateUserId: Data, state: UInt8)throws  {
         FfiConverterUInt8.lower(state),$0
     )
 }
+}
+    
+open func unblockUser(userId: Data)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_unblock_user(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
+    )
+})
 }
     
     /**
@@ -12333,6 +12390,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to() != 11698) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_block_user() != 63065) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints() != 43270) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12433,6 +12493,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_outgoing_reply() != 64676) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_is_user_blocked() != 28386) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_list_blocked_users() != 55393) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_list_contacts() != 40385) {
@@ -12550,6 +12616,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_set_friend_suggestion_state() != 34158) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_unblock_user() != 18388) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_contact() != 23572) {
