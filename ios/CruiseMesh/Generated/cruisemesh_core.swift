@@ -11663,6 +11663,17 @@ public func openBackup(passphrase: String, file: Data)throws  -> CoreBackupPaylo
 /**
  * Open a group-authored envelope with the imported group key and verify the
  * embedded sender signature.
+ *
+ * SECURITY CONTRACT: this verifies only that the payload was sealed with the
+ * group key and signed by the key embedded in it — it does NOT check that
+ * the signer is a group member. Anyone holding the group key (an invite
+ * leak, a removed member before rotation) can produce an envelope that opens
+ * successfully under any identity they mint. Every caller MUST verify
+ * `sender_user_id ∈ group.member_user_ids` before trusting the body; both
+ * shells do this in `deliverOpenedGroupEnvelope`
+ * (InboundEnvelopeProcessor.kt / MeshController.swift), and
+ * `outsider_with_group_key_opens_but_is_not_a_member` pins this contract so
+ * a change here is deliberate, not accidental.
  */
 public func openGroupMessage(group: Group, sealed: Data)throws  -> OpenedMessage {
     return try  FfiConverterTypeOpenedMessage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -12198,7 +12209,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_open_backup() != 7338) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_open_group_message() != 52148) {
+    if (uniffi_cruisemesh_core_checksum_func_open_group_message() != 20328) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_open_message() != 14849) {
