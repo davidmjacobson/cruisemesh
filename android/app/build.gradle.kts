@@ -44,8 +44,9 @@ android {
         // permission trio (see AndroidManifest.xml) with no legacy fallback —
         // BLE mesh silently fails or crashes with SecurityException below API 31.
         minSdk = 31
-        // Play Console requires new releases to target API 35+.
-        targetSdk = 35
+        // Play Console requires new apps/updates to target API 36+ from
+        // 2026-08-31 (API 35 was the floor before that).
+        targetSdk = 36
         versionCode = versionCodeOverride ?: 1784406677
         versionName = versionNameOverride ?: "1.0.0"
     }
