@@ -1,28 +1,23 @@
 name: Android release
 
-# Before this workflow, APK builds were artisanal --
-# one workstation's NDK/cargo-ndk setup, versionCode a hand-bumped epoch
-# timestamp (android/app/build.gradle.kts), no CI job ever ran even
-# assembleDebug. Pushing an `android-v*` tag now cross-compiles the Rust
-# core for all three device ABIs, builds a release APK, and attaches it to
-# a GitHub Release.
+# Pushing an `android-v*` tag cross-compiles the Rust core for all three device
+# ABIs, builds a shrunk release APK (attached to a GitHub Release for
+# sideloading onto the test fleet) and -- when the Play publishing secrets are
+# configured -- also builds an upload-key-signed AAB and ships it to the Google
+# Play **internal testing** track via the Play Developer API.
 #
-# Signing gap (see also android/app/build.gradle.kts, keystore.properties.example):
-# there is no upload keystore checked into this repo or configured as a GitHub
-# secret. `assembleRelease` already falls back to the debug signing config
-# when app/keystore.properties is absent and the CRUISEMESH_RELEASE_STORE_FILE/
-# _STORE_PASSWORD/_KEY_ALIAS/_KEY_PASSWORD env vars aren't set (with a Gradle
-# warning printed at configure time) -- so this workflow builds and ships a
-# debug-signed "release" build type (minified/shrunk, but not upload-keyable).
-# That's fine for sideloading onto the test fleet; it is NOT Play-signable.
-# To close the gap: generate an upload keystore
-# (see android/app/keystore.properties.example), base64-encode it into a
-# CRUISEMESH_RELEASE_STORE_B64 GitHub secret alongside the three string
-# secrets above, add a decode-to-file step here before the gradlew invocation,
-# and point CRUISEMESH_RELEASE_STORE_FILE at the decoded path. Deliberately
-# not wired up yet -- no such secrets exist as of this writing, and inventing
-# names for secrets nobody has created yet would just be a second thing to
-# get wrong later.
+# The Play path is gated on secrets (PLAY_ENABLED below) so the workflow still
+# works without them: with no secrets it behaves exactly like the old
+# debug-signed-APK-only release. Required repository secrets to enable Play:
+#   CRUISEMESH_RELEASE_STORE_B64      base64 (no newlines) of app/upload-keystore.jks
+#   CRUISEMESH_RELEASE_STORE_PASSWORD keystore store password
+#   CRUISEMESH_RELEASE_KEY_ALIAS      key alias (cruisemesh-upload)
+#   CRUISEMESH_RELEASE_KEY_PASSWORD   key password
+#   PLAY_SERVICE_ACCOUNT_JSON         full JSON of the Play Developer API service account
+# The AAB is signed with the upload key; Google Play App Signing re-signs it
+# with the app signing key for distribution. The sideload APK stays debug-signed
+# (a separate gradle invocation without the signing env) so the test fleet's
+# existing install lineage is undisturbed.
 
 on:
   push:
@@ -35,6 +30,10 @@ permissions:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    env:
+      # Secrets can't be referenced in step `if:` conditions directly, so surface
+      # their presence as a plain env flag ('true'/'false') the steps can gate on.
+      PLAY_ENABLED: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' && secrets.CRUISEMESH_RELEASE_STORE_B64 != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,24 +72,25 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: bash core/build-android.sh
 
-      # FR15: versionCode must be unique and monotonically increasing for
-      # Play/adb installs to accept an upgrade over a previous build; a
-      # hand-bumped epoch timestamp doesn't guarantee that across concurrent
-      # branches. Commit count on the tagged ref is monotonic by construction
-      # for a linear history and always fits comfortably under the
-      # 2100000000 versionCode ceiling. versionName is just the tag with the
-      # "android-v" prefix stripped (e.g. tag `android-v1.2.3` -> "1.2.3").
+      # versionCode must be unique and strictly increasing for Play/adb to accept
+      # an upgrade. Epoch seconds at build time is monotonic for sequential
+      # releases AND stays above the epoch-style versionCodes already live on the
+      # Play track -- a commit count (the previous scheme, when this workflow only
+      # made a GitHub Release and never touched Play) would sit far below them and
+      # Play would reject the upload. Fits under the 2100000000 ceiling until
+      # ~2036. versionName is the tag with the "android-v" prefix stripped
+      # (e.g. tag `android-v1.2.3` -> "1.2.3").
       - name: Derive version from tag
         id: version
         run: |
           tag="${GITHUB_REF_NAME}"
           version_name="${tag#android-v}"
-          version_code="$(git rev-list --count HEAD)"
+          version_code="$(date +%s)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
           echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
 
-      - name: gradlew assembleRelease
+      - name: gradlew assembleRelease (debug-signed APK for sideloading)
         working-directory: android
         run: |
           chmod +x ./gradlew
@@ -113,5 +113,47 @@ jobs:
           gh release create "${{ steps.version.outputs.tag }}" \
             "${{ steps.apk.outputs.path }}" \
             --title "CruiseMesh Android ${{ steps.version.outputs.version_name }}" \
-            --notes "Automated build from ${{ github.sha }}. Debug-signed release build type -- see android-release.yml header comment for the signing gap; not Play-signable as-is." \
+            --notes "Automated build from ${{ github.sha }}. APK is debug-signed for sideloading; the Play internal-testing build is the upload-key-signed AAB (when Play secrets are configured)." \
             --generate-notes
+
+      # --- Play internal-testing publish (only when secrets are configured) ---
+
+      - name: Decode upload keystore
+        if: env.PLAY_ENABLED == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.CRUISEMESH_RELEASE_STORE_B64 }}
+        run: printf '%s' "$KEYSTORE_B64" | base64 -d > android/app/upload-keystore.jks
+
+      - name: gradlew bundleRelease (upload-key-signed AAB)
+        if: env.PLAY_ENABLED == 'true'
+        working-directory: android
+        env:
+          # build.gradle.kts's signingProp() reads these when app/keystore.properties
+          # is absent (it is -- gitignored, never in CI). STORE_FILE is resolved
+          # relative to android/app/, matching the decode path above.
+          CRUISEMESH_RELEASE_STORE_FILE: upload-keystore.jks
+          CRUISEMESH_RELEASE_STORE_PASSWORD: ${{ secrets.CRUISEMESH_RELEASE_STORE_PASSWORD }}
+          CRUISEMESH_RELEASE_KEY_ALIAS: ${{ secrets.CRUISEMESH_RELEASE_KEY_ALIAS }}
+          CRUISEMESH_RELEASE_KEY_PASSWORD: ${{ secrets.CRUISEMESH_RELEASE_KEY_PASSWORD }}
+        run: |
+          ./gradlew :app:bundleRelease \
+            -PversionCodeOverride=${{ steps.version.outputs.version_code }} \
+            -PversionNameOverride=${{ steps.version.outputs.version_name }}
+
+      - name: Publish AAB to Play internal testing
+        if: env.PLAY_ENABLED == 'true'
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check cryptography requests
+          umask 077
+          printf '%s' "$PLAY_SERVICE_ACCOUNT_JSON" > play-sa.json
+          trap 'rm -f play-sa.json' EXIT
+          python3 tools/play_publish.py \
+            play-sa.json \
+            android/app/build/outputs/bundle/release/app-release.aab \
+            "${{ steps.version.outputs.version_name }}"
+
+      - name: Clean up decoded keystore
+        if: always() && env.PLAY_ENABLED == 'true'
+        run: rm -f android/app/upload-keystore.jks
