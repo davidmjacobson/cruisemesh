@@ -111,6 +111,7 @@ import com.cruisemesh.app.ui.BubbleGrouping
 import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ComposerCameraIcon
 import com.cruisemesh.app.ui.ComposerMicIcon
+import com.cruisemesh.app.ui.launchContactReport
 import com.cruisemesh.app.ui.ComposerSendIcon
 import com.cruisemesh.app.ui.ReplyIcon
 import com.cruisemesh.app.ui.ContactDetailsSheet
@@ -201,6 +202,7 @@ fun ChatScreen(
     }
     var draft by remember(contact.userId) { mutableStateOf(DraftStore.load(context, contact.userId)) }
     var isMuted by remember(contact.userId) { mutableStateOf(ChatMuteStore.isMuted(context, contact.userId)) }
+    var isBlocked by remember(contact.userId) { mutableStateOf(store.isUserBlocked(contact.userId)) }
     var replyingTo by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
     // A photo picked but not yet sent: shown as a preview card above the composer
@@ -413,6 +415,16 @@ fun ChatScreen(
             reload()
             ChatEvents.notifyChatChanged(currentContact.userId)
         },
+        isBlocked = isBlocked,
+        onBlockedChange = { blocked ->
+            if (blocked) {
+                store.blockUser(currentContact.userId, System.currentTimeMillis())
+            } else {
+                store.unblockUser(currentContact.userId)
+            }
+            isBlocked = blocked
+        },
+        onReport = { launchContactReport(context, currentContact, ownUserId) },
     )
 }
 
@@ -453,6 +465,9 @@ private fun ConversationScreen(
     isMuted: Boolean = false,
     onMutedChange: (Boolean) -> Unit = {},
     onSetNickname: (String?) -> Unit = {},
+    isBlocked: Boolean = false,
+    onBlockedChange: (Boolean) -> Unit = {},
+    onReport: () -> Unit = {},
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
@@ -610,6 +625,9 @@ private fun ConversationScreen(
                     isMuted = isMuted,
                     onMutedChange = onMutedChange,
                     onSetNickname = onSetNickname,
+                    isBlocked = isBlocked,
+                    onBlockedChange = onBlockedChange,
+                    onReport = onReport,
                     avatarBytes = contactAvatar,
                     onDeleteContact = {
                         showContactDetails = false

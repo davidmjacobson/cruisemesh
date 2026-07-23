@@ -10,11 +10,15 @@ struct ContactDetailsSheet: View {
     var isMuted: Bool = false
     var onMutedChange: (Bool) -> Void = { _ in }
     var onSetNickname: (String?) -> Void = { _ in }
+    var isBlocked: Bool = false
+    var onBlockedChange: (Bool) -> Void = { _ in }
+    var onReport: () -> Void = {}
     let onDelete: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var editingNickname = false
     @State private var nicknameDraft = ""
     @State private var showVerification = false
+    @State private var confirmingBlock = false
 
     private var displayId: String { formatUserId(userId: contact.userId) }
     private var displayName: String {
@@ -80,6 +84,18 @@ struct ContactDetailsSheet: View {
                     ))
                     .padding(.top, 24)
 
+                    Toggle("Block contact", isOn: Binding(
+                        get: { isBlocked },
+                        set: { wantBlocked in
+                            if wantBlocked {
+                                confirmingBlock = true
+                            } else {
+                                onBlockedChange(false)
+                            }
+                        }
+                    ))
+                    .padding(.top, 8)
+
                     DisclosureGroup(isExpanded: $showVerification) {
                         VStack(alignment: .leading, spacing: 12) {
                             HStack(spacing: 8) {
@@ -112,6 +128,13 @@ struct ContactDetailsSheet: View {
                     )
                     .padding(.top, 24)
 
+                    Button(action: onReport) {
+                        Text("Report contact")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.top, 16)
+
                     Button(role: .destructive, action: onDelete) {
                         Text("Delete contact")
                             .frame(maxWidth: .infinity)
@@ -130,6 +153,12 @@ struct ContactDetailsSheet: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .alert("Block \(displayName)?", isPresented: $confirmingBlock) {
+                Button("Block", role: .destructive) { onBlockedChange(true) }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("They won't be able to message you, and they won't appear as a suggested friend. They won't be told. Scanning their card again unblocks them.")
             }
             .alert("Nickname", isPresented: $editingNickname) {
                 TextField(contact.name, text: $nicknameDraft)

@@ -57,6 +57,9 @@ fun ContactDetailsSheet(
     isMuted: Boolean = false,
     onMutedChange: (Boolean) -> Unit = {},
     onSetNickname: (String?) -> Unit = {},
+    isBlocked: Boolean = false,
+    onBlockedChange: (Boolean) -> Unit = {},
+    onReport: () -> Unit = {},
 ) {
     // skipPartiallyExpanded: expanding "Verify contact" grows the sheet's
     // content height, which makes Material3 recompute the peek/full anchors.
@@ -73,6 +76,9 @@ fun ContactDetailsSheet(
             isMuted = isMuted,
             onMutedChange = onMutedChange,
             onSetNickname = onSetNickname,
+            isBlocked = isBlocked,
+            onBlockedChange = onBlockedChange,
+            onReport = onReport,
             modifier = Modifier.padding(bottom = 24.dp),
         )
     }
@@ -88,6 +94,9 @@ fun ContactDetailsSheetContent(
     isMuted: Boolean = false,
     onMutedChange: (Boolean) -> Unit = {},
     onSetNickname: (String?) -> Unit = {},
+    isBlocked: Boolean = false,
+    onBlockedChange: (Boolean) -> Unit = {},
+    onReport: () -> Unit = {},
 ) {
     val displayId = formatUserId(contact.userId)
     val displayName = ChatListLogic.displayNameOrId(coreContactDisplayName(contact), displayId)
@@ -228,6 +237,49 @@ fun ContactDetailsSheetContent(
         ) {
             Text(stringResource(R.string.ui_mute_notifications), modifier = Modifier.weight(1f))
             Switch(checked = isMuted, onCheckedChange = onMutedChange)
+        }
+
+        var confirmingBlock by remember(contact.userId) { mutableStateOf(false) }
+        if (confirmingBlock) {
+            AlertDialog(
+                onDismissRequest = { confirmingBlock = false },
+                title = { Text(stringResource(R.string.ui_block_named, displayName)) },
+                text = { Text(stringResource(R.string.ui_block_explanation)) },
+                confirmButton = {
+                    TextButton(onClick = {
+                        confirmingBlock = false
+                        onBlockedChange(true)
+                    }) {
+                        Text(stringResource(R.string.ui_block))
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmingBlock = false }) {
+                        Text(stringResource(R.string.ui_cancel))
+                    }
+                },
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(stringResource(R.string.ui_block_contact), modifier = Modifier.weight(1f))
+            Switch(
+                checked = isBlocked,
+                onCheckedChange = { wantBlocked ->
+                    if (wantBlocked) confirmingBlock = true else onBlockedChange(false)
+                },
+            )
+        }
+
+        OutlinedButton(
+            onClick = onReport,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 16.dp),
+        ) {
+            Text(stringResource(R.string.ui_report_contact))
         }
 
         Button(

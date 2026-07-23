@@ -6,7 +6,11 @@ enum FriendDirectorySender {
     private static let ticketLifetimeMs: Int64 = 30 * 24 * 60 * 60 * 1_000
 
     static func queueToAllContacts(store: MessageStore, identity: Identity) {
-        let contacts = (try? store.listContacts()) ?? []
+        // Blocked contacts are excluded both as directory recipients and as
+        // candidates — we neither talk to them nor introduce them to friends.
+        let blocked = Set((try? store.listBlockedUsers()) ?? [])
+        let contacts = ((try? store.listContacts()) ?? [])
+            .filter { !blocked.contains($0.userId) }
         let revision = FriendsOfFriendsStore.nextDirectoryRevision()
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
         let enabled = FriendsOfFriendsStore.isEnabled()

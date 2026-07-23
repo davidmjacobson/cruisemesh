@@ -1560,6 +1560,56 @@
           }
         }
       }
+    },
+    "Block": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Block"
+          }
+        }
+      }
+    },
+    "Block contact": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Block contact"
+          }
+        }
+      }
+    },
+    "Block %@?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Block %@?"
+          }
+        }
+      }
+    },
+    "They won't be able to message you, and they won't appear as a suggested friend. They won't be told. Scanning their card again unblocks them.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "They won't be able to message you, and they won't appear as a suggested friend. They won't be told. Scanning their card again unblocks them."
+          }
+        }
+      }
+    },
+    "Report contact": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Report contact"
+          }
+        }
+      }
     }
   },
   "version": "1.0"

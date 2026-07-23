@@ -23,6 +23,10 @@
     <string name="ui_ask_them_to_check_these_words_match_their">Ask them to check these words match their card.</string>
     <string name="ui_back">Back</string>
     <string name="ui_back_up_account">Back up account</string>
+    <string name="ui_block">Block</string>
+    <string name="ui_block_contact">Block contact</string>
+    <string name="ui_block_explanation">They won\'t be able to message you, and they won\'t appear as a suggested friend. They won\'t be told. Scanning their card again unblocks them.</string>
+    <string name="ui_block_named">Block %1$s?</string>
     <string name="ui_camera_permission_is_needed_to_scan_a_friend">Camera permission is needed to scan a friend card.</string>
     <string name="ui_cancel">Cancel</string>
     <string name="ui_choose_photo">Choose photo</string>
@@ -104,6 +108,10 @@
     <string name="ui_relay_url">Relay URL</string>
     <string name="ui_relay_url_optional">Relay URL (optional)</string>
     <string name="ui_release_to_send">release to send</string>
+    <string name="ui_report_contact">Report contact</string>
+    <string name="ui_report_email_body">Reporting: %1$s\nTheir ID: %2$s\nTheir safety words: %3$s\nMy ID: %4$s\n\nWhat happened:\n</string>
+    <string name="ui_report_email_subject">CruiseMesh abuse report</string>
+    <string name="ui_no_email_app">No email app found. You can email %1$s directly.</string>
     <string name="ui_recording_duration">Recording… %1$s</string>
     <string name="ui_last_peer">Last peer: %1$s</string>
     <string name="ui_this_phone">This phone: %1$s</string>
