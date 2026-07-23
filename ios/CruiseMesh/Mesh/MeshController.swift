@@ -356,6 +356,12 @@ final class MeshController: ObservableObject {
     private func sendHello(address: String) {
         guard let identity else { return }
         MeshRouter.sendToAddress(address: address, frame: encodeHello(userId: identity.userId))
+        // HELLO2 rides right behind the legacy HELLO: capability bits for
+        // the hidden-kind spray bound. Pre-HELLO2 builds reject the unknown
+        // frame type and drop it without touching the link.
+        if let hello2 = try? encodeHello2(userId: identity.userId, capabilities: coreOwnCapabilities()) {
+            MeshRouter.sendToAddress(address: address, frame: hello2)
+        }
     }
 
     private func onFrameReceived(address: String, frame: Data) {
@@ -370,6 +376,8 @@ final class MeshController: ObservableObject {
         switch parsed {
         case .hello(let userId):
             handleHello(address: address, userId: userId, identity: identity)
+        case .hello2(let userId, let capabilities):
+            MeshRouter.onHello2(address: address, userId: userId, capabilities: capabilities)
         case .envelope(let msgId, let hopTtl, let expiry, let recipientHint, let sealed):
             processInboundEnvelope(
                 sourceAddress: address,
@@ -596,6 +604,15 @@ final class MeshController: ObservableObject {
                 afterLamport: peerHasThrough
             )) ?? []
             let byLamport = Dictionary(uniqueKeysWithValues: queued.map { ($0.lamport, $0) })
+            // Same once-per-session bound as the core spray plan: a peer
+            // without CAP_ACKS_HIDDEN_KINDS never advances its DELIVERED
+            // watermark past hidden kinds, so this direct re-offer would
+            // repeat them on every digest for the full expiry.
+            let gateHidden = !MeshRouter.peerAcksHiddenKinds(address: address)
+            let alreadyOffered = gateHidden
+                ? Set(MeshRouter.hiddenOfferedFor(address: address))
+                : Set<Data>()
+            var newlyOffered: [Data] = []
             let missing = (try? store.messagesAfter(
                 chatId: contact.userId,
                 senderUserId: identity.userId,
@@ -605,9 +622,14 @@ final class MeshController: ObservableObject {
                 let outbound = byLamport[message.lamport]
                     ?? backfillOutbound(identity: identity, contact: contact, message: message)
                 if let outbound {
+                    if gateHidden, coreIsHiddenSprayKind(kind: outbound.kind) {
+                        if alreadyOffered.contains(outbound.msgId) { continue }
+                        newlyOffered.append(outbound.msgId)
+                    }
                     MeshRouter.sendToAddress(address: address, frame: encodeOutboundEnvelopeFrame(outbound))
                 }
             }
+            MeshRouter.recordHiddenOffered(address: address, msgIds: newlyOffered)
         }
         resendGroupOutboundToPeer(address: address, peerUserId: peerUserId, identity: identity)
         sprayDigestPlanTo(
@@ -2064,7 +2086,9 @@ final class MeshController: ObservableObject {
             nowMs: now,
             ownOutboundBudgetBytes: MeshDefaults.ownOutboundSprayBudgetBytes,
             ownReceiptBudgetBytes: MeshDefaults.ownReceiptSprayBudgetBytes,
-            receiptQueryLimit: MeshDefaults.relayStoreBatchLimit
+            receiptQueryLimit: MeshDefaults.relayStoreBatchLimit,
+            peerAcksHiddenKinds: MeshRouter.peerAcksHiddenKinds(address: address),
+            hiddenAlreadyOffered: MeshRouter.hiddenOfferedFor(address: address)
         ) else {
             log.warning("Failed to build digest spray plan for \(address, privacy: .public)")
             return
@@ -2073,6 +2097,7 @@ final class MeshController: ObservableObject {
         for frame in frames {
             _ = MeshRouter.sendToAddress(address: address, frame: frame)
         }
+        MeshRouter.recordHiddenOffered(address: address, msgIds: plan.offeredHiddenMsgIds)
     }
 
     // Hint aggregation (recent/delivery/known-target/group matching) moved

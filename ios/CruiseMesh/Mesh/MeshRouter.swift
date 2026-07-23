@@ -59,6 +59,23 @@ enum MeshRouter {
         state.onHello(address: address, userId: userId)
     }
 
+    @discardableResult
+    static func onHello2(address: String, userId: Data, capabilities: UInt32) -> Bool {
+        state.onHello2(address: address, userId: userId, capabilities: capabilities)
+    }
+
+    static func peerAcksHiddenKinds(address: String) -> Bool {
+        state.peerAcksHiddenKinds(address: address)
+    }
+
+    static func hiddenOfferedFor(address: String) -> [Data] {
+        state.hiddenOfferedFor(address: address)
+    }
+
+    static func recordHiddenOffered(address: String, msgIds: [Data]) {
+        state.recordHiddenOffered(address: address, msgIds: msgIds)
+    }
+
     static func userIdFor(address: String) -> Data? {
         state.userIdFor(address: address)
     }

@@ -86,6 +86,19 @@ object MeshRouter {
     /** [address] identified itself as [userId] via a HELLO frame. */
     fun onHello(address: String, userId: ByteArray): Boolean = state.onHello(address, userId)
 
+    /** [address]'s HELLO2 follow-up: identity + capability bits. */
+    fun onHello2(address: String, userId: ByteArray, capabilities: UInt): Boolean =
+        state.onHello2(address, userId, capabilities)
+
+    /** Whether [address] advertised CAP_ACKS_HIDDEN_KINDS (false = pre-HELLO2 build). */
+    fun peerAcksHiddenKinds(address: String): Boolean = state.peerAcksHiddenKinds(address)
+
+    /** Hidden-kind msg_ids already sprayed to [address] this link session. */
+    fun hiddenOfferedFor(address: String): List<ByteArray> = state.hiddenOfferedFor(address)
+
+    fun recordHiddenOffered(address: String, msgIds: List<ByteArray>) =
+        state.recordHiddenOffered(address, msgIds)
+
     /** The userId [address] identified as, if known. */
     fun userIdFor(address: String): ByteArray? = state.userIdFor(address)
 

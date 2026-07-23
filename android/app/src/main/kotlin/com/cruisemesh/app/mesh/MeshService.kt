@@ -44,7 +44,10 @@ import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.encodeDigest
 import uniffi.cruisemesh_core.shouldRedigest
+import uniffi.cruisemesh_core.coreIsHiddenSprayKind
+import uniffi.cruisemesh_core.coreOwnCapabilities
 import uniffi.cruisemesh_core.encodeHello
+import uniffi.cruisemesh_core.encodeHello2
 import uniffi.cruisemesh_core.encodeLanEndpoint
 import uniffi.cruisemesh_core.encodeTransportProbe
 import uniffi.cruisemesh_core.parseFrame
@@ -1058,6 +1061,10 @@ class MeshService : Service() {
     private fun sendHello(address: String) {
         val ownUserId = identity?.userId ?: return
         MeshRouter.sendToAddress(address, encodeHello(ownUserId))
+        // HELLO2 rides right behind the legacy HELLO: capability bits for
+        // the hidden-kind spray bound. Pre-HELLO2 builds reject the unknown
+        // frame type and drop it without touching the link.
+        MeshRouter.sendToAddress(address, encodeHello2(ownUserId, coreOwnCapabilities()))
     }
 
     private fun onFrameReceived(address: String, frame: ByteArray) {
@@ -1073,6 +1080,7 @@ class MeshService : Service() {
         }
         when (parsed) {
             is Frame.Hello -> handleHello(address, parsed.userId, identity)
+            is Frame.Hello2 -> MeshRouter.onHello2(address, parsed.userId, parsed.capabilities)
             is Frame.Envelope -> envelopeProcessor?.processInboundEnvelope(address, parsed, identity)
             is Frame.Digest -> handleDigest(address, parsed.chatId, parsed.entries, parsed.recentMsgIds, identity)
             is Frame.LanEndpoint -> handleLanEndpointHint(address, parsed)
@@ -1373,13 +1381,29 @@ class MeshService : Service() {
             val queuedByLamport = store
                 .outboundEnvelopesAfter(contact.userId, identity.userId, peerHasThrough)
                 .associateBy { it.lamport }
+            // Same once-per-session bound as the core spray plan: a peer
+            // without CAP_ACKS_HIDDEN_KINDS never advances its DELIVERED
+            // watermark past hidden kinds, so this direct re-offer would
+            // repeat them on every digest for the full expiry.
+            val gateHidden = !MeshRouter.peerAcksHiddenKinds(address)
+            val alreadyOffered = if (gateHidden) {
+                MeshRouter.hiddenOfferedFor(address).mapTo(mutableSetOf(), UserIdHex::encode)
+            } else {
+                mutableSetOf()
+            }
+            val newlyOffered = mutableListOf<ByteArray>()
             val missing = store.messagesAfter(contact.userId, identity.userId, peerHasThrough)
             for (message in missing) {
                 val outbound = queuedByLamport[message.lamport] ?: backfillOutboundAuthoredEnvelope(identity, contact, message)
                 if (outbound != null) {
+                    if (gateHidden && coreIsHiddenSprayKind(outbound.kind)) {
+                        if (UserIdHex.encode(outbound.msgId) in alreadyOffered) continue
+                        newlyOffered += outbound.msgId
+                    }
                     sendStoredOutboundEnvelope(address, outbound)
                 }
             }
+            MeshRouter.recordHiddenOffered(address, newlyOffered)
             // Group digests are not on the wire yet (1:1 digest only). At family
             // scale, re-offer every outbound group envelope we authored for
             // groups this peer is in; their insert is idempotent.

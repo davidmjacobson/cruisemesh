@@ -893,6 +893,8 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
     
     func helloedUserIds()  -> [Data]
     
+    func hiddenOfferedFor(address: String)  -> [Data]
+    
     func identifiedRoutes()  -> [CoreIdentifiedRoute]
     
     func onConnected(address: String, transport: CoreTransport) 
@@ -900,6 +902,23 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
     func onDisconnected(address: String) 
     
     func onHello(address: String, userId: Data)  -> Bool
+    
+    /**
+     * HELLO2 follow-up: same identity-consistency rule as [`Self::on_hello`],
+     * plus the peer's capability bits. Order-tolerant with the legacy HELLO
+     * (which is sent first but could be processed either side of this).
+     */
+    func onHello2(address: String, userId: Data, capabilities: UInt32)  -> Bool
+    
+    /**
+     * Whether this peer advertised [`crate::protocol::CAP_ACKS_HIDDEN_KINDS`].
+     * `false` for pre-HELLO2 builds — they process hidden kinds fine but
+     * never advance their DELIVERED watermark past them, so re-sprays toward
+     * them are bounded to once per session instead of every digest.
+     */
+    func peerAcksHiddenKinds(address: String)  -> Bool
+    
+    func recordHiddenOffered(address: String, msgIds: [Data]) 
     
     func routeFor(userId: Data)  -> CoreTransportRoute?
     
@@ -1002,6 +1021,14 @@ open func helloedUserIds() -> [Data] {
 })
 }
     
+open func hiddenOfferedFor(address: String) -> [Data] {
+    return try!  FfiConverterSequenceData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_hidden_offered_for(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),$0
+    )
+})
+}
+    
 open func identifiedRoutes() -> [CoreIdentifiedRoute] {
     return try!  FfiConverterSequenceTypeCoreIdentifiedRoute.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_method_coremeshrouterstate_identified_routes(self.uniffiClonePointer(),$0
@@ -1031,6 +1058,43 @@ open func onHello(address: String, userId: Data) -> Bool {
         FfiConverterData.lower(userId),$0
     )
 })
+}
+    
+    /**
+     * HELLO2 follow-up: same identity-consistency rule as [`Self::on_hello`],
+     * plus the peer's capability bits. Order-tolerant with the legacy HELLO
+     * (which is sent first but could be processed either side of this).
+     */
+open func onHello2(address: String, userId: Data, capabilities: UInt32) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_on_hello2(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterData.lower(userId),
+        FfiConverterUInt32.lower(capabilities),$0
+    )
+})
+}
+    
+    /**
+     * Whether this peer advertised [`crate::protocol::CAP_ACKS_HIDDEN_KINDS`].
+     * `false` for pre-HELLO2 builds — they process hidden kinds fine but
+     * never advance their DELIVERED watermark past them, so re-sprays toward
+     * them are bounded to once per session instead of every digest.
+     */
+open func peerAcksHiddenKinds(address: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_peer_acks_hidden_kinds(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),$0
+    )
+})
+}
+    
+open func recordHiddenOffered(address: String, msgIds: [Data]) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_record_hidden_offered(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterSequenceData.lower(msgIds),$0
+    )
+}
 }
     
 open func routeFor(userId: Data) -> CoreTransportRoute? {
@@ -1746,7 +1810,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * carried traffic, this device's pending pairwise traffic to other
      * contacts, and pending receipts owed to other contacts.
      */
-    func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64) throws  -> CoreDigestSprayPlan
+    func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data]) throws  -> CoreDigestSprayPlan
     
     /**
      * Relay ack ids for one poll pass, folding the consumed-SEEN rule
@@ -2856,7 +2920,7 @@ open func coreDigestAdvertisedMsgIds()throws  -> [Data] {
      * carried traffic, this device's pending pairwise traffic to other
      * contacts, and pending receipts owed to other contacts.
      */
-open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64)throws  -> CoreDigestSprayPlan {
+open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data])throws  -> CoreDigestSprayPlan {
     return try  FfiConverterTypeCoreDigestSprayPlan.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_core_digest_spray_plan(self.uniffiClonePointer(),
         FfiConverterData.lower(ownUserId),
@@ -2866,7 +2930,9 @@ open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Dat
         FfiConverterInt64.lower(nowMs),
         FfiConverterUInt64.lower(ownOutboundBudgetBytes),
         FfiConverterUInt64.lower(ownReceiptBudgetBytes),
-        FfiConverterUInt64.lower(receiptQueryLimit),$0
+        FfiConverterUInt64.lower(receiptQueryLimit),
+        FfiConverterBool.lower(peerAcksHiddenKinds),
+        FfiConverterSequenceData.lower(hiddenAlreadyOffered),$0
     )
 })
 }
@@ -5209,13 +5275,29 @@ public struct CoreDigestSprayPlan {
     public var carriedFrames: [Data]
     public var ownOutboundFrames: [Data]
     public var ownReceiptFrames: [Data]
+    /**
+     * Hidden-kind msg_ids newly included for a peer that can't ack hidden
+     * kinds. The shell records these on the peer's router entry
+     * (`record_hidden_offered`) after sending, so the next plan for this
+     * session excludes them — the once-per-session re-spray bound. Empty
+     * when the peer advertised CAP_ACKS_HIDDEN_KINDS.
+     */
+    public var offeredHiddenMsgIds: [Data]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(carriedFrames: [Data], ownOutboundFrames: [Data], ownReceiptFrames: [Data]) {
+    public init(carriedFrames: [Data], ownOutboundFrames: [Data], ownReceiptFrames: [Data], 
+        /**
+         * Hidden-kind msg_ids newly included for a peer that can't ack hidden
+         * kinds. The shell records these on the peer's router entry
+         * (`record_hidden_offered`) after sending, so the next plan for this
+         * session excludes them — the once-per-session re-spray bound. Empty
+         * when the peer advertised CAP_ACKS_HIDDEN_KINDS.
+         */offeredHiddenMsgIds: [Data]) {
         self.carriedFrames = carriedFrames
         self.ownOutboundFrames = ownOutboundFrames
         self.ownReceiptFrames = ownReceiptFrames
+        self.offeredHiddenMsgIds = offeredHiddenMsgIds
     }
 }
 
@@ -5232,6 +5314,9 @@ extension CoreDigestSprayPlan: Equatable, Hashable {
         if lhs.ownReceiptFrames != rhs.ownReceiptFrames {
             return false
         }
+        if lhs.offeredHiddenMsgIds != rhs.offeredHiddenMsgIds {
+            return false
+        }
         return true
     }
 
@@ -5239,6 +5324,7 @@ extension CoreDigestSprayPlan: Equatable, Hashable {
         hasher.combine(carriedFrames)
         hasher.combine(ownOutboundFrames)
         hasher.combine(ownReceiptFrames)
+        hasher.combine(offeredHiddenMsgIds)
     }
 }
 
@@ -5252,7 +5338,8 @@ public struct FfiConverterTypeCoreDigestSprayPlan: FfiConverterRustBuffer {
             try CoreDigestSprayPlan(
                 carriedFrames: FfiConverterSequenceData.read(from: &buf), 
                 ownOutboundFrames: FfiConverterSequenceData.read(from: &buf), 
-                ownReceiptFrames: FfiConverterSequenceData.read(from: &buf)
+                ownReceiptFrames: FfiConverterSequenceData.read(from: &buf), 
+                offeredHiddenMsgIds: FfiConverterSequenceData.read(from: &buf)
         )
     }
 
@@ -5260,6 +5347,7 @@ public struct FfiConverterTypeCoreDigestSprayPlan: FfiConverterRustBuffer {
         FfiConverterSequenceData.write(value.carriedFrames, into: &buf)
         FfiConverterSequenceData.write(value.ownOutboundFrames, into: &buf)
         FfiConverterSequenceData.write(value.ownReceiptFrames, into: &buf)
+        FfiConverterSequenceData.write(value.offeredHiddenMsgIds, into: &buf)
     }
 }
 
@@ -9392,6 +9480,17 @@ public enum Frame {
     
     case hello(userId: Data
     )
+    /**
+     * Capability HELLO (frame type 0x06), sent immediately after the legacy
+     * HELLO on every link. Legacy clients reject the unknown frame type in
+     * `parse_frame` and both shells drop unparseable frames without
+     * touching the link, so this is safe to send blind. The legacy HELLO
+     * must never grow trailing fields instead: its parser swallows the
+     * whole remainder into `user_id`, so appended bytes would corrupt the
+     * peer identity on old clients.
+     */
+    case hello2(userId: Data, capabilities: UInt32
+    )
     case envelope(msgId: Data, hopTtl: UInt8, expiry: Int64, recipientHint: Data, sealed: Data
     )
     case digest(chatId: Data, entries: [DigestEntry], recentMsgIds: [Data]
@@ -9416,16 +9515,19 @@ public struct FfiConverterTypeFrame: FfiConverterRustBuffer {
         case 1: return .hello(userId: try FfiConverterData.read(from: &buf)
         )
         
-        case 2: return .envelope(msgId: try FfiConverterData.read(from: &buf), hopTtl: try FfiConverterUInt8.read(from: &buf), expiry: try FfiConverterInt64.read(from: &buf), recipientHint: try FfiConverterData.read(from: &buf), sealed: try FfiConverterData.read(from: &buf)
+        case 2: return .hello2(userId: try FfiConverterData.read(from: &buf), capabilities: try FfiConverterUInt32.read(from: &buf)
         )
         
-        case 3: return .digest(chatId: try FfiConverterData.read(from: &buf), entries: try FfiConverterSequenceTypeDigestEntry.read(from: &buf), recentMsgIds: try FfiConverterSequenceData.read(from: &buf)
+        case 3: return .envelope(msgId: try FfiConverterData.read(from: &buf), hopTtl: try FfiConverterUInt8.read(from: &buf), expiry: try FfiConverterInt64.read(from: &buf), recipientHint: try FfiConverterData.read(from: &buf), sealed: try FfiConverterData.read(from: &buf)
         )
         
-        case 4: return .lanEndpoint(instanceToken: try FfiConverterData.read(from: &buf), host: try FfiConverterString.read(from: &buf), port: try FfiConverterUInt16.read(from: &buf)
+        case 4: return .digest(chatId: try FfiConverterData.read(from: &buf), entries: try FfiConverterSequenceTypeDigestEntry.read(from: &buf), recentMsgIds: try FfiConverterSequenceData.read(from: &buf)
         )
         
-        case 5: return .transportProbe(nonce: try FfiConverterUInt64.read(from: &buf), response: try FfiConverterBool.read(from: &buf)
+        case 5: return .lanEndpoint(instanceToken: try FfiConverterData.read(from: &buf), host: try FfiConverterString.read(from: &buf), port: try FfiConverterUInt16.read(from: &buf)
+        )
+        
+        case 6: return .transportProbe(nonce: try FfiConverterUInt64.read(from: &buf), response: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -9441,8 +9543,14 @@ public struct FfiConverterTypeFrame: FfiConverterRustBuffer {
             FfiConverterData.write(userId, into: &buf)
             
         
-        case let .envelope(msgId,hopTtl,expiry,recipientHint,sealed):
+        case let .hello2(userId,capabilities):
             writeInt(&buf, Int32(2))
+            FfiConverterData.write(userId, into: &buf)
+            FfiConverterUInt32.write(capabilities, into: &buf)
+            
+        
+        case let .envelope(msgId,hopTtl,expiry,recipientHint,sealed):
+            writeInt(&buf, Int32(3))
             FfiConverterData.write(msgId, into: &buf)
             FfiConverterUInt8.write(hopTtl, into: &buf)
             FfiConverterInt64.write(expiry, into: &buf)
@@ -9451,21 +9559,21 @@ public struct FfiConverterTypeFrame: FfiConverterRustBuffer {
             
         
         case let .digest(chatId,entries,recentMsgIds):
-            writeInt(&buf, Int32(3))
+            writeInt(&buf, Int32(4))
             FfiConverterData.write(chatId, into: &buf)
             FfiConverterSequenceTypeDigestEntry.write(entries, into: &buf)
             FfiConverterSequenceData.write(recentMsgIds, into: &buf)
             
         
         case let .lanEndpoint(instanceToken,host,port):
-            writeInt(&buf, Int32(4))
+            writeInt(&buf, Int32(5))
             FfiConverterData.write(instanceToken, into: &buf)
             FfiConverterString.write(host, into: &buf)
             FfiConverterUInt16.write(port, into: &buf)
             
         
         case let .transportProbe(nonce,response):
-            writeInt(&buf, Int32(5))
+            writeInt(&buf, Int32(6))
             FfiConverterUInt64.write(nonce, into: &buf)
             FfiConverterBool.write(response, into: &buf)
             
@@ -10904,6 +11012,20 @@ public func coreInboundGate(isNewMsgId: Bool, hopTtl: UInt8, expiryMs: Int64, no
 })
 }
 /**
+ * The sideband kinds that ride `outbound_envelopes` with a `msg_id = NULL`
+ * messages row: excluded from digests and recent-msg-id acks, so their only
+ * stop condition is the peer's DELIVERED watermark advancing — which never
+ * happens against a peer that lacks [`CAP_ACKS_HIDDEN_KINDS`]. The spray
+ * plan bounds re-sends of exactly these kinds toward such peers.
+ */
+public func coreIsHiddenSprayKind(kind: UInt8) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_is_hidden_spray_kind(
+        FfiConverterUInt8.lower(kind),$0
+    )
+})
+}
+/**
  * No-gossip-reinjection classifier for relay-sourced group mail
  * (`specs/group-relay-durability.md` §4.3): returns whether
  * `recipient_hint` is one of THIS device's own recent-day hints -- i.e.
@@ -10957,6 +11079,16 @@ public func coreMakeLanEndpointLink(endpoint: CoreLanEndpoint) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_make_lan_endpoint_link(
         FfiConverterTypeCoreLanEndpoint.lower(endpoint),$0
+    )
+})
+}
+/**
+ * The capability bits this build advertises in HELLO2. Both shells call
+ * this instead of hardcoding bits so they can never disagree with core.
+ */
+public func coreOwnCapabilities() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_own_capabilities($0
     )
 })
 }
@@ -11396,6 +11528,20 @@ public func encodeHello(userId: Data) -> Data {
     return try!  FfiConverterData.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_encode_hello(
         FfiConverterData.lower(userId),$0
+    )
+})
+}
+/**
+ * Encode a HELLO2 frame: `0x06 ‖ user_id[16] ‖ capabilities:u32-LE`. Send
+ * right after the legacy HELLO (see [`Frame::Hello2`] for why the legacy
+ * frame can't carry this). Parsers ignore trailing bytes past the
+ * capabilities word — that is HELLO2's designated forward-extension point.
+ */
+public func encodeHello2(userId: Data, capabilities: UInt32)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_encode_hello2(
+        FfiConverterData.lower(userId),
+        FfiConverterUInt32.lower(capabilities),$0
     )
 })
 }
@@ -12002,6 +12148,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_inbound_gate() != 47063) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_is_hidden_spray_kind() != 59579) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_is_own_fanout_hint() != 52117) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12018,6 +12167,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_make_lan_endpoint_link() != 27969) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_own_capabilities() != 36411) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_pairwise_sender_authorized() != 18726) {
@@ -12132,6 +12284,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_hello() != 21775) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_encode_hello2() != 33297) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_identity_bytes() != 19325) {
@@ -12311,6 +12466,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_helloed_user_ids() != 10863) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_hidden_offered_for() != 44075) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_identified_routes() != 51137) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12321,6 +12479,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_hello() != 46445) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_hello2() != 17439) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_peer_acks_hidden_kinds() != 60478) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_record_hidden_offered() != 41551) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_route_for() != 36259) {
@@ -12437,7 +12604,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 37419) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 56337) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 37814) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 62249) {

@@ -1743,9 +1743,12 @@ internal class InboundEnvelopeProcessor(
                 ownOutboundBudgetBytes = OWN_OUTBOUND_SPRAY_BUDGET_BYTES.toULong(),
                 ownReceiptBudgetBytes = OWN_RECEIPT_SPRAY_BUDGET_BYTES.toULong(),
                 receiptQueryLimit = RELAY_STORE_BATCH_LIMIT,
+                peerAcksHiddenKinds = MeshRouter.peerAcksHiddenKinds(address),
+                hiddenAlreadyOffered = MeshRouter.hiddenOfferedFor(address),
             )
             val frames = plan.carriedFrames + plan.ownOutboundFrames + plan.ownReceiptFrames
             val sprayed = frames.count { MeshRouter.sendToAddress(address, it) }
+            MeshRouter.recordHiddenOffered(address, plan.offeredHiddenMsgIds)
             Log.i(
                 TAG,
                 "Digest spray to $address sent $sprayed/${frames.size} frame(s) " +
