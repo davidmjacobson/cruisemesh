@@ -3,14 +3,14 @@
 <!--
   Export options for the automated TestFlight release (ios-release.yml).
 
-  Uses automatic (cloud) signing: with "xcodebuild -exportArchive
-  -allowProvisioningUpdates" and an App Store Connect API key, Xcode provisions a
-  distribution profile and signs with the cloud-managed Apple Distribution
-  certificate whose private key lives on Apple's servers. So CI needs no local
-  .p12 certificate or provisioning profile (only the API key), which is why the
-  fragile locked signing keychains on the interactive Mac are irrelevant to this
-  path. The sibling ExportOptions-TestFlight.plist uses manual signing and is
-  kept for hand-driven exports where a distribution cert is installed.
+  MANUAL signing: the workflow imports a dedicated CI distribution certificate
+  and this named provisioning profile ("CruiseMesh CI App Store") into a
+  throwaway keychain, and xcodebuild signs the export entirely locally. No
+  -allowProvisioningUpdates, so nothing contacts Apple's provisioning portal at
+  release time (that portal's intermittent 502/504s are exactly what this
+  avoids). The provisioningProfiles name below must match the profile stored in
+  the IOS_PROVISION_PROFILE_B64 secret. The sibling ExportOptions-TestFlight.plist
+  is the older hand-driven variant.
 
   manageAppVersionAndBuildNumber is false so the CFBundleVersion the workflow
   stamps in (epoch seconds) is preserved rather than auto-managed by Xcode.
@@ -22,9 +22,12 @@
 	<key>teamID</key>
 	<string>DDS64SNDZH</string>
 	<key>signingStyle</key>
-	<string>automatic</string>
-	<key>destination</key>
-	<string>export</string>
+	<string>manual</string>
+	<key>provisioningProfiles</key>
+	<dict>
+		<key>com.cruisemesh.app</key>
+		<string>CruiseMesh CI App Store</string>
+	</dict>
 	<key>manageAppVersionAndBuildNumber</key>
 	<false/>
 	<key>uploadSymbols</key>
