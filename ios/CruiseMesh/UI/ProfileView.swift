@@ -163,6 +163,7 @@ struct ProfileView: View {
 private struct AdvancedSettingsView: View {
     @ObservedObject var appModel: AppModel
     @ObservedObject private var lanDiagnostics = LanTransportDiagnostics.shared
+    @ObservedObject private var connectivity = MeshConnectivityStatus.shared
 
     @State private var relayUrl = ""
     @State private var relayToken = ""
@@ -182,6 +183,11 @@ private struct AdvancedSettingsView: View {
                 Text("When any family phone has internet, queued messages flush through this mailbox.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if case .tokenRejected = connectivity.relay {
+                    Text("The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
             }
 
             Section("Local Wi-Fi (experimental)") {

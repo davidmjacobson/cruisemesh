@@ -14,6 +14,8 @@ enum RelayHealth: Equatable {
     case noInternet
     case noConfig
     case failing(lastAttemptMs: Int64)
+    /// The relay answered but rejected our own saved family token (HTTP 401/403).
+    case tokenRejected(lastAttemptMs: Int64)
 }
 
 enum ContactReachability {

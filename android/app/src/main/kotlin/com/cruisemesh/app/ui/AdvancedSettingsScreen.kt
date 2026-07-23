@@ -50,6 +50,8 @@ import com.cruisemesh.app.friending.encodeQrBitmap
 import com.cruisemesh.app.mesh.LanManualEndpoint
 import com.cruisemesh.app.mesh.LanSweepDisplayState
 import com.cruisemesh.app.mesh.LanTransportDiagnostics
+import com.cruisemesh.app.mesh.MeshConnectivityStatus
+import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.mesh.lanEndpointLink
 import com.cruisemesh.app.mesh.parseLanManualEndpoint
 import com.cruisemesh.app.relay.RelayConfigStore
@@ -67,6 +69,7 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
     var friendLanAddress by remember { mutableStateOf("") }
     var showLanQrEndpoint by remember { mutableStateOf<LanManualEndpoint?>(null) }
     val lanStatus by LanTransportDiagnostics.state.collectAsState()
+    val relayHealth by MeshConnectivityStatus.relay.collectAsState()
 
     fun saveAndBack() {
         RelayConfigStore.save(context, relayUrl, relayToken)
@@ -114,6 +117,13 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
             )
+            if (relayHealth is RelayHealth.TokenRejected) {
+                Text(stringResource(R.string.ui_relay_token_rejected),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
 
             Spacer(modifier = Modifier.height(28.dp))
             Text(stringResource(R.string.ui_local_wi_fi_experimental), style = MaterialTheme.typography.titleMedium)

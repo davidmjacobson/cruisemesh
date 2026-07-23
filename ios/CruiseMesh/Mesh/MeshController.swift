@@ -2177,21 +2177,63 @@ final class MeshController: ObservableObject {
         }
     }
 
+    /// Core owns the mailbox-routing policy (T11): an envelope addressed to a
+    /// contact goes to THAT contact's relay mailbox (from their friend card),
+    /// falling back to our own saved config. relayd scopes rows per family
+    /// token, so posting a cross-family friend request to our own mailbox
+    /// strands it where the recipient can never fetch it. Mirrors
+    /// RelaySyncEngine.kt's resolvedRelayConfig.
+    nonisolated static func resolvedRelayConfig(
+        contact: Contact?,
+        fallback: RelayConfig?
+    ) -> RelayConfig? {
+        resolvedContactRelay(
+            contactRelayUrl: contact?.relayUrl,
+            contactRelayToken: contact?.relayToken,
+            fallbackUrl: fallback?.relayUrl,
+            fallbackToken: fallback?.relayToken
+        ).map { RelayConfig(relayUrl: $0.url, relayToken: $0.token) }
+    }
+
     private nonisolated func relaySyncBlocking(identity: Identity, config: RelayConfig) async {
         let store = AppStore.get()
+        // T11: a stale/rotated family token used to look like a generic relay
+        // outage while queued envelopes retried forever. Track 401/403 from
+        // our OWN saved config and surface it as .tokenRejected.
+        var sawOwnTokenReject = false
+        func noteFailure(_ error: Error, usedConfig: RelayConfig) {
+            guard usedConfig.relayUrl == config.relayUrl,
+                  usedConfig.relayToken == config.relayToken else { return }
+            let ns = error as NSError
+            if ns.domain == "RelayClient", ns.code == 401 || ns.code == 403 {
+                sawOwnTokenReject = true
+            }
+        }
         do {
-            // Upload receipts first, then authored, then family carry.
+            // Upload receipts first, then authored, then family carry --
+            // each to the recipient's resolved mailbox, and each post in its
+            // own catch so one dead contact relay can't stall the pass
+            // (mirrors RelaySyncEngine.kt).
             let now = Int64(Date().timeIntervalSince1970 * 1000)
             _ = try store.pruneExpiredOutgoingReceiptEnvelopes(nowMs: now)
             _ = try store.pruneExpiredOutboundEnvelopes(nowMs: now)
             _ = try store.pruneExpiredCarried(nowMs: now)
+            let contacts = try store.listContacts()
+            let contactsById = Dictionary(
+                uniqueKeysWithValues: contacts.map { ($0.userId, $0) }
+            )
             let receipts = try store.pendingRelayOutgoingReceiptEnvelopes(
                 limit: MeshDefaults.relayStoreBatchLimit,
                 nowMs: now
             )
             for env in receipts {
-                _ = try RelayClient.postReceiptEnvelope(config: config, envelope: env)
-                _ = try store.markOutgoingReceiptEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                guard let contact = contactsById[env.recipientUserId],
+                      let cfg = Self.resolvedRelayConfig(contact: contact, fallback: config)
+                else { continue }
+                do {
+                    _ = try RelayClient.postReceiptEnvelope(config: cfg, envelope: env)
+                    _ = try store.markOutgoingReceiptEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                } catch { noteFailure(error, usedConfig: cfg) }
             }
             let outbound = try store.pendingRelayOutboundEnvelopes(
                 limit: MeshDefaults.relayStoreBatchLimit,
@@ -2201,14 +2243,35 @@ final class MeshController: ObservableObject {
             let groupsById = Dictionary(
                 uniqueKeysWithValues: importedGroups.map { ($0.id, $0) }
             )
+            func relayConfigForGroupRecipient(_ groupId: Data) -> RelayConfig? {
+                guard let group = groupsById[groupId] else { return config }
+                for member in group.memberUserIds {
+                    if let contact = contactsById[member],
+                       let resolved = Self.resolvedRelayConfig(contact: contact, fallback: config) {
+                        return resolved
+                    }
+                }
+                return config
+            }
             for env in outbound {
-                if let group = groupsById[env.recipientUserId] {
+                guard let contact = contactsById[env.recipientUserId] else {
+                    guard let cfg = relayConfigForGroupRecipient(env.recipientUserId) else { continue }
+                    guard let group = groupsById[env.recipientUserId] else {
+                        // Recipient is neither contact nor imported group
+                        // (e.g. a group deleted mid-queue); keep the legacy
+                        // single post so the envelope isn't stranded.
+                        do {
+                            _ = try RelayClient.postOutboundEnvelope(config: cfg, envelope: env)
+                            _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                        } catch { noteFailure(error, usedConfig: cfg) }
+                        continue
+                    }
                     // Group-addressed: per-member fan-out instead of one
                     // shared group-hint row (specs/group-relay-durability.md
                     // §4.2). Mark relay-posted only after ALL member rows
                     // post; a partial failure retries the whole set next
                     // pass, and the deterministic fan-out msg_ids dedupe
-                    // server-side. Mirrors MeshService.kt.
+                    // server-side. Mirrors RelaySyncEngine.kt.
                     let rows = coreGroupFanoutRows(
                         originalMsgId: env.msgId,
                         memberUserIds: group.memberUserIds,
@@ -2219,29 +2282,42 @@ final class MeshController: ObservableObject {
                     )
                     var posted = 0
                     for row in rows {
-                        if (try? RelayClient.postFanoutRow(config: config, row: row)) != nil {
+                        do {
+                            _ = try RelayClient.postFanoutRow(config: cfg, row: row)
                             posted += 1
-                        }
+                        } catch { noteFailure(error, usedConfig: cfg) }
                     }
                     if posted == rows.count {
                         _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
                     }
                     continue
                 }
-                _ = try RelayClient.postOutboundEnvelope(config: config, envelope: env)
-                _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                guard let cfg = Self.resolvedRelayConfig(contact: contact, fallback: config) else { continue }
+                do {
+                    _ = try RelayClient.postOutboundEnvelope(config: cfg, envelope: env)
+                    _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
+                } catch { noteFailure(error, usedConfig: cfg) }
             }
             let family = try store.familyCarriedEnvelopes(
                 limit: MeshDefaults.relayStoreBatchLimit,
                 nowMs: now
             )
             for env in family {
-                // Group-hinted carried envelopes decompose into per-member
-                // fan-out rows so a member mule's uplink serves the whole
-                // group (specs/group-relay-durability.md §4.2); re-posts on
-                // later passes dedupe server-side via the deterministic ids.
-                // Everything else posts unchanged.
+                // Carried mail goes to the mailbox its recipient actually
+                // polls: a contact hint posts to that contact's resolved
+                // relay; a group hint decomposes into per-member fan-out rows
+                // (specs/group-relay-durability.md §4.2, re-posts dedupe
+                // server-side); unrecognizable hints are skipped. Mirrors
+                // RelaySyncEngine.kt.
+                if let contact = (try? store.contactMatchingHint(hint: env.recipientHint, nowMs: now)) ?? nil {
+                    guard let cfg = Self.resolvedRelayConfig(contact: contact, fallback: config) else { continue }
+                    do {
+                        _ = try RelayClient.postCarriedEnvelope(config: cfg, envelope: env)
+                    } catch { noteFailure(error, usedConfig: cfg) }
+                    continue
+                }
                 if let group = (try? store.groupMatchingHint(hint: env.recipientHint, nowMs: now)) ?? nil {
+                    guard let cfg = relayConfigForGroupRecipient(group.id) else { continue }
                     let rows = coreGroupFanoutRowsForCarried(
                         originalMsgId: env.msgId,
                         memberUserIds: group.memberUserIds,
@@ -2250,14 +2326,13 @@ final class MeshController: ObservableObject {
                         sealed: env.sealed
                     )
                     for row in rows {
-                        _ = try? RelayClient.postFanoutRow(config: config, row: row)
+                        do { _ = try RelayClient.postFanoutRow(config: cfg, row: row) }
+                        catch { noteFailure(error, usedConfig: cfg) }
                     }
                     continue
                 }
-                _ = try RelayClient.postCarriedEnvelope(config: config, envelope: env)
             }
 
-            let contacts = try store.listContacts()
             let presenceHints: (Data, Int64) -> [Data] = { userId, timestamp in
                 recentPresenceHintsFor(userId: userId, nowMs: timestamp)
             }
@@ -2342,17 +2417,26 @@ final class MeshController: ObservableObject {
                 afterId = page.nextCursor
                 if page.envelopes.count < fetchBatchLimit { break }
             }
+            let syncedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
+            let tokenRejected = sawOwnTokenReject
             await MainActor.run {
-                MeshConnectivityStatus.shared.setRelayHealth(.ok(
-                    lastSyncMs: Int64(Date().timeIntervalSince1970 * 1_000)
-                ))
+                MeshConnectivityStatus.shared.setRelayHealth(
+                    tokenRejected
+                        ? .tokenRejected(lastAttemptMs: syncedAtMs)
+                        : .ok(lastSyncMs: syncedAtMs)
+                )
             }
         } catch {
+            noteFailure(error, usedConfig: config)
             let message = error.localizedDescription
+            let tokenRejected = sawOwnTokenReject
             await MainActor.run {
-                MeshConnectivityStatus.shared.setRelayHealth(.failing(
-                    lastAttemptMs: Int64(Date().timeIntervalSince1970 * 1_000)
-                ))
+                let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
+                MeshConnectivityStatus.shared.setRelayHealth(
+                    tokenRejected
+                        ? .tokenRejected(lastAttemptMs: nowMs)
+                        : .failing(lastAttemptMs: nowMs)
+                )
                 log.warning("Relay sync failed: \(message, privacy: .public)")
             }
         }

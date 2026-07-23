@@ -11,6 +11,9 @@ sealed class RelayHealth {
     object NoInternet : RelayHealth()
     object NoConfig : RelayHealth()
     data class Failing(val lastAttemptMs: Long) : RelayHealth()
+
+    /** The relay answered but rejected our own saved family token (HTTP 401/403). */
+    data class TokenRejected(val lastAttemptMs: Long) : RelayHealth()
 }
 
 /**
