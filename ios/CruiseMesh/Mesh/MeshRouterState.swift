@@ -29,6 +29,17 @@ final class MeshRouterState {
         core.onHello(address: address, userId: userId)
     }
 
+    @discardableResult
+    func onHello2(address: String, userId: Data, capabilities: UInt32) -> Bool {
+        core.onHello2(address: address, userId: userId, capabilities: capabilities)
+    }
+
+    func peerAcksHiddenKinds(address: String) -> Bool { core.peerAcksHiddenKinds(address: address) }
+    func hiddenOfferedFor(address: String) -> [Data] { core.hiddenOfferedFor(address: address) }
+    func recordHiddenOffered(address: String, msgIds: [Data]) {
+        core.recordHiddenOffered(address: address, msgIds: msgIds)
+    }
+
     func userIdFor(address: String) -> Data? { core.userIdFor(address: address) }
     func transportFor(address: String) -> Transport? { core.transportFor(address: address)?.platform }
     func connectedRoutes() -> [(Transport, String)] { core.connectedRoutes().map { ($0.transport.platform, $0.address) } }

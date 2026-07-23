@@ -14,6 +14,11 @@ class MeshRouterState {
     fun onConnected(address: String, transport: Transport) = core.onConnected(address, transport.toCore())
     fun onDisconnected(address: String) = core.onDisconnected(address)
     fun onHello(address: String, userId: ByteArray): Boolean = core.onHello(address, userId)
+    fun onHello2(address: String, userId: ByteArray, capabilities: UInt): Boolean =
+        core.onHello2(address, userId, capabilities)
+    fun peerAcksHiddenKinds(address: String): Boolean = core.peerAcksHiddenKinds(address)
+    fun hiddenOfferedFor(address: String): List<ByteArray> = core.hiddenOfferedFor(address)
+    fun recordHiddenOffered(address: String, msgIds: List<ByteArray>) = core.recordHiddenOffered(address, msgIds)
     fun userIdFor(address: String): ByteArray? = core.userIdFor(address)
     fun transportFor(address: String): Transport? = core.transportFor(address)?.toPlatform()
     fun connectedRoutes(): List<Pair<Transport, String>> = core.connectedRoutes().map { it.transport.toPlatform() to it.address }

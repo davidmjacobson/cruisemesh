@@ -65,10 +65,11 @@ pub use lan_util::{
 };
 pub use limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 pub use protocol::{
-    compute_recipient_hint, create_introduction_ticket, decode_extended_message_body,
-    decode_friend_directory_content, decode_introduced_friend_request, decode_lan_endpoint_content,
-    decode_message_body, decode_profile_sync_content, decode_receipt_content, default_expiry,
-    encode_digest, encode_envelope_frame, encode_friend_directory_content, encode_hello,
+    compute_recipient_hint, core_is_hidden_spray_kind, core_own_capabilities,
+    create_introduction_ticket, decode_extended_message_body, decode_friend_directory_content,
+    decode_introduced_friend_request, decode_lan_endpoint_content, decode_message_body,
+    decode_profile_sync_content, decode_receipt_content, default_expiry, encode_digest,
+    encode_envelope_frame, encode_friend_directory_content, encode_hello, encode_hello2,
     encode_introduced_friend_request, encode_lan_endpoint, encode_lan_endpoint_content,
     encode_message_body, encode_message_body_with_reply, encode_profile_sync_content,
     encode_receipt_content, encode_transport_probe, fanout_msg_id, generate_msg_id, parse_frame,

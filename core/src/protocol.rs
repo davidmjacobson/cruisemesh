@@ -295,6 +295,42 @@ const FRAME_TYPE_ENVELOPE: u8 = 0x02;
 const FRAME_TYPE_DIGEST: u8 = 0x03;
 const FRAME_TYPE_LAN_ENDPOINT: u8 = 0x04;
 const FRAME_TYPE_TRANSPORT_PROBE: u8 = 0x05;
+const FRAME_TYPE_HELLO2: u8 = 0x06;
+
+/// Wire length of a UserID in HELLO2 (BLAKE2b-16 of the signing key,
+/// [`crate::identity`]). Legacy HELLO never hardcoded this because its
+/// user_id was the frame remainder; HELLO2 must, since capabilities follow.
+const HELLO2_USER_ID_LEN: usize = 16;
+
+/// Capability bit: this client inserts hidden-kind envelopes (friend
+/// requests, profile sync, friend directory, introduced requests) as
+/// `messages` rows on receipt, so its DELIVERED watermark advances past them
+/// and the sender can stop re-spraying. Every build that speaks HELLO2 has
+/// this behavior, but future capabilities get their own bits.
+pub const CAP_ACKS_HIDDEN_KINDS: u32 = 1;
+
+/// The capability bits this build advertises in HELLO2. Both shells call
+/// this instead of hardcoding bits so they can never disagree with core.
+#[uniffi::export]
+pub fn core_own_capabilities() -> u32 {
+    CAP_ACKS_HIDDEN_KINDS
+}
+
+/// The sideband kinds that ride `outbound_envelopes` with a `msg_id = NULL`
+/// messages row: excluded from digests and recent-msg-id acks, so their only
+/// stop condition is the peer's DELIVERED watermark advancing — which never
+/// happens against a peer that lacks [`CAP_ACKS_HIDDEN_KINDS`]. The spray
+/// plan bounds re-sends of exactly these kinds toward such peers.
+#[uniffi::export]
+pub fn core_is_hidden_spray_kind(kind: u8) -> bool {
+    matches!(
+        kind,
+        KIND_FRIEND_REQUEST
+            | KIND_PROFILE_SYNC
+            | KIND_FRIEND_DIRECTORY
+            | KIND_INTRODUCED_FRIEND_REQUEST
+    )
+}
 
 const MSG_ID_LEN: usize = 16;
 const RECIPIENT_HINT_LEN: usize = 8;
@@ -964,6 +1000,17 @@ pub enum Frame {
     Hello {
         user_id: Vec<u8>,
     },
+    /// Capability HELLO (frame type 0x06), sent immediately after the legacy
+    /// HELLO on every link. Legacy clients reject the unknown frame type in
+    /// `parse_frame` and both shells drop unparseable frames without
+    /// touching the link, so this is safe to send blind. The legacy HELLO
+    /// must never grow trailing fields instead: its parser swallows the
+    /// whole remainder into `user_id`, so appended bytes would corrupt the
+    /// peer identity on old clients.
+    Hello2 {
+        user_id: Vec<u8>,
+        capabilities: u32,
+    },
     Envelope {
         msg_id: Vec<u8>,
         hop_ttl: u8,
@@ -998,6 +1045,24 @@ pub fn encode_hello(user_id: Vec<u8>) -> Vec<u8> {
     out.push(FRAME_TYPE_HELLO);
     out.extend_from_slice(&user_id);
     out
+}
+
+/// Encode a HELLO2 frame: `0x06 ‖ user_id[16] ‖ capabilities:u32-LE`. Send
+/// right after the legacy HELLO (see [`Frame::Hello2`] for why the legacy
+/// frame can't carry this). Parsers ignore trailing bytes past the
+/// capabilities word — that is HELLO2's designated forward-extension point.
+#[uniffi::export]
+pub fn encode_hello2(user_id: Vec<u8>, capabilities: u32) -> Result<Vec<u8>, CoreError> {
+    if user_id.len() != HELLO2_USER_ID_LEN {
+        return Err(CoreError::Malformed(format!(
+            "HELLO2 user_id must be {HELLO2_USER_ID_LEN} bytes"
+        )));
+    }
+    let mut out = Vec::with_capacity(1 + HELLO2_USER_ID_LEN + 4);
+    out.push(FRAME_TYPE_HELLO2);
+    out.extend_from_slice(&user_id);
+    out.extend_from_slice(&capabilities.to_le_bytes());
+    Ok(out)
 }
 
 /// Encode a sealed-envelope frame: frame-type byte `0x02`, then the §6.4
@@ -1254,6 +1319,23 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
             }
             Ok(Frame::Hello {
                 user_id: rest.to_vec(),
+            })
+        }
+        FRAME_TYPE_HELLO2 => {
+            if rest.len() < HELLO2_USER_ID_LEN + 4 {
+                return Err(CoreError::Malformed(
+                    "HELLO2 frame too short for user_id + capabilities".to_string(),
+                ));
+            }
+            let user_id = rest[..HELLO2_USER_ID_LEN].to_vec();
+            let caps_bytes: [u8; 4] = rest[HELLO2_USER_ID_LEN..HELLO2_USER_ID_LEN + 4]
+                .try_into()
+                .expect("length checked above");
+            // Trailing bytes are deliberately tolerated: future builds append
+            // fields here, and this parser must keep working against them.
+            Ok(Frame::Hello2 {
+                user_id,
+                capabilities: u32::from_le_bytes(caps_bytes),
             })
         }
         FRAME_TYPE_ENVELOPE => {
@@ -2152,6 +2234,63 @@ mod tests {
     fn parse_frame_rejects_hello_with_no_user_id() {
         let err = parse_frame(vec![0x01]).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn hello2_round_trips_and_tolerates_trailing_extension_bytes() {
+        let user_id = vec![7_u8; 16];
+        let frame = encode_hello2(user_id.clone(), 0x0000_0001).unwrap();
+        assert_eq!(
+            parse_frame(frame.clone()).unwrap(),
+            Frame::Hello2 {
+                user_id: user_id.clone(),
+                capabilities: 1,
+            }
+        );
+
+        // Trailing bytes are HELLO2's designated forward-extension point: a
+        // future build appending fields must still parse on this build.
+        let mut extended = frame;
+        extended.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        assert_eq!(
+            parse_frame(extended).unwrap(),
+            Frame::Hello2 {
+                user_id,
+                capabilities: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn hello2_rejects_short_frames_and_wrong_user_id_length() {
+        let err = parse_frame(vec![0x06, 1, 2, 3]).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+        assert!(encode_hello2(vec![1_u8; 15], 1).is_err());
+    }
+
+    #[test]
+    fn own_capabilities_advertise_hidden_kind_acks() {
+        assert_ne!(core_own_capabilities() & CAP_ACKS_HIDDEN_KINDS, 0);
+    }
+
+    #[test]
+    fn hidden_spray_kind_classification_matches_the_sideband_set() {
+        for kind in [
+            KIND_FRIEND_REQUEST,
+            KIND_PROFILE_SYNC,
+            KIND_FRIEND_DIRECTORY,
+            KIND_INTRODUCED_FRIEND_REQUEST,
+        ] {
+            assert!(core_is_hidden_spray_kind(kind), "kind {kind} is sideband");
+        }
+        for kind in [
+            KIND_TEXT,
+            KIND_GROUP_INVITE,
+            KIND_ATTACHMENT_MANIFEST,
+            KIND_RECEIPT,
+        ] {
+            assert!(!core_is_hidden_spray_kind(kind), "kind {kind} is not gated");
+        }
     }
 
     #[test]

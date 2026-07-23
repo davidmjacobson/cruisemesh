@@ -106,6 +106,13 @@ pub struct CoreIdentifiedRoute {
 struct Peer {
     transport: CoreTransport,
     user_id: Option<Vec<u8>>,
+    /// From HELLO2; `None` = peer never sent one (a pre-HELLO2 build).
+    capabilities: Option<u32>,
+    /// Hidden-kind envelope msg_ids already sprayed to this peer during this
+    /// link session — the once-per-session bound for peers that can't ack
+    /// hidden kinds. Cleared on a fresh legacy HELLO (new handshake) and
+    /// dropped with the peer on disconnect.
+    hidden_offered: std::collections::HashSet<Vec<u8>>,
 }
 
 #[derive(uniffi::Object)]
@@ -128,6 +135,8 @@ impl CoreMeshRouterState {
             Peer {
                 transport,
                 user_id: None,
+                capabilities: None,
+                hidden_offered: std::collections::HashSet::new(),
             },
         );
     }
@@ -145,7 +154,56 @@ impl CoreMeshRouterState {
             return false;
         }
         peer.user_id = Some(user_id);
+        // A fresh legacy HELLO is a new handshake: the once-per-session
+        // hidden-kind spray bound resets so this session gets one new offer.
+        peer.hidden_offered.clear();
         true
+    }
+
+    /// HELLO2 follow-up: same identity-consistency rule as [`Self::on_hello`],
+    /// plus the peer's capability bits. Order-tolerant with the legacy HELLO
+    /// (which is sent first but could be processed either side of this).
+    pub fn on_hello2(&self, address: String, user_id: Vec<u8>, capabilities: u32) -> bool {
+        let mut peers = self.peers.lock_recoverable();
+        let Some(peer) = peers.get_mut(&address) else {
+            return false;
+        };
+        if peer.user_id.as_ref().is_some_and(|known| *known != user_id) {
+            return false;
+        }
+        peer.user_id = Some(user_id);
+        peer.capabilities = Some(capabilities);
+        true
+    }
+
+    /// Whether this peer advertised [`crate::protocol::CAP_ACKS_HIDDEN_KINDS`].
+    /// `false` for pre-HELLO2 builds — they process hidden kinds fine but
+    /// never advance their DELIVERED watermark past them, so re-sprays toward
+    /// them are bounded to once per session instead of every digest.
+    pub fn peer_acks_hidden_kinds(&self, address: String) -> bool {
+        self.peers
+            .lock_recoverable()
+            .get(&address)
+            .and_then(|peer| peer.capabilities)
+            .is_some_and(|caps| caps & crate::protocol::CAP_ACKS_HIDDEN_KINDS != 0)
+    }
+
+    pub fn hidden_offered_for(&self, address: String) -> Vec<Vec<u8>> {
+        self.peers
+            .lock_recoverable()
+            .get(&address)
+            .map(|peer| peer.hidden_offered.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn record_hidden_offered(&self, address: String, msg_ids: Vec<Vec<u8>>) {
+        if msg_ids.is_empty() {
+            return;
+        }
+        let mut peers = self.peers.lock_recoverable();
+        if let Some(peer) = peers.get_mut(&address) {
+            peer.hidden_offered.extend(msg_ids);
+        }
     }
 
     pub fn user_id_for(&self, address: String) -> Option<Vec<u8>> {
@@ -483,6 +541,38 @@ mod tests {
         // "ble" peer) must still be there since the panic never touched it.
         assert!(router.on_hello("ble".into(), vec![1]));
         assert_eq!(router.connected_user_count(), 1);
+    }
+
+    #[test]
+    fn hello2_records_capabilities_and_hello_resets_the_session_offer_set() {
+        let router = CoreMeshRouterState::new();
+        router.on_connected("ble".into(), CoreTransport::Central);
+
+        // Pre-HELLO2 peer: no capabilities recorded, not hidden-kind capable.
+        assert!(router.on_hello("ble".into(), vec![1; 16]));
+        assert!(!router.peer_acks_hidden_kinds("ble".into()));
+
+        // Offers recorded for the session are returned...
+        router.record_hidden_offered("ble".into(), vec![vec![9; 16]]);
+        assert_eq!(router.hidden_offered_for("ble".into()), vec![vec![9; 16]]);
+
+        // ...and a fresh legacy HELLO (new handshake) resets them.
+        assert!(router.on_hello("ble".into(), vec![1; 16]));
+        assert!(router.hidden_offered_for("ble".into()).is_empty());
+
+        // HELLO2 sets capabilities; identity consistency still enforced.
+        assert!(router.on_hello2(
+            "ble".into(),
+            vec![1; 16],
+            crate::protocol::CAP_ACKS_HIDDEN_KINDS
+        ));
+        assert!(router.peer_acks_hidden_kinds("ble".into()));
+        assert!(!router.on_hello2("ble".into(), vec![2; 16], 1));
+
+        // Disconnect drops the whole peer record, offers included.
+        router.on_disconnected("ble".into());
+        assert!(router.hidden_offered_for("ble".into()).is_empty());
+        assert!(!router.peer_acks_hidden_kinds("ble".into()));
     }
 
     #[test]

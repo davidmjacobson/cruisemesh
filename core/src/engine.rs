@@ -134,6 +134,12 @@ pub struct CoreDigestSprayPlan {
     pub carried_frames: Vec<Vec<u8>>,
     pub own_outbound_frames: Vec<Vec<u8>>,
     pub own_receipt_frames: Vec<Vec<u8>>,
+    /// Hidden-kind msg_ids newly included for a peer that can't ack hidden
+    /// kinds. The shell records these on the peer's router entry
+    /// (`record_hidden_offered`) after sending, so the next plan for this
+    /// session excludes them — the once-per-session re-spray bound. Empty
+    /// when the peer advertised CAP_ACKS_HIDDEN_KINDS.
+    pub offered_hidden_msg_ids: Vec<Vec<u8>>,
 }
 
 /// One relay-post row of a group message's per-member fan-out
@@ -507,11 +513,21 @@ impl MessageStore {
         own_outbound_budget_bytes: u64,
         own_receipt_budget_bytes: u64,
         receipt_query_limit: u64,
+        peer_acks_hidden_kinds: bool,
+        hidden_already_offered: Vec<Vec<u8>>,
     ) -> Result<CoreDigestSprayPlan, CoreError> {
         self.prune_expired_carried(now_ms)?;
         let carried =
             self.carried_envelopes_for_peer_sync(peer_hints, peer_known_msg_ids.clone(), now_ms)?;
         let known: HashSet<Vec<u8>> = peer_known_msg_ids.into_iter().collect();
+        // Hidden kinds never advance a non-capable peer's DELIVERED
+        // watermark, so `lamport > delivered_through` re-selects them on
+        // every digest for the full 7-day expiry (the mixed-version resend
+        // chatter). Toward such peers each hidden envelope is offered once
+        // per link session: the shell feeds back what was already offered
+        // and records what this plan newly includes.
+        let hidden_offered: HashSet<Vec<u8>> = hidden_already_offered.into_iter().collect();
+        let mut offered_hidden_msg_ids = Vec::new();
 
         // FC2: fetch each contact's pending backlog with the exclusion
         // (known_msg_ids/expiry) already applied in SQL, and only up to
@@ -544,6 +560,21 @@ impl MessageStore {
                 now_ms,
                 remaining_outbound_budget,
             )?;
+            let contact_pending: Vec<_> = contact_pending
+                .into_iter()
+                .filter(|envelope| {
+                    if peer_acks_hidden_kinds
+                        || !crate::protocol::core_is_hidden_spray_kind(envelope.kind)
+                    {
+                        return true;
+                    }
+                    if hidden_offered.contains(&envelope.msg_id) {
+                        return false;
+                    }
+                    offered_hidden_msg_ids.push(envelope.msg_id.clone());
+                    true
+                })
+                .collect();
             for envelope in &contact_pending {
                 remaining_outbound_budget =
                     remaining_outbound_budget.saturating_sub(envelope.sealed.len() as u64);
@@ -568,10 +599,16 @@ impl MessageStore {
             own_receipt_budget_bytes,
         );
 
+        // select_own_outbound can drop a filtered-in envelope again on the
+        // shared budget; only report msg_ids that actually made the plan, so
+        // a budget-evicted hidden envelope stays eligible next digest.
+        let selected_ids: HashSet<&Vec<u8>> = own_outbound.iter().map(|e| &e.msg_id).collect();
+        offered_hidden_msg_ids.retain(|id| selected_ids.contains(id));
         Ok(CoreDigestSprayPlan {
             carried_frames: carried.into_iter().map(frame_carried).collect(),
             own_outbound_frames: own_outbound.into_iter().map(frame_outbound).collect(),
             own_receipt_frames: own_receipts.into_iter().map(frame_receipt).collect(),
+            offered_hidden_msg_ids,
         })
     }
 
@@ -1333,7 +1370,18 @@ mod tests {
         queue(&carol, 1, 3, 10);
 
         let plan = store
-            .core_digest_spray_plan(own_user_id, peer_user_id, vec![], vec![], now_ms, 15, 0, 0)
+            .core_digest_spray_plan(
+                own_user_id,
+                peer_user_id,
+                vec![],
+                vec![],
+                now_ms,
+                15,
+                0,
+                0,
+                true,
+                vec![],
+            )
             .unwrap();
 
         assert_eq!(
@@ -1348,6 +1396,95 @@ mod tests {
              only to learn it overflows the budget); Carol's envelope must \
              never be fetched once the shared budget is already spent"
         );
+    }
+
+    #[test]
+    fn digest_spray_plan_bounds_hidden_kinds_to_once_per_session_for_legacy_peers() {
+        // Mixed-version resend chatter: a peer without CAP_ACKS_HIDDEN_KINDS
+        // never advances its DELIVERED watermark past hidden kinds, so they
+        // would re-select on every digest for 7 days. The plan must include
+        // each hidden envelope once per link session toward such a peer
+        // (reporting it in offered_hidden_msg_ids), keep visible kinds
+        // unaffected, and leave capability peers entirely ungated.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let own_user_id = vec![1_u8; 16];
+        let peer_user_id = vec![9_u8; 16];
+        let bob = vec![2_u8; 16];
+        let now_ms = 1_700_000_000_000_i64;
+        store
+            .upsert_contact(crate::Contact {
+                user_id: bob.clone(),
+                name: "Bob".to_string(),
+                sign_pk: vec![0; 32],
+                agree_pk: vec![0; 32],
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            })
+            .unwrap();
+
+        let queue = |kind: u8, lamport: u64, msg_id: u8| {
+            let message = crate::StoredMessage {
+                chat_id: bob.clone(),
+                sender_user_id: own_user_id.clone(),
+                lamport,
+                timestamp: now_ms,
+                kind,
+                payload: b"hi".to_vec(),
+            };
+            let envelope = OutboundEnvelope {
+                msg_id: vec![msg_id; 16],
+                recipient_user_id: bob.clone(),
+                chat_id: bob.clone(),
+                sender_user_id: own_user_id.clone(),
+                kind,
+                lamport,
+                timestamp: now_ms,
+                hop_ttl: 7,
+                expiry: now_ms + 60_000,
+                recipient_hint: b"hint".to_vec(),
+                sealed: vec![0xAB; 10],
+            };
+            store
+                .insert_outgoing_message(message, envelope, now_ms)
+                .unwrap();
+        };
+        queue(crate::KIND_FRIEND_REQUEST, 1, 1);
+        queue(crate::KIND_TEXT, 2, 2);
+
+        let plan = |acks: bool, offered: Vec<Vec<u8>>| {
+            store
+                .core_digest_spray_plan(
+                    own_user_id.clone(),
+                    peer_user_id.clone(),
+                    vec![],
+                    vec![],
+                    now_ms,
+                    1024 * 1024,
+                    0,
+                    0,
+                    acks,
+                    offered,
+                )
+                .unwrap()
+        };
+
+        // Legacy peer, first digest of the session: everything goes out and
+        // the hidden envelope is reported for the shell to record.
+        let first = plan(false, vec![]);
+        assert_eq!(first.own_outbound_frames.len(), 2);
+        assert_eq!(first.offered_hidden_msg_ids, vec![vec![1_u8; 16]]);
+
+        // Same session, next digest (e.g. the ~3-5 min re-digest): the
+        // hidden envelope is suppressed, the visible one still re-sprays.
+        let second = plan(false, first.offered_hidden_msg_ids.clone());
+        assert_eq!(second.own_outbound_frames.len(), 1);
+        assert!(second.offered_hidden_msg_ids.is_empty());
+
+        // Capability peer: no gating, nothing to record.
+        let capable = plan(true, vec![]);
+        assert_eq!(capable.own_outbound_frames.len(), 2);
+        assert!(capable.offered_hidden_msg_ids.is_empty());
     }
 
     #[test]
