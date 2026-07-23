@@ -34,7 +34,11 @@ object FriendDirectorySender {
         store: MessageStore,
         identity: Identity,
     ) {
+        // Blocked contacts are excluded both as directory recipients and as
+        // candidates — we neither talk to them nor introduce them to friends.
+        val blocked = store.listBlockedUsers()
         val recipients = store.listContacts()
+            .filterNot { contact -> blocked.any { it.contentEquals(contact.userId) } }
         val revision = FriendsOfFriendsStore.nextDirectoryRevision(context)
         val enabled = FriendsOfFriendsStore.isEnabled(context)
         val now = System.currentTimeMillis()

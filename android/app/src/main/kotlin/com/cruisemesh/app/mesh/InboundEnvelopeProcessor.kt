@@ -708,6 +708,16 @@ internal class InboundEnvelopeProcessor(
             return
         }
 
+        // Blocked identities are dropped before ANY kind handler runs: a
+        // replayed kind=3 must not resurrect the contact, no receipts are
+        // authored (the blocked party sees nothing), and the relay copy still
+        // acks away as consumed — we are the sole endpoint and deliberate
+        // discard is consumption, so the mailbox doesn't refetch it forever.
+        if (store.isUserBlocked(opened.senderUserId)) {
+            Log.i(TAG, "Dropping envelope from $address: sender is blocked")
+            return
+        }
+
         when (body.kind) {
             KIND_TEXT -> handleIncomingChatMessage(
                 address,

@@ -29,7 +29,10 @@ object ProfileSyncSender {
         val name = ProfileStore.loadDisplayName(context)
         val friendsOfFriendsEnabled = FriendsOfFriendsStore.isEnabled(context)
         val friendsOfFriendsRevision = FriendsOfFriendsStore.revision(context)
+        // Blocked contacts get nothing from us — not even profile updates.
+        val blocked = store.listBlockedUsers()
         for (contact in store.listContacts()) {
+            if (blocked.any { it.contentEquals(contact.userId) }) continue
             queueToContact(
                 store,
                 identity,

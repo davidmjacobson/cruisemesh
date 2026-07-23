@@ -866,6 +866,16 @@ final class MeshController: ObservableObject {
             return
         }
 
+        // Blocked identities are dropped before ANY kind handler runs: a
+        // replayed kind=3 must not resurrect the contact, no receipts are
+        // authored (the blocked party sees nothing), and the relay copy still
+        // acks away as consumed — we are the sole endpoint and deliberate
+        // discard is consumption, so the mailbox doesn't refetch it forever.
+        if (try? store.isUserBlocked(userId: opened.senderUserId)) == true {
+            log.info("Dropping envelope from blocked sender on \(sourceLabel, privacy: .public)")
+            return
+        }
+
         switch body.kind {
         case ProtocolKind.text, ProtocolKind.attachmentManifest, ProtocolKind.reaction:
             try handleIncomingChat(

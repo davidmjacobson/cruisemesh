@@ -33,6 +33,7 @@ struct ChatView: View {
     @State private var replyMetadata: [String: MessageReplyMetadata] = [:]
     @State private var viewedPhoto: ViewedPhoto?
     @State private var isMuted = false
+    @State private var isBlocked = false
     @State private var localNickname: String?
     @State private var nicknameEdited = false
 
@@ -199,6 +200,7 @@ struct ChatView: View {
         .onAppear {
             draft = DraftStore.load(chatId: contact.userId)
             isMuted = ChatMuteStore.isMuted(contact.userId)
+            isBlocked = (try? store.isUserBlocked(userId: contact.userId)) ?? false
             ChatVisibility.setVisible(contact.userId)
             MeshController.shared.notifyChatViewed(chatId: contact.userId)
             reload()
@@ -255,6 +257,21 @@ struct ChatView: View {
                     localNickname = nickname
                     nicknameEdited = true
                     ChatEvents.notifyChatChanged(contact.userId)
+                },
+                isBlocked: isBlocked,
+                onBlockedChange: { blocked in
+                    if blocked {
+                        try? store.blockUser(
+                            userId: contact.userId,
+                            nowMs: Int64(Date().timeIntervalSince1970 * 1000)
+                        )
+                    } else {
+                        _ = try? store.unblockUser(userId: contact.userId)
+                    }
+                    isBlocked = blocked
+                },
+                onReport: {
+                    launchContactReport(contact: displayContact, reporterUserId: identity.userId)
                 }
             ) {
                 showDetails = false

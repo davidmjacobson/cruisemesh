@@ -11,7 +11,10 @@ enum ProfileSyncSender {
         epoch: Int64
     ) {
         let avatar = ProfilePhotoStore.loadWireAvatarBytes()
-        let contacts = (try? store.listContacts()) ?? []
+        // Blocked contacts get nothing from us — not even profile updates.
+        let blocked = Set((try? store.listBlockedUsers()) ?? [])
+        let contacts = ((try? store.listContacts()) ?? [])
+            .filter { !blocked.contains($0.userId) }
         for contact in contacts {
             queueToContact(
                 store: store,

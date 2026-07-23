@@ -1774,6 +1774,14 @@ impl MessageStore {
             ],
         )
         .map_err(store_err)?;
+        // A deliberate direct import (QR scan / pasted card) is the one act
+        // that clears a block tombstone (specs/friends-of-friends.md §"delete
+        // + tombstone") — remote-initiated writes never reach here.
+        tx.execute(
+            "DELETE FROM blocked_identities WHERE user_id = ?1",
+            params![contact.user_id],
+        )
+        .map_err(store_err)?;
         tx.commit().map_err(store_err)?;
         Ok(contact)
     }
@@ -2141,7 +2149,9 @@ impl MessageStore {
                  LEFT JOIN friend_suggestion_state x
                     ON x.candidate_user_id = s.candidate_user_id
                  LEFT JOIN contacts c ON c.user_id = s.candidate_user_id
-                 WHERE c.user_id IS NULL AND s.expires_at_ms >= ?1
+                 LEFT JOIN blocked_identities b ON b.user_id = s.candidate_user_id
+                 WHERE c.user_id IS NULL AND b.user_id IS NULL
+                       AND s.expires_at_ms >= ?1
                        AND COALESCE(x.state, 0) != 2
                  ORDER BY lower(s.name), s.introducer_user_id",
             )
@@ -2178,6 +2188,60 @@ impl MessageStore {
             });
         }
         Ok(suggestions)
+    }
+
+    /// Block an identity (specs/friends-of-friends.md "dismissal-block
+    /// tombstone"): inbound envelopes from it are dropped by both shells, it
+    /// never appears as a friend suggestion, and a replayed friend request
+    /// cannot re-create the contact. Silent — the blocked party is never
+    /// notified. The contact row and chat history are kept; only a deliberate
+    /// re-import of their card ([MessageStore::upsert_imported_contact])
+    /// clears the block.
+    pub fn block_user(&self, user_id: Vec<u8>, now_ms: i64) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "INSERT INTO blocked_identities (user_id, blocked_at_ms) VALUES (?1, ?2)
+             ON CONFLICT(user_id) DO NOTHING",
+            params![user_id, now_ms],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn unblock_user(&self, user_id: Vec<u8>) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let deleted = conn
+            .execute(
+                "DELETE FROM blocked_identities WHERE user_id = ?1",
+                params![user_id],
+            )
+            .map_err(store_err)?;
+        Ok(deleted > 0)
+    }
+
+    pub fn is_user_blocked(&self, user_id: Vec<u8>) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blocked_identities WHERE user_id = ?1)",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .map_err(store_err)
+    }
+
+    pub fn list_blocked_users(&self) -> Result<Vec<Vec<u8>>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare("SELECT user_id FROM blocked_identities ORDER BY blocked_at_ms")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
     }
 
     /// State values: 0 available, 1 requested, 2 hidden.
@@ -3473,6 +3537,11 @@ CREATE INDEX IF NOT EXISTS idx_friend_suggestions_introducer
 CREATE TABLE IF NOT EXISTS friend_suggestion_state (
     candidate_user_id BLOB PRIMARY KEY,
     state INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS blocked_identities (
+    user_id BLOB PRIMARY KEY,
+    blocked_at_ms INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS contact_provenance (
@@ -4959,6 +5028,96 @@ mod tests {
         let policy = store.get_contact_discovery_policy(id).unwrap().unwrap();
         assert!(policy.enabled);
         assert_eq!(policy.revision, 5);
+    }
+
+    #[test]
+    fn block_unblock_round_trip_and_listing() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mallory = test_user_id(b"mallory");
+        assert!(!store.is_user_blocked(mallory.clone()).unwrap());
+        store.block_user(mallory.clone(), 1_000).unwrap();
+        store.block_user(mallory.clone(), 2_000).unwrap(); // idempotent
+        assert!(store.is_user_blocked(mallory.clone()).unwrap());
+        assert_eq!(store.list_blocked_users().unwrap(), vec![mallory.clone()]);
+        assert!(store.unblock_user(mallory.clone()).unwrap());
+        assert!(!store.unblock_user(mallory.clone()).unwrap());
+        assert!(!store.is_user_blocked(mallory).unwrap());
+    }
+
+    #[test]
+    fn blocked_identity_is_excluded_from_suggestions() {
+        let alice = generate_identity();
+        let bob = generate_identity();
+        let carol = generate_identity();
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .upsert_contact(Contact {
+                user_id: alice.user_id.clone(),
+                name: "Alice".to_string(),
+                sign_pk: alice.sign_pk.clone(),
+                agree_pk: alice.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            })
+            .unwrap();
+        let ticket = create_introduction_ticket(
+            alice.clone(),
+            carol.user_id.clone(),
+            bob.user_id.clone(),
+            3,
+            1_000,
+            100_000,
+            vec![9; 16],
+        )
+        .unwrap();
+        store
+            .apply_friend_directory(
+                alice.user_id.clone(),
+                bob.user_id.clone(),
+                FriendDirectoryContent {
+                    version: 1,
+                    revision: 1,
+                    entries: vec![FriendDirectoryEntry {
+                        candidate: SuggestedFriendCard {
+                            name: "Carol".to_string(),
+                            user_id: carol.user_id.clone(),
+                            sign_pk: carol.sign_pk.clone(),
+                            agree_pk: carol.agree_pk.clone(),
+                        },
+                        candidate_policy_revision: 3,
+                        ticket,
+                    }],
+                },
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(store.list_friend_suggestions(2_000).unwrap().len(), 1);
+
+        store.block_user(carol.user_id.clone(), 2_500).unwrap();
+        assert!(store.list_friend_suggestions(2_000).unwrap().is_empty());
+        store.unblock_user(carol.user_id).unwrap();
+        assert_eq!(store.list_friend_suggestions(2_000).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deliberate_reimport_clears_block() {
+        let carol = generate_identity();
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.block_user(carol.user_id.clone(), 1_000).unwrap();
+        assert!(store.is_user_blocked(carol.user_id.clone()).unwrap());
+        store
+            .upsert_imported_contact(Contact {
+                user_id: carol.user_id.clone(),
+                name: "Carol".to_string(),
+                sign_pk: carol.sign_pk.clone(),
+                agree_pk: carol.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            })
+            .unwrap();
+        assert!(!store.is_user_blocked(carol.user_id).unwrap());
     }
 
     #[test]
