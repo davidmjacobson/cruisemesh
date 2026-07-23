@@ -1,0 +1,150 @@
+name: iOS release
+
+# Pushing an `ios-v*` tag builds the app on a GitHub macOS runner and -- when the
+# App Store Connect API key secrets are configured -- archives, signs, uploads it
+# to TestFlight, and distributes it to the beta group. The iOS mirror of
+# android-release.yml; together they make "push a tag, walk away" the release
+# path for both platforms, no interactive Mac required.
+#
+# Signing uses the App Store Connect API key ONLY (cloud/automatic signing): the
+# app is archived unsigned, then `xcodebuild -exportArchive
+# -allowProvisioningUpdates` with the API key has Apple mint a distribution
+# profile + cloud-managed distribution certificate and sign the IPA. No local
+# .p12 certificate or provisioning profile is needed, so the fragile locked
+# signing keychains on the interactive Mac never enter the picture.
+#
+# The publish path is gated on IOS_ENABLED (secrets present) so this is a
+# no-op-safe smoke build in forks / before secrets exist. Required secrets:
+#   ASC_API_KEY_ID       App Store Connect API key ID
+#   ASC_API_ISSUER_ID    App Store Connect API issuer ID
+#   ASC_API_KEY_P8       contents of the AuthKey_<id>.p8 private key
+# CFBundleVersion is stamped to epoch seconds (monotonic, above existing
+# TestFlight builds); CFBundleShortVersionString comes from the tag
+# (ios-v1.2.3 -> "1.2.3").
+
+on:
+  push:
+    tags:
+      - "ios-v*"
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      # Secrets can't be used in step `if:` directly; surface presence as a flag.
+      IOS_ENABLED: ${{ secrets.ASC_API_KEY_P8 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Rust stable + iOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # Builds the host lib, regenerates the Swift UniFFI bindings, cross-compiles
+      # the core for device + simulator archs, and packages the xcframework --
+      # same as ios.yml / the Mac validation runbook.
+      - name: Build core + Swift bindings + xcframework
+        run: bash core/build-ios.sh
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      # xcodegen writes Info.plist from project.yml, so stamp the version AFTER
+      # generating. Build number is epoch seconds: monotonic for sequential
+      # releases and above the build numbers already on TestFlight (a small
+      # counter would collide). Marketing version is the tag sans "ios-v".
+      - name: Stamp version (marketing from tag, build = epoch)
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          marketing="${tag#ios-v}"
+          build="$(date +%s)"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $marketing" ios/CruiseMesh/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build" ios/CruiseMesh/Info.plist
+          echo "marketing=$marketing" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "Version $marketing ($build)"
+
+      # Unsigned archive; distribution signing happens at export (cloud signing).
+      # A development profile can't be minted here anyway (the team has no
+      # registered devices), and it isn't needed for an app-store export.
+      - name: Archive (unsigned)
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project CruiseMesh.xcodeproj \
+            -scheme CruiseMesh \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/CruiseMesh.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
+      - name: Write App Store Connect API key
+        if: env.IOS_ENABLED == 'true'
+        env:
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          mkdir -p "$HOME/private_keys"
+          chmod 700 "$HOME/private_keys"
+          printf '%s' "$ASC_API_KEY_P8" > "$HOME/private_keys/AuthKey_${ASC_API_KEY_ID}.p8"
+
+      - name: Export (cloud-signed) and upload to TestFlight
+        if: env.IOS_ENABLED == 'true'
+        working-directory: ios
+        env:
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: |
+          set -o pipefail
+          xcodebuild -exportArchive \
+            -archivePath build/CruiseMesh.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist ExportOptions-AppStoreConnect.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/private_keys/AuthKey_${ASC_API_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_API_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_API_ISSUER_ID"
+          xcrun altool --upload-app \
+            -f build/export/CruiseMesh.ipa \
+            -t ios \
+            --apiKey "$ASC_API_KEY_ID" \
+            --apiIssuer "$ASC_API_ISSUER_ID"
+          echo "Uploaded build ${{ steps.version.outputs.build }} (${{ steps.version.outputs.marketing }}) to TestFlight."
+
+      # Best-effort: wait for processing, add to the beta group, submit for beta
+      # review. continue-on-error so a slow queue never reds a release whose
+      # upload already landed.
+      - name: Distribute to the TestFlight beta group
+        if: env.IOS_ENABLED == 'true'
+        continue-on-error: true
+        env:
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check pyjwt cryptography requests
+          python3 tools/testflight_distribute.py \
+            "$HOME/private_keys/AuthKey_${ASC_API_KEY_ID}.p8" \
+            "$ASC_API_KEY_ID" \
+            "$ASC_API_ISSUER_ID" \
+            "${{ steps.version.outputs.build }}"
+
+      - name: Note skipped publish
+        if: env.IOS_ENABLED != 'true'
+        run: echo "ASC_API_KEY_P8 not set — built + archived only; skipped TestFlight upload."
+
+      - name: Clean up API key
+        if: always()
+        run: rm -rf "$HOME/private_keys"
