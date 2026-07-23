@@ -6,6 +6,10 @@ android/local.properties
 android/app/keystore.properties
 android/app/*.jks
 android/app/*.keystore
+
+# Play Developer API service-account key, written transiently by the
+# android-release workflow's publish step (never committed).
+play-sa.json
 android/.gradle/
 android/.kotlin/
 android/build/

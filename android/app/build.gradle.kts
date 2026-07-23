@@ -25,11 +25,12 @@ fun signingProp(key: String, envVar: String): String? =
 // FR15: versionCode/versionName are normally the hardcoded fallbacks below —
 // bumping the epoch-timestamp versionCode by hand was the whole "artisanal
 // APK builds" problem. android-release.yml passes both as -P project
-// properties, derived from the triggering `android-v*` tag (versionCode from
-// `git rev-list --count HEAD` so it's always monotonically increasing across
-// commits, which is what Play/adb install require; versionName from the tag
-// text itself). Local builds pass neither, so `gradlew assembleDebug` and
-// friends are unaffected.
+// properties, derived from the triggering `android-v*` tag: versionCode is
+// epoch seconds at build time (monotonic for sequential releases and above the
+// epoch-style versionCodes already live on the Play track — a commit count
+// would sit below them and Play would reject the upload), versionName is the
+// tag text. Local builds pass neither, so `gradlew assembleDebug` and friends
+// are unaffected.
 val versionCodeOverride = (findProperty("versionCodeOverride") as String?)?.toIntOrNull()
 val versionNameOverride = findProperty("versionNameOverride") as String?
 
