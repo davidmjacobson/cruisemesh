@@ -8325,6 +8325,80 @@ public func FfiConverterTypeReceiptContent_lower(_ value: ReceiptContent) -> Rus
 
 
 /**
+ * Which relay mailbox serves an envelope addressed to a contact: the
+ * contact's own mailbox from their friend card when complete, else the
+ * device's saved fallback config. relayd scopes every row per family token,
+ * so cross-family delivery only works when the envelope lands in the
+ * *recipient's* mailbox — posting to the sender's own mailbox strands it
+ * (T11). Shared here so both shells route identically.
+ */
+public struct RelayEndpoint {
+    public var url: String
+    public var token: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, token: String) {
+        self.url = url
+        self.token = token
+    }
+}
+
+
+
+extension RelayEndpoint: Equatable, Hashable {
+    public static func ==(lhs: RelayEndpoint, rhs: RelayEndpoint) -> Bool {
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.token != rhs.token {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(url)
+        hasher.combine(token)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRelayEndpoint: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayEndpoint {
+        return
+            try RelayEndpoint(
+                url: FfiConverterString.read(from: &buf), 
+                token: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RelayEndpoint, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.token, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayEndpoint_lift(_ buf: RustBuffer) throws -> RelayEndpoint {
+    return try FfiConverterTypeRelayEndpoint.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayEndpoint_lower(_ value: RelayEndpoint) -> RustBuffer {
+    return FfiConverterTypeRelayEndpoint.lower(value)
+}
+
+
+/**
  * One stored message body (DESIGN.md §7.1). `timestamp` is milliseconds
  * since the Unix epoch; `kind` matches the DESIGN.md §7.1 `kind` byte
  * (text=1, receipt=2, friend-request=3, group-invite=4, ...).
@@ -9814,6 +9888,30 @@ fileprivate struct FfiConverterOptionTypeOutgoingReceiptEnvelope: FfiConverterRu
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeOutgoingReceiptEnvelope.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeRelayEndpoint: FfiConverterRustBuffer {
+    typealias SwiftType = RelayEndpoint?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeRelayEndpoint.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeRelayEndpoint.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -11665,6 +11763,16 @@ public func relayMaxResponseBytes() -> UInt32 {
     )
 })
 }
+public func resolvedContactRelay(contactRelayUrl: String?, contactRelayToken: String?, fallbackUrl: String?, fallbackToken: String?) -> RelayEndpoint? {
+    return try!  FfiConverterOptionTypeRelayEndpoint.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_resolved_contact_relay(
+        FfiConverterOptionString.lower(contactRelayUrl),
+        FfiConverterOptionString.lower(contactRelayToken),
+        FfiConverterOptionString.lower(fallbackUrl),
+        FfiConverterOptionString.lower(fallbackToken),$0
+    )
+})
+}
 /**
  * Rotate a group's symmetric key and replace its member list, keeping the
  * stable group id/name. This is the v1 membership-change mechanism from
@@ -12079,6 +12187,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_relay() != 13200) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_rotate_group() != 56003) {

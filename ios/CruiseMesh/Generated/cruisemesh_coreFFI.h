@@ -1492,6 +1492,11 @@ uint32_t uniffi_cruisemesh_core_fn_func_relay_max_response_bytes(RustCallStatus 
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RESOLVED_CONTACT_RELAY
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RESOLVED_CONTACT_RELAY
+RustBuffer uniffi_cruisemesh_core_fn_func_resolved_contact_relay(RustBuffer contact_relay_url, RustBuffer contact_relay_token, RustBuffer fallback_url, RustBuffer fallback_token, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_ROTATE_GROUP
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_ROTATE_GROUP
 RustBuffer uniffi_cruisemesh_core_fn_func_rotate_group(RustBuffer group, RustBuffer member_user_ids, RustCallStatus *_Nonnull out_status
@@ -2410,6 +2415,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_relay_fetch_batch_limit(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_MAX_RESPONSE_BYTES
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_MAX_RESPONSE_BYTES
 uint16_t uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RESOLVED_CONTACT_RELAY
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RESOLVED_CONTACT_RELAY
+uint16_t uniffi_cruisemesh_core_checksum_func_resolved_contact_relay(void
     
 );
 #endif
