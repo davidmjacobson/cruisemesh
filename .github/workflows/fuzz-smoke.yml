@@ -59,7 +59,14 @@ jobs:
         # install would then fail confusingly at the build/run step instead
         # of here, if it failed at all (a stale cached binary from the old
         # never-invalidating key could mask it entirely).
-        run: cargo install cargo-fuzz --locked
+        # Install only on cache miss: a restored binary makes a plain
+        # `cargo install` fail with "binary already exists", and the
+        # toolchain-keyed cache above already guarantees a restored binary
+        # matches today's nightly.
+        run: |
+          if ! command -v cargo-fuzz >/dev/null; then
+            cargo install cargo-fuzz --locked
+          fi
       # FR9: per-target corpus, keyed so it accumulates across nightly runs
       # instead of restarting exploration from zero every time (the whole
       # point of a 600s nightly run). New key per run (so the post-job save
