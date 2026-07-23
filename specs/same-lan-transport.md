@@ -121,9 +121,10 @@ create a promise of continuous background execution.
 
 ## Platform privacy
 
-Android currently targets API 35 and does not request location for same-LAN
-DNS-SD. The local-network permission introduced for later target SDKs must be
-reviewed before raising the target.
+Android currently targets API 36 and does not request location for same-LAN
+DNS-SD. Android 16's local-network protection is opt-in only at target 36;
+the `ACCESS_LOCAL_NETWORK` runtime permission becomes mandatory at target 37
+(Android 17) and must be added before raising the target again.
 
 iOS declares `_cruisemesh._tcp` in `NSBonjourServices` and provides an
 `NSLocalNetworkUsageDescription`. The user may deny local-network access; BLE
