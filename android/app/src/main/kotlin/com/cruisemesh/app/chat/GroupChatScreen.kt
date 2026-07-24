@@ -42,7 +42,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -211,8 +210,11 @@ fun GroupChatScreen(
     // FA4: same off-main-thread load as ChatScreen -- reply-quote metadata and
     // own-message expiry watermarks, queried once per visible-list change
     // instead of during composition/recomposition.
-    val chatExtras by produceState(ChatExtras(), visibleMessages, ownUserId, contactsByUserId) {
-        value = withContext(Dispatchers.IO) {
+    var chatExtras by remember(visibleMessages, ownUserId, contactsByUserId) {
+        mutableStateOf(ChatExtras())
+    }
+    LaunchedEffect(visibleMessages, ownUserId, contactsByUserId) {
+        chatExtras = withContext(Dispatchers.IO) {
             loadChatExtras(store, visibleMessages, ownUserId) { message -> senderName(message.senderUserId) }
         }
     }

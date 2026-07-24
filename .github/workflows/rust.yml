@@ -77,3 +77,6 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew :app:testDebugUnitTest --rerun-tasks
+      - name: gradlew :app:lintRelease
+        working-directory: android
+        run: ./gradlew :app:lintRelease

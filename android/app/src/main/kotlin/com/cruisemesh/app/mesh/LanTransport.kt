@@ -1,5 +1,6 @@
 package com.cruisemesh.app.mesh
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
@@ -443,8 +444,8 @@ internal class LanTransport(
             port = listener.localPort
             setAttribute(TXT_VERSION, "1")
             setAttribute(TXT_INSTANCE, instanceToken)
-            if (supportsNetworkScopedNsd()) {
-                setNetwork(network)
+            if (supportsNetworkScopedServiceInfo()) {
+                setNetworkCompat(this, network)
             }
         }
         val registration = makeRegistrationListener()
@@ -458,11 +459,8 @@ internal class LanTransport(
         val discovery = makeDiscoveryListener()
         discoveryListener = discovery
         try {
-            if (supportsNetworkScopedNsd()) {
-                val request = DiscoveryRequest.Builder(lanServiceType())
-                    .setNetwork(network)
-                    .build()
-                nsdManager.discoverServices(request, appContext.mainExecutor, discovery)
+            if (supportsNetworkScopedDiscovery()) {
+                discoverServicesOnNetwork(network, discovery)
             } else {
                 @Suppress("DEPRECATION")
                 nsdManager.discoverServices(
@@ -537,9 +535,9 @@ internal class LanTransport(
     private fun connectToService(serviceInfo: NsdServiceInfo) {
         val network = wifiNetwork ?: return
         if (
-            supportsNetworkScopedNsd() &&
-            serviceInfo.network != null &&
-            serviceInfo.network != network
+            supportsNetworkScopedServiceInfo() &&
+            networkCompat(serviceInfo) != null &&
+            networkCompat(serviceInfo) != network
         ) {
             Log.d(TAG, "Ignoring LAN service resolved on a different network")
             return
@@ -923,9 +921,9 @@ internal class LanTransport(
                         version == "1" &&
                         serviceInfo.port in 1..65_535 &&
                         (
-                            !supportsNetworkScopedNsd() ||
-                                serviceInfo.network == null ||
-                                serviceInfo.network == wifiNetwork
+                            !supportsNetworkScopedServiceInfo() ||
+                                networkCompat(serviceInfo) == null ||
+                                networkCompat(serviceInfo) == wifiNetwork
                             )
                     ) {
                         // Only genuinely NEW evidence resets the sweep
@@ -1069,12 +1067,38 @@ internal class LanTransport(
         return if (host.contains(':')) "[$host]:${endpoint.port}" else "$host:${endpoint.port}"
     }
 
-    private fun supportsNetworkScopedNsd(): Boolean {
-        return when {
-            Build.VERSION.SDK_INT > Build.VERSION_CODES.TIRAMISU -> true
-            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU -> false
-            else -> SdkExtensions.getExtensionVersion(Build.VERSION_CODES.TIRAMISU) >= 3
-        }
+    private fun supportsNetworkScopedServiceInfo(): Boolean =
+        supportsNetworkScopedServiceInfo(
+            sdkInt = Build.VERSION.SDK_INT,
+            tiramisuExtension = SdkExtensions.getExtensionVersion(Build.VERSION_CODES.TIRAMISU),
+        )
+
+    private fun supportsNetworkScopedDiscovery(): Boolean =
+        supportsNetworkScopedDiscovery(
+            sdkInt = Build.VERSION.SDK_INT,
+            tiramisuExtension = SdkExtensions.getExtensionVersion(Build.VERSION_CODES.TIRAMISU),
+        )
+
+    // Lint cannot propagate the combined platform/SDK-extension guards through
+    // helper methods. Keep the suppressions on the smallest possible wrappers;
+    // every caller first checks the corresponding tested support predicate.
+    @SuppressLint("NewApi")
+    private fun setNetworkCompat(serviceInfo: NsdServiceInfo, network: Network) {
+        serviceInfo.setNetwork(network)
+    }
+
+    @SuppressLint("NewApi")
+    private fun networkCompat(serviceInfo: NsdServiceInfo): Network? = serviceInfo.network
+
+    @SuppressLint("NewApi")
+    private fun discoverServicesOnNetwork(
+        network: Network,
+        discovery: NsdManager.DiscoveryListener,
+    ) {
+        val request = DiscoveryRequest.Builder(lanServiceType())
+            .setNetwork(network)
+            .build()
+        nsdManager.discoverServices(request, appContext.mainExecutor, discovery)
     }
 
     private inner class LanConnection(

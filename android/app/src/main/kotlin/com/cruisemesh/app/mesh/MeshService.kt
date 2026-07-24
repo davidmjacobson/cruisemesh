@@ -933,7 +933,9 @@ class MeshService : Service() {
     private fun isA2dpConnected(): Boolean {
         val adapter = bluetoothManager.adapter ?: return false
         return try {
-            adapter.getProfileConnectionState(BluetoothProfile.A2DP) == BluetoothProfile.STATE_CONNECTED
+            bluetoothAudioConnectedFromProfileState(
+                adapter.getProfileConnectionState(BluetoothProfile.A2DP),
+            ) == true
         } catch (e: SecurityException) {
             Log.w(TAG, "Cannot query A2DP connection state; assuming disconnected (${e.message})")
             false

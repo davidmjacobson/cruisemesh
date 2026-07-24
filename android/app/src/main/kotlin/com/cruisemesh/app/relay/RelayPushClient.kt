@@ -273,5 +273,5 @@ class RelayPushClient(
         Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
 
     private fun urlEncode(value: String): String =
-        URLEncoder.encode(value, StandardCharsets.UTF_8)
+        URLEncoder.encode(value, StandardCharsets.UTF_8.name())
 }
