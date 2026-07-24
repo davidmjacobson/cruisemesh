@@ -62,7 +62,7 @@ targets:
         CFBundleDisplayName: CruiseMesh
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1784405581"
-        ITSAppUsesNonExemptEncryption: false
+        ITSAppUsesNonExemptEncryption: true
         UILaunchScreen: {}
         UIBackgroundModes:
           - bluetooth-central
