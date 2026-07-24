@@ -27,6 +27,8 @@
     <string name="ui_block_contact">Block contact</string>
     <string name="ui_block_explanation">They won\'t be able to message you, and they won\'t appear as a suggested friend. They won\'t be told. Scanning their card again unblocks them.</string>
     <string name="ui_block_named">Block %1$s?</string>
+    <string name="ui_bluetooth_is_off">Bluetooth is off</string>
+    <string name="ui_bluetooth_is_off_body">CruiseMesh needs Bluetooth on to find nearby phones and deliver messages. Turn it on to use the mesh.</string>
     <string name="ui_camera_permission_is_needed_to_scan_a_friend">Camera permission is needed to scan a friend card.</string>
     <string name="ui_cancel">Cancel</string>
     <string name="ui_choose_photo">Choose photo</string>
@@ -105,6 +107,7 @@
     <string name="ui_terms_messaging_conduct">CruiseMesh is person-to-person messaging. Use it lawfully, connect only with people you trust, and do not send abusive or prohibited content.</string>
     <string name="ui_terms_encryption_reporting">Messages are end-to-end encrypted, so CruiseMesh cannot proactively read them. You can block a contact and report abuse from their contact details.</string>
     <string name="ui_terms_acceptance_confirmation">I have read and agree to the Terms of Use and Privacy Policy.</string>
+    <string name="ui_turn_on_bluetooth">Turn on Bluetooth</string>
     <string name="ui_i_agree">I agree</string>
     <string name="ui_profile_settings">Profile &amp; settings</string>
     <string name="ui_read_these_aloud_to_verify">Read these aloud to verify.</string>
@@ -149,6 +152,11 @@
     <string name="ui_verify_contact_explanation">Match these words with your friend\'s screen to confirm it\'s really them.</string>
     <string name="ui_verify_my_identity">Verify my identity</string>
     <string name="ui_verify_my_identity_explanation">Have your friend match these words against your name in their contacts to confirm it\'s really you.</string>
+    <string name="notification_mesh_channel_name">CruiseMesh mesh sync</string>
+    <string name="notification_mesh_paused_bluetooth">Paused — turn on Bluetooth to sync nearby</string>
+    <string name="notification_mesh_relaying">Relaying messages nearby</string>
+    <string name="notification_mesh_relaying_with_audio">Relaying messages nearby (Bluetooth audio also connected)</string>
+    <string name="notification_stop_cruisemesh">Stop CruiseMesh</string>
     <string name="ui_save">Save</string>
     <string name="ui_save_your_identity_and_messages_to_an_encrypted">Save your identity and messages to an encrypted file.</string>
     <string name="ui_say_hi">Say hi</string>

@@ -58,6 +58,7 @@ private const val NOTIFICATION_CHANNEL_ID = "cruisemesh_mesh_status"
 private const val NOTIFICATION_ID = 1
 private const val OPEN_APP_REQUEST_CODE = 1001
 private const val STOP_SERVICE_REQUEST_CODE = 1002
+private const val ENABLE_BLUETOOTH_REQUEST_CODE = 1003
 private const val LAN_HEALTH_INTERVAL_MS = 30_000L
 // D8: how often to check whether a long-lived link is due for a re-digest. The
 // actual 3-5 min jittered gate lives in core `shouldRedigest`; this only sets
@@ -1490,7 +1491,7 @@ class MeshService : Service() {
         // minSdk is 31, so notification channels always exist (added in API 26).
         val channel = NotificationChannel(
             NOTIFICATION_CHANNEL_ID,
-            "CruiseMesh mesh sync",
+            getString(R.string.notification_mesh_channel_name),
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
             setShowBadge(false)
@@ -1510,22 +1511,41 @@ class MeshService : Service() {
             Intent(this, MeshService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        val enableBluetoothIntent = PendingIntent.getActivity(
+            this,
+            ENABLE_BLUETOOTH_REQUEST_CODE,
+            Intent(this, MainActivity::class.java).apply {
+                action = MainActivity.ACTION_REQUEST_BLUETOOTH_ENABLE
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val bluetoothOff = !isBluetoothOn()
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("CruiseMesh")
+            .setContentTitle(getString(R.string.app_name))
             .setContentText(
                 when {
-                    !isBluetoothOn() -> "Paused — turn on Bluetooth to sync nearby"
-                    bluetoothAudioConnected -> "Relaying messages nearby (Bluetooth audio also connected)"
-                    else -> "Relaying messages nearby"
+                    bluetoothOff -> getString(R.string.notification_mesh_paused_bluetooth)
+                    bluetoothAudioConnected -> getString(R.string.notification_mesh_relaying_with_audio)
+                    else -> getString(R.string.notification_mesh_relaying)
                 },
             )
             // FA9: app-owned icon, was android.R.drawable.stat_sys_data_bluetooth.
             .setSmallIcon(R.drawable.ic_notification_mesh)
             .setBadgeIconType(NotificationCompat.BADGE_ICON_NONE)
             .setContentIntent(contentIntent)
+            .apply {
+                if (bluetoothOff) {
+                    addAction(
+                        android.R.drawable.stat_sys_data_bluetooth,
+                        getString(R.string.ui_turn_on_bluetooth),
+                        enableBluetoothIntent,
+                    )
+                }
+            }
             .addAction(
                 android.R.drawable.ic_menu_close_clear_cancel,
-                "Stop CruiseMesh",
+                getString(R.string.notification_stop_cruisemesh),
                 stopIntent,
             )
             .setOngoing(true)
