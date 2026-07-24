@@ -803,8 +803,11 @@ internal class LanTransport(
 
     private fun scheduleReconnect(serviceKey: String) {
         val now = System.currentTimeMillis()
-        val delayMs = connectionBackoff.retryDelayMs(serviceKey, now)
-            ?: if (connectionBackoff.isGivenUp(serviceKey)) return else RECONNECT_SLOT_DELAY_MS
+        // retryDelayMs is non-null for any key with failure history — including
+        // given-up keys, which now decay to ReconnectBackoffTracker's slow probe
+        // cadence instead of stopping forever (the null fallback is only a
+        // never-failed key's first schedule).
+        val delayMs = connectionBackoff.retryDelayMs(serviceKey, now) ?: RECONNECT_SLOT_DELAY_MS
         mainHandler.postDelayed(
             {
                 if (!started || wifiNetwork == null || outboundServiceKeys.contains(serviceKey)) {

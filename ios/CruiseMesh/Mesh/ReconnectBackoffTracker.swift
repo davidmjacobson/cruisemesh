@@ -5,17 +5,25 @@ final class ReconnectBackoffTracker {
     static let defaultMaxBackoffMs: Int64 = 5 * 60_000
     static let defaultMaxConsecutiveFailures = 6
 
+    /// Give-up is a slow probe cadence, never a permanent refusal: transient
+    /// connect failures during a Wi-Fi teardown can exhaust the failure
+    /// budget against a peer's still-current advertisement address, which
+    /// used to wedge the link until Bluetooth was cycled (2026-07-24).
+    static let defaultGiveUpProbeMs: Int64 = 60_000
+
     private let core: CoreReconnectBackoffTracker
 
     init(
         initialBackoffMs: Int64 = ReconnectBackoffTracker.defaultInitialBackoffMs,
         maxBackoffMs: Int64 = ReconnectBackoffTracker.defaultMaxBackoffMs,
-        maxConsecutiveFailures: Int = ReconnectBackoffTracker.defaultMaxConsecutiveFailures
+        maxConsecutiveFailures: Int = ReconnectBackoffTracker.defaultMaxConsecutiveFailures,
+        giveUpProbeMs: Int64 = ReconnectBackoffTracker.defaultGiveUpProbeMs
     ) {
         core = CoreReconnectBackoffTracker(
             initialBackoffMs: initialBackoffMs,
             maxBackoffMs: maxBackoffMs,
-            maxFailures: UInt32(maxConsecutiveFailures)
+            maxFailures: UInt32(maxConsecutiveFailures),
+            giveUpProbeMs: giveUpProbeMs
         )
     }
 

@@ -1194,6 +1194,12 @@ public protocol CoreReconnectBackoffTrackerProtocol : AnyObject {
     
     func failureCount(address: String)  -> UInt32
     
+    /**
+     * True once the address is past the consecutive-failure budget and in
+     * slow-probe mode. Informational (logging/diagnostics) — callers must
+     * not use it to stop retrying; `can_attempt`/`retry_delay_ms` already
+     * encode the probe cadence.
+     */
     func isGivenUp(address: String)  -> Bool
     
     func recordFailure(address: String, nowMs: Int64)  -> UInt32
@@ -1241,13 +1247,14 @@ open class CoreReconnectBackoffTracker:
     public func uniffiClonePointer() -> UnsafeMutableRawPointer {
         return try! rustCall { uniffi_cruisemesh_core_fn_clone_corereconnectbackofftracker(self.pointer, $0) }
     }
-public convenience init(initialBackoffMs: Int64, maxBackoffMs: Int64, maxFailures: UInt32) {
+public convenience init(initialBackoffMs: Int64, maxBackoffMs: Int64, maxFailures: UInt32, giveUpProbeMs: Int64) {
     let pointer =
         try! rustCall() {
     uniffi_cruisemesh_core_fn_constructor_corereconnectbackofftracker_new(
         FfiConverterInt64.lower(initialBackoffMs),
         FfiConverterInt64.lower(maxBackoffMs),
-        FfiConverterUInt32.lower(maxFailures),$0
+        FfiConverterUInt32.lower(maxFailures),
+        FfiConverterInt64.lower(giveUpProbeMs),$0
     )
 }
     self.init(unsafeFromRawPointer: pointer)
@@ -1287,6 +1294,12 @@ open func failureCount(address: String) -> UInt32 {
 })
 }
     
+    /**
+     * True once the address is past the consecutive-failure budget and in
+     * slow-probe mode. Informational (logging/diagnostics) — callers must
+     * not use it to stop retrying; `can_attempt`/`retry_delay_ms` already
+     * encode the probe cadence.
+     */
 open func isGivenUp(address: String) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_method_corereconnectbackofftracker_is_given_up(self.uniffiClonePointer(),
@@ -12547,7 +12560,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_failure_count() != 57862) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_is_given_up() != 6632) {
+    if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_is_given_up() != 22886) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_record_failure() != 50820) {
@@ -12877,7 +12890,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_constructor_coremeshrouterstate_new() != 20926) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_constructor_corereconnectbackofftracker_new() != 24962) {
+    if (uniffi_cruisemesh_core_checksum_constructor_corereconnectbackofftracker_new() != 29344) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_lannoisesession_new() != 19269) {
