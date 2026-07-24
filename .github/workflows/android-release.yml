@@ -98,6 +98,9 @@ jobs:
             -PversionCodeOverride=${{ steps.version.outputs.version_code }} \
             -PversionNameOverride=${{ steps.version.outputs.version_name }}
 
+      - name: Verify APK 16 KiB native-library support
+        run: python3 tools/check_android_elf_alignment.py android/app/build/outputs/apk/release/app-release.apk
+
       - name: Rename APK for the release asset
         id: apk
         run: |
@@ -139,6 +142,10 @@ jobs:
           ./gradlew :app:bundleRelease \
             -PversionCodeOverride=${{ steps.version.outputs.version_code }} \
             -PversionNameOverride=${{ steps.version.outputs.version_name }}
+
+      - name: Verify AAB 16 KiB native-library support
+        if: env.PLAY_ENABLED == 'true'
+        run: python3 tools/check_android_elf_alignment.py android/app/build/outputs/bundle/release/app-release.aab
 
       - name: Publish AAB to Play internal testing
         if: env.PLAY_ENABLED == 'true'
