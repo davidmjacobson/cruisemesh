@@ -1156,6 +1156,65 @@ mod tests {
         );
     }
 
+    /// The receive leg §6's plan left unpinned (field-found 2026-07-24): a
+    /// fan-out row is addressed to the MEMBER's own hint, so the shells'
+    /// pre-fix gate (`groups_matching_hint` alone) finds zero group-open
+    /// candidates and the copy is misfiled as foreign mule traffic instead
+    /// of delivered. `group_open_candidates` must surface the member's
+    /// groups so the sealed body opens with the group key.
+    #[test]
+    fn fanout_row_opens_via_group_open_candidates_on_the_member_device() {
+        let author = crate::generate_identity();
+        let member = crate::generate_identity();
+        let group = crate::create_group(
+            "fam".to_string(),
+            vec![author.user_id.clone(), member.user_id.clone()],
+        )
+        .unwrap();
+        let now: i64 = 1_700_000_000_000;
+
+        let sealed =
+            crate::seal_group_message(author.clone(), group.clone(), b"dinner at 6".to_vec())
+                .unwrap();
+        let rows = core_group_fanout_rows(
+            vec![0x33; 16],
+            group.member_user_ids.clone(),
+            7,
+            now + 1000,
+            sealed,
+            now,
+        );
+        let member_hint = compute_recipient_hint(member.user_id.clone(), now);
+        let member_row = rows
+            .iter()
+            .find(|row| row.recipient_hint == member_hint)
+            .expect("fan-out addresses every member");
+
+        // Member device state: group imported via its invite, row fetched.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_group(group).unwrap();
+
+        // The hint-only gate can never open a fan-out copy (the bug).
+        assert!(store
+            .groups_matching_hint(member_row.recipient_hint.clone(), now)
+            .unwrap()
+            .is_empty());
+
+        let candidates = store
+            .group_open_candidates(
+                member_row.recipient_hint.clone(),
+                member.user_id.clone(),
+                now,
+            )
+            .unwrap();
+        let opened = candidates
+            .into_iter()
+            .find_map(|g| crate::open_group_message(g, member_row.sealed.clone()).ok())
+            .expect("fan-out copy must open with the member's group key");
+        assert_eq!(opened.payload, b"dinner at 6".to_vec());
+        assert_eq!(opened.sender_user_id, author.user_id);
+    }
+
     #[test]
     fn fanout_rows_cover_every_member_including_self_deterministically() {
         let original = vec![0x33_u8; 16];

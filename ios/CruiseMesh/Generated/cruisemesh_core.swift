@@ -1998,6 +1998,20 @@ public protocol MessageStoreProtocol : AnyObject {
     func groupMatchingHint(hint: Data, nowMs: Int64) throws  -> Group?
     
     /**
+     * Group-open candidates for an inbound sealed envelope that failed
+     * pairwise open: [`Self::groups_matching_hint`] plus -- when `hint` is
+     * one of our OWN recent hints -- every imported group. A per-member
+     * relay fan-out row (specs/group-relay-durability.md §4.1) is addressed
+     * to the *member's* hint, not the group's, and nothing outside the
+     * sealed body says which group it belongs to, so an own-hinted envelope
+     * must be tried against every group key this device holds. Both shells'
+     * `tryOpenGroupMessage` call this instead of `groups_matching_hint`;
+     * hint-matching groups stay first so collision-window behavior is
+     * unchanged.
+     */
+    func groupOpenCandidates(hint: Data, ownUserId: Data, nowMs: Int64) throws  -> [Group]
+    
+    /**
      * Every imported group whose recent-day hints include `hint`, in
      * [`MessageStore::list_groups`] order -- the group-open candidates an
      * inbound sealed envelope is tried against (a hint collision between two
@@ -3214,6 +3228,28 @@ open func groupMatchingHint(hint: Data, nowMs: Int64)throws  -> Group? {
     return try  FfiConverterOptionTypeGroup.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_group_matching_hint(self.uniffiClonePointer(),
         FfiConverterData.lower(hint),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Group-open candidates for an inbound sealed envelope that failed
+     * pairwise open: [`Self::groups_matching_hint`] plus -- when `hint` is
+     * one of our OWN recent hints -- every imported group. A per-member
+     * relay fan-out row (specs/group-relay-durability.md §4.1) is addressed
+     * to the *member's* hint, not the group's, and nothing outside the
+     * sealed body says which group it belongs to, so an own-hinted envelope
+     * must be tried against every group key this device holds. Both shells'
+     * `tryOpenGroupMessage` call this instead of `groups_matching_hint`;
+     * hint-matching groups stay first so collision-window behavior is
+     * unchanged.
+     */
+open func groupOpenCandidates(hint: Data, ownUserId: Data, nowMs: Int64)throws  -> [Group] {
+    return try  FfiConverterSequenceTypeGroup.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_group_open_candidates(self.uniffiClonePointer(),
+        FfiConverterData.lower(hint),
+        FfiConverterData.lower(ownUserId),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -12647,6 +12683,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_group_matching_hint() != 19074) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_group_open_candidates() != 15202) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_groups_matching_hint() != 61300) {
