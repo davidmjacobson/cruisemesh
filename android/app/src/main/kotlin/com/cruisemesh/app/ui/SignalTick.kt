@@ -1,5 +1,6 @@
 package com.cruisemesh.app.ui
 
+import androidx.annotation.StringRes
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -14,16 +15,19 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.TickStatus
 
-fun tickContentDescription(status: TickStatus): String = when (status) {
-    TickStatus.SENT -> "Sent"
-    TickStatus.DELIVERED -> "Delivered"
-    TickStatus.READ -> "Read"
+@StringRes
+fun tickContentDescriptionResource(status: TickStatus): Int = when (status) {
+    TickStatus.SENT -> R.string.ui_sent
+    TickStatus.DELIVERED -> R.string.ui_delivered
+    TickStatus.READ -> R.string.ui_read
 }
 
 fun tickLegendText(status: TickStatus): String = when (status) {
@@ -39,10 +43,11 @@ fun SignalTick(
     bubbleColor: Color,
     modifier: Modifier = Modifier
 ) {
+    val stateDescription = stringResource(tickContentDescriptionResource(status))
     Canvas(
         modifier = modifier
             .size(width = 22.dp, height = 14.dp)
-            .semantics { contentDescription = tickContentDescription(status) }
+            .semantics { contentDescription = stateDescription }
     ) {
         val radius = 4.8.dp.toPx()
         val strokeWidth = 1.15.dp.toPx()
