@@ -489,6 +489,17 @@ private struct GroupMessageRow: View {
                         } else {
                             Text(String(data: message.payload, encoding: .utf8) ?? "")
                         }
+                        if isOwn {
+                            // Group receipts aren't on the wire yet (D9), so
+                            // SENT — "sealed and queued", true at authoring —
+                            // is the only honest state; without it an own
+                            // group bubble reads as never-sent next to 1:1
+                            // chats. Mirrors ChatView's tick placement.
+                            HStack {
+                                Spacer(minLength: 0)
+                                SignalTickView(status: .sent, tint: .white)
+                            }
+                        }
                     }
                         .padding(10)
                         .background(

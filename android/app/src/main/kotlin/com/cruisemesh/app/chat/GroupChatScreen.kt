@@ -48,6 +48,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -66,6 +68,7 @@ import com.cruisemesh.app.ui.AvatarBadge
 import com.cruisemesh.app.ui.BubbleGrouping
 import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ConversationMessageMeta
+import com.cruisemesh.app.ui.SignalTick
 import com.cruisemesh.app.ui.bubbleGroupingFor
 import com.cruisemesh.app.ui.formatConversationTimestamp
 import uniffi.cruisemesh_core.Contact
@@ -894,15 +897,36 @@ fun GroupMessageBubbleVisual(
                         style = MaterialTheme.typography.bodyLarge,
                     )
                 }
-                if (showTimestamp) {
-                    Text(
-                        text = formatConversationTimestamp(message.timestamp),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = contentColor.copy(alpha = 0.7f),
+                if (showTimestamp || isOwn) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
                             .align(Alignment.End)
                             .padding(top = 4.dp),
-                    )
+                    ) {
+                        if (showTimestamp) {
+                            Text(
+                                text = formatConversationTimestamp(message.timestamp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = contentColor.copy(alpha = 0.7f),
+                            )
+                        }
+                        if (isOwn) {
+                            // Group receipts aren't on the wire yet (D9), so
+                            // SENT — "sealed and queued", true at authoring —
+                            // is the only honest state; without it an own
+                            // group bubble reads as never-sent next to 1:1
+                            // chats. Tint mirrors ChatScreen's tick row.
+                            val tickBaseColor =
+                                if (bubbleColor.luminance() > 0.5f) Color.Black else Color.White
+                            SignalTick(
+                                status = TickStatus.SENT,
+                                tint = tickBaseColor.copy(alpha = 0.88f),
+                                bubbleColor = bubbleColor,
+                                modifier = Modifier.padding(start = 6.dp),
+                            )
+                        }
+                    }
                 }
             }
         }
