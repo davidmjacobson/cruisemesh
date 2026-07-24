@@ -702,7 +702,9 @@ final class MeshController: ObservableObject {
             // A store failure while delivering a message that WAS ours must
             // not be misread here as "not for us, carry as foreign" -- the
             // own-delivery path below has its own catch that returns .failed.
-            if let (group, opened) = tryOpenGroupMessage(recipientHint: recipientHint, sealed: sealed, now: now) {
+            if let (group, opened) = tryOpenGroupMessage(
+                recipientHint: recipientHint, ownUserId: identity.userId, sealed: sealed, now: now
+            ) {
                 do {
                     try deliverOpenedGroupEnvelope(
                         sourceLabel: sourceLabel,
@@ -840,12 +842,24 @@ final class MeshController: ObservableObject {
         )
     }
 
-    /// Opens `sealed` with any imported group whose recent-day `recipient_hint`
-    /// matches `recipientHint`. Returns the matching group and opened payload,
-    /// or nil. `openGroupMessage` does not check membership of the signer;
-    /// callers must enforce that before trusting the body.
-    private func tryOpenGroupMessage(recipientHint: Data, sealed: Data, now: Int64) -> (Group, OpenedMessage)? {
-        let groups = (try? store.groupsMatchingHint(hint: recipientHint, nowMs: now)) ?? []
+    /// Opens `sealed` with any imported group `groupOpenCandidates` offers
+    /// for `recipientHint`: groups whose own recent-day hints match, plus
+    /// every imported group when the hint is OUR OWN -- a per-member relay
+    /// fan-out copy (specs/group-relay-durability.md §4.1) is addressed to
+    /// the member, not the group, so nothing but the group key identifies
+    /// it. Returns the matching group and opened payload, or nil.
+    /// `openGroupMessage` does not check membership of the signer; callers
+    /// must enforce that before trusting the body. Mirrors
+    /// InboundEnvelopeProcessor.kt.
+    private func tryOpenGroupMessage(
+        recipientHint: Data,
+        ownUserId: Data,
+        sealed: Data,
+        now: Int64
+    ) -> (Group, OpenedMessage)? {
+        let groups = (try? store.groupOpenCandidates(
+            hint: recipientHint, ownUserId: ownUserId, nowMs: now
+        )) ?? []
         for group in groups {
             if let opened = try? openGroupMessage(group: group, sealed: sealed) {
                 return (group, opened)

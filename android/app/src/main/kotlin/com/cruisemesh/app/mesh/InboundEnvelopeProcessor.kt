@@ -329,7 +329,7 @@ internal class InboundEnvelopeProcessor(
             // whose recipient_hint matches before treating it as pure mule
             // traffic. Group members keep relaying/carrying so absent members
             // still get a copy (mesh_sim group scenario).
-            val groupOpened = tryOpenGroupMessage(envelope.recipientHint, envelope.sealed)
+            val groupOpened = tryOpenGroupMessage(envelope.recipientHint, identity.userId, envelope.sealed)
             if (groupOpened != null) {
                 val arrival = messageArrival(sourceAddress, envelope.hopTtl, groupOpened.second.senderUserId)
                 try {
@@ -431,21 +431,26 @@ internal class InboundEnvelopeProcessor(
     }
 
     /**
-     * Opens [sealed] with any imported group whose recent-day `recipient_hint`
-     * matches [recipientHint]. Returns the matching [Group] and opened
-     * payload, or null. [openGroupMessage] does not check membership of the
-     * signer; callers must enforce that before trusting the body.
+     * Opens [sealed] with any imported group [MessageStore.groupOpenCandidates]
+     * offers for [recipientHint]: groups whose own recent-day hints match,
+     * plus every imported group when the hint is OUR OWN -- a per-member
+     * relay fan-out copy (specs/group-relay-durability.md §4.1) is addressed
+     * to the member, not the group, so nothing but the group key identifies
+     * it. Returns the matching [Group] and opened payload, or null.
+     * [openGroupMessage] does not check membership of the signer; callers
+     * must enforce that before trusting the body.
      */
     private fun tryOpenGroupMessage(
         recipientHint: ByteArray,
+        ownUserId: ByteArray,
         sealed: ByteArray,
     ): Pair<Group, OpenedMessage>? {
         val now = System.currentTimeMillis()
-        for (group in store.groupsMatchingHint(recipientHint, now)) {
+        for (group in store.groupOpenCandidates(recipientHint, ownUserId, now)) {
             try {
                 return group to openGroupMessage(group, sealed)
             } catch (_: CoreException) {
-                // Wrong key / corrupt — try the next matching group (rare).
+                // Wrong key / corrupt — try the next candidate group.
             }
         }
         return null

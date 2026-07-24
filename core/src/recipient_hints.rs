@@ -214,6 +214,33 @@ impl MessageStore {
         Ok(matches)
     }
 
+    /// Group-open candidates for an inbound sealed envelope that failed
+    /// pairwise open: [`Self::groups_matching_hint`] plus -- when `hint` is
+    /// one of our OWN recent hints -- every imported group. A per-member
+    /// relay fan-out row (specs/group-relay-durability.md §4.1) is addressed
+    /// to the *member's* hint, not the group's, and nothing outside the
+    /// sealed body says which group it belongs to, so an own-hinted envelope
+    /// must be tried against every group key this device holds. Both shells'
+    /// `tryOpenGroupMessage` call this instead of `groups_matching_hint`;
+    /// hint-matching groups stay first so collision-window behavior is
+    /// unchanged.
+    pub fn group_open_candidates(
+        &self,
+        hint: Vec<u8>,
+        own_user_id: Vec<u8>,
+        now_ms: i64,
+    ) -> Result<Vec<Group>, CoreError> {
+        let mut candidates = self.groups_matching_hint(hint.clone(), now_ms)?;
+        if crate::engine::core_is_own_fanout_hint(hint, own_user_id, now_ms) {
+            for group in self.list_groups()? {
+                if !candidates.iter().any(|g| g.id == group.id) {
+                    candidates.push(group);
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
     /// Pre-upload receipt backfill for a relay sync pass: for every contact,
     /// refresh the durable relay-uploadable receipt envelope for the current
     /// DELIVERED and READ watermarks (skipping empty streams), exactly the
@@ -425,6 +452,61 @@ mod tests {
                 .map(|c| c.user_id),
             Some(member.user_id),
         );
+    }
+
+    #[test]
+    fn group_open_candidates_cover_all_groups_for_an_own_fanout_hint() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let me = generate_identity();
+        let group = |id: &[u8; 16]| Group {
+            id: id.to_vec(),
+            name: "Fam".to_string(),
+            key: vec![7u8; 32],
+            member_user_ids: vec![me.user_id.clone()],
+            metadata_revision: 0,
+            metadata_changed_by: Vec::new(),
+        };
+        store.upsert_group(group(b"group-id-aaaaaaa")).unwrap();
+        store.upsert_group(group(b"group-id-bbbbbbb")).unwrap();
+
+        // A fan-out row is addressed to OUR hint (spec §4.1): no group-id
+        // hint matches, but every imported group key must be tried.
+        let own_hint = compute_recipient_hint(me.user_id.clone(), NOW - 2 * MS_PER_DAY);
+        let candidates = store
+            .group_open_candidates(own_hint, me.user_id.clone(), NOW)
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+
+        // A group-addressed hint keeps today's behavior: that group alone.
+        let group_hint = compute_recipient_hint(b"group-id-aaaaaaa".to_vec(), NOW);
+        let candidates = store
+            .group_open_candidates(group_hint, me.user_id.clone(), NOW)
+            .unwrap();
+        assert_eq!(
+            candidates.iter().map(|g| g.id.clone()).collect::<Vec<_>>(),
+            vec![b"group-id-aaaaaaa".to_vec()],
+        );
+
+        // A proxy-fetched contact's hint stays foreign: no candidates.
+        let other = generate_identity();
+        assert!(store
+            .group_open_candidates(
+                compute_recipient_hint(other.user_id.clone(), NOW),
+                me.user_id.clone(),
+                NOW,
+            )
+            .unwrap()
+            .is_empty());
+
+        // Own hint beyond the carry window no longer widens the search.
+        let expired = compute_recipient_hint(
+            me.user_id.clone(),
+            NOW - (CARRY_HINT_DAY_WINDOW_DAYS + 1) * MS_PER_DAY,
+        );
+        assert!(store
+            .group_open_candidates(expired, me.user_id, NOW)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
