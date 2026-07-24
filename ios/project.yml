@@ -32,6 +32,9 @@ targets:
           - "Frameworks/**"
           - "Generated/cruisemesh_coreFFI.h"
           - "Generated/*.modulemap"
+          - "PrivacyInfo.xcprivacy"
+      - path: CruiseMesh/PrivacyInfo.xcprivacy
+        buildPhase: resources
     dependencies:
       - framework: CruiseMesh/Frameworks/cruisemesh_core.xcframework
         embed: false
