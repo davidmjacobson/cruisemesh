@@ -247,9 +247,10 @@ class BleCentral(
                     if (backoff.isGivenUp(address)) {
                         Log.w(
                             TAG,
-                            "Giving up on $address after $failures consecutive failures " +
-                                "(likely stale/rotated address); will retry only if rediscovered " +
-                                "under a fresh advertisement address ($diagnostics)",
+                            "Backing off $address to slow probing after $failures consecutive " +
+                                "failures (stale address, or a live peer in a transient radio " +
+                                "storm); next probe in ~${ReconnectBackoffTracker.GIVE_UP_PROBE_MS}ms, " +
+                                "sooner under a fresh advertisement address ($diagnostics)",
                         )
                     }
                     tearDownLink(gatt, "disconnected (status=$status)")

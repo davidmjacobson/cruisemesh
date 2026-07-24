@@ -46,17 +46,30 @@ class ReconnectBackoffTrackerTest {
     }
 
     @Test
-    fun `an address is given up after the consecutive-failure budget is exceeded`() {
+    fun `an address past the failure budget decays to slow probing, never permanent refusal`() {
         val tracker = ReconnectBackoffTracker(
             initialBackoffMs = 1L,
             maxBackoffMs = 1L,
             maxConsecutiveFailures = 3,
+            giveUpProbeMs = 1_000L,
         )
         assertFalse(tracker.isGivenUp("AA:BB"))
-        repeat(3) { tracker.recordFailure("AA:BB", nowMs = it.toLong()) }
+        repeat(3) { tracker.recordFailure("AA:BB", nowMs = 2L) }
         assertTrue(tracker.isGivenUp("AA:BB"))
-        // Even long after the last backoff window, a given-up address stays refused.
-        assertFalse(tracker.canAttempt("AA:BB", nowMs = Long.MAX_VALUE / 2))
+        // Refused only until the probe interval elapses — a permanent refusal
+        // wedged live links whose current address ate transient failures
+        // during a Wi-Fi teardown (observed on-device 2026-07-24; only a
+        // Bluetooth cycle recovered it).
+        assertFalse(tracker.canAttempt("AA:BB", nowMs = 1_001L))
+        assertTrue(tracker.canAttempt("AA:BB", nowMs = 1_002L))
+        // A failed probe re-arms the probe interval, still not a refusal.
+        tracker.recordFailure("AA:BB", nowMs = 1_002L)
+        assertTrue(tracker.isGivenUp("AA:BB"))
+        assertFalse(tracker.canAttempt("AA:BB", nowMs = 2_001L))
+        assertTrue(tracker.canAttempt("AA:BB", nowMs = 2_002L))
+        // retryDelayMs keeps feeding schedulers during probing (LanTransport
+        // relies on this to keep its reconnect loop alive).
+        assertEquals(1_000L, tracker.retryDelayMs("AA:BB", nowMs = 1_002L))
     }
 
     @Test

@@ -329,17 +329,35 @@ pub struct CoreReconnectBackoffTracker {
     initial_backoff_ms: i64,
     max_backoff_ms: i64,
     max_consecutive_failures: u32,
+    give_up_probe_ms: i64,
     state: Mutex<HashMap<String, BackoffState>>,
 }
 
+/// Exponential per-address reconnect backoff. Once an address exceeds
+/// `max_consecutive_failures` it is "given up": attempts continue, but only
+/// at the slow fixed `give_up_probe_ms` cadence. Give-up must never be a
+/// permanent refusal: transient radio failures (2026-07-24, live two-phone
+/// evidence: GATT connect storms while Wi-Fi tears down) can burn the whole
+/// failure budget against a peer's *current* advertisement address, which
+/// then stays valid for many more minutes — a permanent refusal wedges the
+/// link on both sides until Bluetooth itself is cycled. A slow probe caps
+/// the cost of a truly stale address at one attempt per interval while
+/// guaranteeing a live peer is relinked within roughly one probe interval
+/// of the radio settling.
 #[uniffi::export]
 impl CoreReconnectBackoffTracker {
     #[uniffi::constructor]
-    pub fn new(initial_backoff_ms: i64, max_backoff_ms: i64, max_failures: u32) -> Self {
+    pub fn new(
+        initial_backoff_ms: i64,
+        max_backoff_ms: i64,
+        max_failures: u32,
+        give_up_probe_ms: i64,
+    ) -> Self {
         Self {
             initial_backoff_ms: initial_backoff_ms.max(0),
             max_backoff_ms: max_backoff_ms.max(0),
             max_consecutive_failures: max_failures,
+            give_up_probe_ms: give_up_probe_ms.max(0),
             state: Mutex::new(HashMap::new()),
         }
     }
@@ -348,12 +366,13 @@ impl CoreReconnectBackoffTracker {
         self.state
             .lock_recoverable()
             .get(&address)
-            .map_or(true, |state| {
-                state.consecutive_failures < self.max_consecutive_failures
-                    && now_ms >= state.next_eligible_at_ms
-            })
+            .map_or(true, |state| now_ms >= state.next_eligible_at_ms)
     }
 
+    /// True once the address is past the consecutive-failure budget and in
+    /// slow-probe mode. Informational (logging/diagnostics) — callers must
+    /// not use it to stop retrying; `can_attempt`/`retry_delay_ms` already
+    /// encode the probe cadence.
     pub fn is_given_up(&self, address: String) -> bool {
         self.failure_count(address) >= self.max_consecutive_failures
     }
@@ -369,10 +388,7 @@ impl CoreReconnectBackoffTracker {
         self.state
             .lock_recoverable()
             .get(&address)
-            .and_then(|state| {
-                (state.consecutive_failures < self.max_consecutive_failures)
-                    .then(|| state.next_eligible_at_ms.saturating_sub(now_ms).max(0))
-            })
+            .map(|state| state.next_eligible_at_ms.saturating_sub(now_ms).max(0))
     }
 
     pub fn record_failure(&self, address: String, now_ms: i64) -> u32 {
@@ -380,13 +396,16 @@ impl CoreReconnectBackoffTracker {
         let failures = states
             .get(&address)
             .map_or(1, |state| state.consecutive_failures.saturating_add(1));
-        let multiplier = 1_i64
-            .checked_shl(failures.saturating_sub(1).min(20))
-            .unwrap_or(i64::MAX);
-        let backoff = self
-            .initial_backoff_ms
-            .saturating_mul(multiplier)
-            .min(self.max_backoff_ms);
+        let backoff = if failures >= self.max_consecutive_failures {
+            self.give_up_probe_ms
+        } else {
+            let multiplier = 1_i64
+                .checked_shl(failures.saturating_sub(1).min(20))
+                .unwrap_or(i64::MAX);
+            self.initial_backoff_ms
+                .saturating_mul(multiplier)
+                .min(self.max_backoff_ms)
+        };
         states.insert(
             address,
             BackoffState {
@@ -641,14 +660,28 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_backoff_doubles_then_gives_up() {
-        let tracker = CoreReconnectBackoffTracker::new(10, 40, 3);
+    fn reconnect_backoff_doubles_then_probes_slowly_after_give_up() {
+        let tracker = CoreReconnectBackoffTracker::new(10, 40, 3, 100);
         assert!(tracker.can_attempt("peer".into(), 0));
         assert_eq!(tracker.record_failure("peer".into(), 0), 1);
         assert_eq!(tracker.retry_delay_ms("peer".into(), 3), Some(7));
         assert_eq!(tracker.record_failure("peer".into(), 10), 2);
+        // Third failure exhausts the budget: given up, but only demoted to
+        // the slow probe cadence — never refused forever (the live wedge:
+        // transient failures against a still-advertised address).
         assert_eq!(tracker.record_failure("peer".into(), 30), 3);
         assert!(tracker.is_given_up("peer".into()));
+        assert!(!tracker.can_attempt("peer".into(), 129));
+        assert_eq!(tracker.retry_delay_ms("peer".into(), 30), Some(100));
+        assert!(tracker.can_attempt("peer".into(), 130));
+        // A failed probe re-arms the probe interval, not the exponential.
+        assert_eq!(tracker.record_failure("peer".into(), 130), 4);
+        assert!(!tracker.can_attempt("peer".into(), 229));
+        assert!(tracker.can_attempt("peer".into(), 230));
+        // A probe that finally connects clears everything.
+        tracker.record_success("peer".into());
+        assert!(!tracker.is_given_up("peer".into()));
+        assert!(tracker.can_attempt("peer".into(), 230));
     }
 
     #[test]

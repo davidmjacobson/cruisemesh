@@ -37,18 +37,30 @@ final class ReconnectBackoffTrackerTests: XCTestCase {
         XCTAssertTrue(tracker.canAttempt(address: "AA:BB", nowMs: 12_000))
     }
 
-    func testAddressGivenUpAfterConsecutiveFailureBudget() {
+    func testAddressPastFailureBudgetDecaysToSlowProbing() {
         let tracker = ReconnectBackoffTracker(
             initialBackoffMs: 1,
             maxBackoffMs: 1,
-            maxConsecutiveFailures: 3
+            maxConsecutiveFailures: 3,
+            giveUpProbeMs: 1_000
         )
         XCTAssertFalse(tracker.isGivenUp(address: "AA:BB"))
-        for i in 0..<3 {
-            tracker.recordFailure(address: "AA:BB", nowMs: Int64(i))
+        for _ in 0..<3 {
+            tracker.recordFailure(address: "AA:BB", nowMs: 2)
         }
         XCTAssertTrue(tracker.isGivenUp(address: "AA:BB"))
-        XCTAssertFalse(tracker.canAttempt(address: "AA:BB", nowMs: Int64.max / 2))
+        // Refused only until the probe interval elapses — a permanent refusal
+        // wedged live links whose current address ate transient failures
+        // during a Wi-Fi teardown (observed on-device 2026-07-24; only a
+        // Bluetooth cycle recovered it).
+        XCTAssertFalse(tracker.canAttempt(address: "AA:BB", nowMs: 1_001))
+        XCTAssertTrue(tracker.canAttempt(address: "AA:BB", nowMs: 1_002))
+        // A failed probe re-arms the probe interval, still not a refusal.
+        tracker.recordFailure(address: "AA:BB", nowMs: 1_002)
+        XCTAssertTrue(tracker.isGivenUp(address: "AA:BB"))
+        XCTAssertFalse(tracker.canAttempt(address: "AA:BB", nowMs: 2_001))
+        XCTAssertTrue(tracker.canAttempt(address: "AA:BB", nowMs: 2_002))
+        XCTAssertEqual(tracker.retryDelayMs(address: "AA:BB", nowMs: 1_002), 1_000)
     }
 
     func testRecordSuccessClearsFailureHistory() {
