@@ -49,6 +49,13 @@ android {
         targetSdk = 36
         versionCode = versionCodeOverride ?: 1784406677
         versionName = versionNameOverride ?: "1.0.0"
+        ndk {
+            // Keep dependency-provided native libraries on the exact ABI set
+            // built by core/build-android.sh. JNA also publishes legacy ABIs;
+            // packaging those without libcruisemesh_core.so would create
+            // device splits that fail at startup.
+            abiFilters += setOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
     }
 
     signingConfigs {

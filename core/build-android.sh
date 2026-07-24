@@ -2,6 +2,8 @@
 # Rebuilds the Rust core for Android: cross-compiles cruisemesh-core for all
 # target ABIs via cargo-ndk, then regenerates the Kotlin/JNA bindings from a
 # host build. Run from anywhere; paths are resolved relative to this script.
+# The release workflow separately checks every packaged 64-bit ELF for 16 KiB
+# PT_LOAD alignment before publishing an APK or AAB.
 #
 # Requires: rustup targets aarch64-linux-android, armv7-linux-androideabi,
 # x86_64-linux-android; cargo-ndk (`cargo install cargo-ndk`); ANDROID_NDK_HOME
