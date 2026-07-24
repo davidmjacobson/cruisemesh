@@ -563,31 +563,37 @@ private fun ConversationScreen(
                 val index = visibleMessages.lastIndex - revIndex
                 val isOwn = message.senderUserId.contentEquals(ownUserId)
 
-                if (isNewDay(visibleMessages, index)) {
-                    DaySeparator(message.timestamp)
-                }
+                // Keep the separator and its first message in one lazy-list
+                // item. With reverseLayout, emitting multiple roots from the
+                // item lambda placed those roots bottom-to-top, so the first
+                // message of a day appeared above its date separator.
+                Column {
+                    if (isNewDay(visibleMessages, index)) {
+                        DaySeparator(message.timestamp)
+                    }
 
-                if (gaps.contains(index)) {
-                    GapIndicator()
-                }
+                    if (gaps.contains(index)) {
+                        GapIndicator()
+                    }
 
-                MessageBubble(
-                    message = message,
-                    isOwn = isOwn,
-                    tick = if (isOwn) tickStatusFor(message.lamport, deliveredThrough, readThrough) else null,
-                    contactColor = if (isOwn) null else contactColor,
-                    grouping = grouping[index],
-                    quoted = replyMetadata[messageStableKey(message)]?.quoted,
-                    onQuotedClick = { target -> scrollToMessage(target) },
-                    reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
-                    onReact = { emoji ->
-                        toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
-                    },
-                    onPhotoClick = { viewerPhoto = it },
-                    outboundExpiryMs = if (isOwn) chatExtras.outboundExpiryMs[messageStableKey(message)] else null,
-                    onLongPress = { target, bounds -> openOverlay(target, bounds) },
-                    onSwipeReply = { startReply(message) },
-                )
+                    MessageBubble(
+                        message = message,
+                        isOwn = isOwn,
+                        tick = if (isOwn) tickStatusFor(message.lamport, deliveredThrough, readThrough) else null,
+                        contactColor = if (isOwn) null else contactColor,
+                        grouping = grouping[index],
+                        quoted = replyMetadata[messageStableKey(message)]?.quoted,
+                        onQuotedClick = { target -> scrollToMessage(target) },
+                        reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
+                        onReact = { emoji ->
+                            toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
+                        },
+                        onPhotoClick = { viewerPhoto = it },
+                        outboundExpiryMs = if (isOwn) chatExtras.outboundExpiryMs[messageStableKey(message)] else null,
+                        onLongPress = { target, bounds -> openOverlay(target, bounds) },
+                        onSwipeReply = { startReply(message) },
+                    )
+                }
             }
         },
         belowList = {
