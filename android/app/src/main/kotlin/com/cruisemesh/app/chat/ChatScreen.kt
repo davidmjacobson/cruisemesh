@@ -773,8 +773,9 @@ private fun ConversationScreen(
 internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
     val density = LocalDensity.current
     val previewPx = with(density) { 72.dp.toPx().roundToInt() }
-    val bitmap by produceState<ImageBitmap?>(null, bytes, previewPx) {
-        value = withContext(Dispatchers.IO) {
+    var bitmap by remember(bytes, previewPx) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(bytes, previewPx) {
+        bitmap = withContext(Dispatchers.IO) {
             ChatImageDecoder.decodeSampled(bytes, previewPx, previewPx)?.asImageBitmap()
         }
     }
@@ -1612,8 +1613,9 @@ private fun ChatImageAttachment(jpeg: ByteArray) {
         val widthDp = with(density) { widthPx.toDp() }
         val heightDp = with(density) { heightPx.toDp() }
 
-        val imageBitmap by produceState<ImageBitmap?>(null, jpeg, widthPx, heightPx) {
-            value = withContext(Dispatchers.IO) {
+        var imageBitmap by remember(jpeg, widthPx, heightPx) { mutableStateOf<ImageBitmap?>(null) }
+        LaunchedEffect(jpeg, widthPx, heightPx) {
+            imageBitmap = withContext(Dispatchers.IO) {
                 ChatImageDecoder.decodeSampled(jpeg, widthPx.roundToInt(), heightPx.roundToInt())
                     ?.asImageBitmap()
             }
