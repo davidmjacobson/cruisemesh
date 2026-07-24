@@ -31,7 +31,7 @@ struct TermsAcceptanceView: View {
                 HStack {
                     Spacer()
                     Button("Terms of Use") { openURL(TermsAcceptanceStore.termsURL) }
-                    Button("Privacy Policy") { openURL(TermsAcceptanceStore.privacyURL) }
+                    Button("Privacy policy") { openURL(TermsAcceptanceStore.privacyURL) }
                     Spacer()
                 }
                 .buttonStyle(.borderless)

@@ -25,7 +25,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import com.cruisemesh.app.R
 import com.cruisemesh.app.identity.PRIVACY_POLICY_URL
 import com.cruisemesh.app.identity.TERMS_OF_USE_URL
 
@@ -47,15 +49,15 @@ fun TermsAcceptanceScreen(onAccept: () -> Unit) {
                 .padding(24.dp),
             verticalArrangement = Arrangement.Center,
         ) {
-            Text("Before you start", style = MaterialTheme.typography.headlineLarge)
+            Text(stringResource(R.string.ui_before_you_start), style = MaterialTheme.typography.headlineLarge)
             Text(
-                "CruiseMesh is person-to-person messaging. Use it lawfully, connect only with people you trust, and do not send abusive or prohibited content.",
+                stringResource(R.string.ui_terms_messaging_conduct),
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 16.dp),
             )
             Text(
-                "Messages are end-to-end encrypted, so CruiseMesh cannot proactively read them. You can block a contact and report abuse from their contact details.",
+                stringResource(R.string.ui_terms_encryption_reporting),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 12.dp),
@@ -69,7 +71,7 @@ fun TermsAcceptanceScreen(onAccept: () -> Unit) {
             ) {
                 Checkbox(checked = agreed, onCheckedChange = { agreed = it })
                 Text(
-                    "I have read and agree to the Terms of Use and Privacy Policy.",
+                    stringResource(R.string.ui_terms_acceptance_confirmation),
                     modifier = Modifier.padding(start = 8.dp),
                 )
             }
@@ -80,14 +82,18 @@ fun TermsAcceptanceScreen(onAccept: () -> Unit) {
                     .fillMaxWidth()
                     .padding(top = 20.dp),
             ) {
-                Text("I agree")
+                Text(stringResource(R.string.ui_i_agree))
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.Center,
             ) {
-                TextButton(onClick = { open(TERMS_OF_USE_URL) }) { Text("Terms of Use") }
-                TextButton(onClick = { open(PRIVACY_POLICY_URL) }) { Text("Privacy Policy") }
+                TextButton(onClick = { open(TERMS_OF_USE_URL) }) {
+                    Text(stringResource(R.string.ui_terms_of_use))
+                }
+                TextButton(onClick = { open(PRIVACY_POLICY_URL) }) {
+                    Text(stringResource(R.string.ui_privacy_policy))
+                }
             }
         }
     }

@@ -284,7 +284,7 @@ fun ProfileScreen(
                         context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(TERMS_OF_USE_URL)))
                     },
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Terms of Use") }
+                ) { Text(stringResource(R.string.ui_terms_of_use)) }
                 TextButton(
                     onClick = {
                         context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL)))
