@@ -100,6 +100,12 @@
     <string name="ui_photo_ready_add_a_caption_or_send">Photo ready — add a caption or send</string>
     <string name="ui_preview_friend">Preview friend</string>
     <string name="ui_privacy_policy">Privacy policy</string>
+    <string name="ui_terms_of_use">Terms of Use</string>
+    <string name="ui_before_you_start">Before you start</string>
+    <string name="ui_terms_messaging_conduct">CruiseMesh is person-to-person messaging. Use it lawfully, connect only with people you trust, and do not send abusive or prohibited content.</string>
+    <string name="ui_terms_encryption_reporting">Messages are end-to-end encrypted, so CruiseMesh cannot proactively read them. You can block a contact and report abuse from their contact details.</string>
+    <string name="ui_terms_acceptance_confirmation">I have read and agree to the Terms of Use and Privacy Policy.</string>
+    <string name="ui_i_agree">I agree</string>
     <string name="ui_profile_settings">Profile &amp; settings</string>
     <string name="ui_read_these_aloud_to_verify">Read these aloud to verify.</string>
     <string name="ui_relay">Relay</string>

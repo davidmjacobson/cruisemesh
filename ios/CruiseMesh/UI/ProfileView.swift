@@ -1,8 +1,6 @@
 import PhotosUI
 import SwiftUI
 
-private let privacyPolicyURL = URL(string: "https://cruisemesh.app/privacy")!
-
 struct ProfileView: View {
     let identity: Identity
     @ObservedObject var appModel: AppModel
@@ -99,7 +97,8 @@ struct ProfileView: View {
                 }
 
                 Section("Legal") {
-                    Button("Privacy policy") { openURL(privacyPolicyURL) }
+                    Button("Terms of Use") { openURL(TermsAcceptanceStore.termsURL) }
+                    Button("Privacy policy") { openURL(TermsAcceptanceStore.privacyURL) }
                 }
             }
             .navigationTitle("Profile & settings")

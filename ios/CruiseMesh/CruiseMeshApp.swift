@@ -12,12 +12,18 @@ struct CruiseMeshApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var appModel = AppModel()
+    @State private var termsAccepted = TermsAcceptanceStore.isCurrentVersionAccepted()
     @State private var onboardingCompleted = OnboardingStore.isCompleted()
 
     var body: some Scene {
         WindowGroup {
             SwiftUI.Group {
-                if onboardingCompleted {
+                if !termsAccepted {
+                    TermsAcceptanceView {
+                        TermsAcceptanceStore.acceptCurrentVersion()
+                        termsAccepted = true
+                    }
+                } else if onboardingCompleted {
                     ChatListView(identity: appModel.identity, appModel: appModel)
                 } else {
                     OnboardingView(identity: appModel.identity, appModel: appModel) {
@@ -86,7 +92,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // can never be a Bluetooth relaunch anyway (nothing was ever
         // scanning/advertising/connected to restore), but guard explicitly
         // rather than relying on that.
-        guard isBluetoothRelaunch, OnboardingStore.isCompleted() else { return true }
+        guard isBluetoothRelaunch,
+              TermsAcceptanceStore.isCurrentVersionAccepted(),
+              OnboardingStore.isCompleted() else { return true }
         let identity = IdentityStore.loadOrCreate()
         MeshController.shared.configure(identity: identity)
         let meshEnabled = UserDefaults.standard.object(forKey: AppModel.meshEnabledKey) == nil
@@ -115,6 +123,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         defer { completionHandler() }
+        guard TermsAcceptanceStore.isCurrentVersionAccepted() else { return }
         let info = response.notification.request.content.userInfo
         guard let hex = info[MessageNotifier.chatUserIdKey] as? String,
               let chatId = try? UserIdHex.decode(hex) else { return }

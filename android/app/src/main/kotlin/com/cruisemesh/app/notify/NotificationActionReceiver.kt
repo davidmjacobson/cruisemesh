@@ -11,6 +11,7 @@ import com.cruisemesh.app.chat.GroupSender
 import com.cruisemesh.app.chat.RealMeshSender
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.identity.IdentityStore
+import com.cruisemesh.app.identity.TermsAcceptanceStore
 import java.util.concurrent.Executors
 
 /**
@@ -29,6 +30,7 @@ import java.util.concurrent.Executors
  */
 class NotificationActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        if (!TermsAcceptanceStore.isCurrentVersionAccepted(context)) return
         val hex = intent.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX) ?: return
         val chatId = runCatching { UserIdHex.decode(hex) }.getOrNull() ?: return
         val isGroup = intent.getBooleanExtra(MessageNotifier.EXTRA_CHAT_IS_GROUP, false)

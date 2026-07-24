@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.cruisemesh.app.identity.TermsAcceptanceStore
 
 private const val TAG = "BootReceiver"
 
@@ -12,6 +13,10 @@ private const val TAG = "BootReceiver"
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        if (!TermsAcceptanceStore.isCurrentVersionAccepted(context)) {
+            Log.i(TAG, "Skipping mesh startup after boot until the current Terms of Use are accepted")
+            return
+        }
 
         val permissionsGranted = MeshService.requiredPermissions().all {
             ContextCompat.checkSelfPermission(context, it) == android.content.pm.PackageManager.PERMISSION_GRANTED
