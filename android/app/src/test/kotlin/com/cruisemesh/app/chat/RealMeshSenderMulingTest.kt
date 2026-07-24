@@ -34,6 +34,7 @@ class RealMeshSenderMulingTest {
 
     companion object {
         private const val HOST_CORE_LIBRARY_PROPERTY = "cruisemesh.test.hostCoreLibrary"
+        private const val JNA_VERSION = "5.18.1"
 
         init {
             configureJnaBootLibrary()
@@ -90,11 +91,11 @@ class RealMeshSenderMulingTest {
 
         private fun jnaJar(): Path {
             val cacheRoot = Path.of(System.getProperty("user.home"), ".gradle", "caches", "modules-2", "files-2.1")
-            var cursor: Path? = cacheRoot.resolve("net.java.dev.jna").resolve("jna").resolve("5.14.0")
+            var cursor: Path? = cacheRoot.resolve("net.java.dev.jna").resolve("jna").resolve(JNA_VERSION)
             while (cursor != null && Files.exists(cursor)) {
                 Files.walk(cursor).use { paths ->
                     val found = paths
-                        .filter { it.fileName.toString() == "jna-5.14.0.jar" }
+                        .filter { it.fileName.toString() == "jna-$JNA_VERSION.jar" }
                         .findFirst()
                     if (found.isPresent) {
                         return found.get()
@@ -102,7 +103,7 @@ class RealMeshSenderMulingTest {
                 }
                 cursor = cursor.parent
             }
-            error("jna-5.14.0.jar not found under $cacheRoot")
+            error("jna-$JNA_VERSION.jar not found under $cacheRoot")
         }
     }
 
