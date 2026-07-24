@@ -67,6 +67,7 @@ import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.friending.ScanScreen
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.OnboardingStore
+import com.cruisemesh.app.identity.TermsAcceptanceStore
 import com.cruisemesh.app.identity.backup.BackupExportScreen
 import com.cruisemesh.app.identity.backup.BackupRestoreScreen
 import com.cruisemesh.app.identity.ProfilePhotoStore
@@ -101,6 +102,7 @@ import com.cruisemesh.app.ui.MeshStatusTextLogic
 import com.cruisemesh.app.ui.NewGroupScreen
 import com.cruisemesh.app.ui.OnboardingScreen
 import com.cruisemesh.app.ui.ProfileScreen
+import com.cruisemesh.app.ui.TermsAcceptanceScreen
 import com.cruisemesh.app.ui.AdvancedSettingsScreen
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
@@ -194,7 +196,18 @@ fun CruiseMeshApp(
         IdentityStore.load(context) ?: generateIdentity().also { IdentityStore.save(context, it) }
     }
     val navController = rememberNavController()
+    var termsAccepted by remember {
+        mutableStateOf(TermsAcceptanceStore.isCurrentVersionAccepted(context))
+    }
     var onboardingCompleted by remember { mutableStateOf(OnboardingStore.isCompleted(context)) }
+
+    if (!termsAccepted) {
+        TermsAcceptanceScreen {
+            TermsAcceptanceStore.acceptCurrentVersion(context)
+            termsAccepted = true
+        }
+        return
+    }
 
     NavHost(
         navController = navController,

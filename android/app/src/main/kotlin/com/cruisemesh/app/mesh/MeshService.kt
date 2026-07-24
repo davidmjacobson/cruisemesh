@@ -34,6 +34,7 @@ import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.identity.IdentityStore
+import com.cruisemesh.app.identity.TermsAcceptanceStore
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.DigestEntry
@@ -437,6 +438,13 @@ class MeshService : Service() {
         // explicit-stop bit before it ever reaches this path.
         MeshStartupPreferences.clearExplicitStop(this)
         startForeground(NOTIFICATION_ID, buildNotification())
+        if (!TermsAcceptanceStore.isCurrentVersionAccepted(this)) {
+            MeshRuntimeStatus.markStopped()
+            Log.i(TAG, "Current Terms of Use not accepted; stopping mesh service")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         // Debug builds: ensure log capture is running even if the process was
         // revived straight into the service without the UI (no-op in release
         // and idempotent with MainActivity's call).

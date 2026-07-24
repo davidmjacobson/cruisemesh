@@ -50,6 +50,7 @@ import androidx.core.content.ContextCompat
 import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
+import com.cruisemesh.app.identity.TERMS_OF_USE_URL
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.mesh.MeshStartupPreferences
 import com.cruisemesh.app.relay.RelayConfigStore
@@ -57,7 +58,7 @@ import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
 
 /** Hosted privacy policy (Play Console + in-app link). */
-const val PRIVACY_POLICY_URL = "https://cruisemesh.app/privacy"
+const val PRIVACY_POLICY_URL = "https://cruisemesh.app/privacy/"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -278,6 +279,12 @@ fun ProfileScreen(
 
             SettingsSpacer()
             ProfileSection(title = "Legal") {
+                TextButton(
+                    onClick = {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(TERMS_OF_USE_URL)))
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Terms of Use") }
                 TextButton(
                     onClick = {
                         context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL)))

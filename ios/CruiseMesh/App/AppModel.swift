@@ -29,6 +29,7 @@ final class AppModel: ObservableObject {
     }
 
     func startMesh() {
+        guard TermsAcceptanceStore.isCurrentVersionAccepted() else { return }
         meshEnabled = true
         UserDefaults.standard.set(true, forKey: Self.meshEnabledKey)
         MessageNotifier.requestPermission()
@@ -36,7 +37,7 @@ final class AppModel: ObservableObject {
     }
 
     func startMeshIfEnabled() {
-        guard meshEnabled else { return }
+        guard meshEnabled, TermsAcceptanceStore.isCurrentVersionAccepted() else { return }
         MeshController.shared.start()
     }
 
