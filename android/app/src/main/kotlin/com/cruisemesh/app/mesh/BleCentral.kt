@@ -33,6 +33,28 @@ private const val REQUESTED_MTU = 517
 // still freeing the slot well before the stack's own ~30 s give-up.
 private const val CONNECT_TIMEOUT_MS = 12_000L
 
+// Dense-fleet churn guard (2026-07-24 capture: a house full of family phones
+// all running CruiseMesh). The scan callback used to connectGatt to *every*
+// discovered advertiser -- hundreds of one-shot rotating RPAs, ~1 connect/s,
+// 488 status=133 failures in 7 minutes -- and the per-address backoff never
+// engaged because no rotated address is ever seen twice. Android exposes only
+// ~7-8 concurrent ACL links, shared between this central role and the
+// peripheral (GATT-server) role, so an uncapped central both burns radio on
+// doomed connects and squeezes the slot pool. Cap the central role's live
+// links (in-flight + established) below that ceiling and stop issuing new
+// connects once full: this bounds the churn while leaving headroom for the
+// peripheral role, which stays uncapped so a contact whose central can't get
+// a slot still reaches us on the inbound half of the dual-role link. Freed
+// slots (a peer rotated away or a link torn down) let the scan pick up
+// whoever is discovered next. This only bites in dense environments; a
+// typical few-phone family sits far below the cap and is unaffected.
+private const val MAX_CENTRAL_LINKS = 5
+
+// onScanResult fires once per advertisement in range, so in a saturated room
+// the at-cap path is hit hundreds of times a minute -- throttle its log so it
+// reports the condition without reproducing the very spam it prevents.
+private const val AT_CAP_LOG_INTERVAL_MS = 10_000L
+
 /**
  * Scanner + GATT-client (central) half of the dual BLE role (DESIGN.md §5.2).
  * Scans for the CruiseMesh service UUID, connects, and exchanges frames over
@@ -45,7 +67,12 @@ private const val CONNECT_TIMEOUT_MS = 12_000L
  * failure budget, that address is given up on entirely (it's presumably a
  * stale/rotated BLE address; a real peer re-advertising is rediscovered
  * under a fresh address with no prior failure history). The tracker resets
- * for an address the moment it fully connects. Separately, since a device
+ * for an address the moment it fully connects. That per-address backoff can't
+ * help when a whole *fleet* of phones keeps rotating to fresh addresses (each
+ * seen exactly once), so a second layer -- [MAX_CENTRAL_LINKS] -- caps the
+ * central role's concurrent links and stops issuing new connects once full,
+ * bounding the dense-fleet connect storm the backoff never engaged against.
+ * Separately, since a device
  * can't reliably read its own BLE address (rotates, and
  * BluetoothAdapter#getAddress is a dummy constant since API 23) to filter
  * out its own advertisement, [MeshConstants.LOCAL_INSTANCE_ID] is compared
@@ -163,6 +190,10 @@ class BleCentral(
     // than left to fire uselessly. Guarded by [lock].
     private val fullyConnected = mutableSetOf<String>()
 
+    // Epoch-ms of the last "at central link cap" log; throttles that log per
+    // [AT_CAP_LOG_INTERVAL_MS]. Guarded by [lock].
+    private var lastAtCapLogMs = 0L
+
     /**
      * Advertised service UUIDs + device name + whether our service *data*
      * (the scan-response payload the self-connection guard reads, distinct
@@ -203,6 +234,28 @@ class BleCentral(
 
             if (synchronized(lock) { connections.containsKey(device.address) }) return
             val now = System.currentTimeMillis()
+            // Dense-fleet churn guard: once the central role is holding its
+            // share of the shared ACL slot budget, stop issuing new connects
+            // (each doomed connectGatt against a rotated one-shot address is
+            // pure radio/battery burn and never accumulates backoff). Freed
+            // slots let the next scan result through; the peripheral role stays
+            // uncapped so contacts can still reach us inbound. See
+            // [MAX_CENTRAL_LINKS].
+            val liveLinkCount = synchronized(lock) { connections.size }
+            if (liveLinkCount >= MAX_CENTRAL_LINKS) {
+                val shouldLog = synchronized(lock) {
+                    (now - lastAtCapLogMs >= AT_CAP_LOG_INTERVAL_MS).also { if (it) lastAtCapLogMs = now }
+                }
+                if (shouldLog) {
+                    Log.i(
+                        TAG,
+                        "At central link cap ($liveLinkCount/$MAX_CENTRAL_LINKS); not connecting newly " +
+                            "discovered peers (e.g. ${device.address}) until a slot frees -- dense-fleet " +
+                            "connect-churn guard ($diagnostics)",
+                    )
+                }
+                return
+            }
             if (!backoff.canAttempt(device.address, now)) return
             Log.i(TAG, "Discovered peer ${device.address}, connecting ($diagnostics)")
             val gatt = device.connectGatt(context, false, gattClientCallback)
