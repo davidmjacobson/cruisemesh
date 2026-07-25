@@ -265,6 +265,13 @@
     <!-- Help &amp; support -->
     <string name="ui_never_post_a_cruise_pass_setup_card_or">Never post a Cruise Pass setup card or relay token publicly.</string>
     <string name="ui_open_cruisemesh_support">Open CruiseMesh support</string>
+    <!-- Cruise Pass status indicator (Settings row). Screen-reader labels for
+         the icon only; the row's title and detail already carry the wording,
+         so these stay short and are not read as full sentences. -->
+    <string name="ui_cruise_pass_ready">Cruise Pass ready</string>
+    <string name="ui_cruise_pass_waiting_for_internet">Cruise Pass waiting for internet</string>
+    <string name="ui_cruise_pass_needs_attention">Cruise Pass needs attention</string>
+    <string name="ui_cruise_pass_needs_action">Cruise Pass needs action</string>
     <!-- Internal tools -->
     <string name="ui_internal_tools">Internal tools</string>
     <string name="ui_local_wi_fi_field_tools">Local Wi-Fi field tools</string>

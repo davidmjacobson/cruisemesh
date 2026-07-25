@@ -11,10 +11,15 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -32,13 +37,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.R
 import com.cruisemesh.app.identity.TERMS_OF_USE_URL
 import com.cruisemesh.app.mesh.MeshStartupPreferences
+import com.cruisemesh.app.mesh.PassIndicator
 import com.cruisemesh.app.mesh.RelayHealth
+import com.cruisemesh.app.mesh.passIndicator
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.friending.FriendsOfFriendsStore
 
@@ -91,6 +100,7 @@ fun SettingsScreen(
                 SettingsLink(
                     title = relayTitle(relayHealth, relayConfigured),
                     detail = relayDetail(relayHealth, relayConfigured),
+                    indicator = passIndicator(relayHealth, relayConfigured),
                     onClick = onCruisePass,
                 )
             }
@@ -230,21 +240,81 @@ private fun SettingsGroup(title: String, content: @Composable () -> Unit) {
     }
 }
 
+/**
+ * Icon, tint and screen-reader label for a [PassIndicator].
+ *
+ * Each state gets a distinct *shape* as well as a distinct colour -- check,
+ * info, triangle, cross -- so the row still reads correctly for anyone who
+ * cannot tell the tints apart. Colours come from [LocalReachabilityPalette],
+ * which already carries light/dark variants and the app's fixed meanings
+ * (green = good, amber = degraded), rather than new one-off literals.
+ */
 @Composable
-private fun SettingsLink(title: String, detail: String?, onClick: () -> Unit) {
-    Column(
+private fun passIndicatorIcon(
+    indicator: PassIndicator,
+): Triple<ImageVector, Color, String>? {
+    val palette = LocalReachabilityPalette.current
+    return when (indicator) {
+        PassIndicator.NONE -> null
+        PassIndicator.READY -> Triple(
+            Icons.Filled.CheckCircle,
+            palette.nearby,
+            stringResource(R.string.ui_cruise_pass_ready),
+        )
+        PassIndicator.WAITING -> Triple(
+            Icons.Filled.Info,
+            palette.neutral,
+            stringResource(R.string.ui_cruise_pass_waiting_for_internet),
+        )
+        PassIndicator.ATTENTION -> Triple(
+            Icons.Filled.Warning,
+            palette.recent,
+            stringResource(R.string.ui_cruise_pass_needs_attention),
+        )
+        PassIndicator.ACTION_REQUIRED -> Triple(
+            Icons.Filled.Close,
+            MaterialTheme.colorScheme.error,
+            stringResource(R.string.ui_cruise_pass_needs_action),
+        )
+    }
+}
+
+// `indicator` sits before `onClick` on purpose: several call sites pass the
+// click handler as a trailing lambda, which Kotlin binds to the *last*
+// parameter. With the indicator last, those calls silently bound the lambda
+// to the wrong parameter and failed to compile.
+@Composable
+private fun SettingsLink(
+    title: String,
+    detail: String?,
+    indicator: PassIndicator = PassIndicator.NONE,
+    onClick: () -> Unit,
+) {
+    val icon = passIndicatorIcon(indicator)
+    Row(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
             .padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(title, style = MaterialTheme.typography.bodyLarge)
-        detail?.let {
-            Text(
-                it,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 2.dp),
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            detail?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+        }
+        icon?.let { (vector, tint, description) ->
+            Icon(
+                vector,
+                contentDescription = description,
+                tint = tint,
+                modifier = Modifier.padding(start = 12.dp).size(20.dp),
             )
         }
     }
