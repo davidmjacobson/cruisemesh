@@ -699,7 +699,7 @@ class MeshService : Service() {
         // BLE stop tears links down without per-address disconnect callbacks.
         // Preserve authenticated LAN routes, which remain usable.
         MeshRouter.resetBle()
-        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+        publishNearbyConnectivity()
         refreshRuntimeState()
         refreshForegroundNotification()
     }
@@ -960,7 +960,7 @@ class MeshService : Service() {
     private fun onCentralPeerDisconnected(address: String) {
         MeshRouter.onDisconnected(address)
         pendingLanHints.clear(address)
-        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+        publishNearbyConnectivity()
         noteLinkChangeAndReevaluate("central peer disconnected")
     }
 
@@ -973,7 +973,7 @@ class MeshService : Service() {
     private fun onPeripheralCentralDisconnected(address: String) {
         MeshRouter.onDisconnected(address)
         pendingLanHints.clear(address)
-        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+        publishNearbyConnectivity()
         noteLinkChangeAndReevaluate("peripheral central disconnected")
     }
 
@@ -1012,14 +1012,29 @@ class MeshService : Service() {
                 eagerHint.networkId,
             )
         }
+        publishNearbyConnectivity()
+    }
+
+    /**
+     * Publishes the two observable connectivity signals that move together on
+     * every link change -- the HELLO'd peer set and its per-peer transport map
+     * (see [MeshConnectivityStatus.nearbyTransports]). Both are recomputed from
+     * [MeshRouter] and pushed at every point a link forms, HELLOs, or drops.
+     * Publishing the transport map here (not just the peer set) is what fixes
+     * the zombie header: when Wi-Fi drops but the BLE link survives, the peer
+     * set is unchanged so its flow never emits, but the transport flips LAN->BLE
+     * and this map does emit, recomposing the "Nearby via ..." copy.
+     */
+    private fun publishNearbyConnectivity() {
         MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+        MeshConnectivityStatus.setNearbyTransports(MeshRouter.nearbyTransports())
     }
 
     private fun onLanPeerDisconnected(address: String) {
         MeshRouter.onDisconnected(address)
         lanHealthTracker.remove(address)
         LanTransportDiagnostics.disconnected(address)
-        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+        publishNearbyConnectivity()
         noteLinkChangeAndReevaluate("LAN peer disconnected")
     }
 
@@ -1248,7 +1263,7 @@ class MeshService : Service() {
             Log.w(TAG, "Dropping HELLO that conflicts with the authenticated identity for $address")
             return
         }
-        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
+        publishNearbyConnectivity()
         MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(userId), System.currentTimeMillis())
         Log.i(TAG, "HELLO from $address: userId=${UserIdHex.encode(userId)}")
 

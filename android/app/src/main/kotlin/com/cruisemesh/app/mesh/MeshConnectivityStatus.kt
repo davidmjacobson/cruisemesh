@@ -28,6 +28,19 @@ object MeshConnectivityStatus {
     /** Distinct HELLO'd peer userIds (hex via [com.cruisemesh.app.chat.UserIdHex]), any contact or stranger. */
     val nearbyPeerIds: StateFlow<Set<String>> = _nearbyPeerIds.asStateFlow()
 
+    private val _nearbyTransports = MutableStateFlow<Map<String, MeshRouterState.Transport>>(emptyMap())
+
+    /**
+     * hex userId -> the live transport a send to that peer would take right now
+     * (see [MeshRouterState.nearbyTransports]). Kept as its own observable
+     * signal, separate from [nearbyPeerIds], because a LAN->BLE handoff leaves
+     * the peer set unchanged (still HELLO'd, just over a different radio) --
+     * only this map changes, so only observing it makes the "Nearby via
+     * Wi-Fi/Bluetooth" copy flip live instead of freezing on the dead
+     * transport.
+     */
+    val nearbyTransports: StateFlow<Map<String, MeshRouterState.Transport>> = _nearbyTransports.asStateFlow()
+
     private val _relay = MutableStateFlow<RelayHealth>(RelayHealth.NoConfig)
     val relay: StateFlow<RelayHealth> = _relay.asStateFlow()
 
@@ -54,6 +67,10 @@ object MeshConnectivityStatus {
 
     fun setNearbyPeers(peers: Set<String>) {
         _nearbyPeerIds.value = peers
+    }
+
+    fun setNearbyTransports(transports: Map<String, MeshRouterState.Transport>) {
+        _nearbyTransports.value = transports
     }
 
     fun setRelayHealth(health: RelayHealth) {
@@ -90,6 +107,7 @@ object MeshConnectivityStatus {
     /** Mesh service stopped: every signal above is stale, so drop it all rather than show it frozen. */
     fun clear() {
         _nearbyPeerIds.value = emptySet()
+        _nearbyTransports.value = emptyMap()
         _relay.value = RelayHealth.NoConfig
         _contactLastSeen.value = emptyMap()
         _presenceLastSeen.value = emptyMap()

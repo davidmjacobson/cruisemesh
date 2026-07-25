@@ -117,6 +117,9 @@ object MeshRouter {
     /** Distinct HELLO'd peer userIds, hex-encoded; see [MeshRouterState.helloedUserIds]. */
     fun helloedUserIds(): Set<String> = state.helloedUserIds()
 
+    /** Per-userId live transport for every HELLO'd peer; see [MeshRouterState.nearbyTransports]. */
+    fun nearbyTransports(): Map<String, MeshRouterState.Transport> = state.nearbyTransports()
+
     /** Live routes that have identified themselves via HELLO. */
     fun identifiedRoutes(): List<MeshRouterState.IdentifiedRoute> = state.identifiedRoutes()
 
