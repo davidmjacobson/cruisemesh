@@ -26,6 +26,30 @@ class MeshRouterState {
     fun routeFor(userId: ByteArray): Pair<Transport, String>? = core.routeFor(userId)?.let { it.transport.toPlatform() to it.address }
     fun routesFor(userId: ByteArray): List<Pair<Transport, String>> = core.routesFor(userId).map { it.transport.toPlatform() to it.address }
     fun helloedUserIds(): Set<String> = core.helloedUserIds().mapTo(mutableSetOf(), UserIdHex::encode)
+
+    /**
+     * hex userId -> the transport a send to that userId would take right now
+     * (its highest-[Transport.routePriority] HELLO'd link, so LAN wins over
+     * BLE -- the same precedence as [routeFor]). One entry per
+     * [helloedUserIds] member. Exposed so the connectivity flow can publish an
+     * *observable* per-contact transport: [routeFor] read imperatively from a
+     * composable only re-samples when its inputs change, so a LAN->BLE handoff
+     * that leaves the userId still HELLO'd (Wi-Fi dropped, BLE link survives)
+     * never flipped the "Nearby via Wi-Fi/Bluetooth" copy. This map changing is
+     * what makes that flip recompose.
+     */
+    fun nearbyTransports(): Map<String, Transport> {
+        val best = HashMap<String, Transport>()
+        for (route in identifiedRoutes()) {
+            val hex = UserIdHex.encode(route.userId)
+            val current = best[hex]
+            if (current == null || route.transport.routePriority > current.routePriority) {
+                best[hex] = route.transport
+            }
+        }
+        return best
+    }
+
     fun clearTransports(transports: Set<Transport>) = core.clearTransports(transports.map(Transport::toCore))
     fun clear() = core.clear()
 }
