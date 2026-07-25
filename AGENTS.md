@@ -38,3 +38,20 @@ alone is enough for JVM unit tests but not for building/running the app.
 the Xcode project; run the test suite against an available simulator with
 `xcodebuild test -project CruiseMesh.xcodeproj -scheme CruiseMesh -destination
 "platform=iOS Simulator,id=<simulator-udid>" CODE_SIGNING_ALLOWED=NO`.
+
+## Two-phone BLE smoke test
+
+`tools/two_phone_ble_smoke.sh` drives a real pair of Android phones through
+the failure mode that keeps regressing: a LAN link dies and delivery has to
+continue over Bluetooth. With two devices attached over adb and the app
+installed on both:
+
+```sh
+tools/two_phone_ble_smoke.sh -p Emma          # -a/-b to pick serials explicitly
+```
+
+It gates on a **delivery receipt in logcat**, never on the chat header. The
+header lied for ten minutes during the B5 investigation and turned three good
+runs into false failures; screenshots of it are saved as artifacts for a human
+to review, but nothing asserts on them. Wi-Fi state is restored on exit even
+if the run fails.
