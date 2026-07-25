@@ -102,6 +102,17 @@ struct RelayPresencePage {
     let presence: [CoreRelayPresence]
 }
 
+struct RelayHTTPError: LocalizedError {
+    let statusCode: Int
+    let relayCode: String?
+    let responseBody: String
+
+    var errorDescription: String? {
+        let semantic = relayCode.map { " [\($0)]" } ?? ""
+        return "Relay request failed (\(statusCode))\(semantic): \(responseBody)"
+    }
+}
+
 /// HTTPS client for `cruisemesh-relayd` (DESIGN.md §9). Mirrors Android `RelayClient`.
 enum RelayClient {
     private static let connectTimeout: TimeInterval = 10
@@ -272,10 +283,11 @@ enum RelayClient {
         }
         guard (200..<300).contains(http.statusCode) else {
             let body = String(data: data.prefix(2_048), encoding: .utf8) ?? ""
-            throw NSError(
-                domain: "RelayClient",
-                code: http.statusCode,
-                userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode): \(body)"]
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            throw RelayHTTPError(
+                statusCode: http.statusCode,
+                relayCode: json?["code"] as? String,
+                responseBody: body
             )
         }
     }

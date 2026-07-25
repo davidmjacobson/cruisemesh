@@ -42,6 +42,8 @@ import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OutboundEnvelope
+import uniffi.cruisemesh_core.PeerConnectionEventKind
+import uniffi.cruisemesh_core.PeerConnectionTransport
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.encodeDigest
 import uniffi.cruisemesh_core.shouldRedigest
@@ -699,7 +701,7 @@ class MeshService : Service() {
         // BLE stop tears links down without per-address disconnect callbacks.
         // Preserve authenticated LAN routes, which remain usable.
         MeshRouter.resetBle()
-        publishNearbyConnectivity()
+        MeshConnectivityStatus.refreshNearbyRoutes()
         refreshRuntimeState()
         refreshForegroundNotification()
     }
@@ -951,6 +953,30 @@ class MeshService : Service() {
         }
     }
 
+    private fun recordPeerDisconnected(address: String) {
+        val userId = MeshRouter.userIdFor(address) ?: return
+        val transport = MeshRouter.transportFor(address) ?: return
+        if (store.getContact(userId) == null) return
+        recordPeerConnection(userId, transport, PeerConnectionEventKind.DISCONNECTED)
+    }
+
+    private fun recordPeerConnection(
+        userId: ByteArray,
+        transport: MeshRouterState.Transport,
+        kind: PeerConnectionEventKind,
+    ) {
+        val path = when (transport) {
+            MeshRouterState.Transport.CENTRAL,
+            MeshRouterState.Transport.PERIPHERAL -> PeerConnectionTransport.BLUETOOTH
+            MeshRouterState.Transport.LAN -> PeerConnectionTransport.LOCAL_WIFI
+        }
+        runCatching {
+            store.recordPeerConnectionEvent(userId, path, kind, System.currentTimeMillis())
+        }.onFailure { error ->
+            Log.w(TAG, "Could not record connection history: ${error.message}")
+        }
+    }
+
     private fun onCentralPeerConnected(address: String) {
         MeshRouter.onConnected(address, MeshRouterState.Transport.CENTRAL)
         sendHello(address)
@@ -958,9 +984,10 @@ class MeshService : Service() {
     }
 
     private fun onCentralPeerDisconnected(address: String) {
+        recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
         pendingLanHints.clear(address)
-        publishNearbyConnectivity()
+        MeshConnectivityStatus.refreshNearbyRoutes()
         noteLinkChangeAndReevaluate("central peer disconnected")
     }
 
@@ -971,9 +998,10 @@ class MeshService : Service() {
     }
 
     private fun onPeripheralCentralDisconnected(address: String) {
+        recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
         pendingLanHints.clear(address)
-        publishNearbyConnectivity()
+        MeshConnectivityStatus.refreshNearbyRoutes()
         noteLinkChangeAndReevaluate("peripheral central disconnected")
     }
 
@@ -990,6 +1018,13 @@ class MeshService : Service() {
             return
         }
         val contact = store.getContact(userId)
+        if (contact != null) {
+            recordPeerConnection(
+                userId,
+                MeshRouterState.Transport.LAN,
+                PeerConnectionEventKind.CONNECTED,
+            )
+        }
         val peerName = contact?.name ?: "Accepted friend"
         endpoint?.let { lanEndpointCache.save(networkId, userId, it) }
         LanTransportDiagnostics.authenticated(address, peerName)
@@ -1012,29 +1047,15 @@ class MeshService : Service() {
                 eagerHint.networkId,
             )
         }
-        publishNearbyConnectivity()
-    }
-
-    /**
-     * Publishes the two observable connectivity signals that move together on
-     * every link change -- the HELLO'd peer set and its per-peer transport map
-     * (see [MeshConnectivityStatus.nearbyTransports]). Both are recomputed from
-     * [MeshRouter] and pushed at every point a link forms, HELLOs, or drops.
-     * Publishing the transport map here (not just the peer set) is what fixes
-     * the zombie header: when Wi-Fi drops but the BLE link survives, the peer
-     * set is unchanged so its flow never emits, but the transport flips LAN->BLE
-     * and this map does emit, recomposing the "Nearby via ..." copy.
-     */
-    private fun publishNearbyConnectivity() {
-        MeshConnectivityStatus.setNearbyPeers(MeshRouter.helloedUserIds())
-        MeshConnectivityStatus.setNearbyTransports(MeshRouter.nearbyTransports())
+        MeshConnectivityStatus.refreshNearbyRoutes()
     }
 
     private fun onLanPeerDisconnected(address: String) {
+        recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
         lanHealthTracker.remove(address)
         LanTransportDiagnostics.disconnected(address)
-        publishNearbyConnectivity()
+        MeshConnectivityStatus.refreshNearbyRoutes()
         noteLinkChangeAndReevaluate("LAN peer disconnected")
     }
 
@@ -1263,8 +1284,13 @@ class MeshService : Service() {
             Log.w(TAG, "Dropping HELLO that conflicts with the authenticated identity for $address")
             return
         }
-        publishNearbyConnectivity()
+        MeshConnectivityStatus.refreshNearbyRoutes()
         MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(userId), System.currentTimeMillis())
+        if (store.getContact(userId) != null) {
+            MeshRouter.transportFor(address)?.let { transport ->
+                recordPeerConnection(userId, transport, PeerConnectionEventKind.CONNECTED)
+            }
+        }
         Log.i(TAG, "HELLO from $address: userId=${UserIdHex.encode(userId)}")
 
         // A LAN endpoint hint that arrived on this address before this HELLO

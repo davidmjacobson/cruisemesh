@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.Button
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -109,7 +110,13 @@ fun ChatListScreen(
     onDeleteSummary: (ChatSummary) -> Unit,
     onMarkRead: (ChatSummary) -> Unit,
     onNewChatClick: () -> Unit,
+    onAddFriendClick: () -> Unit,
+    onNewGroupClick: () -> Unit,
     onProfileClick: () -> Unit,
+    onFriendsClick: () -> Unit,
+    onConnectionDetailsClick: () -> Unit,
+    onSettingsClick: () -> Unit,
+    onHelpClick: () -> Unit,
     onMeshStatusClick: () -> Unit,
     meshStatusText: String,
     meshStatusDotColor: androidx.compose.ui.graphics.Color? = null,
@@ -118,6 +125,8 @@ fun ChatListScreen(
     onConnectivityWarningSecondaryClick: (() -> Unit)? = null,
     summaries: List<ChatSummary>
 ) {
+    var showHomeMenu by remember { mutableStateOf(false) }
+    var showComposeMenu by remember { mutableStateOf(false) }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -133,11 +142,79 @@ fun ChatListScreen(
                         )
                     }
                 },
+                actions = {
+                    Box {
+                        IconButton(onClick = { showHomeMenu = true }) {
+                            Icon(Icons.Default.MoreVert, contentDescription = "More options")
+                        }
+                        DropdownMenu(
+                            expanded = showHomeMenu,
+                            onDismissRequest = { showHomeMenu = false },
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text(stringResource(R.string.ui_friends)) },
+                                onClick = {
+                                    showHomeMenu = false
+                                    onFriendsClick()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text(stringResource(R.string.ui_connection_details)) },
+                                onClick = {
+                                    showHomeMenu = false
+                                    onConnectionDetailsClick()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text(stringResource(R.string.ui_settings)) },
+                                onClick = {
+                                    showHomeMenu = false
+                                    onSettingsClick()
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text(stringResource(R.string.ui_help_support)) },
+                                onClick = {
+                                    showHomeMenu = false
+                                    onHelpClick()
+                                },
+                            )
+                        }
+                    }
+                },
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = onNewChatClick) {
-                Icon(Icons.Default.Add, contentDescription = "New Chat")
+            Box {
+                FloatingActionButton(onClick = { showComposeMenu = true }) {
+                    Icon(Icons.Default.Add, contentDescription = "Start something")
+                }
+                DropdownMenu(
+                    expanded = showComposeMenu,
+                    onDismissRequest = { showComposeMenu = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.ui_new_message)) },
+                        onClick = {
+                            showComposeMenu = false
+                            onNewChatClick()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.ui_add_a_friend)) },
+                        onClick = {
+                            showComposeMenu = false
+                            onAddFriendClick()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.ui_new_group)) },
+                        onClick = {
+                            showComposeMenu = false
+                            onNewGroupClick()
+                        },
+                    )
+                }
             }
         }
     ) { innerPadding ->
@@ -469,7 +546,13 @@ private fun ChatListScreenEmptyPreview() {
             onDeleteSummary = {},
             onMarkRead = {},
             onNewChatClick = {},
+            onAddFriendClick = {},
+            onNewGroupClick = {},
             onProfileClick = {},
+            onFriendsClick = {},
+            onConnectionDetailsClick = {},
+            onSettingsClick = {},
+            onHelpClick = {},
             onMeshStatusClick = {},
             meshStatusText = "Mesh off",
             connectivityWarning = ConnectivityWarning(
@@ -521,7 +604,13 @@ private fun ChatListScreenPreview() {
             onDeleteSummary = {},
             onMarkRead = {},
             onNewChatClick = {},
+            onAddFriendClick = {},
+            onNewGroupClick = {},
             onProfileClick = {},
+            onFriendsClick = {},
+            onConnectionDetailsClick = {},
+            onSettingsClick = {},
+            onHelpClick = {},
             onMeshStatusClick = {},
             meshStatusText = "Meshing · 2 nearby",
             summaries = listOf(

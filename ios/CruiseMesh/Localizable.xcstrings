@@ -1,6 +1,26 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "About & legal": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "About & legal"
+          }
+        }
+      }
+    },
+    "Active paths, people, recent activity, and support diagnostics.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Active paths, people, recent activity, and support diagnostics."
+          }
+        }
+      }
+    },
     "Add a caption or send as-is.": {
       "localizations": {
         "en": {
@@ -101,32 +121,12 @@
         }
       }
     },
-    "Advanced": {
+    "Anyone with this link can use your household relay. Share it only with people in your group.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Advanced"
-          }
-        }
-      }
-    },
-    "Advanced settings": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Advanced settings"
-          }
-        }
-      }
-    },
-    "Ask them to check these words match their card.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Ask them to check these words match their card."
+            "value": "Anyone with this link can use your household relay. Share it only with people in your group."
           }
         }
       }
@@ -181,6 +181,36 @@
         }
       }
     },
+    "Before you start": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Before you start"
+          }
+        }
+      }
+    },
+    "Block": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Block"
+          }
+        }
+      }
+    },
+    "Bluetooth": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bluetooth"
+          }
+        }
+      }
+    },
     "Cancel": {
       "localizations": {
         "en": {
@@ -201,12 +231,42 @@
         }
       }
     },
+    "Checking the relay before saving…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Checking the relay before saving…"
+          }
+        }
+      }
+    },
     "Choose profile photo": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Choose profile photo"
+          }
+        }
+      }
+    },
+    "Clear connection history": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Clear connection history"
+          }
+        }
+      }
+    },
+    "Clear history": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Clear history"
           }
         }
       }
@@ -247,6 +307,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Connect securely"
+          }
+        }
+      }
+    },
+    "Connection activity will appear here as CruiseMesh reaches your friends.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connection activity will appear here as CruiseMesh reaches your friends."
+          }
+        }
+      }
+    },
+    "Connection details": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connection details"
           }
         }
       }
@@ -301,6 +381,16 @@
         }
       }
     },
+    "Cruise Pass": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cruise Pass"
+          }
+        }
+      }
+    },
     "CruiseMesh": {
       "localizations": {
         "en": {
@@ -311,12 +401,32 @@
         }
       }
     },
-    "CruiseMesh can't reach nearby phones over Wi-Fi without it. Enable Local Network access in Settings — Bluetooth delivery still works.": {
+    "CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Cruise Pass.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "CruiseMesh can't reach nearby phones over Wi-Fi without it. Enable Local Network access in Settings — Bluetooth delivery still works."
+            "value": "CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Cruise Pass."
+          }
+        }
+      }
+    },
+    "CruiseMesh is person-to-person messaging. Use it lawfully, connect only with people you trust, and do not send abusive or prohibited content.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CruiseMesh is person-to-person messaging. Use it lawfully, connect only with people you trust, and do not send abusive or prohibited content."
+          }
+        }
+      }
+    },
+    "CruiseMesh operation": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CruiseMesh operation"
           }
         }
       }
@@ -327,16 +437,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "CruiseMesh will request each connection through the mutual friends shown in the list."
-          }
-        }
-      }
-    },
-    "CruiseMesh works best when iOS lets it use Bluetooth and show delivery notifications.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "CruiseMesh works best when iOS lets it use Bluetooth and show delivery notifications."
           }
         }
       }
@@ -381,12 +481,12 @@
         }
       }
     },
-    "Dismiss": {
+    "Delivery": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Dismiss"
+            "value": "Delivery"
           }
         }
       }
@@ -411,6 +511,16 @@
         }
       }
     },
+    "Dismiss": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dismiss"
+          }
+        }
+      }
+    },
     "Display name": {
       "localizations": {
         "en": {
@@ -427,6 +537,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Done"
+          }
+        }
+      }
+    },
+    "Each family phone needs this setup. A configured phone with internet can help move the family's queued messages; Cruise Pass does not share that phone's internet connection.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Each family phone needs this setup. A configured phone with internet can help move the family's queued messages; Cruise Pass does not share that phone's internet connection."
           }
         }
       }
@@ -451,6 +571,16 @@
         }
       }
     },
+    "Export an encrypted copy of your identity and messages.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Export an encrypted copy of your identity and messages."
+          }
+        }
+      }
+    },
     "Export field metrics": {
       "localizations": {
         "en": {
@@ -471,12 +601,42 @@
         }
       }
     },
+    "Family phone setup": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Family phone setup"
+          }
+        }
+      }
+    },
     "Family token": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Family token"
+          }
+        }
+      }
+    },
+    "Field metrics contain hashed chat tags, route types, and delivery timings—never message content or contact names.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Field metrics contain hashed chat tags, route types, and delivery timings—never message content or contact names."
+          }
+        }
+      }
+    },
+    "For self-hosted relays and development. Most people should use the setup card above.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "For self-hosted relays and development. Most people should use the setup card above."
           }
         }
       }
@@ -571,12 +731,62 @@
         }
       }
     },
+    "Help & support": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Help & support"
+          }
+        }
+      }
+    },
+    "History contains only friend identity, path type, event type, and time. It never stores message content, relay tokens, IP addresses, or Wi-Fi names.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "History contains only friend identity, path type, event type, and time. It never stores message content, relay tokens, IP addresses, or Wi-Fi names."
+          }
+        }
+      }
+    },
     "Hold to record a voice memo": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Hold to record a voice memo"
+          }
+        }
+      }
+    },
+    "Household setup": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Household setup"
+          }
+        }
+      }
+    },
+    "I agree": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "I agree"
+          }
+        }
+      }
+    },
+    "If a setup link does not open, go to Settings → Cruise Pass, paste the complete card, choose Review, then Test and use.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "If a setup link does not open, go to Settings → Cruise Pass, paste the complete card, choose Review, then Test and use."
           }
         }
       }
@@ -597,6 +807,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Info"
+          }
+        }
+      }
+    },
+    "Internal field tools": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Internal field tools"
+          }
+        }
+      }
+    },
+    "Internal tools": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Internal tools"
           }
         }
       }
@@ -631,16 +861,6 @@
         }
       }
     },
-    "Legal": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Legal"
-          }
-        }
-      }
-    },
     "Let friends introduce you to people they know. Messages and phone contacts are never shared.": {
       "localizations": {
         "en": {
@@ -651,12 +871,12 @@
         }
       }
     },
-    "Local Wi-Fi (experimental)": {
+    "Local Wi-Fi": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Local Wi-Fi (experimental)"
+            "value": "Local Wi-Fi"
           }
         }
       }
@@ -671,22 +891,22 @@
         }
       }
     },
-    "Local network access is off": {
+    "Local Wi-Fi field tools": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Local network access is off"
+            "value": "Local Wi-Fi field tools"
           }
         }
       }
     },
-    "Message history could not be read and was reset.": {
+    "Manual local-network probes, raw route counters, and diagnostic exports.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Message history could not be read and was reset."
+            "value": "Manual local-network probes, raw route counters, and diagnostic exports."
           }
         }
       }
@@ -711,16 +931,6 @@
         }
       }
     },
-    "Mesh": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Mesh"
-          }
-        }
-      }
-    },
     "Mesh status": {
       "localizations": {
         "en": {
@@ -741,12 +951,42 @@
         }
       }
     },
+    "Message history could not be read and was reset.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Message history could not be read and was reset."
+          }
+        }
+      }
+    },
     "Message info": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Message info"
+          }
+        }
+      }
+    },
+    "Messages are end-to-end encrypted, so CruiseMesh cannot proactively read them. You can block a contact and report abuse from their contact details.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Messages are end-to-end encrypted, so CruiseMesh cannot proactively read them. You can block a contact and report abuse from their contact details."
+          }
+        }
+      }
+    },
+    "More help": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "More help"
           }
         }
       }
@@ -771,12 +1011,32 @@
         }
       }
     },
+    "Never post a Cruise Pass setup card or relay token publicly.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Never post a Cruise Pass setup card or relay token publicly."
+          }
+        }
+      }
+    },
     "New group": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "New group"
+          }
+        }
+      }
+    },
+    "New message": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "New message"
           }
         }
       }
@@ -797,6 +1057,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "No chats yet"
+          }
+        }
+      }
+    },
+    "No friends added yet.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No friends added yet."
           }
         }
       }
@@ -851,22 +1121,22 @@
         }
       }
     },
-    "Open Settings": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Open Settings"
-          }
-        }
-      }
-    },
     "Open the app when you sit down with family so phones can sync over Bluetooth.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Open the app when you sit down with family so phones can sync over Bluetooth."
+          }
+        }
+      }
+    },
+    "Overview": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Overview"
           }
         }
       }
@@ -891,12 +1161,42 @@
         }
       }
     },
+    "Paste card": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Paste card"
+          }
+        }
+      }
+    },
     "Paste friend card": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Paste friend card"
+          }
+        }
+      }
+    },
+    "Paste the CMRELAY1 card from your purchase email, review it, then test and use it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Paste the CMRELAY1 card from your purchase email, review it, then test and use it."
+          }
+        }
+      }
+    },
+    "People": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "People"
           }
         }
       }
@@ -971,12 +1271,12 @@
         }
       }
     },
-    "Profile & settings": {
+    "Profile": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Profile & settings"
+            "value": "Profile"
           }
         }
       }
@@ -991,6 +1291,16 @@
         }
       }
     },
+    "Queued internet delivery will stop until another Cruise Pass or custom relay is set up. Nearby delivery still works.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Queued internet delivery will stop until another Cruise Pass or custom relay is set up. Nearby delivery still works."
+          }
+        }
+      }
+    },
     "Reachability dots": {
       "localizations": {
         "en": {
@@ -1001,22 +1311,12 @@
         }
       }
     },
-    "Read these aloud to verify.": {
+    "Recent activity": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Read these aloud to verify."
-          }
-        }
-      }
-    },
-    "Read these words aloud with your friend to verify keys.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Read these words aloud with your friend to verify keys."
+            "value": "Recent activity"
           }
         }
       }
@@ -1041,12 +1341,22 @@
         }
       }
     },
-    "Relay, local Wi-Fi, and diagnostics": {
+    "Relay token": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Relay, local Wi-Fi, and diagnostics"
+            "value": "Relay token"
+          }
+        }
+      }
+    },
+    "Remove Cruise Pass setup": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove Cruise Pass setup"
           }
         }
       }
@@ -1067,6 +1377,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Remove profile photo"
+          }
+        }
+      }
+    },
+    "Remove setup": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove setup"
           }
         }
       }
@@ -1121,6 +1441,16 @@
         }
       }
     },
+    "Report contact": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Report contact"
+          }
+        }
+      }
+    },
     "Restore from backup": {
       "localizations": {
         "en": {
@@ -1141,12 +1471,12 @@
         }
       }
     },
-    "Safety words": {
+    "Review": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Safety words"
+            "value": "Review"
           }
         }
       }
@@ -1161,22 +1491,22 @@
         }
       }
     },
+    "Save and check later": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Save and check later"
+          }
+        }
+      }
+    },
     "Save image": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Save image"
-          }
-        }
-      }
-    },
-    "Save your identity and messages to an encrypted file.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Save your identity and messages to an encrypted file."
           }
         }
       }
@@ -1221,6 +1551,16 @@
         }
       }
     },
+    "Scan this with the other phone. It configures internet delivery; it does not add a contact.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scan this with the other phone. It configures internet delivery; it does not add a contact."
+          }
+        }
+      }
+    },
     "Search local subnet": {
       "localizations": {
         "en": {
@@ -1231,12 +1571,62 @@
         }
       }
     },
+    "See active paths, per-person history, recent activity, and diagnostic sharing.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "See active paths, per-person history, recent activity, and diagnostic sharing."
+          }
+        }
+      }
+    },
     "Send": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Send"
+          }
+        }
+      }
+    },
+    "Set up another phone": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set up another phone"
+          }
+        }
+      }
+    },
+    "Set up or fix Cruise Pass": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set up or fix Cruise Pass"
+          }
+        }
+      }
+    },
+    "Settings": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Settings"
+          }
+        }
+      }
+    },
+    "Setup card": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Setup card"
           }
         }
       }
@@ -1267,6 +1657,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Share diagnostics"
+          }
+        }
+      }
+    },
+    "Share setup link": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Share setup link"
           }
         }
       }
@@ -1307,6 +1707,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Show my friend card"
+          }
+        }
+      }
+    },
+    "Show setup QR": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Show setup QR"
           }
         }
       }
@@ -1361,12 +1771,52 @@
         }
       }
     },
+    "Support": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Support"
+          }
+        }
+      }
+    },
     "Take photo": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Take photo"
+          }
+        }
+      }
+    },
+    "Terms of Use": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Terms of Use"
+          }
+        }
+      }
+    },
+    "Test and save": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Test and save"
+          }
+        }
+      }
+    },
+    "Test and use": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Test and use"
           }
         }
       }
@@ -1391,12 +1841,22 @@
         }
       }
     },
-    "This backup file is too large.": {
+    "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "This backup file is too large."
+            "value": "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone."
+          }
+        }
+      }
+    },
+    "They won't be able to message you, and they won't appear as a suggested friend. They won't be told. Scanning their card again unblocks them.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "They won't be able to message you, and they won't appear as a suggested friend. They won't be told. Scanning their card again unblocks them."
           }
         }
       }
@@ -1421,6 +1881,16 @@
         }
       }
     },
+    "This removes local connection events and per-person path summaries. Messages and friends are not affected.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This removes local connection events and per-person path summaries. Messages and friends are not affected."
+          }
+        }
+      }
+    },
     "Turn on a few permissions": {
       "localizations": {
         "en": {
@@ -1431,12 +1901,12 @@
         }
       }
     },
-    "Turn on the permissions that help the mesh": {
+    "Understand delivery": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Turn on the permissions that help the mesh"
+            "value": "Understand delivery"
           }
         }
       }
@@ -1461,12 +1931,12 @@
         }
       }
     },
-    "User ID": {
+    "Use this Cruise Pass?": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "User ID"
+            "value": "Use this Cruise Pass?"
           }
         }
       }
@@ -1521,16 +1991,6 @@
         }
       }
     },
-    "You can continue without these, but delivery is less reliable while the app is backgrounded.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "You can continue without these, but delivery is less reliable while the app is backgrounded."
-          }
-        }
-      }
-    },
     "You can turn these on later in Settings.": {
       "localizations": {
         "en": {
@@ -1547,126 +2007,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your friend must already be accepted. The QR only supplies a local network address; the encrypted identity check still applies."
-          }
-        }
-      }
-    },
-    "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone."
-          }
-        }
-      }
-    },
-    "Block": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Block"
-          }
-        }
-      }
-    },
-    "Block contact": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Block contact"
-          }
-        }
-      }
-    },
-    "Block %@?": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Block %@?"
-          }
-        }
-      }
-    },
-    "They won't be able to message you, and they won't appear as a suggested friend. They won't be told. Scanning their card again unblocks them.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "They won't be able to message you, and they won't appear as a suggested friend. They won't be told. Scanning their card again unblocks them."
-          }
-        }
-      }
-    },
-    "Report contact": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Report contact"
-          }
-        }
-      }
-    },
-    "Before you start": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Before you start"
-          }
-        }
-      }
-    },
-    "CruiseMesh is person-to-person messaging. Use it lawfully, connect only with people you trust, and do not send abusive or prohibited content.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "CruiseMesh is person-to-person messaging. Use it lawfully, connect only with people you trust, and do not send abusive or prohibited content."
-          }
-        }
-      }
-    },
-    "Messages are end-to-end encrypted, so CruiseMesh cannot proactively read them. You can block a contact and report abuse from their contact details.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Messages are end-to-end encrypted, so CruiseMesh cannot proactively read them. You can block a contact and report abuse from their contact details."
-          }
-        }
-      }
-    },
-    "I have read and agree to the Terms of Use and Privacy Policy.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "I have read and agree to the Terms of Use and Privacy Policy."
-          }
-        }
-      }
-    },
-    "I agree": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "I agree"
-          }
-        }
-      }
-    },
-    "Terms of Use": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Terms of Use"
           }
         }
       }

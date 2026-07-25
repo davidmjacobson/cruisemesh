@@ -1,8 +1,6 @@
 package com.cruisemesh.app.ui
 
 import android.Manifest
-import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.net.Uri
@@ -32,9 +30,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -47,13 +43,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
-import com.cruisemesh.app.identity.TERMS_OF_USE_URL
 import com.cruisemesh.app.media.createCameraCaptureUri
-import com.cruisemesh.app.mesh.MeshStartupPreferences
-import com.cruisemesh.app.relay.RelayConfigStore
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
 
@@ -66,22 +58,14 @@ fun ProfileScreen(
     profileUserId: ByteArray,
     displayId: String,
     fingerprint: List<String>,
-    meshStatus: String,
-    onStartMesh: (() -> Unit)?,
     onShowMyQr: () -> Unit,
-    onBackUp: () -> Unit,
-    onAdvanced: () -> Unit,
     onProfileChanged: (Long) -> Unit = {},
-    onFriendsOfFriendsChanged: (Boolean) -> Unit = {},
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
     var displayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     val initialDisplayName = remember { ProfileStore.loadDisplayName(context) }
     var avatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
-    var shareOnline by remember { mutableStateOf(RelayConfigStore.shareOnline(context)) }
-    var friendsOfFriends by remember { mutableStateOf(FriendsOfFriendsStore.isEnabled(context)) }
-    var startAutomatically by remember { mutableStateOf(MeshStartupPreferences.isAutoStartEnabled(context)) }
 
     fun bumpAndSync() = onProfileChanged(ProfileStore.bumpOwnAvatarEpoch(context))
 
@@ -127,7 +111,7 @@ fun ProfileScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(stringResource(R.string.ui_profile_settings)) },
+                title = { Text(stringResource(R.string.ui_profile)) },
                 navigationIcon = {
                     IconButton(onClick = ::leaveScreen) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -212,111 +196,7 @@ fun ProfileScreen(
                 }
             }
 
-            SettingsSpacer()
-            ProfileSection(title = "Backup") {
-                Text(stringResource(R.string.ui_save_your_identity_and_messages_to_an_encrypted),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Button(
-                    onClick = onBackUp,
-                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-                ) { Text(stringResource(R.string.ui_back_up_account)) }
-            }
-
-            SettingsSpacer()
-            ProfileSection(title = "Mesh") {
-                Text(meshStatus, modifier = Modifier.padding(top = 4.dp))
-                if (onStartMesh != null) {
-                    Button(onClick = onStartMesh, modifier = Modifier.padding(top = 12.dp)) {
-                        Text(stringResource(R.string.ui_start_mesh))
-                    }
-                }
-                SettingsToggle(
-                    title = "Start CruiseMesh automatically",
-                    detail = "Run the mesh after this phone restarts.",
-                    checked = startAutomatically,
-                    onCheckedChange = {
-                        startAutomatically = it
-                        MeshStartupPreferences.setAutoStartEnabled(context, it)
-                    },
-                )
-                SettingsToggle(
-                    title = "Share when I'm online",
-                    detail = "Help friends know whether the relay can reach you.",
-                    checked = shareOnline,
-                    onCheckedChange = {
-                        shareOnline = it
-                        RelayConfigStore.setShareOnline(context, it)
-                    },
-                )
-            }
-
-            SettingsSpacer()
-            ProfileSection(title = "Privacy") {
-                SettingsToggle(
-                    title = "Friends of friends",
-                    detail = "Let friends introduce you to people they know. Messages and phone contacts are never shared.",
-                    checked = friendsOfFriends,
-                    onCheckedChange = {
-                        friendsOfFriends = it
-                        onFriendsOfFriendsChanged(it)
-                    },
-                )
-            }
-
-            SettingsSpacer()
-            ProfileSection(title = "Advanced") {
-                Text(stringResource(R.string.ui_relay_configuration_local_wi_fi_tools_and_diagnostics),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Button(
-                    onClick = onAdvanced,
-                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-                ) { Text(stringResource(R.string.ui_open_advanced_settings)) }
-            }
-
-            SettingsSpacer()
-            ProfileSection(title = "Legal") {
-                TextButton(
-                    onClick = {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(TERMS_OF_USE_URL)))
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text(stringResource(R.string.ui_terms_of_use)) }
-                TextButton(
-                    onClick = {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL)))
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text(stringResource(R.string.ui_privacy_policy)) }
-            }
         }
-    }
-}
-
-@Composable
-private fun SettingsToggle(
-    title: String,
-    detail: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(title)
-            Text(
-                detail,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 2.dp),
-            )
-        }
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
 
@@ -353,11 +233,7 @@ fun ProfileScreenPreview() {
             profileUserId = byteArrayOf(1, 2, 3, 4),
             displayId = "CM-K7QX-9M2P-3F8J-QRTZ-AB",
             fingerprint = listOf("anchor", "beacon", "coral", "dock"),
-            meshStatus = "Mesh off",
-            onStartMesh = {},
             onShowMyQr = {},
-            onBackUp = {},
-            onAdvanced = {},
             onBack = {},
         )
     }

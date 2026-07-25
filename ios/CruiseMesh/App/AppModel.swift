@@ -13,6 +13,7 @@ final class AppModel: ObservableObject {
     @Published var displayName: String
     @Published private(set) var meshEnabled: Bool
     @Published var pendingFriendToken: String?
+    @Published var pendingRelayCard: String?
 
     init() {
         try? BackupService.installPendingRestoreIfNeeded()
@@ -20,6 +21,7 @@ final class AppModel: ObservableObject {
         self.identity = id
         self.displayName = ProfileStore.loadDisplayName()
         self.pendingFriendToken = nil
+        self.pendingRelayCard = nil
         if UserDefaults.standard.object(forKey: Self.meshEnabledKey) == nil {
             self.meshEnabled = true
         } else {

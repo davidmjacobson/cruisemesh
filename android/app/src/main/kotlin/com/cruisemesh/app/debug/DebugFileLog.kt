@@ -26,8 +26,8 @@ import kotlin.concurrent.thread
  * app's data is captured. The app never logs message content — only metadata
  * (kinds, counts, addresses, delivery events) — so the capture is safe to
  * offer outside debug builds too. Debuggable builds capture always; release
- * builds capture only while the user opts in from Advanced settings
- * ([setOptIn], persisted so it survives restarts).
+ * builds capture only when explicitly enabled by an internal diagnostic
+ * control ([setOptIn], persisted so it survives restarts).
  */
 object DebugFileLog {
     private const val TAG = "DebugFileLog"
@@ -60,7 +60,7 @@ object DebugFileLog {
         shouldCapture(isDebuggableBuild(context), isOptedIn(context))
 
     /**
-     * Release-build opt-in from Advanced settings. Enabling starts capture
+     * Release-build diagnostic opt-in. Enabling starts capture
      * immediately; disabling stops it (unless this is a debuggable build,
      * where capture is unconditional). The already-captured file is kept so
      * it can still be shared after turning the switch off.

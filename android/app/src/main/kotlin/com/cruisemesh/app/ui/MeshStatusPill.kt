@@ -174,6 +174,7 @@ fun MeshStatusLegendDialog(
     statusText: String,
     canStartMesh: Boolean,
     onStartMesh: () -> Unit,
+    onConnectionDetails: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     // How many other people's messages this phone is currently carrying
@@ -217,7 +218,9 @@ fun MeshStatusLegendDialog(
             }
         },
         confirmButton = {
-            if (canStartMesh) {
+            Row {
+                TextButton(onClick = onConnectionDetails) { Text(stringResource(R.string.ui_connection_details)) }
+                if (canStartMesh) {
                 Button(
                     onClick = {
                         onDismiss()
@@ -226,13 +229,12 @@ fun MeshStatusLegendDialog(
                 ) {
                     Text(stringResource(R.string.ui_start_mesh))
                 }
-            } else {
-                TextButton(onClick = onDismiss) { Text(stringResource(R.string.ui_done)) }
+                }
             }
         },
         dismissButton = {
-            if (canStartMesh) {
-                TextButton(onClick = onDismiss) { Text(stringResource(R.string.ui_cancel)) }
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(if (canStartMesh) R.string.ui_cancel else R.string.ui_done))
             }
         },
     )

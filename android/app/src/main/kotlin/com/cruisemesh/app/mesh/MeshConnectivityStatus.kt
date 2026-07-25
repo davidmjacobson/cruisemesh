@@ -8,13 +8,18 @@ import kotlinx.coroutines.flow.update
 /** Health of our own relay path, as observed by the last sync attempt. */
 sealed class RelayHealth {
     data class Ok(val lastSyncMs: Long) : RelayHealth()
+    object Checking : RelayHealth()
     object NoInternet : RelayHealth()
     object NoConfig : RelayHealth()
     data class Failing(val lastAttemptMs: Long) : RelayHealth()
+    data class Expired(val lastAttemptMs: Long) : RelayHealth()
+    data class Suspended(val lastAttemptMs: Long) : RelayHealth()
 
     /** The relay answered but rejected our own saved family token (HTTP 401/403). */
     data class TokenRejected(val lastAttemptMs: Long) : RelayHealth()
 }
+
+enum class DirectPath { BLUETOOTH, LOCAL_WIFI }
 
 /**
  * Process-wide observable connectivity signals, same object/StateFlow
@@ -27,6 +32,9 @@ object MeshConnectivityStatus {
 
     /** Distinct HELLO'd peer userIds (hex via [com.cruisemesh.app.chat.UserIdHex]), any contact or stranger. */
     val nearbyPeerIds: StateFlow<Set<String>> = _nearbyPeerIds.asStateFlow()
+
+    private val _directPaths = MutableStateFlow<Map<String, DirectPath>>(emptyMap())
+    val directPaths: StateFlow<Map<String, DirectPath>> = _directPaths.asStateFlow()
 
     private val _nearbyTransports = MutableStateFlow<Map<String, MeshRouterState.Transport>>(emptyMap())
 
@@ -65,12 +73,18 @@ object MeshConnectivityStatus {
     /** hex userId -> epoch ms inferred from relay presence, used for ONLINE_RELAY. */
     val presenceLastSeen: StateFlow<Map<String, Long>> = _presenceLastSeen.asStateFlow()
 
-    fun setNearbyPeers(peers: Set<String>) {
-        _nearbyPeerIds.value = peers
-    }
-
-    fun setNearbyTransports(transports: Map<String, MeshRouterState.Transport>) {
+    fun refreshNearbyRoutes() {
+        val transports = MeshRouter.nearbyTransports()
+        val paths = transports.mapValues { (_, transport) ->
+            if (transport == MeshRouterState.Transport.LAN) {
+                DirectPath.LOCAL_WIFI
+            } else {
+                DirectPath.BLUETOOTH
+            }
+        }
         _nearbyTransports.value = transports
+        _directPaths.value = paths
+        _nearbyPeerIds.value = transports.keys
     }
 
     fun setRelayHealth(health: RelayHealth) {
@@ -107,6 +121,7 @@ object MeshConnectivityStatus {
     /** Mesh service stopped: every signal above is stale, so drop it all rather than show it frozen. */
     fun clear() {
         _nearbyPeerIds.value = emptySet()
+        _directPaths.value = emptyMap()
         _nearbyTransports.value = emptyMap()
         _relay.value = RelayHealth.NoConfig
         _contactLastSeen.value = emptyMap()

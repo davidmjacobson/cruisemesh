@@ -17,6 +17,7 @@ mod lan_util;
 mod limits;
 mod protocol;
 mod recipient_hints;
+mod relay_setup;
 mod relay_wire;
 mod semantic;
 mod store;
@@ -83,6 +84,7 @@ pub use protocol::{
     KIND_RECEIPT, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 pub use recipient_hints::{dedupe_hints, recent_hints_for, recent_presence_hints_for};
+pub use relay_setup::{make_relay_setup_card, parse_relay_setup_text, RelaySetup};
 pub use relay_wire::{
     normalize_relay_url, relay_build_fetch_path, relay_decode_fetch_page,
     relay_decode_post_response, relay_decode_presence_page, relay_encode_ack_request,
@@ -98,7 +100,8 @@ pub use semantic::{
 pub use store::{
     CarriedEnvelope, Contact, ContactDiscoveryPolicy, ContactProvenance, DigestEntry,
     FriendSuggestion, MessageArrival, MessageOrigin, MessageReference, MessageStore,
-    OutboundEnvelope, OutgoingReceiptEnvelope, StoredMessage,
+    OutboundEnvelope, OutgoingReceiptEnvelope, PeerConnectionEvent, PeerConnectionEventKind,
+    PeerConnectionSummary, PeerConnectionTransport, StoredMessage,
 };
 pub use transport_policy::{
     core_transport_send_plan, digest_is_expected_chat_id, digest_through_lamport_for_sender,

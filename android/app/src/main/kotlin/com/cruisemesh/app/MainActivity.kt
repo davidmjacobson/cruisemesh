@@ -103,7 +103,11 @@ import com.cruisemesh.app.ui.NewGroupScreen
 import com.cruisemesh.app.ui.OnboardingScreen
 import com.cruisemesh.app.ui.ProfileScreen
 import com.cruisemesh.app.ui.TermsAcceptanceScreen
-import com.cruisemesh.app.ui.AdvancedSettingsScreen
+import com.cruisemesh.app.ui.ConnectionDetailsScreen
+import com.cruisemesh.app.ui.CruisePassScreen
+import com.cruisemesh.app.ui.HelpSupportScreen
+import com.cruisemesh.app.ui.InternalToolsScreen
+import com.cruisemesh.app.ui.SettingsScreen
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.coreContactDisplayName
@@ -114,6 +118,7 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.parseFriendText
+import uniffi.cruisemesh_core.parseRelaySetupText
 import uniffi.cruisemesh_core.lanDefaultTcpPort
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
@@ -128,6 +133,7 @@ data class PendingDeepLink(
     val isGroup: Boolean = false,
     val friendToken: String? = null,
     val lanEndpoint: String? = null,
+    val relayCard: String? = null,
 )
 
 class MainActivity : ComponentActivity() {
@@ -198,6 +204,14 @@ class MainActivity : ComponentActivity() {
         if (
             uri.scheme == "https" &&
             uri.host == "cruisemesh.app" &&
+            (uri.path == "/r" || uri.path == "/r/")
+        ) {
+            val card = uri.fragment?.takeIf { runCatching { parseRelaySetupText(it) }.isSuccess }
+            if (card != null) return PendingDeepLink(relayCard = card)
+        }
+        if (
+            uri.scheme == "https" &&
+            uri.host == "cruisemesh.app" &&
             (uri.path == "/lan" || uri.path == "/lan/")
         ) {
             val endpoint = parseLanEndpointLink(uri.fragment)
@@ -252,8 +266,34 @@ fun CruiseMeshApp(
         }
         composable("home") { HomeRoute(identity, navController) }
         composable("profile") { ProfileRoute(identity, navController) }
-        composable("advancedSettings") {
-            AdvancedSettingsScreen(onBack = { navController.popBackStack() })
+        composable("settings") { SettingsRoute(identity, navController) }
+        composable("connectionDetails") {
+            ConnectionDetailsScreen(onBack = { navController.popBackStack() })
+        }
+        composable("internalTools") {
+            InternalToolsScreen(onBack = { navController.popBackStack() })
+        }
+        composable("help") {
+            HelpSupportScreen(
+                onCruisePass = { navController.navigate("cruisePass") },
+                onConnectionDetails = { navController.navigate("connectionDetails") },
+                onBack = { navController.popBackStack() },
+            )
+        }
+        composable(
+            "cruisePass?card={card}",
+            arguments = listOf(
+                navArgument("card") {
+                    type = NavType.StringType
+                    nullable = true
+                    defaultValue = null
+                },
+            ),
+        ) { entry ->
+            CruisePassScreen(
+                initialCard = entry.arguments?.getString("card"),
+                onBack = { navController.popBackStack() },
+            )
         }
         composable("backup") { BackupExportScreen(onBack = { navController.popBackStack() }) }
         composable("restore") { BackupRestoreScreen(onBack = { navController.popBackStack() }) }
@@ -284,6 +324,13 @@ fun CruiseMeshApp(
     LaunchedEffect(pendingDeepLink, onboardingCompleted) {
         val link = pendingDeepLink ?: return@LaunchedEffect
         if (!onboardingCompleted) return@LaunchedEffect
+        link.relayCard?.let { relayCard ->
+            navController.navigate("cruisePass?card=${Uri.encode(relayCard)}") {
+                launchSingleTop = true
+            }
+            onPendingDeepLinkConsumed()
+            return@LaunchedEffect
+        }
         link.lanEndpoint?.let { endpointText ->
             val endpoint = parseLanManualEndpoint(endpointText, lanDefaultTcpPort().toInt())
             if (endpoint != null) {
@@ -810,7 +857,13 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             reloadSummaries()
         },
         onNewChatClick = { navController.navigate("contacts") },
+        onAddFriendClick = { navController.navigate("addFriend") },
+        onNewGroupClick = { navController.navigate("newGroup") },
         onProfileClick = { navController.navigate("profile") },
+        onFriendsClick = { navController.navigate("contacts") },
+        onConnectionDetailsClick = { navController.navigate("connectionDetails") },
+        onSettingsClick = { navController.navigate("settings") },
+        onHelpClick = { navController.navigate("help") },
         onMeshStatusClick = { showMeshStatusLegend = true },
         meshStatusText = transientMeshStatus ?: pillStatus.text,
         meshStatusDotColor = if (transientMeshStatus != null) null else pillDotColor,
@@ -862,74 +915,28 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             statusText = transientMeshStatus ?: pillStatus.text,
             canStartMesh = runtimeStatus == MeshRuntimeState.STOPPED,
             onStartMesh = { permissionLauncher.launch(MeshService.requiredPermissions()) },
+            onConnectionDetails = {
+                showMeshStatusLegend = false
+                navController.navigate("connectionDetails")
+            },
             onDismiss = { showMeshStatusLegend = false },
         )
     }
 }
 
 @Composable
-private fun ProfileRoute(identity: Identity, navController: NavHostController) {
+private fun SettingsRoute(identity: Identity, navController: NavHostController) {
     val context = LocalContext.current
     val store = remember { AppStore.get(context) }
-    val displayId = remember(identity) { formatUserId(identity.userId) }
-    val fingerprint = remember(identity) { fingerprintWords(identity.userId) }
     val runtimeStatus by MeshRuntimeStatus.state.collectAsState()
-    var transientMeshStatus by remember { mutableStateOf<String?>(null) }
-
-    LaunchedEffect(runtimeStatus) {
-        if (runtimeStatus != MeshRuntimeState.STOPPED) {
-            transientMeshStatus = null
-        }
-    }
-
-    val batteryOptimizationLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) {
-        startMesh(context)
-    }
-
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions(),
-    ) { grants ->
-        if (grants.values.all { it }) {
-            if (isIgnoringBatteryOptimizations(context)) {
-                startMesh(context)
-            } else {
-                transientMeshStatus = "Requesting background permission…"
-                batteryOptimizationLauncher.launch(batteryOptimizationIntent(context))
-            }
-        } else {
-            transientMeshStatus = "Permissions denied — mesh cannot run"
-            val activity = context as? ComponentActivity
-            val permanentlyDenied = activity != null && MeshService.requiredPermissions().any { perm ->
-                grants[perm] == false &&
-                    !ActivityCompat.shouldShowRequestPermissionRationale(activity, perm)
-            }
-            if (permanentlyDenied) {
-                Toast.makeText(
-                    context,
-                    "Enable Nearby devices (and notifications) in App permissions",
-                    Toast.LENGTH_LONG,
-                ).show()
-                openAppPermissionSettings(context)
-            }
-        }
-    }
-
-    ProfileScreen(
-        profileUserId = identity.userId,
-        displayId = displayId,
-        fingerprint = fingerprint,
-        meshStatus = transientMeshStatus ?: runtimeStatus.label,
-        onStartMesh = if (runtimeStatus == MeshRuntimeState.STOPPED) {
-            { permissionLauncher.launch(MeshService.requiredPermissions()) }
-        } else null,
-        onShowMyQr = { navController.navigate("myQr") },
+    val relayHealth by MeshConnectivityStatus.relay.collectAsState()
+    SettingsScreen(
+        meshStatus = runtimeStatus.label,
+        relayHealth = relayHealth,
+        onCruisePass = { navController.navigate("cruisePass") },
+        onConnectionDetails = { navController.navigate("connectionDetails") },
+        onInternalTools = { navController.navigate("internalTools") },
         onBackUp = { navController.navigate("backup") },
-        onAdvanced = { navController.navigate("advancedSettings") },
-        onProfileChanged = { epoch ->
-            ProfileSyncSender.queueToAllContacts(context, store, identity, epoch)
-        },
         onFriendsOfFriendsChanged = { enabled ->
             FriendsOfFriendsStore.setEnabled(context, enabled)
             if (!enabled) store.clearFriendSuggestions()
@@ -940,6 +947,25 @@ private fun ProfileRoute(identity: Identity, navController: NavHostController) {
                 ProfileStore.loadOwnAvatarEpoch(context),
             )
             FriendDirectorySender.queueToAllContacts(context, store, identity)
+        },
+        onBack = { navController.popBackStack() },
+    )
+}
+
+@Composable
+private fun ProfileRoute(identity: Identity, navController: NavHostController) {
+    val context = LocalContext.current
+    val store = remember { AppStore.get(context) }
+    val displayId = remember(identity) { formatUserId(identity.userId) }
+    val fingerprint = remember(identity) { fingerprintWords(identity.userId) }
+
+    ProfileScreen(
+        profileUserId = identity.userId,
+        displayId = displayId,
+        fingerprint = fingerprint,
+        onShowMyQr = { navController.navigate("myQr") },
+        onProfileChanged = { epoch ->
+            ProfileSyncSender.queueToAllContacts(context, store, identity, epoch)
         },
         onBack = { navController.popBackStack() }
     )
