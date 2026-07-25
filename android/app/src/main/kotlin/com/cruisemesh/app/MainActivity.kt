@@ -78,7 +78,6 @@ import com.cruisemesh.app.mesh.ChatViewEvents
 import com.cruisemesh.app.mesh.ContactReachability
 import com.cruisemesh.app.mesh.LanTransportDiagnostics
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
-import com.cruisemesh.app.mesh.MeshRouter
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
 import com.cruisemesh.app.mesh.MeshService
@@ -170,6 +169,12 @@ class MainActivity : ComponentActivity() {
         handleBluetoothEnableRequest(intent)
     }
 
+    // ACTION_REQUEST_ENABLE needs BLUETOOTH_CONNECT on API 31+; the
+    // SecurityException that a missing grant throws is already handled by the
+    // runCatching -> Settings fallback below, but lint's MissingPermission
+    // check can't see through runCatching, so suppress it here (the runtime
+    // handling is the fallback, not a pre-check).
+    @SuppressLint("MissingPermission")
     private fun handleBluetoothEnableRequest(intent: Intent?) {
         if (intent?.action != ACTION_REQUEST_BLUETOOTH_ENABLE) return
         // Consume the trampoline action before opening the system prompt so a
@@ -1231,6 +1236,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
         }
         val sender = remember { RealMeshSender(store, identity) }
         val nearbyPeerIds by MeshConnectivityStatus.nearbyPeerIds.collectAsState()
+        val nearbyTransports by MeshConnectivityStatus.nearbyTransports.collectAsState()
         val relayHealth by MeshConnectivityStatus.relay.collectAsState()
         val pushHealthy by MeshConnectivityStatus.pushHealthy.collectAsState()
         val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
@@ -1240,11 +1246,15 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             reachabilityLevelForUserId(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs, pushHealthy)
         }
         // nearbyPeerIds only proves *some* link HELLO'd, not which transport;
-        // for NEARBY copy, ask the router which link a send would actually
-        // take right now (MeshRouterState is backed by the thread-safe Rust
-        // core, so this is safe to call straight from the composable).
-        val nearbyTransport = remember(reachability, nearbyPeerIds, contact.userId) {
-            if (reachability == ReachabilityLevel.NEARBY) MeshRouter.routeFor(contact.userId)?.first else null
+        // for NEARBY copy, read the live per-peer transport from the observable
+        // map so the copy recomposes when a send would switch radios. Reading
+        // MeshRouter.routeFor() imperatively here instead would freeze the copy
+        // on the dead transport across a LAN->BLE handoff (the peer stays
+        // HELLO'd, so nothing else this composable observes changes).
+        val nearbyTransport = if (reachability == ReachabilityLevel.NEARBY) {
+            nearbyTransports[UserIdHex.encode(contact.userId)]
+        } else {
+            null
         }
         val reachabilityStatusText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs, nearbyTransport) {
             val hex = UserIdHex.encode(contact.userId)

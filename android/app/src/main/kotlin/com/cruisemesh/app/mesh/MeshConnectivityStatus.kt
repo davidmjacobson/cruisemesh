@@ -36,6 +36,19 @@ object MeshConnectivityStatus {
     private val _directPaths = MutableStateFlow<Map<String, DirectPath>>(emptyMap())
     val directPaths: StateFlow<Map<String, DirectPath>> = _directPaths.asStateFlow()
 
+    private val _nearbyTransports = MutableStateFlow<Map<String, MeshRouterState.Transport>>(emptyMap())
+
+    /**
+     * hex userId -> the live transport a send to that peer would take right now
+     * (see [MeshRouterState.nearbyTransports]). Kept as its own observable
+     * signal, separate from [nearbyPeerIds], because a LAN->BLE handoff leaves
+     * the peer set unchanged (still HELLO'd, just over a different radio) --
+     * only this map changes, so only observing it makes the "Nearby via
+     * Wi-Fi/Bluetooth" copy flip live instead of freezing on the dead
+     * transport.
+     */
+    val nearbyTransports: StateFlow<Map<String, MeshRouterState.Transport>> = _nearbyTransports.asStateFlow()
+
     private val _relay = MutableStateFlow<RelayHealth>(RelayHealth.NoConfig)
     val relay: StateFlow<RelayHealth> = _relay.asStateFlow()
 
@@ -61,19 +74,17 @@ object MeshConnectivityStatus {
     val presenceLastSeen: StateFlow<Map<String, Long>> = _presenceLastSeen.asStateFlow()
 
     fun refreshNearbyRoutes() {
-        val paths = buildMap {
-            for (route in MeshRouter.identifiedRoutes()) {
-                val id = com.cruisemesh.app.chat.UserIdHex.encode(route.userId)
-                val path = if (route.transport == MeshRouterState.Transport.LAN) {
-                    DirectPath.LOCAL_WIFI
-                } else {
-                    DirectPath.BLUETOOTH
-                }
-                if (path == DirectPath.LOCAL_WIFI || id !in this) put(id, path)
+        val transports = MeshRouter.nearbyTransports()
+        val paths = transports.mapValues { (_, transport) ->
+            if (transport == MeshRouterState.Transport.LAN) {
+                DirectPath.LOCAL_WIFI
+            } else {
+                DirectPath.BLUETOOTH
             }
         }
+        _nearbyTransports.value = transports
         _directPaths.value = paths
-        _nearbyPeerIds.value = paths.keys
+        _nearbyPeerIds.value = transports.keys
     }
 
     fun setRelayHealth(health: RelayHealth) {
@@ -111,6 +122,7 @@ object MeshConnectivityStatus {
     fun clear() {
         _nearbyPeerIds.value = emptySet()
         _directPaths.value = emptyMap()
+        _nearbyTransports.value = emptyMap()
         _relay.value = RelayHealth.NoConfig
         _contactLastSeen.value = emptyMap()
         _presenceLastSeen.value = emptyMap()

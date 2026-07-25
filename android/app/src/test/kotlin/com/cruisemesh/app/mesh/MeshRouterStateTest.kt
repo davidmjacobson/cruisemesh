@@ -224,4 +224,54 @@ class MeshRouterStateTest {
         state.onConnected("AA:BB", MeshRouterState.Transport.CENTRAL)
         assertEquals(emptySet<String>(), state.helloedUserIds())
     }
+
+    @Test
+    fun `nearbyTransports maps each HELLO'd peer to its live transport`() {
+        val state = MeshRouterState()
+        val alice = userId(1)
+        val bob = userId(2)
+        state.onConnected("AA:BB", MeshRouterState.Transport.CENTRAL)
+        state.onHello("AA:BB", alice)
+        state.onConnected("CC:DD", MeshRouterState.Transport.LAN)
+        state.onHello("CC:DD", bob)
+
+        assertEquals(
+            mapOf(
+                com.cruisemesh.app.chat.UserIdHex.encode(alice) to MeshRouterState.Transport.CENTRAL,
+                com.cruisemesh.app.chat.UserIdHex.encode(bob) to MeshRouterState.Transport.LAN,
+            ),
+            state.nearbyTransports(),
+        )
+    }
+
+    @Test
+    fun `nearbyTransports excludes connected addresses that have not HELLO'd yet`() {
+        val state = MeshRouterState()
+        state.onConnected("AA:BB", MeshRouterState.Transport.CENTRAL)
+        assertEquals(emptyMap<String, MeshRouterState.Transport>(), state.nearbyTransports())
+    }
+
+    // The B5 zombie-header scenario: while a peer is reachable over both Wi-Fi
+    // and BLE, nearbyTransports reports LAN (matching routeFor's precedence);
+    // the instant the LAN link drops it must flip to BLE so the observing UI
+    // stops claiming "Nearby via Wi-Fi" over a dead radio.
+    @Test
+    fun `nearbyTransports flips LAN to BLE when the Wi-Fi link drops but BLE survives`() {
+        val state = MeshRouterState()
+        val alice = userId(1)
+        state.onConnected("BLE", MeshRouterState.Transport.CENTRAL)
+        state.onHello("BLE", alice)
+        state.onConnected("LAN", MeshRouterState.Transport.LAN)
+        state.onHello("LAN", alice)
+        val hex = com.cruisemesh.app.chat.UserIdHex.encode(alice)
+
+        assertEquals(mapOf(hex to MeshRouterState.Transport.LAN), state.nearbyTransports())
+
+        state.onDisconnected("LAN")
+
+        // Peer is still HELLO'd (helloedUserIds unchanged), but the transport
+        // must now report BLE -- this is the change the UI observes.
+        assertEquals(setOf(hex), state.helloedUserIds())
+        assertEquals(mapOf(hex to MeshRouterState.Transport.CENTRAL), state.nearbyTransports())
+    }
 }
