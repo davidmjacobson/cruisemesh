@@ -1,5 +1,6 @@
 package com.cruisemesh.app.ui
 
+import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.TickStatus
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -7,10 +8,10 @@ import org.junit.Test
 class SignalTickTest {
 
     @Test
-    fun `content descriptions are short and state specific`() {
-        assertEquals("Sent", tickContentDescription(TickStatus.SENT))
-        assertEquals("Delivered", tickContentDescription(TickStatus.DELIVERED))
-        assertEquals("Read", tickContentDescription(TickStatus.READ))
+    fun `content descriptions use localized state-specific resources`() {
+        assertEquals(R.string.ui_sent, tickContentDescriptionResource(TickStatus.SENT))
+        assertEquals(R.string.ui_delivered, tickContentDescriptionResource(TickStatus.DELIVERED))
+        assertEquals(R.string.ui_read, tickContentDescriptionResource(TickStatus.READ))
     }
 
     @Test

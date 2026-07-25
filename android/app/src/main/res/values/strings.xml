@@ -50,6 +50,7 @@
     <string name="ui_delete_named">Delete %1$s?</string>
     <string name="ui_delete_group_history_question">Delete this group and its message history from this device?</string>
     <string name="ui_delete_contact_history_question">Delete contact and all message history?</string>
+    <string name="ui_delivered">Delivered</string>
     <string name="ui_draft_preview">Draft: %1$s</string>
     <string name="ui_diagnostics">Diagnostics</string>
     <string name="ui_diagnostic_logging">Diagnostic logging</string>
@@ -111,6 +112,7 @@
     <string name="ui_i_agree">I agree</string>
     <string name="ui_profile_settings">Profile &amp; settings</string>
     <string name="ui_read_these_aloud_to_verify">Read these aloud to verify.</string>
+    <string name="ui_read">Read</string>
     <string name="ui_relay">Relay</string>
     <string name="ui_relay_configuration_local_wi_fi_tools_and_diagnostics">Relay configuration, local Wi-Fi tools, and diagnostics.</string>
     <string name="ui_relay_token_optional">Relay token (optional)</string>
@@ -159,6 +161,7 @@
     <string name="notification_stop_cruisemesh">Stop CruiseMesh</string>
     <string name="ui_save">Save</string>
     <string name="ui_save_your_identity_and_messages_to_an_encrypted">Save your identity and messages to an encrypted file.</string>
+    <string name="ui_sent">Sent</string>
     <string name="ui_say_hi">Say hi</string>
     <string name="ui_scan_qr_code">Scan QR code</string>
     <string name="ui_scan_with_the_other_phone_s_camera_to">Scan with the other phone\'s camera to connect securely.</string>
