@@ -2,6 +2,7 @@ package com.cruisemesh.app
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -152,12 +153,27 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        handleBluetoothEnableRequest(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         MeshStartupPreferences.clearExplicitStop(this)
         pendingDeepLink.value = deepLinkFromIntent(intent)
+        handleBluetoothEnableRequest(intent)
+    }
+
+    private fun handleBluetoothEnableRequest(intent: Intent?) {
+        if (intent?.action != ACTION_REQUEST_BLUETOOTH_ENABLE) return
+        // Consume the trampoline action before opening the system prompt so a
+        // later activity recreation cannot show it a second time.
+        intent.action = null
+        runCatching {
+            startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+        }.onFailure {
+            startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+        }
     }
 
     private fun deepLinkFromIntent(intent: Intent?): PendingDeepLink? {
@@ -183,6 +199,11 @@ class MainActivity : ComponentActivity() {
             if (endpoint != null) return PendingDeepLink(lanEndpoint = endpoint.display)
         }
         return null
+    }
+
+    companion object {
+        const val ACTION_REQUEST_BLUETOOTH_ENABLE =
+            "com.cruisemesh.app.action.REQUEST_BLUETOOTH_ENABLE"
     }
 }
 
@@ -606,6 +627,11 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     ) {
         startMesh(context)
     }
+    val bluetoothEnableLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        bluetoothEnabled = isBluetoothRadioEnabled(context)
+    }
 
     val activity = context as? ComponentActivity
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -791,9 +817,9 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 severity = ConnectivityWarningSeverity.Blocking,
             )
             !bluetoothEnabled -> ConnectivityWarning(
-                title = "Bluetooth is off",
-                body = "CruiseMesh needs Bluetooth on to find nearby phones and deliver messages. Turn it on to use the mesh.",
-                actionLabel = "Open Bluetooth settings",
+                title = stringResource(R.string.ui_bluetooth_is_off),
+                body = stringResource(R.string.ui_bluetooth_is_off_body),
+                actionLabel = stringResource(R.string.ui_turn_on_bluetooth),
                 severity = ConnectivityWarningSeverity.Blocking,
             )
             bluetoothAudioConnected && !bluetoothAudioWarningDismissed && !hideBluetoothAudioWarning -> ConnectivityWarning(
@@ -808,7 +834,11 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         onConnectivityWarningClick = {
             when {
                 !hasPermissions -> permissionLauncher.launch(MeshService.requiredPermissions())
-                !bluetoothEnabled -> context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                !bluetoothEnabled -> runCatching {
+                    bluetoothEnableLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                }.onFailure {
+                    context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                }
                 bluetoothAudioConnected -> bluetoothAudioWarningDismissed = true
             }
         },
