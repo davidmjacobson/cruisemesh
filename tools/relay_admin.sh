@@ -8,37 +8,10 @@
 # yourself reaching for `docker run ... sqlite3` again, add the endpoint
 # instead.
 #
-# Usage:
-#   tools/relay_admin.sh <command> [args]
-#
-# On the relay box (reads the admin token from the deploy's .env, so the
-# credential never enters your shell history or an agent transcript):
-#   ssh root@relay.cruisemesh.app 'bash -s' < tools/relay_admin.sh list
-#
-# From anywhere else, against the public endpoint:
-#   export CRUISEMESH_RELAY_ADMIN_TOKEN=...   # Cloudflare secret / password manager
-#   tools/relay_admin.sh list
-#
-# Commands:
-#   provision [--days N|never] [--plan P] [--note "..."] [--quota-bytes N]
-#             [--token T]        mint a family; prints its token and setup link
-#   list [--status active|suspended] [--limit N] [--offset N] [--reveal|--json]
-#                                every family, with usage and effective state
-#   show <token>                 one family, full JSON
-#   link <token>                 re-print the CMRELAY1 setup link
-#   extend <token> --days N|never    move the expiry
-#   suspend <token>              stop service, keep the mailbox (lapsed pass)
-#   resume <token>               undo a suspend
-#   purge <token> --yes          delete the family AND its stored envelopes
-#
-# Suspend vs purge: a pass that expired or got refunded should be *suspended*
-# -- reversible, and the family's queued mail survives if they renew. A token
-# that leaked should be *purged*, then a fresh one provisioned; purge is
-# irreversible and drops stored envelopes, which is why it demands --yes.
-#
-# Env overrides: RELAY_ADMIN_ORIGIN (API base), RELAY_PUBLIC_URL (what goes in
-# the setup card), CRUISEMESH_SITE_ORIGIN (host of the /r# link),
-# RELAYD_ENV_FILE (where to read the admin token on the box).
+# Run `relay_admin.sh --help` for usage -- it lives in usage() below rather
+# than in this comment block, because the documented way to run this script is
+# to pipe it into a remote shell (`ssh box 'bash -s' < relay_admin.sh`), where
+# $0 is "bash" and the script cannot read its own source to print a header.
 #
 # Needs: bash, curl (7.76+, for --fail-with-body), python3.
 
@@ -402,22 +375,101 @@ cmd_purge() {
 }
 
 usage() {
-  # `bash -s < relay_admin.sh` leaves $0 as "bash", so the header block isn't
-  # always readable back -- fall back to the command list.
-  if [ -r "${0:-}" ] && [ "$(basename -- "${0:-}")" != "bash" ]; then
-    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
-  else
-    echo "relay_admin.sh: provision | list | show | link | extend | suspend | resume | purge"
-    echo "see the header of tools/relay_admin.sh, or relayd/DEPLOY.md §12"
-  fi
+  # Delimiter is deliberately not "USAGE": the text below has a section
+  # header on its own line at column 0, which would end the heredoc there.
+  cat <<'__HELP__'
+relay_admin.sh -- operator CLI for a hosted CruiseMesh relay ("Cruise Pass").
+
+USAGE
+  relay_admin.sh <command> [args]
+
+COMMANDS
+  provision [--days N|never] [--plan P] [--note "..."] [--quota-bytes N]
+            [--token T]
+        Mint a family and print its token plus a paste-ready CMRELAY1 setup
+        link. Defaults: --days 90, --plan dev-test. Re-running with an
+        existing --token re-provisions it (and reactivates a suspended one).
+
+  list [--status active|suspended] [--limit N] [--offset N] [--reveal|--json]
+        Every family with its usage and effective state (active / grace /
+        expired / suspended). Tokens are truncated to 12 characters, which is
+        still a valid argument for the commands below; --reveal prints them
+        in full, --json emits the raw API response.
+
+  show <token>        One family as JSON, including usage_bytes and
+                      envelope_count.
+  link <token>        Re-print the CMRELAY1 setup link for an existing family.
+  extend <token> --days N|never
+                      Move (or clear) the expiry.
+  suspend <token>     Stop service immediately, keep the mailbox.
+  resume <token>      Undo a suspend.
+  purge <token> --yes Delete the family AND its stored envelopes.
+
+  --help, -h          This message.
+
+  <token> may be any unambiguous prefix -- including the 12 characters `list`
+  prints. An ambiguous prefix is refused rather than guessed.
+
+SUSPEND VS PURGE
+  A pass that lapsed or was refunded should be SUSPENDED: reversible, and the
+  family's queued mail survives if they renew. A token that leaked should be
+  PURGED and a fresh one provisioned -- that is irreversible and drops stored
+  envelopes, which is why it demands --yes.
+
+RUNNING IT
+  On the relay box, where the admin token is read from the deploy's .env so it
+  never enters a shell history:
+
+      ssh root@relay.cruisemesh.app 'bash -s list' < tools/relay_admin.sh
+
+  Note the `--` when piping a flag: bash would otherwise claim it for itself.
+
+      ssh root@relay.cruisemesh.app 'bash -s -- --help' < tools/relay_admin.sh
+
+  or, if installed on the box (a symlink to the git checkout, so `git pull`
+  keeps it current):
+
+      relay-admin list
+
+  From anywhere else, against the public endpoint:
+
+      export CRUISEMESH_RELAY_ADMIN_TOKEN=...   # Cloudflare secret
+      tools/relay_admin.sh list
+
+ENVIRONMENT
+  CRUISEMESH_RELAY_ADMIN_TOKEN  Admin bearer. If unset, read from the .env
+                                below (i.e. you are on the relay box).
+  RELAYD_ENV_FILE               Deploy .env to read that token from.
+                                Default: /opt/cruisemesh/relayd/.env
+  RELAY_ADMIN_ORIGIN            API base. Default: https://relay.cruisemesh.app
+  RELAY_PUBLIC_URL              Relay URL embedded in setup cards. Default:
+                                https://<RELAY_DOMAIN from the .env>
+  CRUISEMESH_SITE_ORIGIN        Host of the /r# link. Default:
+                                https://cruisemesh.app
+
+See relayd/DEPLOY.md §12 for the API these commands call.
+__HELP__
 }
 
 main() {
   local command=${1:-}
-  if [ -z "$command" ]; then
-    usage
-    exit 1
-  fi
+  case $command in
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    "")
+      # No command is a usage error, so the text goes to stderr and the exit
+      # status is nonzero -- but an explicit --help is a successful request
+      # and prints to stdout, so it can be piped without tripping a caller.
+      usage >&2
+      exit 1
+      ;;
+    provision|list|show|link|extend|suspend|resume|purge) ;;
+    # Reject a bad command name here, before resolve_config, so a typo says
+    # "unknown command" rather than complaining about a missing admin token.
+    *) die "unknown command \"$command\" (try --help)" ;;
+  esac
   shift
   write_helpers
   resolve_config
@@ -430,7 +482,6 @@ main() {
     suspend)   cmd_suspend "$@" ;;
     resume)    cmd_resume "$@" ;;
     purge)     cmd_purge "$@" ;;
-    *) die "unknown command \"$command\" (run with no arguments for usage)" ;;
   esac
 }
 

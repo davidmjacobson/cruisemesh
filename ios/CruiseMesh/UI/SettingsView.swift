@@ -17,11 +17,21 @@ struct SettingsView: View {
                     NavigationLink {
                         CruisePassView(initialCard: nil, appModel: appModel)
                     } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(relayTitle)
-                            Text(relayDetail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(relayTitle)
+                                Text(relayDetail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let symbol = passIndicator.systemImage {
+                                Spacer()
+                                Image(systemName: symbol)
+                                    .foregroundStyle(passIndicator.tint)
+                                    .accessibilityLabel(
+                                        passIndicator.accessibilityLabel ?? ""
+                                    )
+                            }
                         }
                     }
                 }
@@ -114,6 +124,10 @@ struct SettingsView: View {
                 }
             }
         }
+    }
+
+    private var passIndicator: PassIndicator {
+        PassIndicator.of(connectivity.relay, configured: RelayConfigStore.load() != nil)
     }
 
     /// "CruiseMesh 1.0.2 (1784978966)". The build number is the part that

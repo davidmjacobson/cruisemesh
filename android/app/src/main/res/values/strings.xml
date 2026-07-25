@@ -146,7 +146,40 @@
     <string name="ui_voice_memo_duration">Voice memo · %1$s</string>
     <string name="ui_step_of">Step %1$d of %2$d</string>
     <string name="ui_nearby_access_on_detail">Nearby access is on. Background activity is optional but keeps messages moving while the app isn\'t open.</string>
-    <string name="ui_nearby_access_off_detail">You can finish setup without granting access — you can turn it on later in Settings when you\'re ready to start messaging.</string>
+    <string name="ui_nearby_access_off_detail">You can turn these on later in Settings — CruiseMesh just has fewer ways to reach people until you do.</string>
+    <!-- Onboarding slides (T5). Previously hardcoded Kotlin/Swift literals;
+         the localization gate only matches Text(...) so none of this was
+         visible to it. Every slide reinforces one idea: CruiseMesh uses
+         virtually every connection the phone has, and each permission line
+         says what it BUYS rather than what breaks without it. -->
+    <string name="ui_onboarding_welcome_eyebrow">Nearby-first messaging</string>
+    <string name="ui_onboarding_welcome_title">Messages that find a way through</string>
+    <string name="ui_onboarding_welcome_body">CruiseMesh gets your messages to friends and family using virtually every connection your phone has — Bluetooth, local Wi-Fi, and even handing them phone to phone when there\'s no signal at all.</string>
+    <string name="ui_onboarding_welcome_support">Built for cruises, hikes, festivals, stadiums, road trips — anywhere the network is weak, missing, or overloaded.</string>
+    <string name="ui_onboarding_delivery_eyebrow">How it works</string>
+    <string name="ui_onboarding_delivery_title">It uses whatever\'s around</string>
+    <!-- The internet clause is deliberately qualified: internet delivery
+         needs a Cruise Pass or a self-hosted relay, and onboarding must not
+         imply the free tier includes it. -->
+    <string name="ui_onboarding_delivery_body">Nearby, CruiseMesh talks phone-to-phone over Bluetooth and local Wi-Fi. Farther away, your message hops between other phones running CruiseMesh until it reaches your friend — and, with a Cruise Pass or your own server, over the internet whenever any of those phones has a connection.</string>
+    <string name="ui_onboarding_private_title">Private by default</string>
+    <string name="ui_onboarding_private_detail">Every message is encrypted end to end, so the phones and networks that help carry it can never read it.</string>
+    <string name="ui_onboarding_permissions_eyebrow">Turn on a few permissions</string>
+    <string name="ui_onboarding_permissions_title">Give CruiseMesh more ways to connect</string>
+    <string name="ui_onboarding_permissions_body">Each of these opens up another path for your messages.</string>
+    <string name="ui_onboarding_permission_nearby_title">Nearby devices and notifications</string>
+    <string name="ui_onboarding_permission_nearby_detail">Lets your phone hand messages directly to phones around you, and tells you the moment one arrives.</string>
+    <string name="ui_onboarding_permission_background_title">Background activity</string>
+    <string name="ui_onboarding_permission_background_detail">Keeps the mesh working while your phone is in your pocket, so messages still move when the screen is off.</string>
+    <string name="ui_onboarding_wifi_eyebrow">Local Wi-Fi</string>
+    <string name="ui_onboarding_wifi_title">Leave Wi-Fi on, even with no internet</string>
+    <string name="ui_onboarding_wifi_body">On a ship or anywhere the Wi-Fi has no internet, keep it connected anyway — CruiseMesh uses that local network to reach phones near you faster than Bluetooth alone.</string>
+    <string name="ui_onboarding_wifi_support_title">It costs you nothing</string>
+    <string name="ui_onboarding_wifi_support_detail">CruiseMesh won\'t use the dead connection for the internet; it just uses it to find and talk to nearby phones.</string>
+    <string name="ui_onboarding_profile_eyebrow">Your profile</string>
+    <string name="ui_onboarding_profile_title">What name would you like to go by?</string>
+    <string name="ui_onboarding_profile_body">This is what people see when you share your friend card or add each other nearby. You can change it anytime.</string>
+    <string name="ui_onboarding_profile_photo_helper">The profile photo is shared with friends after you connect.</string>
     <string name="ui_minimum_passphrase_length">At least %1$d characters.</string>
     <string name="ui_remove_photo">Remove photo</string>
     <string name="ui_removes_this_group_and_its_message_history_from">Removes this group and its message history from this device. Other members keep their copy.</string>
@@ -226,39 +259,49 @@
     <!-- Cruise Pass -->
     <string name="ui_cruise_pass">Cruise Pass</string>
     <string name="ui_cruise_pass_is_ready">Cruise Pass is ready</string>
-    <string name="ui_this_phone_can_now_use_whenever_it_has">This phone can now use %1$s whenever it has internet.</string>
+    <string name="ui_internet_delivery_is_ready_on_this_phone">Internet delivery is ready on this phone.</string>
     <string name="ui_cruise_pass_setup_saved">Cruise Pass setup saved</string>
     <string name="ui_cruisemesh_will_verify_when_this_phone_is_online">CruiseMesh will verify %1$s when this phone is online. It will not show Ready until that check succeeds.</string>
     <string name="ui_set_up_your_cruise_pass">Set up your Cruise Pass</string>
     <string name="ui_cruise_pass_is_configured">Cruise Pass is configured</string>
-    <string name="ui_open_the_setup_link_from_your_purchase_email">Open the setup link from your purchase email. If it did not open here, paste the relay card below.</string>
+    <string name="ui_open_the_setup_link_from_your_purchase_email">Open the setup link from your purchase email. If it did not open here, paste the setup card below.</string>
     <string name="ui_saved_for">Saved for %1$s. You can replace it with a new setup card at any time.</string>
     <string name="ui_status">Status: %1$s</string>
-    <string name="ui_relay_card">Relay card</string>
+    <string name="ui_setup_card">Setup card</string>
     <string name="ui_cmrelay1">CMRELAY1:…</string>
     <string name="ui_paste_card">Paste card</string>
     <string name="ui_review">Review</string>
-    <string name="ui_checking_the_relay_before_saving">Checking the relay before saving…</string>
+    <string name="ui_checking_this_setup_before_saving">Checking this setup before saving…</string>
     <string name="ui_save_and_check_later">Save and check later</string>
     <string name="ui_set_up_another_phone">Set up another phone</string>
     <string name="ui_show_setup_qr">Show setup QR</string>
     <string name="ui_remove_cruise_pass_setup">Remove Cruise Pass setup</string>
-    <string name="ui_anyone_with_this_link_can_use_your_household">Anyone with this link can use your household relay. Share it only with people in your group.</string>
+    <string name="ui_anyone_with_this_link_can_use_your_household">Anyone with this link can use your family\'s internet delivery. Share it only with your own phones.</string>
     <string name="ui_each_family_phone_needs_this_setup_a_configured">Each family phone needs this setup. A configured phone with internet can help move the family\'s queued messages; Cruise Pass does not share that phone\'s internet connection.</string>
     <string name="ui_custom_relay">Custom relay</string>
     <string name="ui_for_self_hosted_relays_and_development_most_people">For self-hosted relays and development. Most people should use the setup card above.</string>
     <string name="ui_relay_token">Relay token</string>
     <string name="ui_test_and_save">Test and save</string>
     <string name="ui_use_this_cruise_pass">Use this Cruise Pass?</string>
-    <string name="ui_relay_pass">Relay: %1$s</string>
+    <string name="ui_host_pass">Host: %1$s</string>
     <string name="ui_replace_with">Replace %1$s with %2$s?</string>
-    <string name="ui_this_will_replace_any_relay_currently_saved_on">This will replace any relay currently saved on this phone. The household token stays hidden.</string>
+    <string name="ui_this_will_replace_any_relay_currently_saved_on">This will replace any setup currently saved on this phone. Your family\'s token stays hidden.</string>
     <string name="ui_test_and_use">Test and use</string>
     <string name="ui_set_up_another_family_phone">Set up another family phone</string>
     <string name="ui_scan_this_with_the_other_phone_it_configures">Scan this with the other phone. It configures internet delivery; it does not add a contact.</string>
     <string name="ui_remove_cruise_pass_setup_confirm">Remove Cruise Pass setup?</string>
     <string name="ui_queued_internet_delivery_will_stop_until_another_cruise">Queued internet delivery will stop until another Cruise Pass or custom relay is set up. Nearby delivery still works.</string>
     <string name="ui_remove">Remove</string>
+    <!-- Cruise Pass check results. Previously hardcoded Kotlin/Swift literals,
+         invisible to the localization gate (it only matches Text(...)). -->
+    <string name="ui_this_cruise_pass_has_expired">This Cruise Pass has expired. Renew it, then open the new setup link.</string>
+    <string name="ui_this_cruise_pass_is_suspended">This Cruise Pass is suspended. Contact support for help.</string>
+    <string name="ui_this_setup_card_was_rejected">This setup card was rejected. Check the card, or contact support.</string>
+    <string name="ui_cruisemesh_could_not_check_this_setup">CruiseMesh could not check this setup. Retry, or save it and CruiseMesh will check when this phone is online.</string>
+    <!-- Custom relay section only: "relay URL"/"relay token" stay verbatim
+         here, because that is the technical surface where those are the
+         actual field names. -->
+    <string name="ui_enter_a_complete_https_relay_url_and_token">Enter a complete HTTPS relay URL and token.</string>
     <!-- Connection details -->
     <string name="ui_cruisemesh_chooses_the_best_available_path_automatically_a">CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Cruise Pass.</string>
     <string name="ui_no_friends_added_yet">No friends added yet.</string>
@@ -273,6 +316,13 @@
     <!-- Help &amp; support -->
     <string name="ui_never_post_a_cruise_pass_setup_card_or">Never post a Cruise Pass setup card or relay token publicly.</string>
     <string name="ui_open_cruisemesh_support">Open CruiseMesh support</string>
+    <!-- Cruise Pass status indicator (Settings row). Screen-reader labels for
+         the icon only; the row's title and detail already carry the wording,
+         so these stay short and are not read as full sentences. -->
+    <string name="ui_cruise_pass_ready">Cruise Pass ready</string>
+    <string name="ui_cruise_pass_waiting_for_internet">Cruise Pass waiting for internet</string>
+    <string name="ui_cruise_pass_needs_attention">Cruise Pass needs attention</string>
+    <string name="ui_cruise_pass_needs_action">Cruise Pass needs action</string>
     <!-- Internal tools -->
     <string name="ui_internal_tools">Internal tools</string>
     <string name="ui_local_wi_fi_field_tools">Local Wi-Fi field tools</string>
