@@ -83,6 +83,9 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 | `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` | `268435456` (256 MiB) | Per-family-token storage quota. See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_WS_PER_TOKEN_MAX_CONNECTIONS` | `16` | Max concurrent `GET /ws` connections for a single family token. See §7. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_WS_GLOBAL_MAX_CONNECTIONS` | `256` | Max concurrent `GET /ws` connections across all family tokens combined. See §7. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN` | `600` | Requests per minute allowed for a single family token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_RATE_BYTES_PER_MIN` | `67108864` (64 MiB) | Uploaded `sealed` bytes per minute allowed for a single family token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` | `6000` | Requests per minute across all family tokens combined — the coarse backstop. See §10. Must be a positive integer; unset uses the default. |
 | `RELAY_DOMAIN` | *(compose required)* | Hostname in the Caddyfile for TLS. |
 
 ### The `CRUISEMESH_RELAY_DB` path gotcha
@@ -190,8 +193,10 @@ if started from this directory).
 
 The relay is content-agnostic (§6) and never inspects `sealed`, so the only
 protection against unbounded SQLite growth on the $4 VPS is server-side
-size/quota gating on ingest. Two independent limits apply to every
-`POST /envelopes`:
+size/quota gating on ingest. Two independent limits bound what a family can
+**store** — both applied to every `POST /envelopes` — and a third bounds how
+fast anyone holding a family token can **ask** (see "Request and upload rate
+limits" below):
 
 ### Per-envelope sealed-size cap
 
@@ -261,6 +266,91 @@ envelope on any non-2xx response, so a rejected envelope is simply left
 queued locally for a later retry (harmless for the size cap, which never
 succeeds on retry without shrinking the payload; more useful for the quota
 error, which can resolve once the family drains their mailbox).
+
+### Request and upload rate limits
+
+The two limits above bound how much a family can *store*; neither bounds how
+*fast* it can ask. That gap matters because the family bearer token is
+semi-public — it rides inside QR friend cards — so anyone who has ever seen a
+card can call the API, and every call costs a SQLite round trip on a single
+connection on a $4 VPS. Three token buckets close it:
+
+| Bucket | Default | Env var |
+|---|---|---|
+| Requests, per family token | 600/min | `CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN` |
+| Uploaded `sealed` bytes, per family token | 64 MiB/min | `CRUISEMESH_RELAY_RATE_BYTES_PER_MIN` |
+| Requests, all tokens combined | 6,000/min | `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` |
+
+Each bucket's capacity **is** its per-minute allowance, so a family that has
+been quiet can spend a whole minute's worth in one burst (phones back on
+Wi-Fi in port dump their queue all at once) and then refills steadily at
+`allowance / 60` per second. Refill is lazy and monotonic (`Instant`, never
+the wall clock — an NTP step must not hand out free allowance or freeze a
+family out), so an idle family costs nothing and there is no background
+timer.
+
+**These are floodgates, not plan tiers**, and the defaults are set so a real
+family never meets them:
+
+- **600 requests/min** is 10 requests/second *for the whole family,
+  sustained*. A six-phone fleet polling `GET /envelopes` and `POST /presence`
+  every 15 s is around 50 requests/min; posting a backlog costs one request
+  per envelope, and 600 envelopes in a minute is far past anything a family
+  produces (for media the byte bucket binds first anyway).
+- **64 MiB/min** lets a family upload their *entire* 256 MiB storage quota in
+  about four minutes, so the limiter can never be what keeps a real cruise
+  backlog from landing — it only flattens the peak. That is roughly 360
+  max-size (180 KiB) attachments or ~2,000 typical compressed photos per
+  minute across all of a family's phones. Accounting is on **decoded**
+  `sealed` bytes; the base64 JSON on the wire is about 1.33x that.
+- **6,000 requests/min** globally is ten families simultaneously at their
+  full per-family allowance — an order of magnitude above the real
+  single-digit-family load — so it only fires when many tokens misbehave at
+  once, or when the hosted service has outgrown this box.
+
+Rejections are:
+
+```
+HTTP 429 Too Many Requests
+Retry-After: <seconds>
+{ "error": "family upload byte rate limit exceeded: retry after 3s",
+  "code": "rate_limited" }
+```
+
+`Retry-After` is integer delta-seconds until the bucket holds enough tokens
+again (at least 1, never more than 60 — a full window always refills a
+bucket completely). The single `rate_limited` code covers all three buckets
+because the client's remedy is identical (wait, then retry); the *message*
+names which limit tripped — `family request rate limit`, `family upload byte
+rate limit`, or `server-wide request rate limit` — which is what you want in
+a support report. Server-side, every rejection logs at WARN with the family
+token *prefix* (never the token itself), the scope, and the advertised wait.
+
+Notes an operator will care about:
+
+- **Enforced only after the bearer token authorizes.** The buckets are keyed
+  by family token, so checking before authentication would let an
+  unauthenticated caller grow the bucket map one entry per invented token —
+  the very memory-exhaustion vector the limiter exists to prevent. Unknown
+  tokens are rejected by auth (401) and never allocate a bucket. Idle
+  buckets are evicted lazily once the map grows past a threshold; there is
+  no background sweeper.
+- **`/healthz` and `/admin/*` are exempt.** Uptime monitors poll healthz
+  constantly and a 429 there would read as an outage; admin is a trusted
+  operator path already guarded by its own token (§12), and the purchase
+  flow provisioning a pass must never be throttled behind a family's
+  traffic.
+- **Charged routes** are `POST /envelopes` (1 request + its sealed bytes),
+  `GET /envelopes`, `POST /envelopes/ack`, `POST /presence` (1 request each),
+  and the `GET /ws` **upgrade** (1 request). Frames on an established socket
+  are not charged — the connection caps in §7 bound those instead.
+- **Unlike the storage quota, a dedupe re-post *is* charged.** Re-uploading
+  an existing `msg_id` adds zero stored bytes, but those bytes still crossed
+  the wire and were decoded, which is exactly what this limit is protecting.
+- **A rejected request is never partially charged.** Both dimensions are
+  checked before either is debited, so a post that trips the byte allowance
+  does not also burn a request token; and a family that is over its own
+  limit never eats into the global backstop.
 
 ## 11. Background maintenance (FR7)
 
