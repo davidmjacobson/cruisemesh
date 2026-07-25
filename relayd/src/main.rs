@@ -4,8 +4,9 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use cruisemesh_relayd::{
-    app, parse_bind, parse_family_quota_bytes, parse_tokens, parse_ws_connection_cap,
-    spawn_prune_task, AppState, RelayStore, WsLimitsConfig, DEFAULT_FAMILY_QUOTA_BYTES,
+    app, parse_bind, parse_family_quota_bytes, parse_rate_bytes_per_min,
+    parse_rate_requests_per_min, parse_tokens, parse_ws_connection_cap, spawn_prune_task, AppState,
+    RateLimitConfig, RelayStore, WsLimitsConfig, DEFAULT_FAMILY_QUOTA_BYTES,
     DEFAULT_PRUNE_INTERVAL,
 };
 
@@ -57,6 +58,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws_limits.global_max_connections = parse_ws_connection_cap(&raw)?;
     }
 
+    // Abuse protection: per-family request/byte rate limits plus the global
+    // request backstop, all optional overrides of generous defaults sized so
+    // a real family never trips them (see DEPLOY.md §10).
+    let mut rate_limits = RateLimitConfig::default();
+    if let Ok(raw) = env::var("CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN") {
+        rate_limits.requests_per_min = parse_rate_requests_per_min(&raw)?;
+    }
+    if let Ok(raw) = env::var("CRUISEMESH_RELAY_RATE_BYTES_PER_MIN") {
+        rate_limits.bytes_per_min = parse_rate_bytes_per_min(&raw)?;
+    }
+    if let Ok(raw) = env::var("CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN") {
+        rate_limits.global_requests_per_min = parse_rate_requests_per_min(&raw)?;
+    }
+
     let listener = TcpListener::bind(parse_bind(&bind)?).await?;
     let store = RelayStore::open(&db_path)?;
     // FR7: hourly background prune + incremental_vacuum, independent of
@@ -73,6 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         family_quota_bytes,
         ws_per_token_max_connections = ws_limits.per_token_max_connections,
         ws_global_max_connections = ws_limits.global_max_connections,
+        rate_requests_per_min = rate_limits.requests_per_min,
+        rate_bytes_per_min = rate_limits.bytes_per_min,
+        rate_global_requests_per_min = rate_limits.global_requests_per_min,
         prune_interval_secs = DEFAULT_PRUNE_INTERVAL.as_secs(),
         admin_api = admin_token.is_some(),
         "relay server listening"
@@ -85,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cruisemesh_relayd::WS_BROADCAST_CAPACITY,
             family_quota_bytes,
             ws_limits,
+            rate_limits,
         )
         .with_admin_token(admin_token)),
     )

@@ -54,12 +54,12 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -171,6 +171,74 @@ pub const MAX_ENVELOPE_SEALED_BYTES: usize = 512 * 1024;
 /// this on any realistic itinerary while still bounding the $4 VPS's disk.
 pub const DEFAULT_FAMILY_QUOTA_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Abuse protection (`DEPLOY.md` §10): default sustained request allowance
+/// for one family token, configurable via
+/// `CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN`.
+///
+/// The family bearer token is semi-public (it rides in QR friend cards), so
+/// anyone who has ever seen a card can call the API. Storage is already
+/// bounded (`DEFAULT_FAMILY_QUOTA_BYTES`) and live sockets are already
+/// bounded (`DEFAULT_WS_PER_TOKEN_MAX_CONNECTIONS`), but nothing bounded how
+/// *fast* a leaked token could hammer the $4 VPS — every request costs a
+/// SQLite round trip on one connection.
+///
+/// 600/min is 10 requests/second **for the whole family, sustained forever**,
+/// with a full minute (600) burstable at once. A six-phone fleet polling
+/// `GET /envelopes` plus `POST /presence` every 15 s is ~50 requests/min; a
+/// phone dumping a queued backlog posts one request per envelope, and 600
+/// envelopes in a minute is far past anything a family produces (the byte
+/// allowance below binds first for media). Set generously on purpose: this
+/// is a floodgate, not a plan tier.
+pub const DEFAULT_RATE_REQUESTS_PER_MIN: u32 = 600;
+
+/// Abuse protection (`DEPLOY.md` §10): default sustained upload allowance
+/// for one family token, counted on *decoded* `sealed` bytes (the wire JSON
+/// is ~1.33x that after base64). Configurable via
+/// `CRUISEMESH_RELAY_RATE_BYTES_PER_MIN`.
+///
+/// 64 MiB/min lets a family upload their entire 256 MiB storage quota in
+/// about four minutes, so the limiter can never be what keeps a real cruise
+/// backlog from landing — it only flattens the peak. In legitimate terms
+/// that is ~360 max-size (180 KiB) attachments or ~2,000 typical compressed
+/// photos per minute across all of a family's phones. For a leaked token it
+/// caps sustained ingest at ~1.1 MiB/s, which the $4 VPS's disk and the
+/// 507-quota gate can both absorb.
+pub const DEFAULT_RATE_BYTES_PER_MIN: u64 = 64 * 1024 * 1024;
+
+/// Abuse protection (`DEPLOY.md` §10): default request allowance across all
+/// family tokens combined — the coarse backstop behind the per-family cap,
+/// mirroring how `DEFAULT_WS_GLOBAL_MAX_CONNECTIONS` backs the per-token
+/// connection cap. Configurable via
+/// `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN`.
+///
+/// 6,000/min (100 requests/second) is ten families simultaneously at their
+/// full per-family allowance — an order of magnitude above the real
+/// single-digit-family load (a few hundred requests/minute total), so it
+/// only fires when many tokens misbehave at once or the hosted service has
+/// outgrown this box and wants a bigger one.
+pub const DEFAULT_RATE_GLOBAL_REQUESTS_PER_MIN: u32 = 6_000;
+
+/// Bucket-map size that triggers a lazy eviction sweep of idle families
+/// (`evict_idle_rate_buckets`). One entry is a few dozen bytes, so 1,024 of
+/// them is trivial memory; the threshold exists so the sweep costs nothing at
+/// all on a normal deployment (single-digit families never reach it) instead
+/// of running on every request. If a relay ever does hold that many *active*
+/// families the sweep becomes a linear scan of a small map per request —
+/// still far cheaper than the SQLite round trip that follows it.
+const RATE_BUCKET_EVICT_THRESHOLD: usize = 1_024;
+
+/// How long a family's buckets must go untouched before an eviction sweep
+/// may drop them. Comfortably longer than the one-minute bucket capacity, so
+/// an evicted family is always one that would have refilled to full anyway —
+/// eviction can never hand back allowance that was still being used.
+const RATE_BUCKET_IDLE_EVICT_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Ceiling on the `Retry-After` we advertise on a 429. A bucket's capacity
+/// is one minute's allowance, so waiting a full minute always restores it to
+/// full — never ask a client to sleep longer than that, even for a cost the
+/// bucket could not satisfy at all.
+const RATE_LIMIT_MAX_RETRY_AFTER_SECS: u64 = 60;
+
 /// Hosted-relay (Cruise Pass) expiry grace: after a provisioned family's
 /// `expires_ms` passes, the family may still FETCH and ACK queued envelopes
 /// for this window (so nobody's last messages are stranded mid-cruise), but
@@ -214,6 +282,228 @@ impl Default for WsLimitsConfig {
     }
 }
 
+/// Abuse protection (`DEPLOY.md` §10): tunable request/byte rate-limit
+/// allowances, pulled out of `AppState`'s constructor parameter list the same
+/// way `WsLimitsConfig` is, so a test can shrink them to something it can
+/// exhaust in milliseconds without touching every other constructor.
+///
+/// All three are *per minute*; each is also the burst capacity of its bucket
+/// (a family that has been quiet may spend a whole minute's worth at once).
+#[derive(Clone, Copy, Debug)]
+pub struct RateLimitConfig {
+    pub requests_per_min: u32,
+    pub bytes_per_min: u64,
+    pub global_requests_per_min: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            requests_per_min: DEFAULT_RATE_REQUESTS_PER_MIN,
+            bytes_per_min: DEFAULT_RATE_BYTES_PER_MIN,
+            global_requests_per_min: DEFAULT_RATE_GLOBAL_REQUESTS_PER_MIN,
+        }
+    }
+}
+
+/// A classic token bucket, refilled lazily on use: no timer task, so an idle
+/// family costs exactly nothing until its next request.
+///
+/// `Instant` (monotonic) and never `SystemTime`: an NTP step or a manual
+/// clock change on the VPS must not hand out free allowance, nor freeze a
+/// family out for however long the clock jumped — both of which a
+/// wall-clock bucket would do.
+#[derive(Debug)]
+struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    refill_per_sec: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    /// Build a bucket for a per-minute allowance: capacity is a full
+    /// minute's worth (so a quiet family can burst that much at once) and it
+    /// refills at `allowance / 60` per second. Starts full — a brand-new
+    /// family is not penalized for being new.
+    fn per_minute(per_min: f64, now: Instant) -> Self {
+        let capacity = per_min.max(0.0);
+        Self {
+            tokens: capacity,
+            capacity,
+            refill_per_sec: capacity / 60.0,
+            last_refill: now,
+        }
+    }
+
+    /// Lazily credit the time elapsed since the last touch, clamped to
+    /// capacity (unused allowance does not accumulate past one minute).
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.last_refill = now;
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        }
+    }
+
+    fn has(&self, cost: f64) -> bool {
+        self.tokens >= cost
+    }
+
+    fn take(&mut self, cost: f64) {
+        self.tokens = (self.tokens - cost).max(0.0);
+    }
+
+    /// Refill, then take `cost` if it fits. `false` means the caller is over
+    /// its allowance and nothing was charged.
+    fn try_take(&mut self, cost: f64, now: Instant) -> bool {
+        self.refill(now);
+        if !self.has(cost) {
+            return false;
+        }
+        self.take(cost);
+        true
+    }
+
+    /// Whole seconds until this bucket would hold `cost` tokens — the
+    /// `Retry-After` value. At least 1 (a client told to retry in 0 seconds
+    /// just hot-loops) and never more than one full window.
+    fn retry_after_secs(&self, cost: f64) -> u64 {
+        if self.refill_per_sec <= 0.0 {
+            return RATE_LIMIT_MAX_RETRY_AFTER_SECS;
+        }
+        let missing = (cost - self.tokens).max(0.0);
+        let secs = (missing / self.refill_per_sec).ceil();
+        // `as u64` saturates at 0 for NaN/negative and at u64::MAX for huge
+        // values; the clamp turns both into a sane wait either way.
+        (secs as u64).clamp(1, RATE_LIMIT_MAX_RETRY_AFTER_SECS)
+    }
+
+    fn is_full(&self) -> bool {
+        self.tokens >= self.capacity
+    }
+}
+
+/// The pair of buckets a single family token is charged against.
+struct FamilyBuckets {
+    requests: TokenBucket,
+    bytes: TokenBucket,
+}
+
+impl FamilyBuckets {
+    fn new(config: RateLimitConfig, now: Instant) -> Self {
+        Self {
+            requests: TokenBucket::per_minute(f64::from(config.requests_per_min), now),
+            bytes: TokenBucket::per_minute(config.bytes_per_min as f64, now),
+        }
+    }
+
+    /// Charge both dimensions atomically: both are checked before *either*
+    /// is debited, so a post that trips the byte allowance does not also
+    /// silently burn a request token it never got to use.
+    ///
+    /// `Err` carries which dimension tripped and how long to wait.
+    fn try_take(
+        &mut self,
+        requests: f64,
+        bytes: f64,
+        now: Instant,
+    ) -> Result<(), (RateLimitScope, u64)> {
+        self.requests.refill(now);
+        self.bytes.refill(now);
+        if !self.requests.has(requests) {
+            return Err((
+                RateLimitScope::FamilyRequests,
+                self.requests.retry_after_secs(requests),
+            ));
+        }
+        if !self.bytes.has(bytes) {
+            return Err((
+                RateLimitScope::FamilyBytes,
+                self.bytes.retry_after_secs(bytes),
+            ));
+        }
+        self.requests.take(requests);
+        self.bytes.take(bytes);
+        Ok(())
+    }
+}
+
+/// Which limit rejected a request. One `code` covers all three on the wire
+/// (the client's remedy is identical: back off and retry); the distinction
+/// exists for the operator, in the message and the log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RateLimitScope {
+    FamilyRequests,
+    FamilyBytes,
+    GlobalRequests,
+}
+
+impl RateLimitScope {
+    /// Log-field discriminant. Never contains the token.
+    fn label(self) -> &'static str {
+        match self {
+            Self::FamilyRequests => "family_requests",
+            Self::FamilyBytes => "family_bytes",
+            Self::GlobalRequests => "global_requests",
+        }
+    }
+
+    /// Client-facing phrasing: names both which limit (this family's vs the
+    /// whole server's) and which dimension (requests vs uploaded bytes).
+    fn description(self) -> &'static str {
+        match self {
+            Self::FamilyRequests => "family request rate limit",
+            Self::FamilyBytes => "family upload byte rate limit",
+            Self::GlobalRequests => "server-wide request rate limit",
+        }
+    }
+}
+
+/// Lazy cleanup for the per-family bucket map: one entry accumulates per
+/// family token ever seen, and a hosted relay churns tokens as passes are
+/// sold and expire. Called only when the map crosses
+/// `RATE_BUCKET_EVICT_THRESHOLD` — no background task.
+///
+/// The buckets must be refilled *before* the full-capacity test: `tokens` is
+/// only ever updated on use, so a family that spent its allowance and then
+/// vanished still reads as empty however long ago that was. Idleness is
+/// therefore measured first (from `last_refill`, which refilling resets),
+/// and only then is the refilled bucket asked whether it is back at full —
+/// which, past an idle window several times the one-minute capacity, it
+/// always is. Dropping a full bucket is equivalent to keeping it: a
+/// re-created one also starts full.
+fn evict_idle_rate_buckets(buckets: &mut HashMap<String, FamilyBuckets>, now: Instant) {
+    buckets.retain(|_, family| {
+        let idle_for = now.saturating_duration_since(family.requests.last_refill);
+        if idle_for < RATE_BUCKET_IDLE_EVICT_AFTER {
+            return true;
+        }
+        family.requests.refill(now);
+        family.bytes.refill(now);
+        !(family.requests.is_full() && family.bytes.is_full())
+    });
+}
+
+/// Build the 429 for a tripped limit, logging it first (FR2: every rejection
+/// is visible server-side). Logs the token *prefix* only — the full bearer
+/// token is a credential and never belongs in the log stream.
+fn reject_rate_limited(
+    family_token: &str,
+    scope: RateLimitScope,
+    retry_after_secs: u64,
+) -> ApiError {
+    warn!(
+        family = %token_prefix(family_token),
+        scope = scope.label(),
+        retry_after_secs,
+        "request rejected: rate limit exceeded (429)"
+    );
+    ApiError::rate_limited(scope, retry_after_secs)
+}
+
 #[derive(Clone)]
 pub struct AppState {
     store: RelayStore,
@@ -232,6 +522,17 @@ pub struct AppState {
     ws_per_token_max_connections: usize,
     ws_ping_interval: Duration,
     ws_ping_missed_limit: u32,
+    /// Abuse protection: the configured per-minute allowances, used when a
+    /// family's buckets are created on first (authorized) request.
+    rate_limits: RateLimitConfig,
+    /// Abuse protection: per-family-token request + byte buckets, created
+    /// lazily on first authorized request and evicted once idle
+    /// (`evict_idle_rate_buckets`). Touched once per request under a plain
+    /// mutex — the critical section is a few float operations, far cheaper
+    /// than the SQLite round trip that follows it.
+    rate_buckets: Arc<Mutex<HashMap<String, FamilyBuckets>>>,
+    /// Abuse protection: coarse request backstop shared by every token.
+    rate_global: Arc<Mutex<TokenBucket>>,
     /// Bearer token for the `/admin/families` provisioning API
     /// (`CRUISEMESH_RELAY_ADMIN_TOKEN`). `None` disables the admin routes
     /// entirely (they answer 404), which is the self-hosted default.
@@ -292,6 +593,25 @@ impl AppState {
             WS_BROADCAST_CAPACITY,
             DEFAULT_FAMILY_QUOTA_BYTES,
             ws_limits,
+            RateLimitConfig::default(),
+        )
+    }
+
+    /// Abuse-protection test helper: tiny request/byte allowances (default
+    /// hub capacity, family quota and WS knobs) so a test can exhaust and
+    /// watch a bucket refill in milliseconds instead of a production minute.
+    pub fn with_rate_limits(
+        store: RelayStore,
+        auth_tokens: HashSet<String>,
+        rate_limits: RateLimitConfig,
+    ) -> Self {
+        Self::with_full_config(
+            store,
+            auth_tokens,
+            WS_BROADCAST_CAPACITY,
+            DEFAULT_FAMILY_QUOTA_BYTES,
+            WsLimitsConfig::default(),
+            rate_limits,
         )
     }
 
@@ -307,6 +627,7 @@ impl AppState {
             hub_capacity,
             family_quota_bytes,
             WsLimitsConfig::default(),
+            RateLimitConfig::default(),
         )
     }
 
@@ -317,6 +638,7 @@ impl AppState {
         hub_capacity: usize,
         family_quota_bytes: u64,
         ws_limits: WsLimitsConfig,
+        rate_limits: RateLimitConfig,
     ) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(hub_capacity.max(1));
         let ws_per_token = auth_tokens
@@ -338,8 +660,70 @@ impl AppState {
             ws_per_token_max_connections: ws_limits.per_token_max_connections,
             ws_ping_interval: ws_limits.ping_interval,
             ws_ping_missed_limit: ws_limits.ping_missed_limit,
+            rate_limits,
+            // Family buckets are created on first *authorized* request (see
+            // `check_rate_limit`), not prefilled from the allowlist: hosted
+            // families are provisioned at runtime, so prefilling would only
+            // cover half of them anyway.
+            rate_buckets: Arc::new(Mutex::new(HashMap::new())),
+            rate_global: Arc::new(Mutex::new(TokenBucket::per_minute(
+                f64::from(rate_limits.global_requests_per_min),
+                Instant::now(),
+            ))),
             admin_token: None,
         }
+    }
+
+    /// Charge one request (and, for uploads, its sealed bytes) against this
+    /// family's buckets and the global request backstop.
+    ///
+    /// **Only ever call this after the caller's family token has
+    /// authorized.** The bucket map is keyed by family token: enforcing
+    /// before authorization would let an unauthenticated caller insert one
+    /// entry per made-up token and grow the map without bound, turning the
+    /// abuse protection into exactly the memory-exhaustion vector it exists
+    /// to prevent. Authorization first means an attacker can only ever
+    /// occupy entries for tokens they already hold.
+    fn check_rate_limit(
+        &self,
+        family_token: &str,
+        requests: f64,
+        bytes: f64,
+    ) -> Result<(), ApiError> {
+        let now = Instant::now();
+        let family = {
+            let mut buckets = self.rate_buckets.lock().unwrap_or_else(|e| e.into_inner());
+            if buckets.len() >= RATE_BUCKET_EVICT_THRESHOLD {
+                evict_idle_rate_buckets(&mut buckets, now);
+            }
+            buckets
+                .entry(family_token.to_string())
+                .or_insert_with(|| FamilyBuckets::new(self.rate_limits, now))
+                .try_take(requests, bytes, now)
+        };
+        if let Err((scope, retry_after_secs)) = family {
+            return Err(reject_rate_limited(family_token, scope, retry_after_secs));
+        }
+        // Global backstop, requests only: bytes are already bounded per
+        // family, and a request cap bounds how many uploads can arrive at
+        // all. Charged after the family buckets so a family that is over its
+        // own limit never eats into everyone else's allowance.
+        let global_retry_after = {
+            let mut global = self.rate_global.lock().unwrap_or_else(|e| e.into_inner());
+            if global.try_take(requests, now) {
+                None
+            } else {
+                Some(global.retry_after_secs(requests))
+            }
+        };
+        if let Some(retry_after_secs) = global_retry_after {
+            return Err(reject_rate_limited(
+                family_token,
+                RateLimitScope::GlobalRequests,
+                retry_after_secs,
+            ));
+        }
+        Ok(())
     }
 
     /// Builder: enable the `/admin/families` API with this bearer token.
@@ -1236,6 +1620,34 @@ pub fn parse_ws_connection_cap(raw: &str) -> Result<usize, String> {
     Ok(value)
 }
 
+/// Parse `CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN` /
+/// `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` (see `DEPLOY.md` §10).
+/// `0` is rejected for the same reason as the caps above -- it would mean
+/// "no client may ever call the API", never what an operator means; unset
+/// the env var to keep the default.
+pub fn parse_rate_requests_per_min(raw: &str) -> Result<u32, String> {
+    let value: u32 = raw
+        .parse()
+        .map_err(|_| format!("not a valid request rate: {raw:?}"))?;
+    if value == 0 {
+        return Err("request rate limit must be greater than 0 per minute".to_string());
+    }
+    Ok(value)
+}
+
+/// Parse `CRUISEMESH_RELAY_RATE_BYTES_PER_MIN` (see `DEPLOY.md` §10). `0` is
+/// rejected -- a family that may upload zero bytes per minute could never
+/// post anything, same reasoning as the family storage quota above.
+pub fn parse_rate_bytes_per_min(raw: &str) -> Result<u64, String> {
+    let value: u64 = raw
+        .parse()
+        .map_err(|_| format!("not a valid byte rate: {raw:?}"))?;
+    if value == 0 {
+        return Err("byte rate limit must be greater than 0 per minute".to_string());
+    }
+    Ok(value)
+}
+
 #[derive(Serialize)]
 struct HealthzResponse {
     status: &'static str,
@@ -1272,6 +1684,11 @@ async fn post_envelope(
 ) -> Result<Json<PostEnvelopeResponse>, ApiError> {
     let access = authorize_bearer(&state, &headers, FamilyOp::Post).await?;
     let family_token = access.token.clone();
+    // Rate limit the request unit the moment the caller is known-good, and
+    // before any decoding work: a token spraying malformed payloads is still
+    // spending server time, so it must still be charged. The byte dimension
+    // is charged separately below, once the payload's real size is known.
+    state.check_rate_limit(&family_token, 1.0, 0.0)?;
     let msg_id = decode_base64_field(&request.msg_id, "msg_id")?;
     if msg_id.len() != MSG_ID_LEN {
         return Err(ApiError::bad_request(format!(
@@ -1301,6 +1718,11 @@ async fn post_envelope(
         );
         return Err(ApiError::envelope_too_large(sealed.len()));
     }
+    // Byte allowance, charged after the per-envelope cap so a family is
+    // never billed for bytes the server has already refused to store. A
+    // dedupe re-post *is* charged (unlike the storage quota, which exempts
+    // it): the bytes crossed the wire and were decoded either way.
+    state.check_rate_limit(&family_token, 0.0, sealed.len() as f64)?;
     let now = now_ms();
 
     // Dedupe, quota accounting, expiry pruning, and insertion are one store
@@ -1409,6 +1831,8 @@ async fn get_envelopes(
     let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)
         .await?
         .token;
+    // Enforced only once the token has authorized (see `check_rate_limit`).
+    state.check_rate_limit(&family_token, 1.0, 0.0)?;
     let (hints, _) = decode_fetch_hints(&query.hints)?;
     let after = query.after.unwrap_or(0);
     if after < 0 {
@@ -1468,6 +1892,8 @@ async fn ack_envelopes(
     let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)
         .await?
         .token;
+    // Enforced only once the token has authorized (see `check_rate_limit`).
+    state.check_rate_limit(&family_token, 1.0, 0.0)?;
     if request.ids.len() > MAX_ACK_IDS {
         return Err(ApiError::bad_request(format!(
             "ids must contain at most {MAX_ACK_IDS} entries"
@@ -1515,6 +1941,8 @@ async fn sync_presence(
     let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)
         .await?
         .token;
+    // Enforced only once the token has authorized (see `check_rate_limit`).
+    state.check_rate_limit(&family_token, 1.0, 0.0)?;
     if request.announce.len() > MAX_PRESENCE_ANNOUNCE {
         return Err(ApiError::bad_request(format!(
             "announce must contain at most {MAX_PRESENCE_ANNOUNCE} hints"
@@ -1780,6 +2208,11 @@ async fn ws_handler(
             .await?
             .token
     };
+    // One request unit per *upgrade attempt* (frames on an established
+    // socket are not charged -- the connection caps below bound those).
+    // Enforced only once the token has authorized, whichever of the two auth
+    // paths above resolved it (see `check_rate_limit`).
+    state.check_rate_limit(&token, 1.0, 0.0)?;
     let (hints, hints_base64) = decode_fetch_hints(&query.hints)?;
     let after = query.after.unwrap_or(0);
     if after < 0 {
@@ -2195,6 +2628,11 @@ struct ApiError {
     /// error kinds — omitted from the response body, so their wire shape
     /// is unchanged.
     code: Option<&'static str>,
+    /// Delta-seconds for a `Retry-After` response header, following the same
+    /// convention as `code` above: `Some` only for the rate-limit 429 that
+    /// introduced it, `None` (header omitted entirely) for every other error
+    /// kind, so their wire shape is likewise unchanged.
+    retry_after_secs: Option<u64>,
 }
 
 impl ApiError {
@@ -2203,6 +2641,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             message,
             code: None,
+            retry_after_secs: None,
         }
     }
 
@@ -2215,6 +2654,7 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             message,
             code: None,
+            retry_after_secs: None,
         }
     }
 
@@ -2227,6 +2667,7 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "internal server error".to_string(),
             code: None,
+            retry_after_secs: None,
         }
     }
 
@@ -2241,6 +2682,32 @@ impl ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: format!("too many concurrent websocket connections ({scope} cap reached)"),
             code: Some("ws_connection_cap"),
+            retry_after_secs: None,
+        }
+    }
+
+    /// Abuse protection (`DEPLOY.md` §10): a token bucket refused this
+    /// request. 429 Too Many Requests is the standard status, and this one
+    /// carries a `Retry-After` in delta-seconds so a client backs off by a
+    /// known amount instead of hot-looping into the same rejection.
+    ///
+    /// Deliberately distinct from the two other exhaustion shapes: 507
+    /// `family_quota_exceeded` means the family's *stored* bytes are full
+    /// (drain the mailbox), 429 `ws_connection_cap` means too many *live
+    /// sockets* (close one), and this means too much traffic *per unit
+    /// time* (wait). A single `rate_limited` code covers all three scopes —
+    /// the client's remedy is identical — while the message names which
+    /// limit and which dimension tripped, for the operator reading a
+    /// support report.
+    fn rate_limited(scope: RateLimitScope, retry_after_secs: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!(
+                "{} exceeded: retry after {retry_after_secs}s",
+                scope.description()
+            ),
+            code: Some("rate_limited"),
+            retry_after_secs: Some(retry_after_secs),
         }
     }
 
@@ -2249,6 +2716,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             message: "not found".to_string(),
             code: None,
+            retry_after_secs: None,
         }
     }
 
@@ -2272,6 +2740,7 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             message: message.to_string(),
             code: Some("family_expired"),
+            retry_after_secs: None,
         }
     }
 
@@ -2285,6 +2754,7 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             message: "family is suspended".to_string(),
             code: Some("family_suspended"),
+            retry_after_secs: None,
         }
     }
 
@@ -2298,6 +2768,7 @@ impl ApiError {
                  {MAX_ENVELOPE_SEALED_BYTES}-byte per-envelope cap"
             ),
             code: Some("envelope_too_large"),
+            retry_after_secs: None,
         }
     }
 
@@ -2315,6 +2786,7 @@ impl ApiError {
                  {quota_bytes} byte quota (expired rows already pruned)"
             ),
             code: Some("family_quota_exceeded"),
+            retry_after_secs: None,
         }
     }
 }
@@ -2325,7 +2797,18 @@ impl IntoResponse for ApiError {
             Some(code) => serde_json::json!({ "error": self.message, "code": code }),
             None => serde_json::json!({ "error": self.message }),
         };
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        // `Retry-After` in delta-seconds (RFC 9110 §10.2.3). Set only by the
+        // rate-limit 429; every other error omits the header entirely and
+        // keeps its exact pre-existing wire shape. The value is a plain
+        // integer, so `from_str` cannot realistically fail -- if it somehow
+        // did, the body still carries the wait in its message.
+        if let Some(secs) = self.retry_after_secs {
+            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -3734,6 +4217,95 @@ mod tests {
             caller_thread, worker_thread,
             "store call should run on a spawn_blocking thread, not the caller's"
         );
+    }
+
+    /// Bucket math, driven off explicit `Instant`s instead of sleeping: a
+    /// full minute's allowance bursts at once, refills at allowance/60 per
+    /// second, and never accumulates past capacity while idle.
+    #[test]
+    fn token_bucket_bursts_a_minute_then_refills_without_accumulating() {
+        let start = Instant::now();
+        let mut bucket = TokenBucket::per_minute(60.0, start);
+
+        // A quiet family may spend the whole minute's worth immediately.
+        assert!(bucket.try_take(60.0, start));
+        assert!(!bucket.try_take(1.0, start), "bucket is empty at t=0");
+
+        // 60/min == 1/sec.
+        assert!(bucket.try_take(1.0, start + Duration::from_secs(1)));
+        assert!(!bucket.try_take(1.0, start + Duration::from_secs(1)));
+
+        // Ten idle minutes credit one minute's worth, not ten.
+        let later = start + Duration::from_secs(600);
+        assert!(bucket.try_take(60.0, later));
+        assert!(!bucket.try_take(1.0, later));
+    }
+
+    /// `Retry-After` must be a whole number of seconds, never 0 (a client
+    /// told to retry immediately just hot-loops), and never longer than the
+    /// one-minute window that always refills the bucket completely.
+    #[test]
+    fn token_bucket_retry_after_is_a_sane_whole_second_wait() {
+        let start = Instant::now();
+        let mut bucket = TokenBucket::per_minute(60.0, start);
+        assert!(bucket.try_take(60.0, start));
+
+        // Empty bucket, 1 token/sec: 4 tokens are 4 seconds away.
+        assert_eq!(bucket.retry_after_secs(4.0), 4);
+        // A fractional wait rounds up, and never reports 0.
+        assert_eq!(bucket.retry_after_secs(0.25), 1);
+        // A cost the bucket could never satisfy is clamped, not absurd.
+        assert_eq!(
+            bucket.retry_after_secs(10_000.0),
+            RATE_LIMIT_MAX_RETRY_AFTER_SECS
+        );
+    }
+
+    /// Eviction drops families that have been quiet long enough to have
+    /// refilled anyway, and keeps the ones still spending their allowance —
+    /// including a bucket whose stale `tokens` field only *looks* empty
+    /// until it is refilled.
+    #[test]
+    fn evict_idle_rate_buckets_drops_only_the_long_idle_families() {
+        let start = Instant::now();
+        let config = RateLimitConfig {
+            requests_per_min: 60,
+            bytes_per_min: 60,
+            global_requests_per_min: 60,
+        };
+        let mut buckets = HashMap::new();
+        // Both families spend everything at t=0, so both look empty.
+        for token in ["idle-family", "busy-family"] {
+            let mut family = FamilyBuckets::new(config, start);
+            assert!(family.try_take(60.0, 60.0, start).is_ok());
+            buckets.insert(token.to_string(), family);
+        }
+        // ...but the busy one was touched a second ago.
+        let now = start + RATE_BUCKET_IDLE_EVICT_AFTER + Duration::from_secs(1);
+        let busy = buckets.get_mut("busy-family").unwrap();
+        assert!(busy
+            .try_take(1.0, 1.0, now - Duration::from_secs(1))
+            .is_ok());
+
+        evict_idle_rate_buckets(&mut buckets, now);
+
+        assert!(!buckets.contains_key("idle-family"));
+        assert!(buckets.contains_key("busy-family"));
+    }
+
+    /// `0` is meaningless for every rate knob (it locks every client out
+    /// forever), so the parsers reject it rather than let an operator brick
+    /// the relay with a typo; unset means "use the default".
+    #[test]
+    fn rate_limit_parsers_reject_zero_and_garbage() {
+        assert_eq!(parse_rate_requests_per_min("600"), Ok(600));
+        assert!(parse_rate_requests_per_min("0").is_err());
+        assert!(parse_rate_requests_per_min("-1").is_err());
+        assert!(parse_rate_requests_per_min("lots").is_err());
+
+        assert_eq!(parse_rate_bytes_per_min("67108864"), Ok(67_108_864));
+        assert!(parse_rate_bytes_per_min("0").is_err());
+        assert!(parse_rate_bytes_per_min("64MiB").is_err());
     }
 
     /// FR8 (verifying FR2 already covers this): `ApiError::internal` must
