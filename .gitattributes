@@ -1,0 +1,7 @@
+# Shell scripts must check out with LF even on Windows. Both scripts in
+# tools/ are meant to be run by a Linux bash -- relay_admin.sh is documented
+# as `ssh root@relay... 'bash -s' < tools/relay_admin.sh`, piping the working
+# copy's bytes straight into a remote shell. With core.autocrlf=true (the
+# default on this project's Windows checkout) those bytes would carry CRLF
+# and bash fails on the carriage returns: `$'\r': command not found`.
+*.sh text eol=lf
