@@ -551,12 +551,12 @@
         }
       }
     },
-    "Each of these opens up another way for your messages to get through.": {
+    "Each of these opens up another path for your messages.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Each of these opens up another way for your messages to get through."
+            "value": "Each of these opens up another path for your messages."
           }
         }
       }
@@ -697,6 +697,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Full-screen photo"
+          }
+        }
+      }
+    },
+    "Give CruiseMesh more ways to connect": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Give CruiseMesh more ways to connect"
           }
         }
       }
@@ -1861,12 +1871,12 @@
         }
       }
     },
-    "This is what people will see when you share your friend card or add each other nearby. You can change it later.": {
+    "This is what people see when you share your friend card or add each other nearby. You can change it anytime.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "This is what people will see when you share your friend card or add each other nearby. You can change it later."
+            "value": "This is what people see when you share your friend card or add each other nearby. You can change it anytime."
           }
         }
       }
@@ -1887,16 +1897,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "This removes local connection events and per-person path summaries. Messages and friends are not affected."
-          }
-        }
-      }
-    },
-    "Turn on a few permissions": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Turn on a few permissions"
           }
         }
       }
@@ -1991,12 +1991,12 @@
         }
       }
     },
-    "You can turn these on later in Settings.": {
+    "You can turn these on later in Settings — CruiseMesh just has fewer ways to reach people until you do.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "You can turn these on later in Settings."
+            "value": "You can turn these on later in Settings — CruiseMesh just has fewer ways to reach people until you do."
           }
         }
       }

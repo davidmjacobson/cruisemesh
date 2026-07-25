@@ -138,7 +138,40 @@
     <string name="ui_voice_memo_duration">Voice memo · %1$s</string>
     <string name="ui_step_of">Step %1$d of %2$d</string>
     <string name="ui_nearby_access_on_detail">Nearby access is on. Background activity is optional but keeps messages moving while the app isn\'t open.</string>
-    <string name="ui_nearby_access_off_detail">You can finish setup without granting access — you can turn it on later in Settings when you\'re ready to start messaging.</string>
+    <string name="ui_nearby_access_off_detail">You can turn these on later in Settings — CruiseMesh just has fewer ways to reach people until you do.</string>
+    <!-- Onboarding slides (T5). Previously hardcoded Kotlin/Swift literals;
+         the localization gate only matches Text(...) so none of this was
+         visible to it. Every slide reinforces one idea: CruiseMesh uses
+         virtually every connection the phone has, and each permission line
+         says what it BUYS rather than what breaks without it. -->
+    <string name="ui_onboarding_welcome_eyebrow">Nearby-first messaging</string>
+    <string name="ui_onboarding_welcome_title">Messages that find a way through</string>
+    <string name="ui_onboarding_welcome_body">CruiseMesh gets your messages to friends and family using virtually every connection your phone has — Bluetooth, local Wi-Fi, and even handing them phone to phone when there\'s no signal at all.</string>
+    <string name="ui_onboarding_welcome_support">Built for cruises, hikes, festivals, stadiums, road trips — anywhere the network is weak, missing, or overloaded.</string>
+    <string name="ui_onboarding_delivery_eyebrow">How it works</string>
+    <string name="ui_onboarding_delivery_title">It uses whatever\'s around</string>
+    <!-- The internet clause is deliberately qualified: internet delivery
+         needs a Cruise Pass or a self-hosted relay, and onboarding must not
+         imply the free tier includes it. -->
+    <string name="ui_onboarding_delivery_body">Nearby, CruiseMesh talks phone-to-phone over Bluetooth and local Wi-Fi. Farther away, your message hops between other phones running CruiseMesh until it reaches your friend — and, with a Cruise Pass or your own server, over the internet whenever any of those phones has a connection.</string>
+    <string name="ui_onboarding_private_title">Private by default</string>
+    <string name="ui_onboarding_private_detail">Every message is encrypted end to end, so the phones and networks that help carry it can never read it.</string>
+    <string name="ui_onboarding_permissions_eyebrow">Turn on a few permissions</string>
+    <string name="ui_onboarding_permissions_title">Give CruiseMesh more ways to connect</string>
+    <string name="ui_onboarding_permissions_body">Each of these opens up another path for your messages.</string>
+    <string name="ui_onboarding_permission_nearby_title">Nearby devices and notifications</string>
+    <string name="ui_onboarding_permission_nearby_detail">Lets your phone hand messages directly to phones around you, and tells you the moment one arrives.</string>
+    <string name="ui_onboarding_permission_background_title">Background activity</string>
+    <string name="ui_onboarding_permission_background_detail">Keeps the mesh working while your phone is in your pocket, so messages still move when the screen is off.</string>
+    <string name="ui_onboarding_wifi_eyebrow">Local Wi-Fi</string>
+    <string name="ui_onboarding_wifi_title">Leave Wi-Fi on, even with no internet</string>
+    <string name="ui_onboarding_wifi_body">On a ship or anywhere the Wi-Fi has no internet, keep it connected anyway — CruiseMesh uses that local network to reach phones near you faster than Bluetooth alone.</string>
+    <string name="ui_onboarding_wifi_support_title">It costs you nothing</string>
+    <string name="ui_onboarding_wifi_support_detail">CruiseMesh won\'t use the dead connection for the internet; it just uses it to find and talk to nearby phones.</string>
+    <string name="ui_onboarding_profile_eyebrow">Your profile</string>
+    <string name="ui_onboarding_profile_title">What name would you like to go by?</string>
+    <string name="ui_onboarding_profile_body">This is what people see when you share your friend card or add each other nearby. You can change it anytime.</string>
+    <string name="ui_onboarding_profile_photo_helper">The profile photo is shared with friends after you connect.</string>
     <string name="ui_minimum_passphrase_length">At least %1$d characters.</string>
     <string name="ui_remove_photo">Remove photo</string>
     <string name="ui_removes_this_group_and_its_message_history_from">Removes this group and its message history from this device. Other members keep their copy.</string>
