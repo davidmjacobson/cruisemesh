@@ -164,6 +164,12 @@ class MainActivity : ComponentActivity() {
         handleBluetoothEnableRequest(intent)
     }
 
+    // ACTION_REQUEST_ENABLE needs BLUETOOTH_CONNECT on API 31+; the
+    // SecurityException that a missing grant throws is already handled by the
+    // runCatching -> Settings fallback below, but lint's MissingPermission
+    // check can't see through runCatching, so suppress it here (the runtime
+    // handling is the fallback, not a pre-check).
+    @SuppressLint("MissingPermission")
     private fun handleBluetoothEnableRequest(intent: Intent?) {
         if (intent?.action != ACTION_REQUEST_BLUETOOTH_ENABLE) return
         // Consume the trampoline action before opening the system prompt so a
