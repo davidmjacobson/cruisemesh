@@ -37,7 +37,7 @@ struct CruisePassView: View {
                     .font(.title2.weight(.semibold))
                 Text(
                     configured == nil
-                        ? "Open the setup link from your purchase email. If it did not open here, paste the relay card below."
+                        ? "Open the setup link from your purchase email. If it did not open here, paste the setup card below."
                         : "Saved for \(relayHost(configured!.relayUrl)). You can replace it with a new setup card at any time."
                 )
                 .font(.subheadline)
@@ -67,7 +67,7 @@ struct CruisePassView: View {
                 if isTesting {
                     HStack {
                         ProgressView()
-                        Text("Checking the relay before saving…")
+                        Text("Checking this setup before saving…")
                     }
                 }
                 if let resultMessage {
@@ -113,7 +113,7 @@ struct CruisePassView: View {
                     Button("Remove Cruise Pass setup", role: .destructive) {
                         showRemoveConfirmation = true
                     }
-                    Text("Anyone with this link can use your household relay. Share it only with people in your group.")
+                    Text("Anyone with this link can use your family's internet delivery. Share it only with your own phones.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text("Each family phone needs this setup. A configured phone with internet can help move the family's queued messages; Cruise Pass does not share that phone's internet connection.")
@@ -223,9 +223,9 @@ struct CruisePassView: View {
         } message: {
             if let setup = pending {
                 if let configured {
-                    Text("Replace \(relayHost(configured.relayUrl)) with \(relayHost(setup.relayUrl))?\n\nThe household token stays hidden.")
+                    Text("Replace \(relayHost(configured.relayUrl)) with \(relayHost(setup.relayUrl))?\n\nYour family's token stays hidden.")
                 } else {
-                    Text("Relay: \(relayHost(setup.relayUrl))\n\nThe household token stays hidden.")
+                    Text("Host: \(relayHost(setup.relayUrl))\n\nYour family's token stays hidden.")
                 }
             }
         }
@@ -275,10 +275,10 @@ struct CruisePassView: View {
                     } else if let relay = error as? RelayHTTPError, relay.relayCode == "family_suspended" {
                         resultMessage = "This Cruise Pass is suspended. Contact support for help."
                     } else if error is RelayHTTPError {
-                        resultMessage = "The relay rejected this setup. Check the card or contact support."
+                        resultMessage = "This setup card was rejected. Check the card, or contact support."
                     } else {
                         unverifiedSetup = setup
-                        resultMessage = "CruiseMesh could not reach the relay. Retry, or save the setup and let CruiseMesh check when this phone is online."
+                        resultMessage = "CruiseMesh could not check this setup. Retry, or save it and CruiseMesh will check when this phone is online."
                     }
                 }
             }

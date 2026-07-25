@@ -125,16 +125,18 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
             }.onFailure { error ->
                 if (error !is RelayHttpException) unverifiedSetup = setup
                 setupState = PassSetupState.Failed(
-                    when {
-                        (error as? RelayHttpException)?.relayCode == "family_expired" ->
-                            "This Cruise Pass has expired. Renew it, then open the new setup link."
-                        (error as? RelayHttpException)?.relayCode == "family_suspended" ->
-                            "This Cruise Pass is suspended. Contact support for help."
-                        error is RelayHttpException ->
-                            "The relay rejected this setup. Check the card or contact support."
-                        else ->
-                            "CruiseMesh could not reach the relay. Retry, or save the setup and let CruiseMesh check when this phone is online."
-                    },
+                    context.getString(
+                        when {
+                            (error as? RelayHttpException)?.relayCode == "family_expired" ->
+                                R.string.ui_this_cruise_pass_has_expired
+                            (error as? RelayHttpException)?.relayCode == "family_suspended" ->
+                                R.string.ui_this_cruise_pass_is_suspended
+                            error is RelayHttpException ->
+                                R.string.ui_this_setup_card_was_rejected
+                            else ->
+                                R.string.ui_cruisemesh_could_not_check_this_setup
+                        },
+                    ),
                 )
             }
         }
@@ -166,11 +168,11 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
             when (val state = setupState) {
                 is PassSetupState.Saved -> {
                     Text(stringResource(R.string.ui_cruise_pass_is_ready), style = MaterialTheme.typography.headlineSmall)
+                    // The host used to be interpolated here; it stays visible on
+                    // the configured screen below, so the success line no longer
+                    // needs to name it.
                     Text(
-                        stringResource(
-                            R.string.ui_this_phone_can_now_use_whenever_it_has,
-                            relayHost(state.relayUrl),
-                        ),
+                        stringResource(R.string.ui_internet_delivery_is_ready_on_this_phone),
                         modifier = Modifier.padding(top = 8.dp),
                     )
                 }
@@ -215,7 +217,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
             OutlinedTextField(
                 value = input,
                 onValueChange = { input = it },
-                label = { Text(stringResource(R.string.ui_relay_card)) },
+                label = { Text(stringResource(R.string.ui_setup_card)) },
                 placeholder = { Text(stringResource(R.string.ui_cmrelay1)) },
                 minLines = 3,
                 modifier = Modifier.fillMaxWidth().padding(top = 20.dp),
@@ -250,7 +252,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                     modifier = Modifier.padding(top = 16.dp),
                 ) {
                     CircularProgressIndicator(modifier = Modifier.padding(end = 12.dp))
-                    Text(stringResource(R.string.ui_checking_the_relay_before_saving))
+                    Text(stringResource(R.string.ui_checking_this_setup_before_saving))
                 }
                 is PassSetupState.Failed -> Text(
                     state.message,
@@ -357,7 +359,9 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                             val card = makeRelaySetupCard(customUrl, customToken)
                             parseRelaySetupText(card)
                         }.onSuccess(::testAndSave).onFailure {
-                            setupState = PassSetupState.Failed("Enter a complete HTTPS relay URL and token.")
+                            setupState = PassSetupState.Failed(
+                                context.getString(R.string.ui_enter_a_complete_https_relay_url_and_token),
+                            )
                         }
                     },
                     enabled = customUrl.isNotBlank() && customToken.isNotBlank(),
@@ -375,7 +379,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                 Column {
                     val current = configured
                     if (current == null) {
-                        Text(stringResource(R.string.ui_relay_pass, relayHost(setup.relayUrl)))
+                        Text(stringResource(R.string.ui_host_pass, relayHost(setup.relayUrl)))
                     } else {
                         Text(
                             stringResource(
