@@ -252,6 +252,14 @@ pub const FAMILY_EXPIRY_GRACE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// token the admin API accepts is guaranteed to fit in a friend card.
 pub const MAX_FAMILY_TOKEN_LEN: usize = 1024;
 
+/// Page size for `GET /admin/families` when the caller doesn't ask for one.
+pub const DEFAULT_FAMILY_LIST_LIMIT: usize = 100;
+
+/// Ceiling on `GET /admin/families?limit=`. A larger request is clamped to
+/// this rather than rejected — the response carries `total`, so a caller that
+/// wanted everything can see it got a partial page and ask for the rest.
+pub const MAX_FAMILY_LIST_LIMIT: usize = 500;
+
 /// FR4: build-time version identifiers, embedded via Cargo (`VERSION`) and
 /// `build.rs` (`GIT_SHA`) so `/healthz` and the startup log always reflect
 /// the exact commit running -- there was previously no way to ask a
@@ -814,6 +822,22 @@ pub struct FamilyRow {
     pub note: Option<String>,
 }
 
+/// A family plus its stored-usage figures, as returned by `list_families`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FamilyUsage {
+    pub family: FamilyRow,
+    pub usage_bytes: u64,
+    pub envelope_count: u64,
+}
+
+/// One page of `list_families` output. `total` is the match count across the
+/// whole table, so the caller knows whether to ask for another page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FamilyPage {
+    pub families: Vec<FamilyUsage>,
+    pub total: u64,
+}
+
 impl RelayStore {
     pub fn open(path: &str) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
@@ -1326,6 +1350,71 @@ impl RelayStore {
         get_family_on(&conn, token)
     }
 
+    /// One page of families, newest-provisioned last, each with the usage
+    /// figures `get_family`'s handler reports.
+    ///
+    /// The usage columns are computed in the same statement rather than by
+    /// calling `family_sealed_bytes` / `count_for_family` per row: a page of
+    /// 500 families would otherwise be 1001 separate queries, each retaking
+    /// the store mutex. The aggregate must stay byte-identical to those two
+    /// helpers (no expiry predicate — they count every stored row, expired
+    /// or not) or the same family would report different usage depending on
+    /// whether you listed it or fetched it.
+    ///
+    /// `total` counts every family matching `status_filter`, not just this
+    /// page, so a caller can tell a full page from the end of the list.
+    pub fn list_families(
+        &self,
+        status_filter: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<FamilyPage, String> {
+        let conn = self.conn.lock().expect("relay store mutex poisoned");
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM families WHERE (?1 IS NULL OR status = ?1)",
+                params![status_filter],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.token, f.status, f.plan, f.quota_bytes, f.created_ms,
+                        f.expires_ms, f.note,
+                        COALESCE(SUM(LENGTH(e.sealed)), 0), COUNT(e.id)
+                 FROM families f
+                 LEFT JOIN envelopes e ON e.family_token = f.token
+                 WHERE (?1 IS NULL OR f.status = ?1)
+                 GROUP BY f.token
+                 ORDER BY f.created_ms ASC, f.token ASC
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(|e| e.to_string())?;
+        let families = stmt
+            .query_map(params![status_filter, limit as i64, offset as i64], |row| {
+                Ok(FamilyUsage {
+                    family: FamilyRow {
+                        token: row.get(0)?,
+                        status: row.get(1)?,
+                        plan: row.get(2)?,
+                        quota_bytes: row.get::<_, Option<i64>>(3)?.map(|q| q as u64),
+                        created_ms: row.get(4)?,
+                        expires_ms: row.get(5)?,
+                        note: row.get(6)?,
+                    },
+                    usage_bytes: row.get::<_, i64>(7)? as u64,
+                    envelope_count: row.get::<_, i64>(8)? as u64,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(FamilyPage {
+            families,
+            total: total as u64,
+        })
+    }
+
     /// Partial update: `Some` fields are applied, `None` fields keep their
     /// stored value (no way to clear a field — re-provision for that).
     /// Returns the updated row, or `None` if the family does not exist.
@@ -1569,7 +1658,10 @@ pub fn app(state: AppState) -> Router {
         .route("/envelopes", post(post_envelope).get(get_envelopes))
         .route("/envelopes/ack", post(ack_envelopes))
         .route("/presence", post(sync_presence))
-        .route("/admin/families", post(admin_provision_family))
+        .route(
+            "/admin/families",
+            post(admin_provision_family).get(admin_list_families),
+        )
         .route(
             "/admin/families/{token}",
             get(admin_get_family)
@@ -2031,16 +2123,16 @@ struct FamilyResponse {
     envelope_count: u64,
 }
 
-fn family_response(state: &AppState, row: FamilyRow) -> Result<FamilyResponse, ApiError> {
-    let usage_bytes = state
-        .store
-        .family_sealed_bytes(&row.token)
-        .map_err(ApiError::internal)?;
-    let envelope_count = state
-        .store
-        .count_for_family(&row.token)
-        .map_err(ApiError::internal)?;
-    Ok(FamilyResponse {
+/// Shape one family for the wire. Split from `family_response` so the list
+/// endpoint, which already has the usage figures from its aggregate query,
+/// produces byte-identical JSON without re-querying per row.
+fn family_response_with_usage(
+    state: &AppState,
+    row: FamilyRow,
+    usage_bytes: u64,
+    envelope_count: u64,
+) -> FamilyResponse {
+    FamilyResponse {
         effective_quota_bytes: row.quota_bytes.unwrap_or(state.family_quota_bytes),
         token: row.token,
         status: row.status,
@@ -2051,7 +2143,24 @@ fn family_response(state: &AppState, row: FamilyRow) -> Result<FamilyResponse, A
         note: row.note,
         usage_bytes,
         envelope_count,
-    })
+    }
+}
+
+fn family_response(state: &AppState, row: FamilyRow) -> Result<FamilyResponse, ApiError> {
+    let usage_bytes = state
+        .store
+        .family_sealed_bytes(&row.token)
+        .map_err(ApiError::internal)?;
+    let envelope_count = state
+        .store
+        .count_for_family(&row.token)
+        .map_err(ApiError::internal)?;
+    Ok(family_response_with_usage(
+        state,
+        row,
+        usage_bytes,
+        envelope_count,
+    ))
 }
 
 fn validate_quota_bytes(quota_bytes: Option<u64>) -> Result<(), ApiError> {
@@ -2106,6 +2215,81 @@ async fn admin_provision_family(
         "family provisioned"
     );
     Ok(Json(family_response(&state, row)?))
+}
+
+/// Every field is `Option<String>` and parsed by hand below, deliberately:
+/// a typed `Option<usize>` would make axum's `Query` extractor reject
+/// `?limit=abc` with a 400 *before* the handler runs `authorize_admin`,
+/// which would tell an unauthenticated prober that the route exists on a
+/// deploy whose admin API is off (those must always answer 404).
+#[derive(Deserialize)]
+struct ListFamiliesQuery {
+    status: Option<String>,
+    limit: Option<String>,
+    offset: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FamilyListResponse {
+    families: Vec<FamilyResponse>,
+    /// Families matching `status` across the whole table, not just this page.
+    total: u64,
+    limit: usize,
+    offset: usize,
+}
+
+fn parse_list_bound(raw: Option<&String>, field: &str) -> Result<Option<usize>, ApiError> {
+    let Some(raw) = raw else { return Ok(None) };
+    raw.parse::<usize>()
+        .map(Some)
+        .map_err(|_| ApiError::bad_request(format!("{field} must be a non-negative integer")))
+}
+
+async fn admin_list_families(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListFamiliesQuery>,
+) -> Result<Json<FamilyListResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    if let Some(status) = query.status.as_deref() {
+        if status != "active" && status != "suspended" {
+            return Err(ApiError::bad_request(
+                "status must be \"active\" or \"suspended\"".to_string(),
+            ));
+        }
+    }
+    // Clamped, not rejected — see MAX_FAMILY_LIST_LIMIT.
+    let limit = parse_list_bound(query.limit.as_ref(), "limit")?
+        .unwrap_or(DEFAULT_FAMILY_LIST_LIMIT)
+        .clamp(1, MAX_FAMILY_LIST_LIMIT);
+    let offset = parse_list_bound(query.offset.as_ref(), "offset")?.unwrap_or(0);
+    let status = query.status.clone();
+    let page = state
+        .store
+        .run_blocking(move |store| store.list_families(status.as_deref(), limit, offset))
+        .await
+        .map_err(ApiError::internal)?;
+    let families = page
+        .families
+        .into_iter()
+        // Full tokens, same as GET /admin/families/{token} — the caller is
+        // already holding the admin credential and needs them to re-issue a
+        // setup link. Mask at the display layer, not here.
+        .map(|entry| {
+            family_response_with_usage(
+                &state,
+                entry.family,
+                entry.usage_bytes,
+                entry.envelope_count,
+            )
+        })
+        .collect();
+    Ok(Json(FamilyListResponse {
+        families,
+        total: page.total,
+        limit,
+        offset,
+    }))
 }
 
 async fn admin_get_family(
@@ -3166,6 +3350,172 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+    }
+
+    /// Provision `token` on `app`, asserting it took.
+    async fn provision(app: &Router, token: &str, extra: serde_json::Value) {
+        let mut body = serde_json::json!({ "token": token });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        let response = app
+            .clone()
+            .oneshot(admin_json("POST", "/admin/families", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "provisioning {token}");
+    }
+
+    async fn list_families(app: &Router, query: &str) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(admin_bare("GET", &format!("/admin/families{query}")))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "GET /admin/families{query}"
+        );
+        body_json(response).await
+    }
+
+    #[tokio::test]
+    async fn admin_list_families_reports_usage_and_pages() {
+        let app = admin_app();
+        provision(
+            &app,
+            "fam-a",
+            serde_json::json!({"plan": "cruise-pass-30d"}),
+        )
+        .await;
+        provision(&app, "fam-b", serde_json::json!({})).await;
+        provision(&app, "fam-c", serde_json::json!({})).await;
+        for msg_byte in [1u8, 2] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(envelope_request("fam-a", msg_byte, 48))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+
+        let page = list_families(&app, "").await;
+        assert_eq!(page["total"], 3);
+        assert_eq!(page["limit"], DEFAULT_FAMILY_LIST_LIMIT);
+        assert_eq!(page["offset"], 0);
+        let families = page["families"].as_array().unwrap();
+        // The static env token ("family-a") is an implicit family, not a row
+        // in the table — it must not show up here.
+        assert_eq!(
+            families
+                .iter()
+                .map(|f| f["token"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["fam-a", "fam-b", "fam-c"]
+        );
+        assert_eq!(families[0]["usage_bytes"], 96);
+        assert_eq!(families[0]["envelope_count"], 2);
+        assert_eq!(families[0]["plan"], "cruise-pass-30d");
+        assert_eq!(families[1]["usage_bytes"], 0);
+        assert_eq!(families[1]["envelope_count"], 0);
+
+        // The aggregate in list_families must not drift from the per-row
+        // helpers behind GET /admin/families/{token}.
+        let response = app
+            .clone()
+            .oneshot(admin_bare("GET", "/admin/families/fam-a"))
+            .await
+            .unwrap();
+        assert_eq!(families[0], body_json(response).await);
+
+        let page = list_families(&app, "?limit=2").await;
+        assert_eq!(page["total"], 3, "total counts matches, not the page");
+        assert_eq!(page["families"].as_array().unwrap().len(), 2);
+        let page = list_families(&app, "?limit=2&offset=2").await;
+        assert_eq!(page["families"][0]["token"], "fam-c");
+        assert_eq!(page["families"].as_array().unwrap().len(), 1);
+        let page = list_families(&app, "?offset=99").await;
+        assert_eq!(page["total"], 3);
+        assert!(page["families"].as_array().unwrap().is_empty());
+
+        // Over-large limits clamp instead of failing; total still tells the
+        // caller how much is really there.
+        let page = list_families(&app, "?limit=100000").await;
+        assert_eq!(page["limit"], MAX_FAMILY_LIST_LIMIT);
+        assert_eq!(page["families"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn admin_list_families_filters_by_status() {
+        let app = admin_app();
+        provision(&app, "fam-a", serde_json::json!({})).await;
+        provision(&app, "fam-b", serde_json::json!({})).await;
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PATCH",
+                "/admin/families/fam-b",
+                serde_json::json!({"status": "suspended"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let page = list_families(&app, "?status=active").await;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["families"][0]["token"], "fam-a");
+        let page = list_families(&app, "?status=suspended").await;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["families"][0]["token"], "fam-b");
+        assert_eq!(list_families(&app, "").await["total"], 2);
+    }
+
+    #[tokio::test]
+    async fn admin_list_families_rejects_bad_query() {
+        let app = admin_app();
+        for query in ["?status=deleted", "?limit=abc", "?limit=-1", "?offset=x"] {
+            let response = app
+                .clone()
+                .oneshot(admin_bare("GET", &format!("/admin/families{query}")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_list_hidden_without_admin_token_even_when_malformed() {
+        // A malformed query must not out the route's existence on a deploy
+        // with the admin API off: authorize_admin has to run first, so every
+        // list query param is parsed by hand rather than by the extractor.
+        let app = test_app();
+        for query in ["", "?limit=abc", "?status=deleted"] {
+            let request = Request::builder()
+                .uri(format!("/admin/families{query}"))
+                .header("authorization", "Bearer anything")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND,
+                "{query}"
+            );
+        }
+        // Same for a wrong admin token on a deploy that does have one: 401,
+        // never a 400 that confirms the query shape.
+        let app = admin_app();
+        let request = Request::builder()
+            .uri("/admin/families?limit=abc")
+            .header("authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
         );
     }
 

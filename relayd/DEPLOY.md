@@ -432,6 +432,10 @@ curl -s -X POST https://relay.example.com/admin/families \
   -H "authorization: Bearer $ADMIN" -H "content-type: application/json" \
   -d '{"token":"<family-token>","plan":"cruise-pass-30d","expires_ms":1790000000000}'
 
+# List (paged; the only way to find a family whose token you've lost)
+curl -s "https://relay.example.com/admin/families?status=active&limit=50&offset=0" \
+  -H "authorization: Bearer $ADMIN"
+
 # Inspect (includes usage_bytes / envelope_count for support)
 curl -s https://relay.example.com/admin/families/<family-token> -H "authorization: Bearer $ADMIN"
 
@@ -446,6 +450,19 @@ curl -s -X DELETE https://relay.example.com/admin/families/<family-token> -H "au
 
 PATCH is merge-only (`null`/omitted fields keep their stored value); to clear
 a field, re-provision via POST.
+
+`GET /admin/families` returns
+`{"families":[...],"total":N,"limit":L,"offset":O}`, each entry shaped exactly
+like the single-family GET. `total` counts every family matching `status`
+(not just the returned page), so compare it against `offset + families.length`
+to know whether to page again. `limit` defaults to 100 and is **clamped** to
+500 rather than rejected. `status` accepts only `active` or `suspended`; a
+typo is a 400, never a silently empty list. Static `CRUISEMESH_RELAY_TOKENS`
+entries are implicit families with no table row and do not appear.
+
+Responses carry **full family tokens** — they are the credential. Prefer
+`tools/relay_admin.sh list`, which masks them for display; pipe raw curl
+output somewhere you would put a password.
 
 ## 13. Not in this deploy yet
 
