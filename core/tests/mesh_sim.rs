@@ -19,6 +19,9 @@
 //!     matches the peer, handing each over and dropping it once delivered;
 //!     then spray the remaining carried envelopes onward to a non-recipient
 //!     mule, excluding any `msg_id`s that mule's digest says it already knows.
+//!   * relay: group-addressed uploads fan out into one row per member hint;
+//!     each node polls its own hints, runs the same group-open candidate rule
+//!     as the shells, and only acks rows it consumed.
 //!
 //! Because that orchestration currently lives in Kotlin, this file
 //! re-implements it in `SimNode::receive` / `Network::meet`. That validates
@@ -31,9 +34,10 @@
 use std::collections::VecDeque;
 
 use cruisemesh_core::{
-    compute_recipient_hint, default_expiry, encode_envelope_frame, generate_identity,
-    generate_msg_id, open_group_message, open_message, parse_frame, seal_group_message,
-    seal_message, CarriedEnvelope, Frame, Group, Identity, MessageStore, SeenIds, DEFAULT_HOP_TTL,
+    compute_recipient_hint, core_group_fanout_rows, default_expiry, encode_envelope_frame,
+    generate_identity, generate_msg_id, open_group_message, open_message, parse_frame,
+    seal_group_message, seal_message, CarriedEnvelope, CoreGroupFanoutRow, CoreInboundDisposition,
+    CoreRelayEnvelopeDisposition, Frame, Group, Identity, MessageStore, SeenIds, DEFAULT_HOP_TTL,
 };
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
@@ -162,6 +166,68 @@ impl SimNode {
         }
     }
 
+    /// Relay-source counterpart to [`Self::receive`]. A fetched row is not a
+    /// live-link flood: if it opens under one of this member's group keys it
+    /// is consumed without gossip re-injection; otherwise it is durably
+    /// carried and must stay unacked in the relay mailbox.
+    fn receive_from_relay(&mut self, envelope: &RelayEnvelope, now: i64) -> CoreInboundDisposition {
+        if self.seen.contains(envelope.msg_id.clone()) {
+            return CoreInboundDisposition::Seen;
+        }
+        if envelope.expiry <= now {
+            self.seen.record(envelope.msg_id.clone());
+            return CoreInboundDisposition::Expired;
+        }
+
+        if let Ok(opened) = open_message(self.identity.clone(), envelope.sealed.clone()) {
+            self.inbox.push(opened.payload);
+            self.seen.record(envelope.msg_id.clone());
+            return CoreInboundDisposition::Consumed;
+        }
+
+        let candidates = self
+            .store
+            .group_open_candidates(envelope.recipient_hint.clone(), self.user_id(), now)
+            .expect("group open candidates");
+        for group in candidates {
+            if !group
+                .member_user_ids
+                .iter()
+                .any(|member| member == &self.identity.user_id)
+            {
+                continue;
+            }
+            let Ok(opened) = open_group_message(group.clone(), envelope.sealed.clone()) else {
+                continue;
+            };
+            if !group
+                .member_user_ids
+                .iter()
+                .any(|member| member == &opened.sender_user_id)
+            {
+                continue;
+            }
+            self.inbox.push(opened.payload);
+            self.seen.record(envelope.msg_id.clone());
+            return CoreInboundDisposition::Consumed;
+        }
+
+        self.store
+            .enqueue_relay_carried_envelope(
+                CarriedEnvelope {
+                    msg_id: envelope.msg_id.clone(),
+                    hop_ttl: envelope.hop_ttl,
+                    expiry: envelope.expiry,
+                    recipient_hint: envelope.recipient_hint.clone(),
+                    sealed: envelope.sealed.clone(),
+                },
+                now,
+            )
+            .expect("enqueue relay-carried envelope");
+        self.seen.record(envelope.msg_id.clone());
+        CoreInboundDisposition::Carried
+    }
+
     fn try_open_group_message(
         &self,
         recipient_hint: &[u8],
@@ -223,6 +289,112 @@ fn recent_hints(user_id: &[u8], now: i64) -> Vec<Vec<u8>> {
     (0..=7)
         .map(|days_ago| compute_recipient_hint(user_id.to_vec(), now - days_ago * MS_PER_DAY))
         .collect()
+}
+
+/// One server mailbox row. The relay is intentionally content-blind: it
+/// stores the public envelope header plus sealed bytes and routes only by
+/// recipient hint.
+#[derive(Clone)]
+struct RelayEnvelope {
+    id: i64,
+    msg_id: Vec<u8>,
+    hop_ttl: u8,
+    expiry: i64,
+    recipient_hint: Vec<u8>,
+    sealed: Vec<u8>,
+}
+
+impl RelayEnvelope {
+    fn from_fanout_row(id: i64, row: CoreGroupFanoutRow) -> Self {
+        Self {
+            id,
+            msg_id: row.msg_id,
+            hop_ttl: row.hop_ttl,
+            expiry: row.expiry,
+            recipient_hint: row.recipient_hint,
+            sealed: row.sealed,
+        }
+    }
+}
+
+/// Minimal in-memory relay actor for client-side integration coverage. It
+/// models the pieces `mesh_sim` previously skipped: deterministic group
+/// fan-out upload, hint-scoped fetch, disposition-driven ack, and server-side
+/// dedupe by `msg_id`.
+struct RelayActor {
+    rows: Vec<RelayEnvelope>,
+    next_id: i64,
+}
+
+impl RelayActor {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            next_id: 1,
+        }
+    }
+
+    fn post_group(
+        &mut self,
+        original_msg_id: Vec<u8>,
+        group: &Group,
+        hop_ttl: u8,
+        expiry: i64,
+        sealed: Vec<u8>,
+        authored_at: i64,
+    ) {
+        for row in core_group_fanout_rows(
+            original_msg_id,
+            group.member_user_ids.clone(),
+            hop_ttl,
+            expiry,
+            sealed,
+            authored_at,
+        ) {
+            if self
+                .rows
+                .iter()
+                .any(|existing| existing.msg_id == row.msg_id)
+            {
+                continue;
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            self.rows.push(RelayEnvelope::from_fanout_row(id, row));
+        }
+    }
+
+    fn poll(&mut self, node: &mut SimNode, now: i64) -> Vec<CoreInboundDisposition> {
+        let fetch_hints = recent_hints(&node.user_id(), now);
+        let fetched: Vec<RelayEnvelope> = self
+            .rows
+            .iter()
+            .filter(|row| fetch_hints.contains(&row.recipient_hint))
+            .cloned()
+            .collect();
+        let mut dispositions = Vec::with_capacity(fetched.len());
+        let mut ack_inputs = Vec::with_capacity(fetched.len());
+        for envelope in fetched {
+            let disposition = node.receive_from_relay(&envelope, now);
+            dispositions.push(disposition);
+            ack_inputs.push(CoreRelayEnvelopeDisposition {
+                relay_id: envelope.id,
+                msg_id: envelope.msg_id,
+                disposition,
+                recipient_hint: envelope.recipient_hint,
+            });
+        }
+        let ack_ids = node
+            .store
+            .core_relay_ack_ids_with_consumed(ack_inputs, node.user_id(), now)
+            .expect("select safe relay acknowledgements");
+        self.rows.retain(|row| !ack_ids.contains(&row.id));
+        dispositions
+    }
+
+    fn pending_len(&self) -> usize {
+        self.rows.len()
+    }
 }
 
 /// A collection of nodes plus the current round's adjacency (which nodes are
@@ -303,6 +475,31 @@ impl Network {
             sealed,
         );
         self.flood_from(from, frame, now);
+    }
+
+    fn author_group_to_relay(
+        &self,
+        relay: &mut RelayActor,
+        from: usize,
+        group: &Group,
+        payload: &[u8],
+        hop_ttl: u8,
+        now: i64,
+    ) {
+        let sealed = seal_group_message(
+            self.nodes[from].identity.clone(),
+            group.clone(),
+            payload.to_vec(),
+        )
+        .expect("group seal");
+        relay.post_group(
+            generate_msg_id(),
+            group,
+            hop_ttl,
+            default_expiry(now),
+            sealed,
+            now,
+        );
     }
 
     /// Deliver `frame` to every neighbor of `origin`, cascading relays through
@@ -668,5 +865,60 @@ fn group_message_floods_and_mules_to_every_other_member_with_dedupe() {
         net.openers_of(msg),
         vec![1, 2, 3],
         "all other group members opened it once"
+    );
+}
+
+#[test]
+fn group_relay_fanout_opens_on_every_member_and_each_copy_is_acked() {
+    let mut net = Network::new(3);
+    let group = Group {
+        id: vec![0x66; 16],
+        name: "Family".to_string(),
+        member_user_ids: net.nodes.iter().map(SimNode::user_id).collect(),
+        key: vec![0x77; 32],
+        metadata_revision: 0,
+        metadata_changed_by: Vec::new(),
+    };
+    for node in &net.nodes {
+        node.import_group(group.clone());
+    }
+    let mut relay = RelayActor::new();
+    let msg = b"meet at the theater after dinner";
+
+    net.author_group_to_relay(&mut relay, 0, &group, msg, DEFAULT_HOP_TTL, BASE_NOW);
+    assert_eq!(
+        relay.pending_len(),
+        group.member_user_ids.len(),
+        "relay stores one independently ackable row per member"
+    );
+
+    for node in &net.nodes {
+        let own_hint = compute_recipient_hint(node.user_id(), BASE_NOW);
+        assert!(
+            node.store
+                .groups_matching_hint(own_hint, BASE_NOW)
+                .expect("legacy hint-only candidates")
+                .is_empty(),
+            "fan-out is addressed to the member hint, never the group hint"
+        );
+    }
+
+    for node in &mut net.nodes {
+        assert_eq!(
+            relay.poll(node, BASE_NOW),
+            vec![CoreInboundDisposition::Consumed],
+            "the member opens its fan-out copy instead of carrying it"
+        );
+    }
+
+    assert_eq!(
+        net.openers_of(msg),
+        vec![0, 1, 2],
+        "every group member receives the relay-only message"
+    );
+    assert_eq!(
+        relay.pending_len(),
+        0,
+        "each per-member row is removed only after its member consumes it"
     );
 }
