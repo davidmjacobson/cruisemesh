@@ -219,7 +219,7 @@ fun MeshStatusLegendDialog(
         },
         confirmButton = {
             Row {
-                TextButton(onClick = onConnectionDetails) { Text("Connection details") }
+                TextButton(onClick = onConnectionDetails) { Text(stringResource(R.string.ui_connection_details)) }
                 if (canStartMesh) {
                 Button(
                     onClick = {
@@ -234,7 +234,7 @@ fun MeshStatusLegendDialog(
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text(if (canStartMesh) stringResource(R.string.ui_cancel) else stringResource(R.string.ui_done))
+                Text(stringResource(if (canStartMesh) R.string.ui_cancel else R.string.ui_done))
             }
         },
     )

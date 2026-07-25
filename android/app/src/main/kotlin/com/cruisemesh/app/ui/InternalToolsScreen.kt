@@ -81,7 +81,7 @@ fun InternalToolsScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Internal tools") },
+                title = { Text(stringResource(R.string.ui_internal_tools)) },
                 navigationIcon = {
                     IconButton(onClick = ::saveAndBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -126,7 +126,7 @@ fun InternalToolsScreen(onBack: () -> Unit) {
             }
 
             Spacer(modifier = Modifier.height(28.dp))
-            Text("Local Wi-Fi field tools", style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.ui_local_wi_fi_field_tools), style = MaterialTheme.typography.titleMedium)
             Text(lanStatus.state, modifier = Modifier.padding(top = 8.dp))
             lanStatus.localEndpoint?.let { endpoint ->
                 Text(

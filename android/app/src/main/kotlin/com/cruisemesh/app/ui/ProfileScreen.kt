@@ -111,7 +111,7 @@ fun ProfileScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Profile") },
+                title = { Text(stringResource(R.string.ui_profile)) },
                 navigationIcon = {
                     IconButton(onClick = ::leaveScreen) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")

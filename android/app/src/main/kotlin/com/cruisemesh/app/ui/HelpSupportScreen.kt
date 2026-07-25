@@ -22,7 +22,9 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import com.cruisemesh.app.R
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -35,7 +37,7 @@ fun HelpSupportScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Help & support") },
+                title = { Text(stringResource(R.string.ui_help_support)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -67,7 +69,7 @@ fun HelpSupportScreen(
                 onCruisePass,
             )
             Text(
-                "Never post a Cruise Pass setup card or relay token publicly.",
+                stringResource(R.string.ui_never_post_a_cruise_pass_setup_card_or),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(vertical = 16.dp),
@@ -77,7 +79,7 @@ fun HelpSupportScreen(
                     context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(SUPPORT_URL)))
                 },
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("Open CruiseMesh support") }
+            ) { Text(stringResource(R.string.ui_open_cruisemesh_support)) }
         }
     }
 }

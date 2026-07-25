@@ -33,8 +33,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.AppStore
+import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.debug.FieldMetricsExport
@@ -72,7 +74,7 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Connection details") },
+                title = { Text(stringResource(R.string.ui_connection_details)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -100,7 +102,7 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                 DetailLine("Local Wi-Fi", if (localWifiCount == 0) "No active links" else "$localWifiCount active")
                 DetailLine("Cruise Pass", relayLabel(relay, relayConfigured))
                 Text(
-                    "CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Cruise Pass.",
+                    stringResource(R.string.ui_cruisemesh_chooses_the_best_available_path_automatically_a),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 10.dp),
@@ -110,7 +112,7 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
             Spacer(modifier = Modifier.height(18.dp))
             DetailCard("People") {
                 if (contacts.isEmpty()) {
-                    Text("No friends added yet.")
+                    Text(stringResource(R.string.ui_no_friends_added_yet))
                 } else {
                     for (contact in contacts) {
                         val hex = UserIdHex.encode(contact.userId)
@@ -136,7 +138,7 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
             Spacer(modifier = Modifier.height(18.dp))
             DetailCard("Recent activity") {
                 if (events.isEmpty()) {
-                    Text("Connection activity will appear here as CruiseMesh reaches your friends.")
+                    Text(stringResource(R.string.ui_connection_activity_will_appear_here_as_cruisemesh_reaches))
                 } else {
                     events.forEach { event ->
                         Text(
@@ -157,7 +159,7 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                         } ?: run { supportMessage = "No diagnostics captured this session yet." }
                     },
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Share diagnostics") }
+                ) { Text(stringResource(R.string.ui_share_diagnostics)) }
                 OutlinedButton(
                     onClick = {
                         FieldMetricsExport.shareIntent(context)?.let {
@@ -165,19 +167,19 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                         } ?: run { supportMessage = "No field metrics captured yet." }
                     },
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                ) { Text("Export field metrics") }
+                ) { Text(stringResource(R.string.ui_export_field_metrics)) }
                 OutlinedButton(
                     onClick = { showClear = true },
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                ) { Text("Clear connection history") }
+                ) { Text(stringResource(R.string.ui_clear_connection_history)) }
                 Text(
-                    "History contains only friend identity, path type, event type, and time. It never stores message content, relay tokens, IP addresses, or Wi-Fi names.",
+                    stringResource(R.string.ui_history_contains_only_friend_identity_path_type_event),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 8.dp),
                 )
                 Text(
-                    "Field metrics contain hashed chat tags, route types, and delivery timings—never message content or contact names.",
+                    stringResource(R.string.ui_field_metrics_contain_hashed_chat_tags_route_types),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp),
@@ -197,8 +199,8 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
     if (showClear) {
         AlertDialog(
             onDismissRequest = { showClear = false },
-            title = { Text("Clear connection history?") },
-            text = { Text("This removes local connection events and per-person path summaries. Messages and friends are not affected.") },
+            title = { Text(stringResource(R.string.ui_clear_connection_history_confirm)) },
+            text = { Text(stringResource(R.string.ui_this_removes_local_connection_events_and_per_person)) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -206,9 +208,9 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                         revision += 1
                         showClear = false
                     },
-                ) { Text("Clear") }
+                ) { Text(stringResource(R.string.ui_clear)) }
             },
-            dismissButton = { TextButton(onClick = { showClear = false }) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = { showClear = false }) { Text(stringResource(R.string.ui_cancel)) } },
         )
     }
 }

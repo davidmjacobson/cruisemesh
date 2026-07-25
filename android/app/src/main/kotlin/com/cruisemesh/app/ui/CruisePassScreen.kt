@@ -44,8 +44,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.cruisemesh.app.R
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.mesh.RelaySyncEvents
@@ -145,7 +147,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Cruise Pass") },
+                title = { Text(stringResource(R.string.ui_cruise_pass)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -163,37 +165,47 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
         ) {
             when (val state = setupState) {
                 is PassSetupState.Saved -> {
-                    Text("Cruise Pass is ready", style = MaterialTheme.typography.headlineSmall)
+                    Text(stringResource(R.string.ui_cruise_pass_is_ready), style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        "This phone can now use ${relayHost(state.relayUrl)} whenever it has internet.",
+                        stringResource(
+                            R.string.ui_this_phone_can_now_use_whenever_it_has,
+                            relayHost(state.relayUrl),
+                        ),
                         modifier = Modifier.padding(top = 8.dp),
                     )
                 }
                 is PassSetupState.Checking -> {
-                    Text("Cruise Pass setup saved", style = MaterialTheme.typography.headlineSmall)
+                    Text(stringResource(R.string.ui_cruise_pass_setup_saved), style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        "CruiseMesh will verify ${relayHost(state.relayUrl)} when this phone is online. It will not show Ready until that check succeeds.",
+                        stringResource(
+                            R.string.ui_cruisemesh_will_verify_when_this_phone_is_online,
+                            relayHost(state.relayUrl),
+                        ),
                         modifier = Modifier.padding(top = 8.dp),
                     )
                 }
                 else -> {
                     Text(
-                        if (configured == null) "Set up your Cruise Pass" else "Cruise Pass is configured",
+                        stringResource(
+                            if (configured == null) R.string.ui_set_up_your_cruise_pass
+                            else R.string.ui_cruise_pass_is_configured,
+                        ),
                         style = MaterialTheme.typography.headlineSmall,
                     )
+                    val configuredSummary = if (configured == null) {
+                        stringResource(R.string.ui_open_the_setup_link_from_your_purchase_email)
+                    } else {
+                        stringResource(R.string.ui_saved_for, relayHost(configured!!.relayUrl))
+                    }
                     Text(
-                        if (configured == null) {
-                            "Open the setup link from your purchase email. If it did not open here, paste the relay card below."
-                        } else {
-                            "Saved for ${relayHost(configured!!.relayUrl)}. You can replace it with a new setup card at any time."
-                        },
+                        configuredSummary,
                         modifier = Modifier.padding(top = 8.dp),
                     )
                 }
             }
             if (configured != null) {
                 Text(
-                    "Status: ${passStatus(relayHealth, setupState)}",
+                    stringResource(R.string.ui_status, passStatus(relayHealth, setupState)),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 8.dp),
@@ -203,8 +215,8 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
             OutlinedTextField(
                 value = input,
                 onValueChange = { input = it },
-                label = { Text("Relay card") },
-                placeholder = { Text("CMRELAY1:…") },
+                label = { Text(stringResource(R.string.ui_relay_card)) },
+                placeholder = { Text(stringResource(R.string.ui_cmrelay1)) },
                 minLines = 3,
                 modifier = Modifier.fillMaxWidth().padding(top = 20.dp),
             )
@@ -216,13 +228,13 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                         if (input.isNotBlank()) review(input)
                     },
                     modifier = Modifier.weight(1f),
-                ) { Text("Paste card") }
+                ) { Text(stringResource(R.string.ui_paste_card)) }
                 Spacer(modifier = Modifier.padding(4.dp))
                 Button(
                     onClick = { review(input) },
                     enabled = input.isNotBlank(),
                     modifier = Modifier.weight(1f),
-                ) { Text("Review") }
+                ) { Text(stringResource(R.string.ui_review)) }
             }
             parseError?.let {
                 Text(
@@ -238,7 +250,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                     modifier = Modifier.padding(top = 16.dp),
                 ) {
                     CircularProgressIndicator(modifier = Modifier.padding(end = 12.dp))
-                    Text("Checking the relay before saving…")
+                    Text(stringResource(R.string.ui_checking_the_relay_before_saving))
                 }
                 is PassSetupState.Failed -> Text(
                     state.message,
@@ -258,7 +270,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                         setupState = PassSetupState.Checking(setup.relayUrl)
                     },
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                ) { Text("Save and check later") }
+                ) { Text(stringResource(R.string.ui_save_and_check_later)) }
             }
 
             if (configured != null || setupState is PassSetupState.Saved) {
@@ -279,7 +291,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                         )
                     },
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Set up another phone") }
+                ) { Text(stringResource(R.string.ui_set_up_another_phone)) }
                 OutlinedButton(
                     onClick = {
                         val current = configured ?: return@OutlinedButton
@@ -287,19 +299,19 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                         setupQrLink = "https://cruisemesh.app/r#$card"
                     },
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                ) { Text("Show setup QR") }
+                ) { Text(stringResource(R.string.ui_show_setup_qr)) }
                 TextButton(
                     onClick = { showRemoveConfirmation = true },
                     modifier = Modifier.fillMaxWidth(),
-                ) { Text("Remove Cruise Pass setup") }
+                ) { Text(stringResource(R.string.ui_remove_cruise_pass_setup)) }
                 Text(
-                    "Anyone with this link can use your household relay. Share it only with people in your group.",
+                    stringResource(R.string.ui_anyone_with_this_link_can_use_your_household),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp),
                 )
                 Text(
-                    "Each family phone needs this setup. A configured phone with internet can help move the family's queued messages; Cruise Pass does not share that phone's internet connection.",
+                    stringResource(R.string.ui_each_family_phone_needs_this_setup_a_configured),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp),
@@ -311,7 +323,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                 modifier = Modifier.fillMaxWidth().clickable { showCustom = !showCustom },
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("Custom relay", modifier = Modifier.weight(1f))
+                Text(stringResource(R.string.ui_custom_relay), modifier = Modifier.weight(1f))
                 Icon(
                     if (showCustom) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
                     contentDescription = null,
@@ -319,7 +331,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
             }
             if (showCustom) {
                 Text(
-                    "For self-hosted relays and development. Most people should use the setup card above.",
+                    stringResource(R.string.ui_for_self_hosted_relays_and_development_most_people),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp),
@@ -327,14 +339,14 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                 OutlinedTextField(
                     value = customUrl,
                     onValueChange = { customUrl = it },
-                    label = { Text("Relay URL") },
+                    label = { Text(stringResource(R.string.ui_relay_url)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 )
                 OutlinedTextField(
                     value = customToken,
                     onValueChange = { customToken = it },
-                    label = { Text("Relay token") },
+                    label = { Text(stringResource(R.string.ui_relay_token)) },
                     singleLine = true,
                     textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
@@ -350,7 +362,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                     },
                     enabled = customUrl.isNotBlank() && customToken.isNotBlank(),
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                ) { Text("Test and save") }
+                ) { Text(stringResource(R.string.ui_test_and_save)) }
             }
         }
     }
@@ -358,26 +370,32 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
     pending?.let { setup ->
         AlertDialog(
             onDismissRequest = { pending = null },
-            title = { Text("Use this Cruise Pass?") },
+            title = { Text(stringResource(R.string.ui_use_this_cruise_pass)) },
             text = {
                 Column {
                     val current = configured
                     if (current == null) {
-                        Text("Relay: ${relayHost(setup.relayUrl)}")
+                        Text(stringResource(R.string.ui_relay_pass, relayHost(setup.relayUrl)))
                     } else {
-                        Text("Replace ${relayHost(current.relayUrl)} with ${relayHost(setup.relayUrl)}?")
+                        Text(
+                            stringResource(
+                                R.string.ui_replace_with,
+                                relayHost(current.relayUrl),
+                                relayHost(setup.relayUrl),
+                            ),
+                        )
                     }
                     Text(
-                        "This will replace any relay currently saved on this phone. The household token stays hidden.",
+                        stringResource(R.string.ui_this_will_replace_any_relay_currently_saved_on),
                         modifier = Modifier.padding(top = 8.dp),
                     )
                 }
             },
             confirmButton = {
-                TextButton(onClick = { testAndSave(setup) }) { Text("Test and use") }
+                TextButton(onClick = { testAndSave(setup) }) { Text(stringResource(R.string.ui_test_and_use)) }
             },
             dismissButton = {
-                TextButton(onClick = { pending = null }) { Text("Cancel") }
+                TextButton(onClick = { pending = null }) { Text(stringResource(R.string.ui_cancel)) }
             },
         )
     }
@@ -386,7 +404,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
         val qr = remember(link) { encodeQrBitmap(link) }
         AlertDialog(
             onDismissRequest = { setupQrLink = null },
-            title = { Text("Set up another family phone") },
+            title = { Text(stringResource(R.string.ui_set_up_another_family_phone)) },
             text = {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Image(
@@ -395,14 +413,14 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Text(
-                        "Scan this with the other phone. It configures internet delivery; it does not add a contact.",
+                        stringResource(R.string.ui_scan_this_with_the_other_phone_it_configures),
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(top = 8.dp),
                     )
                 }
             },
             confirmButton = {
-                TextButton(onClick = { setupQrLink = null }) { Text("Done") }
+                TextButton(onClick = { setupQrLink = null }) { Text(stringResource(R.string.ui_done)) }
             },
         )
     }
@@ -410,8 +428,8 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
     if (showRemoveConfirmation) {
         AlertDialog(
             onDismissRequest = { showRemoveConfirmation = false },
-            title = { Text("Remove Cruise Pass setup?") },
-            text = { Text("Queued internet delivery will stop until another Cruise Pass or custom relay is set up. Nearby delivery still works.") },
+            title = { Text(stringResource(R.string.ui_remove_cruise_pass_setup_confirm)) },
+            text = { Text(stringResource(R.string.ui_queued_internet_delivery_will_stop_until_another_cruise)) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -424,10 +442,10 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                         customToken = ""
                         showRemoveConfirmation = false
                     },
-                ) { Text("Remove") }
+                ) { Text(stringResource(R.string.ui_remove)) }
             },
             dismissButton = {
-                TextButton(onClick = { showRemoveConfirmation = false }) { Text("Cancel") }
+                TextButton(onClick = { showRemoveConfirmation = false }) { Text(stringResource(R.string.ui_cancel)) }
             },
         )
     }

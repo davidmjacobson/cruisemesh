@@ -208,4 +208,64 @@
         <item quantity="one">Carrying %1$d message for others</item>
         <item quantity="other">Carrying %1$d messages for others</item>
     </plurals>
+    <!-- Shared navigation labels -->
+    <string name="ui_friends">Friends</string>
+    <string name="ui_connection_details">Connection details</string>
+    <string name="ui_settings">Settings</string>
+    <string name="ui_help_support">Help &amp; support</string>
+    <string name="ui_new_message">New message</string>
+    <string name="ui_profile">Profile</string>
+    <!-- Cruise Pass -->
+    <string name="ui_cruise_pass">Cruise Pass</string>
+    <string name="ui_cruise_pass_is_ready">Cruise Pass is ready</string>
+    <string name="ui_this_phone_can_now_use_whenever_it_has">This phone can now use %1$s whenever it has internet.</string>
+    <string name="ui_cruise_pass_setup_saved">Cruise Pass setup saved</string>
+    <string name="ui_cruisemesh_will_verify_when_this_phone_is_online">CruiseMesh will verify %1$s when this phone is online. It will not show Ready until that check succeeds.</string>
+    <string name="ui_set_up_your_cruise_pass">Set up your Cruise Pass</string>
+    <string name="ui_cruise_pass_is_configured">Cruise Pass is configured</string>
+    <string name="ui_open_the_setup_link_from_your_purchase_email">Open the setup link from your purchase email. If it did not open here, paste the relay card below.</string>
+    <string name="ui_saved_for">Saved for %1$s. You can replace it with a new setup card at any time.</string>
+    <string name="ui_status">Status: %1$s</string>
+    <string name="ui_relay_card">Relay card</string>
+    <string name="ui_cmrelay1">CMRELAY1:…</string>
+    <string name="ui_paste_card">Paste card</string>
+    <string name="ui_review">Review</string>
+    <string name="ui_checking_the_relay_before_saving">Checking the relay before saving…</string>
+    <string name="ui_save_and_check_later">Save and check later</string>
+    <string name="ui_set_up_another_phone">Set up another phone</string>
+    <string name="ui_show_setup_qr">Show setup QR</string>
+    <string name="ui_remove_cruise_pass_setup">Remove Cruise Pass setup</string>
+    <string name="ui_anyone_with_this_link_can_use_your_household">Anyone with this link can use your household relay. Share it only with people in your group.</string>
+    <string name="ui_each_family_phone_needs_this_setup_a_configured">Each family phone needs this setup. A configured phone with internet can help move the family\'s queued messages; Cruise Pass does not share that phone\'s internet connection.</string>
+    <string name="ui_custom_relay">Custom relay</string>
+    <string name="ui_for_self_hosted_relays_and_development_most_people">For self-hosted relays and development. Most people should use the setup card above.</string>
+    <string name="ui_relay_token">Relay token</string>
+    <string name="ui_test_and_save">Test and save</string>
+    <string name="ui_use_this_cruise_pass">Use this Cruise Pass?</string>
+    <string name="ui_relay_pass">Relay: %1$s</string>
+    <string name="ui_replace_with">Replace %1$s with %2$s?</string>
+    <string name="ui_this_will_replace_any_relay_currently_saved_on">This will replace any relay currently saved on this phone. The household token stays hidden.</string>
+    <string name="ui_test_and_use">Test and use</string>
+    <string name="ui_set_up_another_family_phone">Set up another family phone</string>
+    <string name="ui_scan_this_with_the_other_phone_it_configures">Scan this with the other phone. It configures internet delivery; it does not add a contact.</string>
+    <string name="ui_remove_cruise_pass_setup_confirm">Remove Cruise Pass setup?</string>
+    <string name="ui_queued_internet_delivery_will_stop_until_another_cruise">Queued internet delivery will stop until another Cruise Pass or custom relay is set up. Nearby delivery still works.</string>
+    <string name="ui_remove">Remove</string>
+    <!-- Connection details -->
+    <string name="ui_cruisemesh_chooses_the_best_available_path_automatically_a">CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Cruise Pass.</string>
+    <string name="ui_no_friends_added_yet">No friends added yet.</string>
+    <string name="ui_connection_activity_will_appear_here_as_cruisemesh_reaches">Connection activity will appear here as CruiseMesh reaches your friends.</string>
+    <string name="ui_share_diagnostics">Share diagnostics</string>
+    <string name="ui_clear_connection_history">Clear connection history</string>
+    <string name="ui_history_contains_only_friend_identity_path_type_event">History contains only friend identity, path type, event type, and time. It never stores message content, relay tokens, IP addresses, or Wi-Fi names.</string>
+    <string name="ui_field_metrics_contain_hashed_chat_tags_route_types">Field metrics contain hashed chat tags, route types, and delivery timings—never message content or contact names.</string>
+    <string name="ui_clear_connection_history_confirm">Clear connection history?</string>
+    <string name="ui_this_removes_local_connection_events_and_per_person">This removes local connection events and per-person path summaries. Messages and friends are not affected.</string>
+    <string name="ui_clear">Clear</string>
+    <!-- Help &amp; support -->
+    <string name="ui_never_post_a_cruise_pass_setup_card_or">Never post a Cruise Pass setup card or relay token publicly.</string>
+    <string name="ui_open_cruisemesh_support">Open CruiseMesh support</string>
+    <!-- Internal tools -->
+    <string name="ui_internal_tools">Internal tools</string>
+    <string name="ui_local_wi_fi_field_tools">Local Wi-Fi field tools</string>
 </resources>

@@ -152,28 +152,28 @@ fun ChatListScreen(
                             onDismissRequest = { showHomeMenu = false },
                         ) {
                             DropdownMenuItem(
-                                text = { Text("Friends") },
+                                text = { Text(stringResource(R.string.ui_friends)) },
                                 onClick = {
                                     showHomeMenu = false
                                     onFriendsClick()
                                 },
                             )
                             DropdownMenuItem(
-                                text = { Text("Connection details") },
+                                text = { Text(stringResource(R.string.ui_connection_details)) },
                                 onClick = {
                                     showHomeMenu = false
                                     onConnectionDetailsClick()
                                 },
                             )
                             DropdownMenuItem(
-                                text = { Text("Settings") },
+                                text = { Text(stringResource(R.string.ui_settings)) },
                                 onClick = {
                                     showHomeMenu = false
                                     onSettingsClick()
                                 },
                             )
                             DropdownMenuItem(
-                                text = { Text("Help & support") },
+                                text = { Text(stringResource(R.string.ui_help_support)) },
                                 onClick = {
                                     showHomeMenu = false
                                     onHelpClick()
@@ -194,21 +194,21 @@ fun ChatListScreen(
                     onDismissRequest = { showComposeMenu = false },
                 ) {
                     DropdownMenuItem(
-                        text = { Text("New message") },
+                        text = { Text(stringResource(R.string.ui_new_message)) },
                         onClick = {
                             showComposeMenu = false
                             onNewChatClick()
                         },
                     )
                     DropdownMenuItem(
-                        text = { Text("Add a friend") },
+                        text = { Text(stringResource(R.string.ui_add_a_friend)) },
                         onClick = {
                             showComposeMenu = false
                             onAddFriendClick()
                         },
                     )
                     DropdownMenuItem(
-                        text = { Text("New group") },
+                        text = { Text(stringResource(R.string.ui_new_group)) },
                         onClick = {
                             showComposeMenu = false
                             onNewGroupClick()
