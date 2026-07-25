@@ -1,5 +1,6 @@
 package com.cruisemesh.app.ui
 
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.net.Uri
@@ -34,6 +35,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.R
 import com.cruisemesh.app.identity.TERMS_OF_USE_URL
@@ -168,7 +170,51 @@ fun SettingsScreen(
                     context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL)))
                 }
             }
+
+            Text(
+                appVersionLabel(context),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 28.dp),
+            )
+            // The author's dedication, in the traditional place for one: the
+            // very bottom of the last screen, after everything functional.
+            // Latin and untranslated -- a fixed phrase, the way Bach's
+            // manuscripts carry it.
+            Text(
+                stringResource(R.string.ui_soli_deo_gloria),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f),
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 6.dp, bottom = 8.dp),
+            )
         }
+    }
+}
+
+/**
+ * "CruiseMesh 1.0.2 (1784978966)".
+ *
+ * Read from the installed package rather than `BuildConfig` (which this module
+ * does not generate) so it reports what is actually on the phone. The version
+ * code is the part that matters in a bug report: `versionName` falls back to a
+ * hardcoded "1.0.0" for any build not made from a release tag, so several
+ * different builds can share it.
+ */
+@Composable
+private fun appVersionLabel(context: Context): String {
+    val fallback = stringResource(R.string.app_name)
+    val format = stringResource(R.string.ui_app_version_label)
+    return remember(context, format, fallback) {
+        runCatching {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            String.format(format, info.versionName ?: "?", info.longVersionCode)
+        }.getOrDefault(fallback)
     }
 }
 

@@ -87,6 +87,25 @@ struct SettingsView: View {
                     Link("Terms of Use", destination: TermsAcceptanceStore.termsURL)
                     Link("Privacy policy", destination: TermsAcceptanceStore.privacyURL)
                 }
+
+                Section {
+                    VStack(spacing: 6) {
+                        // verbatim: a version string is data, not copy, and
+                        // must not land in the localization catalog.
+                        Text(verbatim: versionLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        // The author's dedication, in the traditional place for
+                        // one: the very bottom of the last screen, after
+                        // everything functional. Latin and untranslated -- a
+                        // fixed phrase, the way Bach's manuscripts carry it.
+                        Text(verbatim: "Soli Deo gloria")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .listRowBackground(Color.clear)
+                }
             }
             .navigationTitle("Settings")
             .toolbar {
@@ -95,6 +114,17 @@ struct SettingsView: View {
                 }
             }
         }
+    }
+
+    /// "CruiseMesh 1.0.2 (1784978966)". The build number is the part that
+    /// identifies a build in a bug report: `CFBundleShortVersionString` falls
+    /// back to a hardcoded value for anything not built from a release tag, so
+    /// it is not unique on its own.
+    private var versionLabel: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "CruiseMesh \(short) (\(build))"
     }
 
     private var relayTitle: String {
