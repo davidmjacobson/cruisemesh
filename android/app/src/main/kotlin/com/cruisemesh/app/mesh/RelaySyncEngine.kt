@@ -20,6 +20,8 @@ import uniffi.cruisemesh_core.CoreInboundDisposition
 import uniffi.cruisemesh_core.CoreRelayEnvelopeDisposition
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
+import uniffi.cruisemesh_core.PeerConnectionEventKind
+import uniffi.cruisemesh_core.PeerConnectionTransport
 import uniffi.cruisemesh_core.coreGroupFanoutRows
 import uniffi.cruisemesh_core.dedupeHints
 import uniffi.cruisemesh_core.coreGroupFanoutRowsForCarried
@@ -200,7 +202,7 @@ internal class RelaySyncEngine(
             when {
                 configs.isEmpty() -> RelayHealth.NoConfig
                 !hasValidatedInternet() -> RelayHealth.NoInternet
-                else -> RelayHealth.Failing(System.currentTimeMillis())
+                else -> RelayHealth.Checking
             },
         )
     }
@@ -387,7 +389,7 @@ internal class RelaySyncEngine(
         // trusted (associated-but-dead Wi‑Fi, no VPN); otherwise null = use the
         // default (normal networks and VPN tunnels route themselves).
         val network = relayBindTarget()
-        sawOwnTokenReject = false
+        ownRelayReject = null
         backfillOutgoingReceipts(identity, now)
         uploadPendingOutgoingReceiptEnvelopes(contacts, fallbackConfig, now, network)
         uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now, network)
@@ -417,7 +419,11 @@ internal class RelaySyncEngine(
         }
         if (ownRelaySucceeded && anyRelaySucceeded) {
             MeshConnectivityStatus.setRelayHealth(RelayHealth.Ok(now))
-        } else if (sawOwnTokenReject) {
+        } else if (ownRelayReject == "family_expired") {
+            MeshConnectivityStatus.setRelayHealth(RelayHealth.Expired(now))
+        } else if (ownRelayReject == "family_suspended") {
+            MeshConnectivityStatus.setRelayHealth(RelayHealth.Suspended(now))
+        } else if (ownRelayReject != null) {
             // T11: a stale/rotated family token used to look like a generic
             // relay outage while friend requests queued forever. Surface it.
             MeshConnectivityStatus.setRelayHealth(RelayHealth.TokenRejected(now))
@@ -697,13 +703,15 @@ internal class RelaySyncEngine(
             fallbackConfig?.relayToken,
         )?.let { RelayConfig(it.url, it.token) }
 
-    /** Set while a sync pass observes our own saved config being auth-rejected; drives [RelayHealth.TokenRejected]. */
-    private var sawOwnTokenReject = false
+    /** Stable relayd rejection code for our own saved config during this pass. */
+    private var ownRelayReject: String? = null
 
     private fun noteRelayAuthFailure(config: RelayConfig, fallbackConfig: RelayConfig?, error: Exception) {
         if (config != fallbackConfig) return
         val code = (error as? RelayHttpException)?.code ?: return
-        if (code == 401 || code == 403) sawOwnTokenReject = true
+        if (code == 401 || code == 403) {
+            ownRelayReject = (error as RelayHttpException).relayCode ?: "token_rejected"
+        }
     }
 
     private fun syncRelayPresence(
@@ -741,6 +749,14 @@ internal class RelaySyncEngine(
                 val ageMs = (page.nowMs - presence.lastSeenMs).coerceAtLeast(0L)
                 val localSeenAt = localNow - ageMs
                 MeshConnectivityStatus.mergePresenceLastSeen(UserIdHex.encode(contact.userId), localSeenAt)
+                runCatching {
+                    store.recordPeerConnectionEvent(
+                        contact.userId,
+                        PeerConnectionTransport.CRUISE_PASS,
+                        PeerConnectionEventKind.PRESENCE_SEEN,
+                        localSeenAt,
+                    )
+                }
             }
             Log.i(
                 TAG,

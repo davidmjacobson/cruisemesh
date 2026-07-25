@@ -38,6 +38,10 @@ struct ChatListView: View {
     @State private var showProfile = false
     @State private var showNewGroup = false
     @State private var showMeshHelp = false
+    @State private var showSettings = false
+    @State private var showConnectionDetails = false
+    @State private var showCruisePass = false
+    @State private var showHelp = false
     @State private var cancellable: AnyCancellable?
     @State private var bluetoothAudioWarningDismissed = false
     @State private var publishedFriendDirectory = false
@@ -165,9 +169,19 @@ struct ChatListView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
+                        Button("New message") { showFriends = true }
+                        Button("Add a friend") { showFriends = true }
                         Button("New group") { showNewGroup = true }
+                    } label: {
+                        Image(systemName: "plus.circle")
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
                         Button("Friends") { showFriends = true }
-                        Button("Mesh status") { showMeshHelp = true }
+                        Button("Connection details") { showConnectionDetails = true }
+                        Button("Settings") { showSettings = true }
+                        Button("Help & support") { showHelp = true }
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -244,6 +258,22 @@ struct ChatListView: View {
             .sheet(isPresented: $showMeshHelp) {
                 MeshStatusSheet(appModel: appModel)
             }
+            .sheet(isPresented: $showSettings) {
+                SettingsView(identity: identity, appModel: appModel)
+            }
+            .sheet(isPresented: $showConnectionDetails) {
+                ConnectionDetailsView()
+            }
+            .sheet(isPresented: $showCruisePass, onDismiss: {
+                appModel.pendingRelayCard = nil
+            }) {
+                NavigationStack {
+                    CruisePassView(initialCard: appModel.pendingRelayCard, appModel: appModel)
+                }
+            }
+            .sheet(isPresented: $showHelp) {
+                HelpSupportView(appModel: appModel)
+            }
             .onAppear {
                 reload()
                 cancellable = ChatEvents.subject.sink { _ in reload() }
@@ -260,6 +290,7 @@ struct ChatListView: View {
                     FriendDirectorySender.queueToAllContacts(store: AppStore.get(), identity: identity)
                 }
                 if appModel.pendingFriendToken != nil { showFriends = true }
+                if appModel.pendingRelayCard != nil { showCruisePass = true }
             }
             .onChange(of: runtime.state) { state in
                 if case .pausedForBluetoothAudio = state {
@@ -269,6 +300,9 @@ struct ChatListView: View {
             }
             .onChange(of: appModel.pendingFriendToken) { token in
                 if token != nil { showFriends = true }
+            }
+            .onChange(of: appModel.pendingRelayCard) { card in
+                if card != nil { showCruisePass = true }
             }
             .onReceive(NotificationOpenEvents.subject) { event in
                 let (chatId, isGroup) = event
@@ -482,6 +516,11 @@ private struct MeshStatusSheet: View {
                     Text("Open the app when you sit down with family so phones can sync over Bluetooth.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                    NavigationLink {
+                        ConnectionDetailsView()
+                    } label: {
+                        Label("Connection details", systemImage: "point.3.connected.trianglepath.dotted")
+                    }
                 }
             }
             .onAppear { carriedCount = (try? AppStore.get().carriedLen()) ?? 0 }

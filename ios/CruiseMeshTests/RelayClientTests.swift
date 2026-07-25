@@ -138,6 +138,25 @@ final class RelayClientTests: XCTestCase {
         XCTAssertEqual((json["expiry_ms"] as? NSNumber)?.int64Value, 1_700_000_070_000)
     }
 
+    func testHostedPassRejectionSurfacesStableRelayCode() {
+        RelayMockURLProtocol.responses = [
+            .init(
+                statusCode: 403,
+                body: Data(#"{"error":"relay pass expired","code":"family_expired"}"#.utf8),
+                headers: ["Content-Type": "application/json"]
+            ),
+        ]
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "expired-token")
+
+        XCTAssertThrowsError(
+            try RelayClient.syncPresence(config: config, announce: [], query: [])
+        ) { error in
+            let relay = error as? RelayHTTPError
+            XCTAssertEqual(relay?.statusCode, 403)
+            XCTAssertEqual(relay?.relayCode, "family_expired")
+        }
+    }
+
     func testFetchAndAckRoundTripRelayEnvelopeContract() throws {
         let msgIdB64 = base64Url(Data(repeating: 3, count: 16))
         let hintB64 = base64Url(Data(repeating: 4, count: 8))

@@ -1,0 +1,151 @@
+import SwiftUI
+
+struct SettingsView: View {
+    let identity: Identity
+    @ObservedObject var appModel: AppModel
+    @ObservedObject private var runtime = MeshRuntimeStatus.shared
+    @ObservedObject private var connectivity = MeshConnectivityStatus.shared
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var shareOnline = RelayConfigStore.shareOnline()
+    @State private var friendsOfFriends = FriendsOfFriendsStore.isEnabled()
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Cruise Pass") {
+                    NavigationLink {
+                        CruisePassView(initialCard: nil, appModel: appModel)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(relayTitle)
+                            Text(relayDetail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Section("CruiseMesh operation") {
+                    Toggle(
+                        "Mesh running",
+                        isOn: Binding(
+                            get: { appModel.meshEnabled },
+                            set: { $0 ? appModel.startMesh() : appModel.stopMesh() }
+                        )
+                    )
+                    LabeledContent("Status", value: runtime.pillText)
+                    NavigationLink {
+                        ConnectionDetailsView()
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Connection details")
+                            Text("Active paths, people, recent activity, and support diagnostics.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+#if DEBUG
+                    NavigationLink {
+                        InternalToolsView(appModel: appModel)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Internal field tools")
+                            Text("Manual local-network probes, raw route counters, and diagnostic exports.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+#endif
+                }
+
+                Section("Privacy") {
+                    Toggle("Friends of friends", isOn: $friendsOfFriends)
+                        .onChange(of: friendsOfFriends) { updateFriendsOfFriends($0) }
+                    Text("Let friends introduce you to people they know. Messages and phone contacts are never shared.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Toggle("Share when I'm online", isOn: $shareOnline)
+                        .onChange(of: shareOnline) { RelayConfigStore.setShareOnline($0) }
+                }
+
+                Section("Backup") {
+                    NavigationLink {
+                        BackupExportView()
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Label("Back up account", systemImage: "externaldrive")
+                            Text("Export an encrypted copy of your identity and messages.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Section("About & legal") {
+                    Link("Help & support", destination: URL(string: "https://cruisemesh.app/support/")!)
+                    Link("Terms of Use", destination: TermsAcceptanceStore.termsURL)
+                    Link("Privacy policy", destination: TermsAcceptanceStore.privacyURL)
+                }
+            }
+            .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private var relayTitle: String {
+        guard RelayConfigStore.load() != nil else { return "Set up Cruise Pass" }
+        switch connectivity.relay {
+        case .noConfig: return "Checking Cruise Pass setup…"
+        case .checking: return "Checking Cruise Pass setup…"
+        case .ok: return "Cruise Pass is working"
+        case .noInternet: return "Cruise Pass is waiting for internet"
+        case .failing: return "Cruise Pass needs attention"
+        case .expired: return "Cruise Pass expired"
+        case .suspended: return "Cruise Pass suspended"
+        case .tokenRejected: return "Cruise Pass setup was rejected"
+        }
+    }
+
+    private var relayDetail: String {
+        guard RelayConfigStore.load() != nil else {
+            return "CruiseMesh still works nearby. Add a pass for internet delivery."
+        }
+        switch connectivity.relay {
+        case .noConfig: return "Setup is saved and will be checked when CruiseMesh runs."
+        case .checking: return "Setup is saved; CruiseMesh has not completed an authenticated check yet."
+        case .ok(let lastSyncMs): return "Internet delivery is ready · checked \(relativeAge(lastSyncMs))."
+        case .noInternet: return "Configured; this phone is currently offline."
+        case .failing: return "The relay could not be reached."
+        case .expired: return "Renew your pass to resume internet delivery."
+        case .suspended: return "Contact support for help with this pass."
+        case .tokenRejected: return "Review or replace the saved setup card."
+        }
+    }
+
+    private func relativeAge(_ timestampMs: Int64) -> String {
+        let minutes = max(0, (Int64(Date().timeIntervalSince1970 * 1_000) - timestampMs) / 60_000)
+        if minutes == 0 { return "just now" }
+        if minutes < 60 { return "\(minutes)m ago" }
+        if minutes < 24 * 60 { return "\(minutes / 60)h ago" }
+        return "\(minutes / (24 * 60))d ago"
+    }
+
+    private func updateFriendsOfFriends(_ enabled: Bool) {
+        guard FriendsOfFriendsStore.isEnabled() != enabled else { return }
+        FriendsOfFriendsStore.setEnabled(enabled)
+        let store = AppStore.get()
+        if !enabled { try? store.clearFriendSuggestions() }
+        ProfileSyncSender.queueToAllContacts(
+            store: store,
+            identity: identity,
+            displayName: appModel.displayName,
+            epoch: ProfileStore.loadOwnAvatarEpoch()
+        )
+        FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
+    }
+}

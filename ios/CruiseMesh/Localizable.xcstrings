@@ -111,16 +111,6 @@
         }
       }
     },
-    "Advanced settings": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Advanced settings"
-          }
-        }
-      }
-    },
     "Ask them to check these words match their card.": {
       "localizations": {
         "en": {
@@ -647,16 +637,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Let friends introduce you to people they know. Messages and phone contacts are never shared."
-          }
-        }
-      }
-    },
-    "Local Wi-Fi (experimental)": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Local Wi-Fi (experimental)"
           }
         }
       }

@@ -41,6 +41,9 @@ struct CruiseMeshApp: App {
                 if url.path == "/f" || url.path == "/f/" {
                     guard (try? parseFriendText(text: fragment)) != nil else { return }
                     appModel.pendingFriendToken = fragment
+                } else if url.path == "/r" || url.path == "/r/" {
+                    guard (try? parseRelaySetupText(text: fragment)) != nil else { return }
+                    appModel.pendingRelayCard = fragment
                 } else if url.path == "/lan" || url.path == "/lan/" {
                     guard let endpoint = parseLanEndpointLink(fragment) else { return }
                     LanTransportDiagnostics.shared.queueManualConnection(endpoint)

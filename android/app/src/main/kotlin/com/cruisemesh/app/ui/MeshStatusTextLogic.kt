@@ -25,9 +25,12 @@ object MeshStatusTextLogic {
         }
         val relaySuffix = when (relayHealth) {
             is RelayHealth.Ok -> "relay ✓"
+            RelayHealth.Checking -> "checking Cruise Pass"
             RelayHealth.NoInternet -> "no internet"
             RelayHealth.NoConfig -> "no relay set up"
             is RelayHealth.Failing -> "relay unreachable"
+            is RelayHealth.Expired -> "pass expired"
+            is RelayHealth.Suspended -> "pass suspended"
             is RelayHealth.TokenRejected -> "relay token rejected"
         }
         val text = when {

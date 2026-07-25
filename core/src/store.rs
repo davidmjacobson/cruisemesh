@@ -160,6 +160,42 @@ pub struct MessageArrival {
     pub received_at: i64,
 }
 
+/// A privacy-preserving path by which the device has reached a friend.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerConnectionTransport {
+    Bluetooth,
+    LocalWifi,
+    CruisePass,
+}
+
+/// A metadata-only connection event. No addresses, network names, tokens, or
+/// message content are retained.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerConnectionEventKind {
+    Connected,
+    Disconnected,
+    PresenceSeen,
+    MessageDelivered,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct PeerConnectionEvent {
+    pub user_id: Vec<u8>,
+    pub transport: PeerConnectionTransport,
+    pub kind: PeerConnectionEventKind,
+    pub occurred_at_ms: i64,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct PeerConnectionSummary {
+    pub user_id: Vec<u8>,
+    pub transport: PeerConnectionTransport,
+    pub last_connected_at_ms: Option<i64>,
+    pub last_disconnected_at_ms: Option<i64>,
+    pub last_seen_at_ms: Option<i64>,
+    pub last_delivered_at_ms: Option<i64>,
+}
+
 /// Stable envelope identity for a stored message and, for replies, the
 /// encrypted id of the quoted message. Legacy rows may have no reference.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
@@ -459,6 +495,160 @@ impl MessageStore {
             #[cfg(test)]
             sealed_reads: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Record a bounded, metadata-only connection event for an accepted peer.
+    /// Identical high-frequency signals are coalesced for 30 seconds; detailed
+    /// events are retained for 30 days and capped at 1,000 rows.
+    pub fn record_peer_connection_event(
+        &self,
+        user_id: Vec<u8>,
+        transport: PeerConnectionTransport,
+        kind: PeerConnectionEventKind,
+        occurred_at_ms: i64,
+    ) -> Result<(), CoreError> {
+        if user_id.is_empty() || user_id.len() > 128 {
+            return Err(CoreError::Malformed("invalid peer user id".into()));
+        }
+        if occurred_at_ms < 0 {
+            return Err(CoreError::Malformed(
+                "connection event time cannot be negative".into(),
+            ));
+        }
+        let transport_value = peer_transport_value(transport);
+        let kind_value = peer_event_kind_value(kind);
+        let mut conn = lock_conn(&self.conn);
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
+            "INSERT INTO peer_connection_events
+                (user_id, transport, kind, occurred_at_ms)
+             SELECT ?1, ?2, ?3, ?4
+             WHERE NOT EXISTS (
+                SELECT 1 FROM peer_connection_events
+                WHERE user_id = ?1 AND transport = ?2 AND kind = ?3
+                  AND occurred_at_ms >= ?4 - 30000
+             )",
+            params![&user_id, transport_value, kind_value, occurred_at_ms],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "INSERT INTO peer_connection_summary
+                (user_id, transport, last_connected_at_ms,
+                 last_disconnected_at_ms, last_seen_at_ms, last_delivered_at_ms)
+             VALUES (
+                ?1, ?2,
+                CASE WHEN ?3 = 0 THEN ?4 END,
+                CASE WHEN ?3 = 1 THEN ?4 END,
+                CASE WHEN ?3 = 2 THEN ?4 END,
+                CASE WHEN ?3 = 3 THEN ?4 END
+             )
+             ON CONFLICT(user_id, transport) DO UPDATE SET
+                last_connected_at_ms = COALESCE(
+                    MAX(last_connected_at_ms, excluded.last_connected_at_ms),
+                    last_connected_at_ms, excluded.last_connected_at_ms),
+                last_disconnected_at_ms = COALESCE(
+                    MAX(last_disconnected_at_ms, excluded.last_disconnected_at_ms),
+                    last_disconnected_at_ms, excluded.last_disconnected_at_ms),
+                last_seen_at_ms = COALESCE(
+                    MAX(last_seen_at_ms, excluded.last_seen_at_ms),
+                    last_seen_at_ms, excluded.last_seen_at_ms),
+                last_delivered_at_ms = COALESCE(
+                    MAX(last_delivered_at_ms, excluded.last_delivered_at_ms),
+                    last_delivered_at_ms, excluded.last_delivered_at_ms)",
+            params![&user_id, transport_value, kind_value, occurred_at_ms],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM peer_connection_events WHERE occurred_at_ms < ?1",
+            params![occurred_at_ms.saturating_sub(30 * 24 * 60 * 60 * 1000)],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM peer_connection_events
+             WHERE id NOT IN (
+                SELECT id FROM peer_connection_events
+                ORDER BY occurred_at_ms DESC, id DESC LIMIT 1000
+             )",
+            [],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)
+    }
+
+    pub fn peer_connection_events(
+        &self,
+        user_id: Option<Vec<u8>>,
+        limit: u32,
+    ) -> Result<Vec<PeerConnectionEvent>, CoreError> {
+        let limit = i64::from(limit.clamp(1, 500));
+        let conn = lock_conn(&self.conn);
+        let mut rows = Vec::new();
+        if let Some(user_id) = user_id {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT user_id, transport, kind, occurred_at_ms
+                     FROM peer_connection_events WHERE user_id = ?1
+                     ORDER BY occurred_at_ms DESC, id DESC LIMIT ?2",
+                )
+                .map_err(store_err)?;
+            let mapped = stmt
+                .query_map(params![user_id, limit], row_to_peer_connection_event)
+                .map_err(store_err)?;
+            for row in mapped {
+                rows.push(row.map_err(store_err)?);
+            }
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT user_id, transport, kind, occurred_at_ms
+                     FROM peer_connection_events
+                     ORDER BY occurred_at_ms DESC, id DESC LIMIT ?1",
+                )
+                .map_err(store_err)?;
+            let mapped = stmt
+                .query_map(params![limit], row_to_peer_connection_event)
+                .map_err(store_err)?;
+            for row in mapped {
+                rows.push(row.map_err(store_err)?);
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn peer_connection_summaries(&self) -> Result<Vec<PeerConnectionSummary>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT user_id, transport, last_connected_at_ms,
+                        last_disconnected_at_ms, last_seen_at_ms, last_delivered_at_ms
+                 FROM peer_connection_summary
+                 ORDER BY COALESCE(last_delivered_at_ms, last_seen_at_ms,
+                                   last_connected_at_ms, last_disconnected_at_ms) DESC",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PeerConnectionSummary {
+                    user_id: row.get(0)?,
+                    transport: peer_transport_from_value(row.get(1)?)?,
+                    last_connected_at_ms: row.get(2)?,
+                    last_disconnected_at_ms: row.get(3)?,
+                    last_seen_at_ms: row.get(4)?,
+                    last_delivered_at_ms: row.get(5)?,
+                })
+            })
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    pub fn clear_peer_connection_history(&self) -> Result<(), CoreError> {
+        let mut conn = lock_conn(&self.conn);
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute("DELETE FROM peer_connection_events", [])
+            .map_err(store_err)?;
+        tx.execute("DELETE FROM peer_connection_summary", [])
+            .map_err(store_err)?;
+        tx.commit().map_err(store_err)
     }
 
     /// Writes a transactionally consistent standalone SQLite snapshot.
@@ -3277,6 +3467,51 @@ fn row_to_contact(row: &rusqlite::Row) -> rusqlite::Result<Contact> {
     })
 }
 
+fn peer_transport_value(transport: PeerConnectionTransport) -> i64 {
+    match transport {
+        PeerConnectionTransport::Bluetooth => 0,
+        PeerConnectionTransport::LocalWifi => 1,
+        PeerConnectionTransport::CruisePass => 2,
+    }
+}
+
+fn peer_transport_from_value(value: i64) -> rusqlite::Result<PeerConnectionTransport> {
+    match value {
+        0 => Ok(PeerConnectionTransport::Bluetooth),
+        1 => Ok(PeerConnectionTransport::LocalWifi),
+        2 => Ok(PeerConnectionTransport::CruisePass),
+        _ => Err(rusqlite::Error::IntegralValueOutOfRange(1, value)),
+    }
+}
+
+fn peer_event_kind_value(kind: PeerConnectionEventKind) -> i64 {
+    match kind {
+        PeerConnectionEventKind::Connected => 0,
+        PeerConnectionEventKind::Disconnected => 1,
+        PeerConnectionEventKind::PresenceSeen => 2,
+        PeerConnectionEventKind::MessageDelivered => 3,
+    }
+}
+
+fn peer_event_kind_from_value(value: i64) -> rusqlite::Result<PeerConnectionEventKind> {
+    match value {
+        0 => Ok(PeerConnectionEventKind::Connected),
+        1 => Ok(PeerConnectionEventKind::Disconnected),
+        2 => Ok(PeerConnectionEventKind::PresenceSeen),
+        3 => Ok(PeerConnectionEventKind::MessageDelivered),
+        _ => Err(rusqlite::Error::IntegralValueOutOfRange(2, value)),
+    }
+}
+
+fn row_to_peer_connection_event(row: &rusqlite::Row) -> rusqlite::Result<PeerConnectionEvent> {
+    Ok(PeerConnectionEvent {
+        user_id: row.get(0)?,
+        transport: peer_transport_from_value(row.get(1)?)?,
+        kind: peer_event_kind_from_value(row.get(2)?)?,
+        occurred_at_ms: row.get(3)?,
+    })
+}
+
 struct GroupRow {
     id: Vec<u8>,
     name: String,
@@ -3661,6 +3896,28 @@ CREATE TABLE IF NOT EXISTS carried_envelopes (
 );
 CREATE INDEX IF NOT EXISTS idx_carried_hint ON carried_envelopes(recipient_hint);
 CREATE INDEX IF NOT EXISTS idx_carried_expiry ON carried_envelopes(expiry);
+
+CREATE TABLE IF NOT EXISTS peer_connection_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        BLOB NOT NULL,
+    transport      INTEGER NOT NULL,
+    kind           INTEGER NOT NULL,
+    occurred_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_peer_connection_events_recent
+    ON peer_connection_events(occurred_at_ms DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_peer_connection_events_user_recent
+    ON peer_connection_events(user_id, occurred_at_ms DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS peer_connection_summary (
+    user_id                 BLOB NOT NULL,
+    transport               INTEGER NOT NULL,
+    last_connected_at_ms    INTEGER,
+    last_disconnected_at_ms INTEGER,
+    last_seen_at_ms         INTEGER,
+    last_delivered_at_ms    INTEGER,
+    PRIMARY KEY(user_id, transport)
+);
 ";
 
 #[cfg(test)]
@@ -3761,6 +4018,54 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].payload, b"hi");
         assert_eq!(messages[1].payload, b"there");
+    }
+
+    #[test]
+    fn connection_history_coalesces_bounds_and_clears() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let alice = test_user_id(b"alice");
+        store
+            .record_peer_connection_event(
+                alice.clone(),
+                PeerConnectionTransport::Bluetooth,
+                PeerConnectionEventKind::Connected,
+                1_700_000_000_000,
+            )
+            .unwrap();
+        store
+            .record_peer_connection_event(
+                alice.clone(),
+                PeerConnectionTransport::Bluetooth,
+                PeerConnectionEventKind::Connected,
+                1_700_000_001_000,
+            )
+            .unwrap();
+        store
+            .record_peer_connection_event(
+                alice.clone(),
+                PeerConnectionTransport::CruisePass,
+                PeerConnectionEventKind::PresenceSeen,
+                1_700_000_002_000,
+            )
+            .unwrap();
+
+        let events = store.peer_connection_events(None, 50).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, PeerConnectionEventKind::PresenceSeen);
+        let summaries = store.peer_connection_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|summary| summary.transport == PeerConnectionTransport::Bluetooth)
+                .unwrap()
+                .last_connected_at_ms,
+            Some(1_700_000_001_000)
+        );
+
+        store.clear_peer_connection_history().unwrap();
+        assert!(store.peer_connection_events(None, 50).unwrap().is_empty());
+        assert!(store.peer_connection_summaries().unwrap().is_empty());
     }
 
     #[test]

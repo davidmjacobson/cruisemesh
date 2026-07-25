@@ -16,7 +16,6 @@
     <string name="ui_add_members">Add members</string>
     <string name="ui_add_this_friend">Add this friend?</string>
     <string name="ui_add_this_friend_60651604">Add this friend</string>
-    <string name="ui_advanced_settings">Advanced settings</string>
     <string name="ui_all_of_your_contacts_are_already_in_this">All of your contacts are already in this group.</string>
     <string name="ui_all_quiet_on_deck">All quiet on deck</string>
     <string name="ui_already_set_up_restore_from_a_backup">Already set up? Restore from a backup</string>
@@ -68,7 +67,6 @@
     <string name="ui_info">Info</string>
     <string name="ui_leave_delete">Leave / delete</string>
     <string name="ui_let_a_friend_scan_this_code_to_add">Let a friend scan this code to add you.</string>
-    <string name="ui_local_wi_fi_experimental">Local Wi-Fi (experimental)</string>
     <string name="ui_manual_connection_requires_an_accepted_friend_and_cruisemesh">Manual connection requires an accepted friend and CruiseMesh\'s encrypted identity check.</string>
     <string name="ui_mark_as_read">Mark as read</string>
     <string name="ui_message">Message</string>

@@ -1,6 +1,7 @@
 package com.cruisemesh.app.relay
 
 import android.net.Network
+import com.google.gson.JsonParser
 import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.CoreGroupFanoutRow
 import uniffi.cruisemesh_core.OutboundEnvelope
@@ -39,8 +40,12 @@ data class RelayFetchPage(
     val nextCursor: Long,
 )
 
-/** Relay HTTP failure carrying its status code so sync can tell an auth reject (401/403) from transport noise. */
-class RelayHttpException(val code: Int, message: String) : IOException(message)
+/** Relay HTTP failure carrying both the status and relayd's stable error code. */
+class RelayHttpException(
+    val code: Int,
+    val relayCode: String?,
+    message: String,
+) : IOException(message)
 
 data class RelayPresence(
     val hint: ByteArray,
@@ -218,7 +223,11 @@ object RelayClient {
             val body = stream?.use { it.readBounded(maxBytes) } ?: ByteArray(0)
             if (code !in 200..299) {
                 val preview = String(body, 0, minOf(body.size, 2_048), StandardCharsets.UTF_8)
-                throw RelayHttpException(code, "Relay request failed ($code): $preview")
+                val relayCode = runCatching {
+                    JsonParser.parseString(preview).asJsonObject.get("code")?.asString
+                }.getOrNull()
+                val semantic = relayCode?.let { " [$it]" }.orEmpty()
+                throw RelayHttpException(code, relayCode, "Relay request failed ($code)$semantic: $preview")
             }
             block(body)
         } finally {

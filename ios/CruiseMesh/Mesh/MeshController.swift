@@ -128,6 +128,13 @@ final class MeshController: ObservableObject {
                 )
                 let name = (try? self.store.getContact(userId: userId))?.name
                     ?? String(UserIdHex.encode(userId).prefix(8))
+                if (try? self.store.getContact(userId: userId)) != nil {
+                    self.recordPeerConnection(
+                        userId: userId,
+                        transport: .lan,
+                        kind: .connected
+                    )
+                }
                 LanTransportDiagnostics.shared.authenticated(address: address, peerName: name)
                 self.sendHello(address: address)
                 self.sendLanEndpointHint(address: address)
@@ -138,6 +145,7 @@ final class MeshController: ObservableObject {
         lan.onDisconnected = { [weak self] address in
             Task { @MainActor in
                 guard let self, self.isRunning else { return }
+                self.recordPeerDisconnected(address: address)
                 self.lanHealth.remove(address: address)
                 LanTransportDiagnostics.shared.disconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
@@ -170,6 +178,7 @@ final class MeshController: ObservableObject {
             // queue's event order, so a fast connect->disconnect can't have
             // its disconnect processed first and re-register a dead route.
             Task { @MainActor in
+                MeshController.shared.recordPeerDisconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 MeshController.shared.refreshNearby()
             }
@@ -183,6 +192,7 @@ final class MeshController: ObservableObject {
         }
         transport.onPeripheralUnsubscribed = { address in
             Task { @MainActor in
+                MeshController.shared.recordPeerDisconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 MeshController.shared.refreshNearby()
             }
@@ -518,6 +528,10 @@ final class MeshController: ObservableObject {
             userId: userId,
             seenAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
         )
+        if (try? store.getContact(userId: userId)) != nil,
+           let transport = MeshRouter.transportFor(address: address) {
+            recordPeerConnection(userId: userId, transport: transport, kind: .connected)
+        }
         log.info("HELLO from \(address, privacy: .public) \(UserIdHex.encode(userId), privacy: .public)")
         sendLanEndpointHint(address: address)
         queueCurrentLanEndpoint(to: userId)
@@ -1360,6 +1374,18 @@ final class MeshController: ObservableObject {
                 throughLamport: receipt.lamport,
                 deliveredAtMs: arrival.receivedAt,
                 viaTransport: arrival.transport
+            )
+            try? store.recordPeerConnectionEvent(
+                userId: envelopeSender,
+                transport: {
+                    switch arrival.transport {
+                    case 0, 1: return .bluetooth
+                    case 3, 4: return .localWifi
+                    default: return .cruisePass
+                    }
+                }(),
+                kind: .messageDelivered,
+                occurredAtMs: arrival.receivedAt
             )
         }
         ChatEvents.notifyChatChanged(envelopeSender)
@@ -2270,14 +2296,14 @@ final class MeshController: ObservableObject {
         // T11: a stale/rotated family token used to look like a generic relay
         // outage while queued envelopes retried forever. Track 401/403 from
         // our OWN saved config and surface it as .tokenRejected.
-        var sawOwnTokenReject = false
+        var ownRelayReject: String?
         func noteFailure(_ error: Error, usedConfig: RelayConfig) {
             guard let own = config,
                   usedConfig.relayUrl == own.relayUrl,
                   usedConfig.relayToken == own.relayToken else { return }
-            let ns = error as NSError
-            if ns.domain == "RelayClient", ns.code == 401 || ns.code == 403 {
-                sawOwnTokenReject = true
+            if let relay = error as? RelayHTTPError,
+               relay.statusCode == 401 || relay.statusCode == 403 {
+                ownRelayReject = relay.relayCode ?? "token_rejected"
             }
         }
         do {
@@ -2458,6 +2484,12 @@ final class MeshController: ObservableObject {
                                         userId: userId,
                                         seenAtMs: localSeenAt
                                     )
+                                    try? store.recordPeerConnectionEvent(
+                                        userId: userId,
+                                        transport: .cruisePass,
+                                        kind: .presenceSeen,
+                                        occurredAtMs: localSeenAt
+                                    )
                                 }
                             }
                         } catch { noteFailure(error, usedConfig: cfg) }
@@ -2530,31 +2562,64 @@ final class MeshController: ObservableObject {
                 }
             }
             let syncedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
-            let tokenRejected = sawOwnTokenReject
+            let reject = ownRelayReject
             let healthy = ownRelaySucceeded && anyRelaySucceeded
             await MainActor.run {
-                MeshConnectivityStatus.shared.setRelayHealth(
-                    healthy
-                        ? .ok(lastSyncMs: syncedAtMs)
-                        : (tokenRejected
-                            ? .tokenRejected(lastAttemptMs: syncedAtMs)
-                            : .failing(lastAttemptMs: syncedAtMs))
-                )
+                let health: RelayHealth
+                if healthy {
+                    health = .ok(lastSyncMs: syncedAtMs)
+                } else if reject == "family_expired" {
+                    health = .expired(lastAttemptMs: syncedAtMs)
+                } else if reject == "family_suspended" {
+                    health = .suspended(lastAttemptMs: syncedAtMs)
+                } else if reject != nil {
+                    health = .tokenRejected(lastAttemptMs: syncedAtMs)
+                } else {
+                    health = .failing(lastAttemptMs: syncedAtMs)
+                }
+                MeshConnectivityStatus.shared.setRelayHealth(health)
             }
         } catch {
             if let config { noteFailure(error, usedConfig: config) }
             let message = error.localizedDescription
-            let tokenRejected = sawOwnTokenReject
+            let reject = ownRelayReject
             await MainActor.run {
                 let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
-                MeshConnectivityStatus.shared.setRelayHealth(
-                    tokenRejected
-                        ? .tokenRejected(lastAttemptMs: nowMs)
-                        : .failing(lastAttemptMs: nowMs)
-                )
+                let health: RelayHealth
+                if reject == "family_expired" {
+                    health = .expired(lastAttemptMs: nowMs)
+                } else if reject == "family_suspended" {
+                    health = .suspended(lastAttemptMs: nowMs)
+                } else if reject != nil {
+                    health = .tokenRejected(lastAttemptMs: nowMs)
+                } else {
+                    health = .failing(lastAttemptMs: nowMs)
+                }
+                MeshConnectivityStatus.shared.setRelayHealth(health)
                 log.warning("Relay sync failed: \(message, privacy: .public)")
             }
         }
+    }
+
+    private func recordPeerDisconnected(address: String) {
+        guard let userId = MeshRouter.userIdFor(address: address),
+              let transport = MeshRouter.transportFor(address: address),
+              (try? store.getContact(userId: userId)) != nil else { return }
+        recordPeerConnection(userId: userId, transport: transport, kind: .disconnected)
+    }
+
+    private func recordPeerConnection(
+        userId: Data,
+        transport: MeshRouterState.Transport,
+        kind: PeerConnectionEventKind
+    ) {
+        let path: PeerConnectionTransport = transport == .lan ? .localWifi : .bluetooth
+        try? store.recordPeerConnectionEvent(
+            userId: userId,
+            transport: path,
+            kind: kind,
+            occurredAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
     }
 
     private func refreshNearby() {

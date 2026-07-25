@@ -11,9 +11,12 @@ enum ReachabilityLevel: Int, CaseIterable {
 
 enum RelayHealth: Equatable {
     case ok(lastSyncMs: Int64)
+    case checking
     case noInternet
     case noConfig
     case failing(lastAttemptMs: Int64)
+    case expired(lastAttemptMs: Int64)
+    case suspended(lastAttemptMs: Int64)
     /// The relay answered but rejected our own saved family token (HTTP 401/403).
     case tokenRejected(lastAttemptMs: Int64)
 }
@@ -96,11 +99,17 @@ enum ContactReachability {
     }
 }
 
+enum DirectPath: Equatable {
+    case bluetooth
+    case localWifi
+}
+
 @MainActor
 final class MeshConnectivityStatus: ObservableObject {
     static let shared = MeshConnectivityStatus()
 
     @Published private(set) var nearbyPeerIds: Set<Data> = []
+    @Published private(set) var directPaths: [Data: DirectPath] = [:]
     @Published private(set) var relay: RelayHealth = .noConfig
     @Published private(set) var contactLastSeen: [Data: Int64] = [:]
     @Published private(set) var presenceLastSeen: [Data: Int64] = [:]
@@ -108,7 +117,15 @@ final class MeshConnectivityStatus: ObservableObject {
     private init() {}
 
     func refreshNearbyRoutes() {
-        nearbyPeerIds = Set(MeshRouter.identifiedRoutes().map(\.userId))
+        var paths: [Data: DirectPath] = [:]
+        for route in MeshRouter.identifiedRoutes() {
+            let path: DirectPath = route.transport == .lan ? .localWifi : .bluetooth
+            if path == .localWifi || paths[route.userId] == nil {
+                paths[route.userId] = path
+            }
+        }
+        directPaths = paths
+        nearbyPeerIds = Set(paths.keys)
     }
 
     func setRelayHealth(_ health: RelayHealth) { relay = health }
@@ -137,6 +154,7 @@ final class MeshConnectivityStatus: ObservableObject {
 
     func clear() {
         nearbyPeerIds = []
+        directPaths = [:]
         relay = .noConfig
         contactLastSeen = [:]
         presenceLastSeen = [:]

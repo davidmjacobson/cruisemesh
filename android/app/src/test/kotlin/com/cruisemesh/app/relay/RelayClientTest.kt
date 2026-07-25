@@ -60,6 +60,30 @@ class RelayClientTest {
                 org.junit.Assert.fail("expected RelayHttpException")
             } catch (e: RelayHttpException) {
                 assertEquals(401, e.code)
+                assertEquals(null, e.relayCode)
+            }
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `hosted pass rejection surfaces stable relay code`() {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(403)
+                .setBody("""{"error":"relay pass expired","code":"family_expired"}"""),
+        )
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "expired-token")
+            try {
+                RelayClient.syncPresence(config, emptyList(), emptyList())
+                org.junit.Assert.fail("expected RelayHttpException")
+            } catch (e: RelayHttpException) {
+                assertEquals(403, e.code)
+                assertEquals("family_expired", e.relayCode)
             }
         } finally {
             server.shutdown()

@@ -61,7 +61,7 @@ import com.cruisemesh.app.R
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AdvancedSettingsScreen(onBack: () -> Unit) {
+fun InternalToolsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val initialRelay = remember { RelayConfigStore.load(context) }
     var relayUrl by remember { mutableStateOf(initialRelay?.relayUrl.orEmpty()) }
@@ -81,7 +81,7 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(stringResource(R.string.ui_advanced_settings)) },
+                title = { Text("Internal tools") },
                 navigationIcon = {
                     IconButton(onClick = ::saveAndBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -126,7 +126,7 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
             }
 
             Spacer(modifier = Modifier.height(28.dp))
-            Text(stringResource(R.string.ui_local_wi_fi_experimental), style = MaterialTheme.typography.titleMedium)
+            Text("Local Wi-Fi field tools", style = MaterialTheme.typography.titleMedium)
             Text(lanStatus.state, modifier = Modifier.padding(top = 8.dp))
             lanStatus.localEndpoint?.let { endpoint ->
                 Text(
@@ -327,6 +327,6 @@ fun AdvancedSettingsScreen(onBack: () -> Unit) {
 @Preview(showBackground = true)
 @Preview(showBackground = true, name = "Advanced Dark", uiMode = Configuration.UI_MODE_NIGHT_YES)
 @Composable
-private fun AdvancedSettingsScreenPreview() {
-    CruiseMeshTheme { AdvancedSettingsScreen(onBack = {}) }
+private fun InternalToolsScreenPreview() {
+    CruiseMeshTheme { InternalToolsScreen(onBack = {}) }
 }

@@ -30,6 +30,8 @@ import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageArrival
+import uniffi.cruisemesh_core.PeerConnectionEventKind
+import uniffi.cruisemesh_core.PeerConnectionTransport
 import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OpenedMessage
@@ -1584,6 +1586,16 @@ internal class InboundEnvelopeProcessor(
                     throughLamport = receipt.lamport,
                     deliveredAtMs = arrival.receivedAt,
                     viaTransport = arrival.transport,
+                )
+                store.recordPeerConnectionEvent(
+                    envelopeSenderUserId,
+                    when (arrival.transport.toInt()) {
+                        0, 1 -> PeerConnectionTransport.BLUETOOTH
+                        3, 4 -> PeerConnectionTransport.LOCAL_WIFI
+                        else -> PeerConnectionTransport.CRUISE_PASS
+                    },
+                    PeerConnectionEventKind.MESSAGE_DELIVERED,
+                    arrival.receivedAt,
                 )
             }
         }
