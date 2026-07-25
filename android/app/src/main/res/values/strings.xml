@@ -1,5 +1,13 @@
 <resources>
     <string name="app_name">CruiseMesh</string>
+    <!-- Settings footer. %1$s is versionName, %2$d the versionCode. The code
+         is the part that identifies a build: versionName falls back to a
+         hardcoded "1.0.0" for anything not built from a release tag, so it is
+         not unique on its own. -->
+    <string name="ui_app_version_label">CruiseMesh %1$s (%2$d)</string>
+    <!-- The author's dedication (Soli Deo gloria). A fixed Latin phrase; not
+         translated, the way it is not translated on a Bach manuscript. -->
+    <string name="ui_soli_deo_gloria" translatable="false">Soli Deo gloria</string>
     <string name="ui_10_0_0_42_45892">10.0.0.42:45892</string>
     <string name="ui_add_a_friend">Add a friend</string>
     <string name="ui_added_you_to_group">Added you to %1$s</string>
