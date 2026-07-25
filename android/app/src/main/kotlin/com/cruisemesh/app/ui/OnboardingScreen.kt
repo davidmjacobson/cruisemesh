@@ -67,7 +67,7 @@ fun OnboardingScreen(
     onComplete: () -> Unit,
 ) {
     var page by rememberSaveable { mutableStateOf(0) }
-    val pages = 4
+    val pages = 5
     val canGoBack = page > 0
     val isLastPage = page == pages - 1
 
@@ -199,6 +199,7 @@ fun OnboardingScreen(
                                     onRequestMeshPermissions = onRequestMeshPermissions,
                                     onRequestBatteryExemption = onRequestBatteryExemption,
                                 )
+                                3 -> WifiSlide()
                                 else -> ProfileSlide(
                                     userId = userId,
                                     displayId = displayId,
@@ -221,10 +222,16 @@ fun OnboardingScreen(
 @Composable
 private fun WelcomeSlide(onRestore: () -> Unit) {
     SlideScaffold(
-        eyebrow = "Nearby-first messaging",
-        title = "Messages that find a way through",
-        body = "CruiseMesh delivers messages to people nearby even without Wi-Fi or cell service — using Bluetooth, local Wi-Fi, or hopping phone to phone.",
+        eyebrow = stringResource(R.string.ui_onboarding_welcome_eyebrow),
+        title = stringResource(R.string.ui_onboarding_welcome_title),
+        body = stringResource(R.string.ui_onboarding_welcome_body),
     ) {
+        Text(
+            stringResource(R.string.ui_onboarding_welcome_support),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 12.dp),
+        )
         TextButton(
             onClick = onRestore,
             modifier = Modifier.padding(top = 8.dp),
@@ -237,13 +244,34 @@ private fun WelcomeSlide(onRestore: () -> Unit) {
 @Composable
 private fun DeliverySlide() {
     SlideScaffold(
-        eyebrow = "How it works",
-        title = "It uses whatever's around",
-        body = "Nearby, messages travel phone-to-phone over Bluetooth and Wi-Fi. Farther away, they hop between other CruiseMesh phones until they reach your friend.",
+        eyebrow = stringResource(R.string.ui_onboarding_delivery_eyebrow),
+        title = stringResource(R.string.ui_onboarding_delivery_title),
+        body = stringResource(R.string.ui_onboarding_delivery_body),
     ) {
         HighlightCard(
-            title = "Private by default",
-            detail = "Always end-to-end encrypted — even the phones that help carry a message can't read it.",
+            title = stringResource(R.string.ui_onboarding_private_title),
+            detail = stringResource(R.string.ui_onboarding_private_detail),
+        )
+    }
+}
+
+/**
+ * T5 slide 4. The single least guessable thing about running CruiseMesh:
+ * staying joined to a Wi-Fi network that has no internet is *useful*, because
+ * the local network reaches nearby phones faster than Bluetooth does. Says so
+ * plainly, and pre-empts the obvious worry that a dead connection will be
+ * treated as a working one.
+ */
+@Composable
+private fun WifiSlide() {
+    SlideScaffold(
+        eyebrow = stringResource(R.string.ui_onboarding_wifi_eyebrow),
+        title = stringResource(R.string.ui_onboarding_wifi_title),
+        body = stringResource(R.string.ui_onboarding_wifi_body),
+    ) {
+        HighlightCard(
+            title = stringResource(R.string.ui_onboarding_wifi_support_title),
+            detail = stringResource(R.string.ui_onboarding_wifi_support_detail),
         )
     }
 }
@@ -256,9 +284,9 @@ private fun PermissionsSlide(
     onRequestBatteryExemption: () -> Unit,
 ) {
     SlideScaffold(
-        eyebrow = "Turn on a few permissions",
-        title = "Give CruiseMesh a way to reach people",
-        body = "Each of these opens up another way for your messages to get through.",
+        eyebrow = stringResource(R.string.ui_onboarding_permissions_eyebrow),
+        title = stringResource(R.string.ui_onboarding_permissions_title),
+        body = stringResource(R.string.ui_onboarding_permissions_body),
     ) {
         if (!meshPermissionsGranted) {
             Surface(
@@ -276,16 +304,22 @@ private fun PermissionsSlide(
             }
         }
 
+        // The T5 draft splits this into three rows (nearby / notifications /
+        // background). Deliberately kept at two: `meshPermissionsGranted` is a
+        // single boolean covering the whole nearby+POST_NOTIFICATIONS set, so
+        // a separate notifications row would show a green tick when only
+        // notifications had been denied. Splitting it needs real per-permission
+        // state first -- a status indicator that can lie is worse than one row.
         val items = listOf(
             PermissionItem(
-                title = "Nearby devices and notifications",
-                detail = "Lets CruiseMesh scan for and connect to phones around you, and notify you when a message arrives.",
+                title = stringResource(R.string.ui_onboarding_permission_nearby_title),
+                detail = stringResource(R.string.ui_onboarding_permission_nearby_detail),
                 enabled = meshPermissionsGranted,
                 required = true,
             ),
             PermissionItem(
-                title = "Background activity",
-                detail = "Keeps the mesh working while your phone is in your pocket.",
+                title = stringResource(R.string.ui_onboarding_permission_background_title),
+                detail = stringResource(R.string.ui_onboarding_permission_background_detail),
                 enabled = batteryExemptionGranted,
                 required = false,
             ),
@@ -346,9 +380,9 @@ private fun ProfileSlide(
     onRemovePhoto: () -> Unit,
 ) {
     SlideScaffold(
-        eyebrow = "Your profile",
-        title = "What name would you like to go by?",
-        body = "This is what people will see when you share your friend card or add each other nearby. You can change it later.",
+        eyebrow = stringResource(R.string.ui_onboarding_profile_eyebrow),
+        title = stringResource(R.string.ui_onboarding_profile_title),
+        body = stringResource(R.string.ui_onboarding_profile_body),
     ) {
         LocalProfileEditor(
             userId = userId,
@@ -359,7 +393,7 @@ private fun ProfileSlide(
             onTakePhoto = onTakePhoto,
             onChoosePhoto = onChoosePhoto,
             onRemovePhoto = onRemovePhoto,
-            helperText = "Your photo is shared with friends after you connect.",
+            helperText = stringResource(R.string.ui_onboarding_profile_photo_helper),
         )
     }
 }
