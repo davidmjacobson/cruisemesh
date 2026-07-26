@@ -10,10 +10,14 @@ struct CruisePassView: View {
     @State private var input: String
     @State private var configured = RelayConfigStore.load()
     @State private var pending: RelaySetup?
-    @State private var parseError: String?
+    @State private var pendingUntrusted: RelaySetup?
+    @State private var setupTask: Task<Void, Never>?
     @State private var isTesting = false
     @State private var resultMessage: String?
     @State private var resultIsError = false
+    @State private var setupCompleted = false
+    @State private var savedForLater = false
+    @State private var showManualEntry = false
     @State private var showCustom = false
     @State private var unverifiedSetup: RelaySetup?
     @State private var showSetupQR = false
@@ -32,122 +36,172 @@ struct CruisePassView: View {
 
     var body: some View {
         Form {
-            Section {
-                Text(configured == nil ? "Set up your Cruise Pass" : "Cruise Pass is configured")
-                    .font(.title2.weight(.semibold))
-                Text(
-                    configured == nil
-                        ? "Open the setup link from your purchase email. If it did not open here, paste the setup card below."
-                        : "Saved for \(relayHost(configured!.relayUrl)). You can replace it with a new setup card at any time."
-                )
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                if configured != nil {
-                    LabeledContent("Status", value: passStatus)
+            if isLinkSetup {
+                Section {
+                    if isTesting || (resultMessage == nil && pending == nil && pendingUntrusted == nil) {
+                        Text("Checking your Cruise Pass")
+                            .font(.title2.weight(.semibold))
+                        HStack {
+                            ProgressView()
+                            Text("This only takes a moment.")
+                        }
+                    } else if setupCompleted {
+                        readyHeading {
+                            Text("You’re all set")
+                        }
+                        Text("Cruise Pass is ready on this phone.")
+                        Button("Done") { dismiss() }
+                            .buttonStyle(.borderedProminent)
+                    } else if savedForLater {
+                        Text("Setup saved")
+                            .font(.title2.weight(.semibold))
+                        Text("We’ll finish checking when this phone is online.")
+                        Button("Done") { dismiss() }
+                            .buttonStyle(.borderedProminent)
+                    } else if pending != nil {
+                        Text("Confirm Cruise Pass change")
+                            .font(.title2.weight(.semibold))
+                        Text("This link is for a different Cruise Pass.")
+                            .foregroundStyle(.secondary)
+                    } else if pendingUntrusted != nil {
+                        Text("Confirm Cruise Pass change")
+                            .font(.title2.weight(.semibold))
+                        Text("This link is for a custom relay.")
+                            .foregroundStyle(.secondary)
+                    } else if let resultMessage {
+                        Text("Cruise Pass wasn’t set up")
+                            .font(.title2.weight(.semibold))
+                        Text(resultMessage)
+                            .foregroundStyle(.red)
+                        if let initialCard {
+                            Button("Try again") { startSetup(initialCard) }
+                        }
+                    }
+                    if let setup = unverifiedSetup {
+                        Button("Save and check later") {
+                            saveAndCheckLater(setup)
+                        }
+                    }
+                    if resultIsError && !isTesting {
+                        Button("Not now", role: .cancel) { dismiss() }
+                    }
                 }
-            }
+            } else {
+                Section {
+                    if configured != nil && isVerified {
+                        readyHeading {
+                            Text("Cruise Pass is set up")
+                        }
+                    } else {
+                        Text(configured == nil ? "Set up your Cruise Pass" : "Cruise Pass is configured")
+                            .font(.title2.weight(.semibold))
+                    }
+                    if configured == nil {
+                        Text("Paste the setup card from your purchase email. CruiseMesh will test and save it automatically.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        LabeledContent("Status", value: passStatus)
+                    }
+                }
 
-            Section("Setup card") {
-                TextEditor(text: $input)
-                    .frame(minHeight: 90)
-                    .font(.footnote.monospaced())
-                HStack {
-                    Button("Paste card") {
-                        input = UIPasteboard.general.string ?? ""
-                        if !input.isEmpty { review(input) }
+                if configured == nil || showManualEntry {
+                    Section("Setup") {
+                        Button("Paste and set up", action: pasteAndStart)
+                            .buttonStyle(.borderedProminent)
+                            .disabled(isTesting)
+                        Button(showManualEntry ? "Hide manual entry" : "Enter setup card manually") {
+                            showManualEntry.toggle()
+                        }
+                        if showManualEntry {
+                            TextEditor(text: $input)
+                                .frame(minHeight: 90)
+                                .font(.footnote.monospaced())
+                            Button("Check and save") { startSetup(input) }
+                                .disabled(
+                                    input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                                    isTesting
+                                )
+                        }
+                        if isTesting {
+                            HStack {
+                                ProgressView()
+                                Text("Checking and saving…")
+                            }
+                        }
+                        if let resultMessage {
+                            Text(resultMessage)
+                                .font(.caption)
+                                .foregroundStyle(resultIsError ? .red : .green)
+                        }
+                        if let setup = unverifiedSetup {
+                            Button("Save and check later") {
+                                saveAndCheckLater(setup)
+                            }
+                        }
                     }
-                    Spacer()
-                    Button("Review") { review(input) }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-                if let parseError {
-                    Text(parseError).font(.caption).foregroundStyle(.red)
-                }
-                if isTesting {
-                    HStack {
-                        ProgressView()
-                        Text("Checking this setup before saving…")
+                } else {
+                    Section {
+                        Button("Use a different Cruise Pass") {
+                            resultMessage = nil
+                            resultIsError = false
+                            showManualEntry = true
+                        }
                     }
                 }
-                if let resultMessage {
-                    Text(resultMessage)
-                        .font(.caption)
-                        .foregroundStyle(resultIsError ? .red : .green)
-                }
-                if let setup = unverifiedSetup {
-                    Button("Save and check later") {
-                        RelayConfigStore.save(
-                            relayUrl: setup.relayUrl,
-                            relayToken: setup.relayToken
+
+                if let configured {
+                    Section("Family phones") {
+                        let card = try? makeRelaySetupCard(
+                            relayUrl: configured.relayUrl,
+                            relayToken: configured.relayToken
                         )
-                        configured = RelayConfig(
-                            relayUrl: setup.relayUrl,
-                            relayToken: setup.relayToken
-                        )
-                        unverifiedSetup = nil
-                        MeshConnectivityStatus.shared.setRelayHealth(.checking)
-                        resultIsError = false
-                        resultMessage = "Setup saved. CruiseMesh will verify it when this phone is online."
-                        appModel.startMesh()
+                        if let card, let url = URL(string: "https://cruisemesh.app/r#\(card)") {
+                            ShareLink(item: url) {
+                                Label("Set up another phone", systemImage: "square.and.arrow.up")
+                            }
+                            Button {
+                                showSetupQR = true
+                            } label: {
+                                Label("Show setup QR", systemImage: "qrcode")
+                            }
+                        }
+                        Text("Share this only with your family’s phones.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Remove Cruise Pass setup", role: .destructive) {
+                            showRemoveConfirmation = true
+                        }
                     }
                 }
-            }
 
-            if let configured {
-                Section("Household setup") {
-                    let card = try? makeRelaySetupCard(
-                        relayUrl: configured.relayUrl,
-                        relayToken: configured.relayToken
-                    )
-                    if let card, let url = URL(string: "https://cruisemesh.app/r#\(card)") {
-                        ShareLink(item: url) {
-                            Label("Set up another phone", systemImage: "square.and.arrow.up")
+                Section {
+                    DisclosureGroup("Custom relay", isExpanded: $showCustom) {
+                        Text("For self-hosted relays and development.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextField("Relay URL", text: $customUrl)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        SecureField("Relay token", text: $customToken)
+                        Button("Test and save") {
+                            do {
+                                let card = try makeRelaySetupCard(
+                                    relayUrl: customUrl,
+                                    relayToken: customToken
+                                )
+                                testAndSave(try parseRelaySetupText(text: card))
+                            } catch {
+                                resultIsError = true
+                                resultMessage = "Enter a complete HTTPS relay URL and token."
+                            }
                         }
-                        Button {
-                            showSetupQR = true
-                        } label: {
-                            Label("Show setup QR", systemImage: "qrcode")
-                        }
+                        .disabled(customUrl.isEmpty || customToken.isEmpty || isTesting)
                     }
-                    Button("Remove Cruise Pass setup", role: .destructive) {
-                        showRemoveConfirmation = true
-                    }
-                    Text("Anyone with this link can use your family's internet delivery. Share it only with your own phones.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("Each family phone needs this setup. A configured phone with internet can help move the family's queued messages; Cruise Pass does not share that phone's internet connection.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Section {
-                DisclosureGroup("Custom relay", isExpanded: $showCustom) {
-                    Text("For self-hosted relays and development. Most people should use the setup card above.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    TextField("Relay URL", text: $customUrl)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    SecureField("Relay token", text: $customToken)
-                    Button("Test and save") {
-                        do {
-                            let card = try makeRelaySetupCard(
-                                relayUrl: customUrl,
-                                relayToken: customToken
-                            )
-                            testAndSave(try parseRelaySetupText(text: card))
-                        } catch {
-                            resultIsError = true
-                            resultMessage = "Enter a complete HTTPS relay URL and token."
-                        }
-                    }
-                    .disabled(customUrl.isEmpty || customToken.isEmpty || isTesting)
                 }
             }
         }
-        .navigationTitle("Cruise Pass")
+        .navigationTitle(isLinkSetup ? "Setting up Cruise Pass" : "Cruise Pass")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
@@ -155,7 +209,10 @@ struct CruisePassView: View {
             }
         }
         .onAppear {
-            if let initialCard, !initialCard.isEmpty { review(initialCard) }
+            if let initialCard, !initialCard.isEmpty { startSetup(initialCard) }
+        }
+        .onDisappear {
+            setupTask?.cancel()
         }
         .sheet(isPresented: $showSetupQR) {
             if let configured,
@@ -208,16 +265,21 @@ struct CruisePassView: View {
                 customUrl = ""
                 customToken = ""
                 resultMessage = nil
+                setupCompleted = false
+                savedForLater = false
             }
         } message: {
             Text("Queued internet delivery will stop until another Cruise Pass or custom relay is set up. Nearby delivery still works.")
         }
-        .alert("Use this Cruise Pass?", isPresented: Binding(
+        .alert("Replace Cruise Pass?", isPresented: Binding(
             get: { pending != nil },
             set: { if !$0 { pending = nil } }
         )) {
-            Button("Cancel", role: .cancel) { pending = nil }
-            Button("Test and use") {
+            Button("Keep current pass", role: .cancel) {
+                pending = nil
+                if isLinkSetup { dismiss() }
+            }
+            Button("Replace and test") {
                 if let setup = pending { testAndSave(setup) }
             }
         } message: {
@@ -229,47 +291,144 @@ struct CruisePassView: View {
                 }
             }
         }
+        .alert("Set up this relay?", isPresented: Binding(
+            get: { pendingUntrusted != nil },
+            set: { if !$0 { pendingUntrusted = nil } }
+        )) {
+            Button("Cancel", role: .cancel) {
+                pendingUntrusted = nil
+                if isLinkSetup { dismiss() }
+            }
+            Button("Set up and test") {
+                if let setup = pendingUntrusted { testAndSave(setup) }
+            }
+        } message: {
+            if let setup = pendingUntrusted {
+                Text("Host: \(relayHost(setup.relayUrl))\n\nThis setup card isn’t for the official Cruise Pass service. Only continue if you set this relay up yourself.")
+            }
+        }
     }
 
-    private func review(_ text: String) {
+    private var isLinkSetup: Bool {
+        !(initialCard?.isEmpty ?? true)
+    }
+
+    // Deliberately health-only: a completed check from minutes ago must not
+    // keep the green check alive after the relay starts rejecting the pass.
+    private var isVerified: Bool {
+        if case .ok = connectivity.relay { return true }
+        return false
+    }
+
+    private func readyHeading<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .accessibilityHidden(true)
+            content()
+                .font(.title2.weight(.semibold))
+        }
+    }
+
+    private func startSetup(_ text: String) {
         do {
-            pending = try parseRelaySetupText(text: text)
-            parseError = nil
+            let setup = try parseRelaySetupText(text: text)
+            if let configured,
+               (configured.relayUrl != setup.relayUrl || configured.relayToken != setup.relayToken) {
+                pending = setup
+            } else if configured == nil && !relaySetupIsOfficial(relayUrl: setup.relayUrl) {
+                pendingUntrusted = setup
+            } else {
+                testAndSave(setup)
+            }
         } catch {
             pending = nil
-            parseError = "That setup card is incomplete or invalid. Copy the whole CMRELAY1 card and try again."
+            setupCompleted = false
+            savedForLater = false
+            resultIsError = true
+            resultMessage = "That setup card is incomplete or invalid. Copy the whole card and try again."
         }
+    }
+
+    private func pasteAndStart() {
+        input = UIPasteboard.general.string ?? ""
+        guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            resultIsError = true
+            resultMessage = "Copy the setup card from your purchase email first."
+            return
+        }
+        startSetup(input)
+    }
+
+    private func saveAndCheckLater(_ setup: RelaySetup) {
+        RelayConfigStore.save(
+            relayUrl: setup.relayUrl,
+            relayToken: setup.relayToken
+        )
+        configured = RelayConfig(
+            relayUrl: setup.relayUrl,
+            relayToken: setup.relayToken
+        )
+        unverifiedSetup = nil
+        MeshConnectivityStatus.shared.setRelayHealth(.checking)
+        resultIsError = false
+        resultMessage = "Setup saved. CruiseMesh will check it when this phone is online."
+        setupCompleted = false
+        savedForLater = true
+        appModel.startMesh()
     }
 
     private func testAndSave(_ setup: RelaySetup) {
         pending = nil
+        pendingUntrusted = nil
         unverifiedSetup = nil
         isTesting = true
+        setupCompleted = false
+        savedForLater = false
         resultMessage = nil
-        Task {
-            let result = await Task.detached(priority: .userInitiated) {
-                Result {
-                    _ = try RelayClient.syncPresence(
-                        config: RelayConfig(relayUrl: setup.relayUrl, relayToken: setup.relayToken),
-                        announce: [],
-                        query: []
-                    )
-                }
-            }.value
+        setupTask?.cancel()
+        setupTask = Task {
+            func checkRelay() async -> Result<Void, Error> {
+                await Task.detached(priority: .userInitiated) {
+                    Result {
+                        _ = try RelayClient.syncPresence(
+                            config: RelayConfig(relayUrl: setup.relayUrl, relayToken: setup.relayToken),
+                            announce: [],
+                            query: []
+                        )
+                    }
+                }.value
+            }
+            var result = await checkRelay()
+            // Retry only transport-level failures: HTTP rejections are
+            // deterministic, and anything else would fail identically.
+            if case .failure(let error) = result, error is URLError {
+                try? await Task.sleep(nanoseconds: 750_000_000)
+                if Task.isCancelled { return }
+                result = await checkRelay()
+            }
+            // The user dismissed the screen mid-check; saving now would
+            // configure the pass behind their back.
+            if Task.isCancelled { return }
             await MainActor.run {
                 isTesting = false
                 switch result {
                 case .success:
                     RelayConfigStore.save(relayUrl: setup.relayUrl, relayToken: setup.relayToken)
                     configured = RelayConfig(relayUrl: setup.relayUrl, relayToken: setup.relayToken)
+                    showManualEntry = false
                     MeshConnectivityStatus.shared.setRelayHealth(
                         .ok(lastSyncMs: Int64(Date().timeIntervalSince1970 * 1_000))
                     )
                     appModel.startMesh()
                     resultIsError = false
                     resultMessage = "Cruise Pass is ready on this phone."
+                    setupCompleted = true
                 case .failure(let error):
                     resultIsError = true
+                    setupCompleted = false
                     if let relay = error as? RelayHTTPError, relay.relayCode == "family_expired" {
                         resultMessage = "This Cruise Pass has expired. Renew it, then open the new setup link."
                     } else if let relay = error as? RelayHTTPError, relay.relayCode == "family_suspended" {
@@ -278,10 +437,29 @@ struct CruisePassView: View {
                         resultMessage = "This setup card was rejected. Check the card, or contact support."
                     } else {
                         unverifiedSetup = setup
-                        resultMessage = "CruiseMesh could not check this setup. Retry, or save it and CruiseMesh will check when this phone is online."
+                        resultMessage = setupFailureMessage(error)
                     }
                 }
             }
+        }
+    }
+
+    private func setupFailureMessage(_ error: Error) -> String {
+        guard let urlError = error as? URLError else {
+            return "CruiseMesh couldn’t reach Cruise Pass. Try again. If it keeps happening, check your VPN or security app."
+        }
+        switch urlError.code {
+        case .timedOut:
+            return "Cruise Pass took too long to respond. Try again."
+        case .cannotFindHost, .dnsLookupFailed:
+            return "CruiseMesh couldn’t find the Cruise Pass service. Check Private DNS or VPN settings, then try again."
+        case .secureConnectionFailed, .serverCertificateUntrusted,
+             .serverCertificateHasBadDate, .serverCertificateNotYetValid:
+            return "CruiseMesh couldn’t make a secure connection to Cruise Pass. Check the phone’s date, VPN, or security app, then try again."
+        case .notConnectedToInternet, .networkConnectionLost:
+            return "CruiseMesh couldn’t reach Cruise Pass. Check the connection or VPN, then try again."
+        default:
+            return "CruiseMesh couldn’t reach Cruise Pass. Try again. If it keeps happening, check your VPN or security app."
         }
     }
 

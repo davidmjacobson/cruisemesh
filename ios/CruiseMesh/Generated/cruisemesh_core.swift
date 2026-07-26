@@ -1746,8 +1746,8 @@ public protocol MessageStoreProtocol : AnyObject {
     
     func clearFriendSuggestions() throws 
     
-    func clearPeerConnectionHistory() throws
-
+    func clearPeerConnectionHistory() throws 
+    
     /**
      * The canonical JPEG avatar bytes for a contact, if one has been synced.
      */
@@ -2272,9 +2272,9 @@ public protocol MessageStoreProtocol : AnyObject {
     func outgoingReceiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8) throws  -> UInt64
     
     func peerConnectionEvents(userId: Data?, limit: UInt32) throws  -> [PeerConnectionEvent]
-
+    
     func peerConnectionSummaries() throws  -> [PeerConnectionSummary]
-
+    
     /**
      * Relay-upload candidates: locally authored envelopes not yet marked as
      * posted to a relay, unexpired as of `now_ms`, oldest first.
@@ -2402,8 +2402,8 @@ public protocol MessageStoreProtocol : AnyObject {
      * Identical high-frequency signals are coalesced for 30 seconds; detailed
      * events are retained for 30 days and capped at 1,000 rows.
      */
-    func recordPeerConnectionEvent(userId: Data, transport: PeerConnectionTransport, kind: PeerConnectionEventKind, occurredAtMs: Int64) throws
-
+    func recordPeerConnectionEvent(userId: Data, transport: PeerConnectionTransport, kind: PeerConnectionEventKind, occurredAtMs: Int64) throws 
+    
     /**
      * Record that a peer has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` (DESIGN.md
@@ -2856,7 +2856,7 @@ open func clearPeerConnectionHistory()throws  {try rustCallWithError(FfiConverte
     )
 }
 }
-
+    
     /**
      * The canonical JPEG avatar bytes for a contact, if one has been synced.
      */
@@ -3715,14 +3715,14 @@ open func peerConnectionEvents(userId: Data?, limit: UInt32)throws  -> [PeerConn
     )
 })
 }
-
+    
 open func peerConnectionSummaries()throws  -> [PeerConnectionSummary] {
     return try  FfiConverterSequenceTypePeerConnectionSummary.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_peer_connection_summaries(self.uniffiClonePointer(),$0
     )
 })
 }
-
+    
     /**
      * Relay-upload candidates: locally authored envelopes not yet marked as
      * posted to a relay, unexpired as of `now_ms`, oldest first.
@@ -3947,7 +3947,7 @@ open func recordPeerConnectionEvent(userId: Data, transport: PeerConnectionTrans
     )
 }
 }
-
+    
     /**
      * Record that a peer has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` (DESIGN.md
@@ -8429,9 +8429,9 @@ public struct FfiConverterTypePeerConnectionEvent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PeerConnectionEvent {
         return
             try PeerConnectionEvent(
-                userId: FfiConverterData.read(from: &buf),
-                transport: FfiConverterTypePeerConnectionTransport.read(from: &buf),
-                kind: FfiConverterTypePeerConnectionEventKind.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                transport: FfiConverterTypePeerConnectionTransport.read(from: &buf), 
+                kind: FfiConverterTypePeerConnectionEventKind.read(from: &buf), 
                 occurredAtMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -8523,11 +8523,11 @@ public struct FfiConverterTypePeerConnectionSummary: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PeerConnectionSummary {
         return
             try PeerConnectionSummary(
-                userId: FfiConverterData.read(from: &buf),
-                transport: FfiConverterTypePeerConnectionTransport.read(from: &buf),
-                lastConnectedAtMs: FfiConverterOptionInt64.read(from: &buf),
-                lastDisconnectedAtMs: FfiConverterOptionInt64.read(from: &buf),
-                lastSeenAtMs: FfiConverterOptionInt64.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                transport: FfiConverterTypePeerConnectionTransport.read(from: &buf), 
+                lastConnectedAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                lastDisconnectedAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                lastSeenAtMs: FfiConverterOptionInt64.read(from: &buf), 
                 lastDeliveredAtMs: FfiConverterOptionInt64.read(from: &buf)
         )
     }
@@ -8861,7 +8861,7 @@ public struct FfiConverterTypeRelaySetup: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelaySetup {
         return
             try RelaySetup(
-                relayUrl: FfiConverterString.read(from: &buf),
+                relayUrl: FfiConverterString.read(from: &buf), 
                 relayToken: FfiConverterString.read(from: &buf)
         )
     }
@@ -9955,7 +9955,7 @@ extension Frame: Equatable, Hashable {}
  */
 
 public enum PeerConnectionEventKind {
-
+    
     case connected
     case disconnected
     case presenceSeen
@@ -9972,38 +9972,38 @@ public struct FfiConverterTypePeerConnectionEventKind: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PeerConnectionEventKind {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-
+        
         case 1: return .connected
-
+        
         case 2: return .disconnected
-
+        
         case 3: return .presenceSeen
-
+        
         case 4: return .messageDelivered
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: PeerConnectionEventKind, into buf: inout [UInt8]) {
         switch value {
-
-
+        
+        
         case .connected:
             writeInt(&buf, Int32(1))
-
-
+        
+        
         case .disconnected:
             writeInt(&buf, Int32(2))
-
-
+        
+        
         case .presenceSeen:
             writeInt(&buf, Int32(3))
-
-
+        
+        
         case .messageDelivered:
             writeInt(&buf, Int32(4))
-
+        
         }
     }
 }
@@ -10036,7 +10036,7 @@ extension PeerConnectionEventKind: Equatable, Hashable {}
  */
 
 public enum PeerConnectionTransport {
-
+    
     case bluetooth
     case localWifi
     case cruisePass
@@ -10052,32 +10052,32 @@ public struct FfiConverterTypePeerConnectionTransport: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PeerConnectionTransport {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-
+        
         case 1: return .bluetooth
-
+        
         case 2: return .localWifi
-
+        
         case 3: return .cruisePass
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: PeerConnectionTransport, into buf: inout [UInt8]) {
         switch value {
-
-
+        
+        
         case .bluetooth:
             writeInt(&buf, Int32(1))
-
-
+        
+        
         case .localWifi:
             writeInt(&buf, Int32(2))
-
-
+        
+        
         case .cruisePass:
             writeInt(&buf, Int32(3))
-
+        
         }
     }
 }
@@ -12550,6 +12550,23 @@ public func relayMaxResponseBytes() -> UInt32 {
     )
 })
 }
+/**
+ * True when a setup card points at the hosted Cruise Pass service.
+ *
+ * URL fragments are unsigned, so anyone can mint a `cruisemesh.app/r#…`
+ * link naming their own relay. The shells auto-accept first-time setup only
+ * for the official host and require an explicit host confirmation for
+ * everything else. Deliberately strict: any port, path, userinfo, or
+ * trailing-dot variant is "not official" — the only cost of a false
+ * negative is one confirmation tap.
+ */
+public func relaySetupIsOfficial(relayUrl: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_setup_is_official(
+        FfiConverterString.lower(relayUrl),$0
+    )
+})
+}
 public func resolvedContactRelay(contactRelayUrl: String?, contactRelayToken: String?, fallbackUrl: String?, fallbackToken: String?) -> RelayEndpoint? {
     return try!  FfiConverterOptionTypeRelayEndpoint.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_resolved_contact_relay(
@@ -12989,6 +13006,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 55007) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_resolved_contact_relay() != 13200) {

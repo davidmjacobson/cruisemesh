@@ -55,7 +55,7 @@ fun HelpSupportScreen(
         ) {
             HelpItem(
                 "Set up or fix Cruise Pass",
-                "Paste the CMRELAY1 card from your purchase email, review it, then test and use it.",
+                "Open the setup link from your purchase email. CruiseMesh checks and saves it automatically.",
                 onCruisePass,
             )
             HelpItem(
@@ -65,7 +65,7 @@ fun HelpSupportScreen(
             )
             HelpItem(
                 "Setup link did not open",
-                "Open Settings → Cruise Pass, paste the complete relay card, choose Review, then Test and use.",
+                "Copy the setup card, then open Settings → Cruise Pass and choose Paste and set up.",
                 onCruisePass,
             )
             Text(

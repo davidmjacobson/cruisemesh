@@ -121,16 +121,6 @@
         }
       }
     },
-    "Anyone with this link can use your family's internet delivery. Share it only with your own phones.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Anyone with this link can use your family's internet delivery. Share it only with your own phones."
-          }
-        }
-      }
-    },
     "Attach": {
       "localizations": {
         "en": {
@@ -231,12 +221,32 @@
         }
       }
     },
-    "Checking this setup before saving…": {
+    "Check and save": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Checking this setup before saving…"
+            "value": "Check and save"
+          }
+        }
+      }
+    },
+    "Checking and saving…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Checking and saving…"
+          }
+        }
+      }
+    },
+    "Checking your Cruise Pass": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Checking your Cruise Pass"
           }
         }
       }
@@ -287,6 +297,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Close and reopen CruiseMesh to finish installing the restored account."
+          }
+        }
+      }
+    },
+    "Confirm Cruise Pass change": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Confirm Cruise Pass change"
           }
         }
       }
@@ -387,6 +407,36 @@
           "stringUnit": {
             "state": "translated",
             "value": "Cruise Pass"
+          }
+        }
+      }
+    },
+    "Cruise Pass is ready on this phone.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cruise Pass is ready on this phone."
+          }
+        }
+      }
+    },
+    "Cruise Pass is set up": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cruise Pass is set up"
+          }
+        }
+      }
+    },
+    "Cruise Pass wasn’t set up": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cruise Pass wasn’t set up"
           }
         }
       }
@@ -541,16 +591,6 @@
         }
       }
     },
-    "Each family phone needs this setup. A configured phone with internet can help move the family's queued messages; Cruise Pass does not share that phone's internet connection.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Each family phone needs this setup. A configured phone with internet can help move the family's queued messages; Cruise Pass does not share that phone's internet connection."
-          }
-        }
-      }
-    },
     "Each of these opens up another path for your messages.": {
       "localizations": {
         "en": {
@@ -611,6 +651,16 @@
         }
       }
     },
+    "Family phones": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Family phones"
+          }
+        }
+      }
+    },
     "Family token": {
       "localizations": {
         "en": {
@@ -631,12 +681,12 @@
         }
       }
     },
-    "For self-hosted relays and development. Most people should use the setup card above.": {
+    "For self-hosted relays and development.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "For self-hosted relays and development. Most people should use the setup card above."
+            "value": "For self-hosted relays and development."
           }
         }
       }
@@ -771,16 +821,6 @@
         }
       }
     },
-    "Household setup": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Household setup"
-          }
-        }
-      }
-    },
     "I agree": {
       "localizations": {
         "en": {
@@ -791,12 +831,12 @@
         }
       }
     },
-    "If a setup link does not open, go to Settings → Cruise Pass, paste the complete card, choose Review, then Test and use.": {
+    "If the link does not open, copy the setup card, then go to Settings → Cruise Pass and choose Paste and set up.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "If a setup link does not open, go to Settings → Cruise Pass, paste the complete card, choose Review, then Test and use."
+            "value": "If the link does not open, copy the setup card, then go to Settings → Cruise Pass and choose Paste and set up."
           }
         }
       }
@@ -847,6 +887,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Keep Wi-Fi connected even when it has no internet — CruiseMesh uses it to reach phones near you."
+          }
+        }
+      }
+    },
+    "Keep current pass": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Keep current pass"
           }
         }
       }
@@ -1101,6 +1151,16 @@
         }
       }
     },
+    "Not now": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Not now"
+          }
+        }
+      }
+    },
     "Notice": {
       "localizations": {
         "en": {
@@ -1141,6 +1201,16 @@
         }
       }
     },
+    "Open the setup link from your purchase email. CruiseMesh checks and saves it automatically.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open the setup link from your purchase email. CruiseMesh checks and saves it automatically."
+          }
+        }
+      }
+    },
     "Overview": {
       "localizations": {
         "en": {
@@ -1171,12 +1241,12 @@
         }
       }
     },
-    "Paste card": {
+    "Paste and set up": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Paste card"
+            "value": "Paste and set up"
           }
         }
       }
@@ -1191,12 +1261,12 @@
         }
       }
     },
-    "Paste the CMRELAY1 card from your purchase email, review it, then test and use it.": {
+    "Paste the setup card from your purchase email. CruiseMesh will test and save it automatically.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Paste the CMRELAY1 card from your purchase email, review it, then test and use it."
+            "value": "Paste the setup card from your purchase email. CruiseMesh will test and save it automatically."
           }
         }
       }
@@ -1441,6 +1511,26 @@
         }
       }
     },
+    "Replace Cruise Pass?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Replace Cruise Pass?"
+          }
+        }
+      }
+    },
+    "Replace and test": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Replace and test"
+          }
+        }
+      }
+    },
     "Reply": {
       "localizations": {
         "en": {
@@ -1477,16 +1567,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Restore ready"
-          }
-        }
-      }
-    },
-    "Review": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Review"
           }
         }
       }
@@ -1601,6 +1681,16 @@
         }
       }
     },
+    "Set up and test": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set up and test"
+          }
+        }
+      }
+    },
     "Set up another phone": {
       "localizations": {
         "en": {
@@ -1621,6 +1711,16 @@
         }
       }
     },
+    "Set up this relay?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set up this relay?"
+          }
+        }
+      }
+    },
     "Settings": {
       "localizations": {
         "en": {
@@ -1631,12 +1731,22 @@
         }
       }
     },
-    "Setup card": {
+    "Setup": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Setup card"
+            "value": "Setup"
+          }
+        }
+      }
+    },
+    "Setup saved": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Setup saved"
           }
         }
       }
@@ -1677,6 +1787,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Share setup link"
+          }
+        }
+      }
+    },
+    "Share this only with your family’s phones.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Share this only with your family’s phones."
           }
         }
       }
@@ -1821,16 +1941,6 @@
         }
       }
     },
-    "Test and use": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Test and use"
-          }
-        }
-      }
-    },
     "Test encrypted LAN link": {
       "localizations": {
         "en": {
@@ -1881,6 +1991,36 @@
         }
       }
     },
+    "This link is for a custom relay.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This link is for a custom relay."
+          }
+        }
+      }
+    },
+    "This link is for a different Cruise Pass.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This link is for a different Cruise Pass."
+          }
+        }
+      }
+    },
+    "This only takes a moment.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This only takes a moment."
+          }
+        }
+      }
+    },
     "This phone": {
       "localizations": {
         "en": {
@@ -1897,6 +2037,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "This removes local connection events and per-person path summaries. Messages and friends are not affected."
+          }
+        }
+      }
+    },
+    "Try again": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Try again"
           }
         }
       }
@@ -1931,12 +2081,12 @@
         }
       }
     },
-    "Use this Cruise Pass?": {
+    "Use a different Cruise Pass": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Use this Cruise Pass?"
+            "value": "Use a different Cruise Pass"
           }
         }
       }
@@ -1957,6 +2107,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Voice memo"
+          }
+        }
+      }
+    },
+    "We’ll finish checking when this phone is online.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "We’ll finish checking when this phone is online."
           }
         }
       }
@@ -2007,6 +2167,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your friend must already be accepted. The QR only supplies a local network address; the encrypted identity check still applies."
+          }
+        }
+      }
+    },
+    "You’re all set": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You’re all set"
           }
         }
       }

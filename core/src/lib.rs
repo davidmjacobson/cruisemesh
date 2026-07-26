@@ -84,7 +84,9 @@ pub use protocol::{
     KIND_RECEIPT, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 pub use recipient_hints::{dedupe_hints, recent_hints_for, recent_presence_hints_for};
-pub use relay_setup::{make_relay_setup_card, parse_relay_setup_text, RelaySetup};
+pub use relay_setup::{
+    make_relay_setup_card, parse_relay_setup_text, relay_setup_is_official, RelaySetup,
+};
 pub use relay_wire::{
     normalize_relay_url, relay_build_fetch_path, relay_decode_fetch_page,
     relay_decode_post_response, relay_decode_presence_page, relay_encode_ack_request,

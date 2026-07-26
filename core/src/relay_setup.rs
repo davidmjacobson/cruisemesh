@@ -13,6 +13,7 @@ const RELAY_SETUP_PREFIX: &str = "CMRELAY1:";
 const MAX_RELAY_SETUP_TEXT_BYTES: usize = 8 * 1024;
 const MAX_RELAY_URL_BYTES: usize = 2 * 1024;
 const MAX_RELAY_TOKEN_BYTES: usize = 1024;
+const OFFICIAL_RELAY_HOST: &str = "relay.cruisemesh.app";
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct RelaySetup {
@@ -81,6 +82,22 @@ pub fn parse_relay_setup_text(text: String) -> Result<RelaySetup, CoreError> {
     validate_setup(wire.relay_url, wire.relay_token)
 }
 
+/// True when a setup card points at the hosted Cruise Pass service.
+///
+/// URL fragments are unsigned, so anyone can mint a `cruisemesh.app/r#…`
+/// link naming their own relay. The shells auto-accept first-time setup only
+/// for the official host and require an explicit host confirmation for
+/// everything else. Deliberately strict: any port, path, userinfo, or
+/// trailing-dot variant is "not official" — the only cost of a false
+/// negative is one confirmation tap.
+#[uniffi::export]
+pub fn relay_setup_is_official(relay_url: String) -> bool {
+    match normalize_relay_url(relay_url).strip_prefix("https://") {
+        Some(host) => host.eq_ignore_ascii_case(OFFICIAL_RELAY_HOST),
+        None => false,
+    }
+}
+
 fn validate_setup(relay_url: String, relay_token: String) -> Result<RelaySetup, CoreError> {
     let relay_url = normalize_relay_url(relay_url);
     let relay_token = relay_token.trim().to_string();
@@ -137,6 +154,44 @@ mod tests {
         .unwrap();
         assert_eq!(setup.relay_url, "https://relay.example");
         assert_eq!(setup.relay_token, "abc123");
+    }
+
+    #[test]
+    fn official_host_matches_exactly_and_case_insensitively() {
+        assert!(relay_setup_is_official(
+            "https://relay.cruisemesh.app".into()
+        ));
+        assert!(relay_setup_is_official(
+            "https://relay.cruisemesh.app/".into()
+        ));
+        assert!(relay_setup_is_official(
+            "https://RELAY.CRUISEMESH.APP".into()
+        ));
+        assert!(relay_setup_is_official("relay.cruisemesh.app".into()));
+
+        assert!(!relay_setup_is_official("https://relay.example".into()));
+        assert!(!relay_setup_is_official(
+            "https://relay.cruisemesh.app.evil.example".into()
+        ));
+        assert!(!relay_setup_is_official(
+            "https://evil.example/relay.cruisemesh.app".into()
+        ));
+        assert!(!relay_setup_is_official(
+            "https://relay.cruisemesh.app:8443".into()
+        ));
+        assert!(!relay_setup_is_official(
+            "https://relay.cruisemesh.app/path".into()
+        ));
+        assert!(!relay_setup_is_official(
+            "https://user@relay.cruisemesh.app".into()
+        ));
+        assert!(!relay_setup_is_official(
+            "https://relay.cruisemesh.app.".into()
+        ));
+        assert!(!relay_setup_is_official(
+            "http://relay.cruisemesh.app".into()
+        ));
+        assert!(!relay_setup_is_official(String::new()));
     }
 
     #[test]
