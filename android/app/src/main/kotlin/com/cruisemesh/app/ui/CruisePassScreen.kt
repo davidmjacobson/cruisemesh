@@ -356,7 +356,10 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                     }
                 } else {
                     OutlinedButton(
-                        onClick = { showManualEntry = true },
+                        onClick = {
+                            setupState = PassSetupState.Idle
+                            showManualEntry = true
+                        },
                         modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
                     ) { Text(stringResource(R.string.ui_use_a_different_cruise_pass)) }
                 }

@@ -136,6 +136,8 @@ struct CruisePassView: View {
                 } else {
                     Section {
                         Button("Use a different Cruise Pass") {
+                            resultMessage = nil
+                            resultIsError = false
                             showManualEntry = true
                         }
                     }

@@ -268,9 +268,7 @@
     <string name="ui_cruise_pass_wasnt_set_up">Cruise Pass wasn’t set up</string>
     <string name="ui_try_again">Try again</string>
     <string name="ui_not_now">Not now</string>
-    <string name="ui_cruise_pass_is_ready">Cruise Pass is ready</string>
     <string name="ui_cruise_pass_is_set_up">Cruise Pass is set up</string>
-    <string name="ui_internet_delivery_is_ready_on_this_phone">Internet delivery is ready on this phone.</string>
     <string name="ui_set_up_your_cruise_pass">Set up your Cruise Pass</string>
     <string name="ui_cruise_pass_is_configured">Cruise Pass is configured</string>
     <string name="ui_status">Status: %1$s</string>
@@ -310,7 +308,6 @@
     <string name="ui_this_cruise_pass_has_expired">This Cruise Pass has expired. Renew it, then open the new setup link.</string>
     <string name="ui_this_cruise_pass_is_suspended">This Cruise Pass is suspended. Contact support for help.</string>
     <string name="ui_this_setup_card_was_rejected">This setup card was rejected. Check the card, or contact support.</string>
-    <string name="ui_cruisemesh_could_not_check_this_setup">CruiseMesh could not check this setup. Retry, or save it and CruiseMesh will check when this phone is online.</string>
     <string name="ui_cruise_pass_check_timed_out">Cruise Pass took too long to respond. Try again.</string>
     <string name="ui_cruise_pass_service_not_found">CruiseMesh couldn’t find the Cruise Pass service. Check Private DNS or VPN settings, then try again.</string>
     <string name="ui_cruise_pass_secure_connection_failed">CruiseMesh couldn’t make a secure connection to Cruise Pass. Check the phone’s date, VPN, or security app, then try again.</string>
