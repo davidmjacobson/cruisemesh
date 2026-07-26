@@ -89,27 +89,53 @@ def main() -> None:
     print(f"Bundle accepted: versionCode {version_code}")
 
     note = f"Automated release {VERSION_NAME}".strip() or "Automated release."
-    body = {
-        "track": TRACK,
-        "releases": [
-            {
-                "versionCodes": [str(version_code)],
-                "status": "completed",
-                "releaseNotes": [{"language": "en-US", "text": note}],
-            }
-        ],
-    }
-    resp = requests.put(
-        f"{BASE}/{PACKAGE}/edits/{edit_id}/tracks/{TRACK}",
-        headers={**headers, "Content-Type": "application/json"},
-        data=json.dumps(body),
-        timeout=30,
-    )
-    if resp.status_code >= 300:
-        die("assign track", resp)
-    print(f"Assigned versionCode {version_code} to '{TRACK}' (status completed).")
 
-    resp = requests.post(f"{BASE}/{PACKAGE}/edits/{edit_id}:commit", headers=headers, timeout=60)
+    def assign_track(status: str) -> None:
+        body = {
+            "track": TRACK,
+            "releases": [
+                {
+                    "versionCodes": [str(version_code)],
+                    "status": status,
+                    "releaseNotes": [{"language": "en-US", "text": note}],
+                }
+            ],
+        }
+        resp = requests.put(
+            f"{BASE}/{PACKAGE}/edits/{edit_id}/tracks/{TRACK}",
+            headers={**headers, "Content-Type": "application/json"},
+            data=json.dumps(body),
+            timeout=30,
+        )
+        if resp.status_code >= 300:
+            die("assign track", resp)
+        print(f"Assigned versionCode {version_code} to '{TRACK}' (status {status}).")
+
+    def commit() -> requests.Response:
+        return requests.post(f"{BASE}/{PACKAGE}/edits/{edit_id}:commit", headers=headers, timeout=60)
+
+    assign_track("completed")
+    resp = commit()
+    if resp.status_code == 400 and "draft app" in resp.text:
+        # An app that has never passed its first Google review only accepts
+        # draft releases on reviewed tracks ("Only releases with status draft
+        # may be created on draft app") — the internal track is exempt, which
+        # is why earlier internal publishes never hit this. A failed commit
+        # leaves the edit open, so stage the same bundle as a draft instead of
+        # failing the run: the first rollout must come from the Play Console
+        # (it starts the app's initial review), and once the app is published
+        # anywhere the completed path works again and this branch goes dormant.
+        print("App is still unpublished (draft app); staging a DRAFT release instead.")
+        assign_track("draft")
+        resp = commit()
+        if resp.status_code >= 300:
+            die("commit draft release", resp)
+        print(
+            f"COMMITTED edit {edit_id}: build {version_code} STAGED AS DRAFT on the "
+            f"'{TRACK}' track. Roll it out in the Play Console to start the app's "
+            "first review; subsequent releases will publish automatically."
+        )
+        return
     if resp.status_code >= 300:
         die("commit", resp)
     print(f"COMMITTED edit {edit_id}: build {version_code} is live on the {TRACK} track.")
