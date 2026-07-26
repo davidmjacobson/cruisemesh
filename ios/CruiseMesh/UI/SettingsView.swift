@@ -167,7 +167,7 @@ struct SettingsView: View {
         case .failing: return "The relay could not be reached."
         case .expired: return "Renew your pass to resume internet delivery."
         case .suspended: return "Contact support for help with this pass."
-        case .tokenRejected: return "Review or replace the saved setup card."
+        case .tokenRejected: return "Paste the setup card again, or use a different Cruise Pass."
         }
     }
 

@@ -252,7 +252,7 @@ private fun relayDetail(health: RelayHealth, configured: Boolean): String {
         is RelayHealth.Failing -> "The relay could not be reached."
         is RelayHealth.Expired -> "Renew your pass to resume internet delivery."
         is RelayHealth.Suspended -> "Contact support for help with this pass."
-        is RelayHealth.TokenRejected -> "Review or replace the saved setup card."
+        is RelayHealth.TokenRejected -> "Paste the setup card again, or use a different Cruise Pass."
     }
 }
 

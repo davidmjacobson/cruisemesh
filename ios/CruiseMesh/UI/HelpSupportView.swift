@@ -13,12 +13,12 @@ struct HelpSupportView: View {
                     } label: {
                         VStack(alignment: .leading, spacing: 3) {
                             Text("Set up or fix Cruise Pass")
-                            Text("Paste the CMRELAY1 card from your purchase email, review it, then test and use it.")
+                            Text("Open the setup link from your purchase email. CruiseMesh checks and saves it automatically.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    Text("If a setup link does not open, go to Settings → Cruise Pass, paste the complete card, choose Review, then Test and use.")
+                    Text("If the link does not open, copy the setup card, then go to Settings → Cruise Pass and choose Paste and set up.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
