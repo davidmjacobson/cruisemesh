@@ -1681,6 +1681,16 @@
         }
       }
     },
+    "Set up and test": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set up and test"
+          }
+        }
+      }
+    },
     "Set up another phone": {
       "localizations": {
         "en": {
@@ -1697,6 +1707,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Set up or fix Cruise Pass"
+          }
+        }
+      }
+    },
+    "Set up this relay?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set up this relay?"
           }
         }
       }
@@ -1967,6 +1987,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "This is what people see when you share your friend card or add each other nearby. You can change it anytime."
+          }
+        }
+      }
+    },
+    "This link is for a custom relay.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This link is for a custom relay."
           }
         }
       }

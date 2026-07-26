@@ -294,6 +294,9 @@
     <string name="ui_test_and_save">Test and save</string>
     <string name="ui_replace_cruise_pass">Replace Cruise Pass?</string>
     <string name="ui_keep_current_pass">Keep current pass</string>
+    <string name="ui_set_up_this_relay">Set up this relay?</string>
+    <string name="ui_this_card_is_not_for_the_official_service">This setup card isn\'t for the official Cruise Pass service. Only continue if you set this relay up yourself.</string>
+    <string name="ui_set_up_and_test">Set up and test</string>
     <string name="ui_host_pass">Host: %1$s</string>
     <string name="ui_replace_with">Replace %1$s with %2$s?</string>
     <string name="ui_this_will_replace_any_relay_currently_saved_on">This will replace any setup currently saved on this phone. Your family\'s token stays hidden.</string>

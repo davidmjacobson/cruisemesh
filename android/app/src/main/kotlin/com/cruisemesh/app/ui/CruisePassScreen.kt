@@ -56,6 +56,8 @@ import com.cruisemesh.app.R
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.mesh.RelaySyncEvents
+import com.cruisemesh.app.mesh.relayCheckFailureRes
+import com.cruisemesh.app.mesh.shouldRetryFirstRelayCheck
 import com.cruisemesh.app.relay.RelayClient
 import com.cruisemesh.app.relay.RelayConfig
 import com.cruisemesh.app.relay.RelayConfigStore
@@ -63,20 +65,19 @@ import com.cruisemesh.app.relay.RelayHttpException
 import com.cruisemesh.app.friending.encodeQrBitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.net.SocketTimeoutException
-import java.net.UnknownHostException
-import javax.net.ssl.SSLException
 import uniffi.cruisemesh_core.RelaySetup
 import uniffi.cruisemesh_core.makeRelaySetupCard
 import uniffi.cruisemesh_core.parseRelaySetupText
+import uniffi.cruisemesh_core.relaySetupIsOfficial
 
 private sealed class PassSetupState {
     object Idle : PassSetupState()
     object Testing : PassSetupState()
-    data class Checking(val relayUrl: String) : PassSetupState()
-    data class Saved(val relayUrl: String) : PassSetupState()
+    object Checking : PassSetupState()
+    object Saved : PassSetupState()
     data class Failed(val message: String) : PassSetupState()
 }
 
@@ -89,6 +90,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
     var configured by remember { mutableStateOf(RelayConfigStore.load(context)) }
     var input by remember { mutableStateOf(initialCard.orEmpty()) }
     var pending by remember { mutableStateOf<RelaySetup?>(null) }
+    var pendingUntrusted by remember { mutableStateOf<RelaySetup?>(null) }
     var setupState by remember { mutableStateOf<PassSetupState>(PassSetupState.Idle) }
     var showCustom by remember { mutableStateOf(false) }
     var showManualEntry by remember { mutableStateOf(false) }
@@ -100,6 +102,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
 
     fun testAndSave(setup: RelaySetup) {
         pending = null
+        pendingUntrusted = null
         unverifiedSetup = null
         setupState = PassSetupState.Testing
         scope.launch {
@@ -113,14 +116,16 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                 }
             }
             var result = checkRelay()
+            ensureActive()
             val firstError = result.exceptionOrNull()
-            if (firstError != null && firstError !is RelayHttpException) {
+            if (firstError != null && shouldRetryFirstRelayCheck(firstError)) {
                 Log.i(
                     "CruisePassSetup",
                     "Retrying initial check after ${firstError.javaClass.simpleName}",
                 )
                 delay(750)
                 result = checkRelay()
+                ensureActive()
             }
             result.onSuccess {
                 RelayConfigStore.save(context, setup.relayUrl, setup.relayToken)
@@ -129,7 +134,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                 MeshConnectivityStatus.setRelayHealth(RelayHealth.Ok(System.currentTimeMillis()))
                 RelaySyncEvents.requestSync()
                 pending = null
-                setupState = PassSetupState.Saved(setup.relayUrl)
+                setupState = PassSetupState.Saved
             }.onFailure { error ->
                 if (error !is RelayHttpException) {
                     unverifiedSetup = setup
@@ -146,16 +151,17 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
 
     fun startSetup(text: String) {
         pending = null
+        pendingUntrusted = null
         runCatching { parseRelaySetupText(text) }
             .onSuccess { setup ->
                 val current = configured
-                if (
+                when {
                     current != null &&
-                    (current.relayUrl != setup.relayUrl || current.relayToken != setup.relayToken)
-                ) {
-                    pending = setup
-                } else {
-                    testAndSave(setup)
+                        (current.relayUrl != setup.relayUrl || current.relayToken != setup.relayToken) ->
+                        pending = setup
+                    current == null && !relaySetupIsOfficial(setup.relayUrl) ->
+                        pendingUntrusted = setup
+                    else -> testAndSave(setup)
                 }
             }
             .onFailure {
@@ -275,7 +281,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                             MeshConnectivityStatus.setRelayHealth(RelayHealth.Checking)
                             RelaySyncEvents.requestSync()
                             unverifiedSetup = null
-                            setupState = PassSetupState.Checking(setup.relayUrl)
+                            setupState = PassSetupState.Checking
                         },
                         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                     ) { Text(stringResource(R.string.ui_save_and_check_later)) }
@@ -287,7 +293,10 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                     ) { Text(stringResource(R.string.ui_not_now)) }
                 }
             } else {
-                val verified = setupState is PassSetupState.Saved || relayHealth is RelayHealth.Ok
+                // Deliberately health-only: a Saved state from minutes ago must
+                // not keep the green check alive after the relay starts
+                // rejecting the pass.
+                val verified = relayHealth is RelayHealth.Ok
                 if (configured != null && verified) {
                     CruisePassReadyHeading(
                         text = stringResource(R.string.ui_cruise_pass_is_set_up),
@@ -387,7 +396,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                             MeshConnectivityStatus.setRelayHealth(RelayHealth.Checking)
                             RelaySyncEvents.requestSync()
                             unverifiedSetup = null
-                            setupState = PassSetupState.Checking(setup.relayUrl)
+                            setupState = PassSetupState.Checking
                         },
                         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                     ) { Text(stringResource(R.string.ui_save_and_check_later)) }
@@ -527,6 +536,38 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
         )
     }
 
+    pendingUntrusted?.let { setup ->
+        AlertDialog(
+            onDismissRequest = {
+                pendingUntrusted = null
+                if (!initialCard.isNullOrBlank()) onBack()
+            },
+            title = { Text(stringResource(R.string.ui_set_up_this_relay)) },
+            text = {
+                Column {
+                    Text(stringResource(R.string.ui_host_pass, relayHost(setup.relayUrl)))
+                    Text(
+                        stringResource(R.string.ui_this_card_is_not_for_the_official_service),
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { testAndSave(setup) }) {
+                    Text(stringResource(R.string.ui_set_up_and_test))
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        pendingUntrusted = null
+                        if (!initialCard.isNullOrBlank()) onBack()
+                    },
+                ) { Text(stringResource(R.string.ui_cancel)) }
+            },
+        )
+    }
+
     setupQrLink?.let { link ->
         val qr = remember(link) { encodeQrBitmap(link) }
         AlertDialog(
@@ -581,26 +622,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
 private fun setupFailureMessage(
     context: Context,
     error: Throwable,
-): String = context.getString(
-    when {
-        (error as? RelayHttpException)?.relayCode == "family_expired" ->
-            R.string.ui_this_cruise_pass_has_expired
-        (error as? RelayHttpException)?.relayCode == "family_suspended" ->
-            R.string.ui_this_cruise_pass_is_suspended
-        error is RelayHttpException ->
-            R.string.ui_this_setup_card_was_rejected
-        error is SocketTimeoutException ->
-            R.string.ui_cruise_pass_check_timed_out
-        error is UnknownHostException ->
-            R.string.ui_cruise_pass_service_not_found
-        error is SSLException ->
-            R.string.ui_cruise_pass_secure_connection_failed
-        !hasValidatedInternet(context) ->
-            R.string.ui_android_has_not_verified_internet
-        else ->
-            R.string.ui_cruise_pass_check_failed_network
-    },
-)
+): String = context.getString(relayCheckFailureRes(error, hasValidatedInternet(context)))
 
 private fun hasValidatedInternet(context: Context): Boolean {
     val manager = context.getSystemService(ConnectivityManager::class.java)

@@ -10,6 +10,8 @@ struct CruisePassView: View {
     @State private var input: String
     @State private var configured = RelayConfigStore.load()
     @State private var pending: RelaySetup?
+    @State private var pendingUntrusted: RelaySetup?
+    @State private var setupTask: Task<Void, Never>?
     @State private var isTesting = false
     @State private var resultMessage: String?
     @State private var resultIsError = false
@@ -36,7 +38,7 @@ struct CruisePassView: View {
         Form {
             if isLinkSetup {
                 Section {
-                    if isTesting || (resultMessage == nil && pending == nil) {
+                    if isTesting || (resultMessage == nil && pending == nil && pendingUntrusted == nil) {
                         Text("Checking your Cruise Pass")
                             .font(.title2.weight(.semibold))
                         HStack {
@@ -60,6 +62,11 @@ struct CruisePassView: View {
                         Text("Confirm Cruise Pass change")
                             .font(.title2.weight(.semibold))
                         Text("This link is for a different Cruise Pass.")
+                            .foregroundStyle(.secondary)
+                    } else if pendingUntrusted != nil {
+                        Text("Confirm Cruise Pass change")
+                            .font(.title2.weight(.semibold))
+                        Text("This link is for a custom relay.")
                             .foregroundStyle(.secondary)
                     } else if let resultMessage {
                         Text("Cruise Pass wasn’t set up")
@@ -204,6 +211,9 @@ struct CruisePassView: View {
         .onAppear {
             if let initialCard, !initialCard.isEmpty { startSetup(initialCard) }
         }
+        .onDisappear {
+            setupTask?.cancel()
+        }
         .sheet(isPresented: $showSetupQR) {
             if let configured,
                let card = try? makeRelaySetupCard(
@@ -281,14 +291,31 @@ struct CruisePassView: View {
                 }
             }
         }
+        .alert("Set up this relay?", isPresented: Binding(
+            get: { pendingUntrusted != nil },
+            set: { if !$0 { pendingUntrusted = nil } }
+        )) {
+            Button("Cancel", role: .cancel) {
+                pendingUntrusted = nil
+                if isLinkSetup { dismiss() }
+            }
+            Button("Set up and test") {
+                if let setup = pendingUntrusted { testAndSave(setup) }
+            }
+        } message: {
+            if let setup = pendingUntrusted {
+                Text("Host: \(relayHost(setup.relayUrl))\n\nThis setup card isn’t for the official Cruise Pass service. Only continue if you set this relay up yourself.")
+            }
+        }
     }
 
     private var isLinkSetup: Bool {
         !(initialCard?.isEmpty ?? true)
     }
 
+    // Deliberately health-only: a completed check from minutes ago must not
+    // keep the green check alive after the relay starts rejecting the pass.
     private var isVerified: Bool {
-        if setupCompleted { return true }
         if case .ok = connectivity.relay { return true }
         return false
     }
@@ -311,6 +338,8 @@ struct CruisePassView: View {
             if let configured,
                (configured.relayUrl != setup.relayUrl || configured.relayToken != setup.relayToken) {
                 pending = setup
+            } else if configured == nil && !relaySetupIsOfficial(relayUrl: setup.relayUrl) {
+                pendingUntrusted = setup
             } else {
                 testAndSave(setup)
             }
@@ -353,12 +382,14 @@ struct CruisePassView: View {
 
     private func testAndSave(_ setup: RelaySetup) {
         pending = nil
+        pendingUntrusted = nil
         unverifiedSetup = nil
         isTesting = true
         setupCompleted = false
         savedForLater = false
         resultMessage = nil
-        Task {
+        setupTask?.cancel()
+        setupTask = Task {
             func checkRelay() async -> Result<Void, Error> {
                 await Task.detached(priority: .userInitiated) {
                     Result {
@@ -371,10 +402,16 @@ struct CruisePassView: View {
                 }.value
             }
             var result = await checkRelay()
-            if case .failure(let error) = result, !(error is RelayHTTPError) {
+            // Retry only transport-level failures: HTTP rejections are
+            // deterministic, and anything else would fail identically.
+            if case .failure(let error) = result, error is URLError {
                 try? await Task.sleep(nanoseconds: 750_000_000)
+                if Task.isCancelled { return }
                 result = await checkRelay()
             }
+            // The user dismissed the screen mid-check; saving now would
+            // configure the pass behind their back.
+            if Task.isCancelled { return }
             await MainActor.run {
                 isTesting = false
                 switch result {
