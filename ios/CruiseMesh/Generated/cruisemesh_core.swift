@@ -9947,6 +9947,90 @@ extension CoreTransport: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * The in-app destination named by a link, independent of which form the
+ * link arrived in.
+ */
+
+public enum DeepLinkRoute {
+    
+    /**
+     * A friend card (`/f`) — add-a-friend.
+     */
+    case friend
+    /**
+     * A Cruise Pass setup card (`/r`) — internet delivery setup.
+     */
+    case relaySetup
+    /**
+     * A LAN endpoint (`/lan`) — diagnostics-only manual connect.
+     */
+    case lan
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeepLinkRoute: FfiConverterRustBuffer {
+    typealias SwiftType = DeepLinkRoute
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeepLinkRoute {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .friend
+        
+        case 2: return .relaySetup
+        
+        case 3: return .lan
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DeepLinkRoute, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .friend:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .relaySetup:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .lan:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeepLinkRoute_lift(_ buf: RustBuffer) throws -> DeepLinkRoute {
+    return try FfiConverterTypeDeepLinkRoute.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeepLinkRoute_lower(_ value: DeepLinkRoute) -> RustBuffer {
+    return FfiConverterTypeDeepLinkRoute.lower(value)
+}
+
+
+
+extension DeepLinkRoute: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * A parsed link frame. HELLO, DIGEST, LAN endpoint hints, and probes are
  * link-control traffic; message content remains inside sealed envelopes.
  */
@@ -10756,6 +10840,30 @@ fileprivate struct FfiConverterOptionTypeCoreTransport: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeCoreTransport.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeDeepLinkRoute: FfiConverterRustBuffer {
+    typealias SwiftType = DeepLinkRoute?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeDeepLinkRoute.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeDeepLinkRoute.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -12096,6 +12204,26 @@ public func dedupeHints(hints: [Data]) -> [Data] {
 })
 }
 /**
+ * Resolve a link's destination from its already-parsed components.
+ *
+ * `host` and `path` are taken as each platform's URL type reports them:
+ * `https://cruisemesh.app/f` gives host `cruisemesh.app` and path `/f`,
+ * while `cruisemesh://f` gives host `f` and an empty path. Both are
+ * accepted, as is the trailing-slash spelling of either. Anything else —
+ * including a stray host on the app scheme, or the web host on some other
+ * scheme — returns `None`, so an unknown link is ignored rather than
+ * guessed at.
+ */
+public func deepLinkRoute(scheme: String, host: String, path: String) -> DeepLinkRoute? {
+    return try!  FfiConverterOptionTypeDeepLinkRoute.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_deep_link_route(
+        FfiConverterString.lower(scheme),
+        FfiConverterString.lower(host),
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+/**
  * `expiry` for a freshly authored envelope's §6.4 header:
  * `timestamp_ms + DEFAULT_EXPIRY_MS` (7 days, DESIGN.md §5.3), saturating
  * rather than overflowing for pathological inputs.
@@ -13114,6 +13242,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_dedupe_hints() != 40661) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_deep_link_route() != 46413) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_default_expiry() != 43648) {

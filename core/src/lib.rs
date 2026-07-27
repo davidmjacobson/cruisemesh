@@ -7,6 +7,7 @@ mod authoring;
 mod backup;
 mod content;
 mod crypto;
+mod deep_link;
 mod engine;
 mod framing;
 mod gossip;
@@ -36,6 +37,7 @@ pub use content::{
     CoreMessageTarget, CoreReactionPayload,
 };
 pub use crypto::{open_message, seal_message, OpenedMessage};
+pub use deep_link::{deep_link_route, DeepLinkRoute};
 pub use engine::{
     core_group_fanout_rows, core_hello_identity_matches, core_inbound_gate,
     core_pairwise_sender_authorized, core_relay_ack_ids, core_should_ack_inbound,

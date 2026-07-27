@@ -36,6 +36,24 @@
 	<array>
 		<string>_cruisemesh._tcp</string>
 	</array>
+	<!-- T20: cruisemesh:// carries the same destinations as the https
+	     Universal Links. It exists because iOS does not fire a Universal
+	     Link for a same-domain navigation, so the website's "Open in
+	     CruiseMesh" button cannot reach the app via https once the user is
+	     already on cruisemesh.app in Safari. A custom scheme always fires. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>com.cruisemesh.app</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>cruisemesh</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Choose a photo from your library to send in chat.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
