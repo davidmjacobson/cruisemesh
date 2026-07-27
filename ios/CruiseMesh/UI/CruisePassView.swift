@@ -102,6 +102,15 @@ struct CruisePassView: View {
                             .foregroundStyle(.secondary)
                     } else {
                         LabeledContent("Status", value: passStatus)
+                        // CP2b: plain-language explanation for the structured
+                        // delivery states -- what's happening, what happens
+                        // next, what to do. Support guidance appears only on
+                        // states that do not heal on their own.
+                        if let explanation = passStatusExplanation {
+                            Text(explanation)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
 
@@ -484,6 +493,29 @@ struct CruisePassView: View {
             return "Pass suspended · contact support"
         case .tokenRejected:
             return "Setup card rejected"
+        case .quotaFull:
+            return String(localized: "Storage full · delivery paused")
+        case .messageTooLarge:
+            return String(localized: "A message is too large to send")
+        case .rateLimited:
+            return String(localized: "Syncing is slowed · recovers on its own")
+        }
+    }
+
+    /// CP2b: the longer what/next/what-to-do paragraph for the structured
+    /// delivery states, or nil for every state the short status line already
+    /// covers. 429 deliberately never mentions support -- it heals on its
+    /// own.
+    private var passStatusExplanation: String? {
+        switch connectivity.relay {
+        case .quotaFull:
+            return String(localized: "The space that holds your family’s waiting messages is full. Delivery resumes as your family’s phones collect their messages, or as older ones expire. If it stays full, contact support@cruisemesh.app.")
+        case .messageTooLarge:
+            return String(localized: "One of your messages is too large to send over internet delivery. Try a smaller photo or a shorter message. Other messages still deliver normally.")
+        case .rateLimited:
+            return String(localized: "Syncing is slowed right now. Your messages are still queued and will be delivered. It recovers on its own.")
+        default:
+            return nil
         }
     }
 

@@ -40,11 +40,16 @@ data class RelayFetchPage(
     val nextCursor: Long,
 )
 
-/** Relay HTTP failure carrying both the status and relayd's stable error code. */
+/**
+ * Relay HTTP failure carrying the status, relayd's stable error code, and --
+ * for 429s -- the raw `Retry-After` header (CP2b; parsed/clamped by the
+ * core's `relayRetryAfterMs`, never here).
+ */
 class RelayHttpException(
     val code: Int,
     val relayCode: String?,
     message: String,
+    val retryAfter: String? = null,
 ) : IOException(message)
 
 data class RelayPresence(
@@ -227,7 +232,12 @@ object RelayClient {
                     JsonParser.parseString(preview).asJsonObject.get("code")?.asString
                 }.getOrNull()
                 val semantic = relayCode?.let { " [$it]" }.orEmpty()
-                throw RelayHttpException(code, relayCode, "Relay request failed ($code)$semantic: $preview")
+                throw RelayHttpException(
+                    code,
+                    relayCode,
+                    "Relay request failed ($code)$semantic: $preview",
+                    retryAfter = getHeaderField("Retry-After"),
+                )
             }
             block(body)
         } finally {

@@ -152,6 +152,9 @@ struct SettingsView: View {
         case .expired: return "Cruise Pass expired"
         case .suspended: return "Cruise Pass suspended"
         case .tokenRejected: return "Cruise Pass setup was rejected"
+        case .quotaFull: return String(localized: "Cruise Pass storage is full")
+        case .messageTooLarge: return String(localized: "A message is too large to send")
+        case .rateLimited: return String(localized: "Cruise Pass is catching up")
         }
     }
 
@@ -168,6 +171,12 @@ struct SettingsView: View {
         case .expired: return "Renew your pass to resume internet delivery."
         case .suspended: return "Contact support for help with this pass."
         case .tokenRejected: return "Paste the setup card again, or use a different Cruise Pass."
+        case .quotaFull:
+            return String(localized: "Internet delivery is paused until your family collects waiting messages.")
+        case .messageTooLarge:
+            return String(localized: "One message can’t be sent over internet delivery. Other messages still deliver.")
+        case .rateLimited:
+            return String(localized: "Syncing is slowed right now. It recovers on its own.")
         }
     }
 

@@ -260,12 +260,16 @@ parsing `message` text.
 envelope re-uploaded every sync) adds zero bytes and must not start
 failing once a family's mailbox is merely full.
 
-**Client-side handling of these two new error shapes is a follow-up, not
-yet implemented** — today's upload loop already logs-and-continues per
-envelope on any non-2xx response, so a rejected envelope is simply left
-queued locally for a later retry (harmless for the size cap, which never
-succeeds on retry without shrinking the payload; more useful for the quota
-error, which can resolve once the family drains their mailbox).
+**Client-side handling shipped with CP2b**: both apps classify these
+bodies in the core (`core/src/relay_status.rs`, keyed on the `code` field)
+and surface them through the Cruise Pass status indicator — 507 as a
+persistent "storage full" state, 413 as a persistent "message too large"
+state, 429 as a transient self-healing state that also honors
+`Retry-After`. The upload loop itself still logs-and-continues per
+envelope, so a rejected envelope stays queued locally for a later retry
+(harmless for the size cap, which never succeeds on retry without
+shrinking the payload; useful for the quota error, which resolves once the
+family drains their mailbox).
 
 ### Request and upload rate limits
 
@@ -469,6 +473,6 @@ output somewhere you would put a password.
 - Multi-region / federation — single VPS is the intended family-scale deploy.
 - Android/iOS clients still primarily poll today; wiring the phone apps to
   `GET /ws` is a client change, not a server gap.
-- Client-side handling of the D7 413/507 error bodies (see §10) — surfacing
-  a distinct "mailbox full" state to the user, rather than the current
-  generic log-and-retry.
+- ~~Client-side handling of the D7 413/507 error bodies (see §10)~~ —
+  shipped with CP2b: both apps now surface distinct storage-full /
+  too-large / rate-limited states through the Cruise Pass indicator.

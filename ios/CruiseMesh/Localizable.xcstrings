@@ -1,6 +1,16 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "A message is too large to send": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A message is too large to send"
+          }
+        }
+      }
+    },
     "About & legal": {
       "localizations": {
         "en": {
@@ -411,6 +421,16 @@
         }
       }
     },
+    "Cruise Pass is catching up": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cruise Pass is catching up"
+          }
+        }
+      }
+    },
     "Cruise Pass is ready on this phone.": {
       "localizations": {
         "en": {
@@ -427,6 +447,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Cruise Pass is set up"
+          }
+        }
+      }
+    },
+    "Cruise Pass storage is full": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cruise Pass storage is full"
           }
         }
       }
@@ -881,6 +911,16 @@
         }
       }
     },
+    "Internet delivery is paused until your family collects waiting messages.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Internet delivery is paused until your family collects waiting messages."
+          }
+        }
+      }
+    },
     "Keep Wi-Fi connected even when it has no internet — CruiseMesh uses it to reach phones near you.": {
       "localizations": {
         "en": {
@@ -1031,6 +1071,16 @@
         }
       }
     },
+    "Message too large": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Message too large"
+          }
+        }
+      }
+    },
     "Messages are end-to-end encrypted, so CruiseMesh cannot proactively read them. You can block a contact and report abuse from their contact details.": {
       "localizations": {
         "en": {
@@ -1177,6 +1227,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "OK"
+          }
+        }
+      }
+    },
+    "One message can’t be sent over internet delivery. Other messages still deliver.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "One message can’t be sent over internet delivery. Other messages still deliver."
+          }
+        }
+      }
+    },
+    "One of your messages is too large to send over internet delivery. Try a smaller photo or a shorter message. Other messages still deliver normally.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "One of your messages is too large to send over internet delivery. Try a smaller photo or a shorter message. Other messages still deliver normally."
           }
         }
       }
@@ -1881,6 +1951,26 @@
         }
       }
     },
+    "Storage full": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Storage full"
+          }
+        }
+      }
+    },
+    "Storage full · delivery paused": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Storage full · delivery paused"
+          }
+        }
+      }
+    },
     "Strength": {
       "localizations": {
         "en": {
@@ -1907,6 +1997,46 @@
           "stringUnit": {
             "state": "translated",
             "value": "Support"
+          }
+        }
+      }
+    },
+    "Syncing is slowed right now. It recovers on its own.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Syncing is slowed right now. It recovers on its own."
+          }
+        }
+      }
+    },
+    "Syncing is slowed right now. Your messages are still queued and will be delivered. It recovers on its own.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Syncing is slowed right now. Your messages are still queued and will be delivered. It recovers on its own."
+          }
+        }
+      }
+    },
+    "Syncing is slowed · recovers on its own": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Syncing is slowed · recovers on its own"
+          }
+        }
+      }
+    },
+    "Syncing slowed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Syncing slowed"
           }
         }
       }
@@ -1967,6 +2097,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone."
+          }
+        }
+      }
+    },
+    "The space that holds your family’s waiting messages is full. Delivery resumes as your family’s phones collect their messages, or as older ones expire. If it stays full, contact support@cruisemesh.app.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The space that holds your family’s waiting messages is full. Delivery resumes as your family’s phones collect their messages, or as older ones expire. If it stays full, contact support@cruisemesh.app."
           }
         }
       }

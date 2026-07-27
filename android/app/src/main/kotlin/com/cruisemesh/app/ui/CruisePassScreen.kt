@@ -326,6 +326,18 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 8.dp),
                     )
+                    // CP2b: plain-language explanation for the structured
+                    // delivery states -- what's happening, what happens next,
+                    // what to do. Support guidance appears only on states
+                    // that do not heal on their own.
+                    passStatusExplanation(relayHealth)?.let { explanation ->
+                        Text(
+                            explanation,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 6.dp),
+                        )
+                    }
                 }
 
                 if (configured == null || showManualEntry) {
@@ -647,6 +659,7 @@ private fun CruisePassReadyHeading(text: String) {
 private fun relayHost(url: String): String =
     runCatching { Uri.parse(url).host }.getOrNull().orEmpty().ifBlank { url }
 
+@Composable
 private fun passStatus(health: RelayHealth, setupState: PassSetupState): String {
     if (setupState is PassSetupState.Checking || setupState is PassSetupState.Testing) {
         return "Checking setup…"
@@ -660,7 +673,23 @@ private fun passStatus(health: RelayHealth, setupState: PassSetupState): String 
         is RelayHealth.Expired -> "Pass expired · renewal required"
         is RelayHealth.Suspended -> "Pass suspended · contact support"
         is RelayHealth.TokenRejected -> "Setup card rejected"
+        is RelayHealth.QuotaFull -> stringResource(R.string.ui_cruise_pass_storage_full_status)
+        is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_cruise_pass_message_too_large_status)
+        is RelayHealth.RateLimited -> stringResource(R.string.ui_cruise_pass_slowed_status)
     }
+}
+
+/**
+ * CP2b: the longer what/next/what-to-do paragraph for the structured
+ * delivery states, or null for every state the short status line already
+ * covers. 429 deliberately never mentions support -- it heals on its own.
+ */
+@Composable
+private fun passStatusExplanation(health: RelayHealth): String? = when (health) {
+    is RelayHealth.QuotaFull -> stringResource(R.string.ui_cruise_pass_storage_full_explanation)
+    is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_cruise_pass_message_too_large_explanation)
+    is RelayHealth.RateLimited -> stringResource(R.string.ui_cruise_pass_slowed_explanation)
+    else -> null
 }
 
 private fun passRelativeAge(timestampMs: Long): String {

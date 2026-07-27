@@ -106,6 +106,9 @@ struct RelayHTTPError: LocalizedError {
     let statusCode: Int
     let relayCode: String?
     let responseBody: String
+    /// Raw `Retry-After` header on a 429 (CP2b); parsed/clamped by the
+    /// core's `relayRetryAfterMs`, never here.
+    var retryAfter: String? = nil
 
     var errorDescription: String? {
         let semantic = relayCode.map { " [\($0)]" } ?? ""
@@ -287,7 +290,8 @@ enum RelayClient {
             throw RelayHTTPError(
                 statusCode: http.statusCode,
                 relayCode: json?["code"] as? String,
-                responseBody: body
+                responseBody: body,
+                retryAfter: http.value(forHTTPHeaderField: "Retry-After")
             )
         }
     }
