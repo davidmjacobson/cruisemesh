@@ -18,6 +18,9 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.CoreInboundDisposition
 import uniffi.cruisemesh_core.CoreRelayEnvelopeDisposition
+import uniffi.cruisemesh_core.CoreRelayFault
+import uniffi.cruisemesh_core.relayClassifyHttpError
+import uniffi.cruisemesh_core.relayRetryAfterMs
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.PeerConnectionEventKind
@@ -247,6 +250,7 @@ internal class RelaySyncEngine(
 
     fun cancelRelayPolling() {
         handler.removeCallbacks(relayPollRunnable)
+        handler.removeCallbacks(rateLimitRetryRunnable)
     }
 
     /** Stops the push socket; MeshService.onDestroy's counterpart to [updateRelayPushSubscription]. */
@@ -348,6 +352,16 @@ internal class RelaySyncEngine(
             MeshConnectivityStatus.setRelayHealth(RelayHealth.NoInternet)
             return
         }
+        // CP2b: honor relayd's Retry-After. Every nudge that arrives inside
+        // the advertised window (poll tick, push frame, queue change)
+        // coalesces into one retry at the window's end instead of hammering
+        // a service that just said "too fast".
+        val backoffRemainingMs = rateLimitedUntilMs - System.currentTimeMillis()
+        if (backoffRemainingMs > 0) {
+            handler.removeCallbacks(rateLimitRetryRunnable)
+            handler.postDelayed(rateLimitRetryRunnable, backoffRemainingMs)
+            return
+        }
         synchronized(relaySyncLock) {
             if (relaySyncInFlight) {
                 relaySyncPending = true
@@ -389,7 +403,8 @@ internal class RelaySyncEngine(
         // trusted (associated-but-dead Wi‑Fi, no VPN); otherwise null = use the
         // default (normal networks and VPN tunnels route themselves).
         val network = relayBindTarget()
-        ownRelayReject = null
+        ownRelayFault = null
+        ownRetryAfterMs = 0L
         backfillOutgoingReceipts(identity, now)
         uploadPendingOutgoingReceiptEnvelopes(contacts, fallbackConfig, now, network)
         uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now, network)
@@ -413,22 +428,20 @@ internal class RelaySyncEngine(
                 // friend card. That relay failing must not abort polling of
                 // the remaining relays or declare our own configured relay
                 // unreachable when it succeeded.
-                noteRelayAuthFailure(config, fallbackConfig, e)
+                noteOwnRelayFault(config, fallbackConfig, e)
                 Log.w(TAG, "Relay sync failed for ${config.relayUrl}: ${e.message}")
             }
         }
-        if (ownRelaySucceeded && anyRelaySucceeded) {
-            MeshConnectivityStatus.setRelayHealth(RelayHealth.Ok(now))
-        } else if (ownRelayReject == "family_expired") {
-            MeshConnectivityStatus.setRelayHealth(RelayHealth.Expired(now))
-        } else if (ownRelayReject == "family_suspended") {
-            MeshConnectivityStatus.setRelayHealth(RelayHealth.Suspended(now))
-        } else if (ownRelayReject != null) {
-            // T11: a stale/rotated family token used to look like a generic
-            // relay outage while friend requests queued forever. Surface it.
-            MeshConnectivityStatus.setRelayHealth(RelayHealth.TokenRejected(now))
+        // T11 + CP2b: structured rejections of our OWN saved config beat both
+        // the generic Failing state and (for the mailbox-level faults) a
+        // successful poll -- see relayHealthAfterSyncPass's KDoc.
+        MeshConnectivityStatus.setRelayHealth(
+            relayHealthAfterSyncPass(ownRelayFault, ownRelaySucceeded, anyRelaySucceeded, now),
+        )
+        rateLimitedUntilMs = if (ownRelayFault == CoreRelayFault.RATE_LIMITED) {
+            System.currentTimeMillis() + ownRetryAfterMs
         } else {
-            MeshConnectivityStatus.setRelayHealth(RelayHealth.Failing(now))
+            0L
         }
         val netDesc = if (network != null) "${networkLabel(network)}(pinned)" else "${networkLabel(connectivityManager.activeNetwork)}(default)"
         Log.i(TAG, "Relay sync complete: configs=${configs.size} net=$netDesc reason=$reason")
@@ -452,7 +465,7 @@ internal class RelaySyncEngine(
                     "Uploaded receipt envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
-                noteRelayAuthFailure(config, fallbackConfig, e)
+                noteOwnRelayFault(config, fallbackConfig, e)
                 Log.w(TAG, "Failed to upload receipt envelope to relay ${config.relayUrl}: ${e.message}")
             }
         }
@@ -484,7 +497,7 @@ internal class RelaySyncEngine(
                         RelayClient.postOutboundEnvelope(config, envelope, network)
                         store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
                     } catch (e: Exception) {
-                        noteRelayAuthFailure(config, fallbackConfig, e)
+                        noteOwnRelayFault(config, fallbackConfig, e)
                         Log.w(TAG, "Failed to upload outbound envelope to relay ${config.relayUrl}: ${e.message}")
                     }
                     continue
@@ -506,7 +519,7 @@ internal class RelaySyncEngine(
                         RelayClient.postFanoutRow(config, row, network)
                         posted++
                     } catch (e: Exception) {
-                        noteRelayAuthFailure(config, fallbackConfig, e)
+                        noteOwnRelayFault(config, fallbackConfig, e)
                         Log.w(TAG, "Failed to upload fan-out row to relay ${config.relayUrl}: ${e.message}")
                     }
                 }
@@ -528,7 +541,7 @@ internal class RelaySyncEngine(
                     "Uploaded outbound envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
-                noteRelayAuthFailure(config, fallbackConfig, e)
+                noteOwnRelayFault(config, fallbackConfig, e)
                 Log.w(TAG, "Failed to upload outbound envelope to relay ${config.relayUrl}: ${e.message}")
             }
         }
@@ -578,7 +591,7 @@ internal class RelaySyncEngine(
                     try {
                         RelayClient.postFanoutRow(config, row, network)
                     } catch (e: Exception) {
-                        noteRelayAuthFailure(config, fallbackConfig, e)
+                        noteOwnRelayFault(config, fallbackConfig, e)
                         Log.w(TAG, "Failed to upload carried fan-out row to relay ${config.relayUrl}: ${e.message}")
                     }
                 }
@@ -592,7 +605,7 @@ internal class RelaySyncEngine(
                     "Uploaded carried envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
-                noteRelayAuthFailure(config, fallbackConfig, e)
+                noteOwnRelayFault(config, fallbackConfig, e)
                 Log.w(TAG, "Failed to upload carried envelope to relay ${config.relayUrl}: ${e.message}")
             }
         }
@@ -703,14 +716,32 @@ internal class RelaySyncEngine(
             fallbackConfig?.relayToken,
         )?.let { RelayConfig(it.url, it.token) }
 
-    /** Stable relayd rejection code for our own saved config during this pass. */
-    private var ownRelayReject: String? = null
+    /** Worst structured rejection of our own saved config during this pass (CP2b). */
+    private var ownRelayFault: CoreRelayFault? = null
 
-    private fun noteRelayAuthFailure(config: RelayConfig, fallbackConfig: RelayConfig?, error: Exception) {
+    /** Largest Retry-After (ms) a 429 advertised for our own config this pass. */
+    private var ownRetryAfterMs: Long = 0L
+
+    /** Epoch ms until which relayd asked us not to sync again; 0 = no backoff. */
+    @Volatile private var rateLimitedUntilMs = 0L
+
+    private val rateLimitRetryRunnable = Runnable { requestRelaySync("rate limit retry") }
+
+    /**
+     * Records a structured HTTP rejection when it concerns our OWN saved
+     * config -- a contact's stale card relay failing is not our pass's
+     * fault. Classification lives in the core (`relay_status.rs`); an
+     * unstructured failure (OUTAGE) is not recorded because the pass's
+     * success flags already express it as [RelayHealth.Failing].
+     */
+    private fun noteOwnRelayFault(config: RelayConfig, fallbackConfig: RelayConfig?, error: Exception) {
         if (config != fallbackConfig) return
-        val code = (error as? RelayHttpException)?.code ?: return
-        if (code == 401 || code == 403) {
-            ownRelayReject = (error as RelayHttpException).relayCode ?: "token_rejected"
+        val http = error as? RelayHttpException ?: return
+        val fault = relayClassifyHttpError(http.code.toUShort(), http.relayCode)
+        if (fault == CoreRelayFault.OUTAGE) return
+        ownRelayFault = worseRelayFault(ownRelayFault, fault)
+        if (fault == CoreRelayFault.RATE_LIMITED) {
+            ownRetryAfterMs = maxOf(ownRetryAfterMs, relayRetryAfterMs(http.retryAfter).toLong())
         }
     }
 

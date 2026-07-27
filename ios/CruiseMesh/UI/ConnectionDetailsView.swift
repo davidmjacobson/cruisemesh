@@ -130,6 +130,9 @@ struct ConnectionDetailsView: View {
         case .expired: return "Pass expired"
         case .suspended: return "Pass suspended"
         case .tokenRejected: return "Setup rejected"
+        case .quotaFull: return String(localized: "Storage full")
+        case .messageTooLarge: return String(localized: "Message too large")
+        case .rateLimited: return String(localized: "Syncing slowed")
         }
     }
 

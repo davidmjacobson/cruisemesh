@@ -19,6 +19,9 @@ class PassIndicatorTest {
             RelayHealth.Expired(now),
             RelayHealth.Suspended(now),
             RelayHealth.TokenRejected(now),
+            RelayHealth.QuotaFull(now),
+            RelayHealth.MessageTooLarge(now),
+            RelayHealth.RateLimited(now),
         )
         for (health in healths) {
             assertEquals(
@@ -46,11 +49,20 @@ class PassIndicatorTest {
     }
 
     @Test
-    fun `a reachable-but-unhappy relay is amber, not red`() {
-        assertEquals(
-            PassIndicator.ATTENTION,
-            passIndicator(RelayHealth.Failing(now), configured = true),
-        )
+    fun `self-healing conditions are the quiet question-mark state`() {
+        // CP2b (David's UX spec): can't-reach-right-now and rate-limited
+        // both clear on their own, so they share the transient "?" state --
+        // worth a glance, never an instruction to do something.
+        for (health in listOf(
+            RelayHealth.Failing(now),
+            RelayHealth.RateLimited(now),
+        )) {
+            assertEquals(
+                "$health clears on its own and should stay amber",
+                PassIndicator.ATTENTION,
+                passIndicator(health, configured = true),
+            )
+        }
     }
 
     @Test
@@ -59,6 +71,8 @@ class PassIndicatorTest {
             RelayHealth.Expired(now),
             RelayHealth.Suspended(now),
             RelayHealth.TokenRejected(now),
+            RelayHealth.QuotaFull(now),
+            RelayHealth.MessageTooLarge(now),
         )) {
             assertEquals(
                 "$health will not self-heal and should demand action",

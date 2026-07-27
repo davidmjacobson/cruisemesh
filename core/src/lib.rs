@@ -18,6 +18,7 @@ mod limits;
 mod protocol;
 mod recipient_hints;
 mod relay_setup;
+mod relay_status;
 mod relay_wire;
 mod semantic;
 mod store;
@@ -86,6 +87,10 @@ pub use protocol::{
 pub use recipient_hints::{dedupe_hints, recent_hints_for, recent_presence_hints_for};
 pub use relay_setup::{
     make_relay_setup_card, parse_relay_setup_text, relay_setup_is_official, RelaySetup,
+};
+pub use relay_status::{
+    relay_classify_http_error, relay_fault_is_transient, relay_fault_rank, relay_retry_after_ms,
+    CoreRelayFault,
 };
 pub use relay_wire::{
     normalize_relay_url, relay_build_fetch_path, relay_decode_fetch_page,

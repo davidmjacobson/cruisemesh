@@ -255,6 +255,9 @@ private fun relayLabel(
         is com.cruisemesh.app.mesh.RelayHealth.Expired -> "Pass expired"
         is com.cruisemesh.app.mesh.RelayHealth.Suspended -> "Pass suspended"
         is com.cruisemesh.app.mesh.RelayHealth.TokenRejected -> "Setup rejected"
+        is com.cruisemesh.app.mesh.RelayHealth.QuotaFull -> "Storage full"
+        is com.cruisemesh.app.mesh.RelayHealth.MessageTooLarge -> "Message too large"
+        is com.cruisemesh.app.mesh.RelayHealth.RateLimited -> "Syncing slowed"
     }
 }
 
