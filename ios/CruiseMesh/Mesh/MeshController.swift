@@ -17,6 +17,10 @@ final class MeshController: ObservableObject {
     private let bluetoothAudioBackoff = BluetoothAudioBackoff()
     private var identity: Identity!
     private var relayTimer: Timer?
+    /// CP2b: epoch ms until which relayd asked us not to sync again
+    /// (`Retry-After` on a 429); 0 = no backoff. `runRelaySync` drops nudges
+    /// inside the window; the 60 s poll tick retries once it has passed.
+    private var relayRateLimitedUntilMs: Int64 = 0
     private var pathMonitor: NWPathMonitor?
     /// DTN_TODOS.md D3 (iOS half of audit finding F1, "relay poll-only"): opens
     /// relayd's `GET /ws` push socket (see `RelayPushClient`'s class doc) once
@@ -230,6 +234,7 @@ final class MeshController: ObservableObject {
         MeshConnectivityStatus.shared.clear()
         relayTimer?.invalidate()
         relayTimer = nil
+        relayRateLimitedUntilMs = 0
         pathMonitor?.cancel()
         pathMonitor = nil
         relayPushClient.stop()
@@ -2211,6 +2216,13 @@ final class MeshController: ObservableObject {
             MeshConnectivityStatus.shared.setRelayHealth(.noInternet)
             return
         }
+        // CP2b: honor relayd's Retry-After. Nudges inside the advertised
+        // window (poll tick, push frame, queue change) are dropped; the 60 s
+        // poll tick retries once the window has passed. Mirrors
+        // RelaySyncEngine.kt's coalesced backoff.
+        if Int64(Date().timeIntervalSince1970 * 1_000) < relayRateLimitedUntilMs {
+            return
+        }
         if relaySyncInFlight {
             relaySyncPending = true
             return
@@ -2312,17 +2324,28 @@ final class MeshController: ObservableObject {
 
     private nonisolated func relaySyncBlocking(identity: Identity, config: RelayConfig?) async {
         let store = AppStore.get()
-        // T11: a stale/rotated family token used to look like a generic relay
-        // outage while queued envelopes retried forever. Track 401/403 from
-        // our OWN saved config and surface it as .tokenRejected.
-        var ownRelayReject: String?
+        // T11 + CP2b: structured rejections of our OWN saved config -- a
+        // contact's stale card relay failing is not our pass's fault. The
+        // classification (HTTP status/`code` -> semantic fault, transient vs
+        // persistent) lives in the core (`core/src/relay_status.rs`); an
+        // unstructured failure (.outage) is not recorded because the pass's
+        // success flags already express it as .failing. Mirrors
+        // RelaySyncEngine.kt's noteOwnRelayFault.
+        var ownRelayFault: CoreRelayFault?
+        var ownRetryAfterMs: UInt64 = 0
         func noteFailure(_ error: Error, usedConfig: RelayConfig) {
             guard let own = config,
                   usedConfig.relayUrl == own.relayUrl,
                   usedConfig.relayToken == own.relayToken else { return }
-            if let relay = error as? RelayHTTPError,
-               relay.statusCode == 401 || relay.statusCode == 403 {
-                ownRelayReject = relay.relayCode ?? "token_rejected"
+            guard let relay = error as? RelayHTTPError else { return }
+            let fault = relayClassifyHttpError(
+                httpStatus: UInt16(clamping: relay.statusCode),
+                relayCode: relay.relayCode
+            )
+            guard fault != .outage else { return }
+            ownRelayFault = RelayHealth.worseFault(ownRelayFault, fault)
+            if fault == .rateLimited {
+                ownRetryAfterMs = max(ownRetryAfterMs, relayRetryAfterMs(retryAfterHeader: relay.retryAfter))
             }
         }
         do {
@@ -2585,42 +2608,45 @@ final class MeshController: ObservableObject {
                 }
             }
             let syncedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
-            let reject = ownRelayReject
-            let healthy = ownRelaySucceeded && anyRelaySucceeded
+            let fault = ownRelayFault
+            let retryAfterMs = ownRetryAfterMs
+            let ownSucceeded = ownRelaySucceeded
+            let anySucceeded = anyRelaySucceeded
             await MainActor.run {
-                let health: RelayHealth
-                if healthy {
-                    health = .ok(lastSyncMs: syncedAtMs)
-                } else if reject == "family_expired" {
-                    health = .expired(lastAttemptMs: syncedAtMs)
-                } else if reject == "family_suspended" {
-                    health = .suspended(lastAttemptMs: syncedAtMs)
-                } else if reject != nil {
-                    health = .tokenRejected(lastAttemptMs: syncedAtMs)
-                } else {
-                    health = .failing(lastAttemptMs: syncedAtMs)
-                }
-                MeshConnectivityStatus.shared.setRelayHealth(health)
+                MeshConnectivityStatus.shared.setRelayHealth(RelayHealth.afterSyncPass(
+                    fault: fault,
+                    ownRelaySucceeded: ownSucceeded,
+                    anyRelaySucceeded: anySucceeded,
+                    nowMs: syncedAtMs
+                ))
+                self.noteRelayRateLimit(fault: fault, retryAfterMs: retryAfterMs)
             }
         } catch {
             if let config { noteFailure(error, usedConfig: config) }
             let message = error.localizedDescription
-            let reject = ownRelayReject
+            let fault = ownRelayFault
+            let retryAfterMs = ownRetryAfterMs
             await MainActor.run {
                 let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
-                let health: RelayHealth
-                if reject == "family_expired" {
-                    health = .expired(lastAttemptMs: nowMs)
-                } else if reject == "family_suspended" {
-                    health = .suspended(lastAttemptMs: nowMs)
-                } else if reject != nil {
-                    health = .tokenRejected(lastAttemptMs: nowMs)
-                } else {
-                    health = .failing(lastAttemptMs: nowMs)
-                }
-                MeshConnectivityStatus.shared.setRelayHealth(health)
+                MeshConnectivityStatus.shared.setRelayHealth(RelayHealth.afterSyncPass(
+                    fault: fault,
+                    ownRelaySucceeded: false,
+                    anyRelaySucceeded: false,
+                    nowMs: nowMs
+                ))
+                self.noteRelayRateLimit(fault: fault, retryAfterMs: retryAfterMs)
                 log.warning("Relay sync failed: \(message, privacy: .public)")
             }
+        }
+    }
+
+    /// CP2b: remember (or clear) the window relayd's Retry-After asked us to
+    /// stay quiet for. `runRelaySync` consults it before starting a pass.
+    private func noteRelayRateLimit(fault: CoreRelayFault?, retryAfterMs: UInt64) {
+        if fault == .rateLimited {
+            relayRateLimitedUntilMs = Int64(Date().timeIntervalSince1970 * 1_000) + Int64(retryAfterMs)
+        } else {
+            relayRateLimitedUntilMs = 0
         }
     }
 

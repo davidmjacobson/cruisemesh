@@ -1,0 +1,11 @@
+# OnFailure= hook for cruisemesh-relay-backup.service: emails the operator
+# through the Resend API. Needs RESEND_API_KEY in /etc/cruisemesh/ops-alert.env
+# (DEPLOY.md §9); without it the failure still lands in the journal and
+# `systemctl --failed`, but nobody is emailed.
+
+[Unit]
+Description=Email the operator that the CruiseMesh relay backup failed
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cruisemesh/tools/relay_backup.sh alert

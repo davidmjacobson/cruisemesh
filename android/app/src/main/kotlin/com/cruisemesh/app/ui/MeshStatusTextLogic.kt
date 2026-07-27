@@ -32,6 +32,9 @@ object MeshStatusTextLogic {
             is RelayHealth.Expired -> "pass expired"
             is RelayHealth.Suspended -> "pass suspended"
             is RelayHealth.TokenRejected -> "relay token rejected"
+            is RelayHealth.QuotaFull -> "storage full"
+            is RelayHealth.MessageTooLarge -> "message too large"
+            is RelayHealth.RateLimited -> "syncing slowed"
         }
         val text = when {
             relayHealth == RelayHealth.NoInternet && nearbyCount == 0 -> "Mesh on · offline"

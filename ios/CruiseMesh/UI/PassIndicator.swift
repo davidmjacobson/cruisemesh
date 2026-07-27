@@ -25,13 +25,16 @@ enum PassIndicator {
     /// ignore the indicator when it finally does mean something.
     case waiting
 
-    /// Amber: something is off in a way that may clear on its own (service
-    /// unavailable). Worth a glance, not worth acting on yet.
+    /// Amber "?": something is off in a way that clears on its own -- the
+    /// service couldn't be reached just now, or asked us to slow down (429).
+    /// Worth a glance, never worth acting on, and never a reason to contact
+    /// anyone.
     case attention
 
-    /// Red: the pass will not work again until the person does something --
-    /// renew it, replace the setup card, or contact support. These states do
-    /// not self-heal, which is what separates them from `attention`.
+    /// Red "!": internet delivery stays affected until the person does
+    /// something -- renew the pass, replace the setup card, send a smaller
+    /// message, or contact support. These states do not self-heal, which is
+    /// what separates them from `attention`.
     case actionRequired
 
     /// Map relay health to the Settings indicator. `configured` is whether a
@@ -44,21 +47,27 @@ enum PassIndicator {
         case .noConfig, .checking: return .none
         case .ok: return .ready
         case .noInternet: return .waiting
-        case .failing: return .attention
-        case .expired, .suspended, .tokenRejected: return .actionRequired
+        // Transient, self-healing ("?"): can't reach right now, or told to
+        // slow down. Same reaction either way -- none.
+        case .failing, .rateLimited: return .attention
+        // Persistent, actionable ("!"): these stay until someone acts.
+        case .expired, .suspended, .tokenRejected, .quotaFull, .messageTooLarge:
+            return .actionRequired
         }
     }
 
     /// SF Symbol for the row. Each state gets a distinct *shape* as well as a
     /// distinct colour so the row still reads correctly for anyone who cannot
-    /// tell the tints apart.
+    /// tell the tints apart. CP2b (David's UX spec): the "?" circle marks
+    /// transient, self-healing conditions; the "!" circle marks persistent
+    /// ones that need a person.
     var systemImage: String? {
         switch self {
         case .none: return nil
         case .ready: return "checkmark.circle.fill"
         case .waiting: return "info.circle.fill"
-        case .attention: return "exclamationmark.triangle.fill"
-        case .actionRequired: return "xmark.circle.fill"
+        case .attention: return "questionmark.circle.fill"
+        case .actionRequired: return "exclamationmark.circle.fill"
         }
     }
 

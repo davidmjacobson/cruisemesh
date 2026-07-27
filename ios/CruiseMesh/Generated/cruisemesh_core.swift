@@ -9674,6 +9674,136 @@ extension CoreLanHealthAction: Equatable, Hashable {}
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * One structured relay rejection, classified. Ordered by nothing — use
+ * [`relay_fault_rank`] when several faults from one sync pass compete for
+ * the single status slot.
+ */
+
+public enum CoreRelayFault {
+    
+    /**
+     * 403 `family_expired`: the pass lapsed; renewing it is the only fix.
+     */
+    case passExpired
+    /**
+     * 403 `family_suspended`: the operator turned the family off.
+     */
+    case passSuspended
+    /**
+     * Any other 401/403: the saved credential itself is bad (T11).
+     */
+    case tokenRejected
+    /**
+     * 507 `family_quota_exceeded`: the family's hosted storage is full.
+     * Posting fails while fetching keeps working, so this must surface even
+     * when the rest of the sync pass succeeds.
+     */
+    case mailboxFull
+    /**
+     * 413 `envelope_too_large`: this one envelope can never be posted.
+     * Actionable locally (send something smaller); never a support case.
+     */
+    case messageTooLarge
+    /**
+     * 429 `rate_limited`: too fast, not broken. Self-heals within the
+     * `Retry-After` window ([`relay_retry_after_ms`]); the person holding
+     * the phone has nothing to do and must not be told to contact anyone.
+     */
+    case rateLimited
+    /**
+     * Any other non-2xx: a generic outage with no structured meaning.
+     */
+    case outage
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayFault: FfiConverterRustBuffer {
+    typealias SwiftType = CoreRelayFault
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayFault {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .passExpired
+        
+        case 2: return .passSuspended
+        
+        case 3: return .tokenRejected
+        
+        case 4: return .mailboxFull
+        
+        case 5: return .messageTooLarge
+        
+        case 6: return .rateLimited
+        
+        case 7: return .outage
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreRelayFault, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .passExpired:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .passSuspended:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .tokenRejected:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .mailboxFull:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .messageTooLarge:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .rateLimited:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .outage:
+            writeInt(&buf, Int32(7))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFault_lift(_ buf: RustBuffer) throws -> CoreRelayFault {
+    return try FfiConverterTypeCoreRelayFault.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFault_lower(_ value: CoreRelayFault) -> RustBuffer {
+    return FfiConverterTypeCoreRelayFault.lower(value)
+}
+
+
+
+extension CoreRelayFault: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum CoreTickStatus {
     
@@ -12493,6 +12623,21 @@ public func relayBuildFetchPath(hints: [Data], afterId: Int64, limit: UInt32)thr
     )
 })
 }
+/**
+ * Map one HTTP rejection to its semantic fault. The stable `code` field
+ * wins over the status code when both are present (a proxy can rewrite a
+ * status; the JSON body comes from relayd itself), and unknown
+ * status/code combinations degrade to [`CoreRelayFault::Outage`] rather
+ * than guessing.
+ */
+public func relayClassifyHttpError(httpStatus: UInt16, relayCode: String?) -> CoreRelayFault {
+    return try!  FfiConverterTypeCoreRelayFault.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_classify_http_error(
+        FfiConverterUInt16.lower(httpStatus),
+        FfiConverterOptionString.lower(relayCode),$0
+    )
+})
+}
 public func relayDecodeFetchPage(body: Data)throws  -> CoreRelayFetchPage {
     return try  FfiConverterTypeCoreRelayFetchPage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_relay_decode_fetch_page(
@@ -12565,6 +12710,33 @@ public func relayEncodePresenceRequest(announce: [Data], query: [Data])throws  -
 })
 }
 /**
+ * True for conditions that clear on their own with no action from the
+ * person holding the phone ("?" on the Cruise Pass indicator); false for
+ * conditions that persist until someone acts ("!"). Support guidance
+ * belongs only on the persistent side.
+ */
+public func relayFaultIsTransient(fault: CoreRelayFault) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_fault_is_transient(
+        FfiConverterTypeCoreRelayFault.lower(fault),$0
+    )
+})
+}
+/**
+ * Which fault wins when one sync pass observes several (e.g. a few 507s and
+ * then a 429 once the burst also trips the rate limiter). Higher rank =
+ * more important to show: credential faults first (nothing else can work),
+ * then the persistent mailbox conditions, then the self-healing ones.
+ * Shared so both shells keep the same worst-of fold.
+ */
+public func relayFaultRank(fault: CoreRelayFault) -> UInt8 {
+    return try!  FfiConverterUInt8.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_fault_rank(
+        FfiConverterTypeCoreRelayFault.lower(fault),$0
+    )
+})
+}
+/**
  * Fetch pages stay deliberately small because every sealed row is controlled
  * by the relay until it has passed the authenticated envelope ingest path.
  */
@@ -12582,6 +12754,21 @@ public func relayFetchBatchLimit() -> UInt32 {
 public func relayMaxResponseBytes() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_relay_max_response_bytes($0
+    )
+})
+}
+/**
+ * How long a 429 asks the client to back off, in milliseconds. relayd's
+ * `Retry-After` is integer delta-seconds, at least 1 and never more than 60
+ * (a full window always refills a bucket completely — DEPLOY.md §10), so
+ * anything outside that range is a parse artifact and gets clamped. A
+ * missing or malformed header falls back to 30 s: long enough to matter,
+ * short enough that an over-cautious default never visibly stalls sync.
+ */
+public func relayRetryAfterMs(retryAfterHeader: String?) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_retry_after_ms(
+        FfiConverterOptionString.lower(retryAfterHeader),$0
     )
 })
 }
@@ -13067,6 +13254,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_build_fetch_path() != 4249) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_classify_http_error() != 51460) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_decode_fetch_page() != 49617) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13088,10 +13278,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_encode_presence_request() != 64701) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_fault_is_transient() != 24298) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_fault_rank() != 19318) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_fetch_batch_limit() != 7996) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_retry_after_ms() != 10198) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 55007) {

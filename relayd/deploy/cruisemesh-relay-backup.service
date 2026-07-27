@@ -1,0 +1,18 @@
+# Nightly WAL-safe backup of the relay's SQLite mailbox (DEPLOY.md §9).
+# Started by cruisemesh-relay-backup.timer, never enabled on its own.
+# ExecStart assumes the provision-hetzner.sh checkout at /opt/cruisemesh;
+# self-hosted deploys with another layout adjust the path when installing.
+
+[Unit]
+Description=Nightly WAL-safe backup of the CruiseMesh relay SQLite mailbox
+Documentation=file:/opt/cruisemesh/relayd/DEPLOY.md
+Wants=docker.service
+After=docker.service
+OnFailure=cruisemesh-relay-backup-alert.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cruisemesh/tools/relay_backup.sh
+# Backups must never starve relayd itself on the little VPS.
+Nice=10
+IOSchedulingClass=idle

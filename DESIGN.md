@@ -6,7 +6,13 @@ optional internet relay, end-to-end encrypted.*
 This document explains the architecture and the reasoning behind it. For current
 implementation status, see [ROADMAP.md](ROADMAP.md).
 
-Last updated: 2026-07-21
+**Naming note:** this is the technical document, so it says *relay*, *token*,
+and *mailbox*. Consumer surfaces (apps, website, email) deliberately never do —
+there the feature is **internet delivery**, the hosted option is **Cruise
+Pass**, and the credential is a **setup card** (`CMRELAY1:`). Same objects,
+two vocabularies, on purpose.
+
+Last updated: 2026-07-27
 
 ---
 
@@ -195,13 +201,15 @@ sailing. Two caveats from the same trip:
   internet-less Wi-Fi after roughly an hour (captive-portal session timeouts;
   Android's adaptive connectivity preferring mobile data). BLE earned its keep
   as the always-on supplement precisely when a phone fell off the LAN.
-- **Client isolation is a per-ship roll of the dice.** Whether associated
-  devices can reach each other will vary by cruise line — and probably ship to
-  ship within a line. CruiseMesh probes this automatically (the subnet-sweep
-  verdict surfaced in Advanced settings) and falls back to BLE + relay on
-  isolated networks. Collecting isolation reports across ships and lines — so
-  a family knows before sailing how well the app will work — is an open
-  project goal; the 🚢 field-report issue template asks for exactly this.
+- **Client isolation varies per ship.** Whether associated devices can reach
+  each other varies by cruise line — and probably ship to ship within a line.
+  This is priced in, not a threat to the product: CruiseMesh probes it
+  automatically (the subnet-sweep verdict is surfaced in Connection details)
+  and falls back to BLE + relay on isolated networks, so messaging works
+  either way; the LAN is the speed upgrade, not the requirement. Collecting
+  isolation reports across ships and lines — so a family knows before sailing
+  which delivery mix to expect — is an open project goal; the 🚢 field-report
+  issue template asks for exactly this.
 
 ---
 
@@ -400,8 +408,21 @@ A deliberately dumb mailbox:
   move the full **public** envelope header shape (`msg_id`, `hop_ttl`, `expiry`,
   `recipient_hint`, `sealed`) rather than plaintext message metadata; relay-side
   dedupe is by `(family_token, msg_id)`, fetch is by `recipient_hint` since cursor,
-  delete-on-ack, 30-day retention, per-family auth token (baked into the QR friend
-  card / group config) so randoms can't use your mailbox.
+  delete-on-ack, 30-day retention.
+- **Two credential classes per family** (the SMTP/IMAP split — see §9.2): the
+  **member token** authorizes everything (post, fetch, ack, WebSocket) and
+  rides only the family's own setup card; the **deposit token** is post-only
+  into that family's mailbox, under a tighter rate limit, and is what friend
+  cards carry. Enforcement lives at relayd's auth layer: a deposit token
+  presented to fetch/ack/WS gets a structured 403, so a leaked friend card is
+  a nuisance (someone can stuff the mail slot, rate-limited), never a
+  compromise (nobody can drain the mailbox).
+- **Multi-tenant service hardening**, because the hosted instance sells Cruise
+  Pass to strangers: a families table with per-family quota (256 MiB default),
+  plan expiry and suspension with a 7-day grace window, per-token
+  request/byte rate limits plus a global backstop, a per-token WebSocket cap,
+  and an admin API that Cruise Pass provisioning drives. Self-hosting stays
+  free and runs the identical binary.
 - Sees only sealed envelopes and hints (§6.4). A compromised relay learns traffic
   timing and approximate social graph size — not contents, senders, or read state.
 - Phones poll it whenever internet appears and also push all queued outbound —
@@ -411,15 +432,17 @@ A deliberately dumb mailbox:
 ### 9.1 Mailbox routing (which relay serves which envelope)
 
 Relay config belongs to the **relationship, not the device**. Every friend
-card can carry its owner's relay URL + family token — "the post-office box
-where mail for me gets dropped" — and a phone's own saved config is just its
-family's default box. Both shells share one core policy
+card can carry its owner's relay URL + **deposit token** — "the mail slot
+where letters for me get dropped" — and a phone's own saved config (member
+token) is just its family's default box. Both shells share one core policy
 (`resolved_contact_relay`): an envelope addressed to a contact goes to **that
 contact's** card relay when the card has one, else to the sender's own config.
-On the fetch side, a phone polls **every distinct mailbox it knows about** —
-its own plus each contact's resolved card relay — because mail addressed to it
-doesn't always reach its own box (a sender may only have had a fallback
-config, or an older build that posted to its own family mailbox).
+On the fetch side, a phone reads its **own** mailbox with its member token;
+mail for you lands in your box because senders deposit into it. (Legacy
+full-token friend cards from before the credential split still work — they
+are accepted for deposit, and during the format transition they also permit
+the old cross-mailbox polling; re-sharing a card upgrades it to
+deposit-only.)
 
 No family ever configures two relays; multi-mailbox behavior is *emergent*
 from two real situations. (1) **Token rotation**: during a family's token
@@ -433,6 +456,43 @@ resolves to the same config and the distinct set dedupes to one, so there is
 no extra traffic. A 401/403 from the phone's *own* saved token is surfaced as
 "relay token rejected" rather than a generic failure, because a stale rotated
 token is otherwise indistinguishable from an outage.
+
+### 9.2 Relationship to email (the mental model)
+
+The relay is a mail server, deliberately. Store-and-forward delivery,
+per-family mailboxes, retry until delivered: that is SMTP's contract, and
+CruiseMesh keeps the parts of email that four decades proved out.
+
+- **The credential split is SMTP vs IMAP.** Email got one thing exactly
+  right: anyone may *submit* mail to your server, but only you hold the
+  credentials to *read and delete* it. The member/deposit token classes in §9
+  are that split. A friend card is submission rights — the holder can deliver
+  mail to your family and nothing else. The member token is the IMAP side,
+  and it never leaves your family's phones.
+- **The "MX record" is not public.** Email publishes the route to your
+  mailbox in DNS, attached to a globally guessable address — which is why
+  spam exists: the whole world holds submission rights to every mailbox.
+  CruiseMesh's route travels only inside a mutually exchanged, key-bound
+  friend card. Nobody can be *discovered*, only *introduced* — so
+  capability-gated deposit plus rate limits do the job that email needed
+  decades of filtering to approximate.
+- **The mailbox is not the identity.** An email address *is* the identity,
+  which is why changing providers is painful. Here identity is the keypair
+  (§6.2) and the relay is one delivery route of four; a family can change
+  relays and nothing about who they are changes — friend cards carry the new
+  route on the next share.
+- **The server is blind.** Every email server reads at least headers and the
+  social graph, and usually content. relayd holds sealed envelopes and hints
+  (§6.4); it cannot read contents, sender identities, or read state.
+- **The server is optional.** Email has exactly one transport. Here the same
+  sealed envelope travels over BLE, ship LAN, or in a family member's pocket,
+  and the relay exists only for the cases where physics offers nothing
+  better.
+
+Shortest version, for a technical reader placing this in their mental map: a
+mail server for your family, except the address is unguessable, the server
+cannot read anything, and it is only consulted when the phones cannot reach
+each other directly.
 
 ---
 
@@ -464,8 +524,8 @@ crypto/protocol logic that must behave identically on both platforms.
 | 1 | **Core + 1:1 direct** | Rust core, identity, QR friending, sealed text, ✓/✓✓/read over direct BLE | Two-phone family dogfood in the house | ✅ Done |
 | 2 | **DTN** | Carry queue, digests, dedupe, cumulative receipts, 3-phone mule delivery | Phone C carries A→B message between rooms; simulated 50-node churn test passes | ✅ Done |
 | 3 | **Relay** | `relayd` on a VPS, internet flush, mixed BLE+relay delivery with dedupe | Message delivered city-to-city; duplicates never render twice | ✅ Done |
-| 4 | **Groups + broadcast** | Group keys, rotation, per-member ticks; public channel | 4-person family group; broadcast between two unfriended installs | 🔨 In progress |
-| 5 | **🚢 Field test** | Everything, on an actual cruise | Family uses it for a week; log delivery latency, battery, mode mix (direct/mule/relay); probe ship-LAN client isolation while aboard | ⏳ Upcoming |
+| 4 | **Groups + broadcast** | Group keys, rotation, per-member ticks; public channel | 4-person family group; broadcast between two unfriended installs | ✅ Groups shipped (membership enforcement pinned by tests; per-member read aggregation is the open D9 item). Broadcast deferred. |
+| 5 | **🚢 Field test** | Everything, on an actual cruise | Family uses it for a week; log delivery latency, battery, mode mix (direct/mule/relay); probe ship-LAN client isolation while aboard | ⏳ Upcoming — meanwhile the family runs CruiseMesh as its daily messenger at home, incl. organic multi-hop deliveries |
 | 6 | Media (per §8) | — | after the field test says the foundation holds | 🔨 Inline attachments shipped; chunked media designed |
 
 Milestone 0 was the go/no-go gate: it de-risked the only thing that couldn't be
@@ -480,21 +540,32 @@ designed around (iOS background BLE) before any real investment.
    down"). If backgrounded-iPhone↔backgrounded-iPhone sync degrades on some
    device generation, the app survives — that pair just syncs on foreground —
    but expectations must be set.
-2. **Steel ship RF** — already priced in (§3): the design leans on the ship's
-   own Wi-Fi (§5.4), mule, and relay — not BLE range. Field data so far says the
-   LAN dominates where it's available and BLE covers the gaps.
-3. **App distribution** — TestFlight + sideload/Play internal testing is fine for
-   family; store review (Apple may poke at BLE background modes) only matters if
-   this is ever distributed beyond family.
+2. **Steel ship RF** — retired as a risk, priced in as a design input (§3):
+   the design leans on the ship's own Wi-Fi (§5.4), mule, and relay — not BLE
+   range. Field results (Norwegian Jade) confirmed it: the LAN dominated
+   where available and BLE covered the gaps. What remains is per-ship
+   variance in LAN client isolation, which the app probes and routes around
+   automatically.
+3. **Store review** — distribution is no longer hypothetical: both store
+   listings are complete, Play closed testing is underway, and TestFlight
+   distributes to the beta group. The remaining risk is review friction
+   (Apple poking at BLE background modes; Play's first-review pass), managed
+   with reviewer notes explaining the no-account model and the two-device
+   nature of mesh testing.
 4. **Battery** — duty-cycle scanning (e.g. 10 s scan / 50 s idle when on battery,
    aggressive when charging). Budget: <5%/day radio overhead.
-5. **Crypto review** — before any non-family distribution, pay for a design review.
-   Bridgefy shipped first and got dissected twice.
+5. **Crypto review** — standing gate from SECURITY-DESIGN: a paid independent
+   security review before recommending CruiseMesh beyond its stated threat
+   model or making any comparative security claims. The design-review
+   discipline (libsodium whole, no bespoke constructions, fuzzers in CI,
+   adversarial review rounds) is the interim substitute, not the
+   replacement. Bridgefy shipped first and got dissected twice.
 
 ## 13. Open questions (deliberately deferred)
 
-- Multi-device / identity backup (v1: keys live and die on one phone; QR re-friend
-  after a lost phone).
+- Multi-device sync. (Identity backup shipped: a passphrase-encrypted local
+  `.cmbak` export/restore of identity + history on both platforms. What
+  remains open is two live devices sharing one identity.)
 - Message history sync for a group member who joins late.
 - Ratchet / post-quantum upgrade timing (envelope `version` byte reserves the path).
 - Passworded broadcast channels; relay federation.
@@ -562,8 +633,10 @@ sit down" expectations get set.
 
 Absorbs the old identity screen: editable display name, local/shared profile
 photo picker, my QR friend card, UserID + fingerprint words (with the "read
-these aloud to verify" hint), mesh on/off, relay configuration status. Nothing
-here is daily-use, which is exactly why it lives behind the avatar.
+these aloud to verify" hint), mesh on/off, the Cruise Pass status indicator
+(quiet glyph states; tap for plain-language detail), backup/restore, and the
+build version. Nothing here is daily-use, which is exactly why it lives
+behind the avatar.
 
 ### 14.5 Chat screen
 

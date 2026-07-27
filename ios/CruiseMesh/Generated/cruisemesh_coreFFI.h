@@ -1541,6 +1541,11 @@ RustBuffer uniffi_cruisemesh_core_fn_func_recent_presence_hints_for(RustBuffer u
 RustBuffer uniffi_cruisemesh_core_fn_func_relay_build_fetch_path(RustBuffer hints, int64_t after_id, uint32_t limit, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_CLASSIFY_HTTP_ERROR
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_CLASSIFY_HTTP_ERROR
+RustBuffer uniffi_cruisemesh_core_fn_func_relay_classify_http_error(uint16_t http_status, RustBuffer relay_code, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_DECODE_FETCH_PAGE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_DECODE_FETCH_PAGE
 RustBuffer uniffi_cruisemesh_core_fn_func_relay_decode_fetch_page(RustBuffer body, RustCallStatus *_Nonnull out_status
@@ -1576,6 +1581,16 @@ RustBuffer uniffi_cruisemesh_core_fn_func_relay_encode_post_envelope(RustBuffer 
 RustBuffer uniffi_cruisemesh_core_fn_func_relay_encode_presence_request(RustBuffer announce, RustBuffer query, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FAULT_IS_TRANSIENT
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FAULT_IS_TRANSIENT
+int8_t uniffi_cruisemesh_core_fn_func_relay_fault_is_transient(RustBuffer fault, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FAULT_RANK
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FAULT_RANK
+uint8_t uniffi_cruisemesh_core_fn_func_relay_fault_rank(RustBuffer fault, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FETCH_BATCH_LIMIT
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FETCH_BATCH_LIMIT
 uint32_t uniffi_cruisemesh_core_fn_func_relay_fetch_batch_limit(RustCallStatus *_Nonnull out_status
@@ -1586,6 +1601,11 @@ uint32_t uniffi_cruisemesh_core_fn_func_relay_fetch_batch_limit(RustCallStatus *
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_MAX_RESPONSE_BYTES
 uint32_t uniffi_cruisemesh_core_fn_func_relay_max_response_bytes(RustCallStatus *_Nonnull out_status
     
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_RETRY_AFTER_MS
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_RETRY_AFTER_MS
+uint64_t uniffi_cruisemesh_core_fn_func_relay_retry_after_ms(RustBuffer retry_after_header, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_SETUP_IS_OFFICIAL
@@ -2511,6 +2531,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_relay_build_fetch_path(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_CLASSIFY_HTTP_ERROR
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_CLASSIFY_HTTP_ERROR
+uint16_t uniffi_cruisemesh_core_checksum_func_relay_classify_http_error(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_DECODE_FETCH_PAGE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_DECODE_FETCH_PAGE
 uint16_t uniffi_cruisemesh_core_checksum_func_relay_decode_fetch_page(void
@@ -2553,6 +2579,18 @@ uint16_t uniffi_cruisemesh_core_checksum_func_relay_encode_presence_request(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FAULT_IS_TRANSIENT
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FAULT_IS_TRANSIENT
+uint16_t uniffi_cruisemesh_core_checksum_func_relay_fault_is_transient(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FAULT_RANK
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FAULT_RANK
+uint16_t uniffi_cruisemesh_core_checksum_func_relay_fault_rank(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FETCH_BATCH_LIMIT
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FETCH_BATCH_LIMIT
 uint16_t uniffi_cruisemesh_core_checksum_func_relay_fetch_batch_limit(void
@@ -2562,6 +2600,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_relay_fetch_batch_limit(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_MAX_RESPONSE_BYTES
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_MAX_RESPONSE_BYTES
 uint16_t uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_RETRY_AFTER_MS
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_RETRY_AFTER_MS
+uint16_t uniffi_cruisemesh_core_checksum_func_relay_retry_after_ms(void
     
 );
 #endif

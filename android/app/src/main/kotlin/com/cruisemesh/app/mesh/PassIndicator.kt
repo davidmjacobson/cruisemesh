@@ -35,16 +35,18 @@ enum class PassIndicator {
     WAITING,
 
     /**
-     * Amber: reached the relay, or tried to, and something is off in a way
-     * that may clear on its own (service unavailable). Worth a glance, not
-     * worth acting on yet.
+     * Amber "?": something is off in a way that clears on its own -- the
+     * service couldn't be reached just now, or asked us to slow down (429).
+     * Worth a glance, never worth acting on, and never a reason to contact
+     * anyone.
      */
     ATTENTION,
 
     /**
-     * Red: the pass will not work again until the person does something --
-     * renew it, replace the setup card, or contact support. These states do
-     * not self-heal, which is what separates them from [ATTENTION].
+     * Red "!": internet delivery stays affected until the person does
+     * something -- renew the pass, replace the setup card, send a smaller
+     * message, or contact support. These states do not self-heal, which is
+     * what separates them from [ATTENTION].
      */
     ACTION_REQUIRED,
 }
@@ -63,10 +65,17 @@ fun passIndicator(health: RelayHealth, configured: Boolean): PassIndicator {
         -> PassIndicator.NONE
         is RelayHealth.Ok -> PassIndicator.READY
         RelayHealth.NoInternet -> PassIndicator.WAITING
-        is RelayHealth.Failing -> PassIndicator.ATTENTION
+        // Transient, self-healing ("?"): can't reach right now, or told to
+        // slow down. Same reaction either way -- none.
+        is RelayHealth.Failing,
+        is RelayHealth.RateLimited,
+        -> PassIndicator.ATTENTION
+        // Persistent, actionable ("!"): these stay until someone acts.
         is RelayHealth.Expired,
         is RelayHealth.Suspended,
         is RelayHealth.TokenRejected,
+        is RelayHealth.QuotaFull,
+        is RelayHealth.MessageTooLarge,
         -> PassIndicator.ACTION_REQUIRED
     }
 }

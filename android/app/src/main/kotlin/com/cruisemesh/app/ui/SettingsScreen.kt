@@ -18,9 +18,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -228,6 +226,7 @@ private fun appVersionLabel(context: Context): String {
     }
 }
 
+@Composable
 private fun relayTitle(health: RelayHealth, configured: Boolean): String {
     if (!configured) return "Set up Cruise Pass"
     return when (health) {
@@ -239,9 +238,13 @@ private fun relayTitle(health: RelayHealth, configured: Boolean): String {
         is RelayHealth.Expired -> "Cruise Pass expired"
         is RelayHealth.Suspended -> "Cruise Pass suspended"
         is RelayHealth.TokenRejected -> "Cruise Pass setup was rejected"
+        is RelayHealth.QuotaFull -> stringResource(R.string.ui_cruise_pass_storage_full_title)
+        is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_cruise_pass_message_too_large_title)
+        is RelayHealth.RateLimited -> stringResource(R.string.ui_cruise_pass_slowed_title)
     }
 }
 
+@Composable
 private fun relayDetail(health: RelayHealth, configured: Boolean): String {
     if (!configured) return "CruiseMesh still works nearby. Add a pass for internet delivery."
     return when (health) {
@@ -253,6 +256,9 @@ private fun relayDetail(health: RelayHealth, configured: Boolean): String {
         is RelayHealth.Expired -> "Renew your pass to resume internet delivery."
         is RelayHealth.Suspended -> "Contact support for help with this pass."
         is RelayHealth.TokenRejected -> "Paste the setup card again, or use a different Cruise Pass."
+        is RelayHealth.QuotaFull -> stringResource(R.string.ui_cruise_pass_storage_full_detail)
+        is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_cruise_pass_message_too_large_detail)
+        is RelayHealth.RateLimited -> stringResource(R.string.ui_cruise_pass_slowed_detail)
     }
 }
 
@@ -290,9 +296,11 @@ private fun SettingsGroup(title: String, content: @Composable () -> Unit) {
  * Icon, tint and screen-reader label for a [PassIndicator].
  *
  * Each state gets a distinct *shape* as well as a distinct colour -- check,
- * info, triangle, cross -- so the row still reads correctly for anyone who
- * cannot tell the tints apart. Colours come from [LocalReachabilityPalette],
- * which already carries light/dark variants and the app's fixed meanings
+ * info, "?", "!" -- so the row still reads correctly for anyone who cannot
+ * tell the tints apart. CP2b (David's UX spec): the "?" circle marks
+ * transient, self-healing conditions; the "!" circle marks persistent ones
+ * that need a person. Colours come from [LocalReachabilityPalette], which
+ * already carries light/dark variants and the app's fixed meanings
  * (green = good, amber = degraded), rather than new one-off literals.
  */
 @Composable
@@ -313,12 +321,12 @@ private fun passIndicatorIcon(
             stringResource(R.string.ui_cruise_pass_waiting_for_internet),
         )
         PassIndicator.ATTENTION -> Triple(
-            Icons.Filled.Warning,
+            PassQuestionIcon,
             palette.recent,
             stringResource(R.string.ui_cruise_pass_needs_attention),
         )
         PassIndicator.ACTION_REQUIRED -> Triple(
-            Icons.Filled.Close,
+            PassExclamationIcon,
             MaterialTheme.colorScheme.error,
             stringResource(R.string.ui_cruise_pass_needs_action),
         )

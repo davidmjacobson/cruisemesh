@@ -17,6 +17,28 @@ sealed class RelayHealth {
 
     /** The relay answered but rejected our own saved family token (HTTP 401/403). */
     data class TokenRejected(val lastAttemptMs: Long) : RelayHealth()
+
+    /**
+     * CP2b: the family's hosted storage is full (HTTP 507
+     * `family_quota_exceeded`). Posting fails while fetching keeps working,
+     * so this is reported even when the rest of the sync pass succeeded.
+     * Persistent until the family drains the backlog or it expires.
+     */
+    data class QuotaFull(val lastAttemptMs: Long) : RelayHealth()
+
+    /**
+     * CP2b: one queued message exceeds the per-envelope size cap (HTTP 413
+     * `envelope_too_large`) and will never post as-is. Actionable locally;
+     * other messages keep delivering.
+     */
+    data class MessageTooLarge(val lastAttemptMs: Long) : RelayHealth()
+
+    /**
+     * CP2b: the service asked us to slow down (HTTP 429 `rate_limited`).
+     * Self-heals within the advertised Retry-After window; never an error
+     * to act on.
+     */
+    data class RateLimited(val lastAttemptMs: Long) : RelayHealth()
 }
 
 enum class DirectPath { BLUETOOTH, LOCAL_WIFI }
