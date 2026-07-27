@@ -5,3 +5,7 @@
 # default on this project's Windows checkout) those bytes would carry CRLF
 # and bash fails on the carriage returns: `$'\r': command not found`.
 *.sh text eol=lf
+# Same story for the systemd units: they are copied verbatim onto the relay
+# box, and systemd reads a CRLF "ExecStart=...\r" as a path that ends in a
+# carriage return.
+relayd/deploy/* text eol=lf
