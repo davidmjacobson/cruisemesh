@@ -189,6 +189,103 @@ docker run --rm -v relayd_relay-data:/data -v "${PWD}:/backup" alpine \
 Volume name may be prefixed with the compose project name (`relayd_relay-data`
 if started from this directory).
 
+### Automated nightly backups (`tools/relay_backup.sh`)
+
+`tools/relay_backup.sh` automates all of the above the WAL-safe way — a
+`sqlite3 ".backup"` (SQLite's online backup API) against the live DB in the
+data volume, an immediate `PRAGMA integrity_check` + row-count verification
+of the copy, gzip, rotation (newest 14 kept), an optional off-box push, and
+a disk watchdog. It is driven by the systemd units in `relayd/deploy/`
+(nightly at 03:17 UTC, deliberately off relayd's top-of-the-hour maintenance
+sweep). The unit files assume the `provision-hetzner.sh` layout
+(`/opt/cruisemesh`); adjust `ExecStart=` if your checkout lives elsewhere.
+
+One-time install on the box, as root:
+
+```sh
+apt-get install -y sqlite3
+cp /opt/cruisemesh/relayd/deploy/cruisemesh-relay-backup.service \
+   /opt/cruisemesh/relayd/deploy/cruisemesh-relay-backup.timer \
+   /opt/cruisemesh/relayd/deploy/cruisemesh-relay-backup-alert.service \
+   /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now cruisemesh-relay-backup.timer
+```
+
+**Failure emails** — a failed run (backup error *or* disk past threshold)
+fires the `OnFailure=` unit, which posts a plain-text alert through the
+Resend API. Give it the key once (same Resend account the purchase Worker
+uses; the file, not argv, so it never shows in a process list):
+
+```sh
+install -d -m 700 /etc/cruisemesh
+(umask 077; printf 'RESEND_API_KEY=%s\n' '<resend key>' > /etc/cruisemesh/ops-alert.env)
+```
+
+Without that file the failure still lands in the journal and
+`systemctl --failed`, but nobody is emailed. (Box-down outages are covered
+separately by the cruisemesh-web Worker's 15-minute `/healthz` cron; this
+hook only covers backup/disk failures, which `/healthz` cannot see.)
+
+**Verify the install — including a restore test.** A backup nobody has ever
+restored is a hope, not a backup. Right after installing (and again after
+any SQLite upgrade):
+
+```sh
+# Run one backup by hand and read its journal line:
+systemctl start cruisemesh-relay-backup.service
+journalctl -u cruisemesh-relay-backup.service -n 5
+ls -la /var/backups/cruisemesh-relayd/
+
+# Restore test: unpack the newest snapshot and prove it opens clean with
+# real data in it.
+latest=$(ls -1t /var/backups/cruisemesh-relayd/cruisemesh-relayd-*.sqlite.gz | head -1)
+gunzip -c "$latest" > /tmp/restore-test.sqlite
+sqlite3 /tmp/restore-test.sqlite \
+  "PRAGMA integrity_check; SELECT COUNT(*) FROM families; SELECT COUNT(*) FROM envelopes;"
+rm /tmp/restore-test.sqlite
+```
+
+**Where backups land**: `/var/backups/cruisemesh-relayd/` as
+`cruisemesh-relayd-<UTC-timestamp>.sqlite.gz`, newest 14 kept
+(`CRUISEMESH_BACKUP_KEEP`), mode 0600 under a 0700 directory — these files
+contain **full family bearer tokens** and the sealed mailbox, so treat them
+like the database itself.
+
+**Off-box copies (recommended once real families are aboard)**: a backup on
+the same disk as the database does not survive the disk. Configure an rclone
+remote once as root (`rclone config` — credentials stay in root's
+`rclone.conf`, never in the unit or the script), point the service at it via
+a drop-in, and use a **private** bucket:
+
+```sh
+systemctl edit cruisemesh-relay-backup.service
+# In the editor, add:
+#   [Service]
+#   Environment=CRUISEMESH_BACKUP_RCLONE_REMOTE=b2:cruisemesh-backups/relayd
+```
+
+**Disk watchdog**: each run ends by checking the filesystems holding the
+data volume and the backup directory; past 85 % (`CRUISEMESH_DISK_ALERT_PCT`)
+it prints an `ALERT:` line and exits non-zero, which fires the same
+`OnFailure=` email. The check runs last on purpose, so a nearly-full disk
+still gets that night's backup.
+
+**Restoring onto the live deploy** (the full-loss path):
+
+```sh
+cd /opt/cruisemesh/relayd
+docker compose stop relayd
+gunzip -c /var/backups/cruisemesh-relayd/<snapshot>.sqlite.gz > /tmp/restore.sqlite
+# Replace the DB and drop stale WAL sidecars from the old incarnation:
+docker run --rm -v relayd_relay-data:/data -v /tmp:/restore alpine \
+  sh -c 'rm -f /data/cruisemesh-relayd.sqlite-wal /data/cruisemesh-relayd.sqlite-shm \
+         && cp /restore/restore.sqlite /data/cruisemesh-relayd.sqlite'
+docker compose start relayd
+rm /tmp/restore.sqlite
+curl -fsS "https://${RELAY_DOMAIN}/healthz"
+```
+
 ## 10. Resource limits (DTN_TODOS.md D7)
 
 The relay is content-agnostic (§6) and never inspects `sealed`, so the only
