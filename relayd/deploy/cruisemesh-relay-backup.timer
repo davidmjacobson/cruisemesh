@@ -1,0 +1,15 @@
+# Nightly trigger for cruisemesh-relay-backup.service (DEPLOY.md §9).
+# 03:17 UTC: an off-peak minute that deliberately avoids relayd's hourly
+# maintenance sweep at the top of the hour; Persistent= catches up a night
+# missed while the box was down.
+
+[Unit]
+Description=Run the CruiseMesh relay backup nightly
+
+[Timer]
+OnCalendar=*-*-* 03:17:00 UTC
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
