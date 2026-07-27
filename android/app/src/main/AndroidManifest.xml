@@ -64,6 +64,19 @@
                 <data android:scheme="https" android:host="cruisemesh.app" android:pathPrefix="/r" />
                 <data android:scheme="https" android:host="cruisemesh.app" android:pathPrefix="/lan" />
             </intent-filter>
+            <!-- T20: the same destinations over cruisemesh://, which the
+                 website's "Open in CruiseMesh" buttons use. A custom scheme
+                 fires regardless of the page's origin, unlike a Universal
+                 Link, and needs its own filter because it must not carry
+                 autoVerify (there is nothing to verify against). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="cruisemesh" android:host="f" />
+                <data android:scheme="cruisemesh" android:host="r" />
+                <data android:scheme="cruisemesh" android:host="lan" />
+            </intent-filter>
         </activity>
 
         <service

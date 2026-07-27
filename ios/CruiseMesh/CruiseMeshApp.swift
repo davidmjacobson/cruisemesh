@@ -37,14 +37,27 @@ struct CruiseMeshApp: App {
                 MessageNotifier.configureCategories()
             }
             .onOpenURL { url in
-                guard url.host == "cruisemesh.app", let fragment = url.fragment else { return }
-                if url.path == "/f" || url.path == "/f/" {
+                // T20: the core owns the routing table so both shells agree,
+                // and so the https link and the cruisemesh:// scheme resolve
+                // identically. The scheme exists because iOS does not fire a
+                // Universal Link for a same-domain navigation, which leaves
+                // the website's "Open in CruiseMesh" button inert in Safari.
+                guard
+                    let route = deepLinkRoute(
+                        scheme: url.scheme ?? "",
+                        host: url.host ?? "",
+                        path: url.path
+                    ),
+                    let fragment = url.fragment
+                else { return }
+                switch route {
+                case .friend:
                     guard (try? parseFriendText(text: fragment)) != nil else { return }
                     appModel.pendingFriendToken = fragment
-                } else if url.path == "/r" || url.path == "/r/" {
+                case .relaySetup:
                     guard (try? parseRelaySetupText(text: fragment)) != nil else { return }
                     appModel.pendingRelayCard = fragment
-                } else if url.path == "/lan" || url.path == "/lan/" {
+                case .lan:
                     guard let endpoint = parseLanEndpointLink(fragment) else { return }
                     LanTransportDiagnostics.shared.queueManualConnection(endpoint)
                     appModel.startMesh()

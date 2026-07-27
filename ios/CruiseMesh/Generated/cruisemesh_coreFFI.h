@@ -1306,6 +1306,11 @@ RustBuffer uniffi_cruisemesh_core_fn_func_decode_receipt_content(RustBuffer byte
 RustBuffer uniffi_cruisemesh_core_fn_func_dedupe_hints(RustBuffer hints, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_DEEP_LINK_ROUTE
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_DEEP_LINK_ROUTE
+RustBuffer uniffi_cruisemesh_core_fn_func_deep_link_route(RustBuffer scheme, RustBuffer host, RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_DEFAULT_EXPIRY
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_DEFAULT_EXPIRY
 int64_t uniffi_cruisemesh_core_fn_func_default_expiry(int64_t timestamp_ms, RustCallStatus *_Nonnull out_status
@@ -2252,6 +2257,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_decode_receipt_content(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_DEDUPE_HINTS
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_DEDUPE_HINTS
 uint16_t uniffi_cruisemesh_core_checksum_func_dedupe_hints(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_DEEP_LINK_ROUTE
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_DEEP_LINK_ROUTE
+uint16_t uniffi_cruisemesh_core_checksum_func_deep_link_route(void
     
 );
 #endif

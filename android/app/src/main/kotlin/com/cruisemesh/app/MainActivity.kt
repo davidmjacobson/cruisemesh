@@ -108,9 +108,11 @@ import com.cruisemesh.app.ui.CruisePassScreen
 import com.cruisemesh.app.ui.HelpSupportScreen
 import com.cruisemesh.app.ui.InternalToolsScreen
 import com.cruisemesh.app.ui.SettingsScreen
+import uniffi.cruisemesh_core.DeepLinkRoute
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.coreContactDisplayName
+import uniffi.cruisemesh_core.deepLinkRoute
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.generateIdentity
@@ -193,31 +195,23 @@ class MainActivity : ComponentActivity() {
             return PendingDeepLink(hex, intent.getBooleanExtra(MessageNotifier.EXTRA_CHAT_IS_GROUP, false))
         }
         val uri = intent?.data ?: return null
-        if (
-            uri.scheme == "https" &&
-            uri.host == "cruisemesh.app" &&
-            (uri.path == "/f" || uri.path == "/f/")
-        ) {
-            val token = uri.fragment?.takeIf { runCatching { parseFriendText(it) }.isSuccess }
-            if (token != null) return PendingDeepLink(friendToken = token)
+        // T20: the core owns the routing table so both shells agree, and so
+        // the https link and the cruisemesh:// scheme resolve identically.
+        // The scheme exists because iOS will not fire a Universal Link for a
+        // same-domain navigation, which makes the website's "Open in
+        // CruiseMesh" button inert in Safari.
+        val route = deepLinkRoute(uri.scheme ?: "", uri.host ?: "", uri.path ?: "") ?: return null
+        val fragment = uri.fragment ?: return null
+        return when (route) {
+            DeepLinkRoute.FRIEND ->
+                fragment.takeIf { runCatching { parseFriendText(it) }.isSuccess }
+                    ?.let { PendingDeepLink(friendToken = it) }
+            DeepLinkRoute.RELAY_SETUP ->
+                fragment.takeIf { runCatching { parseRelaySetupText(it) }.isSuccess }
+                    ?.let { PendingDeepLink(relayCard = it) }
+            DeepLinkRoute.LAN ->
+                parseLanEndpointLink(fragment)?.let { PendingDeepLink(lanEndpoint = it.display) }
         }
-        if (
-            uri.scheme == "https" &&
-            uri.host == "cruisemesh.app" &&
-            (uri.path == "/r" || uri.path == "/r/")
-        ) {
-            val card = uri.fragment?.takeIf { runCatching { parseRelaySetupText(it) }.isSuccess }
-            if (card != null) return PendingDeepLink(relayCard = card)
-        }
-        if (
-            uri.scheme == "https" &&
-            uri.host == "cruisemesh.app" &&
-            (uri.path == "/lan" || uri.path == "/lan/")
-        ) {
-            val endpoint = parseLanEndpointLink(uri.fragment)
-            if (endpoint != null) return PendingDeepLink(lanEndpoint = endpoint.display)
-        }
-        return null
     }
 
     companion object {
