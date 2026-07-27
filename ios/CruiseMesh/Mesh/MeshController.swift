@@ -2282,6 +2282,25 @@ final class MeshController: ObservableObject {
         ).map { RelayConfig(relayUrl: $0.url, relayToken: $0.token) }
     }
 
+    /// CP4: fetch/ack/presence resolution. Post-CP4 friend cards carry
+    /// post-only deposit tokens, which cannot read a mailbox — the core
+    /// resolves a same-family card back to our own member config and drops
+    /// cross-family deposit endpoints entirely (polling them would just 403
+    /// `deposit_only` on every pass). Legacy member-token cards keep
+    /// proxy-polling exactly as before. Sends stay on `resolvedRelayConfig`.
+    /// Mirrors RelaySyncEngine.kt's resolvedPollRelayConfig.
+    nonisolated static func resolvedPollRelayConfig(
+        contact: Contact?,
+        fallback: RelayConfig?
+    ) -> RelayConfig? {
+        resolvedContactPollRelay(
+            contactRelayUrl: contact?.relayUrl,
+            contactRelayToken: contact?.relayToken,
+            fallbackUrl: fallback?.relayUrl,
+            fallbackToken: fallback?.relayToken
+        ).map { RelayConfig(relayUrl: $0.url, relayToken: $0.token) }
+    }
+
     /// Every distinct mailbox this device should poll: its own saved config
     /// first, then each contact's resolved card relay (mirrors
     /// RelaySyncEngine.kt's distinctRelayConfigs).
@@ -2298,7 +2317,7 @@ final class MeshController: ObservableObject {
         }
         add(fallback)
         for contact in contacts {
-            add(Self.resolvedRelayConfig(contact: contact, fallback: fallback))
+            add(Self.resolvedPollRelayConfig(contact: contact, fallback: fallback))
         }
         return result
     }
@@ -2478,8 +2497,12 @@ final class MeshController: ObservableObject {
                 // it; own presence is announced everywhere so contacts on
                 // other relays still see us (mirrors syncRelayPresence in
                 // RelaySyncEngine.kt). Presence failure is never fatal.
+                // CP4: presence is a read, so contacts group under their
+                // *poll* config — a family member's deposit-token card
+                // resolves back to our own member config and their presence
+                // keeps flowing through it.
                 let contactsForConfig = contacts.filter { contact in
-                    guard let resolved = Self.resolvedRelayConfig(contact: contact, fallback: config)
+                    guard let resolved = Self.resolvedPollRelayConfig(contact: contact, fallback: config)
                     else { return false }
                     return resolved.relayUrl == cfg.relayUrl && resolved.relayToken == cfg.relayToken
                 }

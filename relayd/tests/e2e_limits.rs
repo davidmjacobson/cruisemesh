@@ -18,7 +18,9 @@ use axum::response::Response;
 use axum::Router;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use cruisemesh_relayd::{app, AppState, RateLimitConfig, RelayStore, MAX_ENVELOPE_SEALED_BYTES};
+use cruisemesh_relayd::{
+    app, deposit_token_for, AppState, RateLimitConfig, RelayStore, MAX_ENVELOPE_SEALED_BYTES,
+};
 use tempfile::NamedTempFile;
 use tower::util::ServiceExt;
 
@@ -468,6 +470,126 @@ async fn a_limited_family_recovers_as_its_bucket_refills() {
     );
 }
 
+// ---------------------------------------------------------------------
+// CP4: deposit-class tokens get their own, tighter buckets — keyed by the
+// deposit token itself, so friend-card traffic can never spend the
+// family's member-class allowance (or vice versa).
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn deposit_tokens_charge_their_own_tighter_request_bucket() {
+    let (_db, router) = test_app_with_rate_limits(
+        &["family-a"],
+        RateLimitConfig {
+            requests_per_min: 100,
+            deposit_requests_per_min: 2,
+            ..RateLimitConfig::default()
+        },
+    );
+    let deposit = deposit_token_for("family-a");
+
+    for i in 1..=2u8 {
+        let response = post_sealed(
+            &router,
+            &deposit,
+            &msg_id(i),
+            &hint(1),
+            16,
+            now_ms() + 60_000,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "deposit post {i} is inside the 2-per-minute deposit allowance"
+        );
+    }
+    let limited = post_sealed(
+        &router,
+        &deposit,
+        &msg_id(3),
+        &hint(1),
+        16,
+        now_ms() + 60_000,
+    )
+    .await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(retry_after_secs(&limited) >= 1);
+    assert_eq!(body_json(limited).await["code"], "rate_limited");
+
+    // The member class is untouched by the exhausted deposit bucket: the
+    // family keeps posting and fetching on its own 100-per-minute allowance.
+    for i in 10..15u8 {
+        let response = post_sealed(
+            &router,
+            "family-a",
+            &msg_id(i),
+            &hint(1),
+            16,
+            now_ms() + 60_000,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "member post {i}");
+    }
+    assert_eq!(fetch(&router, "family-a").await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn deposit_byte_allowance_binds_independently_of_the_member_one() {
+    let (_db, router) = test_app_with_rate_limits(
+        &["family-a"],
+        RateLimitConfig {
+            deposit_requests_per_min: 10,
+            deposit_bytes_per_min: 64,
+            ..RateLimitConfig::default()
+        },
+    );
+    let deposit = deposit_token_for("family-a");
+
+    // One 100-byte deposit post trips the 64-byte deposit allowance...
+    let limited = post_sealed(
+        &router,
+        &deposit,
+        &msg_id(1),
+        &hint(1),
+        100,
+        now_ms() + 60_000,
+    )
+    .await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    let json = body_json(limited).await;
+    assert_eq!(json["code"], "rate_limited");
+    assert!(
+        json["error"].as_str().unwrap().contains("byte rate"),
+        "the byte dimension should be the one named: {}",
+        json["error"]
+    );
+
+    // ...while a small deposit post still fits (the byte rejection charged
+    // no bytes), and the member class uploads the same payload freely on
+    // its own default allowance.
+    let response = post_sealed(
+        &router,
+        &deposit,
+        &msg_id(2),
+        &hint(1),
+        16,
+        now_ms() + 60_000,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = post_sealed(
+        &router,
+        "family-a",
+        &msg_id(3),
+        &hint(1),
+        100,
+        now_ms() + 60_000,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn healthz_and_admin_routes_are_never_rate_limited() {
     // One request per minute for everything that *is* limited, so any
@@ -481,6 +603,7 @@ async fn healthz_and_admin_routes_are_never_rate_limited() {
             requests_per_min: 1,
             bytes_per_min: 1,
             global_requests_per_min: 1,
+            ..RateLimitConfig::default()
         },
     )
     .with_admin_token(Some("admin-token".to_string())));

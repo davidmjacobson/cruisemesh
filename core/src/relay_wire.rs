@@ -1,3 +1,5 @@
+use blake2::digest::{Update, VariableOutput};
+use blake2::Blake2bVar;
 use data_encoding::BASE64URL_NOPAD;
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +92,61 @@ struct PresenceResponse {
     presence: Vec<PresenceWire>,
 }
 
+/// CP4 (deposit-token split): class prefix that marks a *deposit* relay
+/// token — post-only into one family's mailbox, minted by attenuating the
+/// family's full member token. The prefix makes the class recognizable from
+/// the token string alone, so routing policy (below) and the relay can both
+/// classify a credential without any extra field on the wire.
+const RELAY_DEPOSIT_TOKEN_PREFIX: &str = "cmdep1-";
+
+/// Domain-separation context for the deposit derivation. relayd derives the
+/// same value at provisioning (`relayd/src/lib.rs::deposit_token_for`);
+/// golden vectors in both crates pin the two implementations together.
+const RELAY_DEPOSIT_TOKEN_CONTEXT: &[u8] = b"cruisemesh relay deposit token v1";
+
+/// True when `token` is a deposit-class relay credential (CP4): valid only
+/// for posting envelopes into its family's mailbox, never for fetch/ack/
+/// presence/WebSocket. Friend cards carry this class; the Cruise Pass setup
+/// card carries the full member class.
+#[uniffi::export]
+pub fn relay_token_is_deposit(token: String) -> bool {
+    token.trim().starts_with(RELAY_DEPOSIT_TOKEN_PREFIX)
+}
+
+/// CP4: attenuate a member relay token into its deposit-class counterpart —
+/// `cmdep1-` ‖ base64url(BLAKE2b-256(context ‖ member_token)).
+///
+/// Derivation (a one-way hash), not random minting, on purpose: the phone
+/// can stamp a deposit token onto a friend card entirely offline, knowing
+/// only its own member token, with no new relay endpoint, no extra stored
+/// credential, and no change to the Cruise Pass setup card. The relay
+/// derives and stores the identical value at provisioning/startup, so both
+/// sides agree without ever exchanging it. Preimage resistance means a
+/// deposit token (semi-public: it rides QR friend cards) reveals nothing
+/// about the member token it was derived from — provided the member token
+/// is high-entropy, which `DEPLOY.md` §1 requires (`openssl rand -hex 32`).
+///
+/// Idempotent: a token that is already deposit-class is returned unchanged,
+/// so re-encoding a card can never double-attenuate. Empty input stays empty.
+#[uniffi::export]
+pub fn relay_deposit_token_for(member_token: String) -> String {
+    let member = member_token.trim();
+    if member.is_empty() || member.starts_with(RELAY_DEPOSIT_TOKEN_PREFIX) {
+        return member.to_string();
+    }
+    let mut hasher = Blake2bVar::new(32).expect("valid blake2b output length");
+    hasher.update(RELAY_DEPOSIT_TOKEN_CONTEXT);
+    hasher.update(member.as_bytes());
+    let mut out = [0u8; 32];
+    hasher
+        .finalize_variable(&mut out)
+        .expect("output buffer matches configured length");
+    format!(
+        "{RELAY_DEPOSIT_TOKEN_PREFIX}{}",
+        BASE64URL_NOPAD.encode(&out)
+    )
+}
+
 /// Which relay mailbox serves an envelope addressed to a contact: the
 /// contact's own mailbox from their friend card when complete, else the
 /// device's saved fallback config. relayd scopes every row per family token,
@@ -102,6 +159,14 @@ pub struct RelayEndpoint {
     pub token: String,
 }
 
+/// Send-path routing (CP4-aware). The contact's card credential wins when
+/// complete — for a post-CP4 card that is their family's deposit token,
+/// exactly the capability a send needs — with one refinement: when the
+/// contact's deposit token is the attenuation of our OWN member token (same
+/// family, same relay), the send uses our member credential instead. Family
+/// traffic thus stays on the member-class rate buckets and is never
+/// throttled by the tighter deposit allowance; only genuine cross-family
+/// deposits ride the deposit bucket.
 #[uniffi::export]
 pub fn resolved_contact_relay(
     contact_relay_url: Option<String>,
@@ -109,8 +174,50 @@ pub fn resolved_contact_relay(
     fallback_url: Option<String>,
     fallback_token: Option<String>,
 ) -> Option<RelayEndpoint> {
-    relay_endpoint_from(contact_relay_url, contact_relay_token)
-        .or_else(|| relay_endpoint_from(fallback_url, fallback_token))
+    let contact = relay_endpoint_from(contact_relay_url, contact_relay_token);
+    let fallback = relay_endpoint_from(fallback_url, fallback_token);
+    match (contact, fallback) {
+        (Some(contact), Some(fallback)) => {
+            if contact.url == fallback.url
+                && relay_token_is_deposit(contact.token.clone())
+                && relay_deposit_token_for(fallback.token.clone()) == contact.token
+            {
+                Some(fallback)
+            } else {
+                Some(contact)
+            }
+        }
+        (contact, fallback) => contact.or(fallback),
+    }
+}
+
+/// Poll-path routing (CP4): which mailbox, if any, may be *read*
+/// (fetch/ack/presence) on this contact's behalf. Deposit tokens cannot
+/// read, so a resolved endpoint that would carry one is dropped rather than
+/// handed to the sync engine to 403 on every pass:
+///
+/// - Same family (the card token attenuates from our own member token):
+///   `resolved_contact_relay` already resolved to our member endpoint —
+///   polled as before.
+/// - Legacy member-class card token: still polled (pre-CP4 proxy-polling
+///   keeps working until the contact re-shares their card).
+/// - Cross-family deposit-class token: `None`. Reading another family's
+///   mailbox with a friend-card credential is exactly the capability CP4
+///   removes; the contact's family drains its own mailbox.
+#[uniffi::export]
+pub fn resolved_contact_poll_relay(
+    contact_relay_url: Option<String>,
+    contact_relay_token: Option<String>,
+    fallback_url: Option<String>,
+    fallback_token: Option<String>,
+) -> Option<RelayEndpoint> {
+    resolved_contact_relay(
+        contact_relay_url,
+        contact_relay_token,
+        fallback_url,
+        fallback_token,
+    )
+    .filter(|endpoint| !relay_token_is_deposit(endpoint.token.clone()))
 }
 
 fn relay_endpoint_from(url: Option<String>, token: Option<String>) -> Option<RelayEndpoint> {
@@ -373,6 +480,99 @@ mod tests {
             normalize_relay_url("http://127.0.0.1:8080/".into()),
             "http://127.0.0.1:8080"
         );
+    }
+
+    /// Golden vector shared verbatim with relayd
+    /// (`relayd/src/lib.rs::deposit_derivation_matches_core_golden_vector`):
+    /// if either side's derivation drifts, its copy of this test fails.
+    #[test]
+    fn deposit_token_derivation_matches_golden_vector() {
+        assert_eq!(
+            relay_deposit_token_for("abc123".into()),
+            "cmdep1-0uq69OqNyMo1Dd3vQcspqLlRY6bCCjTWvPyehXd6Ezs"
+        );
+        assert_eq!(
+            relay_deposit_token_for("family-token".into()),
+            "cmdep1-63hWvx1kHLKirfl9GV576eAi_rURpyZixpsCVUCXNJk"
+        );
+    }
+
+    #[test]
+    fn deposit_token_derivation_is_idempotent_and_trims() {
+        let deposit = relay_deposit_token_for("abc123".into());
+        assert_eq!(relay_deposit_token_for(deposit.clone()), deposit);
+        assert_eq!(relay_deposit_token_for(" abc123 ".into()), deposit);
+        assert_eq!(relay_deposit_token_for("  ".into()), "");
+        assert!(relay_token_is_deposit(deposit));
+        assert!(!relay_token_is_deposit("abc123".into()));
+        assert!(!relay_token_is_deposit(String::new()));
+    }
+
+    #[test]
+    fn send_path_prefers_member_credential_for_own_family_deposit() {
+        // A family member's card carries the deposit form of our own member
+        // token: sends must ride our member credential (member-class rate
+        // buckets), not the tighter deposit allowance.
+        let deposit = relay_deposit_token_for("token-own".into());
+        let resolved = resolved_contact_relay(
+            Some("https://own.relay.example".into()),
+            Some(deposit.clone()),
+            Some("own.relay.example/".into()),
+            Some("token-own".into()),
+        )
+        .unwrap();
+        assert_eq!(resolved.token, "token-own");
+
+        // A cross-family deposit token is used as-is for sends: posting is
+        // exactly what the deposit class allows.
+        let resolved = resolved_contact_relay(
+            Some("https://dana.relay.example".into()),
+            Some(deposit.clone()),
+            Some("https://own.relay.example".into()),
+            Some("token-own".into()),
+        )
+        .unwrap();
+        assert_eq!(resolved.url, "https://dana.relay.example");
+        assert_eq!(resolved.token, deposit);
+    }
+
+    #[test]
+    fn poll_path_never_resolves_to_a_deposit_credential() {
+        let deposit = relay_deposit_token_for("token-own".into());
+
+        // Same family → the member fallback is polled, exactly as pre-CP4.
+        let resolved = resolved_contact_poll_relay(
+            Some("https://own.relay.example".into()),
+            Some(deposit.clone()),
+            Some("https://own.relay.example".into()),
+            Some("token-own".into()),
+        )
+        .unwrap();
+        assert_eq!(resolved.token, "token-own");
+
+        // Cross-family deposit → nothing to poll: deposit tokens cannot
+        // fetch/ack/announce, so handing this endpoint to the sync engine
+        // would only 403 on every pass.
+        assert_eq!(
+            resolved_contact_poll_relay(
+                Some("https://dana.relay.example".into()),
+                Some(deposit),
+                Some("https://own.relay.example".into()),
+                Some("token-own".into()),
+            ),
+            None
+        );
+
+        // Legacy member-class card token → still polled (pre-CP4
+        // proxy-polling keeps working until the card is re-shared).
+        let resolved = resolved_contact_poll_relay(
+            Some("https://dana.relay.example".into()),
+            Some("token-dana".into()),
+            Some("https://own.relay.example".into()),
+            Some("token-own".into()),
+        )
+        .unwrap();
+        assert_eq!(resolved.token, "token-dana");
     }
 
     #[test]

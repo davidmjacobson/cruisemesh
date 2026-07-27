@@ -30,6 +30,7 @@ import uniffi.cruisemesh_core.dedupeHints
 import uniffi.cruisemesh_core.coreGroupFanoutRowsForCarried
 import uniffi.cruisemesh_core.recentPresenceHintsFor
 import uniffi.cruisemesh_core.relayFetchBatchLimit
+import uniffi.cruisemesh_core.resolvedContactPollRelay
 import uniffi.cruisemesh_core.resolvedContactRelay
 
 // Deliberately MeshService's tag, not this class's name: this code moved here
@@ -702,7 +703,7 @@ internal class RelaySyncEngine(
         buildList {
             fallbackConfig?.let { add(it) }
             for (contact in contacts) {
-                val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
+                val config = resolvedPollRelayConfig(contact, fallbackConfig) ?: continue
                 if (!contains(config)) add(config)
             }
         }
@@ -710,6 +711,22 @@ internal class RelaySyncEngine(
     /** Core owns the mailbox-routing policy (T11) so both shells resolve identically. */
     private fun resolvedRelayConfig(contact: Contact, fallbackConfig: RelayConfig?): RelayConfig? =
         resolvedContactRelay(
+            contact.relayUrl,
+            contact.relayToken,
+            fallbackConfig?.relayUrl,
+            fallbackConfig?.relayToken,
+        )?.let { RelayConfig(it.url, it.token) }
+
+    /**
+     * CP4: fetch/ack/presence resolution. Post-CP4 friend cards carry
+     * post-only deposit tokens, which cannot read a mailbox — the core
+     * resolves a same-family card back to our own member config and drops
+     * cross-family deposit endpoints entirely (polling them would just 403
+     * `deposit_only` on every pass). Legacy member-token cards keep
+     * proxy-polling exactly as before. Sends stay on [resolvedRelayConfig].
+     */
+    private fun resolvedPollRelayConfig(contact: Contact, fallbackConfig: RelayConfig?): RelayConfig? =
+        resolvedContactPollRelay(
             contact.relayUrl,
             contact.relayToken,
             fallbackConfig?.relayUrl,
@@ -753,8 +770,11 @@ internal class RelaySyncEngine(
         now: Long,
         network: Network?,
     ) {
+        // CP4: presence is a read, so contacts group under their *poll*
+        // config — a family member's deposit-token card resolves back to our
+        // own member config and their presence keeps flowing through it.
         val contactsForConfig = contacts.filter { contact ->
-            resolvedRelayConfig(contact, fallbackConfig) == config
+            resolvedPollRelayConfig(contact, fallbackConfig) == config
         }
         if (contactsForConfig.isEmpty()) return
         val announce = if (RelayConfigStore.shareOnline(context)) {

@@ -13,14 +13,51 @@ process that stores sealed envelopes only. It never sees plaintext.
 
 ## 1. Provision family tokens
 
-Each family gets one long random bearer token. Phones send it as
-`Authorization: Bearer <token>` on every request; it is also what you bake
-into friend cards as `relay_token`.
+Each family gets one long random bearer token — the **member** token. Phones
+send it as `Authorization: Bearer <token>` on every request.
 
 ```sh
 # One token per family (store these somewhere safe; rotating is a re-QR).
 openssl rand -hex 32
 ```
+
+**Use a long random value, not a memorable phrase.** Beyond ordinary
+credential hygiene, CP4 (next section) derives a semi-public deposit token
+from this one with a plain hash — a guessable member token could be
+brute-forced offline by anyone holding the deposit token.
+
+### Token classes (CP4)
+
+Every family has **two** credentials:
+
+| Class | Token | Can do | Rides on |
+|---|---|---|---|
+| **member** | the token you provision (env var or admin API) | post, fetch, ack, presence, WebSocket | Cruise Pass setup card (`CMRELAY1`), each family phone's own config |
+| **deposit** | `cmdep1-` + base64url(BLAKE2b-256(context ‖ member token)), derived automatically | `POST /envelopes` only | friend cards (`CMFRIEND…`) |
+
+You never provision or distribute the deposit token yourself: relayd derives
+and stores it automatically (at provisioning for new families, at startup
+for pre-existing ones), and phones derive the identical value locally when
+stamping a friend card. Every operation other than posting an envelope is
+rejected for a deposit token with:
+
+```
+HTTP 403 Forbidden
+{ "error": "deposit tokens can only post envelopes; ...", "code": "deposit_only" }
+```
+
+Enforcement sits in the shared authorization path, ahead of every handler.
+Envelopes posted with a deposit token land in the family's one mailbox
+(keyed by the member token), count against the same storage quota, and obey
+the same suspension/expiry rules; only the rate-limit buckets differ (§10).
+
+This closes the pre-CP4 hole where friend cards carried the full family
+token, so a publicly posted card let strangers fetch and ack (= delete)
+family mail. **Upgrade the relay before (or with) the phones**: post-CP4
+apps put deposit tokens on friend cards, and a pre-CP4 relayd does not
+recognize them (contacts' posts would 401). All existing tokens migrate as
+member class — zero behavior change for existing families — and old
+full-token friend cards keep working, since member tokens still post.
 
 Multiple families on one server: comma-separate tokens.
 
@@ -60,12 +97,18 @@ the usual cause).
 
 ## 4. Point phones at the relay
 
-On each phone, the friend card / contact fields should be:
+On each phone, the saved relay config (Cruise Pass screen / internal tools)
+should be:
 
 | Field | Value |
 |---|---|
 | relay URL | `https://relay.example.com` (no trailing slash) |
-| relay token | the same family token from step 1 |
+| relay token | the same family **member** token from step 1 |
+
+Friend cards take care of themselves: when a phone with this config shares
+a card, it stamps the derived **deposit** token onto it (CP4) — contacts can
+post into the family mailbox but never read it. Do not hand the member
+token to people outside the family.
 
 The Android client uploads queued envelopes and polls
 `GET /envelopes?hints=...` with that bearer token. With a live network path
@@ -83,9 +126,11 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 | `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` | `268435456` (256 MiB) | Per-family-token storage quota. See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_WS_PER_TOKEN_MAX_CONNECTIONS` | `16` | Max concurrent `GET /ws` connections for a single family token. See §7. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_WS_GLOBAL_MAX_CONNECTIONS` | `256` | Max concurrent `GET /ws` connections across all family tokens combined. See §7. Must be a positive integer; unset uses the default. |
-| `CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN` | `600` | Requests per minute allowed for a single family token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
-| `CRUISEMESH_RELAY_RATE_BYTES_PER_MIN` | `67108864` (64 MiB) | Uploaded `sealed` bytes per minute allowed for a single family token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
-| `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` | `6000` | Requests per minute across all family tokens combined — the coarse backstop. See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN` | `600` | Requests per minute allowed for a single family **member** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_RATE_BYTES_PER_MIN` | `67108864` (64 MiB) | Uploaded `sealed` bytes per minute allowed for a single family **member** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_DEPOSIT_RATE_REQUESTS_PER_MIN` | `60` | CP4: requests per minute allowed for a single family **deposit** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN` | `6291456` (6 MiB) | CP4: uploaded `sealed` bytes per minute allowed for a single family **deposit** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` | `6000` | Requests per minute across all tokens combined — the coarse backstop. See §10. Must be a positive integer; unset uses the default. |
 | `RELAY_DOMAIN` | *(compose required)* | Hostname in the Caddyfile for TLS. |
 
 ### The `CRUISEMESH_RELAY_DB` path gotcha
@@ -378,9 +423,19 @@ connection on a $4 VPS. Three token buckets close it:
 
 | Bucket | Default | Env var |
 |---|---|---|
-| Requests, per family token | 600/min | `CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN` |
-| Uploaded `sealed` bytes, per family token | 64 MiB/min | `CRUISEMESH_RELAY_RATE_BYTES_PER_MIN` |
+| Requests, per member token | 600/min | `CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN` |
+| Uploaded `sealed` bytes, per member token | 64 MiB/min | `CRUISEMESH_RELAY_RATE_BYTES_PER_MIN` |
+| Requests, per deposit token (CP4) | 60/min | `CRUISEMESH_RELAY_DEPOSIT_RATE_REQUESTS_PER_MIN` |
+| Uploaded `sealed` bytes, per deposit token (CP4) | 6 MiB/min | `CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN` |
 | Requests, all tokens combined | 6,000/min | `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` |
+
+CP4: buckets are keyed by the *presented* credential, so a family's deposit
+traffic (friend cards, i.e. what strangers can hold) exhausts its own
+tighter allowance and never spends the family's member-class budget — and
+vice versa. The deposit defaults are a tenth of the member ones: one post a
+second sustained (~34 max-size attachments a minute) is generous for a real
+contact and useless for a card-scraping flood, which now caps out at noise
+instead of the family's full 64 MiB/min.
 
 Each bucket's capacity **is** its per-minute allowance, so a family that has
 been quiet can spend a whole minute's worth in one burst (phones back on
@@ -522,8 +577,18 @@ implicit always-active families). Semantics:
 - **Per-family quota**: `quota_bytes` overrides
   `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` for that family only.
 - **Revocation** (`DELETE`) removes the family **and purges its stored
-  envelopes and presence rows**.
-- All operations are idempotent — the billing webhook retries on failure.
+  envelopes and presence rows** — both credentials die together, since the
+  deposit token is resolved through the same row.
+- **Two-token response (CP4)**: provisioning mints both credentials — you
+  supply the member `token`, relayd derives and stores its post-only
+  `deposit_token` — and every family object in every response carries both
+  fields. The purchase flow keeps putting `token` on the setup card; nothing
+  needs to deliver `deposit_token` anywhere (phones derive it themselves),
+  it is returned for operator visibility and support. Member tokens starting
+  with the reserved `cmdep1-` deposit prefix are rejected with a 400. Routes
+  are keyed by the member token only; a deposit token in the path is a 404.
+- All operations are idempotent — the billing webhook retries on failure,
+  and re-provisioning the same member token derives the same deposit token.
 
 All routes require `Authorization: Bearer $CRUISEMESH_RELAY_ADMIN_TOKEN`:
 

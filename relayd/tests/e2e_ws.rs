@@ -16,7 +16,9 @@ use cruisemesh_core::{
     compute_recipient_hint, default_expiry, encode_message_body, generate_identity,
     generate_msg_id, seal_message, Identity, MessageBody, DEFAULT_HOP_TTL, KIND_TEXT,
 };
-use cruisemesh_relayd::{app, AppState, RelayStore, WsLimitsConfig, WS_MAX_INBOUND_MESSAGE_BYTES};
+use cruisemesh_relayd::{
+    app, deposit_token_for, AppState, RelayStore, WsLimitsConfig, WS_MAX_INBOUND_MESSAGE_BYTES,
+};
 use futures_util::{SinkExt, StreamExt};
 use tempfile::NamedTempFile;
 use tokio::net::TcpListener;
@@ -134,6 +136,62 @@ async fn ws_auth_reject() {
         tokio_tungstenite::connect_async(&url).await.is_err(),
         "bad token must fail handshake"
     );
+}
+
+/// CP4: a deposit-class token is post-only — the WS upgrade (a read) must be
+/// refused with the same structured 403 `deposit_only` as fetch/ack, on both
+/// auth paths (`?token=` and the `Authorization` header).
+#[tokio::test]
+async fn ws_rejects_deposit_tokens_with_deposit_only() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Error;
+
+    let db = NamedTempFile::new().unwrap();
+    let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
+    let (_router, ws_url) = spawn_router(AppState::new(
+        store,
+        HashSet::from(["family-a".to_string()]),
+    ))
+    .await;
+    let deposit = deposit_token_for("family-a");
+
+    fn assert_deposit_only(error: Error, path: &str) {
+        match error {
+            Error::Http(response) => {
+                assert_eq!(response.status(), 403, "{path}");
+                let body = String::from_utf8_lossy(response.body().as_deref().unwrap_or_default())
+                    .to_string();
+                assert!(
+                    body.contains("deposit_only"),
+                    "{path}: body should carry the structured code: {body}"
+                );
+            }
+            other => panic!("{path}: expected an HTTP 403 rejection, got {other:?}"),
+        }
+    }
+
+    // Query-token path (browsers).
+    let url = format!("{ws_url}/ws?hints={}&token={deposit}", b64(&[1u8; 8]));
+    let error = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect_err("deposit token must not upgrade via ?token=");
+    assert_deposit_only(error, "query token");
+
+    // Authorization-header path (native clients).
+    let url = format!("{ws_url}/ws?hints={}", b64(&[1u8; 8]));
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {deposit}").parse().unwrap(),
+    );
+    let error = tokio_tungstenite::connect_async(request)
+        .await
+        .expect_err("deposit token must not upgrade via the Authorization header");
+    assert_deposit_only(error, "authorization header");
+
+    // The member token still upgrades fine on the same server.
+    let url = format!("{ws_url}/ws?hints={}&token=family-a", b64(&[1u8; 8]));
+    assert!(tokio_tungstenite::connect_async(&url).await.is_ok());
 }
 
 #[tokio::test]
