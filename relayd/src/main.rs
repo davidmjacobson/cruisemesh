@@ -68,6 +68,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(raw) = env::var("CRUISEMESH_RELAY_RATE_BYTES_PER_MIN") {
         rate_limits.bytes_per_min = parse_rate_bytes_per_min(&raw)?;
     }
+    // CP4: the tighter allowances for deposit-class (friend-card) tokens,
+    // env-overridable like the member-class pair above (see DEPLOY.md §10).
+    if let Ok(raw) = env::var("CRUISEMESH_RELAY_DEPOSIT_RATE_REQUESTS_PER_MIN") {
+        rate_limits.deposit_requests_per_min = parse_rate_requests_per_min(&raw)?;
+    }
+    if let Ok(raw) = env::var("CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN") {
+        rate_limits.deposit_bytes_per_min = parse_rate_bytes_per_min(&raw)?;
+    }
     if let Ok(raw) = env::var("CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN") {
         rate_limits.global_requests_per_min = parse_rate_requests_per_min(&raw)?;
     }
@@ -90,6 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws_global_max_connections = ws_limits.global_max_connections,
         rate_requests_per_min = rate_limits.requests_per_min,
         rate_bytes_per_min = rate_limits.bytes_per_min,
+        deposit_rate_requests_per_min = rate_limits.deposit_requests_per_min,
+        deposit_rate_bytes_per_min = rate_limits.deposit_bytes_per_min,
         rate_global_requests_per_min = rate_limits.global_requests_per_min,
         prune_interval_secs = DEFAULT_PRUNE_INTERVAL.as_secs(),
         admin_api = admin_token.is_some(),

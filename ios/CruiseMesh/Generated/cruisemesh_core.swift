@@ -12318,6 +12318,17 @@ public func lanServiceType() -> String {
 }
 /**
  * Build the JSON payload shared via QR code / pasted text when friending.
+ *
+ * CP4 (deposit-token split): a friend card exists so a contact can *post*
+ * into this family's mailbox — it never needs fetch/ack/WS capability. The
+ * member token passed in (the phone's own saved relay credential) is
+ * therefore attenuated to its post-only deposit form before it goes on the
+ * card; a publicly re-shared card can then cost the family quota at worst,
+ * never read or delete their mail. Attenuation is idempotent, so a token
+ * that is already deposit-class passes through unchanged, and the wire
+ * layout of the card does not change — old apps parse new cards (and can
+ * still post with the deposit token), new apps parse old full-token cards
+ * (the relay keeps accepting member tokens for posting).
  */
 public func makeFriendCard(name: String, identity: Identity, relayUrl: String?, relayToken: String?)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -12503,6 +12514,30 @@ public func relayDecodePresencePage(body: Data)throws  -> CoreRelayPresencePage 
     )
 })
 }
+/**
+ * CP4: attenuate a member relay token into its deposit-class counterpart —
+ * `cmdep1-` ‖ base64url(BLAKE2b-256(context ‖ member_token)).
+ *
+ * Derivation (a one-way hash), not random minting, on purpose: the phone
+ * can stamp a deposit token onto a friend card entirely offline, knowing
+ * only its own member token, with no new relay endpoint, no extra stored
+ * credential, and no change to the Cruise Pass setup card. The relay
+ * derives and stores the identical value at provisioning/startup, so both
+ * sides agree without ever exchanging it. Preimage resistance means a
+ * deposit token (semi-public: it rides QR friend cards) reveals nothing
+ * about the member token it was derived from — provided the member token
+ * is high-entropy, which `DEPLOY.md` §1 requires (`openssl rand -hex 32`).
+ *
+ * Idempotent: a token that is already deposit-class is returned unchanged,
+ * so re-encoding a card can never double-attenuate. Empty input stays empty.
+ */
+public func relayDepositTokenFor(memberToken: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_deposit_token_for(
+        FfiConverterString.lower(memberToken),$0
+    )
+})
+}
 public func relayEncodeAckRequest(ids: [Int64])throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_relay_encode_ack_request(
@@ -12567,6 +12602,54 @@ public func relaySetupIsOfficial(relayUrl: String) -> Bool {
     )
 })
 }
+/**
+ * True when `token` is a deposit-class relay credential (CP4): valid only
+ * for posting envelopes into its family's mailbox, never for fetch/ack/
+ * presence/WebSocket. Friend cards carry this class; the Cruise Pass setup
+ * card carries the full member class.
+ */
+public func relayTokenIsDeposit(token: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_token_is_deposit(
+        FfiConverterString.lower(token),$0
+    )
+})
+}
+/**
+ * Poll-path routing (CP4): which mailbox, if any, may be *read*
+ * (fetch/ack/presence) on this contact's behalf. Deposit tokens cannot
+ * read, so a resolved endpoint that would carry one is dropped rather than
+ * handed to the sync engine to 403 on every pass:
+ *
+ * - Same family (the card token attenuates from our own member token):
+ * `resolved_contact_relay` already resolved to our member endpoint —
+ * polled as before.
+ * - Legacy member-class card token: still polled (pre-CP4 proxy-polling
+ * keeps working until the contact re-shares their card).
+ * - Cross-family deposit-class token: `None`. Reading another family's
+ * mailbox with a friend-card credential is exactly the capability CP4
+ * removes; the contact's family drains its own mailbox.
+ */
+public func resolvedContactPollRelay(contactRelayUrl: String?, contactRelayToken: String?, fallbackUrl: String?, fallbackToken: String?) -> RelayEndpoint? {
+    return try!  FfiConverterOptionTypeRelayEndpoint.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_resolved_contact_poll_relay(
+        FfiConverterOptionString.lower(contactRelayUrl),
+        FfiConverterOptionString.lower(contactRelayToken),
+        FfiConverterOptionString.lower(fallbackUrl),
+        FfiConverterOptionString.lower(fallbackToken),$0
+    )
+})
+}
+/**
+ * Send-path routing (CP4-aware). The contact's card credential wins when
+ * complete — for a post-CP4 card that is their family's deposit token,
+ * exactly the capability a send needs — with one refinement: when the
+ * contact's deposit token is the attenuation of our OWN member token (same
+ * family, same relay), the send uses our member credential instead. Family
+ * traffic thus stays on the member-class rate buckets and is never
+ * throttled by the tighter deposit allowance; only genuine cross-family
+ * deposits ride the deposit bucket.
+ */
 public func resolvedContactRelay(contactRelayUrl: String?, contactRelayToken: String?, fallbackUrl: String?, fallbackToken: String?) -> RelayEndpoint? {
     return try!  FfiConverterOptionTypeRelayEndpoint.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_resolved_contact_relay(
@@ -12942,7 +13025,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_lan_service_type() != 61768) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_make_friend_card() != 28124) {
+    if (uniffi_cruisemesh_core_checksum_func_make_friend_card() != 17109) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 33620) {
@@ -12993,6 +13076,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_decode_presence_page() != 6708) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_deposit_token_for() != 9229) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_encode_ack_request() != 23747) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13011,7 +13097,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 55007) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_relay() != 13200) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_token_is_deposit() != 47848) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_poll_relay() != 62901) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_relay() != 65141) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_rotate_group() != 56003) {

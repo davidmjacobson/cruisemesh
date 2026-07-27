@@ -65,6 +65,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use blake2::digest::{Update, VariableOutput};
+use blake2::Blake2bVar;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -218,6 +220,85 @@ pub const DEFAULT_RATE_BYTES_PER_MIN: u64 = 64 * 1024 * 1024;
 /// outgrown this box and wants a bigger one.
 pub const DEFAULT_RATE_GLOBAL_REQUESTS_PER_MIN: u32 = 6_000;
 
+/// CP4 (deposit-token split): default sustained request allowance for one
+/// family's *deposit* token, configurable via
+/// `CRUISEMESH_RELAY_DEPOSIT_RATE_REQUESTS_PER_MIN`.
+///
+/// The deposit token is the credential that rides QR friend cards, so it is
+/// the one strangers actually end up holding — the whole point of the split
+/// is that a posted card can no longer fetch/ack family mail, and this
+/// tighter bucket bounds the one thing it still *can* do (post). 60/min is
+/// one envelope a second sustained: far more than any real contact produces
+/// (a chatty friend sends a few messages a minute at most, and their photos
+/// hit the byte bucket first), a tenth of the member allowance, and small
+/// enough that a card-scraping flood is throttled to noise while the
+/// family's own member-class traffic rides its own untouched buckets.
+pub const DEFAULT_DEPOSIT_RATE_REQUESTS_PER_MIN: u32 = 60;
+
+/// CP4: default sustained upload allowance for one family's deposit token,
+/// counted on decoded `sealed` bytes like the member allowance, configurable
+/// via `CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN`. Proportionate to the
+/// request split (a tenth of the member 64 MiB/min, rounded to a clean
+/// figure): ~34 max-size (180 KiB) attachments per minute — generous for a
+/// friend sharing photos, useless for filling a 256 MiB quota quickly.
+pub const DEFAULT_DEPOSIT_RATE_BYTES_PER_MIN: u64 = 6 * 1024 * 1024;
+
+/// CP4: class prefix that marks a deposit token. Mirrors
+/// `core/src/relay_wire.rs::RELAY_DEPOSIT_TOKEN_PREFIX` — golden vectors in
+/// both crates pin the two implementations together. Member tokens are
+/// forbidden from starting with this prefix at provisioning time so a
+/// credential's class is always unambiguous.
+pub const DEPOSIT_TOKEN_PREFIX: &str = "cmdep1-";
+
+/// CP4: domain-separation context for the deposit derivation. Must match
+/// `core/src/relay_wire.rs::RELAY_DEPOSIT_TOKEN_CONTEXT` byte-for-byte.
+const DEPOSIT_TOKEN_CONTEXT: &[u8] = b"cruisemesh relay deposit token v1";
+
+/// CP4: derive a family's post-only deposit token from its member token —
+/// `cmdep1-` ‖ base64url(BLAKE2b-256(context ‖ member_token)).
+///
+/// Derivation (not random minting) is deliberate: phones stamp the identical
+/// value onto friend cards entirely offline, knowing only their member token
+/// (`core/src/relay_wire.rs::relay_deposit_token_for`), so no new endpoint
+/// or credential-distribution channel exists. One-way: a deposit token
+/// (semi-public, it rides QR cards) reveals nothing about the member token
+/// it came from — provided member tokens are high-entropy, which DEPLOY.md
+/// §1 requires (`openssl rand -hex 32`).
+pub fn deposit_token_for(member_token: &str) -> String {
+    let member = member_token.trim();
+    if member.is_empty() || member.starts_with(DEPOSIT_TOKEN_PREFIX) {
+        return member.to_string();
+    }
+    let mut hasher = Blake2bVar::new(32).expect("valid blake2b output length");
+    hasher.update(DEPOSIT_TOKEN_CONTEXT);
+    hasher.update(member.as_bytes());
+    let mut out = [0u8; 32];
+    hasher
+        .finalize_variable(&mut out)
+        .expect("output buffer matches configured length");
+    format!("{DEPOSIT_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(out))
+}
+
+/// CP4: is this credential deposit-class? Purely syntactic (the prefix), so
+/// it can gate validation before any lookup.
+pub fn is_deposit_token(token: &str) -> bool {
+    token.trim().starts_with(DEPOSIT_TOKEN_PREFIX)
+}
+
+/// CP4: which capability class a presented bearer token resolved to.
+/// Enforcement lives in `authorize_family` — the single choke point every
+/// authenticated route goes through — so no individual handler can forget
+/// the check: a deposit-class credential authorizes `FamilyOp::Post` and
+/// nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenClass {
+    /// Full family credential (post + fetch + ack + presence + WS). Rides
+    /// the Cruise Pass setup card; every pre-CP4 token is this class.
+    Member,
+    /// Post-only into the family's mailbox. Rides friend cards.
+    Deposit,
+}
+
 /// Bucket-map size that triggers a lazy eviction sweep of idle families
 /// (`evict_idle_rate_buckets`). One entry is a few dozen bytes, so 1,024 of
 /// them is trivial memory; the threshold exists so the sweep costs nothing at
@@ -295,12 +376,17 @@ impl Default for WsLimitsConfig {
 /// way `WsLimitsConfig` is, so a test can shrink them to something it can
 /// exhaust in milliseconds without touching every other constructor.
 ///
-/// All three are *per minute*; each is also the burst capacity of its bucket
-/// (a family that has been quiet may spend a whole minute's worth at once).
+/// All allowances are *per minute*; each is also the burst capacity of its
+/// bucket (a family that has been quiet may spend a whole minute's worth at
+/// once). CP4: the `deposit_*` pair applies to deposit-class tokens, which
+/// get their own (tighter) buckets, keyed by the deposit token itself, so a
+/// friend-card flood can never eat the family's own member allowance.
 #[derive(Clone, Copy, Debug)]
 pub struct RateLimitConfig {
     pub requests_per_min: u32,
     pub bytes_per_min: u64,
+    pub deposit_requests_per_min: u32,
+    pub deposit_bytes_per_min: u64,
     pub global_requests_per_min: u32,
 }
 
@@ -309,7 +395,20 @@ impl Default for RateLimitConfig {
         Self {
             requests_per_min: DEFAULT_RATE_REQUESTS_PER_MIN,
             bytes_per_min: DEFAULT_RATE_BYTES_PER_MIN,
+            deposit_requests_per_min: DEFAULT_DEPOSIT_RATE_REQUESTS_PER_MIN,
+            deposit_bytes_per_min: DEFAULT_DEPOSIT_RATE_BYTES_PER_MIN,
             global_requests_per_min: DEFAULT_RATE_GLOBAL_REQUESTS_PER_MIN,
+        }
+    }
+}
+
+impl RateLimitConfig {
+    /// The (requests/min, bytes/min) pair that applies to one credential
+    /// class — reusing the CP2a bucket machinery with per-class capacities.
+    fn allowances_for(&self, class: TokenClass) -> (u32, u64) {
+        match class {
+            TokenClass::Member => (self.requests_per_min, self.bytes_per_min),
+            TokenClass::Deposit => (self.deposit_requests_per_min, self.deposit_bytes_per_min),
         }
     }
 }
@@ -401,10 +500,13 @@ struct FamilyBuckets {
 }
 
 impl FamilyBuckets {
-    fn new(config: RateLimitConfig, now: Instant) -> Self {
+    /// CP4: capacities are passed per credential class
+    /// (`RateLimitConfig::allowances_for`) — one bucket map holds member and
+    /// deposit entries side by side, keyed by the presented credential.
+    fn new(requests_per_min: u32, bytes_per_min: u64, now: Instant) -> Self {
         Self {
-            requests: TokenBucket::per_minute(f64::from(config.requests_per_min), now),
-            bytes: TokenBucket::per_minute(config.bytes_per_min as f64, now),
+            requests: TokenBucket::per_minute(f64::from(requests_per_min), now),
+            bytes: TokenBucket::per_minute(bytes_per_min as f64, now),
         }
     }
 
@@ -516,6 +618,11 @@ fn reject_rate_limited(
 pub struct AppState {
     store: RelayStore,
     auth_tokens: HashSet<String>,
+    /// CP4: derived deposit token → static member token, precomputed from
+    /// `auth_tokens` at construction. Static env-allowlist families have no
+    /// `families` table row, so their deposit counterparts are resolved from
+    /// this map instead of SQLite.
+    static_deposit_tokens: Arc<HashMap<String, String>>,
     tx: tokio::sync::broadcast::Sender<std::sync::Arc<BroadcastEnvelope>>,
     family_quota_bytes: u64,
     /// FR6: global concurrent-WS-connection admission gate.
@@ -658,9 +765,16 @@ impl AppState {
                 )
             })
             .collect();
+        // CP4: static families get deposit counterparts too, derived once
+        // here — the same derivation phones apply when stamping friend cards.
+        let static_deposit_tokens = auth_tokens
+            .iter()
+            .map(|token| (deposit_token_for(token), token.clone()))
+            .collect();
         Self {
             store,
             auth_tokens,
+            static_deposit_tokens: Arc::new(static_deposit_tokens),
             tx,
             family_quota_bytes,
             ws_global: Arc::new(Semaphore::new(ws_limits.global_max_connections)),
@@ -683,34 +797,44 @@ impl AppState {
     }
 
     /// Charge one request (and, for uploads, its sealed bytes) against this
-    /// family's buckets and the global request backstop.
+    /// credential's buckets and the global request backstop.
     ///
-    /// **Only ever call this after the caller's family token has
-    /// authorized.** The bucket map is keyed by family token: enforcing
-    /// before authorization would let an unauthenticated caller insert one
-    /// entry per made-up token and grow the map without bound, turning the
-    /// abuse protection into exactly the memory-exhaustion vector it exists
-    /// to prevent. Authorization first means an attacker can only ever
-    /// occupy entries for tokens they already hold.
+    /// **Only ever call this after the caller's token has authorized.** The
+    /// bucket map is keyed by the presented credential: enforcing before
+    /// authorization would let an unauthenticated caller insert one entry
+    /// per made-up token and grow the map without bound, turning the abuse
+    /// protection into exactly the memory-exhaustion vector it exists to
+    /// prevent. Authorization first means an attacker can only ever occupy
+    /// entries for tokens they already hold.
+    ///
+    /// CP4: buckets are keyed by `access.rate_key` — the presented member
+    /// *or* deposit token — with per-class capacities, so friend-card
+    /// (deposit) traffic exhausts its own tighter allowance and never eats
+    /// into the family's member-class buckets.
     fn check_rate_limit(
         &self,
-        family_token: &str,
+        access: &FamilyAccess,
         requests: f64,
         bytes: f64,
     ) -> Result<(), ApiError> {
         let now = Instant::now();
+        let (requests_per_min, bytes_per_min) = self.rate_limits.allowances_for(access.class);
         let family = {
             let mut buckets = self.rate_buckets.lock().unwrap_or_else(|e| e.into_inner());
             if buckets.len() >= RATE_BUCKET_EVICT_THRESHOLD {
                 evict_idle_rate_buckets(&mut buckets, now);
             }
             buckets
-                .entry(family_token.to_string())
-                .or_insert_with(|| FamilyBuckets::new(self.rate_limits, now))
+                .entry(access.rate_key.clone())
+                .or_insert_with(|| FamilyBuckets::new(requests_per_min, bytes_per_min, now))
                 .try_take(requests, bytes, now)
         };
         if let Err((scope, retry_after_secs)) = family {
-            return Err(reject_rate_limited(family_token, scope, retry_after_secs));
+            return Err(reject_rate_limited(
+                &access.rate_key,
+                scope,
+                retry_after_secs,
+            ));
         }
         // Global backstop, requests only: bytes are already bounded per
         // family, and a request cap bounds how many uploads can arrive at
@@ -726,7 +850,7 @@ impl AppState {
         };
         if let Some(retry_after_secs) = global_retry_after {
             return Err(reject_rate_limited(
-                family_token,
+                &access.rate_key,
                 RateLimitScope::GlobalRequests,
                 retry_after_secs,
             ));
@@ -820,6 +944,10 @@ pub struct FamilyRow {
     /// `None` = never expires. Expiry semantics: see `FAMILY_EXPIRY_GRACE_MS`.
     pub expires_ms: Option<i64>,
     pub note: Option<String>,
+    /// CP4: the family's post-only credential, derived from `token` at
+    /// provisioning (or by the startup migration for pre-CP4 rows). Rides
+    /// friend cards; rejected for everything except `POST /envelopes`.
+    pub deposit_token: String,
 }
 
 /// A family plus its stored-usage figures, as returned by `list_families`.
@@ -867,6 +995,11 @@ impl RelayStore {
         // auto-vacuum. See `ensure_incremental_auto_vacuum` for why this
         // can't just be a pragma statement inside `SCHEMA`.
         ensure_incremental_auto_vacuum(&conn)?;
+        // CP4: token-class migration — add `families.deposit_token` on a
+        // pre-existing database and derive it for every existing family, so
+        // all existing tokens become member class with zero behavior change
+        // and their deposit counterparts exist the moment the process is up.
+        migrate_families_deposit_token(&conn)?;
         Ok(Self {
             conn: std::sync::Arc::new(Mutex::new(conn)),
         })
@@ -1323,15 +1456,20 @@ impl RelayStore {
         now_ms: i64,
     ) -> Result<FamilyRow, String> {
         let conn = self.conn.lock().expect("relay store mutex poisoned");
+        // CP4: both credentials are minted together — the deposit token is
+        // the deterministic attenuation of the member token, so re-provision
+        // (webhook retry, renewal) converges on the same pair.
         conn.execute(
-            "INSERT INTO families (token, status, plan, quota_bytes, created_ms, expires_ms, note)
-             VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO families
+                (token, status, plan, quota_bytes, created_ms, expires_ms, note, deposit_token)
+             VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(token) DO UPDATE SET
                 status = 'active',
                 plan = excluded.plan,
                 quota_bytes = excluded.quota_bytes,
                 expires_ms = excluded.expires_ms,
-                note = excluded.note",
+                note = excluded.note,
+                deposit_token = excluded.deposit_token",
             params![
                 token,
                 plan,
@@ -1339,6 +1477,7 @@ impl RelayStore {
                 now_ms,
                 expires_ms,
                 note,
+                deposit_token_for(token),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -1348,6 +1487,16 @@ impl RelayStore {
     pub fn get_family(&self, token: &str) -> Result<Option<FamilyRow>, String> {
         let conn = self.conn.lock().expect("relay store mutex poisoned");
         get_family_on(&conn, token)
+    }
+
+    /// CP4: resolve a presented bearer credential (member or deposit) to its
+    /// family row and token class. See `get_family_by_credential_on`.
+    pub fn get_family_by_credential(
+        &self,
+        credential: &str,
+    ) -> Result<Option<(FamilyRow, TokenClass)>, String> {
+        let conn = self.conn.lock().expect("relay store mutex poisoned");
+        get_family_by_credential_on(&conn, credential)
     }
 
     /// One page of families, newest-provisioned last, each with the usage
@@ -1380,7 +1529,7 @@ impl RelayStore {
         let mut stmt = conn
             .prepare(
                 "SELECT f.token, f.status, f.plan, f.quota_bytes, f.created_ms,
-                        f.expires_ms, f.note,
+                        f.expires_ms, f.note, f.deposit_token,
                         COALESCE(SUM(LENGTH(e.sealed)), 0), COUNT(e.id)
                  FROM families f
                  LEFT JOIN envelopes e ON e.family_token = f.token
@@ -1393,17 +1542,9 @@ impl RelayStore {
         let families = stmt
             .query_map(params![status_filter, limit as i64, offset as i64], |row| {
                 Ok(FamilyUsage {
-                    family: FamilyRow {
-                        token: row.get(0)?,
-                        status: row.get(1)?,
-                        plan: row.get(2)?,
-                        quota_bytes: row.get::<_, Option<i64>>(3)?.map(|q| q as u64),
-                        created_ms: row.get(4)?,
-                        expires_ms: row.get(5)?,
-                        note: row.get(6)?,
-                    },
-                    usage_bytes: row.get::<_, i64>(7)? as u64,
-                    envelope_count: row.get::<_, i64>(8)? as u64,
+                    family: family_row_from(row)?,
+                    usage_bytes: row.get::<_, i64>(8)? as u64,
+                    envelope_count: row.get::<_, i64>(9)? as u64,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -1527,25 +1668,63 @@ impl RelayStore {
     }
 }
 
+fn family_row_from(row: &rusqlite::Row<'_>) -> Result<FamilyRow, rusqlite::Error> {
+    let token: String = row.get(0)?;
+    // Backfilled at startup (`migrate_families_deposit_token`), so NULL is
+    // only reachable in a torn mid-migration read; derive defensively rather
+    // than fail the whole request.
+    let deposit_token = row
+        .get::<_, Option<String>>(7)?
+        .unwrap_or_else(|| deposit_token_for(&token));
+    Ok(FamilyRow {
+        token,
+        status: row.get(1)?,
+        plan: row.get(2)?,
+        quota_bytes: row.get::<_, Option<i64>>(3)?.map(|q| q as u64),
+        created_ms: row.get(4)?,
+        expires_ms: row.get(5)?,
+        note: row.get(6)?,
+        deposit_token,
+    })
+}
+
 fn get_family_on(conn: &Connection, token: &str) -> Result<Option<FamilyRow>, String> {
     conn.query_row(
-        "SELECT token, status, plan, quota_bytes, created_ms, expires_ms, note
+        "SELECT token, status, plan, quota_bytes, created_ms, expires_ms, note, deposit_token
          FROM families WHERE token = ?1",
         params![token],
-        |row| {
-            Ok(FamilyRow {
-                token: row.get(0)?,
-                status: row.get(1)?,
-                plan: row.get(2)?,
-                quota_bytes: row.get::<_, Option<i64>>(3)?.map(|q| q as u64),
-                created_ms: row.get(4)?,
-                expires_ms: row.get(5)?,
-                note: row.get(6)?,
-            })
-        },
+        family_row_from,
     )
     .optional()
     .map_err(|e| e.to_string())
+}
+
+/// CP4: resolve a presented bearer credential to its family row and class —
+/// member (`token` column) or deposit (`deposit_token` column). An exact
+/// member match wins deterministically if a credential somehow appeared in
+/// both columns (provisioning validation forbids creating that state).
+fn get_family_by_credential_on(
+    conn: &Connection,
+    credential: &str,
+) -> Result<Option<(FamilyRow, TokenClass)>, String> {
+    let family = conn
+        .query_row(
+            "SELECT token, status, plan, quota_bytes, created_ms, expires_ms, note, deposit_token
+             FROM families WHERE token = ?1 OR deposit_token = ?1
+             ORDER BY (token = ?1) DESC LIMIT 1",
+            params![credential],
+            family_row_from,
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(family.map(|row| {
+        let class = if row.token == credential {
+            TokenClass::Member
+        } else {
+            TokenClass::Deposit
+        };
+        (row, class)
+    }))
 }
 
 fn family_sealed_bytes_on(conn: &Connection, family_token: &str) -> Result<u64, String> {
@@ -1592,6 +1771,64 @@ fn ensure_incremental_auto_vacuum(conn: &Connection) -> Result<(), String> {
         conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")
             .map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+/// CP4 startup migration, following the same pattern as every previous
+/// schema change (idempotent, self-applying, no operator step):
+///
+/// 1. `ALTER TABLE families ADD COLUMN deposit_token` when the column is
+///    missing (databases created before CP4; `SCHEMA`'s `CREATE TABLE IF NOT
+///    EXISTS` is a no-op for them and cannot add columns).
+/// 2. Backfill `deposit_token = deposit_token_for(token)` for every row
+///    where it is NULL — the migration default is therefore *member class*
+///    for every existing token: nothing about how those tokens authenticate
+///    changes, they simply gain a derived post-only counterpart.
+/// 3. A UNIQUE index on `deposit_token`, created here rather than in
+///    `SCHEMA` because on a pre-CP4 database `SCHEMA` runs before the column
+///    exists.
+fn migrate_families_deposit_token(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(families)")
+        .map_err(|e| e.to_string())?;
+    let has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .any(|name| name == "deposit_token");
+    drop(stmt);
+    if !has_column {
+        conn.execute("ALTER TABLE families ADD COLUMN deposit_token TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+    let missing: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT token FROM families WHERE deposit_token IS NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    for token in &missing {
+        conn.execute(
+            "UPDATE families SET deposit_token = ?2 WHERE token = ?1",
+            params![token, deposit_token_for(token)],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if !missing.is_empty() {
+        info!(
+            families = missing.len(),
+            "CP4 migration: derived deposit tokens for existing families"
+        );
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_families_deposit_token
+             ON families(deposit_token);",
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1775,12 +2012,16 @@ async fn post_envelope(
     Json(request): Json<PostEnvelopeRequest>,
 ) -> Result<Json<PostEnvelopeResponse>, ApiError> {
     let access = authorize_bearer(&state, &headers, FamilyOp::Post).await?;
+    // CP4: rows are always stored (and broadcast) under the canonical
+    // *member* token — a deposit credential deposits into the family's one
+    // mailbox, where member-class fetches actually look.
     let family_token = access.token.clone();
     // Rate limit the request unit the moment the caller is known-good, and
     // before any decoding work: a token spraying malformed payloads is still
     // spending server time, so it must still be charged. The byte dimension
     // is charged separately below, once the payload's real size is known.
-    state.check_rate_limit(&family_token, 1.0, 0.0)?;
+    // Charged per presented credential class (member vs deposit buckets).
+    state.check_rate_limit(&access, 1.0, 0.0)?;
     let msg_id = decode_base64_field(&request.msg_id, "msg_id")?;
     if msg_id.len() != MSG_ID_LEN {
         return Err(ApiError::bad_request(format!(
@@ -1814,7 +2055,7 @@ async fn post_envelope(
     // never billed for bytes the server has already refused to store. A
     // dedupe re-post *is* charged (unlike the storage quota, which exempts
     // it): the bytes crossed the wire and were decoded either way.
-    state.check_rate_limit(&family_token, 0.0, sealed.len() as f64)?;
+    state.check_rate_limit(&access, 0.0, sealed.len() as f64)?;
     let now = now_ms();
 
     // Dedupe, quota accounting, expiry pruning, and insertion are one store
@@ -1920,11 +2161,10 @@ async fn get_envelopes(
     headers: HeaderMap,
     Query(query): Query<GetEnvelopesQuery>,
 ) -> Result<Json<GetEnvelopesResponse>, ApiError> {
-    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)
-        .await?
-        .token;
+    let access = authorize_bearer(&state, &headers, FamilyOp::Read).await?;
     // Enforced only once the token has authorized (see `check_rate_limit`).
-    state.check_rate_limit(&family_token, 1.0, 0.0)?;
+    state.check_rate_limit(&access, 1.0, 0.0)?;
+    let family_token = access.token;
     let (hints, _) = decode_fetch_hints(&query.hints)?;
     let after = query.after.unwrap_or(0);
     if after < 0 {
@@ -1981,11 +2221,10 @@ async fn ack_envelopes(
     headers: HeaderMap,
     Json(request): Json<AckRequest>,
 ) -> Result<Json<AckResponse>, ApiError> {
-    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)
-        .await?
-        .token;
+    let access = authorize_bearer(&state, &headers, FamilyOp::Read).await?;
     // Enforced only once the token has authorized (see `check_rate_limit`).
-    state.check_rate_limit(&family_token, 1.0, 0.0)?;
+    state.check_rate_limit(&access, 1.0, 0.0)?;
+    let family_token = access.token;
     if request.ids.len() > MAX_ACK_IDS {
         return Err(ApiError::bad_request(format!(
             "ids must contain at most {MAX_ACK_IDS} entries"
@@ -2030,11 +2269,10 @@ async fn sync_presence(
     headers: HeaderMap,
     Json(request): Json<PresenceRequest>,
 ) -> Result<Json<PresenceResponse>, ApiError> {
-    let family_token = authorize_bearer(&state, &headers, FamilyOp::Read)
-        .await?
-        .token;
+    let access = authorize_bearer(&state, &headers, FamilyOp::Read).await?;
     // Enforced only once the token has authorized (see `check_rate_limit`).
-    state.check_rate_limit(&family_token, 1.0, 0.0)?;
+    state.check_rate_limit(&access, 1.0, 0.0)?;
+    let family_token = access.token;
     if request.announce.len() > MAX_PRESENCE_ANNOUNCE {
         return Err(ApiError::bad_request(format!(
             "announce must contain at most {MAX_PRESENCE_ANNOUNCE} hints"
@@ -2110,6 +2348,12 @@ struct PatchFamilyRequest {
 #[derive(Serialize)]
 struct FamilyResponse {
     token: String,
+    /// CP4: the family's post-only credential, minted alongside `token` at
+    /// provisioning. The purchase flow puts `token` on the Cruise Pass setup
+    /// card; `deposit_token` is what friend cards carry (phones derive the
+    /// same value locally, so nothing needs to distribute it — it is
+    /// returned here so the operator can see/verify it).
+    deposit_token: String,
     status: String,
     plan: Option<String>,
     /// Per-family override, if any (`null` = server default applies).
@@ -2135,6 +2379,7 @@ fn family_response_with_usage(
     FamilyResponse {
         effective_quota_bytes: row.quota_bytes.unwrap_or(state.family_quota_bytes),
         token: row.token,
+        deposit_token: row.deposit_token,
         status: row.status,
         plan: row.plan,
         quota_bytes: row.quota_bytes,
@@ -2195,6 +2440,14 @@ async fn admin_provision_family(
         return Err(ApiError::bad_request(
             "token collides with a server-configured token".to_string(),
         ));
+    }
+    // CP4: every deposit token carries the class prefix, so forbidding it on
+    // member tokens is what keeps a presented credential's class — and the
+    // `WHERE token = ? OR deposit_token = ?` auth lookup — unambiguous.
+    if is_deposit_token(token) {
+        return Err(ApiError::bad_request(format!(
+            "token must not start with the deposit-token prefix {DEPOSIT_TOKEN_PREFIX:?}"
+        )));
     }
     validate_quota_bytes(request.quota_bytes)?;
     let row = state
@@ -2379,24 +2632,35 @@ async fn ws_handler(
 ) -> Result<Response, ApiError> {
     // Prefer Authorization header when present (native clients); fall back to
     // ?token= for browsers that cannot set WS handshake headers. WS is
-    // delivery-only, so it counts as a Read op for expiry-grace purposes.
-    let token = if let Ok(access) = authorize_bearer(&state, &headers, FamilyOp::Read).await {
-        access.token
-    } else {
-        let Some(t) = query.token.as_deref().filter(|t| !t.is_empty()) else {
+    // delivery-only, so it counts as a Read op for expiry-grace purposes —
+    // and, CP4, deposit-class credentials are therefore rejected with the
+    // same structured 403 `deposit_only` as every other read. When the
+    // header fails and no query token exists, the header's real error is
+    // propagated (not a generic "missing token") so that 403 stays visible.
+    let header_result = authorize_bearer(&state, &headers, FamilyOp::Read).await;
+    let access = match (
+        header_result,
+        query.token.as_deref().filter(|t| !t.is_empty()),
+    ) {
+        (Ok(access), _) => access,
+        (Err(_), Some(query_token)) => {
+            authorize_family(&state, query_token, FamilyOp::Read, now_ms()).await?
+        }
+        (Err(header_error), None) => {
+            if headers.contains_key(AUTHORIZATION) {
+                return Err(header_error);
+            }
             return Err(ApiError::unauthorized(
                 "missing family token (Authorization: Bearer or ?token=)".to_string(),
             ));
-        };
-        authorize_family(&state, t, FamilyOp::Read, now_ms())
-            .await?
-            .token
+        }
     };
     // One request unit per *upgrade attempt* (frames on an established
     // socket are not charged -- the connection caps below bound those).
     // Enforced only once the token has authorized, whichever of the two auth
     // paths above resolved it (see `check_rate_limit`).
-    state.check_rate_limit(&token, 1.0, 0.0)?;
+    state.check_rate_limit(&access, 1.0, 0.0)?;
+    let token = access.token;
     let (hints, hints_base64) = decode_fetch_hints(&query.hints)?;
     let after = query.after.unwrap_or(0);
     if after < 0 {
@@ -2715,16 +2979,32 @@ enum FamilyOp {
     Read,
 }
 
-/// The result of authenticating a family bearer token: the token itself
-/// plus the quota that applies to it (per-family override or server default).
+/// The result of authenticating a family bearer credential.
 struct FamilyAccess {
+    /// The canonical family (member) token — the key envelopes, presence,
+    /// quotas, and WS broadcasts are scoped by. When a *deposit* credential
+    /// authorized, this is the member token it was derived from, so a
+    /// friend's deposited envelope lands where the family actually fetches.
     token: String,
+    /// CP4: which capability class the presented credential carried.
+    class: TokenClass,
+    /// CP4: the credential as presented — the rate-limit bucket key, so
+    /// member and deposit traffic charge separate per-class buckets.
+    rate_key: String,
     quota_bytes: u64,
 }
 
-/// Resolve a family token against the static env allowlist first (implicit
-/// always-active families, the self-hosted path — zero behavior change), then
-/// the provisioned `families` table (status + expiry + per-family quota).
+/// Resolve a family credential against the static env allowlist first
+/// (implicit always-active families, the self-hosted path — zero behavior
+/// change), then the static tokens' derived deposit counterparts, then the
+/// provisioned `families` table (member or deposit column; status + expiry +
+/// per-family quota).
+///
+/// CP4 enforcement lives HERE, not in handlers: every authenticated route
+/// funnels through this function with its `FamilyOp`, and a deposit-class
+/// credential authorizes `FamilyOp::Post` only — fetch/ack/presence/WS all
+/// pass `FamilyOp::Read` and get a structured 403 `deposit_only` before any
+/// handler code runs, so no individual handler can forget the check.
 async fn authorize_family(
     state: &AppState,
     token: &str,
@@ -2734,21 +3014,39 @@ async fn authorize_family(
     if state.auth_tokens.contains(token) {
         return Ok(FamilyAccess {
             token: token.to_string(),
+            class: TokenClass::Member,
+            rate_key: token.to_string(),
+            quota_bytes: state.family_quota_bytes,
+        });
+    }
+    if let Some(member) = state.static_deposit_tokens.get(token) {
+        if op != FamilyOp::Post {
+            return Err(ApiError::deposit_only(token));
+        }
+        return Ok(FamilyAccess {
+            token: member.clone(),
+            class: TokenClass::Deposit,
+            rate_key: token.to_string(),
             quota_bytes: state.family_quota_bytes,
         });
     }
     // FR8: the families lookup is a store read on the request hot path --
     // keep it off the reactor like every other store call. The static
-    // allowlist fast path above stays synchronous and allocation-free.
+    // allowlist fast paths above stay synchronous and allocation-free.
     let lookup_token = token.to_string();
     let family = state
         .store
-        .run_blocking(move |store| store.get_family(&lookup_token))
+        .run_blocking(move |store| store.get_family_by_credential(&lookup_token))
         .await
         .map_err(ApiError::internal)?;
-    let Some(family) = family else {
+    let Some((family, class)) = family else {
         return Err(ApiError::unauthorized("unknown family token".to_string()));
     };
+    // Class boundary first: the op simply does not exist for a deposit
+    // credential, regardless of the family's billing state.
+    if class == TokenClass::Deposit && op != FamilyOp::Post {
+        return Err(ApiError::deposit_only(token));
+    }
     if family.status != "active" {
         return Err(ApiError::family_suspended(&family.token));
     }
@@ -2761,8 +3059,10 @@ async fn authorize_family(
         }
     }
     Ok(FamilyAccess {
-        token: family.token,
         quota_bytes: family.quota_bytes.unwrap_or(state.family_quota_bytes),
+        token: family.token,
+        class,
+        rate_key: token.to_string(),
     })
 }
 
@@ -2928,6 +3228,26 @@ impl ApiError {
         }
     }
 
+    /// CP4: a deposit-class credential attempted anything other than
+    /// posting an envelope. 403 (not 401): the credential is real and
+    /// recognized — the operation is simply outside its class. The stable
+    /// `deposit_only` code lets a client distinguish "you scanned a friend
+    /// card into the Cruise Pass slot" from a revoked or mistyped token.
+    fn deposit_only(token: &str) -> Self {
+        warn!(
+            family = %token_prefix(token),
+            "family reject: deposit token used for a member-only operation (403 deposit_only)"
+        );
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: "deposit tokens can only post envelopes; fetch, ack, presence, \
+                      and websocket access require the family's member token"
+                .to_string(),
+            code: Some("deposit_only"),
+            retry_after_secs: None,
+        }
+    }
+
     /// Family administratively suspended (payment dispute, abuse, …).
     fn family_suspended(token: &str) -> Self {
         warn!(
@@ -3021,13 +3341,14 @@ CREATE TABLE IF NOT EXISTS presence (
 );
 CREATE INDEX IF NOT EXISTS idx_presence_last_seen ON presence(last_seen_ms);
 CREATE TABLE IF NOT EXISTS families (
-    token        TEXT PRIMARY KEY,
-    status       TEXT NOT NULL DEFAULT 'active',
-    plan         TEXT,
-    quota_bytes  INTEGER,
-    created_ms   INTEGER NOT NULL,
-    expires_ms   INTEGER,
-    note         TEXT
+    token         TEXT PRIMARY KEY,
+    status        TEXT NOT NULL DEFAULT 'active',
+    plan          TEXT,
+    quota_bytes   INTEGER,
+    created_ms    INTEGER NOT NULL,
+    expires_ms    INTEGER,
+    note          TEXT,
+    deposit_token TEXT
 );
 ";
 
@@ -3132,6 +3453,32 @@ mod tests {
             ))
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
+            .unwrap()
+    }
+
+    fn ack_request(token: &str, ids: &[i64]) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/envelopes/ack")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "ids": ids }).to_string()))
+            .unwrap()
+    }
+
+    fn presence_request(token: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/presence")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "announce": [encode_base64_field(&sample_hint(1))],
+                    "query": [encode_base64_field(&sample_hint(1))],
+                })
+                .to_string(),
+            ))
             .unwrap()
     }
 
@@ -3351,6 +3698,284 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    // -----------------------------------------------------------------
+    // CP4 — deposit-token split
+
+    /// Golden vectors shared verbatim with
+    /// `core/src/relay_wire.rs::deposit_token_derivation_matches_golden_vector`,
+    /// plus a live parity check against the core implementation phones
+    /// actually run: if either derivation drifts, this fails.
+    #[test]
+    fn deposit_derivation_matches_core_golden_vector() {
+        assert_eq!(
+            deposit_token_for("abc123"),
+            "cmdep1-0uq69OqNyMo1Dd3vQcspqLlRY6bCCjTWvPyehXd6Ezs"
+        );
+        assert_eq!(
+            deposit_token_for("family-token"),
+            "cmdep1-63hWvx1kHLKirfl9GV576eAi_rURpyZixpsCVUCXNJk"
+        );
+        for token in ["family-a", "0123456789abcdef0123456789abcdef", "x"] {
+            assert_eq!(
+                deposit_token_for(token),
+                cruisemesh_core::relay_deposit_token_for(token.to_string()),
+                "relayd and core derivations must agree for {token:?}"
+            );
+        }
+        // Idempotent + classifiable.
+        let deposit = deposit_token_for("family-a");
+        assert_eq!(deposit_token_for(&deposit), deposit);
+        assert!(is_deposit_token(&deposit));
+        assert!(!is_deposit_token("family-a"));
+    }
+
+    #[tokio::test]
+    async fn deposit_token_posts_into_the_family_mailbox_but_never_reads() {
+        let app = admin_app();
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "POST",
+                "/admin/families",
+                serde_json::json!({"token": "fam-pass"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let family = body_json(response).await;
+        let deposit = family["deposit_token"].as_str().unwrap().to_string();
+        assert_eq!(deposit, deposit_token_for("fam-pass"));
+
+        // Deposit can post...
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request(&deposit, 1, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // ...and the row lands in the family's one mailbox, keyed by the
+        // member token, where the family actually fetches.
+        let response = app
+            .clone()
+            .oneshot(fetch_request("fam-pass"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = body_json(response).await;
+        assert_eq!(page["envelopes"].as_array().unwrap().len(), 1);
+        let relay_id = page["envelopes"][0]["id"].as_i64().unwrap();
+
+        // Every read-class operation is a structured 403 for the deposit
+        // token: fetch, ack, presence. (WS is covered in e2e_ws.rs — the
+        // upgrade needs a real socket.)
+        for (request, what) in [
+            (fetch_request(&deposit), "fetch"),
+            (ack_request(&deposit, &[relay_id]), "ack"),
+            (presence_request(&deposit), "presence"),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{what}");
+            assert_eq!(body_json(response).await["code"], "deposit_only", "{what}");
+        }
+
+        // The failed deposit ack must not have deleted anything: the member
+        // still sees the row, and member-class operations are unchanged.
+        let response = app
+            .clone()
+            .oneshot(fetch_request("fam-pass"))
+            .await
+            .unwrap();
+        let page = body_json(response).await;
+        assert_eq!(page["envelopes"].as_array().unwrap().len(), 1);
+        let response = app
+            .clone()
+            .oneshot(ack_request("fam-pass", &[relay_id]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["deleted"], 1);
+        assert_eq!(
+            app.clone()
+                .oneshot(presence_request("fam-pass"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Suspension and expiry still bind the deposit token (it is the
+        // same family): suspended → family_suspended, expired → no posting
+        // even inside the fetch-grace window.
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PATCH",
+                "/admin/families/fam-pass",
+                serde_json::json!({"status": "suspended"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(envelope_request(&deposit, 2, 48))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "family_suspended");
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PATCH",
+                "/admin/families/fam-pass",
+                serde_json::json!({"status": "active", "expires_ms": now_ms() - 1_000}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(envelope_request(&deposit, 3, 48))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "family_expired");
+    }
+
+    #[tokio::test]
+    async fn static_family_deposit_token_behaves_like_a_provisioned_one() {
+        // Static env-allowlist families have no table row; their deposit
+        // counterparts come from the precomputed map in AppState.
+        let app = test_app();
+        let deposit = deposit_token_for("family-a");
+
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request(&deposit, 1, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let response = app
+            .clone()
+            .oneshot(fetch_request("family-a"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await["envelopes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "a static family's deposit post must land in the member mailbox"
+        );
+        let response = app.clone().oneshot(fetch_request(&deposit)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "deposit_only");
+        // Another family's deposit token must not cross mailboxes.
+        let response = app
+            .clone()
+            .oneshot(fetch_request(&deposit_token_for("family-b")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn migration_backfills_deposit_tokens_and_keeps_existing_tokens_member() {
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        {
+            // A database exactly as a pre-CP4 relayd left it: families table
+            // without the deposit_token column, one provisioned row.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE families (
+                    token        TEXT PRIMARY KEY,
+                    status       TEXT NOT NULL DEFAULT 'active',
+                    plan         TEXT,
+                    quota_bytes  INTEGER,
+                    created_ms   INTEGER NOT NULL,
+                    expires_ms   INTEGER,
+                    note         TEXT
+                );
+                INSERT INTO families (token, status, created_ms)
+                    VALUES ('fam-old', 'active', 123);",
+            )
+            .unwrap();
+        }
+
+        let store = RelayStore::open(&path).unwrap();
+        let row = store.get_family("fam-old").unwrap().unwrap();
+        assert_eq!(row.deposit_token, deposit_token_for("fam-old"));
+
+        // Migration default is member: the pre-existing token resolves to
+        // member class (zero behavior change), the derived one to deposit.
+        let (_, class) = store.get_family_by_credential("fam-old").unwrap().unwrap();
+        assert_eq!(class, TokenClass::Member);
+        let (row, class) = store
+            .get_family_by_credential(&deposit_token_for("fam-old"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(class, TokenClass::Deposit);
+        assert_eq!(row.token, "fam-old");
+
+        // Reopening is a no-op (idempotent migration).
+        drop(store);
+        let store = RelayStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_family("fam-old").unwrap().unwrap().deposit_token,
+            deposit_token_for("fam-old")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_returns_both_tokens_and_rejects_deposit_prefixed_member_tokens() {
+        let app = admin_app();
+        provision(&app, "fam-pass", serde_json::json!({})).await;
+        let expected_deposit = deposit_token_for("fam-pass");
+
+        let response = app
+            .clone()
+            .oneshot(admin_bare("GET", "/admin/families/fam-pass"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["deposit_token"], expected_deposit);
+
+        let page = list_families(&app, "").await;
+        assert_eq!(page["families"][0]["deposit_token"], expected_deposit);
+
+        // A member token wearing the deposit prefix would make credential
+        // classification ambiguous — rejected at provisioning.
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "POST",
+                "/admin/families",
+                serde_json::json!({"token": "cmdep1-lookslikeadeposit"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Admin routes are keyed by the member token; the deposit token is
+        // a mailbox credential, not an admin handle.
+        let response = app
+            .clone()
+            .oneshot(admin_bare(
+                "GET",
+                &format!("/admin/families/{expected_deposit}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// Provision `token` on `app`, asserting it took.
@@ -4618,15 +5243,10 @@ mod tests {
     #[test]
     fn evict_idle_rate_buckets_drops_only_the_long_idle_families() {
         let start = Instant::now();
-        let config = RateLimitConfig {
-            requests_per_min: 60,
-            bytes_per_min: 60,
-            global_requests_per_min: 60,
-        };
         let mut buckets = HashMap::new();
         // Both families spend everything at t=0, so both look empty.
         for token in ["idle-family", "busy-family"] {
-            let mut family = FamilyBuckets::new(config, start);
+            let mut family = FamilyBuckets::new(60, 60, start);
             assert!(family.try_take(60.0, 60.0, start).is_ok());
             buckets.insert(token.to_string(), family);
         }

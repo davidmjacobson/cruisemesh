@@ -262,9 +262,15 @@ struct FriendsView: View {
                 introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
             ))
             try? AppStore.get().removeFriendSuggestion(candidateUserId: contact.userId)
+            // CP4: post-CP4 friend cards carry a post-only deposit token —
+            // fine for the contact record (sends resolve through it), never
+            // for this phone's OWN config: adopting it would leave the phone
+            // unable to fetch its own mail (403 deposit_only on every poll).
+            // Own config comes from the member-scoped Cruise Pass setup card.
             if RelayConfigStore.load() == nil,
                let url = contact.relayUrl,
-               let token = contact.relayToken {
+               let token = contact.relayToken,
+               !relayTokenIsDeposit(token: token) {
                 RelayConfigStore.save(relayUrl: url, relayToken: token)
             }
             let delivery = FriendRequestSender.sendMutualFriendRequest(

@@ -130,6 +130,17 @@ pub fn friend_card_user_id(card: FriendCard) -> Vec<u8> {
 }
 
 /// Build the JSON payload shared via QR code / pasted text when friending.
+///
+/// CP4 (deposit-token split): a friend card exists so a contact can *post*
+/// into this family's mailbox — it never needs fetch/ack/WS capability. The
+/// member token passed in (the phone's own saved relay credential) is
+/// therefore attenuated to its post-only deposit form before it goes on the
+/// card; a publicly re-shared card can then cost the family quota at worst,
+/// never read or delete their mail. Attenuation is idempotent, so a token
+/// that is already deposit-class passes through unchanged, and the wire
+/// layout of the card does not change — old apps parse new cards (and can
+/// still post with the deposit token), new apps parse old full-token cards
+/// (the relay keeps accepting member tokens for posting).
 #[uniffi::export]
 pub fn make_friend_card(
     name: String,
@@ -137,6 +148,9 @@ pub fn make_friend_card(
     relay_url: Option<String>,
     relay_token: Option<String>,
 ) -> Result<String, CoreError> {
+    let relay_token = relay_token
+        .map(crate::relay_deposit_token_for)
+        .filter(|token| !token.is_empty());
     let card = FriendCard {
         name,
         sign_pk: identity.sign_pk,
@@ -479,8 +493,98 @@ mod tests {
         assert_eq!(card.sign_pk, id.sign_pk);
         assert_eq!(card.agree_pk, id.agree_pk);
         assert_eq!(card.relay_url, Some("https://relay.example".to_string()));
-        assert_eq!(card.relay_token, Some("family-token".to_string()));
+        // CP4: the shared card carries the post-only deposit form, never the
+        // full member token that was passed in.
+        assert_eq!(
+            card.relay_token,
+            Some(crate::relay_deposit_token_for("family-token".to_string()))
+        );
         assert_eq!(friend_card_user_id(card), id.user_id);
+    }
+
+    #[test]
+    fn make_friend_card_attenuates_member_token_to_deposit_class() {
+        let id = generate_identity();
+        let deposit = crate::relay_deposit_token_for("family-token".to_string());
+
+        // Member in → deposit out; the member token never reaches the card.
+        let json = make_friend_card(
+            "Dave".to_string(),
+            id.clone(),
+            Some("https://relay.example".to_string()),
+            Some("family-token".to_string()),
+        )
+        .unwrap();
+        assert!(!json.contains("family-token"));
+        let card = parse_friend_card(json).unwrap();
+        assert_eq!(card.relay_token, Some(deposit.clone()));
+        assert!(crate::relay_token_is_deposit(deposit.clone()));
+
+        // Deposit in → unchanged (re-encoding a card never double-attenuates).
+        let json = make_friend_card(
+            "Dave".to_string(),
+            id.clone(),
+            Some("https://relay.example".to_string()),
+            Some(deposit.clone()),
+        )
+        .unwrap();
+        assert_eq!(parse_friend_card(json).unwrap().relay_token, Some(deposit));
+
+        // Blank token in → omitted, not attenuated into garbage.
+        let json = make_friend_card(
+            "Dave".to_string(),
+            id,
+            Some("https://relay.example".to_string()),
+            Some("  ".to_string()),
+        )
+        .unwrap();
+        assert_eq!(parse_friend_card(json).unwrap().relay_token, None);
+    }
+
+    /// Fixed-key golden vectors for the CMFRIEND2 wire form. The layout is
+    /// deliberately UNCHANGED by CP4 (an appended field would hard-fail the
+    /// trailing-bytes check in every pre-CP4 decoder in the field); the rev
+    /// is what the `relay_token` slot carries. Old-format cards (full member
+    /// token) must keep parsing forever; new cards pin the deposit form.
+    #[test]
+    fn cmfriend2_golden_vectors_old_and_new_format() {
+        const OLD_FORMAT: &str = "CMFRIEND2:EREREREREREREREREREREREREREREREREREREREREREiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIgREYXZlAQAVaHR0cHM6Ly9yZWxheS5leGFtcGxlAQAMZmFtaWx5LXRva2Vu";
+        const NEW_FORMAT: &str = "CMFRIEND2:EREREREREREREREREREREREREREREREREREREREREREiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIgREYXZlAQAVaHR0cHM6Ly9yZWxheS5leGFtcGxlAQAyY21kZXAxLTYzaFd2eDFrSExLaXJmbDlHVjU3NmVBaV9yVVJweVppeHBzQ1ZVQ1hOSms";
+
+        // Old-format card (minted by a pre-CP4 app, full member token):
+        // still parses, member token intact — the relay keeps accepting it
+        // for posting.
+        let card = parse_friend_text(OLD_FORMAT.to_string()).expect("old-format card must parse");
+        assert_eq!(card.name, "Dave");
+        assert_eq!(card.sign_pk, vec![0x11; 32]);
+        assert_eq!(card.agree_pk, vec![0x22; 32]);
+        assert_eq!(card.relay_url, Some("https://relay.example".to_string()));
+        assert_eq!(card.relay_token, Some("family-token".to_string()));
+
+        // New-format card: byte-identical layout, deposit token in the same
+        // slot. Pinned end-to-end from make_friend_card + make_friend_link
+        // so any accidental format or derivation change fails here.
+        let identity = Identity {
+            user_id: derive_user_id(&[0x11; 32]).to_vec(),
+            sign_pk: vec![0x11; 32],
+            sign_sk: vec![0; 32],
+            agree_pk: vec![0x22; 32],
+            agree_sk: vec![0; 32],
+        };
+        let json = make_friend_card(
+            "Dave".to_string(),
+            identity,
+            Some("https://relay.example".to_string()),
+            Some("family-token".to_string()),
+        )
+        .unwrap();
+        assert_eq!(make_friend_link(json).unwrap(), NEW_FORMAT);
+
+        let card = parse_friend_text(NEW_FORMAT.to_string()).expect("new-format card must parse");
+        assert_eq!(
+            card.relay_token,
+            Some(crate::relay_deposit_token_for("family-token".to_string()))
+        );
     }
 
     #[test]
@@ -516,7 +620,10 @@ mod tests {
         let card = parse_friend_text(wrapped).expect("valid wrapped link");
         assert_eq!(friend_card_user_id(card.clone()), id.user_id);
         assert_eq!(card.relay_url, Some("https://relay.example".to_string()));
-        assert_eq!(card.relay_token, Some("token".to_string()));
+        assert_eq!(
+            card.relay_token,
+            Some(crate::relay_deposit_token_for("token".to_string()))
+        );
     }
 
     #[test]
@@ -559,7 +666,10 @@ mod tests {
         assert_eq!(card.sign_pk, id.sign_pk);
         assert_eq!(card.agree_pk, id.agree_pk);
         assert_eq!(card.relay_url, Some("https://relay.example".to_string()));
-        assert_eq!(card.relay_token, Some("family-token".to_string()));
+        assert_eq!(
+            card.relay_token,
+            Some(crate::relay_deposit_token_for("family-token".to_string()))
+        );
         assert_eq!(friend_card_user_id(card), id.user_id);
 
         // The whole point of T12: the v2 link is much smaller than the v1 form
