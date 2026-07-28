@@ -9218,6 +9218,113 @@ extension BackupPassphraseStrength: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Whether a contact can be reached at all when no direct path exists.
+ *
+ * This answers the one question a chat app trained on Signal and WhatsApp
+ * never has to ask: *can I message this person from across the country?*
+ * Nearby delivery is always free and always available; delivery over the
+ * internet needs the **recipient** to have a mailbox, because the sender
+ * posts into the recipient's mailbox and the recipient fetches from it
+ * (DESIGN.md §9.1). A contact who never shared internet delivery cannot be
+ * reached from a distance no matter how long the message waits, and saying
+ * otherwise is the kind of promise this app must not make.
+ *
+ * This is a property of the *credentials on the friend card*, not of the
+ * contact's current presence. A card can be stale (their pass may have
+ * expired since they shared it), so callers must present this as "they
+ * shared internet delivery", never "they are online now" — the two are
+ * separate axes and only the second needs live evidence.
+ */
+
+public enum ContactDelivery {
+    
+    /**
+     * The contact rides the same mailbox this phone fetches from: our own
+     * family's Cruise Pass. Internet delivery works in both directions and
+     * their presence is observable, because we hold the member credential.
+     */
+    case sharedMailbox
+    /**
+     * The contact shared internet delivery of their own (another family's
+     * pass, or a self-hosted relay). We can post to it; post-CP4 we cannot
+     * read their presence from it, because a friend card carries a
+     * post-only deposit credential.
+     */
+    case ownMailbox(host: String
+    )
+    /**
+     * The contact shared no internet delivery. Only nearby paths -- direct
+     * link, or a phone carrying for us -- will ever reach them.
+     */
+    case nearbyOnly
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactDelivery: FfiConverterRustBuffer {
+    typealias SwiftType = ContactDelivery
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactDelivery {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sharedMailbox
+        
+        case 2: return .ownMailbox(host: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .nearbyOnly
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ContactDelivery, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .sharedMailbox:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .ownMailbox(host):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(host, into: &buf)
+            
+        
+        case .nearbyOnly:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactDelivery_lift(_ buf: RustBuffer) throws -> ContactDelivery {
+    return try FfiConverterTypeContactDelivery.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactDelivery_lower(_ value: ContactDelivery) -> RustBuffer {
+    return FfiConverterTypeContactDelivery.lower(value)
+}
+
+
+
+extension ContactDelivery: Equatable, Hashable {}
+
+
+
 
 public enum CoreBackupError {
 
@@ -11622,6 +11729,21 @@ public func computeRecipientHint(recipientUserId: Data, timestampMs: Int64) -> D
 })
 }
 /**
+ * Classify what [ContactDelivery] a contact's card affords, given our own
+ * relay configuration. Credentials are compared internally and never
+ * returned; only the host is exposed, and only for a contact's own mailbox.
+ */
+public func contactDelivery(contactRelayUrl: String?, contactRelayToken: String?, ownRelayUrl: String?, ownRelayToken: String?) -> ContactDelivery {
+    return try!  FfiConverterTypeContactDelivery.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_contact_delivery(
+        FfiConverterOptionString.lower(contactRelayUrl),
+        FfiConverterOptionString.lower(contactRelayToken),
+        FfiConverterOptionString.lower(ownRelayUrl),
+        FfiConverterOptionString.lower(ownRelayToken),$0
+    )
+})
+}
+/**
  * Narrow follow-up check for a relay-fetched envelope that deduped as
  * [`CoreInboundDisposition::Seen`]: [`core_should_ack_inbound`] can't vouch
  * for it (dedupe happens before a disposition is re-derived, so Seen alone
@@ -13113,6 +13235,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_compute_recipient_hint() != 63461) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_contact_delivery() != 40561) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable() != 8907) {

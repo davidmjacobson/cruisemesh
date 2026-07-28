@@ -106,15 +106,23 @@ object ContactReachability {
         peerLastSeenMs: Long?,
         nowMs: Long,
         transport: MeshRouterState.Transport? = null,
+        contactHasInternetDelivery: Boolean = true,
     ): String = when (level) {
         ReachabilityLevel.NEARBY -> nearbyViaCopy(transport)
-        ReachabilityLevel.ONLINE_RELAY -> "Online via relay"
+        ReachabilityLevel.ONLINE_RELAY -> "Online via Cruise Pass"
         ReachabilityLevel.RECENT -> {
             val minutes = peerLastSeenMs?.let { ((nowMs - it) / 60_000L).coerceAtLeast(0L) } ?: 0L
             if (minutes >= 60) "Active ${minutes / 60}h ago" else "Active ${minutes}m ago"
         }
-        ReachabilityLevel.MESH_CARRY -> "Nearby phones will carry your message"
-        ReachabilityLevel.OFFLINE -> "Offline — will deliver when reachable"
+        // "will carry" promised an outcome no phone has agreed to yet: the
+        // message has only been offered to whoever is nearby.
+        ReachabilityLevel.MESH_CARRY -> "Trying nearby phones"
+        // The old copy said "will deliver when reachable" for everyone. For a
+        // contact who never shared internet delivery that is a promise the
+        // app cannot keep -- no amount of waiting reaches them, because a
+        // sender posts into the *recipient's* mailbox and they have none.
+        ReachabilityLevel.OFFLINE ->
+            if (contactHasInternetDelivery) "Waiting to deliver" else "Delivers when you're nearby"
     }
 
     /**
@@ -123,9 +131,9 @@ object ContactReachability {
      */
     fun contentDescriptionSuffix(level: ReachabilityLevel, transport: MeshRouterState.Transport? = null): String? = when (level) {
         ReachabilityLevel.NEARBY -> nearbyViaCopy(transport)
-        ReachabilityLevel.ONLINE_RELAY -> "Online via relay"
+        ReachabilityLevel.ONLINE_RELAY -> "Online via Cruise Pass"
         ReachabilityLevel.RECENT -> "Recently active"
-        ReachabilityLevel.MESH_CARRY -> "Reachable through the mesh"
+        ReachabilityLevel.MESH_CARRY -> "Reachable through nearby phones"
         ReachabilityLevel.OFFLINE -> null
     }
 
@@ -154,13 +162,18 @@ object ContactReachability {
         presenceLastSeenMs: Long?,
         nowMs: Long,
         transport: MeshRouterState.Transport? = null,
+        contactHasInternetDelivery: Boolean = true,
     ): String {
-        val base = chatHeaderCopy(level, peerLastSeenMs, nowMs, transport)
-        return when {
-            presenceLastSeenMs != null -> "$base · Last seen via relay ${ageText(presenceLastSeenMs, nowMs)} ago"
+        val base = chatHeaderCopy(level, peerLastSeenMs, nowMs, transport, contactHasInternetDelivery)
+        val seen = when {
+            presenceLastSeenMs != null -> "$base · Last seen ${ageText(presenceLastSeenMs, nowMs)} ago"
             peerLastSeenMs != null -> "$base · Last seen ${ageText(peerLastSeenMs, nowMs)} ago"
             else -> base
         }
+        // Capability is a durable fact about the friend card, so state it here
+        // even when the live level already reads well -- it is the thing a
+        // sender needs to know before wondering why nothing arrives.
+        return if (contactHasInternetDelivery) seen else "$seen · Nearby delivery only"
     }
 
     private fun ageText(seenAtMs: Long, nowMs: Long): String {

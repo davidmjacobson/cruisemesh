@@ -466,6 +466,78 @@ fn malformed(message: &str) -> CoreError {
     CoreError::Malformed(message.to_string())
 }
 
+/// Whether a contact can be reached at all when no direct path exists.
+///
+/// This answers the one question a chat app trained on Signal and WhatsApp
+/// never has to ask: *can I message this person from across the country?*
+/// Nearby delivery is always free and always available; delivery over the
+/// internet needs the **recipient** to have a mailbox, because the sender
+/// posts into the recipient's mailbox and the recipient fetches from it
+/// (DESIGN.md §9.1). A contact who never shared internet delivery cannot be
+/// reached from a distance no matter how long the message waits, and saying
+/// otherwise is the kind of promise this app must not make.
+///
+/// This is a property of the *credentials on the friend card*, not of the
+/// contact's current presence. A card can be stale (their pass may have
+/// expired since they shared it), so callers must present this as "they
+/// shared internet delivery", never "they are online now" — the two are
+/// separate axes and only the second needs live evidence.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ContactDelivery {
+    /// The contact rides the same mailbox this phone fetches from: our own
+    /// family's Cruise Pass. Internet delivery works in both directions and
+    /// their presence is observable, because we hold the member credential.
+    SharedMailbox,
+    /// The contact shared internet delivery of their own (another family's
+    /// pass, or a self-hosted relay). We can post to it; post-CP4 we cannot
+    /// read their presence from it, because a friend card carries a
+    /// post-only deposit credential.
+    OwnMailbox { host: String },
+    /// The contact shared no internet delivery. Only nearby paths -- direct
+    /// link, or a phone carrying for us -- will ever reach them.
+    NearbyOnly,
+}
+
+/// Classify what [ContactDelivery] a contact's card affords, given our own
+/// relay configuration. Credentials are compared internally and never
+/// returned; only the host is exposed, and only for a contact's own mailbox.
+#[uniffi::export]
+pub fn contact_delivery(
+    contact_relay_url: Option<String>,
+    contact_relay_token: Option<String>,
+    own_relay_url: Option<String>,
+    own_relay_token: Option<String>,
+) -> ContactDelivery {
+    let Some(contact) = relay_endpoint_from(contact_relay_url, contact_relay_token) else {
+        return ContactDelivery::NearbyOnly;
+    };
+    if let Some(own) = relay_endpoint_from(own_relay_url, own_relay_token) {
+        // Same mailbox when the host matches and the card's credential is
+        // either our own member token (a legacy pre-CP4 card) or its deposit
+        // attenuation (a current card).
+        let same_host = own.url == contact.url;
+        let same_family = contact.token == own.token
+            || contact.token == relay_deposit_token_for(own.token.clone());
+        if same_host && same_family {
+            return ContactDelivery::SharedMailbox;
+        }
+    }
+    ContactDelivery::OwnMailbox {
+        host: relay_host_only(&contact.url),
+    }
+}
+
+/// Host (and port) of a relay URL, with scheme and path stripped -- safe to
+/// show a user who already holds the card. Never includes the credential.
+fn relay_host_only(url: &str) -> String {
+    let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,5 +742,115 @@ mod tests {
     fn rejects_response_body_above_transport_cap_before_json_decode() {
         let body = vec![b' '; RELAY_MAX_RESPONSE_BODY_BYTES + 1];
         assert!(relay_decode_fetch_page(body).is_err());
+    }
+
+    // -- contact_delivery (honest reachability) -------------------------
+
+    const OWN_URL: &str = "https://relay.example";
+    const OWN_TOKEN: &str = "member-token-aaaa";
+
+    #[test]
+    fn no_card_relay_means_nearby_only() {
+        assert_eq!(
+            contact_delivery(None, None, Some(OWN_URL.into()), Some(OWN_TOKEN.into())),
+            ContactDelivery::NearbyOnly
+        );
+        // A url with no token is not a usable endpoint either.
+        assert_eq!(
+            contact_delivery(
+                Some(OWN_URL.into()),
+                Some("   ".into()),
+                Some(OWN_URL.into()),
+                Some(OWN_TOKEN.into())
+            ),
+            ContactDelivery::NearbyOnly
+        );
+    }
+
+    #[test]
+    fn current_card_from_our_own_family_is_the_shared_mailbox() {
+        let deposit = relay_deposit_token_for(OWN_TOKEN.to_string());
+        assert_eq!(
+            contact_delivery(
+                Some(OWN_URL.into()),
+                Some(deposit),
+                Some(OWN_URL.into()),
+                Some(OWN_TOKEN.into())
+            ),
+            ContactDelivery::SharedMailbox
+        );
+    }
+
+    #[test]
+    fn legacy_full_token_card_from_our_own_family_still_reads_as_shared() {
+        assert_eq!(
+            contact_delivery(
+                Some(OWN_URL.into()),
+                Some(OWN_TOKEN.into()),
+                Some(OWN_URL.into()),
+                Some(OWN_TOKEN.into())
+            ),
+            ContactDelivery::SharedMailbox
+        );
+    }
+
+    #[test]
+    fn another_familys_card_is_their_own_mailbox_and_exposes_only_the_host() {
+        let theirs = relay_deposit_token_for("member-token-bbbb".to_string());
+        let got = contact_delivery(
+            Some("https://relay.example/".into()),
+            Some(theirs.clone()),
+            Some("https://other.example".into()),
+            Some(OWN_TOKEN.into()),
+        );
+        match got {
+            ContactDelivery::OwnMailbox { host } => {
+                assert_eq!(host, "relay.example");
+                assert!(
+                    !host.contains(&theirs),
+                    "host must never carry a credential"
+                );
+            }
+            other => panic!("expected OwnMailbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_host_different_family_is_not_the_shared_mailbox() {
+        // Two families hosted on the same relay must not be conflated: the
+        // credential decides, not the hostname.
+        let theirs = relay_deposit_token_for("member-token-cccc".to_string());
+        assert!(matches!(
+            contact_delivery(
+                Some(OWN_URL.into()),
+                Some(theirs),
+                Some(OWN_URL.into()),
+                Some(OWN_TOKEN.into())
+            ),
+            ContactDelivery::OwnMailbox { .. }
+        ));
+    }
+
+    #[test]
+    fn a_contact_can_have_delivery_when_we_have_none() {
+        // We have no pass; they shared one. We can still post to them.
+        assert!(matches!(
+            contact_delivery(
+                Some(OWN_URL.into()),
+                Some("cmdep1-whatever".into()),
+                None,
+                None
+            ),
+            ContactDelivery::OwnMailbox { .. }
+        ));
+    }
+
+    #[test]
+    fn host_strips_scheme_path_and_port_is_kept() {
+        assert_eq!(
+            relay_host_only("https://relay.example:8443/api"),
+            "relay.example:8443"
+        );
+        assert_eq!(relay_host_only("relay.example"), "relay.example");
     }
 }

@@ -1090,6 +1090,11 @@ uint16_t uniffi_cruisemesh_core_fn_func_ble_max_att_value_len(RustCallStatus *_N
 RustBuffer uniffi_cruisemesh_core_fn_func_compute_recipient_hint(RustBuffer recipient_user_id, int64_t timestamp_ms, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CONTACT_DELIVERY
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CONTACT_DELIVERY
+RustBuffer uniffi_cruisemesh_core_fn_func_contact_delivery(RustBuffer contact_relay_url, RustBuffer contact_relay_token, RustBuffer own_relay_url, RustBuffer own_relay_token, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_CONSUMED_SEEN_IS_ACKABLE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_CONSUMED_SEEN_IS_ACKABLE
 int8_t uniffi_cruisemesh_core_fn_func_core_consumed_seen_is_ackable(RustBuffer origin, RustBuffer own_user_id, RustCallStatus *_Nonnull out_status
@@ -1999,6 +2004,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_ble_max_att_value_len(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_COMPUTE_RECIPIENT_HINT
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_COMPUTE_RECIPIENT_HINT
 uint16_t uniffi_cruisemesh_core_checksum_func_compute_recipient_hint(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CONTACT_DELIVERY
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CONTACT_DELIVERY
+uint16_t uniffi_cruisemesh_core_checksum_func_contact_delivery(void
     
 );
 #endif
