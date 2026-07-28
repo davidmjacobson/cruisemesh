@@ -151,7 +151,15 @@ jobs:
           echo "Uploaded build ${{ steps.version.outputs.build }} (${{ steps.version.outputs.marketing }}) to TestFlight."
 
       # Best-effort: wait for processing, add to the beta group, submit for beta
-      # review. continue-on-error so a slow queue never reds a landed release.
+      # review. continue-on-error so a slow queue never reds a landed release --
+      # but that also means a REAL failure here is silent, and the job still
+      # reports success, so the step writes its own verdict to the run summary.
+      # 1.0.4 shipped to TestFlight and reached nobody exactly this way.
+      #
+      # Install into a venv rather than `python3 -m pip install`: the runner's
+      # python3 is Homebrew's, and Homebrew marks it externally managed
+      # (PEP 668), so a bare pip install now dies with
+      # "error: externally-managed-environment" before the script ever runs.
       - name: Distribute to the TestFlight beta group
         if: env.IOS_ENABLED == 'true'
         continue-on-error: true
@@ -159,12 +167,24 @@ jobs:
           ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
           ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check pyjwt cryptography requests
-          python3 tools/testflight_distribute.py \
+          set -o pipefail
+          venv="$RUNNER_TEMP/testflight-venv"
+          python3 -m venv "$venv"
+          "$venv/bin/pip" install --quiet --disable-pip-version-check pyjwt cryptography requests
+          if "$venv/bin/python" tools/testflight_distribute.py \
             "$HOME/private_keys/AuthKey_${ASC_API_KEY_ID}.p8" \
             "$ASC_API_KEY_ID" \
             "$ASC_API_ISSUER_ID" \
-            "${{ steps.version.outputs.build }}"
+            "${{ steps.version.outputs.build }}"; then
+            echo "Distributed build ${{ steps.version.outputs.build }} to the beta group." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**TestFlight distribution FAILED** for build ${{ steps.version.outputs.build }}." \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo "The build is uploaded but NOT with any tester. Re-run tools/testflight_distribute.py by hand." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
       - name: Note skipped publish
         if: env.IOS_ENABLED != 'true'
