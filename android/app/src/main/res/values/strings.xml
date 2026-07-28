@@ -65,7 +65,9 @@
     <string name="ui_diagnostic_logging_always_on">Always on in this test build. Message content is never recorded.</string>
     <string name="ui_diagnostic_logging_tester_desc">Turn this on before testing to keep connection and delivery diagnostics across restarts. Message content is never recorded.</string>
     <string name="ui_diagnostic_logging_enabled_message">Diagnostic logging is on. Reproduce the problem, then return here to share it.</string>
-    <string name="ui_diagnostic_logging_disabled_message">Diagnostic logging is off. Previously captured diagnostics can still be shared.</string>
+    <string name="ui_diagnostic_logging_disabled_message">Diagnostic logging is off. What was already captured is kept until you delete it.</string>
+    <string name="ui_delete_captured_diagnostics">Delete captured diagnostics</string>
+    <string name="ui_diagnostics_deleted">Captured diagnostics deleted.</string>
     <string name="ui_display_name">Display name</string>
     <string name="ui_done">Done</string>
     <string name="ui_family_token">Family token</string>

@@ -231,6 +231,16 @@
         }
       }
     },
+    "Captured diagnostics deleted.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Captured diagnostics deleted."
+          }
+        }
+      }
+    },
     "Check and save": {
       "localizations": {
         "en": {
@@ -541,6 +551,16 @@
         }
       }
     },
+    "Delete captured diagnostics": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Delete captured diagnostics"
+          }
+        }
+      }
+    },
     "Delete contact": {
       "localizations": {
         "en": {
@@ -587,6 +607,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Diagnostic logging"
+          }
+        }
+      }
+    },
+    "Diagnostic logging is off. What was already captured is kept until you delete it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostic logging is off. What was already captured is kept until you delete it."
+          }
+        }
+      }
+    },
+    "Diagnostic logging is on. Reproduce the problem, then return here to share it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostic logging is on. Reproduce the problem, then return here to share it."
           }
         }
       }
@@ -1177,6 +1217,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "No chats yet"
+          }
+        }
+      }
+    },
+    "No diagnostics captured this session yet.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No diagnostics captured this session yet."
           }
         }
       }
