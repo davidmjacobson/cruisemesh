@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -145,6 +146,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         MeshStartupPreferences.clearExplicitStop(this)
+        // T21: a killed process can leave its ongoing mesh notification
+        // posted. Drop it before the auto-start below decides what to do, so
+        // the shade never claims the mesh is running while it isn't.
+        MeshService.clearStaleNotification(this)
         enableEdgeToEdge()
         // Debug builds: start capturing this process's log to a file so it can
         // be shared without adb (no-op in release). Idempotent with MeshService.
@@ -1386,10 +1391,20 @@ private fun startMesh(context: Context) {
     MeshRuntimeStatus.markStarting()
     try {
         ContextCompat.startForegroundService(context, Intent(context, MeshService::class.java))
-    } catch (_: RuntimeException) {
+    } catch (e: RuntimeException) {
+        // T21: this used to swallow the exception silently, which made a
+        // failed start invisible -- a phone whose mesh never came up looked
+        // identical in logs to one that was never asked to start. The usual
+        // cause is ForegroundServiceStartNotAllowedException: Android 12+
+        // refuses a foreground-service start from the background, which is
+        // exactly what happens when the activity is created and the screen
+        // goes off before this effect runs.
+        Log.w(TAG, "Mesh foreground service start refused: ${e.javaClass.simpleName}: ${e.message}")
         MeshRuntimeStatus.markStopped()
     }
 }
+
+private const val TAG = "CruiseMeshUi"
 
 private fun hasMeshPermissions(context: Context): Boolean =
     MeshService.requiredPermissions().all {
