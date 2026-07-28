@@ -65,6 +65,10 @@ struct CruiseMeshApp: App {
             }
             .onChange(of: scenePhase) { phase in
                 appModel.setAppForeground(phase == .active)
+                // Flush both when leaving and when returning: mesh work can
+                // continue while backgrounded, and those entries should reach
+                // the persistent tester archive before a later termination.
+                DiagnosticLogExport.archiveCurrentSession()
             }
         }
     }
@@ -96,6 +100,10 @@ struct CruiseMeshApp: App {
 /// Both only happen today when something calls into `MeshController`, which
 /// this provides for the background-relaunch case specifically.
 final class AppDelegate: NSObject, UIApplicationDelegate {
+    func applicationWillTerminate(_ application: UIApplication) {
+        DiagnosticLogExport.archiveCurrentSession()
+    }
+
     @MainActor
     func application(
         _ application: UIApplication,

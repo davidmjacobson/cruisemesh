@@ -31,6 +31,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -63,6 +64,8 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
     val relayConfigured = RelayConfigStore.load(context) != null
     var revision by remember { mutableStateOf(0) }
     var showClear by remember { mutableStateOf(false) }
+    var showAllActivity by remember { mutableStateOf(false) }
+    var diagnosticLogging by remember { mutableStateOf(DebugFileLog.isEnabled(context)) }
     var supportMessage by remember { mutableStateOf<String?>(null) }
     val contacts = remember(revision) { store.listContacts() }
     val summaries = remember(revision) { store.peerConnectionSummaries() }
@@ -140,25 +143,75 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                 if (events.isEmpty()) {
                     Text(stringResource(R.string.ui_connection_activity_will_appear_here_as_cruisemesh_reaches))
                 } else {
-                    events.forEach { event ->
+                    val visibleEvents =
+                        if (showAllActivity) events else events.take(RECENT_ACTIVITY_PREVIEW_COUNT)
+                    visibleEvents.forEach { event ->
                         Text(
                             eventText(event, names),
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.padding(vertical = 5.dp),
                         )
                     }
+                    if (events.size > RECENT_ACTIVITY_PREVIEW_COUNT) {
+                        TextButton(
+                            onClick = { showAllActivity = !showAllActivity },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            // Resolved before the Text() call: the localization
+                            // gate rejects a conditional inside Text(...) because
+                            // it cannot see that both branches are localized.
+                            val toggleLabel = if (showAllActivity) {
+                                stringResource(R.string.ui_show_less)
+                            } else {
+                                stringResource(R.string.ui_show_recent_activity, events.size)
+                            }
+                            Text(toggleLabel)
+                        }
+                    }
                 }
             }
 
             Spacer(modifier = Modifier.height(18.dp))
             DetailCard("Support") {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(stringResource(R.string.ui_diagnostic_logging))
+                        Text(
+                            stringResource(
+                                if (DebugFileLog.isDebuggableBuild(context)) {
+                                    R.string.ui_diagnostic_logging_always_on
+                                } else {
+                                    R.string.ui_diagnostic_logging_tester_desc
+                                },
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    androidx.compose.material3.Switch(
+                        checked = diagnosticLogging,
+                        enabled = !DebugFileLog.isDebuggableBuild(context),
+                        onCheckedChange = {
+                            diagnosticLogging = it
+                            DebugFileLog.setOptIn(context, it)
+                            supportMessage = if (it) {
+                                context.getString(R.string.ui_diagnostic_logging_enabled_message)
+                            } else {
+                                context.getString(R.string.ui_diagnostic_logging_disabled_message)
+                            }
+                        },
+                    )
+                }
                 Button(
                     onClick = {
                         DebugFileLog.shareIntent(context)?.let {
                             context.startActivity(Intent.createChooser(it, "Share CruiseMesh diagnostics"))
                         } ?: run { supportMessage = "No diagnostics captured this session yet." }
                     },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
                 ) { Text(stringResource(R.string.ui_share_diagnostics)) }
                 OutlinedButton(
                     onClick = {
@@ -304,3 +357,5 @@ private fun transportLabel(transport: PeerConnectionTransport): String = when (t
 
 private fun formatTime(ms: Long): String =
     DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(ms))
+
+private const val RECENT_ACTIVITY_PREVIEW_COUNT = 10

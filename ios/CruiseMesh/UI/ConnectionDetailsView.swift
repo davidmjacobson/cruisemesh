@@ -9,6 +9,8 @@ struct ConnectionDetailsView: View {
     @State private var summaries: [PeerConnectionSummary] = []
     @State private var events: [PeerConnectionEvent] = []
     @State private var showClear = false
+    @State private var showAllActivity = false
+    @State private var diagnosticLogging = DiagnosticLogExport.isEnabled
     @State private var shareFile: ShareableFile?
     @State private var supportMessage: String?
 
@@ -55,13 +57,32 @@ struct ConnectionDetailsView: View {
                         Text("Connection activity will appear here as CruiseMesh reaches your friends.")
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(Array(events.enumerated()), id: \.offset) { _, event in
+                        ForEach(Array(visibleEvents.enumerated()), id: \.offset) { _, event in
                             Text(eventText(event)).font(.caption)
+                        }
+                        if events.count > Self.recentActivityPreviewCount {
+                            Button(
+                                showAllActivity
+                                    ? "Show less"
+                                    : "Show \(events.count) recent entries"
+                            ) {
+                                showAllActivity.toggle()
+                            }
                         }
                     }
                 }
 
                 Section("Support") {
+                    Toggle("Diagnostic logging", isOn: $diagnosticLogging)
+                        .onChange(of: diagnosticLogging) {
+                            DiagnosticLogExport.setEnabled($0)
+                            supportMessage = $0
+                                ? "Diagnostic logging is on. Reproduce the problem, then return here to share it."
+                                : "Diagnostic logging is off. Previously captured diagnostics can still be shared."
+                        }
+                    Text("Turn this on before testing to keep connection and delivery diagnostics across app restarts. Message content is never recorded.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     Button {
                         if let url = DiagnosticLogExport.writeLogFile() {
                             shareFile = ShareableFile(url: url)
@@ -135,6 +156,12 @@ struct ConnectionDetailsView: View {
         case .rateLimited: return String(localized: "Syncing slowed")
         }
     }
+
+    private var visibleEvents: ArraySlice<PeerConnectionEvent> {
+        events.prefix(showAllActivity ? events.count : Self.recentActivityPreviewCount)
+    }
+
+    private static let recentActivityPreviewCount = 10
 
     private var bluetoothCount: Int {
         let contactIds = Set(contacts.map(\.userId))
