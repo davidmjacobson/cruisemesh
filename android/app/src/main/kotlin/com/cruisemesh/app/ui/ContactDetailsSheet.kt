@@ -28,6 +28,11 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Switch
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.ui.platform.LocalContext
+import com.cruisemesh.app.relay.RelayConfigStore
+import uniffi.cruisemesh_core.ContactDelivery
+import uniffi.cruisemesh_core.contactDelivery
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -104,6 +109,9 @@ fun ContactDetailsSheetContent(
     val fingerprint = fingerprintWords(contact.userId)
     var editingNickname by remember(contact.userId) { mutableStateOf(false) }
     var showVerification by remember(contact.userId) { mutableStateOf(false) }
+    var showDeliveryDetails by remember(contact.userId) { mutableStateOf(false) }
+    val deliveryContext = LocalContext.current
+    val ownRelay = remember(deliveryContext) { RelayConfigStore.load(deliveryContext) }
 
     if (editingNickname) {
         NicknameEditDialog(
@@ -172,6 +180,67 @@ fun ContactDetailsSheetContent(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 8.dp),
                     )
+
+                    // Which route this contact's messages take, and -- behind a
+                    // disclosure -- the host and how to repair a stale one. A
+                    // friend card is a snapshot of the sharer's config at the
+                    // moment they shared it, so a contact who has since changed
+                    // relays leaves us posting into an endpoint that no longer
+                    // knows them. That failure was previously invisible on every
+                    // screen, which cost a live debugging session to find.
+                    val delivery = remember(contact.relayUrl, contact.relayToken, ownRelay) {
+                        contactDelivery(
+                            contact.relayUrl,
+                            contact.relayToken,
+                            ownRelay?.relayUrl,
+                            ownRelay?.relayToken,
+                        )
+                    }
+                    Text(
+                        text = stringResource(R.string.ui_internet_delivery),
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.padding(top = 16.dp),
+                    )
+                    Text(
+                        text = stringResource(
+                            when (delivery) {
+                                is ContactDelivery.SharedMailbox -> R.string.ui_delivery_shared_pass
+                                is ContactDelivery.OwnMailbox -> R.string.ui_delivery_their_own
+                                is ContactDelivery.NearbyOnly -> R.string.ui_delivery_nearby_only
+                            },
+                        ),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                    // The host is deliberately behind a tap: it is meaningless to
+                    // most people and CP3 keeps protocol words off the surface,
+                    // but it is exactly what support and self-hosters need.
+                    (delivery as? ContactDelivery.OwnMailbox)?.let { own ->
+                        TextButton(
+                            onClick = { showDeliveryDetails = !showDeliveryDetails },
+                            contentPadding = PaddingValues(0.dp),
+                        ) {
+                            Text(
+                                stringResource(
+                                    if (showDeliveryDetails) R.string.ui_hide_details else R.string.ui_details,
+                                ),
+                            )
+                        }
+                        if (showDeliveryDetails) {
+                            Text(
+                                text = own.host,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                text = stringResource(R.string.ui_delivery_stale_card_hint),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                        }
+                    }
                 }
             }
         }
