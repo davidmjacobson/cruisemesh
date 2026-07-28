@@ -14,6 +14,7 @@ import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.relay.RelayFetchedEnvelope
 import com.cruisemesh.app.relay.RelayHttpException
 import com.cruisemesh.app.relay.RelayPushClient
+import com.cruisemesh.app.relay.RelayUpdateSender
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.CoreInboundDisposition
@@ -407,6 +408,15 @@ internal class RelaySyncEngine(
         ownRelayFault = null
         ownRetryAfterMs = 0L
         backfillOutgoingReceipts(identity, now)
+        // T23: if our own endpoint changed since the last announcement, queue
+        // the notice to every contact *before* this pass uploads, so it rides
+        // out in the same sync. This is the single trigger for every way the
+        // config can change (Cruise Pass setup and removal, manual entry in
+        // Advanced, a scanned setup card, a backup restore) because they all
+        // already end in `RelaySyncEvents.requestSync()` — no save site has to
+        // remember to announce, and none can be missed. `announceIfChanged` is
+        // idempotent, so the periodic poll re-entering here costs nothing.
+        RelayUpdateSender.announceIfChanged(context, store, identity)
         uploadPendingOutgoingReceiptEnvelopes(contacts, fallbackConfig, now, network)
         uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now, network)
         uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now, network)

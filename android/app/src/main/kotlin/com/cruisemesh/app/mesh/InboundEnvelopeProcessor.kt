@@ -50,6 +50,7 @@ import uniffi.cruisemesh_core.decodeIntroducedFriendRequest
 import uniffi.cruisemesh_core.decodeLanEndpointContent
 import uniffi.cruisemesh_core.decodeProfileSyncContent
 import uniffi.cruisemesh_core.decodeReceiptContent
+import uniffi.cruisemesh_core.decodeRelayUpdateContent
 import uniffi.cruisemesh_core.encodeEnvelopeFrame
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.openGroupMessage
@@ -780,6 +781,12 @@ internal class InboundEnvelopeProcessor(
                 body,
                 identity,
             )
+            KIND_RELAY_UPDATE -> handleIncomingRelayUpdate(
+                address,
+                opened.senderUserId,
+                body,
+                identity,
+            )
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
         }
     }
@@ -1187,6 +1194,62 @@ internal class InboundEnvelopeProcessor(
         if (policyChanged) {
             FriendDirectorySender.queueToAllContacts(context, store, identity)
         }
+    }
+
+    /**
+     * T23: a contact told us their own relay endpoint changed.
+     *
+     * `opened.senderUserId` is the identity core verified sealed this
+     * envelope, and it is the only user id passed to
+     * `applyContactRelayUpdate` — core rejects the notice outright if its
+     * payload claims a different subject, so a notice can only ever move its
+     * own sender's endpoint, never a third party's.
+     */
+    private fun handleIncomingRelayUpdate(
+        address: String,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+    ) {
+        val contact = store.getContact(senderUserId) ?: run {
+            Log.i(TAG, "Dropping relay update from $address: sender is not a contact")
+            return
+        }
+        val content = try {
+            decodeRelayUpdateContent(body.content)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping relay update from $address: failed to decode (${e.message})")
+            return
+        }
+        val inserted = store.insertMessage(
+            StoredMessage(
+                chatId = senderUserId,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_RELAY_UPDATE,
+                payload = body.content,
+            ),
+        )
+        if (!inserted) return
+
+        val applied = try {
+            store.applyContactRelayUpdate(senderUserId, content)
+        } catch (e: CoreException) {
+            // Mis-scoped subject or a non-deposit credential: a deterministic
+            // reject, not a store failure. The message row above still stands
+            // so the sender's watermark advances and they stop re-spraying it.
+            Log.w(TAG, "Rejecting relay update from $address: ${e.message}")
+            false
+        }
+        if (applied) {
+            Log.i(TAG, "Applied relay update from ${UserIdHex.encode(senderUserId)}")
+            // Anything queued for them was addressed to the old endpoint's
+            // mailbox; a sync pass re-resolves and re-posts to the new one.
+            RelaySyncEvents.requestSync()
+            ChatEvents.notifyChatChanged(senderUserId)
+        }
+        acknowledgeHiddenMessage(address, senderUserId, identity, contact)
     }
 
     private fun handleIncomingFriendDirectory(

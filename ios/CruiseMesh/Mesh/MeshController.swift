@@ -986,6 +986,13 @@ final class MeshController: ObservableObject {
                 body: body,
                 identity: identity
             )
+        case ProtocolKind.relayUpdate:
+            try handleIncomingRelayUpdate(
+                sourceAddress: sourceAddress,
+                senderUserId: opened.senderUserId,
+                body: body,
+                identity: identity
+            )
         case ProtocolKind.groupInvite:
             try handleIncomingGroupInvite(
                 sourceLabel: sourceLabel,
@@ -1530,6 +1537,57 @@ final class MeshController: ObservableObject {
                 contact: contact
             )
         }
+    }
+
+    /// T23: a contact told us their own relay endpoint changed.
+    ///
+    /// `senderUserId` is the identity core verified sealed this envelope, and
+    /// it is the only user id passed to `applyContactRelayUpdate` — core
+    /// rejects the notice outright if its payload claims a different subject,
+    /// so a notice can only ever move its own sender's endpoint, never a third
+    /// party's. `insertMessage` is the dedup gate, same shape as every other
+    /// handler in this file.
+    private func handleIncomingRelayUpdate(
+        sourceAddress: String?,
+        senderUserId: Data,
+        body: MessageBody,
+        identity: Identity
+    ) throws {
+        // Deterministic reject: unknown sender or undecodable content. Not a
+        // store failure -- stays a swallowed terminal state.
+        guard let contact = try? store.getContact(userId: senderUserId),
+              let content = try? decodeRelayUpdateContent(bytes: body.content) else { return }
+        let inserted = try store.insertMessage(message: StoredMessage(
+            chatId: senderUserId,
+            senderUserId: senderUserId,
+            lamport: body.lamport,
+            timestamp: body.timestamp,
+            kind: ProtocolKind.relayUpdate,
+            payload: body.content
+        ))
+        guard inserted else { return }
+
+        // A mis-scoped subject or a non-deposit credential throws: a
+        // deterministic reject, not a store failure. The message row above
+        // still stands so the sender's watermark advances and they stop
+        // re-spraying it.
+        let applied = (try? store.applyContactRelayUpdate(
+            senderUserId: senderUserId,
+            content: content
+        )) ?? false
+        if applied {
+            log.info("Applied a relay update from \(contact.name, privacy: .public)")
+            // Anything queued for them was addressed to the old endpoint's
+            // mailbox; a sync pass re-resolves and re-posts to the new one.
+            RelaySyncEvents.requestSync()
+            ChatEvents.notifyChatChanged(senderUserId)
+        }
+        acknowledgeHiddenMessage(
+            sourceAddress: sourceAddress,
+            senderUserId: senderUserId,
+            identity: identity,
+            contact: contact
+        )
     }
 
     // FI5: throws now -- see handleIncomingFriendRequest's doc for the
@@ -2229,6 +2287,15 @@ final class MeshController: ObservableObject {
         }
         relaySyncInFlight = true
         backfillRelayReceipts(identity: identity)
+        // T23: if our own endpoint changed since the last announcement, queue
+        // the notice to every contact *before* this pass uploads, so it rides
+        // out in the same sync. This is the single trigger for every way the
+        // config can change (Cruise Pass setup and removal, manual entry in
+        // Advanced, a scanned setup card, a backup restore) because they all
+        // already end in `RelaySyncEvents.requestSync()` — no save site has to
+        // remember to announce, and none can be missed. Mirrors Android's
+        // `RelaySyncEngine.performRelaySyncPass`.
+        RelayUpdateSender.announceIfChanged(store: store, identity: identity)
         if !pausedForBluetoothAudio {
             MeshRuntimeStatus.shared.markSyncingViaRelay()
         }

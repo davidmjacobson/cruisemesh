@@ -7,6 +7,17 @@ private const val PREF_RELAY_URL = "relay_url"
 private const val PREF_RELAY_TOKEN = "relay_token"
 private const val PREF_SHARE_ONLINE = "share_online"
 
+/**
+ * T23: monotonic version of *this device's own* relay endpoint. Bumped only
+ * when [RelayConfigStore.save] actually changes the configuration, and carried
+ * in every relay-change notice so a contact can order notices that arrive out
+ * of sequence (DTN reordering, relay replays).
+ */
+private const val PREF_RELAY_EPOCH = "relay_epoch"
+
+/** T23: the highest [PREF_RELAY_EPOCH] already fanned out to every contact. */
+private const val PREF_ANNOUNCED_RELAY_EPOCH = "relay_announced_epoch"
+
 data class RelayConfig(
     val relayUrl: String,
     val relayToken: String,
@@ -31,15 +42,51 @@ object RelayConfigStore {
     fun save(context: Context, relayUrl: String, relayToken: String) {
         val normalizedUrl = normalizeRelayUrl(relayUrl)
         val normalizedToken = relayToken.trim()
+        val cleared = normalizedUrl.isEmpty() || normalizedToken.isEmpty()
+        val next = if (cleared) null else RelayConfig(normalizedUrl, normalizedToken)
+        // T23: only a real change bumps the epoch. Settings screens re-save on
+        // every keystroke, and a no-op save must not make contacts re-apply an
+        // endpoint they already hold.
+        if (next == load(context)) return
+
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-        if (normalizedUrl.isEmpty() || normalizedToken.isEmpty()) {
-            prefs.remove(PREF_RELAY_URL).remove(PREF_RELAY_TOKEN).apply()
-            return
+        if (next == null) {
+            prefs.remove(PREF_RELAY_URL).remove(PREF_RELAY_TOKEN)
+        } else {
+            prefs.putString(PREF_RELAY_URL, next.relayUrl)
+                .putString(PREF_RELAY_TOKEN, next.relayToken)
         }
-        prefs.putString(PREF_RELAY_URL, normalizedUrl)
-            .putString(PREF_RELAY_TOKEN, normalizedToken)
+        prefs.putLong(PREF_RELAY_EPOCH, nextRelayEpoch(context)).apply()
+    }
+
+    /**
+     * T23: the current epoch of this device's own relay endpoint. `0` means it
+     * has never changed since install, so there is nothing to announce.
+     */
+    fun relayEpoch(context: Context): Long =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getLong(PREF_RELAY_EPOCH, 0L)
+
+    /** T23: the newest epoch already fanned out to contacts. */
+    fun announcedRelayEpoch(context: Context): Long =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getLong(PREF_ANNOUNCED_RELAY_EPOCH, 0L)
+
+    /** T23: records that [epoch] has been queued to every contact. */
+    fun markRelayEpochAnnounced(context: Context, epoch: Long) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putLong(PREF_ANNOUNCED_RELAY_EPOCH, epoch)
             .apply()
     }
+
+    /**
+     * Wall clock, but never at or below the previous value: a backwards clock
+     * (manual change, NTP correction) must not mint an epoch a contact would
+     * ignore as stale, which would strand them on a dead endpoint forever.
+     */
+    private fun nextRelayEpoch(context: Context): Long =
+        maxOf(System.currentTimeMillis(), relayEpoch(context) + 1)
 
     fun shareOnline(context: Context): Boolean =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

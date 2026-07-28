@@ -1,0 +1,116 @@
+package com.cruisemesh.app.relay
+
+import android.content.Context
+import android.util.Log
+import com.cruisemesh.app.chat.UserIdHex
+import com.cruisemesh.app.mesh.GossipState
+import com.cruisemesh.app.mesh.MeshRouter
+import com.cruisemesh.app.mesh.RelaySyncEvents
+import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.Identity
+import uniffi.cruisemesh_core.MessageStore
+import uniffi.cruisemesh_core.RelayUpdateContent
+import uniffi.cruisemesh_core.encodeRelayUpdateContent
+
+private const val TAG = "RelayUpdateSender"
+private const val KIND_RELAY_UPDATE: UByte = 9u
+
+/**
+ * T23 relay-change propagation, the exact twin of
+ * [com.cruisemesh.app.friending.ProfileSyncSender].
+ *
+ * A friend card is a *snapshot* of the sharer's relay config at the moment it
+ * was shared. Buy a Cruise Pass, rotate a token, or migrate servers, and every
+ * contact keeps posting to the endpoint they were handed — in the field that
+ * looked like a contact's phone posting to a long-retired host and collecting
+ * `401 unknown family token` roughly ten times a minute, forever, while the
+ * messages sat in the outbound queue showing a single tick. Nothing surfaced
+ * it and the only repair was re-exchanging cards by hand.
+ *
+ * The notice carries the **deposit** credential, never the member token: core's
+ * [encodeRelayUpdateContent] attenuates whatever it is handed, so this file
+ * passes the saved config through unmodified and cannot leak one (CP4).
+ */
+object RelayUpdateSender {
+
+    /**
+     * Fans the current endpoint out to every contact if it has changed since
+     * the last successful announcement.
+     *
+     * Called both at the point of change (immediate) and from app start
+     * (catch-up): a save that happened while the mesh was down, or during a
+     * backup restore, still reaches contacts on the next launch, and the
+     * announced-epoch check makes both paths idempotent.
+     */
+    fun announceIfChanged(context: Context, store: MessageStore, identity: Identity) {
+        val epoch = RelayConfigStore.relayEpoch(context)
+        if (epoch <= RelayConfigStore.announcedRelayEpoch(context)) return
+        queueToAllContacts(context, store, identity, epoch)
+        RelayConfigStore.markRelayEpochAnnounced(context, epoch)
+    }
+
+    fun queueToAllContacts(
+        context: Context,
+        store: MessageStore,
+        identity: Identity,
+        epoch: Long,
+    ) {
+        val relay = RelayConfigStore.load(context)
+        // Blocked contacts get nothing from us — not even endpoint changes.
+        val blocked = store.listBlockedUsers()
+        for (contact in store.listContacts()) {
+            if (blocked.any { it.contentEquals(contact.userId) }) continue
+            queueToContact(store, identity, contact, epoch, relay)
+        }
+    }
+
+    private fun queueToContact(
+        store: MessageStore,
+        identity: Identity,
+        contact: Contact,
+        epoch: Long,
+        relay: RelayConfig?,
+    ) {
+        val timestamp = System.currentTimeMillis()
+        val payload = try {
+            encodeRelayUpdateContent(
+                RelayUpdateContent(
+                    // Only ever our own UserID: core rejects a notice whose
+                    // subject is not the sealing sender, so a third party's
+                    // endpoint can never ride along (endpoint privacy).
+                    subjectUserId = identity.userId,
+                    relayEpoch = epoch,
+                    // Empty when the pass lapsed or was removed — an honest
+                    // "no internet delivery any more", not a no-op.
+                    relayUrl = relay?.relayUrl.orEmpty(),
+                    relayToken = relay?.relayToken.orEmpty(),
+                ),
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Skipping invalid relay update payload", e)
+            return
+        }
+        val authored = try {
+            store.authorPairwiseMessage(
+                identity,
+                contact,
+                KIND_RELAY_UPDATE,
+                payload,
+                null,
+                timestamp,
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Skipping relay update for ${UserIdHex.encode(contact.userId)}", e)
+            return
+        }
+        GossipState.seenIds.record(authored.envelope.msgId)
+        RelaySyncEvents.requestSync()
+
+        if (!MeshRouter.sendToUserId(contact.userId, authored.frame)) {
+            Log.i(
+                TAG,
+                "Queued relay update for ${UserIdHex.encode(contact.userId)}; peer not currently connected",
+            )
+        }
+    }
+}
