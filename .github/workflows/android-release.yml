@@ -156,6 +156,11 @@ jobs:
           # is absent (it is -- gitignored, never in CI). STORE_FILE is resolved
           # relative to android/app/, matching the decode path above.
           CRUISEMESH_RELEASE_STORE_FILE: upload-keystore.jks
+          # build.gradle.kts points AGP's ndkPath here so it can extract the
+          # native symbol tables debugSymbolLevel packages into the AAB.
+          # Without it AGP finds no NDK, logs "Unable to strip", and emits no
+          # symbols -- Play then reports the app has native code and none.
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           CRUISEMESH_RELEASE_STORE_PASSWORD: ${{ secrets.CRUISEMESH_RELEASE_STORE_PASSWORD }}
           CRUISEMESH_RELEASE_KEY_ALIAS: ${{ secrets.CRUISEMESH_RELEASE_KEY_ALIAS }}
           CRUISEMESH_RELEASE_KEY_PASSWORD: ${{ secrets.CRUISEMESH_RELEASE_KEY_PASSWORD }}
