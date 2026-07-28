@@ -157,13 +157,15 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                             onClick = { showAllActivity = !showAllActivity },
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text(
-                                if (showAllActivity) {
-                                    stringResource(R.string.ui_show_less)
-                                } else {
-                                    stringResource(R.string.ui_show_recent_activity, events.size)
-                                },
-                            )
+                            // Resolved before the Text() call: the localization
+                            // gate rejects a conditional inside Text(...) because
+                            // it cannot see that both branches are localized.
+                            val toggleLabel = if (showAllActivity) {
+                                stringResource(R.string.ui_show_less)
+                            } else {
+                                stringResource(R.string.ui_show_recent_activity, events.size)
+                            }
+                            Text(toggleLabel)
                         }
                     }
                 }
@@ -178,11 +180,13 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(stringResource(R.string.ui_diagnostic_logging))
                         Text(
-                            if (DebugFileLog.isDebuggableBuild(context)) {
-                                stringResource(R.string.ui_diagnostic_logging_always_on)
-                            } else {
-                                stringResource(R.string.ui_diagnostic_logging_tester_desc)
-                            },
+                            stringResource(
+                                if (DebugFileLog.isDebuggableBuild(context)) {
+                                    R.string.ui_diagnostic_logging_always_on
+                                } else {
+                                    R.string.ui_diagnostic_logging_tester_desc
+                                },
+                            ),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

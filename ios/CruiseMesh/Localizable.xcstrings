@@ -581,6 +581,16 @@
         }
       }
     },
+    "Diagnostic logging": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostic logging"
+          }
+        }
+      }
+    },
     "Diagnostics": {
       "localizations": {
         "en": {
@@ -1901,6 +1911,16 @@
         }
       }
     },
+    "Show less": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Show less"
+          }
+        }
+      }
+    },
     "Show my friend card": {
       "localizations": {
         "en": {
@@ -2187,6 +2207,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Try again"
+          }
+        }
+      }
+    },
+    "Turn this on before testing to keep connection and delivery diagnostics across app restarts. Message content is never recorded.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turn this on before testing to keep connection and delivery diagnostics across app restarts. Message content is never recorded."
           }
         }
       }
