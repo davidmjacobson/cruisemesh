@@ -14,6 +14,7 @@ internal const val KIND_PROFILE_SYNC: UByte = 5u
 internal const val KIND_FRIEND_DIRECTORY: UByte = 6u
 internal const val KIND_INTRODUCED_FRIEND_REQUEST: UByte = 7u
 internal const val KIND_LAN_ENDPOINT_HINT: UByte = 8u
+internal const val KIND_RELAY_UPDATE: UByte = 9u
 internal const val KIND_GROUP_METADATA_UPDATE: UByte = 19u
 
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */

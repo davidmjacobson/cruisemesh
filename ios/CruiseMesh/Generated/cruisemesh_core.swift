@@ -911,10 +911,21 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
     func onHello2(address: String, userId: Data, capabilities: UInt32)  -> Bool
     
     /**
-     * Whether this peer advertised [`crate::protocol::CAP_ACKS_HIDDEN_KINDS`].
+     * Whether this peer advertised every capability bit that covers a
+     * hidden spray kind ([`crate::protocol::core_is_hidden_spray_kind`]).
      * `false` for pre-HELLO2 builds — they process hidden kinds fine but
      * never advance their DELIVERED watermark past them, so re-sprays toward
      * them are bounded to once per session instead of every digest.
+     *
+     * T23 made this an *all* bits test rather than a single-bit one. A build
+     * that predates kind 9 truthfully advertises `CAP_ACKS_HIDDEN_KINDS` and
+     * still drops a relay-change notice unhandled, so bit 1 alone no longer
+     * answers "will this peer's watermark advance past every hidden kind I
+     * might spray". Treating such a peer as not-fully-capable costs it the
+     * once-per-session bound on kinds 3/5/6/7 too — the same conservative
+     * path a pre-HELLO2 peer already takes, and the safe direction to err in:
+     * the envelope is still offered on every fresh link session, and the
+     * direct and relay paths are untouched.
      */
     func peerAcksHiddenKinds(address: String)  -> Bool
     
@@ -1076,10 +1087,21 @@ open func onHello2(address: String, userId: Data, capabilities: UInt32) -> Bool 
 }
     
     /**
-     * Whether this peer advertised [`crate::protocol::CAP_ACKS_HIDDEN_KINDS`].
+     * Whether this peer advertised every capability bit that covers a
+     * hidden spray kind ([`crate::protocol::core_is_hidden_spray_kind`]).
      * `false` for pre-HELLO2 builds — they process hidden kinds fine but
      * never advance their DELIVERED watermark past them, so re-sprays toward
      * them are bounded to once per session instead of every digest.
+     *
+     * T23 made this an *all* bits test rather than a single-bit one. A build
+     * that predates kind 9 truthfully advertises `CAP_ACKS_HIDDEN_KINDS` and
+     * still drops a relay-change notice unhandled, so bit 1 alone no longer
+     * answers "will this peer's watermark advance past every hidden kind I
+     * might spray". Treating such a peer as not-fully-capable costs it the
+     * once-per-session bound on kinds 3/5/6/7 too — the same conservative
+     * path a pre-HELLO2 peer already takes, and the safe direction to err in:
+     * the envelope is still offered on every fresh link session, and the
+     * direct and relay paths are untouched.
      */
 open func peerAcksHiddenKinds(address: String) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -1623,6 +1645,34 @@ public func FfiConverterTypeLanNoiseSession_lower(_ value: LanNoiseSession) -> U
 public protocol MessageStoreProtocol : AnyObject {
     
     /**
+     * T23: apply a contact's relay-change notice to their stored endpoint.
+     *
+     * Three rules, all enforced here rather than in either shell, because
+     * getting any of them wrong in one platform's copy is exactly the class
+     * of bug `core-first` exists to prevent:
+     *
+     * 1. **Sender scoping.** `sender_user_id` is the identity that *sealed*
+     * the envelope, as verified by [`crate::open_message`]. A notice may
+     * only move its own sender's endpoint; one claiming a different
+     * `subject_user_id` is rejected outright. Pairwise sealing already
+     * makes forging someone else's notice hard, but "hard" is not the
+     * invariant CLAUDE.md states — a device never publishes, forwards, or
+     * accepts a *third party's* endpoint, full stop.
+     * 2. **Deposit-class only** (CP4), re-checked independently of the
+     * decoder so a future caller cannot route around it.
+     * 3. **Monotonic epochs**, the same "apply only if newer" discipline as
+     * [`MessageStore::set_contact_avatar`]. Sideband traffic reorders
+     * freely over DTN and replays cheaply off a relay, so a notice that
+     * is not strictly newer than what is stored must never regress an
+     * endpoint that already got repaired.
+     *
+     * Returns whether the contact's endpoint actually moved. `false` covers
+     * both "not a contact" and "we already hold this or newer" — neither is
+     * an error, both are ordinary outcomes of a spray/replay.
+     */
+    func applyContactRelayUpdate(senderUserId: Data, content: RelayUpdateContent) throws  -> Bool
+    
+    /**
      * Atomically replace all suggestions supplied by one introducer. The
      * directory's tickets are checked here so both mobile shells share the
      * same fail-closed behavior.
@@ -1764,6 +1814,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * carries upload via any member's relay config).
      */
     func contactMatchingHint(hint: Data, nowMs: Int64) throws  -> Contact?
+    
+    /**
+     * The newest relay-change epoch applied for a contact (T23). 0 means no
+     * notice has ever been applied — their endpoint is still whatever their
+     * friend card carried.
+     */
+    func contactRelayEpoch(userId: Data) throws  -> Int64
     
     /**
      * Confirm-before-delete muling (DTN_TODOS.md §3.2, D2
@@ -2604,6 +2661,41 @@ public static func `open`(path: String)throws  -> MessageStore {
 
     
     /**
+     * T23: apply a contact's relay-change notice to their stored endpoint.
+     *
+     * Three rules, all enforced here rather than in either shell, because
+     * getting any of them wrong in one platform's copy is exactly the class
+     * of bug `core-first` exists to prevent:
+     *
+     * 1. **Sender scoping.** `sender_user_id` is the identity that *sealed*
+     * the envelope, as verified by [`crate::open_message`]. A notice may
+     * only move its own sender's endpoint; one claiming a different
+     * `subject_user_id` is rejected outright. Pairwise sealing already
+     * makes forging someone else's notice hard, but "hard" is not the
+     * invariant CLAUDE.md states — a device never publishes, forwards, or
+     * accepts a *third party's* endpoint, full stop.
+     * 2. **Deposit-class only** (CP4), re-checked independently of the
+     * decoder so a future caller cannot route around it.
+     * 3. **Monotonic epochs**, the same "apply only if newer" discipline as
+     * [`MessageStore::set_contact_avatar`]. Sideband traffic reorders
+     * freely over DTN and replays cheaply off a relay, so a notice that
+     * is not strictly newer than what is stored must never regress an
+     * endpoint that already got repaired.
+     *
+     * Returns whether the contact's endpoint actually moved. `false` covers
+     * both "not a contact" and "we already hold this or newer" — neither is
+     * an error, both are ordinary outcomes of a spray/replay.
+     */
+open func applyContactRelayUpdate(senderUserId: Data, content: RelayUpdateContent)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_apply_contact_relay_update(self.uniffiClonePointer(),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterTypeRelayUpdateContent.lower(content),$0
+    )
+})
+}
+    
+    /**
      * Atomically replace all suggestions supplied by one introducer. The
      * directory's tickets are checked here so both mobile shells share the
      * same fail-closed behavior.
@@ -2889,6 +2981,19 @@ open func contactMatchingHint(hint: Data, nowMs: Int64)throws  -> Contact? {
     uniffi_cruisemesh_core_fn_method_messagestore_contact_matching_hint(self.uniffiClonePointer(),
         FfiConverterData.lower(hint),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * The newest relay-change epoch applied for a contact (T23). 0 means no
+     * notice has ever been applied — their endpoint is still whatever their
+     * friend card carried.
+     */
+open func contactRelayEpoch(userId: Data)throws  -> Int64 {
+    return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_contact_relay_epoch(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
     )
 })
 }
@@ -8889,6 +8994,105 @@ public func FfiConverterTypeRelaySetup_lower(_ value: RelaySetup) -> RustBuffer 
 
 
 /**
+ * The decoded form of a relay-change notice's `content` (a `MessageBody`
+ * with `kind = KIND_RELAY_UPDATE`, T23).
+ *
+ * `subject_user_id` is the UserID whose endpoint this notice claims to
+ * change. It is always the sender's own: sealing already guarantees that,
+ * but carrying it explicitly makes
+ * [`crate::MessageStore::apply_contact_relay_update`] able to *reject* a
+ * mis-scoped notice instead of trusting whichever id its caller happened to
+ * pass. Endpoint privacy (CLAUDE.md) means a device announces only its own
+ * endpoint and never forwards a third party's; this field is what lets core
+ * enforce that rather than assume it.
+ *
+ * `relay_token` is always a **deposit-class** credential (CP4). Empty
+ * `relay_url` *and* `relay_token` mean "I no longer have internet delivery"
+ * — an honest downgrade to nearby-only, not a no-op.
+ */
+public struct RelayUpdateContent {
+    public var subjectUserId: Data
+    public var relayEpoch: Int64
+    public var relayUrl: String
+    public var relayToken: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(subjectUserId: Data, relayEpoch: Int64, relayUrl: String, relayToken: String) {
+        self.subjectUserId = subjectUserId
+        self.relayEpoch = relayEpoch
+        self.relayUrl = relayUrl
+        self.relayToken = relayToken
+    }
+}
+
+
+
+extension RelayUpdateContent: Equatable, Hashable {
+    public static func ==(lhs: RelayUpdateContent, rhs: RelayUpdateContent) -> Bool {
+        if lhs.subjectUserId != rhs.subjectUserId {
+            return false
+        }
+        if lhs.relayEpoch != rhs.relayEpoch {
+            return false
+        }
+        if lhs.relayUrl != rhs.relayUrl {
+            return false
+        }
+        if lhs.relayToken != rhs.relayToken {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(subjectUserId)
+        hasher.combine(relayEpoch)
+        hasher.combine(relayUrl)
+        hasher.combine(relayToken)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRelayUpdateContent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayUpdateContent {
+        return
+            try RelayUpdateContent(
+                subjectUserId: FfiConverterData.read(from: &buf), 
+                relayEpoch: FfiConverterInt64.read(from: &buf), 
+                relayUrl: FfiConverterString.read(from: &buf), 
+                relayToken: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RelayUpdateContent, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.subjectUserId, into: &buf)
+        FfiConverterInt64.write(value.relayEpoch, into: &buf)
+        FfiConverterString.write(value.relayUrl, into: &buf)
+        FfiConverterString.write(value.relayToken, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayUpdateContent_lift(_ buf: RustBuffer) throws -> RelayUpdateContent {
+    return try FfiConverterTypeRelayUpdateContent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayUpdateContent_lower(_ value: RelayUpdateContent) -> RustBuffer {
+    return FfiConverterTypeRelayUpdateContent.lower(value)
+}
+
+
+/**
  * One stored message body (DESIGN.md §7.1). `timestamp` is milliseconds
  * since the Unix epoch; `kind` matches the DESIGN.md §7.1 `kind` byte
  * (text=1, receipt=2, friend-request=3, group-invite=4, ...).
@@ -12314,6 +12518,22 @@ public func decodeReceiptContent(bytes: Data)throws  -> ReceiptContent {
 })
 }
 /**
+ * Decode a [`RelayUpdateContent`] from its wire form.
+ *
+ * Rejects a member-class credential outright. Nothing in the field emits
+ * kind 9 yet, so there is no legacy sender to stay compatible with, and
+ * making the decoder refuse the member class means no relay-change notice
+ * — however malformed, replayed, or hostile the sender — can ever install a
+ * fetch/ack-capable credential for a contact.
+ */
+public func decodeRelayUpdateContent(bytes: Data)throws  -> RelayUpdateContent {
+    return try  FfiConverterTypeRelayUpdateContent.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_decode_relay_update_content(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
  * Order-preserving content dedupe: a contact hint can coincide with a group
  * hint (or another contact's) on the same day; there's no reason to fetch
  * the same relay page twice.
@@ -12560,6 +12780,32 @@ public func encodeReceiptContent(content: ReceiptContent)throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_encode_receipt_content(
         FfiConverterTypeReceiptContent.lower(content),$0
+    )
+})
+}
+/**
+ * Encode a [`RelayUpdateContent`] to its wire form.
+ *
+ * The credential is attenuated here, unconditionally, with
+ * [`relay_deposit_token_for`] — callers hand over whatever their relay
+ * config holds (normally the family's **member** token) and the deposit
+ * form is what reaches the wire. Doing it in the encoder rather than
+ * asking every call site to remember is the whole point: CP4 exists to keep
+ * member tokens off anything a contact receives, and a member token
+ * broadcast to every contact would re-open exactly the hole CP4 closed (a
+ * member credential can fetch *and ack* — i.e. delete — a family's mail).
+ * The derivation is idempotent, so a caller that already attenuated is
+ * unaffected.
+ *
+ * A half-configured endpoint (url without token, or the reverse) is not a
+ * usable endpoint — [`crate::relay_wire::resolved_contact_relay`] would
+ * discard it anyway — so it is normalized to the "no internet delivery"
+ * form rather than emitted as a partial update.
+ */
+public func encodeRelayUpdateContent(content: RelayUpdateContent)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_encode_relay_update_content(
+        FfiConverterTypeRelayUpdateContent.lower(content),$0
     )
 })
 }
@@ -13366,6 +13612,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_decode_receipt_content() != 40419) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_decode_relay_update_content() != 51666) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_dedupe_hints() != 40661) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13430,6 +13679,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_receipt_content() != 20486) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_encode_relay_update_content() != 19215) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_transport_probe() != 39450) {
@@ -13630,7 +13882,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_hello2() != 17439) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_peer_acks_hidden_kinds() != 60478) {
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_peer_acks_hidden_kinds() != 45296) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_record_hidden_offered() != 41551) {
@@ -13685,6 +13937,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_write_handshake_message() != 61679) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 21099) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_friend_directory() != 32757) {
@@ -13745,6 +14000,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_matching_hint() != 11008) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_relay_epoch() != 12666) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 38296) {

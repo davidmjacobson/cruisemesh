@@ -12,7 +12,7 @@ use crate::{
     MessageOrigin, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
     KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
     KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION,
-    KIND_RECEIPT, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+    KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
 };
 
 /// Exact carried+recently-held `msg_id` count advertised in one outgoing
@@ -97,6 +97,7 @@ pub fn core_pairwise_sender_authorized(
             | KIND_FRIEND_DIRECTORY
             | KIND_INTRODUCED_FRIEND_REQUEST
             | KIND_LAN_ENDPOINT_HINT
+            | KIND_RELAY_UPDATE
             | KIND_ATTACHMENT_MANIFEST
             | KIND_REACTION
     );

@@ -113,7 +113,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::groups::{canonicalize_members, validate_group};
 use crate::{
     verify_introduction_ticket, CoreError, FriendDirectoryContent, Group, IntroductionTicket,
-    SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST,
+    RelayUpdateContent, SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST,
 };
 
 /// FC6: recover from mutex poisoning instead of propagating it as a panic.
@@ -395,6 +395,12 @@ impl MessageStore {
         ensure_contact_column(&conn, "avatar", "BLOB")?;
         ensure_contact_column(&conn, "avatar_epoch", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_contact_column(&conn, "nickname", "TEXT")?;
+        // T23 relay-change propagation: the monotonic epoch of the newest
+        // relay endpoint applied for this contact. Older stores predate it,
+        // and 0 is the right default -- any notice a contact sends carries a
+        // wall-clock-seeded epoch well above it, so the first notice after an
+        // upgrade always applies.
+        ensure_contact_column(&conn, "relay_epoch", "INTEGER NOT NULL DEFAULT 0")?;
         // Relay proxy-polling (see enqueue_relay_carried_envelope): marks a
         // carried envelope as one we pulled FROM the relay rather than one we
         // received over BLE, so the relay-upload query can skip re-uploading
@@ -1996,6 +2002,74 @@ impl MessageStore {
             )
             .map_err(store_err)?;
         Ok(changed > 0)
+    }
+
+    /// T23: apply a contact's relay-change notice to their stored endpoint.
+    ///
+    /// Three rules, all enforced here rather than in either shell, because
+    /// getting any of them wrong in one platform's copy is exactly the class
+    /// of bug `core-first` exists to prevent:
+    ///
+    /// 1. **Sender scoping.** `sender_user_id` is the identity that *sealed*
+    ///    the envelope, as verified by [`crate::open_message`]. A notice may
+    ///    only move its own sender's endpoint; one claiming a different
+    ///    `subject_user_id` is rejected outright. Pairwise sealing already
+    ///    makes forging someone else's notice hard, but "hard" is not the
+    ///    invariant CLAUDE.md states — a device never publishes, forwards, or
+    ///    accepts a *third party's* endpoint, full stop.
+    /// 2. **Deposit-class only** (CP4), re-checked independently of the
+    ///    decoder so a future caller cannot route around it.
+    /// 3. **Monotonic epochs**, the same "apply only if newer" discipline as
+    ///    [`MessageStore::set_contact_avatar`]. Sideband traffic reorders
+    ///    freely over DTN and replays cheaply off a relay, so a notice that
+    ///    is not strictly newer than what is stored must never regress an
+    ///    endpoint that already got repaired.
+    ///
+    /// Returns whether the contact's endpoint actually moved. `false` covers
+    /// both "not a contact" and "we already hold this or newer" — neither is
+    /// an error, both are ordinary outcomes of a spray/replay.
+    pub fn apply_contact_relay_update(
+        &self,
+        sender_user_id: Vec<u8>,
+        content: RelayUpdateContent,
+    ) -> Result<bool, CoreError> {
+        if content.subject_user_id != sender_user_id {
+            return Err(CoreError::Malformed(
+                "relay update may only change the sending contact's own endpoint".into(),
+            ));
+        }
+        crate::protocol::validate_relay_update_credential(
+            &content.relay_url,
+            &content.relay_token,
+        )?;
+        let url = (!content.relay_url.is_empty()).then_some(content.relay_url);
+        let token = (!content.relay_token.is_empty()).then_some(content.relay_token);
+        let conn = lock_conn(&self.conn);
+        let changed = conn
+            .execute(
+                "UPDATE contacts
+                 SET relay_url = ?2, relay_token = ?3, relay_epoch = ?4
+                 WHERE user_id = ?1 AND ?4 > relay_epoch",
+                params![sender_user_id, url, token, content.relay_epoch],
+            )
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
+    /// The newest relay-change epoch applied for a contact (T23). 0 means no
+    /// notice has ever been applied — their endpoint is still whatever their
+    /// friend card carried.
+    pub fn contact_relay_epoch(&self, user_id: Vec<u8>) -> Result<i64, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let epoch: Option<i64> = conn
+            .query_row(
+                "SELECT relay_epoch FROM contacts WHERE user_id = ?1",
+                params![user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(epoch.unwrap_or(0))
     }
 
     /// Set (or clear) the local nickname for a contact (T16). A `None` or
@@ -3740,7 +3814,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     relay_token TEXT,
     avatar BLOB,
     avatar_epoch INTEGER NOT NULL DEFAULT 0,
-    nickname TEXT
+    nickname TEXT,
+    relay_epoch INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS contact_discovery_policy (
@@ -5772,6 +5847,178 @@ mod tests {
         let contacts = store.list_contacts().unwrap();
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].name, "Alice R.");
+    }
+
+    // -- T23 relay-change propagation -----------------------------------
+
+    fn relay_notice(subject: &[u8], epoch: i64, url: &str) -> RelayUpdateContent {
+        RelayUpdateContent {
+            subject_user_id: subject.to_vec(),
+            relay_epoch: epoch,
+            relay_url: url.to_string(),
+            relay_token: crate::relay_deposit_token_for("their-member-token".to_string()),
+        }
+    }
+
+    #[test]
+    fn relay_update_repairs_a_stale_endpoint() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut alice = contact(b"alice-id", "Alice");
+        alice.relay_url = Some("https://retired.relay.example".to_string());
+        alice.relay_token = Some("cmdep1-stale".to_string());
+        store.upsert_contact(alice).unwrap();
+        assert_eq!(store.contact_relay_epoch(b"alice-id".to_vec()).unwrap(), 0);
+
+        let notice = relay_notice(b"alice-id", 100, "https://new.relay.example");
+        assert!(store
+            .apply_contact_relay_update(b"alice-id".to_vec(), notice.clone())
+            .unwrap());
+
+        let stored = store.get_contact(b"alice-id".to_vec()).unwrap().unwrap();
+        assert_eq!(
+            stored.relay_url.as_deref(),
+            Some("https://new.relay.example")
+        );
+        assert_eq!(stored.relay_token, Some(notice.relay_token));
+        assert_eq!(
+            store.contact_relay_epoch(b"alice-id".to_vec()).unwrap(),
+            100
+        );
+    }
+
+    /// Sideband traffic reorders freely over DTN and replays cheaply off a
+    /// relay. A notice that is not strictly newer must never walk a repaired
+    /// endpoint back to a dead one.
+    #[test]
+    fn relay_update_epochs_are_monotonic() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+
+        assert!(store
+            .apply_contact_relay_update(
+                b"alice-id".to_vec(),
+                relay_notice(b"alice-id", 200, "https://current.relay.example")
+            )
+            .unwrap());
+
+        for stale_epoch in [199, 200, 0, -5] {
+            assert!(
+                !store
+                    .apply_contact_relay_update(
+                        b"alice-id".to_vec(),
+                        relay_notice(b"alice-id", stale_epoch, "https://retired.relay.example")
+                    )
+                    .unwrap(),
+                "epoch {stale_epoch} was applied over 200"
+            );
+            let stored = store.get_contact(b"alice-id".to_vec()).unwrap().unwrap();
+            assert_eq!(
+                stored.relay_url.as_deref(),
+                Some("https://current.relay.example")
+            );
+            assert_eq!(
+                store.contact_relay_epoch(b"alice-id".to_vec()).unwrap(),
+                200
+            );
+        }
+
+        // Strictly newer still applies.
+        assert!(store
+            .apply_contact_relay_update(
+                b"alice-id".to_vec(),
+                relay_notice(b"alice-id", 201, "https://newer.relay.example")
+            )
+            .unwrap());
+    }
+
+    /// Endpoint privacy (CLAUDE.md): a device never accepts a *third party's*
+    /// endpoint from anyone. Sealing makes forging Bob's notice hard, but the
+    /// invariant is enforced, not assumed -- and this also catches a shell
+    /// that passes the wrong user id into the applier.
+    #[test]
+    fn relay_update_cannot_change_a_third_party() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        let mut bob = contact(b"bob-id", "Bob");
+        bob.relay_url = Some("https://bob.relay.example".to_string());
+        bob.relay_token = Some("cmdep1-bob".to_string());
+        store.upsert_contact(bob).unwrap();
+
+        // Alice seals a notice that claims to move Bob's endpoint.
+        let err = store
+            .apply_contact_relay_update(
+                b"alice-id".to_vec(),
+                relay_notice(b"bob-id", 500, "https://attacker.relay.example"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+
+        for user in [&b"bob-id"[..], &b"alice-id"[..]] {
+            let stored = store.get_contact(user.to_vec()).unwrap().unwrap();
+            assert_ne!(
+                stored.relay_url.as_deref(),
+                Some("https://attacker.relay.example")
+            );
+            assert_eq!(store.contact_relay_epoch(user.to_vec()).unwrap(), 0);
+        }
+    }
+
+    /// CP4, re-checked in the store so a caller that skipped the decoder
+    /// cannot install a fetch/ack-capable credential for a contact.
+    #[test]
+    fn relay_update_refuses_a_member_class_credential() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        let mut notice = relay_notice(b"alice-id", 10, "https://new.relay.example");
+        notice.relay_token = "their-member-token".to_string();
+        assert!(store
+            .apply_contact_relay_update(b"alice-id".to_vec(), notice)
+            .is_err());
+
+        // A half-configured endpoint is refused for the same reason: it is
+        // neither a usable endpoint nor an honest "no internet delivery".
+        let mut partial = relay_notice(b"alice-id", 10, "https://new.relay.example");
+        partial.relay_token = String::new();
+        assert!(store
+            .apply_contact_relay_update(b"alice-id".to_vec(), partial)
+            .is_err());
+    }
+
+    #[test]
+    fn relay_update_can_clear_an_endpoint_and_skips_unknown_contacts() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut alice = contact(b"alice-id", "Alice");
+        alice.relay_url = Some("https://old.relay.example".to_string());
+        alice.relay_token = Some("cmdep1-old".to_string());
+        store.upsert_contact(alice).unwrap();
+
+        // "My pass lapsed": propagating the clear is what stops contacts
+        // posting into a mailbox that no longer accepts their mail.
+        let cleared = RelayUpdateContent {
+            subject_user_id: b"alice-id".to_vec(),
+            relay_epoch: 7,
+            relay_url: String::new(),
+            relay_token: String::new(),
+        };
+        assert!(store
+            .apply_contact_relay_update(b"alice-id".to_vec(), cleared)
+            .unwrap());
+        let stored = store.get_contact(b"alice-id".to_vec()).unwrap().unwrap();
+        assert_eq!(stored.relay_url, None);
+        assert_eq!(stored.relay_token, None);
+
+        // A notice from somebody who is not a contact is an ordinary no-op,
+        // not an error: sprays and relay replays produce these routinely.
+        assert!(!store
+            .apply_contact_relay_update(
+                b"stranger-id".to_vec(),
+                relay_notice(b"stranger-id", 9, "https://stranger.relay.example")
+            )
+            .unwrap());
+        assert_eq!(
+            store.contact_relay_epoch(b"stranger-id".to_vec()).unwrap(),
+            0
+        );
     }
 
     #[test]

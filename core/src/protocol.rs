@@ -264,6 +264,13 @@ pub const KIND_FRIEND_DIRECTORY: u8 = 6;
 pub const KIND_INTRODUCED_FRIEND_REQUEST: u8 = 7;
 /// Encrypted, short-lived same-LAN endpoint candidate for an accepted contact.
 pub const KIND_LAN_ENDPOINT_HINT: u8 = 8;
+/// T23: the sender's own relay endpoint changed. A friend card is a snapshot
+/// of the sharer's relay config at share time, so a contact who buys a Cruise
+/// Pass, rotates a token, or migrates servers leaves every peer posting to a
+/// dead mailbox forever. This kind is the repair path: newest epoch wins,
+/// scoped to the sealing sender, and it carries a *deposit*-class credential
+/// only (CP4). Hidden from chat history.
+pub const KIND_RELAY_UPDATE: u8 = 9;
 /// `MessageBody.kind` value for an attachment manifest (DESIGN.md §7.1
 /// reserved, §8). Android currently embeds the media blob inline in the
 /// manifest payload for BLE/relay-friendly sizes; `KIND_ATTACHMENT_CHUNK`
@@ -309,11 +316,24 @@ const HELLO2_USER_ID_LEN: usize = 16;
 /// this behavior, but future capabilities get their own bits.
 pub const CAP_ACKS_HIDDEN_KINDS: u32 = 1;
 
+/// Capability bit (T23): this client understands [`KIND_RELAY_UPDATE`] and
+/// stores it as a `messages` row on receipt, so its DELIVERED watermark
+/// advances past a relay-change notice.
+///
+/// This needs its own bit rather than riding [`CAP_ACKS_HIDDEN_KINDS`]
+/// because that bit enumerates a *fixed* set of kinds (3/5/6/7). A build
+/// that predates kind 9 still advertises `CAP_ACKS_HIDDEN_KINDS` truthfully
+/// and still drops kind 9 at its `unhandled kind` arm — so trusting bit 1
+/// alone would let the spray plan re-offer a relay-change notice on every
+/// digest for the envelope's full 7-day expiry, which is precisely the
+/// mixed-version resend chatter HELLO2 was introduced to end.
+pub const CAP_RELAY_UPDATE: u32 = 1 << 1;
+
 /// The capability bits this build advertises in HELLO2. Both shells call
 /// this instead of hardcoding bits so they can never disagree with core.
 #[uniffi::export]
 pub fn core_own_capabilities() -> u32 {
-    CAP_ACKS_HIDDEN_KINDS
+    CAP_ACKS_HIDDEN_KINDS | CAP_RELAY_UPDATE
 }
 
 /// The sideband kinds that ride `outbound_envelopes` with a `msg_id = NULL`
@@ -329,6 +349,7 @@ pub fn core_is_hidden_spray_kind(kind: u8) -> bool {
             | KIND_PROFILE_SYNC
             | KIND_FRIEND_DIRECTORY
             | KIND_INTRODUCED_FRIEND_REQUEST
+            | KIND_RELAY_UPDATE
     )
 }
 
@@ -347,6 +368,10 @@ pub const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 const PROFILE_SYNC_VERSION: u8 = 2;
 const PROFILE_SYNC_MAX_AVATAR_BYTES: usize = 64 * 1024;
 const PROFILE_SYNC_MAX_NAME_BYTES: usize = 128;
+const RELAY_UPDATE_VERSION: u8 = 1;
+const RELAY_UPDATE_MAX_URL_BYTES: usize = 512;
+const RELAY_UPDATE_MAX_TOKEN_BYTES: usize = 256;
+const RELAY_UPDATE_MAX_SUBJECT_BYTES: usize = 64;
 const FRIEND_DIRECTORY_VERSION: u8 = 1;
 const INTRODUCED_FRIEND_REQUEST_VERSION: u8 = 1;
 const LAN_ENDPOINT_CONTENT_VERSION: u8 = 1;
@@ -497,6 +522,29 @@ pub struct ProfileSyncContent {
     pub friends_of_friends_revision: u64,
 }
 
+/// The decoded form of a relay-change notice's `content` (a `MessageBody`
+/// with `kind = KIND_RELAY_UPDATE`, T23).
+///
+/// `subject_user_id` is the UserID whose endpoint this notice claims to
+/// change. It is always the sender's own: sealing already guarantees that,
+/// but carrying it explicitly makes
+/// [`crate::MessageStore::apply_contact_relay_update`] able to *reject* a
+/// mis-scoped notice instead of trusting whichever id its caller happened to
+/// pass. Endpoint privacy (CLAUDE.md) means a device announces only its own
+/// endpoint and never forwards a third party's; this field is what lets core
+/// enforce that rather than assume it.
+///
+/// `relay_token` is always a **deposit-class** credential (CP4). Empty
+/// `relay_url` *and* `relay_token` mean "I no longer have internet delivery"
+/// — an honest downgrade to nearby-only, not a no-op.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct RelayUpdateContent {
+    pub subject_user_id: Vec<u8>,
+    pub relay_epoch: i64,
+    pub relay_url: String,
+    pub relay_token: String,
+}
+
 /// Public identity forwarded by a mutual friend. Relay credentials and avatar
 /// bytes are deliberately absent.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -552,6 +600,131 @@ pub struct LanEndpointContent {
     pub host: String,
     pub port: u16,
     pub expires_at_ms: i64,
+}
+
+/// Encode a [`RelayUpdateContent`] to its wire form.
+///
+/// The credential is attenuated here, unconditionally, with
+/// [`relay_deposit_token_for`] — callers hand over whatever their relay
+/// config holds (normally the family's **member** token) and the deposit
+/// form is what reaches the wire. Doing it in the encoder rather than
+/// asking every call site to remember is the whole point: CP4 exists to keep
+/// member tokens off anything a contact receives, and a member token
+/// broadcast to every contact would re-open exactly the hole CP4 closed (a
+/// member credential can fetch *and ack* — i.e. delete — a family's mail).
+/// The derivation is idempotent, so a caller that already attenuated is
+/// unaffected.
+///
+/// A half-configured endpoint (url without token, or the reverse) is not a
+/// usable endpoint — [`crate::relay_wire::resolved_contact_relay`] would
+/// discard it anyway — so it is normalized to the "no internet delivery"
+/// form rather than emitted as a partial update.
+#[uniffi::export]
+pub fn encode_relay_update_content(content: RelayUpdateContent) -> Result<Vec<u8>, CoreError> {
+    if content.subject_user_id.is_empty()
+        || content.subject_user_id.len() > RELAY_UPDATE_MAX_SUBJECT_BYTES
+    {
+        return Err(CoreError::Malformed(
+            "relay update subject user id is out of range".into(),
+        ));
+    }
+    let url = crate::relay_wire::normalize_relay_url(content.relay_url);
+    let token = crate::relay_wire::relay_deposit_token_for(content.relay_token);
+    let (url, token) = if url.is_empty() || token.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (url, token)
+    };
+    if url.len() > RELAY_UPDATE_MAX_URL_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "relay update url exceeds {RELAY_UPDATE_MAX_URL_BYTES} bytes"
+        )));
+    }
+    if token.len() > RELAY_UPDATE_MAX_TOKEN_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "relay update token exceeds {RELAY_UPDATE_MAX_TOKEN_BYTES} bytes"
+        )));
+    }
+    let mut out = Vec::with_capacity(1 + 2 + content.subject_user_id.len() + 8 + 4 + url.len() + 2);
+    out.push(RELAY_UPDATE_VERSION);
+    write_bytes16(&mut out, &content.subject_user_id);
+    out.extend_from_slice(&content.relay_epoch.to_be_bytes());
+    write_bytes16(&mut out, url.as_bytes());
+    write_bytes16(&mut out, token.as_bytes());
+    Ok(out)
+}
+
+/// Decode a [`RelayUpdateContent`] from its wire form.
+///
+/// Rejects a member-class credential outright. Nothing in the field emits
+/// kind 9 yet, so there is no legacy sender to stay compatible with, and
+/// making the decoder refuse the member class means no relay-change notice
+/// — however malformed, replayed, or hostile the sender — can ever install a
+/// fetch/ack-capable credential for a contact.
+#[uniffi::export]
+pub fn decode_relay_update_content(bytes: Vec<u8>) -> Result<RelayUpdateContent, CoreError> {
+    let mut cursor = Cursor::new(&bytes);
+    let version = cursor.take_u8()?;
+    if version != RELAY_UPDATE_VERSION {
+        return Err(CoreError::Malformed(format!(
+            "unknown relay-update version: {version}"
+        )));
+    }
+    let subject_user_id = cursor.take_bytes16()?;
+    if subject_user_id.is_empty() || subject_user_id.len() > RELAY_UPDATE_MAX_SUBJECT_BYTES {
+        return Err(CoreError::Malformed(
+            "relay update subject user id is out of range".into(),
+        ));
+    }
+    let relay_epoch = cursor.take_i64()?;
+    let url_bytes = cursor.take_bytes16()?;
+    if url_bytes.len() > RELAY_UPDATE_MAX_URL_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "relay update url exceeds {RELAY_UPDATE_MAX_URL_BYTES} bytes"
+        )));
+    }
+    let token_bytes = cursor.take_bytes16()?;
+    if token_bytes.len() > RELAY_UPDATE_MAX_TOKEN_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "relay update token exceeds {RELAY_UPDATE_MAX_TOKEN_BYTES} bytes"
+        )));
+    }
+    cursor.finish()?;
+    let relay_url =
+        String::from_utf8(url_bytes).map_err(|e| CoreError::Malformed(e.to_string()))?;
+    let relay_token =
+        String::from_utf8(token_bytes).map_err(|e| CoreError::Malformed(e.to_string()))?;
+    validate_relay_update_credential(&relay_url, &relay_token)?;
+    Ok(RelayUpdateContent {
+        subject_user_id,
+        relay_epoch,
+        relay_url,
+        relay_token,
+    })
+}
+
+/// CP4 gate shared by the decoder and
+/// [`crate::MessageStore::apply_contact_relay_update`]: a relay-change notice
+/// carries either no endpoint at all, or a complete one whose credential is
+/// deposit-class. Checked twice on purpose — the store must not depend on its
+/// caller having gone through the decoder.
+pub(crate) fn validate_relay_update_credential(
+    relay_url: &str,
+    relay_token: &str,
+) -> Result<(), CoreError> {
+    if relay_url.is_empty() != relay_token.is_empty() {
+        return Err(CoreError::Malformed(
+            "relay update must carry both a url and a token, or neither".into(),
+        ));
+    }
+    if !relay_token.is_empty()
+        && !crate::relay_wire::relay_token_is_deposit(relay_token.to_string())
+    {
+        return Err(CoreError::Malformed(
+            "relay update credential must be deposit-class".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Encode a [`ReceiptContent`] to its wire form (see module docs for layout).
@@ -1741,6 +1914,186 @@ mod tests {
         }
     }
 
+    // -- T23 relay-change notices (kind 9) ------------------------------
+
+    const MEMBER_TOKEN: &str = "family-member-token-abc123";
+
+    fn sample_relay_update() -> RelayUpdateContent {
+        RelayUpdateContent {
+            subject_user_id: b"alice-user-id-16".to_vec(),
+            relay_epoch: 1_700_000_123_456,
+            relay_url: "https://new.relay.example".to_string(),
+            relay_token: crate::relay_wire::relay_deposit_token_for(MEMBER_TOKEN.to_string()),
+        }
+    }
+
+    #[test]
+    fn relay_update_content_round_trips() {
+        let content = sample_relay_update();
+        let encoded = encode_relay_update_content(content.clone()).unwrap();
+        let decoded = decode_relay_update_content(encoded).expect("decodes");
+        assert_eq!(decoded, content);
+    }
+
+    /// CP4's whole point: a member token can fetch *and ack* -- i.e. delete --
+    /// a family's mail, so it must never reach a contact. A relay-change
+    /// notice fans out to every contact at once, which makes it the single
+    /// worst place to leak one. The encoder attenuates rather than trusting
+    /// its caller, so even a shell that naively hands over `RelayConfigStore`'s
+    /// member token emits the deposit form.
+    #[test]
+    fn relay_update_encoding_never_carries_a_member_class_token() {
+        let naive = RelayUpdateContent {
+            relay_token: MEMBER_TOKEN.to_string(),
+            ..sample_relay_update()
+        };
+        let encoded = encode_relay_update_content(naive).unwrap();
+
+        assert!(
+            !String::from_utf8_lossy(&encoded).contains(MEMBER_TOKEN),
+            "encoded relay update leaked the member token"
+        );
+        let decoded = decode_relay_update_content(encoded).expect("decodes");
+        assert!(crate::relay_wire::relay_token_is_deposit(
+            decoded.relay_token.clone()
+        ));
+        assert_eq!(
+            decoded.relay_token,
+            crate::relay_wire::relay_deposit_token_for(MEMBER_TOKEN.to_string())
+        );
+    }
+
+    #[test]
+    fn relay_update_decode_rejects_a_member_class_token() {
+        // Hand-built payload: a hostile or buggy sender cannot install a
+        // fetch/ack-capable credential for a contact even by bypassing the
+        // encoder.
+        let mut encoded = vec![RELAY_UPDATE_VERSION];
+        write_bytes16(&mut encoded, b"alice-user-id-16");
+        encoded.extend_from_slice(&1_i64.to_be_bytes());
+        write_bytes16(&mut encoded, b"https://new.relay.example");
+        write_bytes16(&mut encoded, MEMBER_TOKEN.as_bytes());
+        let err = decode_relay_update_content(encoded).unwrap_err();
+        assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn relay_update_encodes_a_cleared_endpoint_as_no_internet_delivery() {
+        let cleared = RelayUpdateContent {
+            relay_url: String::new(),
+            relay_token: String::new(),
+            ..sample_relay_update()
+        };
+        let decoded =
+            decode_relay_update_content(encode_relay_update_content(cleared.clone()).unwrap())
+                .expect("decodes");
+        assert_eq!(decoded, cleared);
+
+        // A half-configured endpoint is not a usable one, so it normalizes to
+        // the same "cleared" form rather than a partial update.
+        let half = RelayUpdateContent {
+            relay_url: "https://new.relay.example".to_string(),
+            relay_token: String::new(),
+            ..sample_relay_update()
+        };
+        let decoded =
+            decode_relay_update_content(encode_relay_update_content(half).unwrap()).unwrap();
+        assert!(decoded.relay_url.is_empty() && decoded.relay_token.is_empty());
+    }
+
+    #[test]
+    fn relay_update_encoding_normalizes_the_url() {
+        let content = RelayUpdateContent {
+            relay_url: " new.relay.example/ ".to_string(),
+            ..sample_relay_update()
+        };
+        let decoded =
+            decode_relay_update_content(encode_relay_update_content(content).unwrap()).unwrap();
+        assert_eq!(decoded.relay_url, "https://new.relay.example");
+    }
+
+    #[test]
+    fn relay_update_decode_rejects_truncation_trailing_bytes_and_bad_versions() {
+        let encoded = encode_relay_update_content(sample_relay_update()).unwrap();
+        for len in 0..encoded.len() {
+            assert!(
+                decode_relay_update_content(encoded[..len].to_vec()).is_err(),
+                "truncation at {len} decoded"
+            );
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_relay_update_content(trailing).is_err());
+
+        let mut bad_version = encoded;
+        bad_version[0] = RELAY_UPDATE_VERSION + 1;
+        assert!(decode_relay_update_content(bad_version).is_err());
+    }
+
+    #[test]
+    fn relay_update_rejects_an_absent_or_oversized_subject() {
+        let empty = RelayUpdateContent {
+            subject_user_id: Vec::new(),
+            ..sample_relay_update()
+        };
+        assert!(encode_relay_update_content(empty).is_err());
+        let huge = RelayUpdateContent {
+            subject_user_id: vec![7; RELAY_UPDATE_MAX_SUBJECT_BYTES + 1],
+            ..sample_relay_update()
+        };
+        assert!(encode_relay_update_content(huge).is_err());
+    }
+
+    #[test]
+    fn relay_update_body_survives_seal_and_open_round_trip() {
+        let alice = generate_identity();
+        let bob = generate_identity();
+        let content = RelayUpdateContent {
+            subject_user_id: alice.user_id.clone(),
+            ..sample_relay_update()
+        };
+        let body = MessageBody {
+            kind: KIND_RELAY_UPDATE,
+            chat_id: alice.user_id.clone(),
+            lamport: 3,
+            timestamp: 1_700_000_001_000,
+            content: encode_relay_update_content(content.clone()).unwrap(),
+        };
+        let payload = encode_message_body(body).unwrap();
+        let sealed = seal_message(alice.clone(), bob.agree_pk.clone(), payload).expect("seals");
+        let opened = open_message(bob, sealed).expect("opens");
+        assert_eq!(opened.sender_user_id, alice.user_id);
+        let decoded_body = decode_message_body(opened.payload).expect("decodes body");
+        assert_eq!(decoded_body.kind, KIND_RELAY_UPDATE);
+        assert_eq!(
+            decode_relay_update_content(decoded_body.content).unwrap(),
+            content
+        );
+    }
+
+    /// Backward compatibility: a build that predates kind 9 must treat the
+    /// notice as an ordinary unknown kind -- the body decodes cleanly, the
+    /// dispatcher finds no handler and drops it. Nothing errors at the frame
+    /// or body layer, so the link is never poisoned and the peer keeps
+    /// working exactly as before.
+    #[test]
+    fn an_unrecognized_kind_decodes_cleanly_so_old_builds_can_just_drop_it() {
+        for kind in [KIND_RELAY_UPDATE, 0x5A, 0xFE] {
+            let body = MessageBody {
+                kind,
+                chat_id: b"alice-user-id-16".to_vec(),
+                lamport: 4,
+                timestamp: 1_700_000_002_000,
+                content: b"payload an old build cannot interpret".to_vec(),
+            };
+            let encoded = encode_message_body(body.clone()).expect("encodes");
+            let decoded = decode_message_body(encoded).expect("an old build still decodes it");
+            assert_eq!(decoded, body);
+            // ...and it is never mistaken for chat history.
+            assert!(!crate::core_is_visible_chat_kind(kind));
+        }
+    }
+
     #[test]
     fn profile_sync_content_round_trips() {
         let content = sample_profile_sync();
@@ -2271,6 +2624,11 @@ mod tests {
     #[test]
     fn own_capabilities_advertise_hidden_kind_acks() {
         assert_ne!(core_own_capabilities() & CAP_ACKS_HIDDEN_KINDS, 0);
+        // T23: kind 9 gets its own bit rather than riding bit 1, because a
+        // build that predates it advertises bit 1 truthfully and still drops
+        // a relay-change notice unhandled.
+        assert_ne!(core_own_capabilities() & CAP_RELAY_UPDATE, 0);
+        assert_ne!(CAP_ACKS_HIDDEN_KINDS, CAP_RELAY_UPDATE);
     }
 
     #[test]
@@ -2280,6 +2638,7 @@ mod tests {
             KIND_PROFILE_SYNC,
             KIND_FRIEND_DIRECTORY,
             KIND_INTRODUCED_FRIEND_REQUEST,
+            KIND_RELAY_UPDATE,
         ] {
             assert!(core_is_hidden_spray_kind(kind), "kind {kind} is sideband");
         }

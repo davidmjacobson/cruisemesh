@@ -176,16 +176,28 @@ impl CoreMeshRouterState {
         true
     }
 
-    /// Whether this peer advertised [`crate::protocol::CAP_ACKS_HIDDEN_KINDS`].
+    /// Whether this peer advertised every capability bit that covers a
+    /// hidden spray kind ([`crate::protocol::core_is_hidden_spray_kind`]).
     /// `false` for pre-HELLO2 builds — they process hidden kinds fine but
     /// never advance their DELIVERED watermark past them, so re-sprays toward
     /// them are bounded to once per session instead of every digest.
+    ///
+    /// T23 made this an *all* bits test rather than a single-bit one. A build
+    /// that predates kind 9 truthfully advertises `CAP_ACKS_HIDDEN_KINDS` and
+    /// still drops a relay-change notice unhandled, so bit 1 alone no longer
+    /// answers "will this peer's watermark advance past every hidden kind I
+    /// might spray". Treating such a peer as not-fully-capable costs it the
+    /// once-per-session bound on kinds 3/5/6/7 too — the same conservative
+    /// path a pre-HELLO2 peer already takes, and the safe direction to err in:
+    /// the envelope is still offered on every fresh link session, and the
+    /// direct and relay paths are untouched.
     pub fn peer_acks_hidden_kinds(&self, address: String) -> bool {
+        let required = crate::protocol::CAP_ACKS_HIDDEN_KINDS | crate::protocol::CAP_RELAY_UPDATE;
         self.peers
             .lock_recoverable()
             .get(&address)
             .and_then(|peer| peer.capabilities)
-            .is_some_and(|caps| caps & crate::protocol::CAP_ACKS_HIDDEN_KINDS != 0)
+            .is_some_and(|caps| caps & required == required)
     }
 
     pub fn hidden_offered_for(&self, address: String) -> Vec<Vec<u8>> {
@@ -579,11 +591,21 @@ mod tests {
         assert!(router.on_hello("ble".into(), vec![1; 16]));
         assert!(router.hidden_offered_for("ble".into()).is_empty());
 
-        // HELLO2 sets capabilities; identity consistency still enforced.
+        // T23: a peer that advertises only the pre-kind-9 bit is truthful
+        // about kinds 3/5/6/7 but still drops a relay-change notice, so it no
+        // longer counts as fully hidden-kind capable.
         assert!(router.on_hello2(
             "ble".into(),
             vec![1; 16],
             crate::protocol::CAP_ACKS_HIDDEN_KINDS
+        ));
+        assert!(!router.peer_acks_hidden_kinds("ble".into()));
+
+        // HELLO2 sets capabilities; identity consistency still enforced.
+        assert!(router.on_hello2(
+            "ble".into(),
+            vec![1; 16],
+            crate::protocol::core_own_capabilities()
         ));
         assert!(router.peer_acks_hidden_kinds("ble".into()));
         assert!(!router.on_hello2("ble".into(), vec![2; 16], 1));
