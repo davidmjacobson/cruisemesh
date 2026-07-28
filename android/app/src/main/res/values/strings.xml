@@ -368,4 +368,11 @@
     <!-- Internal tools -->
     <string name="ui_internal_tools">Internal tools</string>
     <string name="ui_local_wi_fi_field_tools">Local Wi-Fi field tools</string>
+    <string name="ui_internet_delivery">Internet delivery</string>
+    <string name="ui_delivery_shared_pass">Uses your Cruise Pass</string>
+    <string name="ui_delivery_their_own">Uses their own service</string>
+    <string name="ui_delivery_nearby_only">Not shared — nearby delivery only</string>
+    <string name="ui_details">Details</string>
+    <string name="ui_hide_details">Hide details</string>
+    <string name="ui_delivery_stale_card_hint">If your messages are not arriving, ask them to share their friend card again. A card carries the service they used when they shared it.</string>
 </resources>

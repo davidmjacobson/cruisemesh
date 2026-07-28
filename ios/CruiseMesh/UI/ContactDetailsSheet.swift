@@ -18,6 +18,25 @@ struct ContactDetailsSheet: View {
     @State private var editingNickname = false
     @State private var nicknameDraft = ""
     @State private var showVerification = false
+    @State private var showDeliveryDetails = false
+
+    private var delivery: ContactDelivery {
+        let own = RelayConfigStore.load()
+        return contactDelivery(
+            contactRelayUrl: contact.relayUrl,
+            contactRelayToken: contact.relayToken,
+            ownRelayUrl: own?.relayUrl,
+            ownRelayToken: own?.relayToken
+        )
+    }
+
+    private var deliveryLabel: String {
+        switch delivery {
+        case .sharedMailbox: return String(localized: "Uses your Cruise Pass")
+        case .ownMailbox: return String(localized: "Uses their own service")
+        case .nearbyOnly: return String(localized: "Not shared — nearby delivery only")
+        }
+    }
     @State private var confirmingBlock = false
 
     private var displayId: String { formatUserId(userId: contact.userId) }
@@ -68,6 +87,39 @@ struct ContactDetailsSheet: View {
                             Text(connectivityText)
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
+
+                            // Which route this contact's messages take, and --
+                            // behind a disclosure -- the host and how to repair
+                            // a stale one. A friend card is a snapshot of the
+                            // sharer's config at the moment they shared it, so a
+                            // contact who has since changed relays leaves us
+                            // posting into an endpoint that no longer knows
+                            // them. That failure was previously invisible on
+                            // every screen.
+                            Text("Internet delivery")
+                                .font(.subheadline.weight(.semibold))
+                                .padding(.top, 8)
+                            Text(deliveryLabel)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                            // The host sits behind a tap: meaningless to most
+                            // people, and CP3 keeps protocol words off the
+                            // surface -- but it is exactly what support and
+                            // self-hosters need.
+                            if case let .ownMailbox(host) = delivery {
+                                Button(showDeliveryDetails ? "Hide details" : "Details") {
+                                    showDeliveryDetails.toggle()
+                                }
+                                .font(.subheadline)
+                                if showDeliveryDetails {
+                                    Text(host)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text("If your messages are not arriving, ask them to share their friend card again. A card carries the service they used when they shared it.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(20)

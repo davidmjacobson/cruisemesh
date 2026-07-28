@@ -881,6 +881,16 @@
         }
       }
     },
+    "Hide details": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hide details"
+          }
+        }
+      }
+    },
     "History contains only friend identity, path type, event type, and time. It never stores message content, relay tokens, IP addresses, or Wi-Fi names.": {
       "localizations": {
         "en": {
@@ -921,6 +931,16 @@
         }
       }
     },
+    "If your messages are not arriving, ask them to share their friend card again. A card carries the service they used when they shared it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "If your messages are not arriving, ask them to share their friend card again. A card carries the service they used when they shared it."
+          }
+        }
+      }
+    },
     "Import failed": {
       "localizations": {
         "en": {
@@ -957,6 +977,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Internal tools"
+          }
+        }
+      }
+    },
+    "Internet delivery": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Internet delivery"
           }
         }
       }
@@ -1267,6 +1297,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Not now"
+          }
+        }
+      }
+    },
+    "Not shared — nearby delivery only": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Not shared — nearby delivery only"
           }
         }
       }
@@ -2307,6 +2347,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Use a different Cruise Pass"
+          }
+        }
+      }
+    },
+    "Uses their own service": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Uses their own service"
+          }
+        }
+      }
+    },
+    "Uses your Cruise Pass": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Uses your Cruise Pass"
           }
         }
       }
