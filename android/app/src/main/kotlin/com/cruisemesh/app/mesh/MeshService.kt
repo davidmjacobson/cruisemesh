@@ -308,13 +308,28 @@ class MeshService : Service() {
     @Volatile private var lastLinkChangeAtMs: Long = 0L
 
     /**
-     * T2's `carriedLen()` is the closest thing to "holding mail for someone
-     * we can't currently reach" the store exposes today -- see
-     * [RadioPowerPolicy]'s class doc for why this is an aggregate
-     * approximation, not a per-recipient one. Refreshed off [storeExecutor]
-     * by [refreshCarryQueueSignal] on every [radioPowerRunnable] tick.
+     * T22: wall-clock time the carry queue last *grew*, or 0 if it has not
+     * grown this process. Refreshed off [storeExecutor] by
+     * [refreshCarryQueueSignal] on every [radioPowerRunnable] tick.
+     *
+     * This used to be a plain `carriedLen() > 0` boolean, which measured
+     * "are we holding any carried envelope at all". In a family that
+     * actually uses the app that is permanently true -- carried 1:1
+     * envelopes survive until digest-proof of receipt and envelopes live up
+     * to 7 days -- so the escalation latched on and the radio never returned
+     * to LOW_POWER. Confirmed on hardware 2026-07-27: every sampled
+     * `evaluateRadioPower` line reported BALANCED, not one LOW_POWER.
+     *
+     * Freshly arrived mail is the part worth spending radio on, so this
+     * tracks arrivals and [RadioPowerPolicy] treats them like link churn:
+     * escalate now, relax once the window passes. Mail that is merely
+     * sitting in the queue (already uploaded and waiting on a receipt, or
+     * addressed to someone already linked) no longer holds the radio up.
      */
-    @Volatile private var carryQueueHasUnlinkedMail: Boolean = false
+    @Volatile private var carryQueueLastGrewAtMs: Long = 0L
+
+    /** Last carried-envelope count seen by [refreshCarryQueueSignal]; -1 before the first read. */
+    @Volatile private var lastCarriedLen: Long = -1L
 
     private var screenStateReceiverRegistered = false
     private val screenStateReceiver = object : BroadcastReceiver() {
@@ -377,7 +392,7 @@ class MeshService : Service() {
      * link-connect/disconnect callbacks) is event-driven and calls
      * [evaluateRadioPower] directly, but a quiet period simply *elapsing*
      * with no new event needs something to notice it, hence this tick. Also
-     * where [carryQueueHasUnlinkedMail] gets refreshed, since that requires
+     * where [carryQueueLastGrewAtMs] gets refreshed, since that requires
      * a [storeExecutor] hop (see [refreshCarryQueueSignal]).
      */
     private val radioPowerRunnable = object : Runnable {
@@ -606,6 +621,16 @@ class MeshService : Service() {
 
     override fun onDestroy() {
         running = false
+        // T21: the ongoing mesh notification must never outlive the service.
+        // stopForeground(STOP_FOREGROUND_REMOVE) used to run only on the
+        // explicit ACTION_STOP path, so every other teardown (stopSelf, a
+        // system stop, an eviction that still runs onDestroy) left a
+        // notification claiming the mesh was up. Measured on a family phone:
+        // two notifications posted, zero services running, for ~2 hours. Same
+        // trust-breaking class as the B5 zombie transport header. A SIGKILL
+        // never reaches onDestroy, which is why MainActivity also reconciles
+        // stale notifications on launch.
+        stopForeground(STOP_FOREGROUND_REMOVE)
         lanTransport?.stop()
         lanTransport = null
         MeshRuntimeStatus.markStopped()
@@ -842,7 +867,7 @@ class MeshService : Service() {
     }
 
     /**
-     * Off-[storeExecutor] refresh of [carryQueueHasUnlinkedMail] (see that
+     * Off-[storeExecutor] refresh of [carryQueueLastGrewAtMs] (see that
      * field's doc for the aggregate-vs-per-recipient caveat), then hops back
      * to the main thread to fold the new value into an [evaluateRadioPower]
      * pass -- mirrors every other [store] read in this class (FA3).
@@ -850,14 +875,24 @@ class MeshService : Service() {
     private fun refreshCarryQueueSignal() {
         runOnStoreExecutor("radio power carry-queue check") {
             assertOffMainThreadForStore("refreshCarryQueueSignal")
-            val hasUnlinkedMail = try {
-                store.carriedLen() > 0uL
+            val carried = try {
+                store.carriedLen().toLong()
             } catch (e: CoreException) {
                 Log.w(TAG, "Failed to read carriedLen for radio power policy: ${e.message}")
-                false
+                return@runOnStoreExecutor
             }
             relayMainHandler.post {
-                carryQueueHasUnlinkedMail = hasUnlinkedMail
+                // T22: only a *growing* queue means new mail worth spending
+                // radio on. A steady or shrinking count is mail already in
+                // hand, which used to hold the radio at BALANCED forever.
+                // The first observation of this process seeds the baseline
+                // without escalating: a queue inherited from a previous run
+                // is not news.
+                val previous = lastCarriedLen
+                if (previous >= 0L && carried > previous) {
+                    carryQueueLastGrewAtMs = System.currentTimeMillis()
+                }
+                lastCarriedLen = carried
                 evaluateRadioPower("carry-queue check")
             }
         }
@@ -881,7 +916,8 @@ class MeshService : Service() {
             // shouldn't count as "not lonely" for duty-mode purposes.
             liveLinkCount = MeshRouter.identifiedRoutes().size,
             msSinceLastLinkChange = if (lastLinkChangeAtMs == 0L) Long.MAX_VALUE / 2 else now - lastLinkChangeAtMs,
-            carryQueueHasUnlinkedMail = carryQueueHasUnlinkedMail,
+            msSinceCarryQueueGrew =
+                if (carryQueueLastGrewAtMs == 0L) Long.MAX_VALUE / 2 else now - carryQueueLastGrewAtMs,
         )
         val mode = radioPowerPolicy.evaluate(inputs, now)
         central.setScanDutyMode(mode)
@@ -1599,6 +1635,29 @@ class MeshService : Service() {
 
     companion object {
         const val ACTION_STOP = "com.cruisemesh.app.action.STOP_MESH"
+
+        /**
+         * T21: clears a mesh notification left behind by a process that was
+         * killed outright.
+         *
+         * [onDestroy] removes the notification on every teardown it gets to
+         * run for, but a SIGKILL (the low-memory killer, a force-stop, a
+         * pause) never reaches it, so the ongoing notification can outlive
+         * the service and tell the user the mesh is up when nothing is
+         * running. Measured on a family phone: two notifications posted,
+         * zero services, for about two hours.
+         *
+         * Called from the activity on launch, before the mesh is (re)started,
+         * and safe either way -- if the mesh comes up immediately afterwards
+         * it posts a fresh notification through [startForeground].
+         */
+        fun clearStaleNotification(context: Context) {
+            if (MeshRuntimeStatus.state.value != MeshRuntimeState.STOPPED) return
+            runCatching {
+                context.getSystemService(NotificationManager::class.java)
+                    ?.cancel(NOTIFICATION_ID)
+            }
+        }
 
         /** Permissions MeshService needs before it will start its BLE roles. */
         fun requiredPermissions(): Array<String> {

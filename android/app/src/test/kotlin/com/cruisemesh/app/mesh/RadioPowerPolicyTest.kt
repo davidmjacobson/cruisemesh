@@ -15,7 +15,7 @@ class RadioPowerPolicyTest {
             screenInteractive = true,
             liveLinkCount = 0,
             msSinceLastLinkChange = Long.MAX_VALUE / 2,
-            carryQueueHasUnlinkedMail = false,
+            msSinceCarryQueueGrew = Long.MAX_VALUE / 2,
         )
         assertTrue(RadioPowerPolicy.shouldEscalate(inputs))
     }
@@ -26,7 +26,7 @@ class RadioPowerPolicyTest {
             screenInteractive = false,
             liveLinkCount = 0,
             msSinceLastLinkChange = Long.MAX_VALUE / 2,
-            carryQueueHasUnlinkedMail = false,
+            msSinceCarryQueueGrew = Long.MAX_VALUE / 2,
         )
         assertFalse(RadioPowerPolicy.shouldEscalate(inputs))
     }
@@ -37,7 +37,7 @@ class RadioPowerPolicyTest {
             screenInteractive = true,
             liveLinkCount = 1,
             msSinceLastLinkChange = Long.MAX_VALUE / 2,
-            carryQueueHasUnlinkedMail = false,
+            msSinceCarryQueueGrew = Long.MAX_VALUE / 2,
         )
         assertFalse(RadioPowerPolicy.shouldEscalate(inputs))
     }
@@ -48,7 +48,7 @@ class RadioPowerPolicyTest {
             screenInteractive = false,
             liveLinkCount = 1,
             msSinceLastLinkChange = 1_000L,
-            carryQueueHasUnlinkedMail = false,
+            msSinceCarryQueueGrew = Long.MAX_VALUE / 2,
         )
         assertTrue(RadioPowerPolicy.shouldEscalate(inputs))
     }
@@ -59,7 +59,7 @@ class RadioPowerPolicyTest {
             screenInteractive = false,
             liveLinkCount = 1,
             msSinceLastLinkChange = RadioPowerPolicy.ESCALATION_WINDOW_MS + 1,
-            carryQueueHasUnlinkedMail = false,
+            msSinceCarryQueueGrew = Long.MAX_VALUE / 2,
         )
         assertFalse(RadioPowerPolicy.shouldEscalate(inputs))
     }
@@ -70,18 +70,47 @@ class RadioPowerPolicyTest {
             screenInteractive = false,
             liveLinkCount = 1,
             msSinceLastLinkChange = RadioPowerPolicy.ESCALATION_WINDOW_MS,
-            carryQueueHasUnlinkedMail = false,
+            msSinceCarryQueueGrew = Long.MAX_VALUE / 2,
         )
         assertTrue(RadioPowerPolicy.shouldEscalate(inputs))
     }
 
     @Test
-    fun `carried mail for an unlinked contact escalates on its own`() {
+    fun `freshly arrived carried mail escalates on its own`() {
         val inputs = RadioPowerInputs(
             screenInteractive = false,
             liveLinkCount = 1,
             msSinceLastLinkChange = Long.MAX_VALUE / 2,
-            carryQueueHasUnlinkedMail = true,
+            msSinceCarryQueueGrew = 0L,
+        )
+        assertTrue(RadioPowerPolicy.shouldEscalate(inputs))
+    }
+
+    /**
+     * T22 regression. The carry-queue signal used to be "the queue is
+     * non-empty", which is permanently true for a family that uses the app,
+     * so the radio never returned to LOW_POWER. Mail that arrived longer ago
+     * than the escalation window must stop holding the radio up.
+     */
+    @Test
+    fun `carried mail that stopped arriving no longer escalates`() {
+        val inputs = RadioPowerInputs(
+            screenInteractive = false,
+            liveLinkCount = 1,
+            msSinceLastLinkChange = Long.MAX_VALUE / 2,
+            msSinceCarryQueueGrew = RadioPowerPolicy.ESCALATION_WINDOW_MS + 1,
+        )
+        assertFalse(RadioPowerPolicy.shouldEscalate(inputs))
+    }
+
+    /** A queue that keeps receiving mail keeps the radio escalated. */
+    @Test
+    fun `carried mail still arriving keeps escalating`() {
+        val inputs = RadioPowerInputs(
+            screenInteractive = false,
+            liveLinkCount = 1,
+            msSinceLastLinkChange = Long.MAX_VALUE / 2,
+            msSinceCarryQueueGrew = RadioPowerPolicy.ESCALATION_WINDOW_MS - 1,
         )
         assertTrue(RadioPowerPolicy.shouldEscalate(inputs))
     }
@@ -135,7 +164,7 @@ class RadioPowerPolicyTest {
             screenInteractive = false,
             liveLinkCount = 1,
             msSinceLastLinkChange = Long.MAX_VALUE / 2,
-            carryQueueHasUnlinkedMail = false,
+            msSinceCarryQueueGrew = Long.MAX_VALUE / 2,
         )
         assertEquals(RadioDutyMode.LOW_POWER, policy.evaluate(quiet, nowMs = 0L))
     }
@@ -147,7 +176,7 @@ class RadioPowerPolicyTest {
             screenInteractive = true,
             liveLinkCount = 0,
             msSinceLastLinkChange = Long.MAX_VALUE / 2,
-            carryQueueHasUnlinkedMail = false,
+            msSinceCarryQueueGrew = Long.MAX_VALUE / 2,
         )
         assertEquals(RadioDutyMode.BALANCED, policy.evaluate(lonely, nowMs = 1_000L))
     }
@@ -159,7 +188,7 @@ class RadioPowerPolicyTest {
             screenInteractive = true,
             liveLinkCount = 0,
             msSinceLastLinkChange = Long.MAX_VALUE / 2,
-            carryQueueHasUnlinkedMail = false,
+            msSinceCarryQueueGrew = Long.MAX_VALUE / 2,
         )
         val quiet = lonely.copy(screenInteractive = false, liveLinkCount = 1)
 
@@ -177,7 +206,7 @@ class RadioPowerPolicyTest {
             screenInteractive = true,
             liveLinkCount = 0,
             msSinceLastLinkChange = Long.MAX_VALUE / 2,
-            carryQueueHasUnlinkedMail = false,
+            msSinceCarryQueueGrew = Long.MAX_VALUE / 2,
         )
         val quiet = lonely.copy(screenInteractive = false, liveLinkCount = 1)
 
@@ -198,7 +227,7 @@ class RadioPowerPolicyTest {
             screenInteractive = true,
             liveLinkCount = 0,
             msSinceLastLinkChange = Long.MAX_VALUE / 2,
-            carryQueueHasUnlinkedMail = false,
+            msSinceCarryQueueGrew = Long.MAX_VALUE / 2,
         )
         val quiet = lonely.copy(screenInteractive = false, liveLinkCount = 1)
 

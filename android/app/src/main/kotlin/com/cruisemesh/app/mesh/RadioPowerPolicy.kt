@@ -22,13 +22,26 @@ package com.cruisemesh.app.mesh
  *  - a link connected or disconnected within [ESCALATION_WINDOW_MS] (a
  *    disconnected peer's readvertised address, or a peer that just found
  *    us, is worth a faster duty cycle for a while).
- *  - the carry queue holds mail for a contact we're not currently linked to.
- *    The store has no per-recipient carried count today (TODO.md T2 only
- *    added an aggregate `carriedLen()`), so
- *    [RadioPowerInputs.carryQueueHasUnlinkedMail] is approximated as
- *    "carrying anything at all" -- a false positive (carrying only for
- *    already-linked contacts) just means a few extra quiet-period minutes at
- *    BALANCED, never a correctness problem.
+ *  - the carry queue *grew* within [ESCALATION_WINDOW_MS], i.e. mail arrived
+ *    that we may need to hand on.
+ *
+ *    This was originally "the carry queue is non-empty at all", since the
+ *    store has no per-recipient carried count (TODO.md T2 only added an
+ *    aggregate `carriedLen()`), and the false positive was assumed to cost
+ *    "a few extra quiet-period minutes at BALANCED". It cost far more than
+ *    that: carried 1:1 envelopes survive until digest-proof of receipt and
+ *    envelopes live up to 7 days, so in a family that actually uses the app
+ *    the queue is never empty, the escalation latched on permanently, and
+ *    the radio never returned to LOW_POWER at all. Confirmed on hardware
+ *    2026-07-27 -- every sampled decision was BALANCED, none LOW_POWER, so
+ *    the whole escalate-fast/relax-slow design below was inert.
+ *
+ *    Arrival is the part worth spending radio on, so it is now treated like
+ *    link churn: escalate on the event, relax once the window passes. Mail
+ *    merely sitting in the queue (already uploaded and awaiting a receipt,
+ *    or addressed to someone already linked) no longer holds the radio up.
+ *    A per-recipient count would still be strictly better and remains the
+ *    real fix.
  *
  * ## Android scan-throttling hysteresis
  *
@@ -87,7 +100,8 @@ data class RadioPowerInputs(
     val screenInteractive: Boolean,
     val liveLinkCount: Int,
     val msSinceLastLinkChange: Long,
-    val carryQueueHasUnlinkedMail: Boolean,
+    /** Time since the carry queue last grew; large when no new mail has arrived. */
+    val msSinceCarryQueueGrew: Long,
 )
 
 class RadioPowerPolicy {
@@ -136,7 +150,8 @@ class RadioPowerPolicy {
         internal fun shouldEscalate(inputs: RadioPowerInputs): Boolean {
             val lonelyWhileAwake = inputs.screenInteractive && inputs.liveLinkCount == 0
             val recentLinkChurn = inputs.msSinceLastLinkChange in 0..ESCALATION_WINDOW_MS
-            return lonelyWhileAwake || recentLinkChurn || inputs.carryQueueHasUnlinkedMail
+            val freshCarriedMail = inputs.msSinceCarryQueueGrew in 0..ESCALATION_WINDOW_MS
+            return lonelyWhileAwake || recentLinkChurn || freshCarriedMail
         }
 
         /**
