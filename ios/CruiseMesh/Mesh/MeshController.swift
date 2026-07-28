@@ -322,7 +322,7 @@ final class MeshController: ObservableObject {
             notifyGroupViewed(groupId: chatId)
             return
         }
-        let through = (try? store.highestContiguousLamport(chatId: chatId, senderUserId: chatId)) ?? 0
+        let through = PeerStreamWatermark.through(store: store, chatId: chatId, senderUserId: chatId)
         guard through > 0 else { return }
         try? store.recordOutgoingReceipt(
             chatId: chatId,
@@ -352,10 +352,11 @@ final class MeshController: ObservableObject {
               let group = try? store.getGroup(groupId: groupId),
               group.memberUserIds.contains(identity.userId) else { return }
         for senderUserId in group.memberUserIds where senderUserId != identity.userId {
-            let through = (try? store.highestContiguousLamport(
+            let through = PeerStreamWatermark.through(
+                store: store,
                 chatId: groupId,
                 senderUserId: senderUserId
-            )) ?? 0
+            )
             guard through > 0 else { continue }
             try? store.recordOutgoingReceipt(
                 chatId: groupId,
@@ -1156,7 +1157,11 @@ final class MeshController: ObservableObject {
         ChatEvents.notifyChatChanged(group.id)
 
         // Local read watermark only (group wire receipts are deferred).
-        let throughLamport = (try? store.highestLamport(chatId: group.id, senderUserId: senderUserId)) ?? 0
+        let throughLamport = PeerStreamWatermark.through(
+            store: store,
+            chatId: group.id,
+            senderUserId: senderUserId
+        )
         try? store.recordOutgoingReceipt(
             chatId: group.id,
             senderUserId: senderUserId,
@@ -1273,7 +1278,11 @@ final class MeshController: ObservableObject {
         )
         ChatEvents.notifyChatChanged(senderUserId)
 
-        let through = (try? store.highestContiguousLamport(chatId: senderUserId, senderUserId: senderUserId)) ?? 0
+        let through = PeerStreamWatermark.through(
+            store: store,
+            chatId: senderUserId,
+            senderUserId: senderUserId
+        )
         try? store.recordOutgoingReceipt(
             chatId: senderUserId,
             senderUserId: senderUserId,
@@ -1467,7 +1476,11 @@ final class MeshController: ObservableObject {
         ))
         guard inserted else { return }
         ChatEvents.notifyChatChanged(senderUserId)
-        let through = (try? store.highestContiguousLamport(chatId: senderUserId, senderUserId: senderUserId)) ?? 0
+        let through = PeerStreamWatermark.through(
+            store: store,
+            chatId: senderUserId,
+            senderUserId: senderUserId
+        )
         try? store.recordOutgoingReceipt(
             chatId: senderUserId,
             senderUserId: senderUserId,
@@ -1640,7 +1653,11 @@ final class MeshController: ObservableObject {
         ChatEvents.notifyChatChanged(senderUserId)
 
         let contact = (try? store.getContact(userId: senderUserId)) ?? existing
-        let through = (try? store.highestContiguousLamport(chatId: senderUserId, senderUserId: senderUserId)) ?? 0
+        let through = PeerStreamWatermark.through(
+            store: store,
+            chatId: senderUserId,
+            senderUserId: senderUserId
+        )
         try? store.recordOutgoingReceipt(
             chatId: senderUserId,
             senderUserId: senderUserId,
@@ -1812,10 +1829,11 @@ final class MeshController: ObservableObject {
         identity: Identity,
         contact: Contact
     ) {
-        let through = (try? store.highestLamport(
+        let through = PeerStreamWatermark.through(
+            store: store,
             chatId: senderUserId,
             senderUserId: senderUserId
-        )) ?? 0
+        )
         try? store.recordOutgoingReceipt(
             chatId: senderUserId,
             senderUserId: senderUserId,

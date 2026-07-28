@@ -172,7 +172,11 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 senderIds = [chatId]
             }
             for senderId in senderIds {
-                let through = (try? store.highestLamport(chatId: chatId, senderUserId: senderId)) ?? 0
+                let through = PeerStreamWatermark.through(
+                    store: store,
+                    chatId: chatId,
+                    senderUserId: senderId
+                )
                 if through > 0 {
                     try? store.recordOutgoingReceipt(
                         chatId: chatId,
