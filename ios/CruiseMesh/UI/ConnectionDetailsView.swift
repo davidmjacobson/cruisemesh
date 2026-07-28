@@ -11,6 +11,7 @@ struct ConnectionDetailsView: View {
     @State private var showClear = false
     @State private var showAllActivity = false
     @State private var diagnosticLogging = DiagnosticLogExport.isEnabled
+    @State private var hasDiagnosticArchive = DiagnosticLogExport.hasArchive()
     @State private var shareFile: ShareableFile?
     @State private var supportMessage: String?
 
@@ -77,8 +78,8 @@ struct ConnectionDetailsView: View {
                         .onChange(of: diagnosticLogging) {
                             DiagnosticLogExport.setEnabled($0)
                             supportMessage = $0
-                                ? "Diagnostic logging is on. Reproduce the problem, then return here to share it."
-                                : "Diagnostic logging is off. Previously captured diagnostics can still be shared."
+                                ? String(localized: "Diagnostic logging is on. Reproduce the problem, then return here to share it.")
+                                : String(localized: "Diagnostic logging is off. What was already captured is kept until you delete it.")
                         }
                     Text("Turn this on before testing to keep connection and delivery diagnostics across app restarts. Message content is never recorded.")
                         .font(.caption)
@@ -86,12 +87,21 @@ struct ConnectionDetailsView: View {
                     Button {
                         if let url = DiagnosticLogExport.writeLogFile() {
                             shareFile = ShareableFile(url: url)
+                            hasDiagnosticArchive = true
                         } else {
-                            supportMessage = "No diagnostics captured this session yet."
+                            supportMessage = String(localized: "No diagnostics captured this session yet.")
                         }
                     } label: {
                         Label("Share diagnostics", systemImage: "ladybug")
                     }
+                    Button(role: .destructive) {
+                        DiagnosticLogExport.deleteArchive()
+                        hasDiagnosticArchive = false
+                        supportMessage = String(localized: "Captured diagnostics deleted.")
+                    } label: {
+                        Label("Delete captured diagnostics", systemImage: "trash")
+                    }
+                    .disabled(!hasDiagnosticArchive)
                     Button {
                         if let url = FieldMetricsExport.writeCSVFile() {
                             shareFile = ShareableFile(url: url)

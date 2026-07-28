@@ -66,6 +66,7 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
     var showClear by remember { mutableStateOf(false) }
     var showAllActivity by remember { mutableStateOf(false) }
     var diagnosticLogging by remember { mutableStateOf(DebugFileLog.isEnabled(context)) }
+    var hasCapturedDiagnostics by remember { mutableStateOf(DebugFileLog.hasCapturedLogs(context)) }
     var supportMessage by remember { mutableStateOf<String?>(null) }
     val contacts = remember(revision) { store.listContacts() }
     val summaries = remember(revision) { store.peerConnectionSummaries() }
@@ -213,6 +214,15 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                     },
                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
                 ) { Text(stringResource(R.string.ui_share_diagnostics)) }
+                OutlinedButton(
+                    onClick = {
+                        DebugFileLog.deleteCapturedLogs(context)
+                        hasCapturedDiagnostics = false
+                        supportMessage = context.getString(R.string.ui_diagnostics_deleted)
+                    },
+                    enabled = hasCapturedDiagnostics,
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                ) { Text(stringResource(R.string.ui_delete_captured_diagnostics)) }
                 OutlinedButton(
                     onClick = {
                         FieldMetricsExport.shareIntent(context)?.let {

@@ -112,6 +112,33 @@ enum DiagnosticLogExport {
         }
     }
 
+    /// Whether any archive exists to share or delete.
+    static func hasArchive() -> Bool {
+        guard let url = archiveURL(),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber else {
+            return false
+        }
+        return size.intValue > 0
+    }
+
+    /// Erases the persistent archive.
+    ///
+    /// The archive survives app restarts by design and its entries include
+    /// contact and group *names*, so turning capture off has to be separable
+    /// from erasing what was already captured. `lastArchivedAt` is moved to
+    /// now rather than cleared: clearing it would let the next flush re-read
+    /// the unified log back to the start of the window and rewrite the very
+    /// entries the user just deleted.
+    static func deleteArchive() {
+        lock.lock()
+        defer { lock.unlock() }
+        if let url = archiveURL() {
+            try? FileManager.default.removeItem(at: url)
+        }
+        UserDefaults.standard.set(Date(), forKey: lastArchivedAtKey)
+    }
+
     private static func archiveURL() -> URL? {
         guard let base = try? FileManager.default.url(
             for: .applicationSupportDirectory,

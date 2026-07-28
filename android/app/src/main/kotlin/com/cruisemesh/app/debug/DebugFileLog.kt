@@ -80,6 +80,37 @@ object DebugFileLog {
 
     fun logFile(context: Context): File = File(logDir(context), FILE_NAME)
 
+    /** Whether any captured log exists to share or delete. */
+    fun hasCapturedLogs(context: Context): Boolean =
+        logFile(context).let { it.exists() && it.length() > 0 } ||
+            File(logDir(context), ROTATED_NAME).exists()
+
+    /**
+     * Erases every captured log.
+     *
+     * Capture keeps diagnostics on disk indefinitely once it has run, and the
+     * entries include contact and group *names*, so a tester who turns the
+     * switch off has to be able to erase what was already written -- not just
+     * stop adding to it. Stops the capture thread first so nothing is holding
+     * the file open, then restarts capture if it is still meant to be running
+     * (an opted-in release build, or any debuggable build, where capture is
+     * unconditional). Returns whether the files are gone afterwards.
+     */
+    @Synchronized
+    fun deleteCapturedLogs(context: Context): Boolean {
+        val wasCapturing = started
+        stopCapture()
+        val deleted = listOf(logFile(context), File(logDir(context), ROTATED_NAME))
+            .all { !it.exists() || it.delete() }
+        if (wasCapturing && isEnabled(context)) {
+            // The capture thread exits asynchronously once logcat dies; start()
+            // is idempotent and no-ops until it has, so re-arm on the next
+            // start/share instead of racing it here.
+            start(context)
+        }
+        return deleted
+    }
+
     /**
      * Starts capturing (idempotent). Safe to call from both [MainActivity] and
      * [com.cruisemesh.app.mesh.MeshService]: whichever spins up the process
