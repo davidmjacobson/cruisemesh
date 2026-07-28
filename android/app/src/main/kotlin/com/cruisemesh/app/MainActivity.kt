@@ -118,6 +118,8 @@ import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.generateIdentity
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.ContactDelivery
+import uniffi.cruisemesh_core.contactDelivery
 import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.parseFriendText
@@ -1255,16 +1257,29 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
         } else {
             null
         }
-        val reachabilityStatusText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs, nearbyTransport) {
+        // Whether this contact can be reached at all when no direct path
+        // exists. A property of their friend card, not of the moment, so it
+        // only recomputes when the card or our own config changes.
+        val ownRelayConfig = remember { RelayConfigStore.load(context) }
+        val contactHasInternetDelivery = remember(contact.relayUrl, contact.relayToken, ownRelayConfig) {
+            contactDelivery(
+                contact.relayUrl,
+                contact.relayToken,
+                ownRelayConfig?.relayUrl,
+                ownRelayConfig?.relayToken,
+            ) != ContactDelivery.NearbyOnly
+        }
+        val reachabilityStatusText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs, nearbyTransport, contactHasInternetDelivery) {
             val hex = UserIdHex.encode(contact.userId)
             ContactReachability.chatHeaderCopy(
                 reachability,
                 listOfNotNull(contactLastSeen[hex], presenceLastSeen[hex]).maxOrNull(),
                 connectivityNowMs,
                 nearbyTransport,
+                contactHasInternetDelivery,
             )
         }
-        val reachabilityDetailsText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs, nearbyTransport) {
+        val reachabilityDetailsText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs, nearbyTransport, contactHasInternetDelivery) {
             val hex = UserIdHex.encode(contact.userId)
             ContactReachability.contactDetailsCopy(
                 reachability,
@@ -1272,6 +1287,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
                 presenceLastSeen[hex],
                 connectivityNowMs,
                 nearbyTransport,
+                contactHasInternetDelivery,
             )
         }
         ChatScreen(

@@ -104,25 +104,35 @@ enum ContactReachability {
     static func chatHeaderCopy(
         _ level: ReachabilityLevel,
         peerLastSeenMs: Int64?,
-        nowMs: Int64
+        nowMs: Int64,
+        contactHasInternetDelivery: Bool = true
     ) -> String {
         switch level {
         case .nearby: return "Nearby via Bluetooth"
-        case .onlineRelay: return "Online via relay"
+        case .onlineRelay: return "Online via Cruise Pass"
         case .recent:
             let minutes = max(0, (nowMs - (peerLastSeenMs ?? nowMs)) / 60_000)
             return minutes >= 60 ? "Active \(minutes / 60)h ago" : "Active \(minutes)m ago"
-        case .meshCarry: return "Nearby phones will carry your message"
-        case .offline: return "Offline — will deliver when reachable"
+        // "will carry" promised an outcome no phone has agreed to yet: the
+        // message has only been offered to whoever is nearby.
+        case .meshCarry: return "Trying nearby phones"
+        // The old copy said "will deliver when reachable" for everyone. For a
+        // contact who never shared internet delivery that is a promise the app
+        // cannot keep -- a sender posts into the *recipient's* mailbox, and
+        // they have none, so no amount of waiting reaches them.
+        case .offline:
+            return contactHasInternetDelivery
+                ? "Waiting to deliver"
+                : "Delivers when you're nearby"
         }
     }
 
     static func contentDescriptionSuffix(_ level: ReachabilityLevel) -> String? {
         switch level {
         case .nearby: return "Nearby via Bluetooth"
-        case .onlineRelay: return "Online via relay"
+        case .onlineRelay: return "Online via Cruise Pass"
         case .recent: return "Recently active"
-        case .meshCarry: return "Reachable through the mesh"
+        case .meshCarry: return "Reachable through nearby phones"
         case .offline: return nil
         }
     }
@@ -131,16 +141,25 @@ enum ContactReachability {
         _ level: ReachabilityLevel,
         peerLastSeenMs: Int64?,
         presenceLastSeenMs: Int64?,
-        nowMs: Int64
+        nowMs: Int64,
+        contactHasInternetDelivery: Bool = true
     ) -> String {
-        let base = chatHeaderCopy(level, peerLastSeenMs: peerLastSeenMs, nowMs: nowMs)
+        let base = chatHeaderCopy(
+            level,
+            peerLastSeenMs: peerLastSeenMs,
+            nowMs: nowMs,
+            contactHasInternetDelivery: contactHasInternetDelivery
+        )
+        var seenText = base
         if let seen = presenceLastSeenMs {
-            return "\(base) · Last seen via relay \(ageText(seen, nowMs: nowMs)) ago"
+            seenText = "\(base) · Last seen \(ageText(seen, nowMs: nowMs)) ago"
+        } else if let seen = peerLastSeenMs {
+            seenText = "\(base) · Last seen \(ageText(seen, nowMs: nowMs)) ago"
         }
-        if let seen = peerLastSeenMs {
-            return "\(base) · Last seen \(ageText(seen, nowMs: nowMs)) ago"
-        }
-        return base
+        // Capability is a durable fact about the friend card, so state it even
+        // when the live level already reads well -- it is what a sender needs
+        // to know before wondering why nothing ever arrives.
+        return contactHasInternetDelivery ? seenText : "\(seenText) · Nearby delivery only"
     }
 
     private static func ageText(_ seenAtMs: Int64, nowMs: Int64) -> String {

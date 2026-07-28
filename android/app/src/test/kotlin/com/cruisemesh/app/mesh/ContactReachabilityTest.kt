@@ -255,7 +255,7 @@ class ContactReachabilityTest {
     @Test
     fun `contactDetailsCopy includes relay path detail when presence is known`() {
         assertEquals(
-            "Online via relay · Last seen via relay 2m ago",
+            "Online via Cruise Pass · Last seen 2m ago",
             ContactReachability.contactDetailsCopy(
                 ReachabilityLevel.ONLINE_RELAY,
                 peerLastSeenMs = 60_000L,
@@ -276,6 +276,66 @@ class ContactReachabilityTest {
                 nowMs = 60 * 60_000L,
             ),
         )
+    }
+
+    @Test
+    fun `OFFLINE never promises eventual delivery to a contact who shared no internet delivery`() {
+        // The old copy said "will deliver when reachable" for everyone. A
+        // sender posts into the RECIPIENT's mailbox, so a contact without one
+        // is unreachable at any distance, however long the message waits.
+        assertEquals(
+            "Delivers when you're nearby",
+            ContactReachability.chatHeaderCopy(
+                ReachabilityLevel.OFFLINE,
+                peerLastSeenMs = null,
+                nowMs = 0L,
+                contactHasInternetDelivery = false,
+            ),
+        )
+        assertEquals(
+            "Waiting to deliver",
+            ContactReachability.chatHeaderCopy(
+                ReachabilityLevel.OFFLINE,
+                peerLastSeenMs = null,
+                nowMs = 0L,
+                contactHasInternetDelivery = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `MESH_CARRY only claims an attempt, never a delivery`() {
+        assertEquals(
+            "Trying nearby phones",
+            ContactReachability.chatHeaderCopy(ReachabilityLevel.MESH_CARRY, null, 0L),
+        )
+    }
+
+    @Test
+    fun `contactDetailsCopy states nearby-only capability whatever the live level says`() {
+        val copy = ContactReachability.contactDetailsCopy(
+            ReachabilityLevel.NEARBY,
+            peerLastSeenMs = null,
+            presenceLastSeenMs = null,
+            nowMs = 0L,
+            contactHasInternetDelivery = false,
+        )
+        assert(copy.endsWith("Nearby delivery only")) { "expected capability suffix, got: $copy" }
+    }
+
+    @Test
+    fun `no user-facing copy calls the mailbox a relay`() {
+        // CP3 vocabulary: consumer surfaces say "internet delivery" or
+        // "Cruise Pass", never protocol words.
+        for (level in ReachabilityLevel.entries) {
+            for (hasDelivery in listOf(true, false)) {
+                val copy = ContactReachability.chatHeaderCopy(level, 0L, 60_000L, null, hasDelivery)
+                assert(!copy.contains("relay", ignoreCase = true)) { "jargon in $level copy: $copy" }
+            }
+            ContactReachability.contentDescriptionSuffix(level)?.let {
+                assert(!it.contains("relay", ignoreCase = true)) { "jargon in $level suffix: $it" }
+            }
+        }
     }
 
     @Test
