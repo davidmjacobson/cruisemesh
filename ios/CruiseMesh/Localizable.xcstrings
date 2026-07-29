@@ -691,6 +691,16 @@
         }
       }
     },
+    "Enter a name to continue.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Enter a name to continue."
+          }
+        }
+      }
+    },
     "Export an encrypted copy of your identity and messages.": {
       "localizations": {
         "en": {
@@ -2447,6 +2457,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your friend must already be accepted. The QR only supplies a local network address; the encrypted identity check still applies."
+          }
+        }
+      }
+    },
+    "Your name": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your name"
           }
         }
       }

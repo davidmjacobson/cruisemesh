@@ -35,7 +35,16 @@ struct ProfileView: View {
                             syncProfile(epoch: ProfileStore.bumpOwnAvatarEpoch())
                         }
                     }
-                    TextField("Display name", text: $displayName)
+                    // Labelled, not a bare TextField: SwiftUI treats the
+                    // TextField string as a *placeholder*, which disappears the
+                    // moment the field has a value. A populated field therefore
+                    // rendered as an unlabelled row of text between two buttons
+                    // and read as a static label -- the first outside tester
+                    // could not find anywhere to change her name at all.
+                    LabeledContent("Name") {
+                        TextField("Your name", text: $displayName)
+                            .multilineTextAlignment(.trailing)
+                    }
                     DisclosureGroup("Verify my identity") {
                         Text(fingerprintWords(userId: identity.userId).joined(separator: " "))
                             .font(.body.monospaced())

@@ -92,13 +92,18 @@ fun OnboardingScreen(
                     } else {
                         Spacer(modifier = Modifier.height(1.dp))
                     }
-                    Button(onClick = {
-                        if (isLastPage) {
-                            onComplete()
-                        } else {
-                            page += 1
-                        }
-                    }) {
+                    Button(
+                        onClick = {
+                            if (isLastPage) {
+                                onComplete()
+                            } else {
+                                page += 1
+                            }
+                        },
+                        // A name is required to finish. Nothing is substituted
+                        // if it is left blank, so the gate has to be here.
+                        enabled = !isLastPage || displayName.isNotBlank(),
+                    ) {
                         Text(
                             stringResource(
                                 if (isLastPage) R.string.ui_start_using_cruisemesh else R.string.ui_next,
@@ -393,7 +398,13 @@ private fun ProfileSlide(
             onTakePhoto = onTakePhoto,
             onChoosePhoto = onChoosePhoto,
             onRemovePhoto = onRemovePhoto,
-            helperText = stringResource(R.string.ui_onboarding_profile_photo_helper),
+            // Says why the button below is disabled; without it a blank field
+            // and a dead button is a dead end.
+            helperText = if (displayName.isBlank()) {
+                stringResource(R.string.ui_onboarding_name_required)
+            } else {
+                stringResource(R.string.ui_onboarding_profile_photo_helper)
+            },
         )
     }
 }
