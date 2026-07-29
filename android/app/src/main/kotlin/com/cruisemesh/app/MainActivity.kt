@@ -357,7 +357,9 @@ fun CruiseMeshApp(
 private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplete: () -> Unit) {
     val context = LocalContext.current
     val displayId = remember(identity) { formatUserId(identity.userId) }
-    var displayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
+    // Stored name, not the fallback: onboarding must open with an empty field
+    // so the user supplies a real one (see ProfileStore.loadStoredDisplayName).
+    var displayName by remember { mutableStateOf(ProfileStore.loadStoredDisplayName(context)) }
     var avatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
     var permissionRefreshToken by remember { mutableStateOf(0) }
     val meshPermissionsGranted = remember(context, permissionRefreshToken) {
@@ -476,10 +478,9 @@ private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplet
         },
         onRestore = onRestore,
         onComplete = {
-            if (displayName.isBlank()) {
-                displayName = ProfileStore.defaultDisplayName()
-                ProfileStore.saveDisplayName(context, displayName)
-            }
+            // No silent substitution: OnboardingScreen keeps the final button
+            // disabled until a name is entered, so reaching here means the user
+            // chose one.
             if (ProfileStore.loadOwnAvatarEpoch(context) == 0L) {
                 ProfileStore.bumpOwnAvatarEpoch(context)
             }

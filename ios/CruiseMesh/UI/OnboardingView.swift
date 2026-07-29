@@ -20,8 +20,15 @@ struct OnboardingView: View {
     private static let pageCount = 5
     private var lastPage: Int { Self.pageCount - 1 }
 
-    private var defaultName: String {
-        UIDevice.current.name.trimmingCharacters(in: .whitespacesAndNewlines)
+    // There is deliberately no device-name default here. `UIDevice.current.name`
+    // stopped returning the user's chosen device name in iOS 16 unless the app
+    // holds Apple's entitlement for it, so every install gets the bare model
+    // string instead. Pre-filling the profile slide with it made the question
+    // look already answered: testers tapped past and shipped as "iPhone",
+    // indistinguishable from one another in every contact list. The name is now
+    // required and nothing substitutes one silently.
+    private var trimmedName: String {
+        displayName.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     var body: some View {
@@ -70,8 +77,7 @@ struct OnboardingView: View {
                     identity: identity,
                     displayName: $displayName,
                     avatarImage: $avatarImage,
-                    photoItem: $photoItem,
-                    defaultName: defaultName
+                    photoItem: $photoItem
                 )
                 .tag(4)
             }
@@ -105,6 +111,7 @@ struct OnboardingView: View {
                         }
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(page == lastPage && trimmedName.isEmpty)
                 }
             }
             .padding(20)
@@ -130,8 +137,10 @@ struct OnboardingView: View {
     }
 
     private func complete() {
-        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let finalName = trimmed.isEmpty ? defaultName : trimmed
+        // Mirrors the button's own guard: the last slide cannot be completed
+        // without a name, so there is no fallback to fall back to.
+        let finalName = trimmedName
+        guard !finalName.isEmpty else { return }
         ProfileStore.saveDisplayName(finalName)
         appModel.displayName = finalName
         if ProfileStore.loadOwnAvatarEpoch() == 0 {
@@ -201,7 +210,10 @@ private struct ProfileSetupSlide: View {
     @Binding var displayName: String
     @Binding var avatarImage: UIImage?
     @Binding var photoItem: PhotosPickerItem?
-    let defaultName: String
+
+    private var isNameEmpty: Bool {
+        displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var body: some View {
         VStack(spacing: 18) {
@@ -212,19 +224,21 @@ private struct ProfileSetupSlide: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+            // An empty name is fine here: AvatarView falls back to initials
+            // derived from the user id, so the preview is never blank.
             AvatarView(
                 userId: identity.userId,
-                name: displayName.isEmpty ? defaultName : displayName,
+                name: displayName,
                 size: 92,
                 photo: avatarImage
             )
-            TextField("Display name", text: $displayName)
+            TextField("Your name", text: $displayName)
                 .textFieldStyle(.roundedBorder)
-                .onAppear {
-                    if displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        displayName = defaultName
-                    }
-                }
+            if isNameEmpty {
+                Text("Enter a name to continue.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             PhotosPicker(selection: $photoItem, matching: .images) {
                 Label("Choose profile photo", systemImage: "photo")
             }
