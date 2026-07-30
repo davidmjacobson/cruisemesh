@@ -1242,6 +1242,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
         val pushHealthy by MeshConnectivityStatus.pushHealthy.collectAsState()
         val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
         val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
+        val staleRelayContacts by MeshConnectivityStatus.staleRelayContacts.collectAsState()
         val connectivityNowMs = rememberConnectivityNowMs()
         val reachability = remember(contact.userId, nearbyPeerIds, relayHealth, pushHealthy, contactLastSeen, presenceLastSeen, connectivityNowMs) {
             reachabilityLevelForUserId(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs, pushHealthy)
@@ -1304,6 +1305,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             reachability = reachability,
             reachabilityStatusText = reachabilityStatusText,
             reachabilityDetailsText = reachabilityDetailsText,
+            relayCardIsStale = staleRelayContacts.contains(UserIdHex.encode(contact.userId)),
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }

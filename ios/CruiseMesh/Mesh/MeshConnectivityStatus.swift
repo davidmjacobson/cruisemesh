@@ -180,6 +180,15 @@ final class MeshConnectivityStatus: ObservableObject {
     @Published private(set) var nearbyPeerIds: Set<Data> = []
     @Published private(set) var directPaths: [Data: DirectPath] = [:]
     @Published private(set) var relay: RelayHealth = .noConfig
+    /// Contacts whose friend-card relay endpoint has been written off after
+    /// authoritatively rejecting us (core `contact_relay_health`).
+    ///
+    /// Distinct from `relay`, which is our OWN Cruise Pass's health -- both
+    /// can be true at once ("my pass is fine, but their card points at a host
+    /// that no longer knows them"). Published so the contact sheet can say it
+    /// live, instead of a person discovering it from device logs as happened
+    /// in the field. Mirrors MeshConnectivityStatus.kt's staleRelayContacts.
+    @Published private(set) var staleRelayContacts: Set<Data> = []
     @Published private(set) var contactLastSeen: [Data: Int64] = [:]
     @Published private(set) var presenceLastSeen: [Data: Int64] = [:]
 
@@ -198,6 +207,10 @@ final class MeshConnectivityStatus: ObservableObject {
     }
 
     func setRelayHealth(_ health: RelayHealth) { relay = health }
+
+    /// Replaces the whole set each sync pass -- a repaired card must clear as
+    /// promptly as a broken one appears.
+    func setStaleRelayContacts(_ userIds: Set<Data>) { staleRelayContacts = userIds }
 
     func mergeLastSeen(userId: Data, seenAtMs: Int64) {
         if seenAtMs > (contactLastSeen[userId] ?? 0) { contactLastSeen[userId] = seenAtMs }
@@ -225,6 +238,7 @@ final class MeshConnectivityStatus: ObservableObject {
         nearbyPeerIds = []
         directPaths = [:]
         relay = .noConfig
+        staleRelayContacts = []
         contactLastSeen = [:]
         presenceLastSeen = [:]
     }

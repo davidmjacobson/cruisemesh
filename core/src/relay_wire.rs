@@ -220,6 +220,77 @@ pub fn resolved_contact_poll_relay(
     .filter(|endpoint| !relay_token_is_deposit(endpoint.token.clone()))
 }
 
+/// Send-path routing when the contact's card endpoint has been written off
+/// (see [`crate::contact_relay_health`]).
+///
+/// A card whose endpoint authoritatively rejects us is worse than no card at
+/// all: [`resolved_contact_relay`] returns the contact endpoint
+/// unconditionally, so one dead field beats a working alternative *forever*
+/// and the messages never leave the queue. This is that same resolution with
+/// one added rule — a written-off endpoint is skipped, exactly as though the
+/// card had carried no relay fields, which falls through to our own.
+///
+/// Falling back is not a new capability: a card with no relay fields already
+/// resolves to our own endpoint today. It is also the routing that actually
+/// delivers whenever the contact is in our own family (they poll the mailbox
+/// we are posting to) — the common case for somebody we handed a Cruise Pass
+/// to. For a cross-family contact it delivers nothing, but neither did the
+/// dead endpoint, and unlike the dead endpoint this state is surfaced, so a
+/// person can repair the card.
+#[uniffi::export]
+pub fn resolved_contact_delivery_relay(
+    contact_relay_url: Option<String>,
+    contact_relay_token: Option<String>,
+    fallback_url: Option<String>,
+    fallback_token: Option<String>,
+    contact_endpoint_usable: bool,
+) -> Option<RelayEndpoint> {
+    if contact_endpoint_usable {
+        return resolved_contact_relay(
+            contact_relay_url,
+            contact_relay_token,
+            fallback_url,
+            fallback_token,
+        );
+    }
+    let Some(fallback) = relay_endpoint_from(fallback_url, fallback_token) else {
+        return None;
+    };
+    // Only worth a request if it is somewhere other than the host we just
+    // wrote off; otherwise report "nowhere to post" honestly rather than
+    // retrying the same dead host under a different name.
+    match relay_endpoint_from(contact_relay_url, contact_relay_token) {
+        Some(contact) if contact.url == fallback.url => None,
+        _ => Some(fallback),
+    }
+}
+
+/// Poll-path routing with the same written-off rule.
+///
+/// Proxy-polling a written-off endpoint is pure waste — it rejects every
+/// pass exactly as the posts did — so a stale card drops out of the poll set
+/// entirely. There is deliberately no fallback here: our own mailbox is
+/// already polled on its own account, and reading it again under a contact's
+/// heading would fetch nothing new.
+#[uniffi::export]
+pub fn resolved_contact_delivery_poll_relay(
+    contact_relay_url: Option<String>,
+    contact_relay_token: Option<String>,
+    fallback_url: Option<String>,
+    fallback_token: Option<String>,
+    contact_endpoint_usable: bool,
+) -> Option<RelayEndpoint> {
+    if !contact_endpoint_usable {
+        return None;
+    }
+    resolved_contact_poll_relay(
+        contact_relay_url,
+        contact_relay_token,
+        fallback_url,
+        fallback_token,
+    )
+}
+
 fn relay_endpoint_from(url: Option<String>, token: Option<String>) -> Option<RelayEndpoint> {
     let url = normalize_relay_url(url.unwrap_or_default());
     let token = token.unwrap_or_default().trim().to_string();
@@ -852,5 +923,94 @@ mod tests {
             "relay.example:8443"
         );
         assert_eq!(relay_host_only("relay.example"), "relay.example");
+    }
+
+    fn some(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn a_usable_card_endpoint_routes_exactly_as_before() {
+        let usable = resolved_contact_delivery_relay(
+            some("https://theirs.example"),
+            some("their-token"),
+            some("https://ours.example"),
+            some("our-token"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(usable.url, "https://theirs.example");
+        assert_eq!(usable.token, "their-token");
+    }
+
+    #[test]
+    fn a_written_off_card_endpoint_falls_back_to_our_own() {
+        // The whole point: one dead field must stop beating a working
+        // alternative forever.
+        let routed = resolved_contact_delivery_relay(
+            some("https://dead.example"),
+            some("their-token"),
+            some("https://ours.example"),
+            some("our-token"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(routed.url, "https://ours.example");
+        assert_eq!(routed.token, "our-token");
+    }
+
+    #[test]
+    fn a_written_off_endpoint_with_no_alternative_posts_nowhere() {
+        assert_eq!(
+            resolved_contact_delivery_relay(
+                some("https://dead.example"),
+                some("their-token"),
+                None,
+                None,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn falling_back_never_re_posts_to_the_host_we_just_wrote_off() {
+        // Same host, different credential (a family member's card): retrying
+        // it under our own token would be the same hammering with extra
+        // steps.
+        assert_eq!(
+            resolved_contact_delivery_relay(
+                some("https://same.example"),
+                some("their-token"),
+                some("https://same.example"),
+                some("our-token"),
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_written_off_endpoint_drops_out_of_the_poll_set_without_falling_back() {
+        // Polling our own mailbox under a contact's heading would fetch
+        // nothing new -- it is already polled on its own account.
+        assert_eq!(
+            resolved_contact_delivery_poll_relay(
+                some("https://dead.example"),
+                some("their-token"),
+                some("https://ours.example"),
+                some("our-token"),
+                false,
+            ),
+            None
+        );
+        assert!(resolved_contact_delivery_poll_relay(
+            some("https://live.example"),
+            some("their-token"),
+            some("https://ours.example"),
+            some("our-token"),
+            true,
+        )
+        .is_some());
     }
 }
