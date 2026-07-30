@@ -52,6 +52,62 @@ enum class PassIndicator {
 }
 
 /**
+ * True when this health is an actual verdict on the pass rather than "we have
+ * not looked yet". [RelayHealth.Checking] and [RelayHealth.NoConfig] both mean
+ * the absence of an answer -- the latter is what
+ * [MeshConnectivityStatus.clear] leaves behind when the service restarts, and
+ * what a saved-but-unchecked card reports.
+ */
+fun RelayHealth.isPassVerdict(): Boolean =
+    this !is RelayHealth.Checking && this !is RelayHealth.NoConfig
+
+/**
+ * Heading shown at the top of the Cruise Pass screen.
+ *
+ * Pure so the flicker rules below are unit-testable; the copy lives in
+ * `strings.xml` and iOS mirrors this in `PassIndicator.swift`.
+ */
+enum class CruisePassHeading {
+    /** No setup card saved: invite them to add one. */
+    NOT_SET_UP,
+
+    /** A card is saved but no check has landed yet. */
+    CHECKING,
+
+    /** Green check: the relay answered and the pass is good. */
+    READY,
+
+    /** A card is saved and the last check said something other than OK. */
+    CONFIGURED,
+}
+
+/**
+ * Heading for a saved pass, given the live [health] and [lastVerdict] -- the
+ * most recent health that was an actual answer (see [isPassVerdict]).
+ *
+ * Re-checks are not demotions. A background sync pass, or a service restart,
+ * drops health to [RelayHealth.Checking]/[RelayHealth.NoConfig] for a second
+ * or two; without [lastVerdict] the heading would fall from "Cruise Pass is
+ * set up" with its green check to "Cruise Pass is configured" and back, which
+ * reads to the person holding the phone as the pass breaking and healing.
+ * This is the same reasoning that maps those two states to
+ * [PassIndicator.NONE] rather than to a symbol that would only flicker.
+ *
+ * It stays health-only for every real verdict: the moment the relay answers
+ * with anything but OK -- rejected token, expired, no internet -- the green
+ * check goes, because [lastVerdict] is then that answer and not the stale OK.
+ */
+fun cruisePassHeading(
+    health: RelayHealth,
+    configured: Boolean,
+    lastVerdict: RelayHealth?,
+): CruisePassHeading {
+    if (!configured) return CruisePassHeading.NOT_SET_UP
+    val settled = if (health.isPassVerdict()) health else lastVerdict ?: return CruisePassHeading.CHECKING
+    return if (settled is RelayHealth.Ok) CruisePassHeading.READY else CruisePassHeading.CONFIGURED
+}
+
+/**
  * Map relay health to the Settings indicator. [configured] is whether a setup
  * card is saved at all, which [RelayHealth] alone cannot express: a phone
  * that has never had a pass and a phone whose pass is saved but unchecked can

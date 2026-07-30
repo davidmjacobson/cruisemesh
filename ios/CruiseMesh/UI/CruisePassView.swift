@@ -24,6 +24,9 @@ struct CruisePassView: View {
     @State private var showRemoveConfirmation = false
     @State private var customUrl: String
     @State private var customToken: String
+    /// Last health that was an actual answer, so an in-flight re-check keeps
+    /// showing the previous verdict instead of flickering the heading.
+    @State private var lastVerdict: RelayHealth?
 
     init(initialCard: String?, appModel: AppModel) {
         self.initialCard = initialCard
@@ -88,12 +91,19 @@ struct CruisePassView: View {
                 }
             } else {
                 Section {
-                    if configured != nil && isVerified {
+                    switch heading {
+                    case .ready:
                         readyHeading {
                             Text("Cruise Pass is set up")
                         }
-                    } else {
-                        Text(configured == nil ? "Set up your Cruise Pass" : "Cruise Pass is configured")
+                    case .notSetUp:
+                        Text("Set up your Cruise Pass")
+                            .font(.title2.weight(.semibold))
+                    case .checking:
+                        Text("Checking your Cruise Pass")
+                            .font(.title2.weight(.semibold))
+                    case .configured:
+                        Text("Cruise Pass is configured")
                             .font(.title2.weight(.semibold))
                     }
                     if configured == nil {
@@ -261,6 +271,16 @@ struct CruisePassView: View {
                 }
             }
         }
+        // Cleared on a pass swap first, so a new card never inherits the old
+        // card's verdict; then re-latched from whatever health is current.
+        .onChange(of: configured) { _ in lastVerdict = nil }
+        .onChange(of: connectivity.relay) { health in
+            if health.isPassVerdict { lastVerdict = health }
+        }
+        .onAppear {
+            let health = connectivity.relay
+            if health.isPassVerdict { lastVerdict = health }
+        }
         .confirmationDialog(
             "Remove Cruise Pass setup?",
             isPresented: $showRemoveConfirmation,
@@ -322,11 +342,15 @@ struct CruisePassView: View {
         !(initialCard?.isEmpty ?? true)
     }
 
-    // Deliberately health-only: a completed check from minutes ago must not
-    // keep the green check alive after the relay starts rejecting the pass.
-    private var isVerified: Bool {
-        if case .ok = connectivity.relay { return true }
-        return false
+    // Verdict-driven, not health-driven: an in-flight re-check must not demote
+    // the heading (see CruisePassHeading.of), but any real answer other than
+    // OK takes the green check away at once.
+    private var heading: CruisePassHeading {
+        CruisePassHeading.of(
+            connectivity.relay,
+            configured: configured != nil,
+            lastVerdict: lastVerdict
+        )
     }
 
     private func readyHeading<Content: View>(

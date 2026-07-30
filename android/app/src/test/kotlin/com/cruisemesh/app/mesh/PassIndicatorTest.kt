@@ -91,4 +91,100 @@ class PassIndicatorTest {
             )
         }
     }
+
+    @Test
+    fun `no saved pass invites setup whatever the stale health says`() {
+        assertEquals(
+            CruisePassHeading.NOT_SET_UP,
+            cruisePassHeading(RelayHealth.Ok(now), configured = false, lastVerdict = RelayHealth.Ok(now)),
+        )
+    }
+
+    @Test
+    fun `a working pass reads as set up`() {
+        assertEquals(
+            CruisePassHeading.READY,
+            cruisePassHeading(RelayHealth.Ok(now), configured = true, lastVerdict = null),
+        )
+    }
+
+    @Test
+    fun `a re-check does not demote a pass that just verified`() {
+        // Aunt Joan's report: pasting a card showed "Cruise Pass is set up"
+        // with its green check, then flipped to "Cruise Pass is configured"
+        // and back as the first background sync -- and the service restart
+        // that clears health to NoConfig -- passed through. A check in flight
+        // is not evidence against the pass, so the heading must hold.
+        for (health in listOf(RelayHealth.Checking, RelayHealth.NoConfig)) {
+            assertEquals(
+                "$health is an absent answer, not a failing one",
+                CruisePassHeading.READY,
+                cruisePassHeading(health, configured = true, lastVerdict = RelayHealth.Ok(now)),
+            )
+        }
+    }
+
+    @Test
+    fun `a saved pass with no answer yet says it is being checked`() {
+        for (health in listOf(RelayHealth.Checking, RelayHealth.NoConfig)) {
+            assertEquals(
+                CruisePassHeading.CHECKING,
+                cruisePassHeading(health, configured = true, lastVerdict = null),
+            )
+        }
+    }
+
+    @Test
+    fun `any real answer other than OK drops the green check at once`() {
+        // The stickiness above must never outlive a genuine verdict: a pass
+        // the relay has started rejecting loses the check on that answer, not
+        // one sync later.
+        for (health in listOf(
+            RelayHealth.NoInternet,
+            RelayHealth.Failing(now),
+            RelayHealth.Expired(now),
+            RelayHealth.Suspended(now),
+            RelayHealth.TokenRejected(now),
+            RelayHealth.QuotaFull(now),
+            RelayHealth.MessageTooLarge(now),
+            RelayHealth.RateLimited(now),
+        )) {
+            assertEquals(
+                "$health is an answer and must beat the previous OK",
+                CruisePassHeading.CONFIGURED,
+                cruisePassHeading(health, configured = true, lastVerdict = RelayHealth.Ok(now)),
+            )
+        }
+    }
+
+    @Test
+    fun `a check in flight holds a failing verdict too`() {
+        assertEquals(
+            CruisePassHeading.CONFIGURED,
+            cruisePassHeading(
+                RelayHealth.Checking,
+                configured = true,
+                lastVerdict = RelayHealth.TokenRejected(now),
+            ),
+        )
+    }
+
+    @Test
+    fun `only real answers count as verdicts`() {
+        assertEquals(false, RelayHealth.Checking.isPassVerdict())
+        assertEquals(false, RelayHealth.NoConfig.isPassVerdict())
+        for (health in listOf(
+            RelayHealth.Ok(now),
+            RelayHealth.NoInternet,
+            RelayHealth.Failing(now),
+            RelayHealth.Expired(now),
+            RelayHealth.Suspended(now),
+            RelayHealth.TokenRejected(now),
+            RelayHealth.QuotaFull(now),
+            RelayHealth.MessageTooLarge(now),
+            RelayHealth.RateLimited(now),
+        )) {
+            assertEquals("$health is an answer", true, health.isPassVerdict())
+        }
+    }
 }
