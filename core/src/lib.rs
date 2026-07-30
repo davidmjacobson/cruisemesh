@@ -5,6 +5,7 @@ uniffi::setup_scaffolding!("cruisemesh_core");
 
 mod authoring;
 mod backup;
+mod causal_order;
 mod content;
 mod crypto;
 mod deep_link;
@@ -31,6 +32,7 @@ pub use backup::{
     decode_identity_bytes, encode_identity_bytes, open_backup, seal_backup,
     BackupPassphraseStrength, CoreBackupError, CoreBackupPayload,
 };
+pub use causal_order::{causal_display_timestamp, CAUSAL_ORDER_MAX_SKEW_MS};
 pub use content::{
     attachment_max_blob_bytes, decode_attachment_payload, decode_reaction_payload,
     encode_attachment_payload, encode_reaction_payload, AttachmentMediaType, CoreAttachmentPayload,
