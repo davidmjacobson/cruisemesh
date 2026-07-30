@@ -65,25 +65,6 @@ object MediaCompressor {
         }
     }
 
-    fun compressImageFile(path: String): ByteArray? {
-        return try {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(path, bounds)
-            val sample = sampleSizeFor(bounds.outWidth, bounds.outHeight, MAX_EDGE_PX)
-            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-            val decoded = BitmapFactory.decodeFile(path, opts) ?: return null
-            val orientation = ExifInterface(path).getAttributeInt(
-                ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL,
-            )
-            val transformed = transform(decoded, MAX_EDGE_PX, orientation)
-            if (transformed !== decoded) decoded.recycle()
-            compressJpeg(transformed).also { transformed.recycle() }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to compress image file $path: ${e.message}")
-            null
-        }
-    }
-
     private fun sampleSizeFor(width: Int, height: Int, maxEdge: Int): Int {
         var sample = 1
         var w = width

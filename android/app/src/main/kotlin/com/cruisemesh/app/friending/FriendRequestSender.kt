@@ -13,10 +13,6 @@ import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.makeFriendCard
 
 private const val TAG = "FriendRequestSender"
-private const val KIND_FRIEND_REQUEST: UByte = 3u
-
-/** Cumulative-receipt type bytes (DESIGN.md §7.2), mirroring the private
- * copies already established in MainActivity.kt / ChatScreen.kt / MeshService.kt. */
 
 /**
  * Queues the mutual-friending follow-up from DESIGN.md §6.2: once we scan a

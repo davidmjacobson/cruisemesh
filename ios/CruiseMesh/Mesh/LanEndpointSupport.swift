@@ -1,5 +1,4 @@
 import Darwin
-import Foundation
 
 struct LanManualEndpoint: Codable, Equatable {
     let host: String
@@ -22,11 +21,6 @@ func lanEndpointLink(_ endpoint: LanManualEndpoint) -> String {
 func parseLanEndpointLink(_ fragment: String?) -> LanManualEndpoint? {
     guard let endpoint = coreParseLanEndpointLink(fragment: fragment) else { return nil }
     return LanManualEndpoint(host: endpoint.host, port: endpoint.port)
-}
-
-/// The active Wi-Fi IPv4 address. iOS normally exposes Wi-Fi as `en0`.
-func localWifiIPv4Address() -> String? {
-    localWifiIPv4Network()?.address
 }
 
 /// The active Wi-Fi IPv4 address and its advertised subnet prefix.

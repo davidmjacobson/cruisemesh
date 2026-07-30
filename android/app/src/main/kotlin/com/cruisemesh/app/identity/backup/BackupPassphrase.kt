@@ -18,9 +18,6 @@ object BackupPassphrase {
 
     enum class Strength { TOO_SHORT, WEAK, FAIR, STRONG }
 
-    /** True once the passphrase is long enough to be allowed (see [strength] for quality). */
-    fun isAcceptable(passphrase: CharArray): Boolean = passphrase.size >= MIN_LENGTH
-
     /**
      * A coarse strength estimate from length + character-class variety. Not a
      * substitute for a real estimator, just enough to nudge the user off

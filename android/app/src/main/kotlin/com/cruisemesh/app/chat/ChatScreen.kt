@@ -137,9 +137,6 @@ import kotlinx.coroutines.withContext
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
 
-/** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
-private const val KIND_TEXT: kotlin.UByte = 1u
-
 /** `receipt_type` values (DESIGN.md §7.2), for reading own-message tick watermarks out of the store. */
 private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
