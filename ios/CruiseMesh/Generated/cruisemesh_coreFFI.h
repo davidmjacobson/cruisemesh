@@ -1110,6 +1110,11 @@ uint16_t uniffi_cruisemesh_core_fn_func_ble_max_att_value_len(RustCallStatus *_N
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_COMPOSER_REACH
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_COMPOSER_REACH
+RustBuffer uniffi_cruisemesh_core_fn_func_composer_reach(RustBuffer delivery, int8_t own_relay_configured, int8_t contact_nearby, int8_t added_while_nearby, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_COMPUTE_RECIPIENT_HINT
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_COMPUTE_RECIPIENT_HINT
 RustBuffer uniffi_cruisemesh_core_fn_func_compute_recipient_hint(RustBuffer recipient_user_id, int64_t timestamp_ms, RustCallStatus *_Nonnull out_status
@@ -2063,6 +2068,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_ble_default_att_mtu(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_BLE_MAX_ATT_VALUE_LEN
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_BLE_MAX_ATT_VALUE_LEN
 uint16_t uniffi_cruisemesh_core_checksum_func_ble_max_att_value_len(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_COMPOSER_REACH
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_COMPOSER_REACH
+uint16_t uniffi_cruisemesh_core_checksum_func_composer_reach(void
     
 );
 #endif

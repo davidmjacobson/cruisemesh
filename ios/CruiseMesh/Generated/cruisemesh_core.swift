@@ -5244,17 +5244,43 @@ public struct ContactProvenance {
     public var source: UInt8
     public var introducerUserId: Data?
     public var introducedAtMs: Int64
+    /**
+     * Were we standing next to this person when we accepted them? True for a
+     * camera QR scan (co-presence by construction) and for any add where the
+     * peer was in the live nearby set at the time.
+     *
+     * Deliberately not inferred from [`ContactProvenance::source`]: `source =
+     * 0` conflates an in-person scan with a card pasted from an aeroplane,
+     * and those two carry opposite expectations about whether internet
+     * delivery was ever part of the deal. Stores written before this field
+     * existed read as `false` -- unknown, so say the true thing rather than
+     * assume an in-person encounter we have no record of.
+     */
+    public var addedNearby: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(userId: Data, 
         /**
          * 0 = direct QR/link, 1 = introduced by another accepted contact.
-         */source: UInt8, introducerUserId: Data?, introducedAtMs: Int64) {
+         */source: UInt8, introducerUserId: Data?, introducedAtMs: Int64, 
+        /**
+         * Were we standing next to this person when we accepted them? True for a
+         * camera QR scan (co-presence by construction) and for any add where the
+         * peer was in the live nearby set at the time.
+         *
+         * Deliberately not inferred from [`ContactProvenance::source`]: `source =
+         * 0` conflates an in-person scan with a card pasted from an aeroplane,
+         * and those two carry opposite expectations about whether internet
+         * delivery was ever part of the deal. Stores written before this field
+         * existed read as `false` -- unknown, so say the true thing rather than
+         * assume an in-person encounter we have no record of.
+         */addedNearby: Bool) {
         self.userId = userId
         self.source = source
         self.introducerUserId = introducerUserId
         self.introducedAtMs = introducedAtMs
+        self.addedNearby = addedNearby
     }
 }
 
@@ -5274,6 +5300,9 @@ extension ContactProvenance: Equatable, Hashable {
         if lhs.introducedAtMs != rhs.introducedAtMs {
             return false
         }
+        if lhs.addedNearby != rhs.addedNearby {
+            return false
+        }
         return true
     }
 
@@ -5282,6 +5311,7 @@ extension ContactProvenance: Equatable, Hashable {
         hasher.combine(source)
         hasher.combine(introducerUserId)
         hasher.combine(introducedAtMs)
+        hasher.combine(addedNearby)
     }
 }
 
@@ -5296,7 +5326,8 @@ public struct FfiConverterTypeContactProvenance: FfiConverterRustBuffer {
                 userId: FfiConverterData.read(from: &buf), 
                 source: FfiConverterUInt8.read(from: &buf), 
                 introducerUserId: FfiConverterOptionData.read(from: &buf), 
-                introducedAtMs: FfiConverterInt64.read(from: &buf)
+                introducedAtMs: FfiConverterInt64.read(from: &buf), 
+                addedNearby: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -5305,6 +5336,7 @@ public struct FfiConverterTypeContactProvenance: FfiConverterRustBuffer {
         FfiConverterUInt8.write(value.source, into: &buf)
         FfiConverterOptionData.write(value.introducerUserId, into: &buf)
         FfiConverterInt64.write(value.introducedAtMs, into: &buf)
+        FfiConverterBool.write(value.addedNearby, into: &buf)
     }
 }
 
@@ -9583,6 +9615,111 @@ extension BackupPassphraseStrength: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Which direction of a one-to-one conversation cannot carry beyond
+ * Bluetooth range, decided entirely from local facts -- no network call, no
+ * round trip, and no evidence of the other phone's current state.
+ *
+ * The asymmetry this exists to explain: sending needs nothing of your own
+ * (their friend card carries the credential that authorises a post into
+ * *their* mailbox), but receiving needs a mailbox you poll, which needs a
+ * pass of your own. So a person with no pass can reach everyone and be
+ * reached by no one, and today both people believe they are connected.
+ */
+
+public enum ComposerReach {
+    
+    /**
+     * Say nothing. Either a path exists in both directions, or the contact
+     * is nearby right now, or we met them in person and nearby delivery was
+     * always the point.
+     */
+    case fine
+    /**
+     * We have no mailbox of our own: we can post to them, but their replies
+     * have nowhere to land until we hold a pass or they come back in range.
+     */
+    case repliesCannotReachMe
+    /**
+     * They shared no internet delivery: our messages wait for range.
+     */
+    case theyCannotBeReached
+    /**
+     * Neither of us has a mailbox. Nothing crosses in either direction
+     * unless the phones are near each other.
+     */
+    case neitherDirectionWorks
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeComposerReach: FfiConverterRustBuffer {
+    typealias SwiftType = ComposerReach
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ComposerReach {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .fine
+        
+        case 2: return .repliesCannotReachMe
+        
+        case 3: return .theyCannotBeReached
+        
+        case 4: return .neitherDirectionWorks
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ComposerReach, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .fine:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .repliesCannotReachMe:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .theyCannotBeReached:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .neitherDirectionWorks:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposerReach_lift(_ buf: RustBuffer) throws -> ComposerReach {
+    return try FfiConverterTypeComposerReach.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposerReach_lower(_ value: ComposerReach) -> RustBuffer {
+    return FfiConverterTypeComposerReach.lower(value)
+}
+
+
+
+extension ComposerReach: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Whether a contact can be reached at all when no direct path exists.
  *
  * This answers the one question a chat app trained on Signal and WhatsApp
@@ -12098,6 +12235,29 @@ public func bleMaxAttValueLen() -> UInt16 {
 })
 }
 /**
+ * What (if anything) the composer should say about a one-to-one chat.
+ *
+ * `contact_nearby` must come from the same live link lookup the send path
+ * uses -- when a direct BLE/LAN link exists, everything works and the
+ * composer stays quiet. `added_while_nearby` is
+ * `ContactProvenance::added_nearby`: adding someone in person carries an
+ * implicit "we are standing together, nearby delivery is the point", so that
+ * case stays silent rather than nagging about a limit both people chose.
+ * Being introduced remotely carries the opposite implication -- the whole
+ * encounter was internet-mediated -- so the absence of a mailbox is a genuine
+ * surprise and gets said out loud.
+ */
+public func composerReach(delivery: ContactDelivery, ownRelayConfigured: Bool, contactNearby: Bool, addedWhileNearby: Bool) -> ComposerReach {
+    return try!  FfiConverterTypeComposerReach.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_composer_reach(
+        FfiConverterTypeContactDelivery.lower(delivery),
+        FfiConverterBool.lower(ownRelayConfigured),
+        FfiConverterBool.lower(contactNearby),
+        FfiConverterBool.lower(addedWhileNearby),$0
+    )
+})
+}
+/**
  * `recipient_hint` for an envelope's §6.4 header: `BLAKE2b-8(recipient
  * UserID || day number)`, where the day number is `timestamp_ms` divided
  * into whole days since the Unix epoch. Deterministic given the same
@@ -13772,6 +13932,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_ble_max_att_value_len() != 51624) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_composer_reach() != 10891) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_compute_recipient_hint() != 63461) {

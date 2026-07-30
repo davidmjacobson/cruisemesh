@@ -1424,6 +1424,14 @@ final class MeshController: ObservableObject {
     // handler here) -- now propagate; everything else (provenance,
     // suggestion cleanup, outbound profile-sync queueing, receipts) stays
     // best-effort `try?`, same as before.
+    /// Was this peer in range when we accepted them? Recorded in
+    /// `ContactProvenance.addedNearby` so the composer can stay quiet about
+    /// nearby-only delivery for people we actually met, and say it plainly for
+    /// people who only ever arrived over the internet.
+    private func peerIsNearby(_ userId: Data) -> Bool {
+        MeshConnectivityStatus.shared.nearbyPeerIds.contains(userId)
+    }
+
     private func handleIncomingFriendRequest(
         sourceAddress: String?,
         senderUserId: Data,
@@ -1456,7 +1464,8 @@ final class MeshController: ObservableObject {
             userId: senderUserId,
             source: pending == nil ? 0 : 1,
             introducerUserId: pending?.introducerUserId,
-            introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000),
+            addedNearby: peerIsNearby(senderUserId)
         ))
         if pending != nil { try? store.removeFriendSuggestion(candidateUserId: senderUserId) }
         ProfileSyncSender.queueToContact(
@@ -1782,7 +1791,8 @@ final class MeshController: ObservableObject {
             userId: senderUserId,
             source: 1,
             introducerUserId: introducer.userId,
-            introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000),
+            addedNearby: peerIsNearby(senderUserId)
         ))
         try? store.removeFriendSuggestion(candidateUserId: senderUserId)
         _ = try store.insertMessage(message: StoredMessage(

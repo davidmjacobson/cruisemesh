@@ -1064,6 +1064,20 @@ internal class InboundEnvelopeProcessor(
     }
 
     /**
+     * Was this peer in range when we accepted them? Recorded in
+     * [ContactProvenance.addedNearby] so the composer can stay quiet about
+     * nearby-only delivery for people we actually met, and say it plainly for
+     * people who only ever arrived over the internet.
+     *
+     * A direct BLE arrival counts on its own: the envelope came off a link to
+     * their phone, which is the strongest evidence of range there is. The
+     * nearby set covers the LAN case (and a BLE peer whose HELLO landed under
+     * a different address).
+     */
+    private fun peerIsNearby(senderUserId: ByteArray, directBle: Boolean): Boolean =
+        directBle || MeshConnectivityStatus.nearbyPeerIds.value.contains(UserIdHex.encode(senderUserId))
+
+    /**
      * Stores a signed `kind=3` friend request in the hidden lamport stream and
      * imports/updates the sender as a contact from the authenticated payload.
      * The payload is a FriendCard JSON string, but unlike a QR scan we can
@@ -1109,6 +1123,7 @@ internal class InboundEnvelopeProcessor(
                 source = if (pendingSuggestion == null) 0u else 1u,
                 introducerUserId = pendingSuggestion?.introducerUserId,
                 introducedAtMs = System.currentTimeMillis(),
+                addedNearby = peerIsNearby(senderUserId, directBle),
             ),
         )
         if (pendingSuggestion != null) store.removeFriendSuggestion(senderUserId)
@@ -1360,6 +1375,7 @@ internal class InboundEnvelopeProcessor(
                 source = 1u,
                 introducerUserId = introducer.userId,
                 introducedAtMs = System.currentTimeMillis(),
+                addedNearby = peerIsNearby(senderUserId, directBle),
             ),
         )
         store.removeFriendSuggestion(senderUserId)
