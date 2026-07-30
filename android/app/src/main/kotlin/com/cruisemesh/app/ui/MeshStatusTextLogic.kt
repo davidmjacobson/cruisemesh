@@ -8,6 +8,11 @@ enum class MeshStatusDotColor { GREEN, BLUE, AMBER, NEUTRAL }
 
 data class MeshStatusPillStatus(val text: String, val dot: MeshStatusDotColor?)
 
+enum class InternetDeliveryService(val displayName: String) {
+    CRUISE_PASS("Cruise Pass"),
+    CUSTOM_RELAY("relay"),
+}
+
 /**
  * Pure builder for the mesh status pill: text
  * composed from three axes (mesh runtime state x nearby peer count x relay
@@ -19,19 +24,31 @@ object MeshStatusTextLogic {
         runtimeState: MeshRuntimeState,
         nearbyCount: Int,
         relayHealth: RelayHealth,
+        internetDeliveryService: InternetDeliveryService?,
     ): MeshStatusPillStatus {
         if (runtimeState != MeshRuntimeState.ACTIVE) {
             return MeshStatusPillStatus(runtimeState.label, MeshStatusDotColor.NEUTRAL)
         }
+        val serviceName = internetDeliveryService?.displayName ?: "internet delivery"
         val relaySuffix = when (relayHealth) {
-            is RelayHealth.Ok -> "Cruise Pass ✓"
-            RelayHealth.Checking -> "checking Cruise Pass"
+            is RelayHealth.Ok -> "$serviceName ✓"
+            RelayHealth.Checking -> "checking $serviceName"
             RelayHealth.NoInternet -> "no internet"
-            RelayHealth.NoConfig -> "no Cruise Pass set up"
-            is RelayHealth.Failing -> "Cruise Pass unreachable"
-            is RelayHealth.Expired -> "Cruise Pass expired"
-            is RelayHealth.Suspended -> "Cruise Pass suspended"
-            is RelayHealth.TokenRejected -> "Cruise Pass token rejected"
+            RelayHealth.NoConfig -> "no internet delivery set up"
+            is RelayHealth.Failing -> "$serviceName unreachable"
+            is RelayHealth.Expired ->
+                if (internetDeliveryService == InternetDeliveryService.CRUISE_PASS) {
+                    "Cruise Pass expired"
+                } else {
+                    "$serviceName pass expired"
+                }
+            is RelayHealth.Suspended ->
+                if (internetDeliveryService == InternetDeliveryService.CRUISE_PASS) {
+                    "Cruise Pass suspended"
+                } else {
+                    "$serviceName pass suspended"
+                }
+            is RelayHealth.TokenRejected -> "$serviceName token rejected"
             is RelayHealth.QuotaFull -> "storage full"
             is RelayHealth.MessageTooLarge -> "message too large"
             is RelayHealth.RateLimited -> "syncing slowed"
