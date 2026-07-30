@@ -17,6 +17,7 @@ struct FriendsView: View {
     @State private var chatContact: Contact?
     @State private var suggestions: [FriendSuggestion] = []
     @State private var showAddAllConfirmation = false
+    @FocusState private var pasteFocused: Bool
 
     private var groupedSuggestions: [(Data, [FriendSuggestion])] {
         Dictionary(grouping: suggestions, by: { $0.candidate.userId })
@@ -85,10 +86,11 @@ struct FriendsView: View {
                 Section("Paste friend card") {
                     TextField("Friend card", text: $pasteText, axis: .vertical)
                         .lineLimit(3...8)
+                        .focused($pasteFocused)
                     HStack {
                         Button("Paste") { pasteText = UIPasteboard.general.string ?? "" }
                         Spacer()
-                        Button("Preview friend") { previewText(pasteText) }
+                        Button("Preview friend") { submitPaste() }
                     }
                 }
                 Section("Friends") {
@@ -128,9 +130,18 @@ struct FriendsView: View {
                 }
             }
             .navigationTitle("Friends")
+            .scrollDismissesKeyboard(.interactively)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done", action: onDone)
+                }
+                // The keyboard covers the "Preview friend" button under the
+                // paste field, so the only way forward used to be dismissing
+                // the keyboard first. Put the same action above the keyboard.
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Preview friend") { submitPaste() }
+                        .disabled(pasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
             .sheet(isPresented: $showMyQR) {
@@ -222,6 +233,12 @@ struct FriendsView: View {
         reload()
     }
 
+    /// Drop the keyboard before previewing so the sheet is not fighting it.
+    private func submitPaste() {
+        pasteFocused = false
+        previewText(pasteText)
+    }
+
     private func previewText(_ text: String) {
         do {
             let card = try parseFriendText(text: text)
@@ -238,13 +255,12 @@ struct FriendsView: View {
                 relayUrl: card.relayUrl,
                 relayToken: card.relayToken
             )
-            let collision = ((try? AppStore.get().listContacts()) ?? []).first {
-                $0.name.caseInsensitiveCompare(contact.name) == .orderedSame && $0.userId != contact.userId
-            }
-            let warning = collision == nil ? nil :
-                "You already have a \(contact.name); this card has different security keys. Compare the fingerprint words before adding it."
+            let match = friendCardMatch(
+                candidate: contact,
+                existing: (try? AppStore.get().listContacts()) ?? []
+            )
             UINotificationFeedbackGenerator().notificationOccurred(.success)
-            preview = FriendPreviewState(contact: contact, warning: warning)
+            preview = FriendPreviewState(contact: contact, match: match)
         } catch {
             self.error = text.contains("CMFRIEND")
                 ? "That looks like a friend card but part of it is missing. Copy the whole message and try again."

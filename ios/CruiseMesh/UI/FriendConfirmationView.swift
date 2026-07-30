@@ -2,7 +2,9 @@ import SwiftUI
 
 struct FriendPreviewState: Identifiable {
     let contact: Contact
-    let warning: String?
+    /// How this card relates to contacts already saved, decided in core so both
+    /// shells agree (`friend_card_match`).
+    let match: FriendCardMatch
     var id: String { UserIdHex.encode(contact.userId) }
 }
 
@@ -31,23 +33,93 @@ struct FriendIdentityBlock: View {
     }
 }
 
+/// One friend's safety words, labelled, so two of them can be read side by side.
+struct SafetyWordsRow: View {
+    let label: String
+    let userId: Data
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(fingerprintWords(userId: userId).joined(separator: " "))
+                .font(.body.monospaced())
+                .textSelection(.enabled)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 struct FriendPreviewView: View {
     let state: FriendPreviewState
     let onConfirm: () -> Void
     @Environment(\.dismiss) private var dismiss
 
+    private var isUpdate: Bool {
+        if case .alreadySaved = state.match { return true }
+        return false
+    }
+
     var body: some View {
-        VStack(spacing: 18) {
-            Text("Add this friend?").font(.title.bold())
-            FriendIdentityBlock(contact: state.contact)
-            if let warning = state.warning {
-                Text(warning).foregroundStyle(.red).font(.callout)
+        ScrollView {
+            VStack(spacing: 18) {
+                Text(isUpdate ? "Update this friend?" : "Add this friend?").font(.title.bold())
+                FriendIdentityBlock(contact: state.contact)
+                matchNote
+                Button(isUpdate ? "Update this friend" : "Add this friend", action: onConfirm)
+                    .buttonStyle(.borderedProminent)
+                Button("Cancel", role: .cancel) { dismiss() }
             }
-            Button("Add this friend", action: onConfirm).buttonStyle(.borderedProminent)
-            Button("Cancel", role: .cancel) { dismiss() }
+            .padding(24)
         }
-        .padding(24)
         .presentationDetents([.medium, .large])
+    }
+
+    @ViewBuilder
+    private var matchNote: some View {
+        switch state.match {
+        case .new:
+            EmptyView()
+
+        case let .alreadySaved(savedName, nameSharedWithOther):
+            // Not a warning: the card's UserID is derived from its signing key,
+            // so a card already on file is the same person re-sharing.
+            VStack(spacing: 8) {
+                Text("You already have this friend, saved as \(savedName). Adding the card again just updates how your phone reaches them.")
+                    .font(.callout)
+                    .multilineTextAlignment(.center)
+                if nameSharedWithOther {
+                    // Two contacts show the same name, so name alone cannot say
+                    // which one this is. The safety words can.
+                    VStack(spacing: 6) {
+                        Text("Another friend also shows as \(savedName). This card belongs to the one with these safety words:")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        SafetyWordsRow(label: savedName, userId: state.contact.userId)
+                        Text("Give one of them a nickname so you can tell them apart.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                }
+            }
+
+        case let .nameTaken(otherUserId, otherName):
+            VStack(spacing: 10) {
+                Text("You already have a different friend named \(otherName). This card is someone else, with different security keys.")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                SafetyWordsRow(label: String(localized: "This card"), userId: state.contact.userId)
+                SafetyWordsRow(label: otherName, userId: otherUserId)
+                Text("Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
     }
 }
 

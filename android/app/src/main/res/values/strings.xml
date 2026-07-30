@@ -27,7 +27,9 @@
     <string name="ui_all_of_your_contacts_are_already_in_this">All of your contacts are already in this group.</string>
     <string name="ui_all_quiet_on_deck">All quiet on deck</string>
     <string name="ui_already_set_up_restore_from_a_backup">Already set up? Restore from a backup</string>
+    <string name="ui_another_friend_also_shows_as">Another friend also shows as %1$s. This card belongs to the one with these safety words:</string>
     <string name="ui_ask_them_to_check_these_words_match_their">Ask them to check these words match their card.</string>
+    <string name="ui_ask_them_to_read_their_safety_words_aloud">Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them.</string>
     <string name="ui_back">Back</string>
     <string name="ui_back_up_account">Back up account</string>
     <string name="ui_block">Block</string>
@@ -376,4 +378,10 @@
     <string name="ui_details">Details</string>
     <string name="ui_hide_details">Hide details</string>
     <string name="ui_delivery_stale_card_hint">If your messages are not arriving, ask them to share their friend card again. A card carries the service they used when they shared it.</string>
+    <string name="ui_update_this_friend_question">Update this friend?</string>
+    <string name="ui_update_this_friend">Update this friend</string>
+    <string name="ui_you_already_have_this_friend_saved_as">You already have this friend, saved as %1$s. Adding the card again just updates how your phone reaches them.</string>
+    <string name="ui_you_already_have_a_different_friend_named">You already have a different friend named %1$s. This card is someone else, with different security keys.</string>
+    <string name="ui_give_one_of_them_a_nickname">Give one of them a nickname so you can tell them apart.</string>
+    <string name="ui_this_card">This card</string>
 </resources>

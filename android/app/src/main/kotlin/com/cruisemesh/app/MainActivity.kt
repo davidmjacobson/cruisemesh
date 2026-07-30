@@ -115,6 +115,7 @@ import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.deepLinkRoute
 import uniffi.cruisemesh_core.fingerprintWords
+import uniffi.cruisemesh_core.friendCardMatch
 import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.generateIdentity
 import uniffi.cruisemesh_core.Contact
@@ -1054,14 +1055,9 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
                             relayUrl = card.relayUrl,
                             relayToken = card.relayToken,
                     )
-                    val collision = store.listContacts().firstOrNull {
-                        it.name.equals(candidate.name, ignoreCase = true) &&
-                            !it.userId.contentEquals(candidate.userId)
-                    }
-                    val warning = collision?.let {
-                        "You already have a ${candidate.name}; this card has different security keys. Compare the fingerprint words before adding it."
-                    }
-                    ImportFriendResult.Preview(FriendPreview(candidate, warning))
+                    ImportFriendResult.Preview(
+                        FriendPreview(candidate, friendCardMatch(candidate, store.listContacts())),
+                    )
                 }
             } catch (_: Exception) {
                 if (text.contains("CMFRIEND")) {

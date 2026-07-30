@@ -131,6 +131,16 @@
         }
       }
     },
+    "Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them."
+          }
+        }
+      }
+    },
     "Attach": {
       "localizations": {
         "en": {
@@ -847,6 +857,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Give CruiseMesh more ways to connect"
+          }
+        }
+      }
+    },
+    "Give one of them a nickname so you can tell them apart.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Give one of them a nickname so you can tell them apart."
           }
         }
       }
@@ -2241,6 +2261,16 @@
         }
       }
     },
+    "This card": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This card"
+          }
+        }
+      }
+    },
     "This is what people see when you share your friend card or add each other nearby. You can change it anytime.": {
       "localizations": {
         "en": {
@@ -2347,6 +2377,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Unsupported attachment"
+          }
+        }
+      }
+    },
+    "Update this friend": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Update this friend"
+          }
+        }
+      }
+    },
+    "Update this friend?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Update this friend?"
           }
         }
       }
