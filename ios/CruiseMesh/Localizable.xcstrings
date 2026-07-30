@@ -441,6 +441,16 @@
         }
       }
     },
+    "Cruise Pass is configured": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cruise Pass is configured"
+          }
+        }
+      }
+    },
     "Cruise Pass is ready on this phone.": {
       "localizations": {
         "en": {
@@ -1897,6 +1907,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Set up this relay?"
+          }
+        }
+      }
+    },
+    "Set up your Cruise Pass": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set up your Cruise Pass"
           }
         }
       }
