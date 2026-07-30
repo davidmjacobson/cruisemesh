@@ -3,21 +3,22 @@ package com.cruisemesh.app.ui
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.RelayHealth
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 class MeshStatusTextLogicTest {
 
     @Test
-    fun `active with nearby peers and healthy relay`() {
+    fun `active with nearby peers and healthy Cruise Pass`() {
         val status = MeshStatusTextLogic.build(MeshRuntimeState.ACTIVE, 3, RelayHealth.Ok(0L))
-        assertEquals("Mesh on · 3 nearby · relay ✓", status.text)
+        assertEquals("Mesh on · 3 nearby · Cruise Pass ✓", status.text)
         assertEquals(MeshStatusDotColor.GREEN, status.dot)
     }
 
     @Test
-    fun `active with no peers and healthy relay`() {
+    fun `active with no peers and healthy Cruise Pass`() {
         val status = MeshStatusTextLogic.build(MeshRuntimeState.ACTIVE, 0, RelayHealth.Ok(0L))
-        assertEquals("Mesh on · relay ✓", status.text)
+        assertEquals("Mesh on · Cruise Pass ✓", status.text)
         assertEquals(MeshStatusDotColor.BLUE, status.dot)
     }
 
@@ -36,24 +37,46 @@ class MeshStatusTextLogicTest {
     }
 
     @Test
-    fun `active with relay failing`() {
+    fun `active with Cruise Pass failing`() {
         val status = MeshStatusTextLogic.build(MeshRuntimeState.ACTIVE, 0, RelayHealth.Failing(0L))
-        assertEquals("Mesh on · relay unreachable", status.text)
+        assertEquals("Mesh on · Cruise Pass unreachable", status.text)
         assertEquals(MeshStatusDotColor.AMBER, status.dot)
     }
 
     @Test
     fun `active with own token rejected names the cause instead of generic unreachable`() {
         val status = MeshStatusTextLogic.build(MeshRuntimeState.ACTIVE, 0, RelayHealth.TokenRejected(0L))
-        assertEquals("Mesh on · relay token rejected", status.text)
+        assertEquals("Mesh on · Cruise Pass token rejected", status.text)
         assertEquals(MeshStatusDotColor.AMBER, status.dot)
     }
 
     @Test
-    fun `active with no relay configured`() {
+    fun `active with no Cruise Pass configured`() {
         val status = MeshStatusTextLogic.build(MeshRuntimeState.ACTIVE, 0, RelayHealth.NoConfig)
-        assertEquals("Mesh on · no relay set up", status.text)
+        assertEquals("Mesh on · no Cruise Pass set up", status.text)
         assertEquals(MeshStatusDotColor.AMBER, status.dot)
+    }
+
+    @Test
+    fun `active status copy never exposes relay terminology`() {
+        val healthStates = listOf(
+            RelayHealth.Ok(0L),
+            RelayHealth.Checking,
+            RelayHealth.NoInternet,
+            RelayHealth.NoConfig,
+            RelayHealth.Failing(0L),
+            RelayHealth.Expired(0L),
+            RelayHealth.Suspended(0L),
+            RelayHealth.TokenRejected(0L),
+            RelayHealth.QuotaFull(0L),
+            RelayHealth.MessageTooLarge(0L),
+            RelayHealth.RateLimited(0L),
+        )
+
+        for (health in healthStates) {
+            val copy = MeshStatusTextLogic.build(MeshRuntimeState.ACTIVE, 0, health).text
+            assertFalse(copy.contains("relay", ignoreCase = true))
+        }
     }
 
     @Test

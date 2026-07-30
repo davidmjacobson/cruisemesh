@@ -24,14 +24,14 @@ object MeshStatusTextLogic {
             return MeshStatusPillStatus(runtimeState.label, MeshStatusDotColor.NEUTRAL)
         }
         val relaySuffix = when (relayHealth) {
-            is RelayHealth.Ok -> "relay ✓"
+            is RelayHealth.Ok -> "Cruise Pass ✓"
             RelayHealth.Checking -> "checking Cruise Pass"
             RelayHealth.NoInternet -> "no internet"
-            RelayHealth.NoConfig -> "no relay set up"
-            is RelayHealth.Failing -> "relay unreachable"
-            is RelayHealth.Expired -> "pass expired"
-            is RelayHealth.Suspended -> "pass suspended"
-            is RelayHealth.TokenRejected -> "relay token rejected"
+            RelayHealth.NoConfig -> "no Cruise Pass set up"
+            is RelayHealth.Failing -> "Cruise Pass unreachable"
+            is RelayHealth.Expired -> "Cruise Pass expired"
+            is RelayHealth.Suspended -> "Cruise Pass suspended"
+            is RelayHealth.TokenRejected -> "Cruise Pass token rejected"
             is RelayHealth.QuotaFull -> "storage full"
             is RelayHealth.MessageTooLarge -> "message too large"
             is RelayHealth.RateLimited -> "syncing slowed"
