@@ -182,6 +182,8 @@ fun ChatScreen(
     reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
     reachabilityStatusText: String = ContactReachability.chatHeaderCopy(ReachabilityLevel.OFFLINE, null, 0L),
     reachabilityDetailsText: String = reachabilityStatusText,
+    /** Their friend card's relay endpoint has been written off after rejecting us (core `contact_relay_health`). */
+    relayCardIsStale: Boolean = false,
 ) {
     val context = LocalContext.current
     var currentContact by remember(contact.userId) { mutableStateOf(contact) }
@@ -401,6 +403,7 @@ fun ChatScreen(
         reachability = reachability,
         reachabilityStatusText = reachabilityStatusText,
         reachabilityDetailsText = reachabilityDetailsText,
+        relayCardIsStale = relayCardIsStale,
         isMuted = isMuted,
         onMutedChange = {
             isMuted = it
@@ -459,6 +462,8 @@ private fun ConversationScreen(
     reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
     reachabilityStatusText: String = ContactReachability.chatHeaderCopy(ReachabilityLevel.OFFLINE, null, 0L),
     reachabilityDetailsText: String = reachabilityStatusText,
+    /** Their friend card's relay endpoint has been written off after rejecting us (core `contact_relay_health`). */
+    relayCardIsStale: Boolean = false,
     isMuted: Boolean = false,
     onMutedChange: (Boolean) -> Unit = {},
     onSetNickname: (String?) -> Unit = {},
@@ -631,6 +636,7 @@ private fun ConversationScreen(
                     isBlocked = isBlocked,
                     onBlockedChange = onBlockedChange,
                     onReport = onReport,
+                    relayCardIsStale = relayCardIsStale,
                     avatarBytes = contactAvatar,
                     onDeleteContact = {
                         showContactDetails = false

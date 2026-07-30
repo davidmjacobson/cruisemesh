@@ -1,16 +1,6 @@
 {
   "sourceLanguage": "en",
   "strings": {
-    "A message is too large to send": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "A message is too large to send"
-          }
-        }
-      }
-    },
     "About & legal": {
       "localizations": {
         "en": {
@@ -231,16 +221,6 @@
         }
       }
     },
-    "Captured diagnostics deleted.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Captured diagnostics deleted."
-          }
-        }
-      }
-    },
     "Check and save": {
       "localizations": {
         "en": {
@@ -431,16 +411,6 @@
         }
       }
     },
-    "Cruise Pass is catching up": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Cruise Pass is catching up"
-          }
-        }
-      }
-    },
     "Cruise Pass is ready on this phone.": {
       "localizations": {
         "en": {
@@ -457,16 +427,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Cruise Pass is set up"
-          }
-        }
-      }
-    },
-    "Cruise Pass storage is full": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Cruise Pass storage is full"
           }
         }
       }
@@ -597,36 +557,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Details"
-          }
-        }
-      }
-    },
-    "Diagnostic logging": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Diagnostic logging"
-          }
-        }
-      }
-    },
-    "Diagnostic logging is off. What was already captured is kept until you delete it.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Diagnostic logging is off. What was already captured is kept until you delete it."
-          }
-        }
-      }
-    },
-    "Diagnostic logging is on. Reproduce the problem, then return here to share it.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Diagnostic logging is on. Reproduce the problem, then return here to share it."
           }
         }
       }
@@ -891,16 +821,6 @@
         }
       }
     },
-    "Hide details": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Hide details"
-          }
-        }
-      }
-    },
     "History contains only friend identity, path type, event type, and time. It never stores message content, relay tokens, IP addresses, or Wi-Fi names.": {
       "localizations": {
         "en": {
@@ -997,16 +917,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Internet delivery"
-          }
-        }
-      }
-    },
-    "Internet delivery is paused until your family collects waiting messages.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Internet delivery is paused until your family collects waiting messages."
           }
         }
       }
@@ -1161,16 +1071,6 @@
         }
       }
     },
-    "Message too large": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Message too large"
-          }
-        }
-      }
-    },
     "Messages are end-to-end encrypted, so CruiseMesh cannot proactively read them. You can block a contact and report abuse from their contact details.": {
       "localizations": {
         "en": {
@@ -1261,16 +1161,6 @@
         }
       }
     },
-    "No diagnostics captured this session yet.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "No diagnostics captured this session yet."
-          }
-        }
-      }
-    },
     "No friends added yet.": {
       "localizations": {
         "en": {
@@ -1311,16 +1201,6 @@
         }
       }
     },
-    "Not shared — nearby delivery only": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Not shared — nearby delivery only"
-          }
-        }
-      }
-    },
     "Notice": {
       "localizations": {
         "en": {
@@ -1337,26 +1217,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "OK"
-          }
-        }
-      }
-    },
-    "One message can’t be sent over internet delivery. Other messages still deliver.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "One message can’t be sent over internet delivery. Other messages still deliver."
-          }
-        }
-      }
-    },
-    "One of your messages is too large to send over internet delivery. Try a smaller photo or a shorter message. Other messages still deliver normally.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "One of your messages is too large to send over internet delivery. Try a smaller photo or a shorter message. Other messages still deliver normally."
           }
         }
       }
@@ -2011,16 +1871,6 @@
         }
       }
     },
-    "Show less": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Show less"
-          }
-        }
-      }
-    },
     "Show my friend card": {
       "localizations": {
         "en": {
@@ -2071,26 +1921,6 @@
         }
       }
     },
-    "Storage full": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Storage full"
-          }
-        }
-      }
-    },
-    "Storage full · delivery paused": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Storage full · delivery paused"
-          }
-        }
-      }
-    },
     "Strength": {
       "localizations": {
         "en": {
@@ -2117,46 +1947,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Support"
-          }
-        }
-      }
-    },
-    "Syncing is slowed right now. It recovers on its own.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Syncing is slowed right now. It recovers on its own."
-          }
-        }
-      }
-    },
-    "Syncing is slowed right now. Your messages are still queued and will be delivered. It recovers on its own.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Syncing is slowed right now. Your messages are still queued and will be delivered. It recovers on its own."
-          }
-        }
-      }
-    },
-    "Syncing is slowed · recovers on its own": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Syncing is slowed · recovers on its own"
-          }
-        }
-      }
-    },
-    "Syncing slowed": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Syncing slowed"
           }
         }
       }
@@ -2221,12 +2011,22 @@
         }
       }
     },
-    "The space that holds your family’s waiting messages is full. Delivery resumes as your family’s phones collect their messages, or as older ones expire. If it stays full, contact support@cruisemesh.app.": {
+    "The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Cruise Pass is set up, then share their friend card again. Messages still deliver when you are near each other.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The space that holds your family’s waiting messages is full. Delivery resumes as your family’s phones collect their messages, or as older ones expire. If it stays full, contact support@cruisemesh.app."
+            "value": "The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Cruise Pass is set up, then share their friend card again. Messages still deliver when you are near each other."
+          }
+        }
+      }
+    },
+    "Their friend card is out of date": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Their friend card is out of date"
           }
         }
       }
@@ -2357,26 +2157,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Use a different Cruise Pass"
-          }
-        }
-      }
-    },
-    "Uses their own service": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Uses their own service"
-          }
-        }
-      }
-    },
-    "Uses your Cruise Pass": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Uses your Cruise Pass"
           }
         }
       }
