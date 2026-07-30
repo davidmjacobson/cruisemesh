@@ -1,5 +1,3 @@
-import Foundation
-
 /// Message body `kind` values (DESIGN.md §7.1) — must match Android + Rust.
 enum ProtocolKind {
     static let text: UInt8 = 1
@@ -12,7 +10,6 @@ enum ProtocolKind {
     static let lanEndpointHint: UInt8 = 8
     static let relayUpdate: UInt8 = 9
     static let attachmentManifest: UInt8 = 16
-    static let attachmentChunk: UInt8 = 17
     static let reaction: UInt8 = 18
     static let groupMetadataUpdate: UInt8 = 19
 }
@@ -36,7 +33,6 @@ enum MeshDefaults {
     static let relayStoreBatchLimit: UInt64 = 128
     static let ownOutboundSprayBudgetBytes: UInt64 = 256 * 1024
     static let ownReceiptSprayBudgetBytes: UInt64 = 64 * 1024
-    static let relayPollIntervalNs: UInt64 = 60_000_000_000
 }
 
 func isVisibleChatKind(_ kind: UInt8) -> Bool {
@@ -77,18 +73,4 @@ func carriedHopTtl(_ authoredHopTtl: UInt8) -> UInt8 {
 /// underflowing.
 func arrivalHopsTaken(receivedHopTtl: UInt8, initialHopTtl: UInt8 = MeshDefaults.hopTtl) -> UInt8 {
     initialHopTtl >= receivedHopTtl ? initialHopTtl - receivedHopTtl : 0
-}
-
-func isAuthoredChatKind(_ kind: UInt8) -> Bool {
-    kind == ProtocolKind.text
-        || kind == ProtocolKind.friendRequest
-        || kind == ProtocolKind.groupInvite
-        || kind == ProtocolKind.profileSync
-        || kind == ProtocolKind.friendDirectory
-        || kind == ProtocolKind.introducedFriendRequest
-        || kind == ProtocolKind.lanEndpointHint
-        || kind == ProtocolKind.relayUpdate
-        || kind == ProtocolKind.attachmentManifest
-        || kind == ProtocolKind.reaction
-        || kind == ProtocolKind.groupMetadataUpdate
 }
