@@ -10770,6 +10770,112 @@ extension Frame: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What an incoming friend card means relative to the contacts already saved.
+ *
+ * Identity beats name, always. A UserID is derived from the signing key, so a
+ * card whose UserID is already on file is the same person re-sharing (new
+ * relay details after a Cruise Pass, a fresh card over the air) even when some
+ * *other* contact happens to share their display name. Deciding by name first
+ * points a key-change warning at the wrong person and teaches a family to tap
+ * through the one warning that would ever have mattered.
+ */
+
+public enum FriendCardMatch {
+    
+    /**
+     * Nobody on file with this identity or this display name.
+     */
+    case new
+    /**
+     * This exact identity is already saved; importing refreshes their details.
+     */
+    case alreadySaved(
+        /**
+         * What this phone currently shows them as (nickname wins over card name).
+         */savedName: String, 
+        /**
+         * A *different* contact also goes by this name — worth saying out loud
+         * so the two are not confused, but not a security warning.
+         */nameSharedWithOther: Bool
+    )
+    /**
+     * A genuinely different identity already uses this display name. This is
+     * the only case where comparing safety words is worth anyone's time.
+     */
+    case nameTaken(otherUserId: Data, otherName: String
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFriendCardMatch: FfiConverterRustBuffer {
+    typealias SwiftType = FriendCardMatch
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendCardMatch {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .new
+        
+        case 2: return .alreadySaved(savedName: try FfiConverterString.read(from: &buf), nameSharedWithOther: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 3: return .nameTaken(otherUserId: try FfiConverterData.read(from: &buf), otherName: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FriendCardMatch, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .new:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .alreadySaved(savedName,nameSharedWithOther):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(savedName, into: &buf)
+            FfiConverterBool.write(nameSharedWithOther, into: &buf)
+            
+        
+        case let .nameTaken(otherUserId,otherName):
+            writeInt(&buf, Int32(3))
+            FfiConverterData.write(otherUserId, into: &buf)
+            FfiConverterString.write(otherName, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendCardMatch_lift(_ buf: RustBuffer) throws -> FriendCardMatch {
+    return try FfiConverterTypeFriendCardMatch.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendCardMatch_lower(_ value: FriendCardMatch) -> RustBuffer {
+    return FfiConverterTypeFriendCardMatch.lower(value)
+}
+
+
+
+extension FriendCardMatch: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * A metadata-only connection event. No addresses, network names, tokens, or
  * message content are retained.
  */
@@ -13292,6 +13398,18 @@ public func fragmentBleFrame(frame: Data, mtuPayloadSize: UInt32) -> [Data]? {
 })
 }
 /**
+ * Classify a pasted/scanned friend card against the contacts already saved,
+ * so both shells reach the same verdict from the same rules.
+ */
+public func friendCardMatch(candidate: Contact, existing: [Contact]) -> FriendCardMatch {
+    return try!  FfiConverterTypeFriendCardMatch.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_friend_card_match(
+        FfiConverterTypeContact.lower(candidate),
+        FfiConverterSequenceTypeContact.lower(existing),$0
+    )
+})
+}
+/**
  * Derive the UserID that a FriendCard corresponds to (from its signing key).
  */
 public func friendCardUserId(card: FriendCard) -> Data {
@@ -14166,6 +14284,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_fragment_ble_frame() != 30680) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_friend_card_match() != 12255) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_friend_card_user_id() != 30116) {

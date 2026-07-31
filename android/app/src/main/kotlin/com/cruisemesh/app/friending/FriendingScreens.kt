@@ -21,6 +21,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxSize
@@ -58,6 +62,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.collectLatest
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -444,7 +450,7 @@ private fun ScanViewfinderOverlay() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun AddFriendScreen(
     onScanClick: () -> Unit,
@@ -466,6 +472,18 @@ fun AddFriendScreen(
     var suggestions by remember { mutableStateOf(emptyList<FriendSuggestion>()) }
     var confirmAddAll by remember { mutableStateOf(false) }
     val context = LocalContext.current
+    val pasteScroll = rememberScrollState()
+    val imeVisible = WindowInsets.isImeVisible
+
+    // With the keyboard up, park the bottom of the form (the "Preview friend"
+    // button) just above it. `imePadding` shrinks the viewport as the IME
+    // animates in, so `maxValue` keeps growing; re-target on every change and
+    // the scroll settles on the real bottom rather than a stale one.
+    androidx.compose.runtime.LaunchedEffect(imeVisible) {
+        if (imeVisible) {
+            snapshotFlow { pasteScroll.maxValue }.collectLatest { pasteScroll.animateScrollTo(it) }
+        }
+    }
 
     fun reloadSuggestions() {
         suggestions = if (FriendsOfFriendsStore.isEnabled(context)) {
@@ -507,7 +525,12 @@ fun AddFriendScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .verticalScroll(rememberScrollState())
+                // The app draws edge to edge, so nothing insets for the
+                // keyboard on its own: without this the IME sat on top of the
+                // "Preview friend" button and the only way forward was to
+                // dismiss the keyboard first.
+                .imePadding()
+                .verticalScroll(pasteScroll)
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {

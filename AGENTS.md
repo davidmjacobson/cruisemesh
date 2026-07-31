@@ -34,6 +34,20 @@ alone is enough for JVM unit tests but not for building/running the app.
 
 ## iOS
 
+The Swift bindings in `ios/CruiseMesh/Generated/` are checked in, so a core
+change that adds or alters an exported function must regenerate them or the iOS
+build links against a stale surface. That step needs no Mac — `uniffi-bindgen`
+introspects the *host* library, so the same command works on Windows:
+
+```powershell
+cargo build -p cruisemesh-core --features cruisemesh-core/cli
+cargo run -p cruisemesh-core --bin uniffi-bindgen --features cruisemesh-core/cli -- generate --library target/debug/cruisemesh_core.dll --language swift --out-dir ios/CruiseMesh/Generated
+```
+
+`cruisemesh_coreFFI.modulemap` regenerates byte-identical; revert it if it shows
+as modified (line endings only). Compiling the Swift itself still needs a Mac or
+the `ios.yml` runner.
+
 `core/build-ios.sh` must run on a Mac. From `ios/`, `xcodegen generate` produces
 the Xcode project; run the test suite against an available simulator with
 `xcodebuild test -project CruiseMesh.xcodeproj -scheme CruiseMesh -destination

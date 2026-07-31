@@ -1501,6 +1501,11 @@ RustBuffer uniffi_cruisemesh_core_fn_func_format_user_id(RustBuffer user_id, Rus
 RustBuffer uniffi_cruisemesh_core_fn_func_fragment_ble_frame(RustBuffer frame, uint32_t mtu_payload_size, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_FRIEND_CARD_MATCH
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_FRIEND_CARD_MATCH
+RustBuffer uniffi_cruisemesh_core_fn_func_friend_card_match(RustBuffer candidate, RustBuffer existing, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_FRIEND_CARD_USER_ID
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_FRIEND_CARD_USER_ID
 RustBuffer uniffi_cruisemesh_core_fn_func_friend_card_user_id(RustBuffer card, RustCallStatus *_Nonnull out_status
@@ -2536,6 +2541,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_format_user_id(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_FRAGMENT_BLE_FRAME
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_FRAGMENT_BLE_FRAME
 uint16_t uniffi_cruisemesh_core_checksum_func_fragment_ble_frame(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_FRIEND_CARD_MATCH
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_FRIEND_CARD_MATCH
+uint16_t uniffi_cruisemesh_core_checksum_func_friend_card_match(void
     
 );
 #endif

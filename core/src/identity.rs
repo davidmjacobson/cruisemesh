@@ -5,6 +5,7 @@
 //! BLAKE2b(Ed25519 public key). Friending exchanges a FriendCard (JSON, carried
 //! over QR code or pasted text) containing both public keys.
 
+use crate::store::{contact_display_name, Contact};
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
 use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
@@ -127,6 +128,61 @@ pub fn fingerprint_words(user_id: Vec<u8>) -> Vec<String> {
 #[uniffi::export]
 pub fn friend_card_user_id(card: FriendCard) -> Vec<u8> {
     derive_user_id(&card.sign_pk).to_vec()
+}
+
+/// What an incoming friend card means relative to the contacts already saved.
+///
+/// Identity beats name, always. A UserID is derived from the signing key, so a
+/// card whose UserID is already on file is the same person re-sharing (new
+/// relay details after a Cruise Pass, a fresh card over the air) even when some
+/// *other* contact happens to share their display name. Deciding by name first
+/// points a key-change warning at the wrong person and teaches a family to tap
+/// through the one warning that would ever have mattered.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq)]
+pub enum FriendCardMatch {
+    /// Nobody on file with this identity or this display name.
+    New,
+    /// This exact identity is already saved; importing refreshes their details.
+    AlreadySaved {
+        /// What this phone currently shows them as (nickname wins over card name).
+        saved_name: String,
+        /// A *different* contact also goes by this name — worth saying out loud
+        /// so the two are not confused, but not a security warning.
+        name_shared_with_other: bool,
+    },
+    /// A genuinely different identity already uses this display name. This is
+    /// the only case where comparing safety words is worth anyone's time.
+    NameTaken {
+        other_user_id: Vec<u8>,
+        other_name: String,
+    },
+}
+
+/// Classify a pasted/scanned friend card against the contacts already saved,
+/// so both shells reach the same verdict from the same rules.
+#[uniffi::export]
+pub fn friend_card_match(candidate: Contact, existing: Vec<Contact>) -> FriendCardMatch {
+    let candidate_name = contact_display_name(&candidate).to_lowercase();
+    let same_name = |c: &&Contact| contact_display_name(c).to_lowercase() == candidate_name;
+
+    if let Some(saved) = existing.iter().find(|c| c.user_id == candidate.user_id) {
+        return FriendCardMatch::AlreadySaved {
+            saved_name: contact_display_name(saved),
+            name_shared_with_other: existing
+                .iter()
+                .filter(|c| c.user_id != candidate.user_id)
+                .any(|c| same_name(&c)),
+        };
+    }
+
+    existing
+        .iter()
+        .filter(|c| c.user_id != candidate.user_id)
+        .find(same_name)
+        .map_or(FriendCardMatch::New, |other| FriendCardMatch::NameTaken {
+            other_user_id: other.user_id.clone(),
+            other_name: contact_display_name(other),
+        })
 }
 
 /// Build the JSON payload shared via QR code / pasted text when friending.
@@ -782,5 +838,88 @@ mod tests {
         let b = fingerprint_words(id.user_id);
         assert_eq!(a, b);
         assert_eq!(a.len(), 4);
+    }
+
+    fn contact(user_id: &[u8], name: &str) -> Contact {
+        Contact {
+            user_id: user_id.to_vec(),
+            name: name.to_string(),
+            sign_pk: vec![1; 32],
+            agree_pk: vec![2; 32],
+            relay_url: None,
+            relay_token: None,
+            nickname: None,
+        }
+    }
+
+    #[test]
+    fn friend_card_match_reports_a_brand_new_contact() {
+        let existing = vec![contact(b"dad", "iPhone")];
+        assert_eq!(
+            friend_card_match(contact(b"joan", "Joan"), existing),
+            FriendCardMatch::New
+        );
+    }
+
+    #[test]
+    fn friend_card_match_reports_a_name_collision_with_the_other_contact() {
+        let existing = vec![contact(b"dad", "iphone"), contact(b"lynn", "Lynn")];
+        assert_eq!(
+            friend_card_match(contact(b"joan", "iPhone"), existing),
+            FriendCardMatch::NameTaken {
+                other_user_id: b"dad".to_vec(),
+                other_name: "iphone".to_string(),
+            }
+        );
+    }
+
+    /// The bug this exists to stop: Aunt Joan (already saved as "iPhone")
+    /// re-sends her card after setting up a Cruise Pass, and Dad — a different
+    /// person who also shows up as "iPhone" — makes it look like her keys
+    /// changed. Her UserID is on file, so this is a refresh, not a stranger.
+    #[test]
+    fn a_resent_card_from_a_saved_contact_is_not_a_key_change() {
+        let existing = vec![contact(b"dad", "iPhone"), contact(b"joan", "iPhone")];
+        let mut resent = contact(b"joan", "iPhone");
+        resent.relay_url = Some("https://relay.example".to_string());
+        assert_eq!(
+            friend_card_match(resent, existing),
+            FriendCardMatch::AlreadySaved {
+                saved_name: "iPhone".to_string(),
+                name_shared_with_other: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_resent_card_with_a_unique_name_does_not_claim_a_shared_name() {
+        let existing = vec![contact(b"dad", "iPhone"), contact(b"joan", "Joan")];
+        assert_eq!(
+            friend_card_match(contact(b"joan", "Joan"), existing),
+            FriendCardMatch::AlreadySaved {
+                saved_name: "Joan".to_string(),
+                name_shared_with_other: false,
+            }
+        );
+    }
+
+    #[test]
+    fn friend_card_match_compares_the_nickname_the_user_actually_sees() {
+        // Dad's card says "iPhone" but this phone shows him as "Dad", so an
+        // incoming "iPhone" collides with nobody the user would recognise.
+        let mut dad = contact(b"dad", "iPhone");
+        dad.nickname = Some("Dad".to_string());
+        assert_eq!(
+            friend_card_match(contact(b"joan", "iPhone"), vec![dad.clone()]),
+            FriendCardMatch::New
+        );
+        // ...and a card claiming the nickname does collide.
+        assert_eq!(
+            friend_card_match(contact(b"joan", "dad"), vec![dad]),
+            FriendCardMatch::NameTaken {
+                other_user_id: b"dad".to_vec(),
+                other_name: "Dad".to_string(),
+            }
+        );
     }
 }

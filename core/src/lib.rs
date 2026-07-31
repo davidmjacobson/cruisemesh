@@ -64,8 +64,8 @@ pub use groups::{
     GroupMetadataUpdate,
 };
 pub use identity::{
-    fingerprint_words, generate_identity, make_friend_card, make_friend_link, parse_friend_card,
-    parse_friend_text, CoreError, FriendCard, Identity,
+    fingerprint_words, friend_card_match, generate_identity, make_friend_card, make_friend_link,
+    parse_friend_card, parse_friend_text, CoreError, FriendCard, FriendCardMatch, Identity,
 };
 pub use lan_session::{
     lan_default_tcp_port, lan_max_frame_size, lan_service_type, LanNoiseSession,

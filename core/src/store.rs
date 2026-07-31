@@ -256,6 +256,12 @@ pub struct ContactRelayRejection {
 /// resolve identically everywhere a contact name is displayed.
 #[uniffi::export]
 pub fn core_contact_display_name(contact: Contact) -> String {
+    contact_display_name(&contact)
+}
+
+/// Borrowing form of [`core_contact_display_name`], for core-internal callers
+/// that would otherwise clone a whole contact per comparison.
+pub(crate) fn contact_display_name(contact: &Contact) -> String {
     match contact.nickname.as_deref().map(str::trim) {
         Some(nickname) if !nickname.is_empty() => nickname.to_string(),
         _ => contact.name.clone(),
