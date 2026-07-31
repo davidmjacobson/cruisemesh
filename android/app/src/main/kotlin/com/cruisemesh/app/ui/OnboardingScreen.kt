@@ -10,11 +10,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -81,6 +84,10 @@ fun OnboardingScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        // The activity draws edge to edge and Scaffold does not
+                        // inset a custom bottom bar, so without this the buttons
+                        // sit underneath the system navigation bar.
+                        .windowInsetsPadding(WindowInsets.navigationBars)
                         .padding(horizontal = 20.dp, vertical = 16.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
@@ -92,13 +99,18 @@ fun OnboardingScreen(
                     } else {
                         Spacer(modifier = Modifier.height(1.dp))
                     }
-                    Button(onClick = {
-                        if (isLastPage) {
-                            onComplete()
-                        } else {
-                            page += 1
-                        }
-                    }) {
+                    Button(
+                        onClick = {
+                            if (isLastPage) {
+                                onComplete()
+                            } else {
+                                page += 1
+                            }
+                        },
+                        // A name is required to finish. Nothing is substituted
+                        // if it is left blank, so the gate has to be here.
+                        enabled = !isLastPage || displayName.isNotBlank(),
+                    ) {
                         Text(
                             stringResource(
                                 if (isLastPage) R.string.ui_start_using_cruisemesh else R.string.ui_next,
@@ -393,7 +405,13 @@ private fun ProfileSlide(
             onTakePhoto = onTakePhoto,
             onChoosePhoto = onChoosePhoto,
             onRemovePhoto = onRemovePhoto,
-            helperText = stringResource(R.string.ui_onboarding_profile_photo_helper),
+            // Says why the button below is disabled; without it a blank field
+            // and a dead button is a dead end.
+            helperText = if (displayName.isBlank()) {
+                stringResource(R.string.ui_onboarding_name_required)
+            } else {
+                stringResource(R.string.ui_onboarding_profile_photo_helper)
+            },
         )
     }
 }

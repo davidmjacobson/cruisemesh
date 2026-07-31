@@ -85,6 +85,20 @@ object MeshConnectivityStatus {
      */
     val pushHealthy: StateFlow<Boolean> = _pushHealthy.asStateFlow()
 
+    private val _staleRelayContacts = MutableStateFlow<Set<String>>(emptySet())
+
+    /**
+     * hex userIds whose friend-card relay endpoint has been written off after
+     * authoritatively rejecting us (core `contact_relay_health`).
+     *
+     * Distinct from [relay], which is our OWN Cruise Pass's health -- both can
+     * be true at once ("my pass is fine, but their card points at a host that
+     * no longer knows them"). Observable so a chat's route row can say it
+     * live, instead of a person discovering it from logcat as happened in the
+     * field.
+     */
+    val staleRelayContacts: StateFlow<Set<String>> = _staleRelayContacts.asStateFlow()
+
     private val _contactLastSeen = MutableStateFlow<Map<String, Long>>(emptyMap())
 
     /** hex userId -> epoch ms we last had evidence the contact's device was alive. */
@@ -111,6 +125,11 @@ object MeshConnectivityStatus {
 
     fun setRelayHealth(health: RelayHealth) {
         _relay.value = health
+    }
+
+    /** Replaces the whole set each sync pass -- a repaired card must clear as promptly as a broken one appears. */
+    fun setStaleRelayContacts(userIdHexes: Set<String>) {
+        _staleRelayContacts.value = userIdHexes
     }
 
     /** [MeshService] calls this from [com.cruisemesh.app.relay.RelayPushClient]'s health-change callback. */
@@ -146,6 +165,7 @@ object MeshConnectivityStatus {
         _directPaths.value = emptyMap()
         _nearbyTransports.value = emptyMap()
         _relay.value = RelayHealth.NoConfig
+        _staleRelayContacts.value = emptySet()
         _contactLastSeen.value = emptyMap()
         _presenceLastSeen.value = emptyMap()
         _pushHealthy.value = false

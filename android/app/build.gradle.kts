@@ -38,6 +38,25 @@ android {
     namespace = "com.cruisemesh.app"
     compileSdk = 36
 
+    // AGP needs an NDK to strip native libraries and to extract the symbol
+    // tables that `debugSymbolLevel` (below) packages into the AAB. Without
+    // one it prints "Unable to strip the following libraries" and quietly
+    // produces no symbols -- a green build that ships nothing, which is how
+    // Play ended up warning that this app has native code and no symbols.
+    //
+    // Point AGP at whatever NDK the environment already provides rather than
+    // pinning `ndkVersion`: CI installs r27c via setup-ndk and exports its
+    // path, while local machines have whatever Studio installed, and a pinned
+    // version would break whichever side didn't match. Unset (plain local
+    // builds) leaves AGP's default lookup untouched.
+    // Read via `providers`, not System.getenv(): a build script's System.getenv
+    // returns the Gradle *daemon's* environment, which is fixed when the daemon
+    // starts, so an env var exported by the calling shell is invisible here and
+    // this silently did nothing.
+    providers.environmentVariable("ANDROID_NDK_HOME").orNull
+        ?.takeIf { it.isNotBlank() }
+        ?.let { ndkPath = it }
+
     defaultConfig {
         applicationId = "com.cruisemesh.app"
         // minSdk 31 (S): mesh needs the API-31 BLUETOOTH_SCAN/ADVERTISE/CONNECT
@@ -75,6 +94,22 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            ndk {
+                // Nearly all of this app's logic is Rust behind JNI, so an
+                // unsymbolicated native crash is a bare address and nothing
+                // else -- exactly the crashes we can least afford to lose.
+                // Play warns "you've not uploaded debug symbols" without this.
+                //
+                // SYMBOL_TABLE, not FULL: cargo's release profile emits no
+                // DWARF (no `debug = true`), so the .so files carry a symbol
+                // table and no .debug_* sections. FULL would package the same
+                // information under a slower build. If line numbers are ever
+                // wanted, that starts with debug info in the Rust profile.
+                //
+                // AAB-only, and Play strips symbols before delivery, so this
+                // costs the download nothing.
+                debugSymbolLevel = "SYMBOL_TABLE"
+            }
             val releaseSigning = signingConfigs.getByName("release")
             signingConfig = if (releaseSigning.storeFile != null) {
                 releaseSigning

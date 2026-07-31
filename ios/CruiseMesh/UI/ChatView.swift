@@ -272,7 +272,8 @@ struct ChatView: View {
                 },
                 onReport: {
                     launchContactReport(contact: displayContact, reporterUserId: identity.userId)
-                }
+                },
+                relayCardIsStale: connectivity.staleRelayContacts.contains(contact.userId)
             ) {
                 showDetails = false
                 confirmDelete = true

@@ -186,6 +186,7 @@
     <string name="ui_onboarding_profile_title">What name would you like to go by?</string>
     <string name="ui_onboarding_profile_body">This is what people see when you share your friend card or add each other nearby. You can change it anytime.</string>
     <string name="ui_onboarding_profile_photo_helper">The profile photo is shared with friends after you connect.</string>
+    <string name="ui_onboarding_name_required">Enter a name to continue.</string>
     <string name="ui_minimum_passphrase_length">At least %1$d characters.</string>
     <string name="ui_remove_photo">Remove photo</string>
     <string name="ui_removes_this_group_and_its_message_history_from">Removes this group and its message history from this device. Other members keep their copy.</string>
@@ -375,4 +376,6 @@
     <string name="ui_details">Details</string>
     <string name="ui_hide_details">Hide details</string>
     <string name="ui_delivery_stale_card_hint">If your messages are not arriving, ask them to share their friend card again. A card carries the service they used when they shared it.</string>
+    <string name="ui_delivery_card_out_of_date">Their friend card is out of date</string>
+    <string name="ui_delivery_card_out_of_date_detail">The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Cruise Pass is set up, then share their friend card again. Messages still deliver when you are near each other.</string>
 </resources>

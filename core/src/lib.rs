@@ -6,6 +6,7 @@ uniffi::setup_scaffolding!("cruisemesh_core");
 mod authoring;
 mod backup;
 mod causal_order;
+mod contact_relay_health;
 mod content;
 mod crypto;
 mod deep_link;
@@ -33,6 +34,11 @@ pub use backup::{
     BackupPassphraseStrength, CoreBackupError, CoreBackupPayload,
 };
 pub use causal_order::{causal_display_timestamp, CAUSAL_ORDER_MAX_SKEW_MS};
+pub use contact_relay_health::{
+    contact_relay_fault_is_authoritative, core_contact_relay_endpoint_usable,
+    core_contact_relay_is_stale, core_contact_relay_recheck_due, core_contact_relay_streak_delta,
+    CONTACT_RELAY_RECHECK_MS, CONTACT_RELAY_STALE_STREAK,
+};
 pub use content::{
     attachment_max_blob_bytes, decode_attachment_payload, decode_reaction_payload,
     encode_attachment_payload, encode_reaction_payload, AttachmentMediaType, CoreAttachmentPayload,
@@ -103,6 +109,7 @@ pub use relay_wire::{
     relay_decode_post_response, relay_decode_presence_page, relay_deposit_token_for,
     relay_encode_ack_request, relay_encode_post_envelope, relay_encode_presence_request,
     relay_fetch_batch_limit, relay_max_response_bytes, relay_token_is_deposit,
+    resolved_contact_delivery_poll_relay, resolved_contact_delivery_relay,
     resolved_contact_poll_relay, resolved_contact_relay, CoreRelayFetchPage,
     CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage, RelayEndpoint,
 };
@@ -112,8 +119,8 @@ pub use semantic::{
     CoreReactionSummary, CoreReactionTargetSummary, CoreReplyMetadata, CoreTickStatus,
 };
 pub use store::{
-    CarriedEnvelope, Contact, ContactDiscoveryPolicy, ContactProvenance, DigestEntry,
-    FriendSuggestion, MessageArrival, MessageOrigin, MessageReference, MessageStore,
+    CarriedEnvelope, Contact, ContactDiscoveryPolicy, ContactProvenance, ContactRelayRejection,
+    DigestEntry, FriendSuggestion, MessageArrival, MessageOrigin, MessageReference, MessageStore,
     OutboundEnvelope, OutgoingReceiptEnvelope, PeerConnectionEvent, PeerConnectionEventKind,
     PeerConnectionSummary, PeerConnectionTransport, StoredMessage,
 };
