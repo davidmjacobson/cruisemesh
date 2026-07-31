@@ -607,30 +607,18 @@ private struct MessageBubbleView: View {
                     }
                 }
                 .contextMenu {
-                    if canReply {
-                        Button(action: onReply) {
-                            Label("Reply", systemImage: "arrowshape.turn.up.left")
-                        }
-                    }
-                    ForEach(reactionChoices, id: \.self) { emoji in
-                        Button(emoji) {
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            onReact(emoji)
-                        }
-                    }
-                    if !messageCopyText(message).isEmpty {
-                        Button {
+                    MessageActionsMenu(
+                        canReply: canReply,
+                        copyText: messageCopyText(message),
+                        ownReaction: reactions.first(where: { $0.reactedByOwnUser })?.emoji,
+                        onReact: onReact,
+                        onReply: onReply,
+                        onCopy: {
                             UIPasteboard.general.string = messageCopyText(message)
                             onStatus("Copied")
-                        } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
-                        }
-                    }
-                    Button {
-                        showInfo = true
-                    } label: {
-                        Label("Info", systemImage: "info.circle")
-                    }
+                        },
+                        onInfo: { showInfo = true }
+                    )
                 }
 
                 if !reactions.isEmpty {
@@ -799,13 +787,6 @@ struct PendingPhotoPreview: View {
         )
     }
 
-}
-
-private func messageCopyText(_ message: StoredMessage) -> String {
-    if message.kind == ProtocolKind.attachmentManifest {
-        return AttachmentPayload.decode(message.payload)?.caption ?? ""
-    }
-    return String(data: message.payload, encoding: .utf8) ?? ""
 }
 
 /// The transport an own message's delivery receipt returned on (T6), resolved

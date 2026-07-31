@@ -1471,6 +1471,36 @@
         }
       }
     },
+    "React": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "React"
+          }
+        }
+      }
+    },
+    "React %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "React %@"
+          }
+        }
+      }
+    },
+    "React %@, selected. Tap to remove": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "React %@, selected. Tap to remove"
+          }
+        }
+      }
+    },
     "Recent activity": {
       "localizations": {
         "en": {
