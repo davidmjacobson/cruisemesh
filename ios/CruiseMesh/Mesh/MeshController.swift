@@ -35,7 +35,7 @@ final class MeshController: ObservableObject {
     }
     private var isRunning = false
     private var meshRolesRunning = false
-    private var pausedForBluetoothAudio = false
+    private var bluetoothAudioConnected = false
     private var relayCancellable: AnyCancellable?
     private var lanHealthTimer: Timer?
     // D8: periodic re-digest bookkeeping.
@@ -58,11 +58,7 @@ final class MeshController: ObservableObject {
     func start() {
         if isRunning {
             // Repeat start while already running: refresh status only.
-            if pausedForBluetoothAudio {
-                MeshRuntimeStatus.shared.markPausedForBluetoothAudio()
-            } else {
-                MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
-            }
+            MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
             return
         }
         isRunning = true
@@ -204,14 +200,16 @@ final class MeshController: ObservableObject {
 
         registerBluetoothAudioObserver()
         startRelayLoop()
-        refreshBluetoothAudioBackoff(reason: "mesh start")
+        startMeshRoles()
+        refreshBluetoothAudioState(reason: "mesh start")
+        MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
         log.info("Mesh started")
     }
 
     func stop() {
         guard isRunning else { return }
         isRunning = false
-        pausedForBluetoothAudio = false
+        bluetoothAudioConnected = false
         bluetoothAudioBackoff.reset()
         unregisterBluetoothAudioObserver()
         lanTransport?.stop()
@@ -260,7 +258,7 @@ final class MeshController: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.refreshBluetoothAudioBackoff(reason: "route change")
+                self?.refreshBluetoothAudioState(reason: "route change")
             }
         }
     }
@@ -272,22 +270,26 @@ final class MeshController: ObservableObject {
         }
     }
 
-    private func refreshBluetoothAudioBackoff(reason: String) {
+    /**
+     Records whether Bluetooth audio is routed. It no longer changes the mesh:
+     Android dropped that policy on 2026-07-09 because messaging was dead on a
+     phone whenever earbuds were connected, and iOS has strictly less control
+     over its radio than Android does, so there is no iOS-specific knob whose
+     absence would justify a stricter rule here.
+     */
+    private func refreshBluetoothAudioState(reason: String) {
         guard isRunning else { return }
         switch bluetoothAudioBackoff.update(bluetoothAudioActive: isBluetoothAudioActive()) {
-        case .active:
-            pausedForBluetoothAudio = false
-            log.info("Bluetooth audio clear; resuming BLE mesh (\(reason, privacy: .public))")
-            startMeshRoles()
-            MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
-        case .pausedForBluetoothAudio:
-            pausedForBluetoothAudio = true
-            log.info("Bluetooth audio active; pausing BLE mesh to protect audio (\(reason, privacy: .public))")
-            stopMeshRoles()
-            MeshRuntimeStatus.shared.markPausedForBluetoothAudio()
+        case .audioClear:
+            bluetoothAudioConnected = false
+            log.info("Bluetooth audio route cleared (\(reason, privacy: .public))")
+        case .audioConnected:
+            bluetoothAudioConnected = true
+            log.info("Bluetooth audio routed; mesh stays up (\(reason, privacy: .public))")
         case nil:
-            break
+            return
         }
+        MeshRuntimeStatus.shared.setBluetoothAudioConnected(bluetoothAudioConnected)
     }
 
     /// Active Bluetooth audio route (A2DP / HFP / LE audio). See `BluetoothAudioBackoff`.
@@ -2324,9 +2326,7 @@ final class MeshController: ObservableObject {
         // remember to announce, and none can be missed. Mirrors Android's
         // `RelaySyncEngine.performRelaySyncPass`.
         RelayUpdateSender.announceIfChanged(store: store, identity: identity)
-        if !pausedForBluetoothAudio {
-            MeshRuntimeStatus.shared.markSyncingViaRelay()
-        }
+        MeshRuntimeStatus.shared.markSyncingViaRelay()
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             await self.relaySyncBlocking(identity: identity, config: config)
@@ -2892,11 +2892,7 @@ final class MeshController: ObservableObject {
     private func refreshNearby() {
         guard isRunning else { return }
         MeshConnectivityStatus.shared.refreshNearbyRoutes()
-        if pausedForBluetoothAudio {
-            MeshRuntimeStatus.shared.markPausedForBluetoothAudio()
-        } else {
-            MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
-        }
+        MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
     }
 }
 

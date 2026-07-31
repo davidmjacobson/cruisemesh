@@ -79,14 +79,16 @@ struct ChatListView: View {
                 severity: .caution
             )
         }
-        if case .pausedForBluetoothAudio = runtime.state,
+        if runtime.bluetoothAudioConnected,
            !bluetoothAudioWarningDismissed,
            !hideBluetoothAudioWarning {
             return ConnectivityWarning(
-                title: "Bluetooth audio connected",
-                body: "The mesh may pause or slow while wireless audio is active. Watch for delayed delivery.",
-                actionLabel: "Dismiss",
-                secondaryActionLabel: "Don't show this again",
+                title: String(localized: "Bluetooth audio connected"),
+                body: String(
+                    localized: "The mesh is still running, but wireless earbuds/speakers can slow nearby delivery. Watch for glitches."
+                ),
+                actionLabel: String(localized: "Dismiss"),
+                secondaryActionLabel: String(localized: "Don't show this again"),
                 severity: .caution
             )
         }
@@ -292,10 +294,8 @@ struct ChatListView: View {
                 if appModel.pendingFriendToken != nil { showFriends = true }
                 if appModel.pendingRelayCard != nil { showCruisePass = true }
             }
-            .onChange(of: runtime.state) { state in
-                if case .pausedForBluetoothAudio = state {
-                    return
-                }
+            .onChange(of: runtime.bluetoothAudioConnected) { connected in
+                if connected { return }
                 bluetoothAudioWarningDismissed = false
             }
             .onChange(of: appModel.pendingFriendToken) { token in
@@ -539,7 +539,6 @@ private struct MeshStatusSheet: View {
         case .stopped: return .gray
         case .starting: return .orange
         case .meshing: return .green
-        case .pausedForBluetoothAudio: return .yellow
         case .syncingViaRelay: return .blue
         }
     }

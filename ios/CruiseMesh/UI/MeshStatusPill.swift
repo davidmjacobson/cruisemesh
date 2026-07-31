@@ -31,7 +31,7 @@ struct MeshStatusPill: View {
     private var shouldPulse: Bool {
         switch runtime.state {
         case .starting, .meshing: return true
-        case .stopped, .pausedForBluetoothAudio, .syncingViaRelay: return false
+        case .stopped, .syncingViaRelay: return false
         }
     }
 
@@ -40,7 +40,6 @@ struct MeshStatusPill: View {
         case .stopped: return .gray
         case .starting: return .orange
         case .meshing: return .green
-        case .pausedForBluetoothAudio: return .yellow
         case .syncingViaRelay: return .blue
         }
     }
