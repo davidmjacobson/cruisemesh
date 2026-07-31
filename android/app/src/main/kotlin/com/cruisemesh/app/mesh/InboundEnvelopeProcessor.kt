@@ -15,7 +15,8 @@ import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import com.cruisemesh.app.media.KIND_REACTION
 import com.cruisemesh.app.media.isVisibleChatKind
 import com.cruisemesh.app.notify.ChatVisibility
-import com.cruisemesh.app.notify.MessageNotifier
+import com.cruisemesh.app.notify.IncomingMessageAnnouncer
+import com.cruisemesh.app.notify.NotificationAnnouncer
 import com.cruisemesh.app.relay.RelayFetchedEnvelope
 import com.cruisemesh.app.relay.RelayImport
 import uniffi.cruisemesh_core.CarriedEnvelope
@@ -130,6 +131,15 @@ internal class InboundEnvelopeProcessor(
     private val identityProvider: () -> Identity?,
     private val requestRelaySync: (String) -> Unit,
     private val lan: LanHooks,
+    /**
+     * Where "tell the user something arrived" goes. Defaults to the real
+     * notification path, so production callers (MeshService) need no change;
+     * tests substitute a recording fake to assert the ROADMAP notification
+     * release gate. See [IncomingMessageAnnouncer] for why this is injectable
+     * at all -- before it, the gate's decisive branch was the one branch of
+     * this class no unit test could execute.
+     */
+    private val announcer: IncomingMessageAnnouncer = NotificationAnnouncer(context),
 ) {
 
     /**
@@ -1000,7 +1010,7 @@ internal class InboundEnvelopeProcessor(
             } else {
                 body.content.toString(Charsets.UTF_8)
             }
-            MessageNotifier.notifyIncomingGroupMessage(context, group, senderName, preview)
+            announcer.announceGroupMessage(group, senderName, preview)
         }
     }
 
@@ -1059,7 +1069,7 @@ internal class InboundEnvelopeProcessor(
         if (!ChatVisibility.isVisible(group.id)) {
             // FA8: a typed entry point, not a literal string sniffed by
             // MessageNotifier's prefix check -- see notifyGroupInvite's KDoc.
-            MessageNotifier.notifyGroupInvite(context, group)
+            announcer.announceGroupInvite(group)
         }
     }
 
@@ -1136,7 +1146,7 @@ internal class InboundEnvelopeProcessor(
         acknowledgePeerStream(identity, contact, address, senderUserId, markRead = ChatVisibility.isVisible(senderUserId))
         if (!wasKnown) {
             FriendImportEvents.notifyImported(contact, directBle)
-            MessageNotifier.notifyFriendAdded(context, contact)
+            announcer.announceFriendAdded(contact)
         }
         Log.i(TAG, "Imported contact ${contact.name} from friend request on $address")
     }
@@ -1387,7 +1397,7 @@ internal class InboundEnvelopeProcessor(
         ChatEvents.notifyChatChanged(senderUserId)
         if (!wasKnown) {
             FriendImportEvents.notifyImported(contact, directBle)
-            MessageNotifier.notifyFriendAdded(context, contact)
+            announcer.announceFriendAdded(contact)
         }
     }
 
@@ -1454,7 +1464,7 @@ internal class InboundEnvelopeProcessor(
      * sends a delivered receipt back on the same link (DESIGN.md §7.2), plus
      * -- if the chat is currently on screen ([ChatVisibility.isVisible]) -- a
      * read receipt too. Otherwise, posts a notification
-     * ([MessageNotifier.notifyIncomingMessage]) instead, since the chat isn't
+     * ([IncomingMessageAnnouncer.announceDirectMessage]) instead, since the chat isn't
      * visible for the user to see the message land. Those two are mutually
      * exclusive by construction (`if (visible) read-receipt else notify`),
      * which matches the product intent: no point notifying about a chat the
@@ -1569,7 +1579,7 @@ internal class InboundEnvelopeProcessor(
                     AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))
                 else -> body.content.toString(Charsets.UTF_8)
             }
-            MessageNotifier.notifyIncomingMessage(context, contact, preview)
+            announcer.announceDirectMessage(contact, preview)
         }
     }
 
