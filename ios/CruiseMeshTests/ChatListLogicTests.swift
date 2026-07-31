@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import CruiseMesh
 
@@ -13,15 +14,40 @@ final class ChatListLogicTests: XCTestCase {
         )
         XCTAssertEqual(init2, "A")
 
+        // No name: no initials at all, so the avatar draws a neutral glyph.
+        // It used to render the first two characters of the user id ("AB"),
+        // which is what put a magenta "7B" on the onboarding profile slide
+        // before the new tester had typed anything.
         let (_, init3) = ChatListLogic.avatarHueAndInitials(
             userId: Data(), name: "", displayId: "CM-ABCD"
         )
-        XCTAssertEqual(init3, "AB")
+        XCTAssertEqual(init3, "")
 
         let (_, init4) = ChatListLogic.avatarHueAndInitials(
             userId: Data(), name: "Unknown", displayId: "CM-1234"
         )
-        XCTAssertEqual(init4, "12")
+        XCTAssertEqual(init4, "")
+
+        let (_, init5) = ChatListLogic.avatarHueAndInitials(
+            userId: Data(), name: "   ", displayId: "CM-7B4A"
+        )
+        XCTAssertEqual(init5, "")
+
+        // Typing into the onboarding field updates the preview as it goes.
+        let (_, init6) = ChatListLogic.avatarHueAndInitials(
+            userId: Data(), name: "Caleb", displayId: "CM-7B4A"
+        )
+        XCTAssertEqual(init6, "CA")
+    }
+
+    func testAvatarColourStillDerivesFromTheUserId() {
+        let (color1, _) = ChatListLogic.avatarHueAndInitials(
+            userId: Data([1, 2, 3]), name: "Caleb", displayId: "CM-7B4A"
+        )
+        let (color2, _) = ChatListLogic.avatarHueAndInitials(
+            userId: Data([1, 2, 3]), name: "", displayId: "CM-7B4A"
+        )
+        XCTAssertEqual(color1, color2)
     }
 
     func testFormatRelativeTime() {

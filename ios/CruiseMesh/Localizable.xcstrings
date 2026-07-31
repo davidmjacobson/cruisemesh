@@ -211,12 +211,42 @@
         }
       }
     },
+    "Bluetooth and notifications are on": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bluetooth and notifications are on"
+          }
+        }
+      }
+    },
+    "Bluetooth and notifications are turned off for CruiseMesh. Turn them on in Settings to add those ways of reaching people.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bluetooth and notifications are turned off for CruiseMesh. Turn them on in Settings to add those ways of reaching people."
+          }
+        }
+      }
+    },
     "Bluetooth audio connected": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Bluetooth audio connected"
+          }
+        }
+      }
+    },
+    "Bluetooth is turned off for CruiseMesh. Turn it on in Settings to reach people nearby without any network.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bluetooth is turned off for CruiseMesh. Turn it on in Settings to reach people nearby without any network."
           }
         }
       }
@@ -1271,6 +1301,16 @@
         }
       }
     },
+    "Notifications are turned off for CruiseMesh. Turn them on in Settings to hear about messages as they arrive.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Notifications are turned off for CruiseMesh. Turn them on in Settings to hear about messages as they arrive."
+          }
+        }
+      }
+    },
     "OK": {
       "localizations": {
         "en": {
@@ -1287,6 +1327,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Only you see this. It replaces the name they shared, just on your phone."
+          }
+        }
+      }
+    },
+    "Open Settings": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open Settings"
           }
         }
       }
@@ -2331,6 +2381,16 @@
         }
       }
     },
+    "You can change these anytime in Settings.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You can change these anytime in Settings."
+          }
+        }
+      }
+    },
     "You can turn these on later in Settings — CruiseMesh just has fewer ways to reach people until you do.": {
       "localizations": {
         "en": {
@@ -2357,6 +2417,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your name"
+          }
+        }
+      }
+    },
+    "Your profile picture": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your profile picture"
           }
         }
       }
