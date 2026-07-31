@@ -1794,6 +1794,17 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func chatDigest(chatId: Data) throws  -> [DigestEntry]
     
+    /**
+     * Forget any recorded rejection for a contact — called on every
+     * successful post to their endpoint.
+     *
+     * Success is the only thing that clears a streak. In particular a
+     * *transient* fault must not, or a dead endpoint that also rate-limits
+     * us could launder itself back to healthy on the strength of the 429
+     * and resume hammering forever.
+     */
+    func clearContactRelayRejection(userId: Data) throws 
+    
     func clearFriendSuggestions() throws 
     
     func clearPeerConnectionHistory() throws 
@@ -2206,6 +2217,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func listBlockedUsers() throws  -> [Data]
     
     /**
+     * Every contact whose card endpoint currently carries a rejection
+     * streak. Read once per sync pass and consulted per contact, rather
+     * than a query per contact per pass.
+     */
+    func listContactRelayRejections() throws  -> [ContactRelayRejection]
+    
+    /**
      * All contacts, alphabetical by name.
      */
     func listContacts() throws  -> [Contact]
@@ -2297,6 +2315,17 @@ public protocol MessageStoreProtocol : AnyObject {
      * timestamps.
      */
     func messagesForChat(chatId: Data) throws  -> [StoredMessage]
+    
+    /**
+     * Record one authoritative rejection from a contact's card endpoint and
+     * return the resulting streak (see `crate::contact_relay_health`).
+     *
+     * Advancing the streak also re-stamps `relay_rejected_at`, so the
+     * six-hour re-probe window is measured from the most recent evidence
+     * rather than from the first failure — a card that has been dead for a
+     * week is probed once every six hours, not continuously.
+     */
+    func noteContactRelayRejected(userId: Data, nowMs: Int64) throws  -> Int64
     
     /**
      * Exact sealed envelopes for this device's authored messages in
@@ -2935,6 +2964,22 @@ open func chatDigest(chatId: Data)throws  -> [DigestEntry] {
         FfiConverterData.lower(chatId),$0
     )
 })
+}
+    
+    /**
+     * Forget any recorded rejection for a contact — called on every
+     * successful post to their endpoint.
+     *
+     * Success is the only thing that clears a streak. In particular a
+     * *transient* fault must not, or a dead endpoint that also rate-limits
+     * us could launder itself back to healthy on the strength of the 429
+     * and resume hammering forever.
+     */
+open func clearContactRelayRejection(userId: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_contact_relay_rejection(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
+    )
+}
 }
     
 open func clearFriendSuggestions()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -3585,6 +3630,18 @@ open func listBlockedUsers()throws  -> [Data] {
 }
     
     /**
+     * Every contact whose card endpoint currently carries a rejection
+     * streak. Read once per sync pass and consulted per contact, rather
+     * than a query per contact per pass.
+     */
+open func listContactRelayRejections()throws  -> [ContactRelayRejection] {
+    return try  FfiConverterSequenceTypeContactRelayRejection.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_list_contact_relay_rejections(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * All contacts, alphabetical by name.
      */
 open func listContacts()throws  -> [Contact] {
@@ -3746,6 +3803,24 @@ open func messagesForChat(chatId: Data)throws  -> [StoredMessage] {
     return try  FfiConverterSequenceTypeStoredMessage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_messages_for_chat(self.uniffiClonePointer(),
         FfiConverterData.lower(chatId),$0
+    )
+})
+}
+    
+    /**
+     * Record one authoritative rejection from a contact's card endpoint and
+     * return the resulting streak (see `crate::contact_relay_health`).
+     *
+     * Advancing the streak also re-stamps `relay_rejected_at`, so the
+     * six-hour re-probe window is measured from the most recent evidence
+     * rather than from the first failure — a card that has been dead for a
+     * week is probed once every six hours, not continuously.
+     */
+open func noteContactRelayRejected(userId: Data, nowMs: Int64)throws  -> Int64 {
+    return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_note_contact_relay_rejected(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -5246,6 +5321,89 @@ public func FfiConverterTypeContactProvenance_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeContactProvenance_lower(_ value: ContactProvenance) -> RustBuffer {
     return FfiConverterTypeContactProvenance.lower(value)
+}
+
+
+/**
+ * One contact's recorded rejection streak against their card's relay
+ * endpoint (see `crate::contact_relay_health`).
+ *
+ * Deliberately NOT a field on [`Contact`]: this is observed local health,
+ * not part of the identity a friend card carries, and folding it into the
+ * record every call site constructs would invite it into a wire format it
+ * has no business in.
+ */
+public struct ContactRelayRejection {
+    public var userId: Data
+    public var rejectStreak: Int64
+    public var rejectedAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(userId: Data, rejectStreak: Int64, rejectedAtMs: Int64) {
+        self.userId = userId
+        self.rejectStreak = rejectStreak
+        self.rejectedAtMs = rejectedAtMs
+    }
+}
+
+
+
+extension ContactRelayRejection: Equatable, Hashable {
+    public static func ==(lhs: ContactRelayRejection, rhs: ContactRelayRejection) -> Bool {
+        if lhs.userId != rhs.userId {
+            return false
+        }
+        if lhs.rejectStreak != rhs.rejectStreak {
+            return false
+        }
+        if lhs.rejectedAtMs != rhs.rejectedAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(userId)
+        hasher.combine(rejectStreak)
+        hasher.combine(rejectedAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactRelayRejection: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactRelayRejection {
+        return
+            try ContactRelayRejection(
+                userId: FfiConverterData.read(from: &buf), 
+                rejectStreak: FfiConverterInt64.read(from: &buf), 
+                rejectedAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ContactRelayRejection, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.userId, into: &buf)
+        FfiConverterInt64.write(value.rejectStreak, into: &buf)
+        FfiConverterInt64.write(value.rejectedAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactRelayRejection_lift(_ buf: RustBuffer) throws -> ContactRelayRejection {
+    return try FfiConverterTypeContactRelayRejection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactRelayRejection_lower(_ value: ContactRelayRejection) -> RustBuffer {
+    return FfiConverterTypeContactRelayRejection.lower(value)
 }
 
 
@@ -11488,6 +11646,31 @@ fileprivate struct FfiConverterSequenceTypeContact: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeContactRelayRejection: FfiConverterRustBuffer {
+    typealias SwiftType = [ContactRelayRejection]
+
+    public static func write(_ value: [ContactRelayRejection], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeContactRelayRejection.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ContactRelayRejection] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ContactRelayRejection]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeContactRelayRejection.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCoreGroupFanoutRow: FfiConverterRustBuffer {
     typealias SwiftType = [CoreGroupFanoutRow]
 
@@ -12126,6 +12309,67 @@ public func coreContactDisplayName(contact: Contact) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_contact_display_name(
         FfiConverterTypeContact.lower(contact),$0
+    )
+})
+}
+/**
+ * The whole per-contact decision for one sync pass, in one call so neither
+ * shell can implement half of it: given the persisted streak and when it
+ * last advanced, may we post to this contact's card endpoint right now?
+ *
+ * `true` for a healthy endpoint, for one that has not yet reached the
+ * streak, and for a written-off one whose probe is due.
+ */
+public func coreContactRelayEndpointUsable(rejectStreak: Int64, rejectedAtMs: Int64, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_relay_endpoint_usable(
+        FfiConverterInt64.lower(rejectStreak),
+        FfiConverterInt64.lower(rejectedAtMs),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * Should the endpoint be treated as stale, given the rejection streak
+ * recorded for it (already including the fault just observed)?
+ */
+public func coreContactRelayIsStale(rejectStreak: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_relay_is_stale(
+        FfiConverterInt64.lower(rejectStreak),$0
+    )
+})
+}
+/**
+ * May we spend a request re-probing a written-off endpoint?
+ *
+ * `rejected_at_ms` is when the streak last advanced. A clock that jumped
+ * backwards (restore onto a different phone, manual time change) would
+ * otherwise pin an endpoint as un-probeable until the clock caught up, so
+ * a future timestamp re-probes immediately rather than waiting it out.
+ */
+public func coreContactRelayRecheckDue(rejectedAtMs: Int64, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_relay_recheck_due(
+        FfiConverterInt64.lower(rejectedAtMs),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * Classify a rejection observed against a contact's endpoint into the
+ * streak delta to persist: `1` to advance toward writing the card off, `0`
+ * to leave the streak untouched.
+ *
+ * Note that a transient fault does not *reset* the streak. A dead endpoint
+ * that also happens to rate-limit us must not be able to launder its way
+ * back to healthy on the strength of the 429 — only an actual success
+ * clears it (`clear_contact_relay_rejection`).
+ */
+public func coreContactRelayStreakDelta(fault: CoreRelayFault) -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_relay_streak_delta(
+        FfiConverterTypeCoreRelayFault.lower(fault),$0
     )
 })
 }
@@ -13417,6 +13661,56 @@ public func relayTokenIsDeposit(token: String) -> Bool {
 })
 }
 /**
+ * Poll-path routing with the same written-off rule.
+ *
+ * Proxy-polling a written-off endpoint is pure waste — it rejects every
+ * pass exactly as the posts did — so a stale card drops out of the poll set
+ * entirely. There is deliberately no fallback here: our own mailbox is
+ * already polled on its own account, and reading it again under a contact's
+ * heading would fetch nothing new.
+ */
+public func resolvedContactDeliveryPollRelay(contactRelayUrl: String?, contactRelayToken: String?, fallbackUrl: String?, fallbackToken: String?, contactEndpointUsable: Bool) -> RelayEndpoint? {
+    return try!  FfiConverterOptionTypeRelayEndpoint.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_resolved_contact_delivery_poll_relay(
+        FfiConverterOptionString.lower(contactRelayUrl),
+        FfiConverterOptionString.lower(contactRelayToken),
+        FfiConverterOptionString.lower(fallbackUrl),
+        FfiConverterOptionString.lower(fallbackToken),
+        FfiConverterBool.lower(contactEndpointUsable),$0
+    )
+})
+}
+/**
+ * Send-path routing when the contact's card endpoint has been written off
+ * (see [`crate::contact_relay_health`]).
+ *
+ * A card whose endpoint authoritatively rejects us is worse than no card at
+ * all: [`resolved_contact_relay`] returns the contact endpoint
+ * unconditionally, so one dead field beats a working alternative *forever*
+ * and the messages never leave the queue. This is that same resolution with
+ * one added rule — a written-off endpoint is skipped, exactly as though the
+ * card had carried no relay fields, which falls through to our own.
+ *
+ * Falling back is not a new capability: a card with no relay fields already
+ * resolves to our own endpoint today. It is also the routing that actually
+ * delivers whenever the contact is in our own family (they poll the mailbox
+ * we are posting to) — the common case for somebody we handed a Cruise Pass
+ * to. For a cross-family contact it delivers nothing, but neither did the
+ * dead endpoint, and unlike the dead endpoint this state is surfaced, so a
+ * person can repair the card.
+ */
+public func resolvedContactDeliveryRelay(contactRelayUrl: String?, contactRelayToken: String?, fallbackUrl: String?, fallbackToken: String?, contactEndpointUsable: Bool) -> RelayEndpoint? {
+    return try!  FfiConverterOptionTypeRelayEndpoint.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_resolved_contact_delivery_relay(
+        FfiConverterOptionString.lower(contactRelayUrl),
+        FfiConverterOptionString.lower(contactRelayToken),
+        FfiConverterOptionString.lower(fallbackUrl),
+        FfiConverterOptionString.lower(fallbackToken),
+        FfiConverterBool.lower(contactEndpointUsable),$0
+    )
+})
+}
+/**
  * Poll-path routing (CP4): which mailbox, if any, may be *read*
  * (fetch/ack/presence) on this contact's behalf. Deposit tokens cannot
  * read, so a resolved endpoint that would carry one is dropped rather than
@@ -13608,6 +13902,18 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_contact_display_name() != 41746) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_endpoint_usable() != 26591) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_is_stale() != 16879) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_recheck_due() != 3880) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_streak_delta() != 44972) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_format_lan_endpoint() != 59419) {
@@ -13928,6 +14234,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_token_is_deposit() != 47848) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_poll_relay() != 54665) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_relay() != 21664) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_resolved_contact_poll_relay() != 62901) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14108,6 +14420,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_chat_digest() != 38268) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_contact_relay_rejection() != 26476) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_friend_suggestions() != 35411) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14210,6 +14525,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_list_blocked_users() != 55393) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_list_contact_relay_rejections() != 16233) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_list_contacts() != 40385) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14241,6 +14559,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_messages_for_chat() != 6345) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_contact_relay_rejected() != 13589) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_outbound_envelopes_after() != 35551) {

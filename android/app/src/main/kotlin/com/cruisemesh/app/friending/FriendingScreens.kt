@@ -83,9 +83,12 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.ui.AvatarBadge
+import com.cruisemesh.app.ui.ChatListLogic
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.FriendSuggestion
+import uniffi.cruisemesh_core.coreContactDisplayName
+import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.makeFriendCard
 import uniffi.cruisemesh_core.makeFriendLink
@@ -695,6 +698,12 @@ sealed interface ImportFriendResult {
     data class Error(val message: String) : ImportFriendResult
 }
 
+internal fun contactsScreenDisplayName(contact: Contact): String =
+    ChatListLogic.displayNameOrId(
+        coreContactDisplayName(contact),
+        formatUserId(contact.userId),
+    )
+
 /**
  * Lists accepted contacts (DESIGN.md §6.2); tapping a row opens its 1:1 chat,
  * long-pressing offers deletion behind a confirmation dialog. Deleting exists
@@ -817,7 +826,8 @@ fun ContactsScreen(
                         )
                     }
                     items(contacts) { contact ->
-                        val displayId = uniffi.cruisemesh_core.formatUserId(contact.userId)
+                        val displayId = formatUserId(contact.userId)
+                        val displayName = contactsScreenDisplayName(contact)
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -830,13 +840,13 @@ fun ContactsScreen(
                         ) {
                             AvatarBadge(
                                 userId = contact.userId,
-                                name = contact.name,
+                                name = displayName,
                                 displayId = displayId,
                                 photoBytes = avatarBytesByUserId[displayId],
                             )
                             Spacer(modifier = Modifier.width(16.dp))
                             Text(
-                                contact.name,
+                                displayName,
                                 style = MaterialTheme.typography.bodyLarge
                             )
                         }
@@ -883,7 +893,14 @@ fun ContactsScreen(
     if (toDelete != null) {
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
-            title = { Text(stringResource(R.string.ui_delete_named, toDelete.name)) },
+            title = {
+                Text(
+                    stringResource(
+                        R.string.ui_delete_named,
+                        contactsScreenDisplayName(toDelete),
+                    ),
+                )
+            },
             text = { Text(stringResource(R.string.ui_this_removes_the_contact_and_deletes_your_chat_f3fb0a50)) },
             confirmButton = {
                 TextButton(

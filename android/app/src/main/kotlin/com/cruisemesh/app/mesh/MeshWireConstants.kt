@@ -24,6 +24,4 @@ internal const val RECEIPT_TYPE_READ: UByte = 2u
 /** DESIGN.md §5.3: hop budget a freshly authored envelope's §6.4 header starts with. Mirrors core's `DEFAULT_HOP_TTL`. */
 internal const val DEFAULT_HOP_TTL: UByte = 7u
 
-internal const val MS_PER_DAY: Long = 24L * 60 * 60 * 1000
-
 internal const val RELAY_STORE_BATCH_LIMIT: ULong = 128uL

@@ -237,6 +237,20 @@ pub struct Contact {
     pub nickname: Option<String>,
 }
 
+/// One contact's recorded rejection streak against their card's relay
+/// endpoint (see `crate::contact_relay_health`).
+///
+/// Deliberately NOT a field on [`Contact`]: this is observed local health,
+/// not part of the identity a friend card carries, and folding it into the
+/// record every call site constructs would invite it into a wire format it
+/// has no business in.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct ContactRelayRejection {
+    pub user_id: Vec<u8>,
+    pub reject_streak: i64,
+    pub rejected_at_ms: i64,
+}
+
 /// The name to show for a contact: the local nickname when the user has set a
 /// non-blank one (T16), otherwise the card `name`. Kept in core so both shells
 /// resolve identically everywhere a contact name is displayed.
@@ -407,6 +421,14 @@ impl MessageStore {
         // wall-clock-seeded epoch well above it, so the first notice after an
         // upgrade always applies.
         ensure_contact_column(&conn, "relay_epoch", "INTEGER NOT NULL DEFAULT 0")?;
+        // Consecutive authoritative rejections from this contact's card
+        // endpoint, and when the streak last advanced (see
+        // `crate::contact_relay_health`). 0 is the right default for an
+        // existing store: an endpoint is only written off by observing it
+        // fail, never by assumption, so every contact starts trusted and the
+        // very next sync pass re-establishes the truth.
+        ensure_contact_column(&conn, "relay_reject_streak", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_contact_column(&conn, "relay_rejected_at", "INTEGER NOT NULL DEFAULT 0")?;
         // Relay proxy-polling (see enqueue_relay_carried_envelope): marks a
         // carried envelope as one we pulled FROM the relay rather than one we
         // received over BLE, so the relay-upload query can skip re-uploading
@@ -1909,7 +1931,21 @@ impl MessageStore {
                 sign_pk = excluded.sign_pk,
                 agree_pk = excluded.agree_pk,
                 relay_url = excluded.relay_url,
-                relay_token = excluded.relay_token",
+                relay_token = excluded.relay_token,
+                -- A card that moves the endpoint earns a clean slate; one
+                -- that re-states the same endpoint keeps its streak, so
+                -- re-importing an unchanged stale card cannot launder it
+                -- back to healthy. `IS NOT` is the null-safe comparison:
+                -- plain `<>` is NULL for a card with no relay fields, which
+                -- would silently take the ELSE branch.
+                relay_reject_streak = CASE
+                    WHEN excluded.relay_url IS NOT contacts.relay_url
+                      OR excluded.relay_token IS NOT contacts.relay_token
+                    THEN 0 ELSE contacts.relay_reject_streak END,
+                relay_rejected_at = CASE
+                    WHEN excluded.relay_url IS NOT contacts.relay_url
+                      OR excluded.relay_token IS NOT contacts.relay_token
+                    THEN 0 ELSE contacts.relay_rejected_at END",
             params![
                 contact.user_id,
                 contact.name,
@@ -1965,7 +2001,21 @@ impl MessageStore {
                 sign_pk = excluded.sign_pk,
                 agree_pk = excluded.agree_pk,
                 relay_url = excluded.relay_url,
-                relay_token = excluded.relay_token",
+                relay_token = excluded.relay_token,
+                -- A card that moves the endpoint earns a clean slate; one
+                -- that re-states the same endpoint keeps its streak, so
+                -- re-importing an unchanged stale card cannot launder it
+                -- back to healthy. `IS NOT` is the null-safe comparison:
+                -- plain `<>` is NULL for a card with no relay fields, which
+                -- would silently take the ELSE branch.
+                relay_reject_streak = CASE
+                    WHEN excluded.relay_url IS NOT contacts.relay_url
+                      OR excluded.relay_token IS NOT contacts.relay_token
+                    THEN 0 ELSE contacts.relay_reject_streak END,
+                relay_rejected_at = CASE
+                    WHEN excluded.relay_url IS NOT contacts.relay_url
+                      OR excluded.relay_token IS NOT contacts.relay_token
+                    THEN 0 ELSE contacts.relay_rejected_at END",
             params![
                 contact.user_id,
                 contact.name,
@@ -2053,8 +2103,13 @@ impl MessageStore {
         let conn = lock_conn(&self.conn);
         let changed = conn
             .execute(
+                // A newly announced endpoint has never been tried, so it
+                // starts trusted: carrying the old endpoint's rejection
+                // streak forward would write off the very notice that
+                // repairs the contact.
                 "UPDATE contacts
-                 SET relay_url = ?2, relay_token = ?3, relay_epoch = ?4
+                 SET relay_url = ?2, relay_token = ?3, relay_epoch = ?4,
+                     relay_reject_streak = 0, relay_rejected_at = 0
                  WHERE user_id = ?1 AND ?4 > relay_epoch",
                 params![sender_user_id, url, token, content.relay_epoch],
             )
@@ -2076,6 +2131,81 @@ impl MessageStore {
             .optional()
             .map_err(store_err)?;
         Ok(epoch.unwrap_or(0))
+    }
+
+    /// Record one authoritative rejection from a contact's card endpoint and
+    /// return the resulting streak (see `crate::contact_relay_health`).
+    ///
+    /// Advancing the streak also re-stamps `relay_rejected_at`, so the
+    /// six-hour re-probe window is measured from the most recent evidence
+    /// rather than from the first failure — a card that has been dead for a
+    /// week is probed once every six hours, not continuously.
+    pub fn note_contact_relay_rejected(
+        &self,
+        user_id: Vec<u8>,
+        now_ms: i64,
+    ) -> Result<i64, CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "UPDATE contacts
+             SET relay_reject_streak = relay_reject_streak + 1, relay_rejected_at = ?2
+             WHERE user_id = ?1",
+            params![user_id, now_ms],
+        )
+        .map_err(store_err)?;
+        let streak: Option<i64> = conn
+            .query_row(
+                "SELECT relay_reject_streak FROM contacts WHERE user_id = ?1",
+                params![user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(streak.unwrap_or(0))
+    }
+
+    /// Forget any recorded rejection for a contact — called on every
+    /// successful post to their endpoint.
+    ///
+    /// Success is the only thing that clears a streak. In particular a
+    /// *transient* fault must not, or a dead endpoint that also rate-limits
+    /// us could launder itself back to healthy on the strength of the 429
+    /// and resume hammering forever.
+    pub fn clear_contact_relay_rejection(&self, user_id: Vec<u8>) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "UPDATE contacts
+             SET relay_reject_streak = 0, relay_rejected_at = 0
+             WHERE user_id = ?1 AND relay_reject_streak <> 0",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Every contact whose card endpoint currently carries a rejection
+    /// streak. Read once per sync pass and consulted per contact, rather
+    /// than a query per contact per pass.
+    pub fn list_contact_relay_rejections(&self) -> Result<Vec<ContactRelayRejection>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT user_id, relay_reject_streak, relay_rejected_at
+                 FROM contacts WHERE relay_reject_streak > 0",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ContactRelayRejection {
+                    user_id: row.get(0)?,
+                    reject_streak: row.get(1)?,
+                    rejected_at_ms: row.get(2)?,
+                })
+            })
+            .map_err(store_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(store_err)?;
+        Ok(rows)
     }
 
     /// Set (or clear) the local nickname for a contact (T16). A `None` or
@@ -3821,7 +3951,9 @@ CREATE TABLE IF NOT EXISTS contacts (
     avatar BLOB,
     avatar_epoch INTEGER NOT NULL DEFAULT 0,
     nickname TEXT,
-    relay_epoch INTEGER NOT NULL DEFAULT 0
+    relay_epoch INTEGER NOT NULL DEFAULT 0,
+    relay_reject_streak INTEGER NOT NULL DEFAULT 0,
+    relay_rejected_at INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS contact_discovery_policy (
@@ -6047,6 +6179,96 @@ mod tests {
             store.contact_avatar_epoch(b"alice-id".to_vec()).unwrap(),
             123
         );
+    }
+
+    #[test]
+    fn contact_relay_rejections_accumulate_and_clear_on_success() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut alice = contact(b"alice-id", "Alice");
+        alice.relay_url = Some("https://dead.example".to_string());
+        alice.relay_token = Some("tok".to_string());
+        store.upsert_contact(alice).unwrap();
+
+        assert!(store.list_contact_relay_rejections().unwrap().is_empty());
+        assert_eq!(
+            store
+                .note_contact_relay_rejected(b"alice-id".to_vec(), 1_000)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .note_contact_relay_rejected(b"alice-id".to_vec(), 2_000)
+                .unwrap(),
+            2
+        );
+
+        let rejections = store.list_contact_relay_rejections().unwrap();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].reject_streak, 2);
+        // Re-stamped by the newest evidence, not pinned to the first failure.
+        assert_eq!(rejections[0].rejected_at_ms, 2_000);
+
+        store
+            .clear_contact_relay_rejection(b"alice-id".to_vec())
+            .unwrap();
+        assert!(store.list_contact_relay_rejections().unwrap().is_empty());
+    }
+
+    #[test]
+    fn re_importing_the_same_stale_card_does_not_launder_the_streak() {
+        // The field repair is "ask them to share their card again" -- but a
+        // card re-shared from a phone whose config never changed carries the
+        // SAME dead endpoint. Clearing the streak for it would restart the
+        // hammering and make the repair look like it worked.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut alice = contact(b"alice-id", "Alice");
+        alice.relay_url = Some("https://dead.example".to_string());
+        alice.relay_token = Some("tok".to_string());
+        store.upsert_imported_contact(alice.clone()).unwrap();
+        store
+            .note_contact_relay_rejected(b"alice-id".to_vec(), 1_000)
+            .unwrap();
+        store
+            .note_contact_relay_rejected(b"alice-id".to_vec(), 2_000)
+            .unwrap();
+
+        store.upsert_imported_contact(alice).unwrap();
+        assert_eq!(
+            store.list_contact_relay_rejections().unwrap()[0].reject_streak,
+            2
+        );
+
+        // A card that actually moves the endpoint has never been tried, so
+        // it starts trusted.
+        let mut moved = contact(b"alice-id", "Alice");
+        moved.relay_url = Some("https://live.example".to_string());
+        moved.relay_token = Some("tok".to_string());
+        store.upsert_imported_contact(moved).unwrap();
+        assert!(store.list_contact_relay_rejections().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_relay_update_notice_clears_the_streak() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut alice = contact(b"alice-id", "Alice");
+        alice.relay_url = Some("https://dead.example".to_string());
+        alice.relay_token = Some("tok".to_string());
+        store.upsert_contact(alice).unwrap();
+        store
+            .note_contact_relay_rejected(b"alice-id".to_vec(), 1_000)
+            .unwrap();
+        store
+            .note_contact_relay_rejected(b"alice-id".to_vec(), 2_000)
+            .unwrap();
+
+        assert!(store
+            .apply_contact_relay_update(
+                b"alice-id".to_vec(),
+                relay_notice(b"alice-id", 5, "https://live.example")
+            )
+            .unwrap());
+        assert!(store.list_contact_relay_rejections().unwrap().is_empty());
     }
 
     #[test]

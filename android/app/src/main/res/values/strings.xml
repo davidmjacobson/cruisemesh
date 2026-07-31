@@ -378,6 +378,8 @@
     <string name="ui_details">Details</string>
     <string name="ui_hide_details">Hide details</string>
     <string name="ui_delivery_stale_card_hint">If your messages are not arriving, ask them to share their friend card again. A card carries the service they used when they shared it.</string>
+    <string name="ui_delivery_card_out_of_date">Their friend card is out of date</string>
+    <string name="ui_delivery_card_out_of_date_detail">The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Cruise Pass is set up, then share their friend card again. Messages still deliver when you are near each other.</string>
     <string name="ui_update_this_friend_question">Update this friend?</string>
     <string name="ui_update_this_friend">Update this friend</string>
     <string name="ui_you_already_have_this_friend_saved_as">You already have this friend, saved as %1$s. Adding the card again just updates how your phone reaches them.</string>

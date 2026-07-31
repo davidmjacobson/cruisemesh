@@ -13,6 +13,10 @@ struct ContactDetailsSheet: View {
     var isBlocked: Bool = false
     var onBlockedChange: (Bool) -> Void = { _ in }
     var onReport: () -> Void = {}
+    /// Their card's relay endpoint has authoritatively rejected us (core
+    /// `contact_relay_health`), so we have stopped posting to it. Defaulted
+    /// false so previews and existing call sites are unaffected.
+    var relayCardIsStale: Bool = false
     let onDelete: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var editingNickname = false
@@ -102,6 +106,20 @@ struct ContactDetailsSheet: View {
                             Text(deliveryLabel)
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
+                            // Not behind the disclosure below: once the
+                            // endpoint has actually rejected us we KNOW the
+                            // card is stale, and the whole failure mode is
+                            // that nobody finds out. The generic hint stays
+                            // where it is for the case we only suspect it.
+                            if relayCardIsStale {
+                                Text("Their friend card is out of date")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.red)
+                                    .padding(.top, 12)
+                                Text("The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Cruise Pass is set up, then share their friend card again. Messages still deliver when you are near each other.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                             // The host sits behind a tap: meaningless to most
                             // people, and CP3 keeps protocol words off the
                             // surface -- but it is exactly what support and
