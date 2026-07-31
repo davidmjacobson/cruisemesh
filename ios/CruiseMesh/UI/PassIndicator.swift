@@ -92,3 +92,59 @@ enum PassIndicator {
         }
     }
 }
+
+extension RelayHealth {
+    /// True when this health is an actual verdict on the pass rather than "we
+    /// have not looked yet". `.checking` and `.noConfig` both mean the absence
+    /// of an answer -- the latter is what a stopped mesh service leaves
+    /// behind, and what a saved-but-unchecked card reports.
+    var isPassVerdict: Bool {
+        switch self {
+        case .checking, .noConfig: return false
+        default: return true
+        }
+    }
+}
+
+/// Heading shown at the top of the Cruise Pass screen.
+///
+/// Mirrors Android's `PassIndicator.kt` -- keep the two mappings in step.
+enum CruisePassHeading {
+    /// No setup card saved: invite them to add one.
+    case notSetUp
+
+    /// A card is saved but no check has landed yet.
+    case checking
+
+    /// Green check: the relay answered and the pass is good.
+    case ready
+
+    /// A card is saved and the last check said something other than OK.
+    case configured
+
+    /// Heading for a saved pass, given the live `health` and `lastVerdict` --
+    /// the most recent health that was an actual answer (`isPassVerdict`).
+    ///
+    /// Re-checks are not demotions. A background sync pass, or a service
+    /// restart, drops health to `.checking`/`.noConfig` for a second or two;
+    /// without `lastVerdict` the heading would fall from "Cruise Pass is set
+    /// up" with its green check to "Cruise Pass is configured" and back, which
+    /// reads to the person holding the phone as the pass breaking and healing.
+    /// This is the same reasoning that maps those two states to
+    /// `PassIndicator.none` rather than to a symbol that would only flicker.
+    ///
+    /// It stays health-only for every real verdict: the moment the relay
+    /// answers with anything but OK -- rejected token, expired, no internet --
+    /// the green check goes, because `lastVerdict` is then that answer and not
+    /// the stale OK.
+    static func of(
+        _ health: RelayHealth,
+        configured: Bool,
+        lastVerdict: RelayHealth?
+    ) -> CruisePassHeading {
+        guard configured else { return .notSetUp }
+        guard let settled = health.isPassVerdict ? health : lastVerdict else { return .checking }
+        if case .ok = settled { return .ready }
+        return .configured
+    }
+}

@@ -122,6 +122,94 @@ final class PassIndicatorTests: XCTestCase {
         }
     }
 
+    func testHeadingInvitesSetupWhateverTheStaleHealthSays() {
+        XCTAssertEqual(
+            CruisePassHeading.of(.ok(lastSyncMs: now), configured: false, lastVerdict: .ok(lastSyncMs: now)),
+            .notSetUp
+        )
+    }
+
+    func testHeadingReadsAsSetUpWhenTheRelayAnswersOk() {
+        XCTAssertEqual(
+            CruisePassHeading.of(.ok(lastSyncMs: now), configured: true, lastVerdict: nil),
+            .ready
+        )
+    }
+
+    func testARecheckDoesNotDemoteAPassThatJustVerified() {
+        // Aunt Joan's report: pasting a card showed "Cruise Pass is set up"
+        // with its green check, then flipped to "Cruise Pass is configured"
+        // and back as the first background sync -- and the service restart
+        // that clears health to .noConfig -- passed through. A check in
+        // flight is not evidence against the pass, so the heading must hold.
+        for health in [RelayHealth.checking, .noConfig] {
+            XCTAssertEqual(
+                CruisePassHeading.of(health, configured: true, lastVerdict: .ok(lastSyncMs: now)),
+                .ready,
+                "\(health) is an absent answer, not a failing one"
+            )
+        }
+    }
+
+    func testASavedPassWithNoAnswerYetSaysItIsBeingChecked() {
+        for health in [RelayHealth.checking, .noConfig] {
+            XCTAssertEqual(
+                CruisePassHeading.of(health, configured: true, lastVerdict: nil),
+                .checking,
+                "\(health)"
+            )
+        }
+    }
+
+    func testAnyRealAnswerOtherThanOkDropsTheGreenCheckAtOnce() {
+        // The stickiness above must never outlive a genuine verdict: a pass
+        // the relay has started rejecting loses the check on that answer, not
+        // one sync later.
+        let healths: [RelayHealth] = [
+            .noInternet,
+            .failing(lastAttemptMs: now),
+            .expired(lastAttemptMs: now),
+            .suspended(lastAttemptMs: now),
+            .tokenRejected(lastAttemptMs: now),
+            .quotaFull(lastAttemptMs: now),
+            .messageTooLarge(lastAttemptMs: now),
+            .rateLimited(lastAttemptMs: now),
+        ]
+        for health in healths {
+            XCTAssertEqual(
+                CruisePassHeading.of(health, configured: true, lastVerdict: .ok(lastSyncMs: now)),
+                .configured,
+                "\(health) is an answer and must beat the previous OK"
+            )
+        }
+    }
+
+    func testACheckInFlightHoldsAFailingVerdictToo() {
+        XCTAssertEqual(
+            CruisePassHeading.of(.checking, configured: true, lastVerdict: .tokenRejected(lastAttemptMs: now)),
+            .configured
+        )
+    }
+
+    func testOnlyRealAnswersCountAsVerdicts() {
+        XCTAssertFalse(RelayHealth.checking.isPassVerdict)
+        XCTAssertFalse(RelayHealth.noConfig.isPassVerdict)
+        let answers: [RelayHealth] = [
+            .ok(lastSyncMs: now),
+            .noInternet,
+            .failing(lastAttemptMs: now),
+            .expired(lastAttemptMs: now),
+            .suspended(lastAttemptMs: now),
+            .tokenRejected(lastAttemptMs: now),
+            .quotaFull(lastAttemptMs: now),
+            .messageTooLarge(lastAttemptMs: now),
+            .rateLimited(lastAttemptMs: now),
+        ]
+        for health in answers {
+            XCTAssertTrue(health.isPassVerdict, "\(health) is an answer")
+        }
+    }
+
     func testRetryAfterHonorsAdvertisedWindow() {
         XCTAssertEqual(relayRetryAfterMs(retryAfterHeader: "3"), 3_000)
         XCTAssertEqual(relayRetryAfterMs(retryAfterHeader: "999"), 60_000)

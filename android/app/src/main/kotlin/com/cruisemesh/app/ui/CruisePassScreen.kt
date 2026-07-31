@@ -53,9 +53,12 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.R
+import com.cruisemesh.app.mesh.CruisePassHeading
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.mesh.RelaySyncEvents
+import com.cruisemesh.app.mesh.cruisePassHeading
+import com.cruisemesh.app.mesh.isPassVerdict
 import com.cruisemesh.app.mesh.relayCheckFailureRes
 import com.cruisemesh.app.mesh.shouldRetryFirstRelayCheck
 import com.cruisemesh.app.relay.RelayClient
@@ -88,6 +91,14 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     val relayHealth by MeshConnectivityStatus.relay.collectAsState()
     var configured by remember { mutableStateOf(RelayConfigStore.load(context)) }
+    // Last health that was an actual answer, so an in-flight re-check keeps
+    // showing the previous verdict instead of flickering the heading. Keyed on
+    // [configured] so swapping in a different pass never inherits the old
+    // pass's verdict.
+    var lastVerdict by remember(configured) { mutableStateOf(relayHealth.takeIf { it.isPassVerdict() }) }
+    LaunchedEffect(relayHealth) {
+        if (relayHealth.isPassVerdict()) lastVerdict = relayHealth
+    }
     var input by remember { mutableStateOf(initialCard.orEmpty()) }
     var pending by remember { mutableStateOf<RelaySetup?>(null) }
     var pendingUntrusted by remember { mutableStateOf<RelaySetup?>(null) }
@@ -293,23 +304,23 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                     ) { Text(stringResource(R.string.ui_not_now)) }
                 }
             } else {
-                // Deliberately health-only: a Saved state from minutes ago must
-                // not keep the green check alive after the relay starts
-                // rejecting the pass.
-                val verified = relayHealth is RelayHealth.Ok
-                if (configured != null && verified) {
-                    CruisePassReadyHeading(
+                // Verdict-driven, not health-driven: an in-flight re-check must
+                // not demote the heading (see cruisePassHeading), but any real
+                // answer other than OK takes the green check away at once.
+                when (cruisePassHeading(relayHealth, configured != null, lastVerdict)) {
+                    CruisePassHeading.READY -> CruisePassReadyHeading(
                         text = stringResource(R.string.ui_cruise_pass_is_set_up),
                     )
-                } else {
-                    Text(
-                        stringResource(
-                            if (configured == null) {
-                                R.string.ui_set_up_your_cruise_pass
-                            } else {
-                                R.string.ui_cruise_pass_is_configured
-                            },
-                        ),
+                    CruisePassHeading.NOT_SET_UP -> Text(
+                        stringResource(R.string.ui_set_up_your_cruise_pass),
+                        style = MaterialTheme.typography.headlineSmall,
+                    )
+                    CruisePassHeading.CHECKING -> Text(
+                        stringResource(R.string.ui_checking_your_cruise_pass),
+                        style = MaterialTheme.typography.headlineSmall,
+                    )
+                    CruisePassHeading.CONFIGURED -> Text(
+                        stringResource(R.string.ui_cruise_pass_is_configured),
                         style = MaterialTheme.typography.headlineSmall,
                     )
                 }
