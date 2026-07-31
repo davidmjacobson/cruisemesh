@@ -129,6 +129,7 @@
     <string name="ui_relay_configuration_local_wi_fi_tools_and_diagnostics">Relay configuration, local Wi-Fi tools, and diagnostics.</string>
     <string name="ui_relay_token_optional">Relay token (optional)</string>
     <string name="ui_relay_url">Relay URL</string>
+    <string name="ui_relay_url_must_be_https">Relay URL must start with https:// This one was not saved.</string>
     <string name="ui_relay_url_optional">Relay URL (optional)</string>
     <string name="ui_release_to_send">release to send</string>
     <string name="ui_report_contact">Report contact</string>

@@ -113,6 +113,15 @@ me?", **rotating daily** so there is no stable global identifier on the wire.
 Sender identity is inside the ciphertext. The relay server stores sealed
 envelopes and hints, nothing else, with bounded retention.
 
+Relay traffic is **HTTPS-only**, enforced in the core rather than left to each
+platform's cleartext-traffic default: `normalize_relay_url` drops any relay URL
+that isn't `https://`, whether it was typed by the user, carried in a scanned
+friend card, or named in a contact's relay-change notice. Loopback (and the
+Android emulator's host alias) keeps plain HTTP so relayd can be developed
+locally. Envelope bodies are sealed either way — what this protects is the
+relay token, the hints, and the envelope sizes, none of which should cross an
+open connection.
+
 What a compromised relay or malicious mule learns: traffic timing, volume,
 bucketed sizes, daily-rotating hints, and rough social-graph scale. What it
 does not learn: contents, senders, recipients' stable identities, read
