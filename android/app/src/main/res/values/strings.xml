@@ -263,6 +263,10 @@
     <string name="ui_help_support">Help &amp; support</string>
     <string name="ui_new_message">New message</string>
     <string name="ui_profile">Profile</string>
+    <!-- Composer notice: which direction of this chat cannot cross the internet -->
+    <string name="ui_composer_replies_cannot_reach_you">Your messages will reach %1$s, but their replies only arrive when you\'re near each other. Set up a Cruise Pass to get replies anywhere.</string>
+    <string name="ui_composer_they_cannot_be_reached">%1$s hasn\'t set up a Cruise Pass, so your messages only arrive when you\'re near each other. They need their own pass to be reached from further away.</string>
+    <string name="ui_composer_neither_direction_works">Neither phone has a Cruise Pass, so messages only cross when you\'re near each other. Either of you can set one up.</string>
     <!-- Cruise Pass -->
     <string name="ui_cruise_pass">Cruise Pass</string>
     <string name="ui_setting_up_cruise_pass">Setting up Cruise Pass</string>

@@ -290,6 +290,17 @@ pub struct ContactProvenance {
     pub source: u8,
     pub introducer_user_id: Option<Vec<u8>>,
     pub introduced_at_ms: i64,
+    /// Were we standing next to this person when we accepted them? True for a
+    /// camera QR scan (co-presence by construction) and for any add where the
+    /// peer was in the live nearby set at the time.
+    ///
+    /// Deliberately not inferred from [`ContactProvenance::source`]: `source =
+    /// 0` conflates an in-person scan with a card pasted from an aeroplane,
+    /// and those two carry opposite expectations about whether internet
+    /// delivery was ever part of the deal. Stores written before this field
+    /// existed read as `false` -- unknown, so say the true thing rather than
+    /// assume an in-person encounter we have no record of.
+    pub added_nearby: bool,
 }
 
 /// One entry of a per-chat sync digest (DESIGN.md §7.3): "I have `sender_user_id`'s
@@ -460,6 +471,17 @@ impl MessageStore {
             [],
         )
         .map_err(store_err)?;
+        // Whether the peer was standing next to us when we accepted them (see
+        // `ContactProvenance::added_nearby`). Existing rows predate the field
+        // and default to 0, which reads as "no record of an in-person
+        // encounter" -- the honest default, since it only ever suppresses a
+        // warning we would otherwise be right to show.
+        ensure_column(
+            &conn,
+            "contact_provenance",
+            "added_nearby",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(&conn, "messages", "arrival_transport", "INTEGER")?;
         ensure_column(&conn, "receipts", "via_transport", "INTEGER")?;
         ensure_column(&conn, "messages", "hops_taken", "INTEGER")?;
@@ -2694,19 +2716,25 @@ impl MessageStore {
         let conn = lock_conn(&self.conn);
         conn.execute(
             "INSERT INTO contact_provenance
-                (user_id, source, introducer_user_id, introduced_at_ms)
-             VALUES (?1, ?2, ?3, ?4)
+                (user_id, source, introducer_user_id, introduced_at_ms, added_nearby)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(user_id) DO UPDATE SET
                 source = CASE WHEN contact_provenance.source = 0 THEN 0 ELSE excluded.source END,
                 introducer_user_id = CASE WHEN contact_provenance.source = 0
                     THEN contact_provenance.introducer_user_id ELSE excluded.introducer_user_id END,
                 introduced_at_ms = CASE WHEN contact_provenance.source = 0
-                    THEN contact_provenance.introduced_at_ms ELSE excluded.introduced_at_ms END",
+                    THEN contact_provenance.introduced_at_ms ELSE excluded.introduced_at_ms END,
+                -- Meeting in person is a fact about an encounter that happened;
+                -- a later remote re-add does not unmake it, so this one is
+                -- sticky rather than last-write-wins.
+                added_nearby = CASE WHEN contact_provenance.added_nearby = 1 OR excluded.added_nearby = 1
+                    THEN 1 ELSE 0 END",
             params![
                 provenance.user_id,
                 provenance.source as i64,
                 provenance.introducer_user_id,
                 provenance.introduced_at_ms,
+                provenance.added_nearby as i64,
             ],
         )
         .map_err(store_err)?;
@@ -2719,7 +2747,7 @@ impl MessageStore {
     ) -> Result<Option<ContactProvenance>, CoreError> {
         let conn = lock_conn(&self.conn);
         conn.query_row(
-            "SELECT user_id, source, introducer_user_id, introduced_at_ms
+            "SELECT user_id, source, introducer_user_id, introduced_at_ms, added_nearby
              FROM contact_provenance WHERE user_id = ?1",
             params![user_id],
             |row| {
@@ -2728,6 +2756,7 @@ impl MessageStore {
                     source: row.get::<_, i64>(1)? as u8,
                     introducer_user_id: row.get(2)?,
                     introduced_at_ms: row.get(3)?,
+                    added_nearby: row.get::<_, i64>(4)? != 0,
                 })
             },
         )
@@ -3990,7 +4019,8 @@ CREATE TABLE IF NOT EXISTS contact_provenance (
     user_id BLOB PRIMARY KEY,
     source INTEGER NOT NULL,
     introducer_user_id BLOB,
-    introduced_at_ms INTEGER NOT NULL
+    introduced_at_ms INTEGER NOT NULL,
+    added_nearby INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS groups (
@@ -5754,6 +5784,7 @@ mod tests {
                 source: 0,
                 introducer_user_id: None,
                 introduced_at_ms: 10,
+                added_nearby: true,
             })
             .unwrap();
         store
@@ -5762,12 +5793,84 @@ mod tests {
                 source: 1,
                 introducer_user_id: Some(vec![4; 16]),
                 introduced_at_ms: 20,
+                added_nearby: false,
             })
             .unwrap();
         let provenance = store.get_contact_provenance(user_id).unwrap().unwrap();
         assert_eq!(provenance.source, 0);
         assert!(provenance.introducer_user_id.is_none());
         assert_eq!(provenance.introduced_at_ms, 10);
+    }
+
+    #[test]
+    fn meeting_in_person_survives_a_later_remote_re_add() {
+        // A card pasted later (or an introduction arriving from a friend)
+        // must not erase the fact that we once stood next to this person.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let user_id = vec![7; 16];
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: user_id.clone(),
+                source: 0,
+                introducer_user_id: None,
+                introduced_at_ms: 10,
+                added_nearby: true,
+            })
+            .unwrap();
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: user_id.clone(),
+                source: 0,
+                introducer_user_id: None,
+                introduced_at_ms: 20,
+                added_nearby: false,
+            })
+            .unwrap();
+        assert!(
+            store
+                .get_contact_provenance(user_id)
+                .unwrap()
+                .unwrap()
+                .added_nearby
+        );
+    }
+
+    #[test]
+    fn a_remote_add_can_be_upgraded_once_we_actually_meet() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let user_id = vec![8; 16];
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: user_id.clone(),
+                source: 0,
+                introducer_user_id: None,
+                introduced_at_ms: 10,
+                added_nearby: false,
+            })
+            .unwrap();
+        assert!(
+            !store
+                .get_contact_provenance(user_id.clone())
+                .unwrap()
+                .unwrap()
+                .added_nearby
+        );
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: user_id.clone(),
+                source: 0,
+                introducer_user_id: None,
+                introduced_at_ms: 20,
+                added_nearby: true,
+            })
+            .unwrap();
+        assert!(
+            store
+                .get_contact_provenance(user_id)
+                .unwrap()
+                .unwrap()
+                .added_nearby
+        );
     }
 
     #[test]

@@ -3,6 +3,10 @@ import SwiftUI
 struct FriendPreviewState: Identifiable {
     let contact: Contact
     let warning: String?
+    /// The card came off this phone's camera, which is co-presence by
+    /// construction. Recorded in `ContactProvenance.addedNearby`; a pasted or
+    /// linked card says nothing about where its owner is, so it defaults false.
+    var scanned: Bool = false
     var id: String { UserIdHex.encode(contact.userId) }
 }
 
