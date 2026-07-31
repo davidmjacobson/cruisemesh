@@ -97,6 +97,7 @@ import com.cruisemesh.app.ui.ChatListScreen
 import com.cruisemesh.app.ui.ChatSummary
 import com.cruisemesh.app.ui.CruiseMeshTheme
 import com.cruisemesh.app.ui.LocalReachabilityPalette
+import com.cruisemesh.app.ui.InternetDeliveryService
 import com.cruisemesh.app.ui.MeshStatusDotColor
 import com.cruisemesh.app.ui.MeshStatusLegendDialog
 import com.cruisemesh.app.ui.MeshStatusTextLogic
@@ -124,6 +125,7 @@ import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.parseFriendText
 import uniffi.cruisemesh_core.parseRelaySetupText
+import uniffi.cruisemesh_core.relaySetupIsOfficial
 import uniffi.cruisemesh_core.lanDefaultTcpPort
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
@@ -600,6 +602,15 @@ private fun freshRelayHealthForDisplay(relayHealth: RelayHealth, nowMs: Long, pu
         relayHealth
     }
 
+private fun configuredInternetDeliveryService(context: Context): InternetDeliveryService? =
+    RelayConfigStore.load(context)?.let { config ->
+        if (relaySetupIsOfficial(config.relayUrl)) {
+            InternetDeliveryService.CRUISE_PASS
+        } else {
+            InternetDeliveryService.CUSTOM_RELAY
+        }
+    }
+
 /** Resolves a [MeshStatusDotColor] to an actual [androidx.compose.ui.graphics.Color] via the current theme palette. */
 @Composable
 private fun MeshStatusDotColor?.toComposeColor(): androidx.compose.ui.graphics.Color? {
@@ -636,6 +647,9 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     var transientMeshStatus by remember { mutableStateOf<String?>(null) }
     var ownDisplayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     var ownAvatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
+    var internetDeliveryService by remember {
+        mutableStateOf(configuredInternetDeliveryService(context))
+    }
     var showMeshStatusLegend by remember { mutableStateOf(false) }
     val uiPrefs = remember(context) { context.getSharedPreferences(UI_PREFS_NAME, Context.MODE_PRIVATE) }
     var bluetoothAudioWarningDismissed by remember { mutableStateOf(false) }
@@ -790,6 +804,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             if (dest.route == "home") {
                 ownDisplayName = ProfileStore.loadDisplayName(context)
                 ownAvatarPath = ProfilePhotoStore.loadAvatarPath(context)
+                internetDeliveryService = configuredInternetDeliveryService(context)
                 permissionRefreshToken += 1
                 bluetoothEnabled = isBluetoothRadioEnabled(context)
                 reloadSummaries()
@@ -818,8 +833,13 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val displayRelayHealth = remember(relayHealth, pushHealthy, connectivityNowMs) {
         freshRelayHealthForDisplay(relayHealth, connectivityNowMs, pushHealthy)
     }
-    val pillStatus = remember(runtimeStatus, nearbyPeerIds, displayRelayHealth) {
-        MeshStatusTextLogic.build(runtimeStatus, nearbyPeerIds.size, displayRelayHealth)
+    val pillStatus = remember(runtimeStatus, nearbyPeerIds, displayRelayHealth, internetDeliveryService) {
+        MeshStatusTextLogic.build(
+            runtimeStatus,
+            nearbyPeerIds.size,
+            displayRelayHealth,
+            internetDeliveryService,
+        )
     }
     val pillDotColor = pillStatus.dot.toComposeColor()
 
@@ -1243,6 +1263,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
         val pushHealthy by MeshConnectivityStatus.pushHealthy.collectAsState()
         val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
         val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
+        val staleRelayContacts by MeshConnectivityStatus.staleRelayContacts.collectAsState()
         val connectivityNowMs = rememberConnectivityNowMs()
         val reachability = remember(contact.userId, nearbyPeerIds, relayHealth, pushHealthy, contactLastSeen, presenceLastSeen, connectivityNowMs) {
             reachabilityLevelForUserId(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs, pushHealthy)
@@ -1305,6 +1326,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             reachability = reachability,
             reachabilityStatusText = reachabilityStatusText,
             reachabilityDetailsText = reachabilityDetailsText,
+            relayCardIsStale = staleRelayContacts.contains(UserIdHex.encode(contact.userId)),
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }

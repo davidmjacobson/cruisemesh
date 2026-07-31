@@ -65,6 +65,12 @@ fun ContactDetailsSheet(
     isBlocked: Boolean = false,
     onBlockedChange: (Boolean) -> Unit = {},
     onReport: () -> Unit = {},
+    /**
+     * Their card's relay endpoint has authoritatively rejected us (core
+     * `contact_relay_health`), so we have stopped posting to it. Defaulted
+     * false so previews and existing call sites are unaffected.
+     */
+    relayCardIsStale: Boolean = false,
 ) {
     // skipPartiallyExpanded: expanding "Verify contact" grows the sheet's
     // content height, which makes Material3 recompute the peek/full anchors.
@@ -84,6 +90,7 @@ fun ContactDetailsSheet(
             isBlocked = isBlocked,
             onBlockedChange = onBlockedChange,
             onReport = onReport,
+            relayCardIsStale = relayCardIsStale,
             modifier = Modifier.padding(bottom = 24.dp),
         )
     }
@@ -102,6 +109,12 @@ fun ContactDetailsSheetContent(
     isBlocked: Boolean = false,
     onBlockedChange: (Boolean) -> Unit = {},
     onReport: () -> Unit = {},
+    /**
+     * Their card's relay endpoint has authoritatively rejected us (core
+     * `contact_relay_health`), so we have stopped posting to it. Defaulted
+     * false so previews and existing call sites are unaffected.
+     */
+    relayCardIsStale: Boolean = false,
 ) {
     val displayId = formatUserId(contact.userId)
     val displayName = ChatListLogic.displayNameOrId(coreContactDisplayName(contact), displayId)
@@ -213,6 +226,25 @@ fun ContactDetailsSheetContent(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 4.dp),
                     )
+                    // Not behind the disclosure below: once the endpoint has
+                    // actually rejected us we KNOW the card is stale, and the
+                    // whole failure mode is that nobody finds out. The generic
+                    // hint stays where it is for the case we only suspect it.
+                    if (relayCardIsStale) {
+                        Text(
+                            text = stringResource(R.string.ui_delivery_card_out_of_date),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(top = 12.dp),
+                        )
+                        Text(
+                            text = stringResource(R.string.ui_delivery_card_out_of_date_detail),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
                     // The host is deliberately behind a tap: it is meaningless to
                     // most people and CP3 keeps protocol words off the surface,
                     // but it is exactly what support and self-hosters need.

@@ -137,9 +137,6 @@ import kotlinx.coroutines.withContext
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
 
-/** The `kind` byte for a plaintext chat message (DESIGN.md §7.1). */
-private const val KIND_TEXT: kotlin.UByte = 1u
-
 /** `receipt_type` values (DESIGN.md §7.2), for reading own-message tick watermarks out of the store. */
 private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
@@ -185,6 +182,8 @@ fun ChatScreen(
     reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
     reachabilityStatusText: String = ContactReachability.chatHeaderCopy(ReachabilityLevel.OFFLINE, null, 0L),
     reachabilityDetailsText: String = reachabilityStatusText,
+    /** Their friend card's relay endpoint has been written off after rejecting us (core `contact_relay_health`). */
+    relayCardIsStale: Boolean = false,
 ) {
     val context = LocalContext.current
     var currentContact by remember(contact.userId) { mutableStateOf(contact) }
@@ -404,6 +403,7 @@ fun ChatScreen(
         reachability = reachability,
         reachabilityStatusText = reachabilityStatusText,
         reachabilityDetailsText = reachabilityDetailsText,
+        relayCardIsStale = relayCardIsStale,
         isMuted = isMuted,
         onMutedChange = {
             isMuted = it
@@ -462,6 +462,8 @@ private fun ConversationScreen(
     reachability: ReachabilityLevel = ReachabilityLevel.OFFLINE,
     reachabilityStatusText: String = ContactReachability.chatHeaderCopy(ReachabilityLevel.OFFLINE, null, 0L),
     reachabilityDetailsText: String = reachabilityStatusText,
+    /** Their friend card's relay endpoint has been written off after rejecting us (core `contact_relay_health`). */
+    relayCardIsStale: Boolean = false,
     isMuted: Boolean = false,
     onMutedChange: (Boolean) -> Unit = {},
     onSetNickname: (String?) -> Unit = {},
@@ -634,6 +636,7 @@ private fun ConversationScreen(
                     isBlocked = isBlocked,
                     onBlockedChange = onBlockedChange,
                     onReport = onReport,
+                    relayCardIsStale = relayCardIsStale,
                     avatarBytes = contactAvatar,
                     onDeleteContact = {
                         showContactDetails = false
