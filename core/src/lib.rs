@@ -5,6 +5,7 @@ uniffi::setup_scaffolding!("cruisemesh_core");
 
 mod authoring;
 mod backup;
+mod causal_order;
 mod contact_relay_health;
 mod content;
 mod crypto;
@@ -32,6 +33,7 @@ pub use backup::{
     decode_identity_bytes, encode_identity_bytes, open_backup, seal_backup,
     BackupPassphraseStrength, CoreBackupError, CoreBackupPayload,
 };
+pub use causal_order::{causal_display_timestamp, CAUSAL_ORDER_MAX_SKEW_MS};
 pub use contact_relay_health::{
     contact_relay_fault_is_authoritative, core_contact_relay_endpoint_usable,
     core_contact_relay_is_stale, core_contact_relay_recheck_due, core_contact_relay_streak_delta,

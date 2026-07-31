@@ -598,6 +598,61 @@ pub fn contact_delivery(
     }
 }
 
+/// Which direction of a one-to-one conversation cannot carry beyond
+/// Bluetooth range, decided entirely from local facts -- no network call, no
+/// round trip, and no evidence of the other phone's current state.
+///
+/// The asymmetry this exists to explain: sending needs nothing of your own
+/// (their friend card carries the credential that authorises a post into
+/// *their* mailbox), but receiving needs a mailbox you poll, which needs a
+/// pass of your own. So a person with no pass can reach everyone and be
+/// reached by no one, and today both people believe they are connected.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ComposerReach {
+    /// Say nothing. Either a path exists in both directions, or the contact
+    /// is nearby right now, or we met them in person and nearby delivery was
+    /// always the point.
+    Fine,
+    /// We have no mailbox of our own: we can post to them, but their replies
+    /// have nowhere to land until we hold a pass or they come back in range.
+    RepliesCannotReachMe,
+    /// They shared no internet delivery: our messages wait for range.
+    TheyCannotBeReached,
+    /// Neither of us has a mailbox. Nothing crosses in either direction
+    /// unless the phones are near each other.
+    NeitherDirectionWorks,
+}
+
+/// What (if anything) the composer should say about a one-to-one chat.
+///
+/// `contact_nearby` must come from the same live link lookup the send path
+/// uses -- when a direct BLE/LAN link exists, everything works and the
+/// composer stays quiet. `added_while_nearby` is
+/// `ContactProvenance::added_nearby`: adding someone in person carries an
+/// implicit "we are standing together, nearby delivery is the point", so that
+/// case stays silent rather than nagging about a limit both people chose.
+/// Being introduced remotely carries the opposite implication -- the whole
+/// encounter was internet-mediated -- so the absence of a mailbox is a genuine
+/// surprise and gets said out loud.
+#[uniffi::export]
+pub fn composer_reach(
+    delivery: ContactDelivery,
+    own_relay_configured: bool,
+    contact_nearby: bool,
+    added_while_nearby: bool,
+) -> ComposerReach {
+    if contact_nearby || added_while_nearby {
+        return ComposerReach::Fine;
+    }
+    let they_are_unreachable = delivery == ContactDelivery::NearbyOnly;
+    match (own_relay_configured, they_are_unreachable) {
+        (false, true) => ComposerReach::NeitherDirectionWorks,
+        (false, false) => ComposerReach::RepliesCannotReachMe,
+        (true, true) => ComposerReach::TheyCannotBeReached,
+        (true, false) => ComposerReach::Fine,
+    }
+}
+
 /// Host (and port) of a relay URL, with scheme and path stripped -- safe to
 /// show a user who already holds the card. Never includes the credential.
 fn relay_host_only(url: &str) -> String {
@@ -923,6 +978,78 @@ mod tests {
             "relay.example:8443"
         );
         assert_eq!(relay_host_only("relay.example"), "relay.example");
+    }
+
+    // -- composer_reach (say it where the person is typing) --------------
+
+    const THEIR_MAILBOX: ContactDelivery = ContactDelivery::SharedMailbox;
+
+    #[test]
+    fn no_pass_of_our_own_means_replies_have_nowhere_to_land() {
+        // The Leanne case: she reaches David with his card, he replies, and
+        // his replies cannot arrive. Her phone knows this locally.
+        assert_eq!(
+            composer_reach(THEIR_MAILBOX, false, false, false),
+            ComposerReach::RepliesCannotReachMe
+        );
+    }
+
+    #[test]
+    fn a_contact_with_no_mailbox_cannot_be_reached_from_a_pass_holder() {
+        assert_eq!(
+            composer_reach(ContactDelivery::NearbyOnly, true, false, false),
+            ComposerReach::TheyCannotBeReached
+        );
+    }
+
+    #[test]
+    fn two_phones_without_passes_reach_each_other_only_in_person() {
+        assert_eq!(
+            composer_reach(ContactDelivery::NearbyOnly, false, false, false),
+            ComposerReach::NeitherDirectionWorks
+        );
+    }
+
+    #[test]
+    fn both_ends_holding_a_mailbox_says_nothing() {
+        assert_eq!(
+            composer_reach(THEIR_MAILBOX, true, false, false),
+            ComposerReach::Fine
+        );
+    }
+
+    #[test]
+    fn a_contact_who_is_nearby_right_now_says_nothing() {
+        // Every broken-path combination is silent while a direct link exists:
+        // that path works, and it is the one a send would take.
+        for delivery in [
+            ContactDelivery::NearbyOnly,
+            THEIR_MAILBOX,
+            ContactDelivery::OwnMailbox {
+                host: "relay.example".into(),
+            },
+        ] {
+            for own_pass in [false, true] {
+                assert_eq!(
+                    composer_reach(delivery.clone(), own_pass, true, false),
+                    ComposerReach::Fine
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn meeting_in_person_keeps_the_composer_quiet_afterwards() {
+        // Adding someone while standing next to them means nearby delivery
+        // was the deal; nagging about it later is noise, not news.
+        assert_eq!(
+            composer_reach(ContactDelivery::NearbyOnly, false, false, true),
+            ComposerReach::Fine
+        );
+        assert_eq!(
+            composer_reach(THEIR_MAILBOX, false, false, true),
+            ComposerReach::Fine
+        );
     }
 
     fn some(value: &str) -> Option<String> {

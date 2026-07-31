@@ -122,6 +122,7 @@ import uniffi.cruisemesh_core.generateIdentity
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.ContactDelivery
 import uniffi.cruisemesh_core.contactDelivery
+import uniffi.cruisemesh_core.composerReach
 import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.parseFriendText
@@ -1018,8 +1019,11 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
             store = store,
             onContactAdded = { scanned ->
                 val contact = RelayImport.reconcileOnImport(context, store, scanned)
+                // Pointing a camera at their screen is co-presence by
+                // construction -- no need to consult the peer set, which may
+                // not have HELLO'd them yet.
                 store.upsertContactProvenance(
-                    ContactProvenance(contact.userId, 0u, null, System.currentTimeMillis()),
+                    ContactProvenance(contact.userId, 0u, null, System.currentTimeMillis(), addedNearby = true),
                 )
                 store.removeFriendSuggestion(contact.userId)
                 val delivery = FriendRequestSender.queueForScannedContact(context, store, identity, contact)
@@ -1089,8 +1093,18 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
         },
         onConfirmContact = { candidate ->
             val contact = RelayImport.reconcileOnImport(context, store, candidate)
+            // A pasted card says nothing about where its owner is: it may have
+            // been handed over in person or forwarded from an aeroplane. Only
+            // a live link to them counts as having met.
             store.upsertContactProvenance(
-                ContactProvenance(contact.userId, 0u, null, System.currentTimeMillis()),
+                ContactProvenance(
+                    contact.userId,
+                    0u,
+                    null,
+                    System.currentTimeMillis(),
+                    addedNearby = MeshConnectivityStatus.nearbyPeerIds.value
+                        .contains(UserIdHex.encode(contact.userId)),
+                ),
             )
             store.removeFriendSuggestion(contact.userId)
             val delivery = FriendRequestSender.queueForScannedContact(context, store, identity, contact)
@@ -1279,13 +1293,30 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
         // exists. A property of their friend card, not of the moment, so it
         // only recomputes when the card or our own config changes.
         val ownRelayConfig = remember { RelayConfigStore.load(context) }
-        val contactHasInternetDelivery = remember(contact.relayUrl, contact.relayToken, ownRelayConfig) {
+        val delivery = remember(contact.relayUrl, contact.relayToken, ownRelayConfig) {
             contactDelivery(
                 contact.relayUrl,
                 contact.relayToken,
                 ownRelayConfig?.relayUrl,
                 ownRelayConfig?.relayToken,
-            ) != ContactDelivery.NearbyOnly
+            )
+        }
+        val contactHasInternetDelivery = delivery != ContactDelivery.NearbyOnly
+        // Whether we ever stood next to this person. A durable fact, so read it
+        // once per chat rather than on every connectivity tick.
+        val addedNearby = remember(contact.userId) {
+            store.getContactProvenance(contact.userId)?.addedNearby ?: false
+        }
+        // Which direction of this chat cannot cross the internet. Local
+        // knowledge only: our own config, their card, and whether a link to
+        // them exists right now.
+        val composerReachVerdict = remember(delivery, ownRelayConfig, nearbyPeerIds, addedNearby, contact.userId) {
+            composerReach(
+                delivery,
+                ownRelayConfig != null,
+                nearbyPeerIds.contains(UserIdHex.encode(contact.userId)),
+                addedNearby,
+            )
         }
         val reachabilityStatusText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs, nearbyTransport, contactHasInternetDelivery) {
             val hex = UserIdHex.encode(contact.userId)
@@ -1323,6 +1354,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             reachabilityStatusText = reachabilityStatusText,
             reachabilityDetailsText = reachabilityDetailsText,
             relayCardIsStale = staleRelayContacts.contains(UserIdHex.encode(contact.userId)),
+            composerReach = composerReachVerdict,
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }

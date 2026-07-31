@@ -3,8 +3,13 @@ import SwiftUI
 struct FriendPreviewState: Identifiable {
     let contact: Contact
     /// How this card relates to contacts already saved, decided in core so both
-    /// shells agree (`friend_card_match`).
+    /// shells agree (`friend_card_match`). Supersedes the old free-text
+    /// `warning`, which named the wrong person.
     let match: FriendCardMatch
+    /// The card came off this phone's camera, which is co-presence by
+    /// construction. Recorded in `ContactProvenance.addedNearby`; a pasted or
+    /// linked card says nothing about where its owner is, so it defaults false.
+    var scanned: Bool = false
     var id: String { UserIdHex.encode(contact.userId) }
 }
 

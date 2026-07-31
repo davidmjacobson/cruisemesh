@@ -121,6 +121,7 @@ import com.cruisemesh.app.ui.SignalTick
 import com.cruisemesh.app.ui.bubbleGroupingFor
 import com.cruisemesh.app.ui.formatConversationTimestamp
 import com.cruisemesh.app.ui.tickLegendText
+import uniffi.cruisemesh_core.ComposerReach
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.MessageStore
@@ -184,6 +185,11 @@ fun ChatScreen(
     reachabilityDetailsText: String = reachabilityStatusText,
     /** Their friend card's relay endpoint has been written off after rejecting us (core `contact_relay_health`). */
     relayCardIsStale: Boolean = false,
+    /**
+     * Which direction of this chat cannot cross the internet, from core
+     * `composer_reach`. Purely local; drives the notice above the composer.
+     */
+    composerReach: ComposerReach = ComposerReach.FINE,
 ) {
     val context = LocalContext.current
     var currentContact by remember(contact.userId) { mutableStateOf(contact) }
@@ -404,6 +410,7 @@ fun ChatScreen(
         reachabilityStatusText = reachabilityStatusText,
         reachabilityDetailsText = reachabilityDetailsText,
         relayCardIsStale = relayCardIsStale,
+        composerReach = composerReach,
         isMuted = isMuted,
         onMutedChange = {
             isMuted = it
@@ -464,6 +471,7 @@ private fun ConversationScreen(
     reachabilityDetailsText: String = reachabilityStatusText,
     /** Their friend card's relay endpoint has been written off after rejecting us (core `contact_relay_health`). */
     relayCardIsStale: Boolean = false,
+    composerReach: ComposerReach = ComposerReach.FINE,
     isMuted: Boolean = false,
     onMutedChange: (Boolean) -> Unit = {},
     onSetNickname: (String?) -> Unit = {},
@@ -599,6 +607,8 @@ private fun ConversationScreen(
             }
         },
         belowList = {
+            ComposerReachNotice(reach = composerReach, contactName = displayName)
+
             if (pendingPhoto != null) {
                 PendingPhotoCard(bytes = pendingPhoto, onRemove = onClearPendingPhoto)
             }
@@ -769,6 +779,36 @@ private fun ConversationScreen(
         PhotoViewerOverlay(
             jpeg = currentViewerPhoto,
             onDismiss = { viewerPhoto = null },
+        )
+    }
+}
+
+/**
+ * The one place a person is guaranteed to look before typing: a persistent,
+ * non-modal line above the composer saying which direction of this chat cannot
+ * cross the internet. Renders nothing for [ComposerReach.FINE], which is every
+ * ordinary chat.
+ *
+ * Deliberately not a dialog, a snackbar, or a row inside the contact sheet
+ * three taps away. The failure it describes is silent -- messages sit at one
+ * tick forever and no screen explains why -- so it has to be where the typing
+ * happens, and it has to stay put.
+ */
+@Composable
+internal fun ComposerReachNotice(reach: ComposerReach, contactName: String, modifier: Modifier = Modifier) {
+    val stringRes = ComposerReachCopy.stringResFor(reach) ?: return
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(bottom = 8.dp),
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+    ) {
+        Text(
+            text = stringResource(stringRes, contactName),
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
         )
     }
 }
