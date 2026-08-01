@@ -49,7 +49,7 @@ func contactReportAction(
 /// thing in `ui_no_email_app`; kept here as a function so the wording is
 /// pinned by a test rather than typed twice.
 func noMailAppMessage(address: String) -> String {
-    "No email app found. You can email \(address) directly — the address has been copied."
+    String(localized: "No email app found. You can email \(address) directly — the address has been copied.")
 }
 
 /// Opens the user's email app with a pre-filled abuse report. E2E stays
