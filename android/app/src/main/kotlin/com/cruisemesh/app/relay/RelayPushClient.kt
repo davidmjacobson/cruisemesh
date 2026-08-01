@@ -30,6 +30,23 @@ internal fun isPushHintReplyCurrent(stopped: Boolean, desiredConfig: RelayConfig
     !stopped && desiredConfig == replyConfig
 
 /**
+ * What a subscribe needs: which recipient hints to watch, and where in the
+ * mailbox to start from.
+ *
+ * [afterId] used to be hardcoded to 0, which asked relayd to replay the
+ * entire mailbox as push frames on every single reconnect -- tens of
+ * thousands of frames this class then threw away one by one, because it
+ * deliberately ignores frame content (see the class doc). Passing the poll
+ * path's persisted frontier instead makes a reconnect cost what it should:
+ * the mail that actually arrived since. Correctness is unchanged either way,
+ * since a frame is only ever a doorbell.
+ */
+data class RelayPushSubscription(
+    val hints: List<ByteArray>,
+    val afterId: Long,
+)
+
+/**
  * Idle read timeout. relayd pings on an interval well inside this; a value
  * this generous just guards against a socket that has gone silent without
  * either side noticing (see relayd/src/lib.rs `WS_WRITE_TIMEOUT`, the
@@ -115,7 +132,7 @@ class RelayPushClient(
     private val backoff = RelayPushBackoff()
 
     @Volatile private var desiredConfig: RelayConfig? = null
-    @Volatile private var hintsProvider: (((List<ByteArray>) -> Unit) -> Unit)? = null
+    @Volatile private var hintsProvider: (((RelayPushSubscription) -> Unit) -> Unit)? = null
     @Volatile private var webSocket: WebSocket? = null
     @Volatile private var stopped = true
     @Volatile private var connected = false
@@ -138,7 +155,7 @@ class RelayPushClient(
      * asynchronously" section. It must call that callback exactly once.
      */
     @Synchronized
-    fun start(config: RelayConfig, hintsProvider: (onReady: (List<ByteArray>) -> Unit) -> Unit) {
+    fun start(config: RelayConfig, hintsProvider: (onReady: (RelayPushSubscription) -> Unit) -> Unit) {
         if (!stopped && desiredConfig == config) return
         stop()
         stopped = false
@@ -174,7 +191,7 @@ class RelayPushClient(
         if (stopped) return
         val config = desiredConfig ?: return
         val provider = hintsProvider ?: return
-        provider.invoke { hints -> finishConnect(config, hints) }
+        provider.invoke { subscription -> finishConnect(config, subscription) }
     }
 
     /**
@@ -186,8 +203,9 @@ class RelayPushClient(
      * we've already moved on from.
      */
     @Synchronized
-    private fun finishConnect(config: RelayConfig, hints: List<ByteArray>) {
+    private fun finishConnect(config: RelayConfig, subscription: RelayPushSubscription) {
         if (!isPushHintReplyCurrent(stopped, desiredConfig, config)) return
+        val hints = subscription.hints
         if (hints.isEmpty()) {
             // Nothing addressed to us yet (e.g. no contacts/groups -- the
             // fresh-onboarding state). relayd rejects a hint-less subscribe
@@ -200,13 +218,12 @@ class RelayPushClient(
             scheduleReconnect()
             return
         }
-        val encodedHints = hints.joinToString(",") { urlEncode(base64Url(it)) }
-        val wsUrl = "${toWebSocketUrl(config.relayUrl)}/ws?hints=$encodedHints&after=0"
+        val wsUrl = "${toWebSocketUrl(config.relayUrl)}${pushSubscribePath(hints, subscription.afterId)}"
         val request = Request.Builder()
             .url(wsUrl)
             .header("Authorization", "Bearer ${config.relayToken}")
             .build()
-        Log.i(TAG, "Connecting relay push socket to ${config.relayUrl}")
+        Log.i(TAG, "Connecting relay push socket to ${config.relayUrl} after=${subscription.afterId}")
         webSocket = httpClient.newWebSocket(request, listener)
     }
 
@@ -269,9 +286,24 @@ class RelayPushClient(
         }
     }
 
-    private fun base64Url(bytes: ByteArray): String =
-        Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
-
-    private fun urlEncode(value: String): String =
-        URLEncoder.encode(value, StandardCharsets.UTF_8.name())
 }
+
+/**
+ * The `/ws` subscribe path for a hint set and a starting cursor. Extracted so
+ * the one thing worth pinning -- that the frontier reaches the query string
+ * instead of a hardcoded `after=0` -- is testable without a socket.
+ *
+ * A negative cursor is clamped to 0: relayd rejects a negative `after`, and
+ * failing the doorbell over a corrupt local value would be a worse trade than
+ * replaying.
+ */
+internal fun pushSubscribePath(hints: List<ByteArray>, afterId: Long): String {
+    val encodedHints = hints.joinToString(",") { urlEncode(base64Url(it)) }
+    return "/ws?hints=$encodedHints&after=${afterId.coerceAtLeast(0L)}"
+}
+
+private fun base64Url(bytes: ByteArray): String =
+    Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+
+private fun urlEncode(value: String): String =
+    URLEncoder.encode(value, StandardCharsets.UTF_8.name())

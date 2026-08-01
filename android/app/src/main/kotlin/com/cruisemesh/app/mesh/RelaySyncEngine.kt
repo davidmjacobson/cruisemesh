@@ -14,6 +14,7 @@ import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.relay.RelayFetchedEnvelope
 import com.cruisemesh.app.relay.RelayHttpException
 import com.cruisemesh.app.relay.RelayPushClient
+import com.cruisemesh.app.relay.RelayPushSubscription
 import com.cruisemesh.app.relay.RelayUpdateSender
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
@@ -30,7 +31,11 @@ import uniffi.cruisemesh_core.coreGroupFanoutRows
 import uniffi.cruisemesh_core.dedupeHints
 import uniffi.cruisemesh_core.coreGroupFanoutRowsForCarried
 import uniffi.cruisemesh_core.recentPresenceHintsFor
+import uniffi.cruisemesh_core.relayCursorKey
 import uniffi.cruisemesh_core.relayFetchBatchLimit
+import uniffi.cruisemesh_core.relayFetchWalkContinues
+import uniffi.cruisemesh_core.relayPassStartCursor
+import uniffi.cruisemesh_core.relaySweepDue
 import uniffi.cruisemesh_core.ContactRelayRejection
 import uniffi.cruisemesh_core.coreContactRelayEndpointUsable
 import uniffi.cruisemesh_core.coreContactRelayIsStale
@@ -336,28 +341,49 @@ internal class RelaySyncEngine(
             relayPushClient.stop()
             return
         }
-        relayPushClient.start(config) { onReady -> computeRelayPushHints(identity, onReady) }
+        relayPushClient.start(config) { onReady -> computeRelayPushHints(identity, config, onReady) }
     }
 
     /**
-     * FA3: computes the relay-push hint set on the store executor and always
-     * invokes [onReady] exactly once -- with the hints, with `emptyList()` if
-     * the computation throws, or with `emptyList()` if the executor has
-     * already been shut down (MeshService.onDestroy racing a pending
-     * reconnect). [RelayPushClient.connect] depends on hearing back to decide
-     * whether to open a socket or back off and retry (empty hints reads as
-     * "nothing to subscribe to yet," same as before this fix); silently
-     * dropping the callback would strand it never reconnecting.
+     * FA3: computes the relay-push subscription on the store executor and
+     * always invokes [onReady] exactly once -- with the hints, with an empty
+     * hint set if the computation throws, or with an empty hint set if the
+     * executor has already been shut down (MeshService.onDestroy racing a
+     * pending reconnect). [RelayPushClient.connect] depends on hearing back
+     * to decide whether to open a socket or back off and retry (empty hints
+     * reads as "nothing to subscribe to yet," same as before this fix);
+     * silently dropping the callback would strand it never reconnecting.
+     *
+     * Two things go into a subscription, and both matter:
+     *
+     *  - **Which hints**, from [MessageStore.relayFetchPushHints] -- the
+     *    fetch id set plus one day ahead, so a socket opened before midnight
+     *    is still subscribed to the right topic after it (see that function's
+     *    doc for why a subscription may safely reach a day further than a
+     *    fetch).
+     *  - **Where to replay from**: the poll path's persisted frontier for
+     *    this relay, so a reconnect asks relayd for what arrived since rather
+     *    than for the whole mailbox. The doorbell ignores frame content
+     *    either way -- this is purely about not making the server serialize
+     *    an entire mailbox into frames that are discarded on arrival, on
+     *    every reconnect, forever.
      */
-    private fun computeRelayPushHints(identity: Identity, onReady: (List<ByteArray>) -> Unit) {
-        runOnStoreExecutorAlwaysReplying("relay push hint computation", { onReady(emptyList()) }) {
+    private fun computeRelayPushHints(
+        identity: Identity,
+        config: RelayConfig,
+        onReady: (RelayPushSubscription) -> Unit,
+    ) {
+        val empty = RelayPushSubscription(emptyList(), 0L)
+        runOnStoreExecutorAlwaysReplying("relay push hint computation", { onReady(empty) }) {
             assertOffMainThreadForStore("relay push hint computation")
             val now = System.currentTimeMillis()
             val computed = try {
-                store.relayFetchPushHints(identity.userId, now)
+                val hints = store.relayFetchPushHints(identity.userId, now)
+                val cursorKey = relayCursorKey(config.relayUrl, config.relayToken)
+                RelayPushSubscription(hints, store.relayFetchCursor(cursorKey).afterId)
             } catch (e: CoreException) {
                 Log.w(TAG, "Failed to compute relay push hints: ${e.message}")
-                emptyList()
+                empty
             }
             onReady(computed)
         }
@@ -678,23 +704,38 @@ internal class RelaySyncEngine(
      * re-fetched on every pass until expiry -- see
      * [CoreRelayEnvelopeDisposition]'s KDoc for the exact rule.
      *
-     * The un-acked proxy envelopes DO still advance the cursor within this
-     * pass (`after = page.nextCursor` is unconditional), so the inner loop
-     * still terminates the same way it always did; they simply get
-     * re-fetched on the next poll pass. That's bounded and cheap (deduped by
-     * [GossipState.seenIds] on the way in) but not free -- see the TODO below
-     * for the follow-up that would avoid the re-fetch entirely.
+     * ### Where the walk starts (the persistent frontier)
      *
-     * TODO(relay-proxy-polling follow-ups):
-     *  - A persistent per-contact proxy cursor (like `after`, but remembered
-     *    across passes instead of restarting at 0) would let us skip
-     *    re-fetching already-seen-but-still-CARRIED envelopes on every pass,
-     *    at the cost of a bit more state to persist and reconcile.
-     *  - [MessageStore.relayProxyHints] fetches every contact's hints on
-     *    every pass, so its cost scales with contact-list size. Fine for this
-     *    app's small family circles; would need a smarter server-side "for
-     *    this family token" fan-out if that ever became a large flat social
-     *    graph.
+     * This used to start every pass at `after = 0` and page forward to the
+     * end. The un-acked rows above are left on the relay *by design*, so a
+     * real mailbox only grows, relayd returns rows in ascending id order,
+     * and a **fresh** message therefore has the highest id and was fetched
+     * last -- after every stale row ahead of it. In the field that reached
+     * ~29k rows at 16 rows a page: thousands of sequential HTTP round trips
+     * before the newest message was looked at, and passes that regularly died
+     * on a timeout before finishing. Messages took minutes to arrive.
+     *
+     * A pass now resumes from the frontier persisted for this mailbox
+     * ([MessageStore.relayFetchCursor], keyed by [relayCursorKey]) and
+     * advances it per [MessageStore.advanceRelayFetchCursor] -- which never
+     * moves past a page that did not reach a terminal disposition for every
+     * envelope *and* land its acks, and never moves backwards. That is the
+     * mirror of the DTN ack-safety rule applied to skipping: an envelope
+     * whose processing threw must be re-presented next pass, so nothing may
+     * be persisted past it.
+     *
+     * Occasionally the pass sweeps instead -- walks the whole mailbox from 0,
+     * exactly as before -- so those deliberately-unacked rows stay
+     * re-discoverable for the phones that depend on this one re-offering
+     * them over Bluetooth, and so a relay rebuilt with its row ids restarted
+     * at 1 heals itself. [relaySweepDue] owns when: the first pass of every
+     * process, then every [uniffi.cruisemesh_core.relaySweepIntervalMs].
+     *
+     * TODO(relay-proxy-polling follow-up): [MessageStore.relayProxyHints]
+     * fetches every contact's hints on every pass, so its cost scales with
+     * contact-list size. Fine for this app's small family circles; would need
+     * a smarter server-side "for this family token" fan-out if that ever
+     * became a large flat social graph.
      */
     private fun pollRelayMailbox(
         config: RelayConfig,
@@ -704,18 +745,46 @@ internal class RelaySyncEngine(
     ) {
         val fetchHints = store.relayFetchHints(identity.userId, now)
         if (fetchHints.isEmpty()) return
-        var after = 0L
+        val cursorKey = relayCursorKey(config.relayUrl, config.relayToken)
+        val cursor = store.relayFetchCursor(cursorKey)
+        val sweeping = relaySweepDue(sweptThisSession.contains(cursorKey), cursor.lastSweepAtMs, now)
+        var after = relayPassStartCursor(sweeping, cursor.afterId)
+        // Once any page fails to fully process, the frontier stops moving for
+        // the rest of this pass -- persisting a later page's cursor would
+        // skip the failed one forever. The walk itself continues, so one bad
+        // envelope never blocks the mail behind it.
+        var frontierAdvancing = true
         val fetchBatchLimit = relayFetchBatchLimit().toInt()
+        Log.i(
+            TAG,
+            "Relay mailbox walk on ${config.relayUrl}: ${if (sweeping) "sweep" else "frontier"} from after=$after",
+        )
         while (isRunning() && hasValidatedInternet()) {
             val page = RelayClient.fetchEnvelopes(config, fetchHints, after, fetchBatchLimit, network)
             Log.i(
                 TAG,
                 "Fetched ${page.envelopes.size} relay envelope(s) from ${config.relayUrl} after=$after next=${page.nextCursor}",
             )
-            if (page.envelopes.isEmpty()) return
+            if (page.envelopes.isEmpty()) {
+                if (sweeping) noteSweepCompleted(cursorKey, now)
+                return
+            }
+            var pageFullyProcessed = true
             val dispositions = ArrayList<CoreRelayEnvelopeDisposition>(page.envelopes.size)
             for (envelope in page.envelopes) {
-                val disposition = processRelayEnvelope(envelope, identity)
+                val disposition = try {
+                    processRelayEnvelope(envelope, identity)
+                } catch (e: Exception) {
+                    // Terminal for this page's cursor purposes only in the
+                    // negative sense: we do NOT know what happened to this
+                    // envelope, so the frontier must not pass it.
+                    pageFullyProcessed = false
+                    Log.w(
+                        TAG,
+                        "Failed to process relay envelope id=${envelope.id} from ${config.relayUrl}: ${e.message}",
+                    )
+                    continue
+                }
                 dispositions += CoreRelayEnvelopeDisposition(
                     relayId = envelope.id,
                     msgId = envelope.msgId,
@@ -732,11 +801,50 @@ internal class RelaySyncEngine(
             val ackIds = store.coreRelayAckIdsWithConsumed(dispositions, identity.userId, now)
             if (ackIds.isNotEmpty()) {
                 Log.i(TAG, "Acking ${ackIds.size} relay envelope(s) on ${config.relayUrl}: $ackIds")
-                RelayClient.ackEnvelopes(config, ackIds, network)
+                // An ack that never landed leaves consumed rows in the
+                // mailbox; skipping past them would strand them there until
+                // expiry, so the frontier waits for the next pass to retry.
+                try {
+                    RelayClient.ackEnvelopes(config, ackIds, network)
+                } catch (e: Exception) {
+                    pageFullyProcessed = false
+                    Log.w(TAG, "Failed to ack relay envelope(s) on ${config.relayUrl}: ${e.message}")
+                }
+            }
+            if (!pageFullyProcessed) frontierAdvancing = false
+            if (frontierAdvancing) {
+                store.advanceRelayFetchCursor(cursorKey, page.nextCursor, true)
+            }
+            // End the walk on an EMPTY page, never on a short one: a server
+            // is free to clamp `limit=` below our ask, and reading a short
+            // page as end-of-mailbox would strand every row above it -- which
+            // in an ascending-id mailbox is all the new mail.
+            if (!relayFetchWalkContinues(page.envelopes.size.toUInt(), after, page.nextCursor)) {
+                if (sweeping) noteSweepCompleted(cursorKey, now)
+                return
             }
             after = page.nextCursor
-            if (page.envelopes.size < fetchBatchLimit) return
         }
+    }
+
+    /**
+     * Mailboxes this process has already walked in full. Deliberately
+     * in-memory: the first pass after a cold start always sweeps, which is
+     * the self-healing answer to a persisted frontier that has gone stale in
+     * a way no response can reveal (most importantly a relay rebuilt with its
+     * row ids restarted at 1).
+     */
+    private val sweptThisSession = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Records that a walk from 0 reached the end of this mailbox. Only called
+     * on natural termination -- a sweep cut short by the service stopping,
+     * the network going away, or a relay error leaves the timestamp alone so
+     * the next pass tries again rather than believing a partial re-walk.
+     */
+    private fun noteSweepCompleted(cursorKey: String, now: Long) {
+        sweptThisSession.add(cursorKey)
+        store.noteRelaySweepCompleted(cursorKey, now)
     }
 
     private fun distinctRelayConfigs(contacts: List<Contact>, fallbackConfig: RelayConfig?): List<RelayConfig> =
