@@ -2871,13 +2871,18 @@ final class MeshController: ObservableObject {
                         // a server may clamp `limit=` below our ask, and
                         // reading a short page as end-of-mailbox would strand
                         // every row above it -- in an ascending-id mailbox,
-                        // all the new mail.
+                        // all the new mail. Reaching here with a non-empty
+                        // page means the cursor stood still, which relayd
+                        // cannot produce -- a bail-out, not end-of-mailbox, so
+                        // it deliberately does not record a completed sweep.
                         guard relayFetchWalkContinues(
                             pageEnvelopeCount: UInt32(clamping: page.envelopes.count),
                             afterId: afterId,
                             pageNextCursor: page.nextCursor
                         ) else {
-                            finishSweep()
+                            relaySyncLog.warning(
+                                "Relay returned rows without advancing the cursor; ending the walk"
+                            )
                             break
                         }
                         afterId = page.nextCursor

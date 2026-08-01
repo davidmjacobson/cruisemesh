@@ -42,6 +42,7 @@ import uniffi.cruisemesh_core.coreContactRelayIsStale
 import uniffi.cruisemesh_core.coreContactRelayStreakDelta
 import uniffi.cruisemesh_core.resolvedContactDeliveryPollRelay
 import uniffi.cruisemesh_core.resolvedContactDeliveryRelay
+import java.util.concurrent.ConcurrentHashMap
 
 // Deliberately MeshService's tag, not this class's name: this code moved here
 // verbatim in the FA15 extraction, and field tooling (logcat filters, the
@@ -818,9 +819,12 @@ internal class RelaySyncEngine(
             // End the walk on an EMPTY page, never on a short one: a server
             // is free to clamp `limit=` below our ask, and reading a short
             // page as end-of-mailbox would strand every row above it -- which
-            // in an ascending-id mailbox is all the new mail.
+            // in an ascending-id mailbox is all the new mail. Reaching here
+            // with a non-empty page means the cursor stood still, which relayd
+            // cannot produce -- so this is a bail-out, not end-of-mailbox, and
+            // deliberately does NOT record a completed sweep.
             if (!relayFetchWalkContinues(page.envelopes.size.toUInt(), after, page.nextCursor)) {
-                if (sweeping) noteSweepCompleted(cursorKey, now)
+                Log.w(TAG, "Relay ${config.relayUrl} returned rows without advancing the cursor; ending the walk")
                 return
             }
             after = page.nextCursor
@@ -834,7 +838,7 @@ internal class RelaySyncEngine(
      * a way no response can reveal (most importantly a relay rebuilt with its
      * row ids restarted at 1).
      */
-    private val sweptThisSession = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val sweptThisSession: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     /**
      * Records that a walk from 0 reached the end of this mailbox. Only called
