@@ -53,9 +53,6 @@ object ProfilePhotoStore {
         }
     }
 
-    /** Persist an already-decoded bitmap (e.g. tests or preview captures). */
-    fun saveFromBitmap(context: Context, bitmap: Bitmap): String? = saveBitmap(context, bitmap)
-
     fun loadWireAvatarBytes(context: Context): ByteArray {
         val path = loadAvatarPath(context) ?: return ByteArray(0)
         val bitmap = BitmapFactory.decodeFile(path) ?: return ByteArray(0)

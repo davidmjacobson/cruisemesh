@@ -5,6 +5,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material3.Button
@@ -22,6 +24,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -29,7 +32,9 @@ import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.ui.AvatarBadge
 import kotlinx.coroutines.delay
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.FriendCardMatch
 import uniffi.cruisemesh_core.MessageStore
+import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
@@ -49,7 +54,11 @@ data class FriendAddedOutcome(
 
 data class FriendPreview(
     val contact: Contact,
-    val keyChangeWarning: String? = null,
+    /**
+     * How this card relates to contacts already saved, decided in core
+     * (`friend_card_match`) so both shells reach the same verdict.
+     */
+    val match: FriendCardMatch = FriendCardMatch.New,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -141,20 +150,113 @@ fun FriendPreviewSheet(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val isUpdate = preview.match is FriendCardMatch.AlreadySaved
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 24.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text(stringResource(R.string.ui_add_this_friend), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Text(
+                stringResource(
+                    if (isUpdate) R.string.ui_update_this_friend_question else R.string.ui_add_this_friend,
+                ),
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+            )
             FriendIdentityBlock(preview.contact, null)
-            preview.keyChangeWarning?.let {
-                Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+            FriendMatchNote(preview)
+            Button(onClick = onConfirm, modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    stringResource(
+                        if (isUpdate) R.string.ui_update_this_friend else R.string.ui_add_this_friend_60651604,
+                    ),
+                )
             }
-            Button(onClick = onConfirm, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.ui_add_this_friend_60651604)) }
             TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.ui_cancel)) }
         }
+    }
+}
+
+/**
+ * What this card means next to the contacts already saved. A card whose UserID
+ * is already on file is the same person re-sharing (new relay details after a
+ * Cruise Pass, say) — never a key change, even when a *different* contact
+ * happens to share their display name.
+ */
+@Composable
+private fun FriendMatchNote(preview: FriendPreview) {
+    when (val match = preview.match) {
+        is FriendCardMatch.New -> Unit
+
+        is FriendCardMatch.AlreadySaved -> Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                stringResource(R.string.ui_you_already_have_this_friend_saved_as, match.savedName),
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = TextAlign.Center,
+            )
+            if (match.nameSharedWithOther) {
+                // Two contacts show the same name, so the name alone cannot say
+                // which one this is. The safety words can.
+                Text(
+                    stringResource(R.string.ui_another_friend_also_shows_as, match.savedName),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+                SafetyWordsRow(match.savedName, preview.contact.userId)
+                Text(
+                    stringResource(R.string.ui_give_one_of_them_a_nickname),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+
+        is FriendCardMatch.NameTaken -> Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                stringResource(R.string.ui_you_already_have_a_different_friend_named, match.otherName),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error,
+                textAlign = TextAlign.Center,
+            )
+            SafetyWordsRow(stringResource(R.string.ui_this_card), preview.contact.userId)
+            SafetyWordsRow(match.otherName, match.otherUserId)
+            Text(
+                stringResource(R.string.ui_ask_them_to_read_their_safety_words_aloud),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+        }
+    }
+}
+
+/** One friend's safety words, labelled, so two of them read side by side. */
+@Composable
+private fun SafetyWordsRow(label: String, userId: ByteArray) {
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            fingerprintWords(userId).joinToString(" "),
+            style = MaterialTheme.typography.bodyMedium,
+            fontFamily = FontFamily.Monospace,
+        )
     }
 }
 

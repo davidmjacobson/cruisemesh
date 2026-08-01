@@ -33,14 +33,9 @@ data class AttachmentPayload(
     val blob: ByteArray,
     val caption: String = "",
 ) {
-    enum class MediaType(val wire: Int) {
-        IMAGE(1),
-        AUDIO(2),
-        ;
-
-        companion object {
-            fun fromWire(value: Int): MediaType? = entries.firstOrNull { it.wire == value }
-        }
+    enum class MediaType {
+        IMAGE,
+        AUDIO,
     }
 
     fun encode(): ByteArray = encodeAttachmentPayload(
@@ -112,9 +107,6 @@ data class AttachmentPayload(
 
 /** DESIGN.md §7.1 reserved: attachment-manifest (chat-stream message). */
 const val KIND_ATTACHMENT_MANIFEST: UByte = 16u
-
-/** DESIGN.md §7.1 reserved: attachment-chunk (not used for inline v1). */
-const val KIND_ATTACHMENT_CHUNK: UByte = 17u
 
 /** DESIGN.md §7.1 extension: a hidden chat-stream reaction targeting another message. */
 const val KIND_REACTION: UByte = 18u

@@ -1,16 +1,6 @@
 {
   "sourceLanguage": "en",
   "strings": {
-    "A message is too large to send": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "A message is too large to send"
-          }
-        }
-      }
-    },
     "About & legal": {
       "localizations": {
         "en": {
@@ -131,6 +121,16 @@
         }
       }
     },
+    "Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them."
+          }
+        }
+      }
+    },
     "Attach": {
       "localizations": {
         "en": {
@@ -211,6 +211,16 @@
         }
       }
     },
+    "Bluetooth audio connected": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bluetooth audio connected"
+          }
+        }
+      }
+    },
     "Cancel": {
       "localizations": {
         "en": {
@@ -227,16 +237,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Cancel reply"
-          }
-        }
-      }
-    },
-    "Captured diagnostics deleted.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Captured diagnostics deleted."
           }
         }
       }
@@ -441,6 +441,16 @@
         }
       }
     },
+    "Cruise Pass is configured": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cruise Pass is configured"
+          }
+        }
+      }
+    },
     "Cruise Pass is ready on this phone.": {
       "localizations": {
         "en": {
@@ -457,16 +467,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Cruise Pass is set up"
-          }
-        }
-      }
-    },
-    "Cruise Pass storage is full": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Cruise Pass storage is full"
           }
         }
       }
@@ -601,36 +601,6 @@
         }
       }
     },
-    "Diagnostic logging": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Diagnostic logging"
-          }
-        }
-      }
-    },
-    "Diagnostic logging is off. What was already captured is kept until you delete it.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Diagnostic logging is off. What was already captured is kept until you delete it."
-          }
-        }
-      }
-    },
-    "Diagnostic logging is on. Reproduce the problem, then return here to share it.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Diagnostic logging is on. Reproduce the problem, then return here to share it."
-          }
-        }
-      }
-    },
     "Diagnostics": {
       "localizations": {
         "en": {
@@ -661,6 +631,16 @@
         }
       }
     },
+    "Don't show this again": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Don't show this again"
+          }
+        }
+      }
+    },
     "Done": {
       "localizations": {
         "en": {
@@ -687,6 +667,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Enable Bluetooth and notifications"
+          }
+        }
+      }
+    },
+    "Enter a name to continue.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Enter a name to continue."
           }
         }
       }
@@ -841,6 +831,16 @@
         }
       }
     },
+    "Give one of them a nickname so you can tell them apart.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Give one of them a nickname so you can tell them apart."
+          }
+        }
+      }
+    },
     "Group": {
       "localizations": {
         "en": {
@@ -877,16 +877,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Help & support"
-          }
-        }
-      }
-    },
-    "Hide details": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Hide details"
           }
         }
       }
@@ -987,16 +977,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Internet delivery"
-          }
-        }
-      }
-    },
-    "Internet delivery is paused until your family collects waiting messages.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Internet delivery is paused until your family collects waiting messages."
           }
         }
       }
@@ -1151,16 +1131,6 @@
         }
       }
     },
-    "Message too large": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Message too large"
-          }
-        }
-      }
-    },
     "Messages are end-to-end encrypted, so CruiseMesh cannot proactively read them. You can block a contact and report abuse from their contact details.": {
       "localizations": {
         "en": {
@@ -1251,16 +1221,6 @@
         }
       }
     },
-    "No diagnostics captured this session yet.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "No diagnostics captured this session yet."
-          }
-        }
-      }
-    },
     "No friends added yet.": {
       "localizations": {
         "en": {
@@ -1301,16 +1261,6 @@
         }
       }
     },
-    "Not shared — nearby delivery only": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Not shared — nearby delivery only"
-          }
-        }
-      }
-    },
     "Notice": {
       "localizations": {
         "en": {
@@ -1327,26 +1277,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "OK"
-          }
-        }
-      }
-    },
-    "One message can’t be sent over internet delivery. Other messages still deliver.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "One message can’t be sent over internet delivery. Other messages still deliver."
-          }
-        }
-      }
-    },
-    "One of your messages is too large to send over internet delivery. Try a smaller photo or a shorter message. Other messages still deliver normally.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "One of your messages is too large to send over internet delivery. Try a smaller photo or a shorter message. Other messages still deliver normally."
           }
         }
       }
@@ -1901,6 +1831,16 @@
         }
       }
     },
+    "Set up your Cruise Pass": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set up your Cruise Pass"
+          }
+        }
+      }
+    },
     "Settings": {
       "localizations": {
         "en": {
@@ -2011,16 +1951,6 @@
         }
       }
     },
-    "Show less": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Show less"
-          }
-        }
-      }
-    },
     "Show my friend card": {
       "localizations": {
         "en": {
@@ -2071,26 +2001,6 @@
         }
       }
     },
-    "Storage full": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Storage full"
-          }
-        }
-      }
-    },
-    "Storage full · delivery paused": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Storage full · delivery paused"
-          }
-        }
-      }
-    },
     "Strength": {
       "localizations": {
         "en": {
@@ -2117,46 +2027,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Support"
-          }
-        }
-      }
-    },
-    "Syncing is slowed right now. It recovers on its own.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Syncing is slowed right now. It recovers on its own."
-          }
-        }
-      }
-    },
-    "Syncing is slowed right now. Your messages are still queued and will be delivered. It recovers on its own.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Syncing is slowed right now. Your messages are still queued and will be delivered. It recovers on its own."
-          }
-        }
-      }
-    },
-    "Syncing is slowed · recovers on its own": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Syncing is slowed · recovers on its own"
-          }
-        }
-      }
-    },
-    "Syncing slowed": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Syncing slowed"
           }
         }
       }
@@ -2201,6 +2071,16 @@
         }
       }
     },
+    "The mesh is still running, but wireless earbuds/speakers can slow nearby delivery. Watch for glitches.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The mesh is still running, but wireless earbuds/speakers can slow nearby delivery. Watch for glitches."
+          }
+        }
+      }
+    },
     "The port is optional. An accepted friend and encrypted identity check are still required.": {
       "localizations": {
         "en": {
@@ -2221,12 +2101,22 @@
         }
       }
     },
-    "The space that holds your family’s waiting messages is full. Delivery resumes as your family’s phones collect their messages, or as older ones expire. If it stays full, contact support@cruisemesh.app.": {
+    "The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Cruise Pass is set up, then share their friend card again. Messages still deliver when you are near each other.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The space that holds your family’s waiting messages is full. Delivery resumes as your family’s phones collect their messages, or as older ones expire. If it stays full, contact support@cruisemesh.app."
+            "value": "The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Cruise Pass is set up, then share their friend card again. Messages still deliver when you are near each other."
+          }
+        }
+      }
+    },
+    "Their friend card is out of date": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Their friend card is out of date"
           }
         }
       }
@@ -2237,6 +2127,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "They won't be able to message you, and they won't appear as a suggested friend. They won't be told. Scanning their card again unblocks them."
+          }
+        }
+      }
+    },
+    "This card": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This card"
           }
         }
       }
@@ -2351,32 +2251,32 @@
         }
       }
     },
+    "Update this friend": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Update this friend"
+          }
+        }
+      }
+    },
+    "Update this friend?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Update this friend?"
+          }
+        }
+      }
+    },
     "Use a different Cruise Pass": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Use a different Cruise Pass"
-          }
-        }
-      }
-    },
-    "Uses their own service": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Uses their own service"
-          }
-        }
-      }
-    },
-    "Uses your Cruise Pass": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Uses your Cruise Pass"
           }
         }
       }
@@ -2457,6 +2357,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your friend must already be accepted. The QR only supplies a local network address; the encrypted identity check still applies."
+          }
+        }
+      }
+    },
+    "Your name": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your name"
           }
         }
       }

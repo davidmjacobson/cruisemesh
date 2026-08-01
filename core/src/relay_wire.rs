@@ -220,6 +220,77 @@ pub fn resolved_contact_poll_relay(
     .filter(|endpoint| !relay_token_is_deposit(endpoint.token.clone()))
 }
 
+/// Send-path routing when the contact's card endpoint has been written off
+/// (see [`crate::contact_relay_health`]).
+///
+/// A card whose endpoint authoritatively rejects us is worse than no card at
+/// all: [`resolved_contact_relay`] returns the contact endpoint
+/// unconditionally, so one dead field beats a working alternative *forever*
+/// and the messages never leave the queue. This is that same resolution with
+/// one added rule — a written-off endpoint is skipped, exactly as though the
+/// card had carried no relay fields, which falls through to our own.
+///
+/// Falling back is not a new capability: a card with no relay fields already
+/// resolves to our own endpoint today. It is also the routing that actually
+/// delivers whenever the contact is in our own family (they poll the mailbox
+/// we are posting to) — the common case for somebody we handed a Cruise Pass
+/// to. For a cross-family contact it delivers nothing, but neither did the
+/// dead endpoint, and unlike the dead endpoint this state is surfaced, so a
+/// person can repair the card.
+#[uniffi::export]
+pub fn resolved_contact_delivery_relay(
+    contact_relay_url: Option<String>,
+    contact_relay_token: Option<String>,
+    fallback_url: Option<String>,
+    fallback_token: Option<String>,
+    contact_endpoint_usable: bool,
+) -> Option<RelayEndpoint> {
+    if contact_endpoint_usable {
+        return resolved_contact_relay(
+            contact_relay_url,
+            contact_relay_token,
+            fallback_url,
+            fallback_token,
+        );
+    }
+    let Some(fallback) = relay_endpoint_from(fallback_url, fallback_token) else {
+        return None;
+    };
+    // Only worth a request if it is somewhere other than the host we just
+    // wrote off; otherwise report "nowhere to post" honestly rather than
+    // retrying the same dead host under a different name.
+    match relay_endpoint_from(contact_relay_url, contact_relay_token) {
+        Some(contact) if contact.url == fallback.url => None,
+        _ => Some(fallback),
+    }
+}
+
+/// Poll-path routing with the same written-off rule.
+///
+/// Proxy-polling a written-off endpoint is pure waste — it rejects every
+/// pass exactly as the posts did — so a stale card drops out of the poll set
+/// entirely. There is deliberately no fallback here: our own mailbox is
+/// already polled on its own account, and reading it again under a contact's
+/// heading would fetch nothing new.
+#[uniffi::export]
+pub fn resolved_contact_delivery_poll_relay(
+    contact_relay_url: Option<String>,
+    contact_relay_token: Option<String>,
+    fallback_url: Option<String>,
+    fallback_token: Option<String>,
+    contact_endpoint_usable: bool,
+) -> Option<RelayEndpoint> {
+    if !contact_endpoint_usable {
+        return None;
+    }
+    resolved_contact_poll_relay(
+        contact_relay_url,
+        contact_relay_token,
+        fallback_url,
+        fallback_token,
+    )
+}
+
 fn relay_endpoint_from(url: Option<String>, token: Option<String>) -> Option<RelayEndpoint> {
     let url = normalize_relay_url(url.unwrap_or_default());
     let token = token.unwrap_or_default().trim().to_string();
@@ -613,6 +684,61 @@ pub fn contact_delivery(
     }
     ContactDelivery::OwnMailbox {
         host: relay_host_only(&contact.url),
+    }
+}
+
+/// Which direction of a one-to-one conversation cannot carry beyond
+/// Bluetooth range, decided entirely from local facts -- no network call, no
+/// round trip, and no evidence of the other phone's current state.
+///
+/// The asymmetry this exists to explain: sending needs nothing of your own
+/// (their friend card carries the credential that authorises a post into
+/// *their* mailbox), but receiving needs a mailbox you poll, which needs a
+/// pass of your own. So a person with no pass can reach everyone and be
+/// reached by no one, and today both people believe they are connected.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ComposerReach {
+    /// Say nothing. Either a path exists in both directions, or the contact
+    /// is nearby right now, or we met them in person and nearby delivery was
+    /// always the point.
+    Fine,
+    /// We have no mailbox of our own: we can post to them, but their replies
+    /// have nowhere to land until we hold a pass or they come back in range.
+    RepliesCannotReachMe,
+    /// They shared no internet delivery: our messages wait for range.
+    TheyCannotBeReached,
+    /// Neither of us has a mailbox. Nothing crosses in either direction
+    /// unless the phones are near each other.
+    NeitherDirectionWorks,
+}
+
+/// What (if anything) the composer should say about a one-to-one chat.
+///
+/// `contact_nearby` must come from the same live link lookup the send path
+/// uses -- when a direct BLE/LAN link exists, everything works and the
+/// composer stays quiet. `added_while_nearby` is
+/// `ContactProvenance::added_nearby`: adding someone in person carries an
+/// implicit "we are standing together, nearby delivery is the point", so that
+/// case stays silent rather than nagging about a limit both people chose.
+/// Being introduced remotely carries the opposite implication -- the whole
+/// encounter was internet-mediated -- so the absence of a mailbox is a genuine
+/// surprise and gets said out loud.
+#[uniffi::export]
+pub fn composer_reach(
+    delivery: ContactDelivery,
+    own_relay_configured: bool,
+    contact_nearby: bool,
+    added_while_nearby: bool,
+) -> ComposerReach {
+    if contact_nearby || added_while_nearby {
+        return ComposerReach::Fine;
+    }
+    let they_are_unreachable = delivery == ContactDelivery::NearbyOnly;
+    match (own_relay_configured, they_are_unreachable) {
+        (false, true) => ComposerReach::NeitherDirectionWorks,
+        (false, false) => ComposerReach::RepliesCannotReachMe,
+        (true, true) => ComposerReach::TheyCannotBeReached,
+        (true, false) => ComposerReach::Fine,
     }
 }
 
@@ -1025,5 +1151,166 @@ mod tests {
             "relay.example:8443"
         );
         assert_eq!(relay_host_only("relay.example"), "relay.example");
+    }
+
+    // -- composer_reach (say it where the person is typing) --------------
+
+    const THEIR_MAILBOX: ContactDelivery = ContactDelivery::SharedMailbox;
+
+    #[test]
+    fn no_pass_of_our_own_means_replies_have_nowhere_to_land() {
+        // The Leanne case: she reaches David with his card, he replies, and
+        // his replies cannot arrive. Her phone knows this locally.
+        assert_eq!(
+            composer_reach(THEIR_MAILBOX, false, false, false),
+            ComposerReach::RepliesCannotReachMe
+        );
+    }
+
+    #[test]
+    fn a_contact_with_no_mailbox_cannot_be_reached_from_a_pass_holder() {
+        assert_eq!(
+            composer_reach(ContactDelivery::NearbyOnly, true, false, false),
+            ComposerReach::TheyCannotBeReached
+        );
+    }
+
+    #[test]
+    fn two_phones_without_passes_reach_each_other_only_in_person() {
+        assert_eq!(
+            composer_reach(ContactDelivery::NearbyOnly, false, false, false),
+            ComposerReach::NeitherDirectionWorks
+        );
+    }
+
+    #[test]
+    fn both_ends_holding_a_mailbox_says_nothing() {
+        assert_eq!(
+            composer_reach(THEIR_MAILBOX, true, false, false),
+            ComposerReach::Fine
+        );
+    }
+
+    #[test]
+    fn a_contact_who_is_nearby_right_now_says_nothing() {
+        // Every broken-path combination is silent while a direct link exists:
+        // that path works, and it is the one a send would take.
+        for delivery in [
+            ContactDelivery::NearbyOnly,
+            THEIR_MAILBOX,
+            ContactDelivery::OwnMailbox {
+                host: "relay.example".into(),
+            },
+        ] {
+            for own_pass in [false, true] {
+                assert_eq!(
+                    composer_reach(delivery.clone(), own_pass, true, false),
+                    ComposerReach::Fine
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn meeting_in_person_keeps_the_composer_quiet_afterwards() {
+        // Adding someone while standing next to them means nearby delivery
+        // was the deal; nagging about it later is noise, not news.
+        assert_eq!(
+            composer_reach(ContactDelivery::NearbyOnly, false, false, true),
+            ComposerReach::Fine
+        );
+        assert_eq!(
+            composer_reach(THEIR_MAILBOX, false, false, true),
+            ComposerReach::Fine
+        );
+    }
+
+    fn some(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn a_usable_card_endpoint_routes_exactly_as_before() {
+        let usable = resolved_contact_delivery_relay(
+            some("https://theirs.example"),
+            some("their-token"),
+            some("https://ours.example"),
+            some("our-token"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(usable.url, "https://theirs.example");
+        assert_eq!(usable.token, "their-token");
+    }
+
+    #[test]
+    fn a_written_off_card_endpoint_falls_back_to_our_own() {
+        // The whole point: one dead field must stop beating a working
+        // alternative forever.
+        let routed = resolved_contact_delivery_relay(
+            some("https://dead.example"),
+            some("their-token"),
+            some("https://ours.example"),
+            some("our-token"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(routed.url, "https://ours.example");
+        assert_eq!(routed.token, "our-token");
+    }
+
+    #[test]
+    fn a_written_off_endpoint_with_no_alternative_posts_nowhere() {
+        assert_eq!(
+            resolved_contact_delivery_relay(
+                some("https://dead.example"),
+                some("their-token"),
+                None,
+                None,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn falling_back_never_re_posts_to_the_host_we_just_wrote_off() {
+        // Same host, different credential (a family member's card): retrying
+        // it under our own token would be the same hammering with extra
+        // steps.
+        assert_eq!(
+            resolved_contact_delivery_relay(
+                some("https://same.example"),
+                some("their-token"),
+                some("https://same.example"),
+                some("our-token"),
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_written_off_endpoint_drops_out_of_the_poll_set_without_falling_back() {
+        // Polling our own mailbox under a contact's heading would fetch
+        // nothing new -- it is already polled on its own account.
+        assert_eq!(
+            resolved_contact_delivery_poll_relay(
+                some("https://dead.example"),
+                some("their-token"),
+                some("https://ours.example"),
+                some("our-token"),
+                false,
+            ),
+            None
+        );
+        assert!(resolved_contact_delivery_poll_relay(
+            some("https://live.example"),
+            some("their-token"),
+            some("https://ours.example"),
+            some("our-token"),
+            true,
+        )
+        .is_some());
     }
 }

@@ -35,7 +35,7 @@ final class MeshController: ObservableObject {
     }
     private var isRunning = false
     private var meshRolesRunning = false
-    private var pausedForBluetoothAudio = false
+    private var bluetoothAudioConnected = false
     private var relayCancellable: AnyCancellable?
     private var lanHealthTimer: Timer?
     // D8: periodic re-digest bookkeeping.
@@ -58,11 +58,7 @@ final class MeshController: ObservableObject {
     func start() {
         if isRunning {
             // Repeat start while already running: refresh status only.
-            if pausedForBluetoothAudio {
-                MeshRuntimeStatus.shared.markPausedForBluetoothAudio()
-            } else {
-                MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
-            }
+            MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
             return
         }
         isRunning = true
@@ -204,14 +200,16 @@ final class MeshController: ObservableObject {
 
         registerBluetoothAudioObserver()
         startRelayLoop()
-        refreshBluetoothAudioBackoff(reason: "mesh start")
+        startMeshRoles()
+        refreshBluetoothAudioState(reason: "mesh start")
+        MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
         log.info("Mesh started")
     }
 
     func stop() {
         guard isRunning else { return }
         isRunning = false
-        pausedForBluetoothAudio = false
+        bluetoothAudioConnected = false
         bluetoothAudioBackoff.reset()
         unregisterBluetoothAudioObserver()
         lanTransport?.stop()
@@ -260,7 +258,7 @@ final class MeshController: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.refreshBluetoothAudioBackoff(reason: "route change")
+                self?.refreshBluetoothAudioState(reason: "route change")
             }
         }
     }
@@ -272,22 +270,26 @@ final class MeshController: ObservableObject {
         }
     }
 
-    private func refreshBluetoothAudioBackoff(reason: String) {
+    /**
+     Records whether Bluetooth audio is routed. It no longer changes the mesh:
+     Android dropped that policy on 2026-07-09 because messaging was dead on a
+     phone whenever earbuds were connected, and iOS has strictly less control
+     over its radio than Android does, so there is no iOS-specific knob whose
+     absence would justify a stricter rule here.
+     */
+    private func refreshBluetoothAudioState(reason: String) {
         guard isRunning else { return }
         switch bluetoothAudioBackoff.update(bluetoothAudioActive: isBluetoothAudioActive()) {
-        case .active:
-            pausedForBluetoothAudio = false
-            log.info("Bluetooth audio clear; resuming BLE mesh (\(reason, privacy: .public))")
-            startMeshRoles()
-            MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
-        case .pausedForBluetoothAudio:
-            pausedForBluetoothAudio = true
-            log.info("Bluetooth audio active; pausing BLE mesh to protect audio (\(reason, privacy: .public))")
-            stopMeshRoles()
-            MeshRuntimeStatus.shared.markPausedForBluetoothAudio()
+        case .audioClear:
+            bluetoothAudioConnected = false
+            log.info("Bluetooth audio route cleared (\(reason, privacy: .public))")
+        case .audioConnected:
+            bluetoothAudioConnected = true
+            log.info("Bluetooth audio routed; mesh stays up (\(reason, privacy: .public))")
         case nil:
-            break
+            return
         }
+        MeshRuntimeStatus.shared.setBluetoothAudioConnected(bluetoothAudioConnected)
     }
 
     /// Active Bluetooth audio route (A2DP / HFP / LE audio). See `BluetoothAudioBackoff`.
@@ -1424,6 +1426,14 @@ final class MeshController: ObservableObject {
     // handler here) -- now propagate; everything else (provenance,
     // suggestion cleanup, outbound profile-sync queueing, receipts) stays
     // best-effort `try?`, same as before.
+    /// Was this peer in range when we accepted them? Recorded in
+    /// `ContactProvenance.addedNearby` so the composer can stay quiet about
+    /// nearby-only delivery for people we actually met, and say it plainly for
+    /// people who only ever arrived over the internet.
+    private func peerIsNearby(_ userId: Data) -> Bool {
+        MeshConnectivityStatus.shared.nearbyPeerIds.contains(userId)
+    }
+
     private func handleIncomingFriendRequest(
         sourceAddress: String?,
         senderUserId: Data,
@@ -1456,7 +1466,8 @@ final class MeshController: ObservableObject {
             userId: senderUserId,
             source: pending == nil ? 0 : 1,
             introducerUserId: pending?.introducerUserId,
-            introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000),
+            addedNearby: peerIsNearby(senderUserId)
         ))
         if pending != nil { try? store.removeFriendSuggestion(candidateUserId: senderUserId) }
         ProfileSyncSender.queueToContact(
@@ -1782,7 +1793,8 @@ final class MeshController: ObservableObject {
             userId: senderUserId,
             source: 1,
             introducerUserId: introducer.userId,
-            introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000),
+            addedNearby: peerIsNearby(senderUserId)
         ))
         try? store.removeFriendSuggestion(candidateUserId: senderUserId)
         _ = try store.insertMessage(message: StoredMessage(
@@ -2314,9 +2326,7 @@ final class MeshController: ObservableObject {
         // remember to announce, and none can be missed. Mirrors Android's
         // `RelaySyncEngine.performRelaySyncPass`.
         RelayUpdateSender.announceIfChanged(store: store, identity: identity)
-        if !pausedForBluetoothAudio {
-            MeshRuntimeStatus.shared.markSyncingViaRelay()
-        }
+        MeshRuntimeStatus.shared.markSyncingViaRelay()
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             await self.relaySyncBlocking(identity: identity, config: config)
@@ -2355,15 +2365,23 @@ final class MeshController: ObservableObject {
     /// token, so posting a cross-family friend request to our own mailbox
     /// strands it where the recipient can never fetch it. Mirrors
     /// RelaySyncEngine.kt's resolvedRelayConfig.
+    ///
+    /// `endpointUsable: false` means their card endpoint has authoritatively
+    /// rejected us and has been written off (core `contact_relay_health`), so
+    /// resolution skips it exactly as though the card carried no relay
+    /// fields — otherwise one dead field beats a working alternative forever.
+    /// Mirrors RelaySyncEngine.kt's resolvedRelayConfig.
     nonisolated static func resolvedRelayConfig(
         contact: Contact?,
-        fallback: RelayConfig?
+        fallback: RelayConfig?,
+        endpointUsable: Bool = true
     ) -> RelayConfig? {
-        resolvedContactRelay(
+        resolvedContactDeliveryRelay(
             contactRelayUrl: contact?.relayUrl,
             contactRelayToken: contact?.relayToken,
             fallbackUrl: fallback?.relayUrl,
-            fallbackToken: fallback?.relayToken
+            fallbackToken: fallback?.relayToken,
+            contactEndpointUsable: endpointUsable
         ).map { RelayConfig(relayUrl: $0.url, relayToken: $0.token) }
     }
 
@@ -2376,14 +2394,32 @@ final class MeshController: ObservableObject {
     /// Mirrors RelaySyncEngine.kt's resolvedPollRelayConfig.
     nonisolated static func resolvedPollRelayConfig(
         contact: Contact?,
-        fallback: RelayConfig?
+        fallback: RelayConfig?,
+        endpointUsable: Bool = true
     ) -> RelayConfig? {
-        resolvedContactPollRelay(
+        resolvedContactDeliveryPollRelay(
             contactRelayUrl: contact?.relayUrl,
             contactRelayToken: contact?.relayToken,
             fallbackUrl: fallback?.relayUrl,
-            fallbackToken: fallback?.relayToken
+            fallbackToken: fallback?.relayToken,
+            contactEndpointUsable: endpointUsable
         ).map { RelayConfig(relayUrl: $0.url, relayToken: $0.token) }
+    }
+
+    /// Whether a contact's card endpoint has earned another attempt, given
+    /// the rejection streaks read once at the start of this pass. Mirrors
+    /// RelaySyncEngine.kt's contactEndpointUsable.
+    nonisolated static func contactEndpointUsable(
+        contact: Contact,
+        rejections: [Data: ContactRelayRejection],
+        nowMs: Int64
+    ) -> Bool {
+        guard let rejection = rejections[contact.userId] else { return true }
+        return coreContactRelayEndpointUsable(
+            rejectStreak: rejection.rejectStreak,
+            rejectedAtMs: rejection.rejectedAtMs,
+            nowMs: nowMs
+        )
     }
 
     /// Every distinct mailbox this device should poll: its own saved config
@@ -2391,7 +2427,9 @@ final class MeshController: ObservableObject {
     /// RelaySyncEngine.kt's distinctRelayConfigs).
     nonisolated static func distinctRelayConfigs(
         contacts: [Contact],
-        fallback: RelayConfig?
+        fallback: RelayConfig?,
+        rejections: [Data: ContactRelayRejection] = [:],
+        nowMs: Int64 = 0
     ) -> [RelayConfig] {
         var result: [RelayConfig] = []
         func add(_ cfg: RelayConfig?) {
@@ -2402,7 +2440,15 @@ final class MeshController: ObservableObject {
         }
         add(fallback)
         for contact in contacts {
-            add(Self.resolvedPollRelayConfig(contact: contact, fallback: fallback))
+            add(Self.resolvedPollRelayConfig(
+                contact: contact,
+                fallback: fallback,
+                endpointUsable: Self.contactEndpointUsable(
+                    contact: contact,
+                    rejections: rejections,
+                    nowMs: nowMs
+                )
+            ))
         }
         return result
     }
@@ -2446,18 +2492,70 @@ final class MeshController: ObservableObject {
             let contactsById = Dictionary(
                 uniqueKeysWithValues: contacts.map { ($0.userId, $0) }
             )
+            // The other half of noteFailure, which had no owner before this:
+            // rejections from the endpoint in a CONTACT's friend card. Those
+            // were dropped entirely, so a card pointing at a retired host
+            // produced an unbounded silent retry loop while the person's
+            // messages sat at one tick. Read once per pass; only contacts
+            // with a non-zero streak appear. Mirrors RelaySyncEngine.kt.
+            var rejections = Dictionary(
+                uniqueKeysWithValues: (try store.listContactRelayRejections()).map { ($0.userId, $0) }
+            )
+            func endpointUsable(_ contact: Contact) -> Bool {
+                Self.contactEndpointUsable(contact: contact, rejections: rejections, nowMs: now)
+            }
+            /// Only counts when `usedConfig` is genuinely the contact's own
+            /// endpoint: once we have fallen back to our own relay, a failure
+            /// there is our relay's health, not evidence about their card.
+            func noteContactFailure(_ error: Error, contact: Contact, usedConfig: RelayConfig) {
+                if let own = config,
+                   usedConfig.relayUrl == own.relayUrl,
+                   usedConfig.relayToken == own.relayToken { return }
+                guard let relay = error as? RelayHTTPError else { return }
+                let fault = relayClassifyHttpError(
+                    httpStatus: UInt16(clamping: relay.statusCode),
+                    relayCode: relay.relayCode
+                )
+                guard coreContactRelayStreakDelta(fault: fault) != 0 else { return }
+                if let streak = try? store.noteContactRelayRejected(userId: contact.userId, nowMs: now) {
+                    rejections[contact.userId] = ContactRelayRejection(
+                        userId: contact.userId,
+                        rejectStreak: streak,
+                        rejectedAtMs: now
+                    )
+                }
+            }
+            /// Success is the only thing that clears a streak -- see
+            /// `clear_contact_relay_rejection` for why a transient fault
+            /// deliberately does not.
+            func noteContactSuccess(contact: Contact, usedConfig: RelayConfig) {
+                if let own = config,
+                   usedConfig.relayUrl == own.relayUrl,
+                   usedConfig.relayToken == own.relayToken { return }
+                guard rejections[contact.userId] != nil else { return }
+                try? store.clearContactRelayRejection(userId: contact.userId)
+                rejections[contact.userId] = nil
+            }
             let receipts = try store.pendingRelayOutgoingReceiptEnvelopes(
                 limit: MeshDefaults.relayStoreBatchLimit,
                 nowMs: now
             )
             for env in receipts {
                 guard let contact = contactsById[env.recipientUserId],
-                      let cfg = Self.resolvedRelayConfig(contact: contact, fallback: config)
+                      let cfg = Self.resolvedRelayConfig(
+                        contact: contact,
+                        fallback: config,
+                        endpointUsable: endpointUsable(contact)
+                      )
                 else { continue }
                 do {
                     _ = try RelayClient.postReceiptEnvelope(config: cfg, envelope: env)
                     _ = try store.markOutgoingReceiptEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
-                } catch { noteFailure(error, usedConfig: cfg) }
+                    noteContactSuccess(contact: contact, usedConfig: cfg)
+                } catch {
+                    noteFailure(error, usedConfig: cfg)
+                    noteContactFailure(error, contact: contact, usedConfig: cfg)
+                }
             }
             let outbound = try store.pendingRelayOutboundEnvelopes(
                 limit: MeshDefaults.relayStoreBatchLimit,
@@ -2471,7 +2569,11 @@ final class MeshController: ObservableObject {
                 guard let group = groupsById[groupId] else { return config }
                 for member in group.memberUserIds {
                     if let contact = contactsById[member],
-                       let resolved = Self.resolvedRelayConfig(contact: contact, fallback: config) {
+                       let resolved = Self.resolvedRelayConfig(
+                        contact: contact,
+                        fallback: config,
+                        endpointUsable: endpointUsable(contact)
+                       ) {
                         return resolved
                     }
                 }
@@ -2516,11 +2618,19 @@ final class MeshController: ObservableObject {
                     }
                     continue
                 }
-                guard let cfg = Self.resolvedRelayConfig(contact: contact, fallback: config) else { continue }
+                guard let cfg = Self.resolvedRelayConfig(
+                    contact: contact,
+                    fallback: config,
+                    endpointUsable: endpointUsable(contact)
+                ) else { continue }
                 do {
                     _ = try RelayClient.postOutboundEnvelope(config: cfg, envelope: env)
                     _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
-                } catch { noteFailure(error, usedConfig: cfg) }
+                    noteContactSuccess(contact: contact, usedConfig: cfg)
+                } catch {
+                    noteFailure(error, usedConfig: cfg)
+                    noteContactFailure(error, contact: contact, usedConfig: cfg)
+                }
             }
             let family = try store.familyCarriedEnvelopes(
                 limit: MeshDefaults.relayStoreBatchLimit,
@@ -2534,10 +2644,18 @@ final class MeshController: ObservableObject {
                 // server-side); unrecognizable hints are skipped. Mirrors
                 // RelaySyncEngine.kt.
                 if let contact = (try? store.contactMatchingHint(hint: env.recipientHint, nowMs: now)) ?? nil {
-                    guard let cfg = Self.resolvedRelayConfig(contact: contact, fallback: config) else { continue }
+                    guard let cfg = Self.resolvedRelayConfig(
+                        contact: contact,
+                        fallback: config,
+                        endpointUsable: endpointUsable(contact)
+                    ) else { continue }
                     do {
                         _ = try RelayClient.postCarriedEnvelope(config: cfg, envelope: env)
-                    } catch { noteFailure(error, usedConfig: cfg) }
+                        noteContactSuccess(contact: contact, usedConfig: cfg)
+                    } catch {
+                        noteFailure(error, usedConfig: cfg)
+                        noteContactFailure(error, contact: contact, usedConfig: cfg)
+                    }
                     continue
                 }
                 if let group = (try? store.groupMatchingHint(hint: env.recipientHint, nowMs: now)) ?? nil {
@@ -2563,7 +2681,12 @@ final class MeshController: ObservableObject {
             // mailbox (a sender may only have had a fallback config, or an
             // older build posted to its own family mailbox), so checking one
             // box quietly loses cross-token mail.
-            let distinctConfigs = Self.distinctRelayConfigs(contacts: contacts, fallback: config)
+            let distinctConfigs = Self.distinctRelayConfigs(
+                contacts: contacts,
+                fallback: config,
+                rejections: rejections,
+                nowMs: now
+            )
             guard !distinctConfigs.isEmpty else {
                 await MainActor.run {
                     MeshConnectivityStatus.shared.setRelayHealth(.noConfig)
@@ -2697,6 +2820,15 @@ final class MeshController: ObservableObject {
             let retryAfterMs = ownRetryAfterMs
             let ownSucceeded = ownRelaySucceeded
             let anySucceeded = anyRelaySucceeded
+            // Reported from the streak alone, not from `endpointUsable`: a
+            // card stays reported stale through its six-hourly probe window,
+            // so the explanation in the contact sheet doesn't blink out and
+            // back while nothing about the person's situation changed.
+            let stale = Set(
+                rejections.values
+                    .filter { coreContactRelayIsStale(rejectStreak: $0.rejectStreak) }
+                    .map(\.userId)
+            )
             await MainActor.run {
                 MeshConnectivityStatus.shared.setRelayHealth(RelayHealth.afterSyncPass(
                     fault: fault,
@@ -2704,6 +2836,7 @@ final class MeshController: ObservableObject {
                     anyRelaySucceeded: anySucceeded,
                     nowMs: syncedAtMs
                 ))
+                MeshConnectivityStatus.shared.setStaleRelayContacts(stale)
                 self.noteRelayRateLimit(fault: fault, retryAfterMs: retryAfterMs)
             }
         } catch {
@@ -2759,11 +2892,7 @@ final class MeshController: ObservableObject {
     private func refreshNearby() {
         guard isRunning else { return }
         MeshConnectivityStatus.shared.refreshNearbyRoutes()
-        if pausedForBluetoothAudio {
-            MeshRuntimeStatus.shared.markPausedForBluetoothAudio()
-        } else {
-            MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
-        }
+        MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
     }
 }
 

@@ -17,6 +17,7 @@ struct FriendsView: View {
     @State private var chatContact: Contact?
     @State private var suggestions: [FriendSuggestion] = []
     @State private var showAddAllConfirmation = false
+    @FocusState private var pasteFocused: Bool
 
     private var groupedSuggestions: [(Data, [FriendSuggestion])] {
         Dictionary(grouping: suggestions, by: { $0.candidate.userId })
@@ -85,10 +86,11 @@ struct FriendsView: View {
                 Section("Paste friend card") {
                     TextField("Friend card", text: $pasteText, axis: .vertical)
                         .lineLimit(3...8)
+                        .focused($pasteFocused)
                     HStack {
                         Button("Paste") { pasteText = UIPasteboard.general.string ?? "" }
                         Spacer()
-                        Button("Preview friend") { previewText(pasteText) }
+                        Button("Preview friend") { submitPaste() }
                     }
                 }
                 Section("Friends") {
@@ -128,9 +130,18 @@ struct FriendsView: View {
                 }
             }
             .navigationTitle("Friends")
+            .scrollDismissesKeyboard(.interactively)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done", action: onDone)
+                }
+                // The keyboard covers the "Preview friend" button under the
+                // paste field, so the only way forward used to be dismissing
+                // the keyboard first. Put the same action above the keyboard.
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Preview friend") { submitPaste() }
+                        .disabled(pasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
             .sheet(isPresented: $showMyQR) {
@@ -142,11 +153,11 @@ struct FriendsView: View {
             .sheet(isPresented: $showScan) {
                 QRScannerView { code in
                     showScan = false
-                    previewText(code)
+                    previewText(code, scanned: true)
                 }
             }
             .sheet(item: $preview) { state in
-                FriendPreviewView(state: state) { confirm(state.contact) }
+                FriendPreviewView(state: state) { confirm(state.contact, scanned: state.scanned) }
             }
             .sheet(item: $added) { state in
                 FriendConfirmationView(
@@ -222,7 +233,14 @@ struct FriendsView: View {
         reload()
     }
 
-    private func previewText(_ text: String) {
+    /// Drop the keyboard before previewing so the sheet is not fighting it.
+    /// A pasted card is never `scanned`: it says nothing about where its owner is.
+    private func submitPaste() {
+        pasteFocused = false
+        previewText(pasteText)
+    }
+
+    private func previewText(_ text: String, scanned: Bool = false) {
         do {
             let card = try parseFriendText(text: text)
             let userId = friendCardUserId(card: card)
@@ -238,13 +256,12 @@ struct FriendsView: View {
                 relayUrl: card.relayUrl,
                 relayToken: card.relayToken
             )
-            let collision = ((try? AppStore.get().listContacts()) ?? []).first {
-                $0.name.caseInsensitiveCompare(contact.name) == .orderedSame && $0.userId != contact.userId
-            }
-            let warning = collision == nil ? nil :
-                "You already have a \(contact.name); this card has different security keys. Compare the fingerprint words before adding it."
+            let match = friendCardMatch(
+                candidate: contact,
+                existing: (try? AppStore.get().listContacts()) ?? []
+            )
             UINotificationFeedbackGenerator().notificationOccurred(.success)
-            preview = FriendPreviewState(contact: contact, warning: warning)
+            preview = FriendPreviewState(contact: contact, match: match, scanned: scanned)
         } catch {
             self.error = text.contains("CMFRIEND")
                 ? "That looks like a friend card but part of it is missing. Copy the whole message and try again."
@@ -252,14 +269,18 @@ struct FriendsView: View {
         }
     }
 
-    private func confirm(_ candidate: Contact) {
+    private func confirm(_ candidate: Contact, scanned: Bool = false) {
         do {
             let contact = try AppStore.get().upsertImportedContact(contact: candidate)
+            // Pointing a camera at their screen means we were standing
+            // together; a pasted card may equally have been forwarded from an
+            // aeroplane, so only a live link to them counts as having met.
             try? AppStore.get().upsertContactProvenance(provenance: ContactProvenance(
                 userId: contact.userId,
                 source: 0,
                 introducerUserId: nil,
-                introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000),
+                addedNearby: scanned || MeshConnectivityStatus.shared.nearbyPeerIds.contains(contact.userId)
             ))
             try? AppStore.get().removeFriendSuggestion(candidateUserId: contact.userId)
             // CP4: post-CP4 friend cards carry a post-only deposit token —

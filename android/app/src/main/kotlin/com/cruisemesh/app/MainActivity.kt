@@ -97,6 +97,7 @@ import com.cruisemesh.app.ui.ChatListScreen
 import com.cruisemesh.app.ui.ChatSummary
 import com.cruisemesh.app.ui.CruiseMeshTheme
 import com.cruisemesh.app.ui.LocalReachabilityPalette
+import com.cruisemesh.app.ui.InternetDeliveryService
 import com.cruisemesh.app.ui.MeshStatusDotColor
 import com.cruisemesh.app.ui.MeshStatusLegendDialog
 import com.cruisemesh.app.ui.MeshStatusTextLogic
@@ -115,15 +116,18 @@ import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.deepLinkRoute
 import uniffi.cruisemesh_core.fingerprintWords
+import uniffi.cruisemesh_core.friendCardMatch
 import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.generateIdentity
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.ContactDelivery
 import uniffi.cruisemesh_core.contactDelivery
+import uniffi.cruisemesh_core.composerReach
 import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.parseFriendText
 import uniffi.cruisemesh_core.parseRelaySetupText
+import uniffi.cruisemesh_core.relaySetupIsOfficial
 import uniffi.cruisemesh_core.lanDefaultTcpPort
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
@@ -357,7 +361,9 @@ fun CruiseMeshApp(
 private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplete: () -> Unit) {
     val context = LocalContext.current
     val displayId = remember(identity) { formatUserId(identity.userId) }
-    var displayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
+    // Stored name, not the fallback: onboarding must open with an empty field
+    // so the user supplies a real one (see ProfileStore.loadStoredDisplayName).
+    var displayName by remember { mutableStateOf(ProfileStore.loadStoredDisplayName(context)) }
     var avatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
     var permissionRefreshToken by remember { mutableStateOf(0) }
     val meshPermissionsGranted = remember(context, permissionRefreshToken) {
@@ -476,10 +482,9 @@ private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplet
         },
         onRestore = onRestore,
         onComplete = {
-            if (displayName.isBlank()) {
-                displayName = ProfileStore.defaultDisplayName()
-                ProfileStore.saveDisplayName(context, displayName)
-            }
+            // No silent substitution: OnboardingScreen keeps the final button
+            // disabled until a name is entered, so reaching here means the user
+            // chose one.
             if (ProfileStore.loadOwnAvatarEpoch(context) == 0L) {
                 ProfileStore.bumpOwnAvatarEpoch(context)
             }
@@ -599,6 +604,15 @@ private fun freshRelayHealthForDisplay(relayHealth: RelayHealth, nowMs: Long, pu
         relayHealth
     }
 
+private fun configuredInternetDeliveryService(context: Context): InternetDeliveryService? =
+    RelayConfigStore.load(context)?.let { config ->
+        if (relaySetupIsOfficial(config.relayUrl)) {
+            InternetDeliveryService.CRUISE_PASS
+        } else {
+            InternetDeliveryService.CUSTOM_RELAY
+        }
+    }
+
 /** Resolves a [MeshStatusDotColor] to an actual [androidx.compose.ui.graphics.Color] via the current theme palette. */
 @Composable
 private fun MeshStatusDotColor?.toComposeColor(): androidx.compose.ui.graphics.Color? {
@@ -635,6 +649,9 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     var transientMeshStatus by remember { mutableStateOf<String?>(null) }
     var ownDisplayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     var ownAvatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
+    var internetDeliveryService by remember {
+        mutableStateOf(configuredInternetDeliveryService(context))
+    }
     var showMeshStatusLegend by remember { mutableStateOf(false) }
     val uiPrefs = remember(context) { context.getSharedPreferences(UI_PREFS_NAME, Context.MODE_PRIVATE) }
     var bluetoothAudioWarningDismissed by remember { mutableStateOf(false) }
@@ -789,6 +806,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             if (dest.route == "home") {
                 ownDisplayName = ProfileStore.loadDisplayName(context)
                 ownAvatarPath = ProfilePhotoStore.loadAvatarPath(context)
+                internetDeliveryService = configuredInternetDeliveryService(context)
                 permissionRefreshToken += 1
                 bluetoothEnabled = isBluetoothRadioEnabled(context)
                 reloadSummaries()
@@ -817,8 +835,13 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val displayRelayHealth = remember(relayHealth, pushHealthy, connectivityNowMs) {
         freshRelayHealthForDisplay(relayHealth, connectivityNowMs, pushHealthy)
     }
-    val pillStatus = remember(runtimeStatus, nearbyPeerIds, displayRelayHealth) {
-        MeshStatusTextLogic.build(runtimeStatus, nearbyPeerIds.size, displayRelayHealth)
+    val pillStatus = remember(runtimeStatus, nearbyPeerIds, displayRelayHealth, internetDeliveryService) {
+        MeshStatusTextLogic.build(
+            runtimeStatus,
+            nearbyPeerIds.size,
+            displayRelayHealth,
+            internetDeliveryService,
+        )
     }
     val pillDotColor = pillStatus.dot.toComposeColor()
 
@@ -996,8 +1019,11 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
             store = store,
             onContactAdded = { scanned ->
                 val contact = RelayImport.reconcileOnImport(context, store, scanned)
+                // Pointing a camera at their screen is co-presence by
+                // construction -- no need to consult the peer set, which may
+                // not have HELLO'd them yet.
                 store.upsertContactProvenance(
-                    ContactProvenance(contact.userId, 0u, null, System.currentTimeMillis()),
+                    ContactProvenance(contact.userId, 0u, null, System.currentTimeMillis(), addedNearby = true),
                 )
                 store.removeFriendSuggestion(contact.userId)
                 val delivery = FriendRequestSender.queueForScannedContact(context, store, identity, contact)
@@ -1053,14 +1079,9 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
                             relayUrl = card.relayUrl,
                             relayToken = card.relayToken,
                     )
-                    val collision = store.listContacts().firstOrNull {
-                        it.name.equals(candidate.name, ignoreCase = true) &&
-                            !it.userId.contentEquals(candidate.userId)
-                    }
-                    val warning = collision?.let {
-                        "You already have a ${candidate.name}; this card has different security keys. Compare the fingerprint words before adding it."
-                    }
-                    ImportFriendResult.Preview(FriendPreview(candidate, warning))
+                    ImportFriendResult.Preview(
+                        FriendPreview(candidate, friendCardMatch(candidate, store.listContacts())),
+                    )
                 }
             } catch (_: Exception) {
                 if (text.contains("CMFRIEND")) {
@@ -1072,8 +1093,18 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
         },
         onConfirmContact = { candidate ->
             val contact = RelayImport.reconcileOnImport(context, store, candidate)
+            // A pasted card says nothing about where its owner is: it may have
+            // been handed over in person or forwarded from an aeroplane. Only
+            // a live link to them counts as having met.
             store.upsertContactProvenance(
-                ContactProvenance(contact.userId, 0u, null, System.currentTimeMillis()),
+                ContactProvenance(
+                    contact.userId,
+                    0u,
+                    null,
+                    System.currentTimeMillis(),
+                    addedNearby = MeshConnectivityStatus.nearbyPeerIds.value
+                        .contains(UserIdHex.encode(contact.userId)),
+                ),
             )
             store.removeFriendSuggestion(contact.userId)
             val delivery = FriendRequestSender.queueForScannedContact(context, store, identity, contact)
@@ -1242,6 +1273,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
         val pushHealthy by MeshConnectivityStatus.pushHealthy.collectAsState()
         val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
         val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
+        val staleRelayContacts by MeshConnectivityStatus.staleRelayContacts.collectAsState()
         val connectivityNowMs = rememberConnectivityNowMs()
         val reachability = remember(contact.userId, nearbyPeerIds, relayHealth, pushHealthy, contactLastSeen, presenceLastSeen, connectivityNowMs) {
             reachabilityLevelForUserId(contact.userId, nearbyPeerIds, relayHealth, contactLastSeen, presenceLastSeen, connectivityNowMs, pushHealthy)
@@ -1261,13 +1293,30 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
         // exists. A property of their friend card, not of the moment, so it
         // only recomputes when the card or our own config changes.
         val ownRelayConfig = remember { RelayConfigStore.load(context) }
-        val contactHasInternetDelivery = remember(contact.relayUrl, contact.relayToken, ownRelayConfig) {
+        val delivery = remember(contact.relayUrl, contact.relayToken, ownRelayConfig) {
             contactDelivery(
                 contact.relayUrl,
                 contact.relayToken,
                 ownRelayConfig?.relayUrl,
                 ownRelayConfig?.relayToken,
-            ) != ContactDelivery.NearbyOnly
+            )
+        }
+        val contactHasInternetDelivery = delivery != ContactDelivery.NearbyOnly
+        // Whether we ever stood next to this person. A durable fact, so read it
+        // once per chat rather than on every connectivity tick.
+        val addedNearby = remember(contact.userId) {
+            store.getContactProvenance(contact.userId)?.addedNearby ?: false
+        }
+        // Which direction of this chat cannot cross the internet. Local
+        // knowledge only: our own config, their card, and whether a link to
+        // them exists right now.
+        val composerReachVerdict = remember(delivery, ownRelayConfig, nearbyPeerIds, addedNearby, contact.userId) {
+            composerReach(
+                delivery,
+                ownRelayConfig != null,
+                nearbyPeerIds.contains(UserIdHex.encode(contact.userId)),
+                addedNearby,
+            )
         }
         val reachabilityStatusText = remember(reachability, contactLastSeen, presenceLastSeen, connectivityNowMs, nearbyTransport, contactHasInternetDelivery) {
             val hex = UserIdHex.encode(contact.userId)
@@ -1304,6 +1353,8 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             reachability = reachability,
             reachabilityStatusText = reachabilityStatusText,
             reachabilityDetailsText = reachabilityDetailsText,
+            relayCardIsStale = staleRelayContacts.contains(UserIdHex.encode(contact.userId)),
+            composerReach = composerReachVerdict,
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }

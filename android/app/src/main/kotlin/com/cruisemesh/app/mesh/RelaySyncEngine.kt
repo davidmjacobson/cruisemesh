@@ -31,8 +31,12 @@ import uniffi.cruisemesh_core.dedupeHints
 import uniffi.cruisemesh_core.coreGroupFanoutRowsForCarried
 import uniffi.cruisemesh_core.recentPresenceHintsFor
 import uniffi.cruisemesh_core.relayFetchBatchLimit
-import uniffi.cruisemesh_core.resolvedContactPollRelay
-import uniffi.cruisemesh_core.resolvedContactRelay
+import uniffi.cruisemesh_core.ContactRelayRejection
+import uniffi.cruisemesh_core.coreContactRelayEndpointUsable
+import uniffi.cruisemesh_core.coreContactRelayIsStale
+import uniffi.cruisemesh_core.coreContactRelayStreakDelta
+import uniffi.cruisemesh_core.resolvedContactDeliveryPollRelay
+import uniffi.cruisemesh_core.resolvedContactDeliveryRelay
 
 // Deliberately MeshService's tag, not this class's name: this code moved here
 // verbatim in the FA15 extraction, and field tooling (logcat filters, the
@@ -407,6 +411,10 @@ internal class RelaySyncEngine(
         val network = relayBindTarget()
         ownRelayFault = null
         ownRetryAfterMs = 0L
+        passNowMs = now
+        contactRelayRejections = store.listContactRelayRejections()
+            .associateBy { UserIdHex.encode(it.userId) }
+        publishStaleContactRelays()
         backfillOutgoingReceipts(identity, now)
         // T23: if our own endpoint changed since the last announcement, queue
         // the notice to every contact *before* this pass uploads, so it rides
@@ -454,6 +462,12 @@ internal class RelaySyncEngine(
         } else {
             0L
         }
+        // Re-read: the uploads above may have advanced or cleared streaks, and
+        // a person who just watched a message fail should not have to wait a
+        // whole poll interval for the explanation to appear.
+        contactRelayRejections = store.listContactRelayRejections()
+            .associateBy { UserIdHex.encode(it.userId) }
+        publishStaleContactRelays()
         val netDesc = if (network != null) "${networkLabel(network)}(pinned)" else "${networkLabel(connectivityManager.activeNetwork)}(default)"
         Log.i(TAG, "Relay sync complete: configs=${configs.size} net=$netDesc reason=$reason")
     }
@@ -471,12 +485,14 @@ internal class RelaySyncEngine(
             try {
                 val relayId = RelayClient.postReceiptEnvelope(config, envelope, network)
                 store.markOutgoingReceiptEnvelopeRelayPosted(envelope.msgId, now)
+                noteContactRelaySuccess(contact, config, fallbackConfig)
                 Log.i(
                     TAG,
                     "Uploaded receipt envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
                 noteOwnRelayFault(config, fallbackConfig, e)
+                noteContactRelayFault(contact, config, fallbackConfig, e)
                 Log.w(TAG, "Failed to upload receipt envelope to relay ${config.relayUrl}: ${e.message}")
             }
         }
@@ -547,12 +563,14 @@ internal class RelaySyncEngine(
             try {
                 val relayId = RelayClient.postOutboundEnvelope(config, envelope, network)
                 store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
+                noteContactRelaySuccess(contact, config, fallbackConfig)
                 Log.i(
                     TAG,
                     "Uploaded outbound envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
                 noteOwnRelayFault(config, fallbackConfig, e)
+                noteContactRelayFault(contact, config, fallbackConfig, e)
                 Log.w(TAG, "Failed to upload outbound envelope to relay ${config.relayUrl}: ${e.message}")
             }
         }
@@ -720,12 +738,43 @@ internal class RelaySyncEngine(
 
     /** Core owns the mailbox-routing policy (T11) so both shells resolve identically. */
     private fun resolvedRelayConfig(contact: Contact, fallbackConfig: RelayConfig?): RelayConfig? =
-        resolvedContactRelay(
+        resolvedContactDeliveryRelay(
             contact.relayUrl,
             contact.relayToken,
             fallbackConfig?.relayUrl,
             fallbackConfig?.relayToken,
+            contactEndpointUsable(contact),
         )?.let { RelayConfig(it.url, it.token) }
+
+    /**
+     * Mirrors the written-off set into the observable the UI reads. Computed
+     * from the streak alone, not from [contactEndpointUsable]: a card stays
+     * *reported* stale through its six-hourly probe window, so the explanation
+     * in the chat doesn't blink out and back every six hours while nothing
+     * about the person's situation changed.
+     */
+    private fun publishStaleContactRelays() {
+        MeshConnectivityStatus.setStaleRelayContacts(
+            contactRelayRejections
+                .filterValues { coreContactRelayIsStale(it.rejectStreak) }
+                .keys,
+        )
+    }
+
+    /**
+     * Whether this contact's card endpoint has earned another attempt this
+     * pass. False once the core's streak threshold is met, until the
+     * re-probe window opens -- this is what turns the pre-fix ten-rejections-
+     * a-minute loop into four probes a day.
+     */
+    private fun contactEndpointUsable(contact: Contact): Boolean {
+        val rejection = contactRelayRejections[UserIdHex.encode(contact.userId)] ?: return true
+        return coreContactRelayEndpointUsable(
+            rejection.rejectStreak,
+            rejection.rejectedAtMs,
+            passNowMs,
+        )
+    }
 
     /**
      * CP4: fetch/ack/presence resolution. Post-CP4 friend cards carry
@@ -736,15 +785,25 @@ internal class RelaySyncEngine(
      * proxy-polling exactly as before. Sends stay on [resolvedRelayConfig].
      */
     private fun resolvedPollRelayConfig(contact: Contact, fallbackConfig: RelayConfig?): RelayConfig? =
-        resolvedContactPollRelay(
+        resolvedContactDeliveryPollRelay(
             contact.relayUrl,
             contact.relayToken,
             fallbackConfig?.relayUrl,
             fallbackConfig?.relayToken,
+            contactEndpointUsable(contact),
         )?.let { RelayConfig(it.url, it.token) }
 
     /** Worst structured rejection of our own saved config during this pass (CP2b). */
     private var ownRelayFault: CoreRelayFault? = null
+
+    /**
+     * Rejection streaks against contacts' card endpoints, read once per pass
+     * and consulted per contact (only contacts with a non-zero streak appear).
+     */
+    private var contactRelayRejections: Map<String, ContactRelayRejection> = emptyMap()
+
+    /** This pass's `now`, so streak timestamps and re-probe windows agree within a pass. */
+    private var passNowMs: Long = 0L
 
     /** Largest Retry-After (ms) a 429 advertised for our own config this pass. */
     private var ownRetryAfterMs: Long = 0L
@@ -770,6 +829,50 @@ internal class RelaySyncEngine(
         if (fault == CoreRelayFault.RATE_LIMITED) {
             ownRetryAfterMs = maxOf(ownRetryAfterMs, relayRetryAfterMs(http.retryAfter).toLong())
         }
+    }
+
+    /**
+     * The other half of [noteOwnRelayFault], which had no owner before this:
+     * a rejection from the endpoint in a CONTACT's friend card.
+     *
+     * [noteOwnRelayFault] deliberately ignores these ("not our pass's
+     * fault"), and nothing else looked at them, so a card pointing at a
+     * retired host produced an unbounded silent retry loop -- observed in the
+     * field posting to a rebuilt relay ~10x/minute forever while the person's
+     * messages sat at one tick. Recording the streak is what lets
+     * [contactEndpointUsable] stop the loop and the UI say why.
+     *
+     * Only counts when [config] is genuinely the contact's own endpoint: once
+     * we have fallen back to our own relay, a failure there is our own
+     * relay's health, not evidence about their card.
+     */
+    private fun noteContactRelayFault(
+        contact: Contact,
+        config: RelayConfig,
+        fallbackConfig: RelayConfig?,
+        error: Exception,
+    ) {
+        if (config == fallbackConfig) return
+        val http = error as? RelayHttpException ?: return
+        val fault = relayClassifyHttpError(http.code.toUShort(), http.relayCode)
+        if (coreContactRelayStreakDelta(fault) == 0L) return
+        val streak = store.noteContactRelayRejected(contact.userId, passNowMs)
+        Log.w(
+            TAG,
+            "Contact ${UserIdHex.encode(contact.userId)} relay ${config.relayUrl} rejected us " +
+                "($fault, streak=$streak); their friend card looks stale",
+        )
+    }
+
+    /**
+     * A successful post to a contact's own endpoint is the only thing that
+     * clears its streak -- see `clear_contact_relay_rejection`'s doc for why
+     * a transient fault deliberately does not.
+     */
+    private fun noteContactRelaySuccess(contact: Contact, config: RelayConfig, fallbackConfig: RelayConfig?) {
+        if (config == fallbackConfig) return
+        if (!contactRelayRejections.containsKey(UserIdHex.encode(contact.userId))) return
+        store.clearContactRelayRejection(contact.userId)
     }
 
     private fun syncRelayPresence(

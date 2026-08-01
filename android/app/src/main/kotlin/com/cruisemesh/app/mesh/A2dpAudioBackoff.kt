@@ -1,12 +1,15 @@
 package com.cruisemesh.app.mesh
 
 /**
- * Tracks whether the BLE mesh should stay up or pause itself for Bluetooth
- * Classic audio coexistence (HANDOFF.md blocking item #4).
+ * Edge detector for "is an A2DP device connected", so [MeshService] acts on the
+ * transition once rather than on every broadcast. The class is framework-free
+ * so the transition logic is unit-testable.
  *
- * Policy: any connected A2DP device counts as "Bluetooth audio in use", so
- * [MeshService] pauses both BLE roles entirely until that A2DP connection is
- * gone. The class is framework-free so the transition logic is unit-testable.
+ * It used to pause both BLE roles, and [Mode.PAUSED_FOR_A2DP] is a leftover of
+ * that name. It no longer pauses anything: messaging was dead on a phone
+ * whenever earbuds were connected, so 2026-07-09 kept the mesh running and made
+ * the relaxed low-power scan/advertise settings the coexistence mitigation. The
+ * connection state now only drives an informational banner and notification.
  */
 class A2dpAudioBackoff {
     enum class Mode { ACTIVE, PAUSED_FOR_A2DP }

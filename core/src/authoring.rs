@@ -1,5 +1,6 @@
 use rusqlite::{params, OptionalExtension, Transaction};
 
+use crate::causal_order::causal_display_timestamp;
 use crate::store::{
     outbound_message_dedupe_key, row_to_outbound, row_to_outgoing_receipt, store_err,
     upsert_group_tx,
@@ -60,16 +61,24 @@ impl MessageStore {
         let tx = conn.transaction().map_err(store_err)?;
         let (lamport, acknowledged_delivered) =
             next_authored_lamport(&tx, &contact.user_id, &identity.user_id)?;
+        // A message we author is causally after everything already in this
+        // chat, whatever the two phones' clocks think.
+        let display_ts = causal_timestamp_for_chat(&tx, &contact.user_id, timestamp_ms)?;
         let message = StoredMessage {
             chat_id: contact.user_id.clone(),
             sender_user_id: identity.user_id.clone(),
             lamport,
-            timestamp: timestamp_ms,
+            timestamp: display_ts,
             kind,
             payload,
         };
-        let envelope =
-            build_pairwise_envelope(identity, &contact, &message, reply_to_msg_id.as_deref())?;
+        let envelope = build_pairwise_envelope(
+            identity,
+            &contact,
+            &message,
+            reply_to_msg_id.as_deref(),
+            timestamp_ms,
+        )?;
         insert_authored_rows(
             &tx,
             &message,
@@ -139,8 +148,13 @@ impl MessageStore {
         if let Some(envelope) = existing {
             return Ok(authored(message, envelope, 0));
         }
-        let envelope =
-            build_pairwise_envelope(identity, &contact, &message, reply_to_msg_id.as_deref())?;
+        let envelope = build_pairwise_envelope(
+            identity,
+            &contact,
+            &message,
+            reply_to_msg_id.as_deref(),
+            message.timestamp,
+        )?;
         insert_authored_rows(
             &tx,
             &message,
@@ -180,11 +194,12 @@ impl MessageStore {
         let tx = conn.transaction().map_err(store_err)?;
         let (lamport, acknowledged_delivered) =
             next_authored_lamport(&tx, &group.id, &identity.user_id)?;
+        let display_ts = causal_timestamp_for_chat(&tx, &group.id, timestamp_ms)?;
         let message = StoredMessage {
             chat_id: group.id.clone(),
             sender_user_id: identity.user_id.clone(),
             lamport,
-            timestamp: timestamp_ms,
+            timestamp: display_ts,
             kind,
             payload,
         };
@@ -198,7 +213,7 @@ impl MessageStore {
             sender_user_id: message.sender_user_id.clone(),
             kind,
             lamport,
-            timestamp: timestamp_ms,
+            timestamp: display_ts,
             hop_ttl: DEFAULT_HOP_TTL,
             expiry: default_expiry(timestamp_ms),
             recipient_hint: compute_recipient_hint(group.id, timestamp_ms),
@@ -243,11 +258,12 @@ impl MessageStore {
         let tx = conn.transaction().map_err(store_err)?;
         let (lamport, acknowledged_delivered) =
             next_authored_lamport(&tx, &group.id, &identity.user_id)?;
+        let display_ts = causal_timestamp_for_chat(&tx, &group.id, timestamp_ms)?;
         let message = StoredMessage {
             chat_id: group.id.clone(),
             sender_user_id: identity.user_id.clone(),
             lamport,
-            timestamp: timestamp_ms,
+            timestamp: display_ts,
             kind: KIND_GROUP_METADATA_UPDATE,
             payload,
         };
@@ -261,7 +277,7 @@ impl MessageStore {
             sender_user_id: message.sender_user_id.clone(),
             kind: KIND_GROUP_METADATA_UPDATE,
             lamport,
-            timestamp: timestamp_ms,
+            timestamp: display_ts,
             hop_ttl: DEFAULT_HOP_TTL,
             expiry: default_expiry(timestamp_ms),
             recipient_hint: compute_recipient_hint(message.chat_id.clone(), timestamp_ms),
@@ -291,11 +307,12 @@ impl MessageStore {
         let tx = conn.transaction().map_err(store_err)?;
         let (lamport, acknowledged_delivered) =
             next_authored_lamport(&tx, &group.id, &identity.user_id)?;
+        let display_ts = causal_timestamp_for_chat(&tx, &group.id, timestamp_ms)?;
         let message = StoredMessage {
             chat_id: group.id,
             sender_user_id: identity.user_id.clone(),
             lamport,
-            timestamp: timestamp_ms,
+            timestamp: display_ts,
             kind: KIND_GROUP_INVITE,
             payload: invite,
         };
@@ -304,7 +321,8 @@ impl MessageStore {
             if member.user_id == identity.user_id {
                 continue;
             }
-            let envelope = build_pairwise_envelope(identity.clone(), &member, &message, None)?;
+            let envelope =
+                build_pairwise_envelope(identity.clone(), &member, &message, None, timestamp_ms)?;
             insert_authored_rows(&tx, &message, &envelope, None, timestamp_ms)?;
             authored_invites.push(authored(message.clone(), envelope, acknowledged_delivered));
         }
@@ -577,11 +595,38 @@ fn next_authored_lamport(
     Ok((next, delivered as u64))
 }
 
+/// `routing_timestamp_ms` is the TRUE clock, kept separate from
+/// `message.timestamp` (which may have been floored for display order, see
+/// [`crate::causal_order`]). Expiry and the recipient hint are keyed to real
+/// elapsed time -- the hint's match window only looks backwards, so pushing
+/// it into tomorrow's day bucket to fix a display artifact would trade a
+/// cosmetic bug for an undeliverable message.
+/// The display timestamp a message authored into `chat_id` right now should
+/// carry: `now_ms`, floored so it cannot sort above anything already in the
+/// chat. See [`crate::causal_order`] for why.
+fn causal_timestamp_for_chat(
+    tx: &Transaction<'_>,
+    chat_id: &[u8],
+    now_ms: i64,
+) -> Result<i64, CoreError> {
+    let newest: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(timestamp) FROM messages WHERE chat_id = ?1",
+            params![chat_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(store_err)?
+        .flatten();
+    Ok(causal_display_timestamp(newest, now_ms))
+}
+
 fn build_pairwise_envelope(
     identity: Identity,
     contact: &Contact,
     message: &StoredMessage,
     reply_to_msg_id: Option<&[u8]>,
+    routing_timestamp_ms: i64,
 ) -> Result<OutboundEnvelope, CoreError> {
     let body = encoded_body(message, identity.user_id.clone(), reply_to_msg_id)?;
     Ok(OutboundEnvelope {
@@ -593,8 +638,8 @@ fn build_pairwise_envelope(
         lamport: message.lamport,
         timestamp: message.timestamp,
         hop_ttl: DEFAULT_HOP_TTL,
-        expiry: default_expiry(message.timestamp),
-        recipient_hint: compute_recipient_hint(contact.user_id.clone(), message.timestamp),
+        expiry: default_expiry(routing_timestamp_ms),
+        recipient_hint: compute_recipient_hint(contact.user_id.clone(), routing_timestamp_ms),
         sealed: seal_message(identity, contact.agree_pk.clone(), body)?,
     })
 }
@@ -735,6 +780,92 @@ mod tests {
             relay_token: None,
             nickname: None,
         }
+    }
+
+    /// The reported field symptom, end to end: their clock runs ahead, we
+    /// reply seconds later, and the reply must still render below the message
+    /// it answers.
+    #[test]
+    fn a_reply_to_a_fast_clocked_peer_still_renders_below_the_question() {
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        let alice = generate_identity();
+        let bob = generate_identity();
+        let bob_contact = contact(&bob, "Bob");
+
+        // Bob's phone is five minutes fast; his question lands stamped in
+        // our future.
+        let our_now = 1_700_000_000_000i64;
+        let his_clock = our_now + 5 * 60 * 1_000;
+        store
+            .insert_message(StoredMessage {
+                chat_id: bob_contact.user_id.clone(),
+                sender_user_id: bob.user_id.clone(),
+                lamport: 1,
+                timestamp: his_clock,
+                kind: KIND_TEXT,
+                payload: b"are you there?".to_vec(),
+            })
+            .unwrap();
+
+        let authored = store
+            .author_pairwise_message(
+                alice.clone(),
+                bob_contact.clone(),
+                KIND_TEXT,
+                b"yes!".to_vec(),
+                None,
+                our_now + 10_000,
+            )
+            .unwrap();
+
+        assert!(
+            authored.message.timestamp > his_clock,
+            "reply stamped {} must sort after the question at {his_clock}",
+            authored.message.timestamp
+        );
+        let rendered = store
+            .messages_for_chat(bob_contact.user_id.clone())
+            .unwrap();
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(rendered[0].payload, b"are you there?".to_vec());
+        assert_eq!(rendered[1].payload, b"yes!".to_vec());
+
+        // The peer sees the same order, because the floored timestamp is what
+        // rides the wire -- fixing only our own view would leave the question
+        // and answer inverted on their phone instead.
+        assert_eq!(authored.envelope.timestamp, authored.message.timestamp);
+
+        // Routing time stays on the true clock: the recipient hint is day
+        // bucketed and only matched backwards, so it must not be dragged
+        // forward by a peer's fast clock.
+        assert_eq!(
+            authored.envelope.recipient_hint,
+            compute_recipient_hint(bob_contact.user_id.clone(), our_now + 10_000)
+        );
+        assert_eq!(authored.envelope.expiry, default_expiry(our_now + 10_000));
+    }
+
+    #[test]
+    fn agreeing_clocks_leave_the_authored_timestamp_untouched() {
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        let alice = generate_identity();
+        let bob = generate_identity();
+        let bob_contact = contact(&bob, "Bob");
+        let now = 1_700_000_000_000i64;
+        store
+            .insert_message(StoredMessage {
+                chat_id: bob_contact.user_id.clone(),
+                sender_user_id: bob.user_id.clone(),
+                lamport: 1,
+                timestamp: now - 60_000,
+                kind: KIND_TEXT,
+                payload: b"hi".to_vec(),
+            })
+            .unwrap();
+        let authored = store
+            .author_pairwise_message(alice, bob_contact, KIND_TEXT, b"hello".to_vec(), None, now)
+            .unwrap();
+        assert_eq!(authored.message.timestamp, now);
     }
 
     #[test]

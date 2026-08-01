@@ -27,7 +27,9 @@
     <string name="ui_all_of_your_contacts_are_already_in_this">All of your contacts are already in this group.</string>
     <string name="ui_all_quiet_on_deck">All quiet on deck</string>
     <string name="ui_already_set_up_restore_from_a_backup">Already set up? Restore from a backup</string>
+    <string name="ui_another_friend_also_shows_as">Another friend also shows as %1$s. This card belongs to the one with these safety words:</string>
     <string name="ui_ask_them_to_check_these_words_match_their">Ask them to check these words match their card.</string>
+    <string name="ui_ask_them_to_read_their_safety_words_aloud">Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them.</string>
     <string name="ui_back">Back</string>
     <string name="ui_back_up_account">Back up account</string>
     <string name="ui_block">Block</string>
@@ -187,6 +189,7 @@
     <string name="ui_onboarding_profile_title">What name would you like to go by?</string>
     <string name="ui_onboarding_profile_body">This is what people see when you share your friend card or add each other nearby. You can change it anytime.</string>
     <string name="ui_onboarding_profile_photo_helper">The profile photo is shared with friends after you connect.</string>
+    <string name="ui_onboarding_name_required">Enter a name to continue.</string>
     <string name="ui_minimum_passphrase_length">At least %1$d characters.</string>
     <string name="ui_remove_photo">Remove photo</string>
     <string name="ui_removes_this_group_and_its_message_history_from">Removes this group and its message history from this device. Other members keep their copy.</string>
@@ -263,6 +266,10 @@
     <string name="ui_help_support">Help &amp; support</string>
     <string name="ui_new_message">New message</string>
     <string name="ui_profile">Profile</string>
+    <!-- Composer notice: which direction of this chat cannot cross the internet -->
+    <string name="ui_composer_replies_cannot_reach_you">Your messages will reach %1$s, but their replies only arrive when you\'re near each other. Set up a Cruise Pass to get replies anywhere.</string>
+    <string name="ui_composer_they_cannot_be_reached">%1$s hasn\'t set up a Cruise Pass, so your messages only arrive when you\'re near each other. They need their own pass to be reached from further away.</string>
+    <string name="ui_composer_neither_direction_works">Neither phone has a Cruise Pass, so messages only cross when you\'re near each other. Either of you can set one up.</string>
     <!-- Cruise Pass -->
     <string name="ui_cruise_pass">Cruise Pass</string>
     <string name="ui_setting_up_cruise_pass">Setting up Cruise Pass</string>
@@ -376,4 +383,12 @@
     <string name="ui_details">Details</string>
     <string name="ui_hide_details">Hide details</string>
     <string name="ui_delivery_stale_card_hint">If your messages are not arriving, ask them to share their friend card again. A card carries the service they used when they shared it.</string>
+    <string name="ui_delivery_card_out_of_date">Their friend card is out of date</string>
+    <string name="ui_delivery_card_out_of_date_detail">The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Cruise Pass is set up, then share their friend card again. Messages still deliver when you are near each other.</string>
+    <string name="ui_update_this_friend_question">Update this friend?</string>
+    <string name="ui_update_this_friend">Update this friend</string>
+    <string name="ui_you_already_have_this_friend_saved_as">You already have this friend, saved as %1$s. Adding the card again just updates how your phone reaches them.</string>
+    <string name="ui_you_already_have_a_different_friend_named">You already have a different friend named %1$s. This card is someone else, with different security keys.</string>
+    <string name="ui_give_one_of_them_a_nickname">Give one of them a nickname so you can tell them apart.</string>
+    <string name="ui_this_card">This card</string>
 </resources>

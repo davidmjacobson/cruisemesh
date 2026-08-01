@@ -36,6 +36,10 @@ struct ChatView: View {
     @State private var isBlocked = false
     @State private var localNickname: String?
     @State private var nicknameEdited = false
+    /// `ContactProvenance.addedNearby`: were we standing next to this person
+    /// when we accepted them? A durable fact, so it is read once per chat
+    /// rather than on every connectivity tick.
+    @State private var addedNearby = false
 
     private let store = AppStore.get()
     private var sender: RealMeshSender { RealMeshSender(store: store, identity: identity) }
@@ -72,6 +76,25 @@ struct ChatView: View {
 
     private var reactions: [String: [ReactionSummary]] {
         reactionSummariesByTarget(messages: messages, ownUserId: identity.userId)
+    }
+
+    /// Which direction of this chat cannot cross the internet. Local knowledge
+    /// only -- our own config, their card, whether a link exists right now, and
+    /// whether we ever stood next to them -- so it costs no round trip and is
+    /// right even with no connectivity at all.
+    private var composerReachVerdict: ComposerReach {
+        let own = RelayConfigStore.load()
+        return composerReach(
+            delivery: contactDelivery(
+                contactRelayUrl: contact.relayUrl,
+                contactRelayToken: contact.relayToken,
+                ownRelayUrl: own?.relayUrl,
+                ownRelayToken: own?.relayToken
+            ),
+            ownRelayConfigured: own != nil,
+            contactNearby: connectivity.nearbyPeerIds.contains(contact.userId),
+            addedWhileNearby: addedNearby
+        )
     }
 
     private var replyingToPreview: QuotedMessagePreview? {
@@ -154,6 +177,8 @@ struct ChatView: View {
                     }
                 }
             }
+
+            ComposerReachNotice(reach: composerReachVerdict, contactName: resolvedName)
 
             ChatComposerBar(
                 replyingToPreview: replyingToPreview,
@@ -272,7 +297,8 @@ struct ChatView: View {
                 },
                 onReport: {
                     launchContactReport(contact: displayContact, reporterUserId: identity.userId)
-                }
+                },
+                relayCardIsStale: connectivity.staleRelayContacts.contains(contact.userId)
             ) {
                 showDetails = false
                 confirmDelete = true
@@ -355,6 +381,8 @@ struct ChatView: View {
             senderUserId: identity.userId,
             receiptType: ReceiptType.read
         )) ?? 0
+        let provenance = try? store.getContactProvenance(userId: contact.userId)
+        addedNearby = provenance?.addedNearby ?? false
     }
 
     private func sendVoice(url: URL, durationMs: Int32) {
@@ -692,6 +720,47 @@ private struct MessageBubbleView: View {
             bottomTrailingRadius: isOwn && grouping.joinsNext ? 6 : 18,
             topTrailingRadius: isOwn && grouping.joinsPrevious ? 6 : 18
         )
+    }
+}
+
+/// The one place a person is guaranteed to look before typing: a persistent,
+/// non-modal line above the composer saying which direction of this chat cannot
+/// cross the internet. Renders nothing for `.fine`, which is every ordinary
+/// chat.
+///
+/// Deliberately not an alert, a toast, or a row inside the contact sheet three
+/// taps away. The failure it describes is silent -- messages sit at one tick
+/// forever and no screen explains why -- so it has to be where the typing
+/// happens, and it has to stay put.
+struct ComposerReachNotice: View {
+    let reach: ComposerReach
+    let contactName: String
+
+    private var text: String? {
+        switch reach {
+        case .fine:
+            return nil
+        case .repliesCannotReachMe:
+            return "Your messages will reach \(contactName), but their replies only arrive when you're near each other. Set up a Cruise Pass to get replies anywhere."
+        case .theyCannotBeReached:
+            return "\(contactName) hasn't set up a Cruise Pass, so your messages only arrive when you're near each other. They need their own pass to be reached from further away."
+        case .neitherDirectionWorks:
+            return String(localized: "Neither phone has a Cruise Pass, so messages only cross when you're near each other. Either of you can set one up.")
+        }
+    }
+
+    var body: some View {
+        if let text {
+            Text(text)
+                .font(.caption)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .padding(.horizontal, 12)
+                .padding(.bottom, 4)
+        }
     }
 }
 

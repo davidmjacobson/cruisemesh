@@ -122,9 +122,6 @@ class RadioPowerPolicy {
         return mode
     }
 
-    /** Current mode without recomputing -- for diagnostics/tests. */
-    fun currentMode(): RadioDutyMode = mode
-
     companion object {
         /** Minimum time at BALANCED before [nextDutyMode] allows a downshift -- see the class doc's throttling section. */
         const val MIN_DWELL_MS: Long = 60_000L

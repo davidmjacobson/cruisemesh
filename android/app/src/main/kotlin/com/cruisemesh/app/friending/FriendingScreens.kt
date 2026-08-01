@@ -21,6 +21,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxSize
@@ -58,6 +62,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.collectLatest
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -77,9 +83,12 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.ui.AvatarBadge
+import com.cruisemesh.app.ui.ChatListLogic
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.FriendSuggestion
+import uniffi.cruisemesh_core.coreContactDisplayName
+import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.makeFriendCard
 import uniffi.cruisemesh_core.makeFriendLink
@@ -454,7 +463,7 @@ private fun ScanViewfinderOverlay() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun AddFriendScreen(
     onScanClick: () -> Unit,
@@ -476,6 +485,18 @@ fun AddFriendScreen(
     var suggestions by remember { mutableStateOf(emptyList<FriendSuggestion>()) }
     var confirmAddAll by remember { mutableStateOf(false) }
     val context = LocalContext.current
+    val pasteScroll = rememberScrollState()
+    val imeVisible = WindowInsets.isImeVisible
+
+    // With the keyboard up, park the bottom of the form (the "Preview friend"
+    // button) just above it. `imePadding` shrinks the viewport as the IME
+    // animates in, so `maxValue` keeps growing; re-target on every change and
+    // the scroll settles on the real bottom rather than a stale one.
+    androidx.compose.runtime.LaunchedEffect(imeVisible) {
+        if (imeVisible) {
+            snapshotFlow { pasteScroll.maxValue }.collectLatest { pasteScroll.animateScrollTo(it) }
+        }
+    }
 
     fun reloadSuggestions() {
         suggestions = if (FriendsOfFriendsStore.isEnabled(context)) {
@@ -517,7 +538,12 @@ fun AddFriendScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .verticalScroll(rememberScrollState())
+                // The app draws edge to edge, so nothing insets for the
+                // keyboard on its own: without this the IME sat on top of the
+                // "Preview friend" button and the only way forward was to
+                // dismiss the keyboard first.
+                .imePadding()
+                .verticalScroll(pasteScroll)
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
@@ -685,6 +711,12 @@ sealed interface ImportFriendResult {
     data class Error(val message: String) : ImportFriendResult
 }
 
+internal fun contactsScreenDisplayName(contact: Contact): String =
+    ChatListLogic.displayNameOrId(
+        coreContactDisplayName(contact),
+        formatUserId(contact.userId),
+    )
+
 /**
  * Lists accepted contacts (DESIGN.md §6.2); tapping a row opens its 1:1 chat,
  * long-pressing offers deletion behind a confirmation dialog. Deleting exists
@@ -807,7 +839,8 @@ fun ContactsScreen(
                         )
                     }
                     items(contacts) { contact ->
-                        val displayId = uniffi.cruisemesh_core.formatUserId(contact.userId)
+                        val displayId = formatUserId(contact.userId)
+                        val displayName = contactsScreenDisplayName(contact)
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -820,13 +853,13 @@ fun ContactsScreen(
                         ) {
                             AvatarBadge(
                                 userId = contact.userId,
-                                name = contact.name,
+                                name = displayName,
                                 displayId = displayId,
                                 photoBytes = avatarBytesByUserId[displayId],
                             )
                             Spacer(modifier = Modifier.width(16.dp))
                             Text(
-                                contact.name,
+                                displayName,
                                 style = MaterialTheme.typography.bodyLarge
                             )
                         }
@@ -873,7 +906,14 @@ fun ContactsScreen(
     if (toDelete != null) {
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
-            title = { Text(stringResource(R.string.ui_delete_named, toDelete.name)) },
+            title = {
+                Text(
+                    stringResource(
+                        R.string.ui_delete_named,
+                        contactsScreenDisplayName(toDelete),
+                    ),
+                )
+            },
             text = { Text(stringResource(R.string.ui_this_removes_the_contact_and_deletes_your_chat_f3fb0a50)) },
             confirmButton = {
                 TextButton(
