@@ -14904,17 +14904,43 @@ public func relaySetupIsOfficial(relayUrl: String) -> Bool {
 /**
  * Must this pass walk the whole mailbox from 0?
  *
- * `swept_this_session` is per-process, not persisted: the first pass after a
- * cold start always sweeps. That is the cheap, self-healing answer to every
- * way a persisted cursor can go stale in a way we cannot detect from a
- * response — most importantly a relay rebuilt from scratch, whose row ids
- * restart at 1 and would otherwise sit forever below a frontier we still
- * remember. Restarting the app fixes it; the timer fixes it unattended.
+ * The answer comes from the *persisted* `last_sweep_at_ms`, cold start
+ * included. It used to be an unconditional yes for the first pass of every
+ * process, on the theory that a restart is a cheap moment to re-check
+ * everything. On a phone it is not cheap and it is not occasional: the mesh
+ * service is killed and restarted all day (Doze, swipe-away, memory
+ * pressure), every restart forced a full walk, and a full walk re-downloads
+ * the sealed body of every row still in the mailbox — including all the rows
+ * left there on purpose, which is most of them. So the restart rate, not
+ * [`RELAY_SWEEP_INTERVAL_MS`], was deciding how much data this app moved, and
+ * a churny phone could sweep many times a day instead of four.
  *
- * A `last_sweep_at_ms` in the future (a clock that jumped backwards, a
- * restore onto a phone set to a different time) sweeps immediately rather
- * than pinning the mailbox as un-swept until real time catches up — the same
- * rule [`crate::core_contact_relay_recheck_due`] applies for the same reason.
+ * What that costs: a relay rebuilt from scratch, whose row ids restart at 1
+ * underneath a frontier we still remember, is no longer repaired by
+ * restarting the app. It heals unattended within one sweep interval instead —
+ * up to six hours. That is the right way round: the rebuild is a rare
+ * operator event, the restart is constant.
+ *
+ * Two valves stay open, because they are the states a stored timestamp
+ * genuinely cannot speak for:
+ *
+ * - **Never swept** (`last_sweep_at_ms <= 0`) sweeps. This is also,
+ * deliberately, the entire "heal promptly after an install or restore"
+ * story, and the reason no extra cold-start grace period is warranted on
+ * top of it. A fresh install has no `relay_fetch_cursors` row; those rows
+ * deliberately do not ride a `.cmbak` (see `MessageStore::backup_to`), so a
+ * restore has none either; and a rotated token or a moved host hashes to a
+ * different [`relay_cursor_key`], which has no row of its own. All three
+ * read as 0 here and sweep on their first pass. A grace period would buy
+ * those cases nothing they don't already have, and would hand back a share
+ * of exactly the restart-driven cost this rule exists to remove.
+ * `swept_this_session` guards this branch alone, so a store write that
+ * keeps failing costs one walk per process rather than one per pass.
+ * - **A timestamp in the future** (a clock that jumped backwards, a restore
+ * onto a phone set to a different time) sweeps immediately rather than
+ * pinning the mailbox as un-swept until real time catches up — the same
+ * rule [`crate::core_contact_relay_recheck_due`] applies for the same
+ * reason. One sweep rewrites the timestamp to now, so it cannot loop.
  */
 public func relaySweepDue(sweptThisSession: Bool, lastSweepAtMs: Int64, nowMs: Int64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -15562,7 +15588,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 55007) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 2810) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 46431) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_interval_ms() != 37428) {

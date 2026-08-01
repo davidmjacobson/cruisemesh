@@ -6628,8 +6628,12 @@ mod tests {
         let cursor = store.relay_fetch_cursor(cursor_key()).unwrap();
         assert_eq!(cursor.after_id, 0);
         assert_eq!(cursor.last_sweep_at_ms, 0);
+        // A mailbox this device has never swept walks from the beginning on
+        // its first pass -- which is what a fresh install, a restore (these
+        // rows never ride a `.cmbak`), a rotated token and a moved host all
+        // look like from here.
         assert!(crate::relay_sweep_due(
-            true,
+            false,
             cursor.last_sweep_at_ms,
             10_000
         ));

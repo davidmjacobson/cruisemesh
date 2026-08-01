@@ -17,13 +17,17 @@ struct RelayPushSubscription {
 /// Which relay mailboxes this *process* has already walked in full.
 ///
 /// The counterpart of `RelaySyncEngine.sweptThisSession` on Android, and
-/// deliberately in-memory on both: `relaySweepDue` treats the first pass after
-/// a cold start as a sweep, which is the self-healing answer to a persisted
-/// fetch frontier that has gone stale in a way no relay response can reveal --
-/// most importantly a relay rebuilt from scratch, whose row ids restart at 1
-/// and would otherwise sit forever below a frontier we still remember.
-/// Restarting the app repairs it immediately; the six-hourly sweep repairs it
-/// unattended.
+/// deliberately in-memory on both -- but deliberately *narrow* on both too.
+/// `relaySweepDue` schedules from the persisted sweep timestamp and consults
+/// this only for a mailbox that has never recorded a completed sweep at all,
+/// where it stops a store write that keeps failing from turning every pass
+/// into a full walk. A cold start on a mailbox with a recent sweep no longer
+/// re-walks anything: a sweep re-downloads the sealed body of every row still
+/// in the mailbox, and tying that to the process lifetime made the six-hourly
+/// interval meaningless on a phone that restarts its mesh service all day.
+/// The cost is that a relay rebuilt from scratch -- row ids restarting at 1
+/// under a frontier we still remember -- heals on the interval rather than at
+/// the next app restart.
 ///
 /// Keys are `relayCursorKey(relayUrl:relayToken:)` values -- hashes, never
 /// credentials.

@@ -26,9 +26,10 @@
 //!
 //! Remember the frontier. A normal pass resumes from the highest id whose
 //! page was fully processed, so it fetches only what is genuinely new and
-//! reaches fresh mail on the first page. Occasionally — at cold start, and on
-//! a slow timer — a pass walks the whole mailbox from 0 again so the rows
-//! that are *supposed* to stay there remain re-discoverable.
+//! reaches fresh mail on the first page. Occasionally — on a slow timer, and
+//! the first time a mailbox is seen at all — a pass walks the whole mailbox
+//! from 0 again so the rows that are *supposed* to stay there remain
+//! re-discoverable.
 //!
 //! Policy lives here, as plain functions, so both shells answer every
 //! question the same way and every answer is unit-testable without a relay,
@@ -60,6 +61,10 @@ const RELAY_CURSOR_KEY_CONTEXT: &[u8] = b"cruisemesh relay fetch cursor key v1";
 /// polling, short enough that no phone is more than a quarter of a day away
 /// from re-offering what it is carrying for someone else. It is deliberately
 /// *not* the delivery path — nothing a person sends waits on it.
+///
+/// This is the *whole* schedule. Starting the process no longer forces a walk
+/// (see [`relay_sweep_due`]), so the number of sweeps a phone does per day is
+/// this constant and nothing else.
 pub const RELAY_SWEEP_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
 
 /// [`RELAY_SWEEP_INTERVAL_MS`], for shells that cannot see the constant.
@@ -110,23 +115,49 @@ pub fn relay_cursor_key(relay_url: String, relay_token: String) -> String {
 
 /// Must this pass walk the whole mailbox from 0?
 ///
-/// `swept_this_session` is per-process, not persisted: the first pass after a
-/// cold start always sweeps. That is the cheap, self-healing answer to every
-/// way a persisted cursor can go stale in a way we cannot detect from a
-/// response — most importantly a relay rebuilt from scratch, whose row ids
-/// restart at 1 and would otherwise sit forever below a frontier we still
-/// remember. Restarting the app fixes it; the timer fixes it unattended.
+/// The answer comes from the *persisted* `last_sweep_at_ms`, cold start
+/// included. It used to be an unconditional yes for the first pass of every
+/// process, on the theory that a restart is a cheap moment to re-check
+/// everything. On a phone it is not cheap and it is not occasional: the mesh
+/// service is killed and restarted all day (Doze, swipe-away, memory
+/// pressure), every restart forced a full walk, and a full walk re-downloads
+/// the sealed body of every row still in the mailbox — including all the rows
+/// left there on purpose, which is most of them. So the restart rate, not
+/// [`RELAY_SWEEP_INTERVAL_MS`], was deciding how much data this app moved, and
+/// a churny phone could sweep many times a day instead of four.
 ///
-/// A `last_sweep_at_ms` in the future (a clock that jumped backwards, a
-/// restore onto a phone set to a different time) sweeps immediately rather
-/// than pinning the mailbox as un-swept until real time catches up — the same
-/// rule [`crate::core_contact_relay_recheck_due`] applies for the same reason.
+/// What that costs: a relay rebuilt from scratch, whose row ids restart at 1
+/// underneath a frontier we still remember, is no longer repaired by
+/// restarting the app. It heals unattended within one sweep interval instead —
+/// up to six hours. That is the right way round: the rebuild is a rare
+/// operator event, the restart is constant.
+///
+/// Two valves stay open, because they are the states a stored timestamp
+/// genuinely cannot speak for:
+///
+/// - **Never swept** (`last_sweep_at_ms <= 0`) sweeps. This is also,
+///   deliberately, the entire "heal promptly after an install or restore"
+///   story, and the reason no extra cold-start grace period is warranted on
+///   top of it. A fresh install has no `relay_fetch_cursors` row; those rows
+///   deliberately do not ride a `.cmbak` (see `MessageStore::backup_to`), so a
+///   restore has none either; and a rotated token or a moved host hashes to a
+///   different [`relay_cursor_key`], which has no row of its own. All three
+///   read as 0 here and sweep on their first pass. A grace period would buy
+///   those cases nothing they don't already have, and would hand back a share
+///   of exactly the restart-driven cost this rule exists to remove.
+///   `swept_this_session` guards this branch alone, so a store write that
+///   keeps failing costs one walk per process rather than one per pass.
+/// - **A timestamp in the future** (a clock that jumped backwards, a restore
+///   onto a phone set to a different time) sweeps immediately rather than
+///   pinning the mailbox as un-swept until real time catches up — the same
+///   rule [`crate::core_contact_relay_recheck_due`] applies for the same
+///   reason. One sweep rewrites the timestamp to now, so it cannot loop.
 #[uniffi::export]
 pub fn relay_sweep_due(swept_this_session: bool, last_sweep_at_ms: i64, now_ms: i64) -> bool {
-    if !swept_this_session {
-        return true;
+    if last_sweep_at_ms <= 0 {
+        return !swept_this_session;
     }
-    if last_sweep_at_ms <= 0 || now_ms < last_sweep_at_ms {
+    if now_ms < last_sweep_at_ms {
         return true;
     }
     now_ms - last_sweep_at_ms >= RELAY_SWEEP_INTERVAL_MS
@@ -260,11 +291,34 @@ mod tests {
     }
 
     #[test]
-    fn the_first_pass_of_a_process_always_sweeps() {
-        // Cold start: whatever the persisted timestamp says.
-        assert!(relay_sweep_due(false, 0, 1_000));
-        assert!(relay_sweep_due(false, 1_000, 1_000));
-        assert!(relay_sweep_due(false, i64::MAX, 1_000));
+    fn a_cold_start_with_a_recent_sweep_does_not_sweep_again() {
+        // The regression this rule exists for. The mesh service is killed and
+        // restarted all day; if every restart re-walked the mailbox, the
+        // restart rate would set the bandwidth bill and the interval would
+        // mean nothing.
+        let swept_at = 1_000_000i64;
+        assert!(!relay_sweep_due(false, swept_at, swept_at));
+        assert!(!relay_sweep_due(false, swept_at, swept_at + 1));
+        assert!(!relay_sweep_due(
+            false,
+            swept_at,
+            swept_at + RELAY_SWEEP_INTERVAL_MS - 1
+        ));
+    }
+
+    #[test]
+    fn a_cold_start_with_a_stale_sweep_still_sweeps() {
+        let swept_at = 1_000_000i64;
+        assert!(relay_sweep_due(
+            false,
+            swept_at,
+            swept_at + RELAY_SWEEP_INTERVAL_MS
+        ));
+        assert!(relay_sweep_due(
+            false,
+            swept_at,
+            swept_at + 10 * RELAY_SWEEP_INTERVAL_MS
+        ));
     }
 
     #[test]
@@ -285,10 +339,26 @@ mod tests {
     }
 
     #[test]
-    fn a_never_recorded_or_backwards_clock_sweeps_rather_than_stalling() {
-        assert!(relay_sweep_due(true, 0, 5_000));
-        assert!(relay_sweep_due(true, -1, 5_000));
+    fn a_mailbox_never_swept_sweeps_on_its_first_pass() {
+        // Fresh install, a restore (cursor rows don't ride a `.cmbak`), a
+        // rotated token, a moved host: all of them read as 0 here, and all of
+        // them must walk from the beginning. This is the promptness a
+        // cold-start grace period would otherwise have had to provide.
+        assert!(relay_sweep_due(false, 0, 5_000));
+        assert!(relay_sweep_due(false, -1, 5_000));
+        // ...but only once per process. A store write that keeps failing must
+        // not turn every single pass into a full walk.
+        assert!(!relay_sweep_due(true, 0, 5_000));
+        assert!(!relay_sweep_due(true, -1, 5_000));
+    }
+
+    #[test]
+    fn a_backwards_clock_sweeps_rather_than_pinning_the_mailbox() {
+        // A timestamp in the future, from either side of a restart. Recording
+        // the sweep rewrites it to now, so this resolves in one pass.
         assert!(relay_sweep_due(true, 5_000_000, 1_000));
+        assert!(relay_sweep_due(false, 5_000_000, 1_000));
+        assert!(relay_sweep_due(false, i64::MAX, 1_000));
     }
 
     #[test]

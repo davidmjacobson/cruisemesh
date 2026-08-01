@@ -2857,10 +2857,14 @@ final class MeshController: ObservableObject {
                 // which never moves past a page that failed to fully process
                 // or to land its acks, and never moves backwards -- the mirror
                 // of the DTN ack-safety rule applied to skipping. Occasionally
-                // (first pass of a process, then every `relaySweepIntervalMs`)
                 // it sweeps the whole mailbox from 0 instead, so the rows that
                 // are supposed to stay there remain re-discoverable and a
-                // rebuilt relay heals itself. Mirrors RelaySyncEngine.kt.
+                // rebuilt relay heals itself. `relaySweepDue` owns when, from
+                // the persisted sweep timestamp: every `relaySweepIntervalMs`,
+                // plus the first pass against a mailbox never swept at all --
+                // notably NOT every process start, which would tie a full
+                // re-download of the mailbox to the restart rate. Mirrors
+                // RelaySyncEngine.kt.
                 let cursorKey = relayCursorKey(relayUrl: cfg.relayUrl, relayToken: cfg.relayToken)
                 do {
                     let cursor = try store.relayFetchCursor(configKey: cursorKey)
