@@ -35,6 +35,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -467,6 +468,7 @@ private fun ScanViewfinderOverlay() {
 @Composable
 fun AddFriendScreen(
     onScanClick: () -> Unit,
+    onShowMyCardClick: () -> Unit,
     onImportText: (String) -> ImportFriendResult,
     onConfirmContact: (Contact) -> FriendAddedOutcome,
     onRequestSuggestion: (FriendSuggestion) -> Boolean,
@@ -613,6 +615,9 @@ fun AddFriendScreen(
             Text(stringResource(R.string.ui_add_directly), style = MaterialTheme.typography.titleMedium)
             Button(onClick = onScanClick, modifier = Modifier.fillMaxWidth()) {
                 Text(stringResource(R.string.ui_scan_qr_code))
+            }
+            OutlinedButton(onClick = onShowMyCardClick, modifier = Modifier.fillMaxWidth()) {
+                Text(stringResource(R.string.ui_show_my_friend_card))
             }
             OutlinedTextField(
                 value = pasted,
