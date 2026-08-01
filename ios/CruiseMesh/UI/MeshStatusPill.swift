@@ -2,8 +2,25 @@ import SwiftUI
 
 struct MeshStatusPill: View {
     @ObservedObject var runtime = MeshRuntimeStatus.shared
+    @ObservedObject private var connectivity = MeshConnectivityStatus.shared
     @State private var pulse = false
     let onTap: () -> Void
+
+    /// Set only when internet delivery has stopped in a way that needs the
+    /// person to act -- see `MeshStatusPillLogic`. Nil the rest of the time,
+    /// which is nearly always.
+    private var faultSuffix: String? {
+        MeshStatusPillLogic.faultSuffix(
+            runtimeState: runtime.state,
+            relayHealth: connectivity.relay,
+            service: InternetDeliveryService.of(RelayConfigStore.load())
+        )
+    }
+
+    private var pillText: String {
+        guard let faultSuffix else { return runtime.pillText }
+        return "\(runtime.pillText) · \(faultSuffix)"
+    }
 
     var body: some View {
         Button(action: onTap) {
@@ -13,7 +30,7 @@ struct MeshStatusPill: View {
                     .frame(width: 8, height: 8)
                     .scaleEffect(shouldPulse ? (pulse ? 1.22 : 0.84) : 1)
                     .opacity(shouldPulse ? (pulse ? 1 : 0.62) : 1)
-                Text(runtime.pillText)
+                Text(pillText)
                     .font(.caption.weight(.medium))
             }
             .padding(.horizontal, 12)
@@ -29,6 +46,9 @@ struct MeshStatusPill: View {
     }
 
     private var shouldPulse: Bool {
+        // A steady red reads as a state to deal with; a pulsing one reads as
+        // work in progress, which this is not.
+        if faultSuffix != nil { return false }
         switch runtime.state {
         case .starting, .meshing: return true
         case .stopped, .syncingViaRelay: return false
@@ -36,6 +56,10 @@ struct MeshStatusPill: View {
     }
 
     private var dotColor: Color {
+        // A fault the person must act on outranks the runtime colour: green
+        // beside "Cruise Pass expired" would undercut the words next to it.
+        // Red matches `PassIndicator.actionRequired`'s tint in Settings.
+        if faultSuffix != nil { return .red }
         switch runtime.state {
         case .stopped: return .gray
         case .starting: return .orange
