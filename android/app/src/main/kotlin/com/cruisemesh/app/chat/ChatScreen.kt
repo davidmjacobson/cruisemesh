@@ -79,6 +79,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -91,6 +92,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -1468,6 +1470,34 @@ fun Modifier.messageActions(
     onLongClick = onLongClick,
 )
 
+/**
+ * How far the reaction row is pulled back up under the bubble.
+ *
+ * A chip is a ~24dp pill, but [minimumInteractiveComponentSize] grows its
+ * touch target to 48dp, which hangs ~12dp of invisible padding above the
+ * pill. Laid out naively that padding reads as a gap, so the chips floated
+ * ~15dp below the bubble instead of tucking under its bottom edge. This
+ * cancels the top half of that padding; the pill itself is untouched and so
+ * is the 48dp target.
+ */
+private val REACTION_ROW_TUCK = 12.dp
+
+/**
+ * Pull the row up by [amount] *and* shrink the space it claims by the same
+ * amount, so tucking the chips under the bubble doesn't leave a dead band
+ * before the next message. The bottom edge of the content stays flush with
+ * the bottom of the reported bounds, so the whole touch target is still
+ * inside them; only transparent padding ends up above the row, overlapping
+ * the bubble's own (in-bounds, and therefore tap-winning) area.
+ */
+private fun Modifier.tuckUnderBubble(amount: Dp): Modifier = layout { measurable, constraints ->
+    val placeable = measurable.measure(constraints)
+    val tuck = amount.roundToPx().coerceAtMost(placeable.height)
+    layout(placeable.width, placeable.height - tuck) {
+        placeable.place(0, -tuck)
+    }
+}
+
 @Composable
 fun ReactionRow(
     reactions: List<ReactionSummary>,
@@ -1476,11 +1506,13 @@ fun ReactionRow(
 ) {
     Row(
         horizontalArrangement = Arrangement.spacedBy(4.dp),
-        modifier = Modifier.padding(
-            start = if (isOwn) 0.dp else 10.dp,
-            top = 3.dp,
-            end = if (isOwn) 10.dp else 0.dp,
-        ),
+        modifier = Modifier
+            .tuckUnderBubble(REACTION_ROW_TUCK)
+            .padding(
+                start = if (isOwn) 0.dp else 10.dp,
+                top = 3.dp,
+                end = if (isOwn) 10.dp else 0.dp,
+            ),
     ) {
         for (reaction in reactions) {
             Surface(
