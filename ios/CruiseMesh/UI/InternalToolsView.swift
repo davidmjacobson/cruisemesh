@@ -21,6 +21,14 @@ struct InternalToolsView: View {
                 TextField("Relay URL", text: $relayUrl)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                // The core drops a non-HTTPS URL on save rather than storing
+                // it. Say so here: this field writes on every keystroke, so
+                // without a message the value just never takes effect.
+                if relayUrlIsInsecure(value: relayUrl) {
+                    Text("Relay URL must start with https:// This one was not saved.")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
                 SecureField("Family token", text: $relayToken)
                 Text("When any family phone has internet, queued messages flush through this mailbox.")
                     .font(.caption)

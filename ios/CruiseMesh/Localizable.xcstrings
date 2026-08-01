@@ -1641,6 +1641,16 @@
         }
       }
     },
+    "Relay URL must start with https:// This one was not saved.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Relay URL must start with https:// This one was not saved."
+          }
+        }
+      }
+    },
     "Relay token": {
       "localizations": {
         "en": {

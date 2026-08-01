@@ -79,6 +79,24 @@ final class RelayClientTests: XCTestCase {
         XCTAssertEqual(normalizeRelayUrl("https://relay.example/"), "https://relay.example")
         XCTAssertEqual(normalizeRelayUrl("http://127.0.0.1:8080/"), "http://127.0.0.1:8080")
     }
+
+    func testNonLoopbackHTTPRelayURLIsRefusedInsteadOfStored() {
+        XCTAssertEqual(normalizeRelayUrl("http://relay.example"), "")
+        XCTAssertEqual(normalizeRelayUrl("http://192.168.1.50:8080"), "")
+        XCTAssertTrue(relayUrlIsInsecure(value: "http://relay.example"))
+        XCTAssertFalse(relayUrlIsInsecure(value: "https://relay.example"))
+        XCTAssertFalse(relayUrlIsInsecure(value: ""))
+    }
+
+    func testPostingToNonHTTPSRelayFailsWithLegibleError() {
+        let config = RelayConfig(relayUrl: "http://relay.example", relayToken: "family-token")
+        XCTAssertThrowsError(
+            try RelayClient.postOutboundEnvelope(config: config, envelope: sampleOutboundEnvelope())
+        ) { error in
+            XCTAssertEqual((error as NSError).localizedDescription, "Relay URL must use https")
+        }
+    }
+
     private var previousSession: URLSession!
 
     override func setUp() {

@@ -246,7 +246,16 @@ object RelayClient {
     }
 
     private fun buildUrl(baseUrl: String, pathAndQuery: String): String {
-        return "${normalizeRelayUrl(baseUrl)}$pathAndQuery"
+        // normalizeRelayUrl returns empty for a non-HTTPS base. Both callers
+        // filter those out well before here (RelayConfigStore.load and
+        // resolvedContactRelay both drop them), so this is the backstop that
+        // keeps a future third caller from concatenating a bare path and
+        // getting an opaque MalformedURLException instead of the reason.
+        val base = normalizeRelayUrl(baseUrl)
+        if (base.isEmpty()) {
+            throw IOException("Relay URL must use https")
+        }
+        return "$base$pathAndQuery"
     }
 
 }

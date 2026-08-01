@@ -13782,6 +13782,31 @@ public func makeRelaySetupCard(relayUrl: String, relayToken: String)throws  -> S
     )
 })
 }
+/**
+ * Canonicalize a relay base URL, **rejecting anything that would put the
+ * family's relay token on an unencrypted connection**.
+ *
+ * A bare host still gains an implicit `https://`, as it always did. What
+ * changed: an explicit non-HTTPS scheme no longer passes through. It returns
+ * the empty string instead, which every caller already reads as "no relay
+ * configured" — so the rejection fails closed at load, at save, at friend-card
+ * import, and at relay-update apply without any of them needing a new branch.
+ *
+ * This is the *only* chokepoint that sees every relay URL the app will ever
+ * use, from three sources with very different trust: a URL the user typed, a
+ * URL inside a scanned friend card, and a URL inside a kind-9 relay-change
+ * notice sealed by a contact. `validate_setup` has always required HTTPS for
+ * Cruise Pass setup cards; the other two paths reached
+ * [`RelayConfig`](crate::relay_setup) with whatever scheme they carried. Message
+ * bodies are sealed either way, so this is not about message secrecy — it is
+ * the relay token, the recipient hints, and the envelope sizes, which an
+ * `http://` endpoint hands to anyone on the path. Until now the only thing
+ * stopping that was each platform's cleartext-traffic default (Android
+ * `targetSdk` 36, iOS ATS), which is a manifest setting away from silently
+ * regressing.
+ *
+ * Plain `http://` survives for loopback only — see [`is_loopback_relay_host`].
+ */
 public func normalizeRelayUrl(value: String) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_normalize_relay_url(
@@ -14087,6 +14112,20 @@ public func relayTokenIsDeposit(token: String) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_relay_token_is_deposit(
         FfiConverterString.lower(token),$0
+    )
+})
+}
+/**
+ * True when a non-empty relay URL was rejected by [`normalize_relay_url`] for
+ * using an unencrypted transport. Purely for user-facing copy: the shells show
+ * "must start with https://" under a manually typed field instead of letting
+ * the value silently vanish. Remote sources (friend cards, relay-update
+ * notices) deliberately do not surface anything.
+ */
+public func relayUrlIsInsecure(value: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_url_is_insecure(
+        FfiConverterString.lower(value),$0
     )
 })
 }
@@ -14595,7 +14634,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_make_relay_setup_card() != 25797) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 27474) {
+    if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 19541) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_open_backup() != 7338) {
@@ -14671,6 +14710,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_token_is_deposit() != 47848) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_url_is_insecure() != 16245) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_poll_relay() != 54665) {

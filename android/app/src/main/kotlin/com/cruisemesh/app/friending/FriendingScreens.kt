@@ -93,6 +93,7 @@ import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.makeFriendCard
 import uniffi.cruisemesh_core.makeFriendLink
 import uniffi.cruisemesh_core.parseFriendText
+import uniffi.cruisemesh_core.relayUrlIsInsecure
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.pluralStringResource
 import com.cruisemesh.app.R
@@ -207,6 +208,10 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                 )
             }
             if (showAdvanced) {
+                // Core drops a non-HTTPS URL on save rather than storing it.
+                // Say so here: this field writes on every keystroke, so without
+                // a message the value the user typed just never takes effect.
+                val relayUrlInsecure = relayUrlIsInsecure(relayUrl)
                 OutlinedTextField(
                     value = relayUrl,
                     onValueChange = {
@@ -214,9 +219,17 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                         RelayConfigStore.save(context, relayUrl = it, relayToken = relayToken)
                     },
                     label = { Text(stringResource(R.string.ui_relay_url_optional)) },
+                    isError = relayUrlInsecure,
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                if (relayUrlInsecure) {
+                    Text(
+                        stringResource(R.string.ui_relay_url_must_be_https),
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
                 OutlinedTextField(
                     value = relayToken,
                     onValueChange = {

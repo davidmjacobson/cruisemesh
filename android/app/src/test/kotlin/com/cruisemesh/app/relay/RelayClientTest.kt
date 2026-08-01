@@ -5,6 +5,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.OutgoingReceiptEnvelope
@@ -20,6 +21,21 @@ class RelayClientTest {
         assertEquals("https://relay.example", normalizeRelayUrl(" relay.example/ "))
         assertEquals("https://relay.example", normalizeRelayUrl("https://relay.example/"))
         assertEquals("http://10.0.2.2:8080", normalizeRelayUrl("http://10.0.2.2:8080/"))
+    }
+
+    @Test
+    fun `a non-loopback http relay URL is refused instead of stored`() {
+        assertEquals("", normalizeRelayUrl("http://relay.example"))
+        assertEquals("", normalizeRelayUrl("http://192.168.1.50:8080"))
+    }
+
+    @Test
+    fun `posting to a non-https relay fails with a legible error`() {
+        val config = RelayConfig("http://relay.example", "family-token")
+        val error = assertThrows(IOException::class.java) {
+            RelayClient.postOutboundEnvelope(config, sampleOutboundEnvelope())
+        }
+        assertEquals("Relay URL must use https", error.message)
     }
 
     @Test

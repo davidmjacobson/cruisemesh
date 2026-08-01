@@ -301,16 +301,105 @@ fn relay_endpoint_from(url: Option<String>, token: Option<String>) -> Option<Rel
     }
 }
 
+/// Canonicalize a relay base URL, **rejecting anything that would put the
+/// family's relay token on an unencrypted connection**.
+///
+/// A bare host still gains an implicit `https://`, as it always did. What
+/// changed: an explicit non-HTTPS scheme no longer passes through. It returns
+/// the empty string instead, which every caller already reads as "no relay
+/// configured" — so the rejection fails closed at load, at save, at friend-card
+/// import, and at relay-update apply without any of them needing a new branch.
+///
+/// This is the *only* chokepoint that sees every relay URL the app will ever
+/// use, from three sources with very different trust: a URL the user typed, a
+/// URL inside a scanned friend card, and a URL inside a kind-9 relay-change
+/// notice sealed by a contact. `validate_setup` has always required HTTPS for
+/// Cruise Pass setup cards; the other two paths reached
+/// [`RelayConfig`](crate::relay_setup) with whatever scheme they carried. Message
+/// bodies are sealed either way, so this is not about message secrecy — it is
+/// the relay token, the recipient hints, and the envelope sizes, which an
+/// `http://` endpoint hands to anyone on the path. Until now the only thing
+/// stopping that was each platform's cleartext-traffic default (Android
+/// `targetSdk` 36, iOS ATS), which is a manifest setting away from silently
+/// regressing.
+///
+/// Plain `http://` survives for loopback only — see [`is_loopback_relay_host`].
 #[uniffi::export]
 pub fn normalize_relay_url(value: String) -> String {
     let trimmed = value.trim().trim_end_matches('/');
     if trimmed.is_empty() {
-        String::new()
-    } else if trimmed.contains("://") {
-        trimmed.to_string()
-    } else {
-        format!("https://{trimmed}")
+        return String::new();
     }
+    let candidate = match trimmed.split_once("://") {
+        // Lowercase the scheme so downstream `starts_with("https://")` checks
+        // (`relay_setup_is_official`, the WebSocket upgrade in both shells)
+        // can't be sidestepped by `HTTPS://`.
+        Some((scheme, rest)) => format!("{}://{}", scheme.to_ascii_lowercase(), rest),
+        None => format!("https://{trimmed}"),
+    };
+    if relay_url_transport_is_secure(&candidate) {
+        candidate
+    } else {
+        String::new()
+    }
+}
+
+/// True when a non-empty relay URL was rejected by [`normalize_relay_url`] for
+/// using an unencrypted transport. Purely for user-facing copy: the shells show
+/// "must start with https://" under a manually typed field instead of letting
+/// the value silently vanish. Remote sources (friend cards, relay-update
+/// notices) deliberately do not surface anything.
+#[uniffi::export]
+pub fn relay_url_is_insecure(value: String) -> bool {
+    !value.trim().trim_end_matches('/').is_empty() && normalize_relay_url(value).is_empty()
+}
+
+fn relay_url_transport_is_secure(url: &str) -> bool {
+    match url.split_once("://") {
+        Some(("https", _)) => true,
+        Some(("http", _)) => is_loopback_relay_host(relay_url_host(url)),
+        _ => false,
+    }
+}
+
+/// Extract the host from an already-schemed URL, the way a browser would:
+/// authority is everything up to the first `/`, `?`, or `#`; userinfo before
+/// the *last* `@` is discarded; a bracketed IPv6 literal keeps its brackets off.
+///
+/// Parsing this by hand rather than by prefix match is the whole point — a
+/// naive "contains 127.0.0.1" check would wave through
+/// `http://127.0.0.1@attacker.example/`, whose real host is `attacker.example`.
+fn relay_url_host(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    match host_port.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => host_port.rsplit_once(':').map_or(host_port, |(h, _)| h),
+    }
+}
+
+/// Hosts still reachable over plain `http://`: the loopback interface, and the
+/// Android emulator's alias for its host machine.
+///
+/// Running relayd locally over HTTP is how the relay is developed and how
+/// `tools/relay_admin.sh` talks to a box through an SSH tunnel, so forbidding
+/// it outright would trade a real workflow for no attacker-visible traffic —
+/// loopback never leaves the device. `10.0.2.2` is unroutable off an emulator,
+/// so honouring it costs nothing on a real phone; the existing
+/// `RelayClientTest` pins it.
+fn is_loopback_relay_host(host: &str) -> bool {
+    const ANDROID_EMULATOR_HOST: &str = "10.0.2.2";
+    let host = host.trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host == ANDROID_EMULATOR_HOST
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Maximum response body that either mobile shell may accumulate before
@@ -678,6 +767,90 @@ mod tests {
             normalize_relay_url("http://127.0.0.1:8080/".into()),
             "http://127.0.0.1:8080"
         );
+    }
+
+    #[test]
+    fn plain_http_relay_urls_are_rejected() {
+        for insecure in [
+            "http://relay.example",
+            "http://relay.example:8080/",
+            "http://192.168.1.50:8080",
+            "http://10.0.0.7",
+            // Loopback in the userinfo, attacker in the authority: the reason
+            // the host is parsed instead of substring-matched.
+            "http://127.0.0.1@attacker.example/",
+            "http://localhost.attacker.example",
+            "ws://relay.example",
+            "ftp://relay.example",
+        ] {
+            assert_eq!(
+                normalize_relay_url(insecure.into()),
+                "",
+                "expected {insecure} to be rejected"
+            );
+            assert!(relay_url_is_insecure(insecure.into()));
+        }
+    }
+
+    #[test]
+    fn https_and_loopback_http_survive() {
+        for allowed in [
+            "https://relay.example",
+            "https://relay.example:8443/",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://127.5.5.5",
+            "http://[::1]:8080",
+            // The emulator's alias for its host machine, pinned by
+            // RelayClientTest and unroutable off an emulator.
+            "http://10.0.2.2:8080",
+        ] {
+            assert!(
+                !normalize_relay_url(allowed.into()).is_empty(),
+                "expected {allowed} to be accepted"
+            );
+            assert!(!relay_url_is_insecure(allowed.into()));
+        }
+    }
+
+    #[test]
+    fn scheme_case_is_normalized_so_prefix_checks_hold() {
+        assert_eq!(
+            normalize_relay_url("HTTPS://Relay.Example/".into()),
+            "https://Relay.Example"
+        );
+        assert_eq!(
+            normalize_relay_url("HtTp://relay.example".into()),
+            "",
+            "an uppercase scheme must not bypass the HTTPS gate"
+        );
+    }
+
+    #[test]
+    fn empty_input_is_not_reported_as_insecure() {
+        assert!(!relay_url_is_insecure(String::new()));
+        assert!(!relay_url_is_insecure("   ".into()));
+        assert!(!relay_url_is_insecure("/".into()));
+    }
+
+    #[test]
+    fn insecure_contact_endpoints_resolve_to_none() {
+        // A friend card or a kind-9 relay-change notice naming an http:// host
+        // must not become a usable endpoint just because it arrived sealed.
+        assert_eq!(
+            relay_endpoint_from(
+                Some("http://relay.example".into()),
+                Some("cmdep1-token".into())
+            ),
+            None
+        );
+        assert!(resolved_contact_relay(
+            Some("http://contact.relay.example".into()),
+            Some("cmdep1-token".into()),
+            None,
+            None,
+        )
+        .is_none());
     }
 
     /// Golden vector shared verbatim with relayd
