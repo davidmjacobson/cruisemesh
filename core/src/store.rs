@@ -251,6 +251,23 @@ pub struct ContactRelayRejection {
     pub rejected_at_ms: i64,
 }
 
+/// How far a relay mailbox has been walked, and when it was last walked in
+/// full. See [`crate::relay_cursor`] for what the two numbers mean and the
+/// rules that move them.
+///
+/// An unknown mailbox reads as `{ after_id: 0, last_sweep_at_ms: 0 }` — walk
+/// everything, and a sweep is due. That is the correct answer for a first
+/// run, for a rotated credential, and for a restored backup alike, so no
+/// caller needs to special-case any of them.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct RelayFetchCursor {
+    /// The highest relay row id whose page was fully processed. A normal
+    /// pass resumes its `after=` here.
+    pub after_id: i64,
+    /// When a walk from 0 last completed for this mailbox, or 0 if never.
+    pub last_sweep_at_ms: i64,
+}
+
 /// The name to show for a contact: the local nickname when the user has set a
 /// non-blank one (T16), otherwise the card `name`. Kept in core so both shells
 /// resolve identically everywhere a contact name is displayed.
@@ -710,6 +727,25 @@ impl MessageStore {
     /// Writes a transactionally consistent standalone SQLite snapshot.
     /// The destination must not already exist; callers should use a unique
     /// temporary path and remove it after reading the backup bytes.
+    ///
+    /// ## Relay fetch cursors do not ride the backup
+    ///
+    /// Everything else in the store is history and should come back exactly
+    /// as it was. A relay fetch cursor is not history — it is a claim about
+    /// the *current* state of a remote mailbox, and a backup is the one place
+    /// that claim can be carried somewhere it was never true. Restore onto a
+    /// second phone, restore months later, or restore after the relay box was
+    /// rebuilt (its `families` table emptied and its row ids restarted at 1,
+    /// which has happened in this project's own deployment) and an inherited
+    /// frontier sits above every row that now exists. The phone would then
+    /// fetch nothing, forever, and report perfect health while doing it —
+    /// silent non-delivery, the worst failure this app can have.
+    ///
+    /// So the snapshot is scrubbed of them before it is sealed. The restored
+    /// device re-walks each mailbox once from 0 and re-establishes its own
+    /// frontier from evidence. That costs one full walk and nothing else:
+    /// everything already delivered is recognised and dropped by the seen-id
+    /// filter on the way back in.
     pub fn backup_to(&self, destination: String) -> Result<(), CoreError> {
         let destination = std::path::Path::new(destination.trim());
         if !destination.is_absolute() {
@@ -734,6 +770,15 @@ impl MessageStore {
         let conn = lock_conn(&self.conn);
         conn.execute("VACUUM INTO ?1", params![destination.to_string_lossy()])
             .map_err(store_err)?;
+        // See the doc comment: the snapshot must not carry this device's idea
+        // of where each relay mailbox got to. Done on the copy rather than by
+        // deleting from the live store, so taking a backup never costs the
+        // running phone its frontier.
+        let snapshot = Connection::open(destination).map_err(store_err)?;
+        snapshot
+            .execute("DELETE FROM relay_fetch_cursors", [])
+            .map_err(store_err)?;
+        drop(snapshot);
         Ok(())
     }
 
@@ -2228,6 +2273,120 @@ impl MessageStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(store_err)?;
         Ok(rows)
+    }
+
+    /// Where the walk of one relay mailbox got to (see
+    /// [`crate::relay_cursor`]). An unknown or empty `config_key` reads as
+    /// "nothing remembered": start at 0, sweep is due.
+    pub fn relay_fetch_cursor(&self, config_key: String) -> Result<RelayFetchCursor, CoreError> {
+        if config_key.is_empty() {
+            return Ok(RelayFetchCursor {
+                after_id: 0,
+                last_sweep_at_ms: 0,
+            });
+        }
+        let conn = lock_conn(&self.conn);
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT after_id, last_sweep_at FROM relay_fetch_cursors WHERE config_key = ?1",
+                params![config_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let (after_id, last_sweep_at_ms) = row.unwrap_or((0, 0));
+        Ok(RelayFetchCursor {
+            after_id,
+            last_sweep_at_ms,
+        })
+    }
+
+    /// Persist the frontier after one fetch page, and return what is now
+    /// remembered.
+    ///
+    /// The decision itself is [`crate::relay_cursor_advance`] — the store only
+    /// reads, applies it, and writes — so the safety rule (never move past a
+    /// page that did not reach a terminal disposition for every envelope, and
+    /// never move backwards) is stated once, in policy, and tested there
+    /// rather than through SQL.
+    ///
+    /// A blank `config_key` (an endpoint with no URL or no token) persists
+    /// nothing: such a config always walks from 0 rather than sharing one row
+    /// with every other incomplete config.
+    pub fn advance_relay_fetch_cursor(
+        &self,
+        config_key: String,
+        page_next_cursor: i64,
+        page_fully_processed: bool,
+    ) -> Result<i64, CoreError> {
+        if config_key.is_empty() {
+            return Ok(0);
+        }
+        let conn = lock_conn(&self.conn);
+        let persisted: i64 = conn
+            .query_row(
+                "SELECT after_id FROM relay_fetch_cursors WHERE config_key = ?1",
+                params![config_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?
+            .unwrap_or(0);
+        let advanced =
+            crate::relay_cursor_advance(persisted, page_next_cursor, page_fully_processed);
+        if advanced == persisted {
+            return Ok(persisted);
+        }
+        conn.execute(
+            "INSERT INTO relay_fetch_cursors (config_key, after_id, last_sweep_at)
+             VALUES (?1, ?2, 0)
+             ON CONFLICT(config_key) DO UPDATE SET after_id = ?2",
+            params![config_key, advanced],
+        )
+        .map_err(store_err)?;
+        Ok(advanced)
+    }
+
+    /// Record that a walk from 0 completed for this mailbox, restarting its
+    /// sweep interval.
+    ///
+    /// Called only when the walk actually reached the end of the mailbox. A
+    /// sweep cut short — the service stopped, internet went away, the relay
+    /// errored — deliberately leaves the timestamp alone, so the next pass
+    /// tries again instead of believing a partial re-walk was a full one.
+    pub fn note_relay_sweep_completed(
+        &self,
+        config_key: String,
+        now_ms: i64,
+    ) -> Result<(), CoreError> {
+        if config_key.is_empty() {
+            return Ok(());
+        }
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "INSERT INTO relay_fetch_cursors (config_key, after_id, last_sweep_at)
+             VALUES (?1, 0, ?2)
+             ON CONFLICT(config_key) DO UPDATE SET last_sweep_at = ?2",
+            params![config_key, now_ms],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Forget every remembered frontier, so the next pass re-walks each
+    /// mailbox from the beginning.
+    ///
+    /// This is the reset a restored `.cmbak` needs — [`Self::backup_to`]
+    /// applies it to the snapshot it writes, so a restore never inherits
+    /// another device's (or another relay generation's) idea of where the
+    /// mailbox got to. Re-walking once is cheap and self-correcting:
+    /// everything already delivered is deduped on the way back in by the
+    /// seen-id gossip filter.
+    pub fn clear_relay_fetch_cursors(&self) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute("DELETE FROM relay_fetch_cursors", [])
+            .map_err(store_err)?;
+        Ok(())
     }
 
     /// Set (or clear) the local nickname for a contact (T16). A `None` or
@@ -4160,6 +4319,17 @@ CREATE TABLE IF NOT EXISTS peer_connection_summary (
     last_seen_at_ms         INTEGER,
     last_delivered_at_ms    INTEGER,
     PRIMARY KEY(user_id, transport)
+);
+
+-- How far the relay-mailbox walk has got, per mailbox. `config_key` is
+-- `relay_cursor_key(url, token)` -- a hash, so no relay credential is stored
+-- here and a rotated token simply has no row (which reads as cursor 0). See
+-- `crate::relay_cursor` for the policy and `backup_to` for why these rows
+-- deliberately do not ride a `.cmbak`.
+CREATE TABLE IF NOT EXISTS relay_fetch_cursors (
+    config_key    TEXT PRIMARY KEY,
+    after_id      INTEGER NOT NULL DEFAULT 0,
+    last_sweep_at INTEGER NOT NULL DEFAULT 0
 );
 ";
 
@@ -6282,6 +6452,219 @@ mod tests {
             store.contact_avatar_epoch(b"alice-id".to_vec()).unwrap(),
             123
         );
+    }
+
+    // -- relay fetch cursors (the frontier that stops re-walking the
+    //    whole mailbox on every pass) -----------------------------------
+
+    fn cursor_key() -> String {
+        crate::relay_cursor_key("https://relay.example".into(), "member-token".into())
+    }
+
+    #[test]
+    fn an_unknown_mailbox_starts_at_zero_with_a_sweep_due() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let cursor = store.relay_fetch_cursor(cursor_key()).unwrap();
+        assert_eq!(cursor.after_id, 0);
+        assert_eq!(cursor.last_sweep_at_ms, 0);
+        assert!(crate::relay_sweep_due(
+            true,
+            cursor.last_sweep_at_ms,
+            10_000
+        ));
+    }
+
+    #[test]
+    fn a_fully_processed_page_advances_the_persisted_frontier() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        assert_eq!(
+            store
+                .advance_relay_fetch_cursor(key.clone(), 256, true)
+                .unwrap(),
+            256
+        );
+        assert_eq!(store.relay_fetch_cursor(key.clone()).unwrap().after_id, 256);
+        assert_eq!(
+            store
+                .advance_relay_fetch_cursor(key.clone(), 512, true)
+                .unwrap(),
+            512
+        );
+        assert_eq!(store.relay_fetch_cursor(key).unwrap().after_id, 512);
+    }
+
+    #[test]
+    fn a_page_that_failed_mid_way_never_advances_the_persisted_frontier() {
+        // The safety rule: an envelope that did not reach a terminal
+        // disposition must be presented again next pass, which can only
+        // happen if nothing was persisted past it.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        store
+            .advance_relay_fetch_cursor(key.clone(), 256, true)
+            .unwrap();
+        assert_eq!(
+            store
+                .advance_relay_fetch_cursor(key.clone(), 512, false)
+                .unwrap(),
+            256
+        );
+        assert_eq!(store.relay_fetch_cursor(key).unwrap().after_id, 256);
+    }
+
+    #[test]
+    fn a_sweep_re_reading_old_pages_does_not_rewind_the_frontier() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        store
+            .advance_relay_fetch_cursor(key.clone(), 9_000, true)
+            .unwrap();
+        // A sweep walks from 0 again; its early pages report low cursors.
+        for page_cursor in [256, 512, 8_000] {
+            store
+                .advance_relay_fetch_cursor(key.clone(), page_cursor, true)
+                .unwrap();
+        }
+        assert_eq!(
+            store.relay_fetch_cursor(key.clone()).unwrap().after_id,
+            9_000
+        );
+        // ...and it still moves once the sweep passes the old frontier.
+        store
+            .advance_relay_fetch_cursor(key.clone(), 9_500, true)
+            .unwrap();
+        assert_eq!(store.relay_fetch_cursor(key).unwrap().after_id, 9_500);
+    }
+
+    #[test]
+    fn a_rotated_token_or_a_moved_host_reads_as_a_fresh_mailbox() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .advance_relay_fetch_cursor(cursor_key(), 9_000, true)
+            .unwrap();
+        let rotated = crate::relay_cursor_key("https://relay.example".into(), "new-token".into());
+        let moved = crate::relay_cursor_key("https://other.example".into(), "member-token".into());
+        for key in [rotated, moved] {
+            let cursor = store.relay_fetch_cursor(key).unwrap();
+            assert_eq!(cursor.after_id, 0, "an unknown key must start over");
+            assert_eq!(cursor.last_sweep_at_ms, 0);
+        }
+        // The original mailbox is untouched by either.
+        assert_eq!(
+            store.relay_fetch_cursor(cursor_key()).unwrap().after_id,
+            9_000
+        );
+    }
+
+    #[test]
+    fn an_endpoint_with_no_key_persists_nothing() {
+        // A config missing a URL or a token has no stable identity; it must
+        // not share one row with every other incomplete config.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert_eq!(
+            store
+                .advance_relay_fetch_cursor(String::new(), 9_000, true)
+                .unwrap(),
+            0
+        );
+        store
+            .note_relay_sweep_completed(String::new(), 5_000)
+            .unwrap();
+        let cursor = store.relay_fetch_cursor(String::new()).unwrap();
+        assert_eq!(cursor.after_id, 0);
+        assert_eq!(cursor.last_sweep_at_ms, 0);
+    }
+
+    #[test]
+    fn a_completed_sweep_restarts_the_sweep_interval_without_touching_the_frontier() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        store
+            .advance_relay_fetch_cursor(key.clone(), 9_000, true)
+            .unwrap();
+        store
+            .note_relay_sweep_completed(key.clone(), 1_000_000)
+            .unwrap();
+        let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
+        assert_eq!(cursor.after_id, 9_000, "a sweep must not cost the frontier");
+        assert_eq!(cursor.last_sweep_at_ms, 1_000_000);
+        assert!(!crate::relay_sweep_due(
+            true,
+            cursor.last_sweep_at_ms,
+            1_000_001
+        ));
+        assert!(crate::relay_sweep_due(
+            true,
+            cursor.last_sweep_at_ms,
+            1_000_000 + crate::RELAY_SWEEP_INTERVAL_MS
+        ));
+        // Recording a sweep for a mailbox with no frontier yet is fine too.
+        let fresh = crate::relay_cursor_key("https://fresh.example".into(), "tok".into());
+        store.note_relay_sweep_completed(fresh.clone(), 7).unwrap();
+        assert_eq!(store.relay_fetch_cursor(fresh).unwrap().after_id, 0);
+    }
+
+    #[test]
+    fn clearing_cursors_makes_the_next_pass_re_walk_every_mailbox() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let other = crate::relay_cursor_key("https://other.example".into(), "tok".into());
+        store
+            .advance_relay_fetch_cursor(cursor_key(), 9_000, true)
+            .unwrap();
+        store
+            .advance_relay_fetch_cursor(other.clone(), 4_000, true)
+            .unwrap();
+        store.clear_relay_fetch_cursors().unwrap();
+        assert_eq!(store.relay_fetch_cursor(cursor_key()).unwrap().after_id, 0);
+        assert_eq!(store.relay_fetch_cursor(other).unwrap().after_id, 0);
+    }
+
+    #[test]
+    fn a_backup_snapshot_carries_no_relay_fetch_cursor() {
+        // A cursor is a claim about a *remote* mailbox's current state, and a
+        // backup is the one place that claim travels somewhere it was never
+        // true (another phone, months later, or a relay rebuilt with its row
+        // ids restarted at 1). Inheriting one there means fetching nothing,
+        // forever, while reporting perfect health.
+        let dir = std::env::temp_dir().join(format!(
+            "cruisemesh-cursor-backup-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snapshot.sqlite");
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_message(msg(b"chat", b"alice", 1, "hello"))
+            .unwrap();
+        store
+            .advance_relay_fetch_cursor(cursor_key(), 9_000, true)
+            .unwrap();
+        store
+            .note_relay_sweep_completed(cursor_key(), 1_000_000)
+            .unwrap();
+
+        store.backup_to(path.to_string_lossy().to_string()).unwrap();
+        let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
+        // History survives...
+        assert_eq!(
+            restored.messages_for_chat(b"chat".to_vec()).unwrap().len(),
+            1
+        );
+        // ...the frontier does not, so the restored phone re-walks once.
+        let cursor = restored.relay_fetch_cursor(cursor_key()).unwrap();
+        assert_eq!(cursor.after_id, 0);
+        assert_eq!(cursor.last_sweep_at_ms, 0);
+        // And taking the backup did not cost the live store its frontier.
+        assert_eq!(
+            store.relay_fetch_cursor(cursor_key()).unwrap().after_id,
+            9_000
+        );
+        drop(restored);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

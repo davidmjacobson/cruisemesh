@@ -6,8 +6,50 @@ use serde::{Deserialize, Serialize};
 use crate::CoreError;
 
 const RELAY_MAX_SEALED_BYTES: usize = 512 * 1024;
-const RELAY_FETCH_MAX_ROWS: usize = 16;
-const RELAY_FETCH_MAX_DECODED_BYTES: usize = RELAY_FETCH_MAX_ROWS * RELAY_MAX_SEALED_BYTES;
+
+/// Rows per fetch page.
+///
+/// This used to be 16, sized against the theoretical worst case of a page
+/// entirely made of maximum-size sealed rows (16 × 512 KiB = 8 MiB). That
+/// bound was real but it was not the *binding* one — the response body cap
+/// below already refuses anything over 12 MiB before a single byte is
+/// decoded — and it made pagination the dominant cost of every sync pass.
+///
+/// A relay mailbox legitimately accumulates rows that are never acked (a
+/// proxy-fetched `CARRIED` copy stays as the durable fallback; a legacy
+/// group-hint row is never acked at all), relayd returns rows in ascending
+/// id order, and a *fresh* message therefore has the highest id and is
+/// fetched last. At 16 rows a page, a mailbox observed in the field at ~29k
+/// rows needed on the order of 1,800 sequential HTTP round trips before the
+/// newest message was even looked at, and passes routinely timed out before
+/// finishing. Typical sealed rows are around a kilobyte, not half a megabyte,
+/// so 16 was buying a memory bound that the body cap already guaranteed and
+/// paying for it in minutes of delivery latency.
+///
+/// 256 keeps every existing safety property (see
+/// [`RELAY_FETCH_MAX_DECODED_BYTES`]) and cuts the page count by 16×.
+/// relayd's own ceiling is 500, so the deployed server accepts this without
+/// any change; a server that clamps lower is handled by the client's
+/// termination rule (see [`crate::relay_fetch_walk_continues`]), which ends a
+/// walk on an *empty* page rather than on a short one.
+const RELAY_FETCH_MAX_ROWS: usize = 256;
+
+/// Ceiling on the decoded (post-base64) sealed bytes one fetch page may
+/// materialize.
+///
+/// Pinned to the response body cap rather than to `rows × max row size`,
+/// because with 256 rows the latter is no longer a bound at all (256 × 512
+/// KiB = 128 MiB, an order of magnitude above anything the transport would
+/// hand us). The body cap *is* the real bound and it is the tighter one:
+/// base64url expands by 4/3, so a body that passes
+/// [`RELAY_MAX_RESPONSE_BODY_BYTES`] can carry at most ~9 MiB of decoded
+/// payload no matter how the rows are arranged. Keeping the explicit running
+/// check is defense in depth — [`relay_decode_fetch_page`] enforces the body
+/// cap itself, at its own boundary, so a caller outside the first-party
+/// shells cannot skip it, and this second check then holds even if that ever
+/// changed.
+const RELAY_FETCH_MAX_DECODED_BYTES: usize = RELAY_MAX_RESPONSE_BODY_BYTES;
+
 const RELAY_MAX_RESPONSE_BODY_BYTES: usize = 12 * 1024 * 1024;
 const RELAY_MAX_PRESENCE_ROWS: usize = 256;
 
@@ -410,8 +452,12 @@ pub fn relay_max_response_bytes() -> u32 {
     RELAY_MAX_RESPONSE_BODY_BYTES as u32
 }
 
-/// Fetch pages stay deliberately small because every sealed row is controlled
-/// by the relay until it has passed the authenticated envelope ingest path.
+/// Rows a shell asks for per fetch page — see [`RELAY_FETCH_MAX_ROWS`] for
+/// why this is 256 and what still bounds the memory a page can cost.
+///
+/// A shell must not treat a *short* page as end-of-mailbox: a server may
+/// clamp `limit=` below this. [`crate::relay_fetch_walk_continues`] owns that
+/// rule for both shells.
 #[uniffi::export]
 pub fn relay_fetch_batch_limit() -> u32 {
     RELAY_FETCH_MAX_ROWS as u32
@@ -1003,11 +1049,104 @@ mod tests {
 
     #[test]
     fn exposes_bounded_fetch_policy() {
-        assert_eq!(relay_fetch_batch_limit(), 16);
+        assert_eq!(relay_fetch_batch_limit(), 256);
         assert_eq!(relay_max_response_bytes(), 12 * 1024 * 1024);
-        assert!(relay_build_fetch_path(vec![], 0, 16).is_ok());
-        assert!(relay_build_fetch_path(vec![], 0, 17).is_err());
+        assert!(relay_build_fetch_path(vec![], 0, 256).is_ok());
+        assert!(relay_build_fetch_path(vec![], 0, 257).is_err());
+        assert!(relay_build_fetch_path(vec![], 0, 0).is_err());
         assert!(relay_build_fetch_path(vec![], -1, 1).is_err());
+    }
+
+    /// The batch limit and the decode bound have to stay consistent with each
+    /// other and with the transport cap, or one of them silently stops being
+    /// a bound. Pinned here so raising the row count again cannot quietly
+    /// leave the memory ceiling behind.
+    #[test]
+    fn the_batch_limit_and_the_decode_bound_agree_with_the_transport_cap() {
+        // The decode bound must never exceed the body cap: base64url expands
+        // by 4/3, so a body under the cap can never decode to more than the
+        // cap's worth of payload, and a decode bound above it would be dead
+        // code pretending to be a limit.
+        assert!(RELAY_FETCH_MAX_DECODED_BYTES <= RELAY_MAX_RESPONSE_BODY_BYTES);
+        // A single maximum-size row must still fit, or a legitimate large
+        // attachment chunk could never be fetched at all.
+        assert!(RELAY_MAX_SEALED_BYTES <= RELAY_FETCH_MAX_DECODED_BYTES);
+        // relayd's MAX_FETCH_LIMIT is 500 (relayd/src/lib.rs); asking for
+        // more than the deployed server accepts would rely on its clamp.
+        assert!(RELAY_FETCH_MAX_ROWS <= 500);
+        assert_eq!(relay_fetch_batch_limit() as usize, RELAY_FETCH_MAX_ROWS);
+    }
+
+    #[test]
+    fn a_page_is_still_bounded_by_the_body_cap_after_the_row_count_rose() {
+        // 256 rows of the maximum sealed size would be 128 MiB decoded, far
+        // above anything the decoder may materialize. The body cap fires
+        // first, before any JSON is parsed.
+        let body = vec![b' '; RELAY_MAX_RESPONSE_BODY_BYTES + 1];
+        assert!(relay_decode_fetch_page(body).is_err());
+
+        // And the running decode check is still wired up: a page whose rows
+        // sum past the bound is rejected even though each row is legal.
+        let encoded_msg_id = b64(&[1; 16]);
+        let encoded_hint = b64(&[2; 8]);
+        let big_row = b64(&vec![3; RELAY_MAX_SEALED_BYTES]);
+        let rows: Vec<_> = (1..=32)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id, "msg_id": encoded_msg_id, "hop_ttl": 7,
+                    "recipient_hint": encoded_hint, "sealed": big_row, "expiry_ms": 9
+                })
+            })
+            .collect();
+        let body =
+            serde_json::to_vec(&serde_json::json!({"envelopes": rows, "next_cursor": 32})).unwrap();
+        // 32 × 512 KiB = 16 MiB of payload, which cannot survive either
+        // check: the encoded body is already past the transport cap.
+        assert!(relay_decode_fetch_page(body).is_err());
+    }
+
+    #[test]
+    fn a_full_page_of_typical_rows_decodes() {
+        // The realistic case the raise exists for: 256 ordinary ~1 KB rows
+        // in one page, well inside every bound.
+        let encoded_msg_id = b64(&[1; 16]);
+        let encoded_hint = b64(&[2; 8]);
+        let sealed = b64(&vec![3; 1024]);
+        let rows: Vec<_> = (1..=RELAY_FETCH_MAX_ROWS as i64)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id, "msg_id": encoded_msg_id, "hop_ttl": 7,
+                    "recipient_hint": encoded_hint, "sealed": sealed, "expiry_ms": 9
+                })
+            })
+            .collect();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "envelopes": rows, "next_cursor": RELAY_FETCH_MAX_ROWS as i64
+        }))
+        .unwrap();
+        let page = relay_decode_fetch_page(body).unwrap();
+        assert_eq!(page.envelopes.len(), RELAY_FETCH_MAX_ROWS);
+        assert_eq!(page.next_cursor, RELAY_FETCH_MAX_ROWS as i64);
+    }
+
+    #[test]
+    fn a_page_with_more_rows_than_the_limit_is_still_rejected() {
+        let encoded_msg_id = b64(&[1; 16]);
+        let encoded_hint = b64(&[2; 8]);
+        let sealed = b64(&[3]);
+        let rows: Vec<_> = (1..=RELAY_FETCH_MAX_ROWS as i64 + 1)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id, "msg_id": encoded_msg_id, "hop_ttl": 7,
+                    "recipient_hint": encoded_hint, "sealed": sealed, "expiry_ms": 9
+                })
+            })
+            .collect();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "envelopes": rows, "next_cursor": RELAY_FETCH_MAX_ROWS as i64 + 1
+        }))
+        .unwrap();
+        assert!(relay_decode_fetch_page(body).is_err());
     }
 
     #[test]

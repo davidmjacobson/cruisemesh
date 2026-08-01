@@ -69,7 +69,7 @@ final class RelayPushClient: NSObject {
     private var urlSession: URLSession?
     private var webSocketTask: URLSessionWebSocketTask?
     private var desiredConfig: RelayConfig?
-    private var hintsProvider: (() -> [Data])?
+    private var hintsProvider: (() -> RelayPushSubscription)?
     private var stopped = true
     private var reconnectWorkItem: DispatchWorkItem?
 
@@ -82,7 +82,7 @@ final class RelayPushClient: NSObject {
     /// subscribed `hints=` set from `hintsProvider` on every (re)connect. Safe
     /// to call repeatedly (e.g. from every path-update callback); a no-op if
     /// already started against an equal `config`.
-    func start(config: RelayConfig, hintsProvider: @escaping () -> [Data]) {
+    func start(config: RelayConfig, hintsProvider: @escaping () -> RelayPushSubscription) {
         queue.async { [self] in
             if !stopped, desiredConfig == config { return }
             stopLocked()
@@ -113,7 +113,8 @@ final class RelayPushClient: NSObject {
 
     private func connectLocked() {
         guard !stopped, let config = desiredConfig else { return }
-        let hints = hintsProvider?() ?? []
+        let subscription = hintsProvider?() ?? RelayPushSubscription(hints: [], afterId: 0)
+        let hints = subscription.hints
         guard !hints.isEmpty else {
             // Nothing addressed to us yet (e.g. no contacts/groups). relayd
             // rejects a hint-less subscribe with 400; just retry once hints
@@ -121,7 +122,11 @@ final class RelayPushClient: NSObject {
             scheduleReconnectLocked()
             return
         }
-        guard let url = Self.buildWebSocketURL(config: config, hints: hints) else {
+        guard let url = Self.buildWebSocketURL(
+            config: config,
+            hints: hints,
+            afterId: subscription.afterId
+        ) else {
             Self.log.warning("Failed to build relay push URL")
             scheduleReconnectLocked()
             return
@@ -176,7 +181,17 @@ final class RelayPushClient: NSObject {
         queue.asyncAfter(deadline: .now() + .milliseconds(Int(backoff.nextDelayMs())), execute: item)
     }
 
-    private static func buildWebSocketURL(config: RelayConfig, hints: [Data]) -> URL? {
+    /// `afterId` used to be hardcoded to 0, which asked relayd to replay the
+    /// whole mailbox as push frames on every reconnect -- frames this class
+    /// discards one by one, because it deliberately ignores frame content
+    /// (see the class doc). Passing the poll path's persisted frontier makes
+    /// a reconnect cost what it should: the mail that actually arrived since.
+    /// Correctness is unchanged either way, since a frame is only a doorbell.
+    ///
+    /// A negative cursor is clamped to 0: relayd rejects a negative `after`,
+    /// and failing the doorbell over a corrupt local value would be a worse
+    /// trade than replaying.
+    static func buildWebSocketURL(config: RelayConfig, hints: [Data], afterId: Int64) -> URL? {
         let encodedHints = hints.map(base64URLEncode).joined(separator: ",")
         // Empty means the core refused the URL (non-HTTPS). A bare
         // "/ws?..." is a relative URL the socket cannot open, so fail to
@@ -184,7 +199,7 @@ final class RelayPushClient: NSObject {
         let normalized = normalizeRelayUrl(config.relayUrl)
         guard !normalized.isEmpty else { return nil }
         let wsBase = toWebSocketScheme(normalized)
-        return URL(string: "\(wsBase)/ws?hints=\(encodedHints)&after=0")
+        return URL(string: "\(wsBase)/ws?hints=\(encodedHints)&after=\(max(0, afterId))")
     }
 
     private static func toWebSocketScheme(_ normalized: String) -> String {

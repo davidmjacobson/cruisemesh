@@ -428,6 +428,20 @@ A deliberately dumb mailbox:
 - Phones poll it whenever internet appears and also push all queued outbound —
   including envelopes they're muling for family members, which is how one phone with
   a Wi-Fi package uplinks the whole family.
+- **Clients keep a fetch frontier, and sweep occasionally.** Most rows in a
+  real mailbox are deliberately never acked — a proxy-fetched copy stays as the
+  durable fallback, a legacy group-hint row is never acked at all — so the
+  mailbox grows and, because rows come back in ascending id order, the newest
+  message is the *last* one a walk from 0 reaches. A phone therefore remembers
+  how far it got (per mailbox, keyed by a hash of URL + token, in its own
+  store) and resumes there. The frontier only moves past a page whose envelopes
+  all reached a terminal disposition and whose acks landed — the ack-safety
+  rule applied to *skipping* rather than to deleting. At cold start and every
+  six hours a pass walks from 0 again, so the rows that are supposed to stay
+  put remain re-discoverable and a rebuilt relay (row ids restarting at 1)
+  heals itself. The frontier is local-only and is stripped from `.cmbak`
+  backups: it is a claim about a remote mailbox's *current* state, and a
+  restore is exactly where that claim stops being true.
 
 ### 9.1 Mailbox routing (which relay serves which envelope)
 

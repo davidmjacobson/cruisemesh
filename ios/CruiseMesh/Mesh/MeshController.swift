@@ -2289,8 +2289,9 @@ final class MeshController: ObservableObject {
             return
         }
         let ownUserId = identity.userId
+        let subscribeConfig = config
         relayPushClient.start(config: config) {
-            relayPushHints(ownUserId: ownUserId)
+            relayPushSubscription(ownUserId: ownUserId, config: subscribeConfig)
         }
     }
 
@@ -2756,8 +2757,50 @@ final class MeshController: ObservableObject {
                 // `.carried`, never `.consumed`, so coreRelayAckIdsWithConsumed
                 // keeps the DTN ack invariant exactly as before: a carried relay
                 // copy is never acked away.
+                //
+                // Where the walk starts (the persistent frontier). This used
+                // to begin every pass at `afterId = 0` and page to the end.
+                // The un-acked rows above are left on the relay by design, so
+                // a real mailbox only grows, relayd returns rows in ascending
+                // id order, and a *fresh* message therefore has the highest id
+                // and was fetched last -- after every stale row ahead of it.
+                // In the field that reached ~29k rows at 16 rows a page:
+                // thousands of sequential round trips before the newest
+                // message was looked at, and passes that died on a timeout
+                // before finishing. Messages took minutes to arrive.
+                //
+                // A pass now resumes from the frontier persisted for this
+                // mailbox and advances it through `advanceRelayFetchCursor`,
+                // which never moves past a page that failed to fully process
+                // or to land its acks, and never moves backwards -- the mirror
+                // of the DTN ack-safety rule applied to skipping. Occasionally
+                // (first pass of a process, then every `relaySweepIntervalMs`)
+                // it sweeps the whole mailbox from 0 instead, so the rows that
+                // are supposed to stay there remain re-discoverable and a
+                // rebuilt relay heals itself. Mirrors RelaySyncEngine.kt.
+                let cursorKey = relayCursorKey(relayUrl: cfg.relayUrl, relayToken: cfg.relayToken)
                 do {
-                    var afterId: Int64 = 0
+                    let cursor = try store.relayFetchCursor(configKey: cursorKey)
+                    let sweeping = relaySweepDue(
+                        sweptThisSession: RelaySweepSession.shared.hasSwept(cursorKey),
+                        lastSweepAtMs: cursor.lastSweepAtMs,
+                        nowMs: now
+                    )
+                    var afterId = relayPassStartCursor(
+                        sweeping: sweeping,
+                        persistedAfterId: cursor.afterId
+                    )
+                    // Once a page fails to fully process, the frontier stops
+                    // moving for the rest of this pass: persisting a later
+                    // page's cursor would skip the failed one forever. The
+                    // walk itself continues, so one bad page never blocks the
+                    // mail behind it.
+                    var frontierAdvancing = true
+                    func finishSweep() {
+                        guard sweeping else { return }
+                        RelaySweepSession.shared.noteSwept(cursorKey)
+                        try? store.noteRelaySweepCompleted(configKey: cursorKey, nowMs: now)
+                    }
                     while true {
                         let page = try RelayClient.fetchEnvelopes(
                             config: cfg,
@@ -2765,7 +2808,11 @@ final class MeshController: ObservableObject {
                             afterId: afterId,
                             limit: fetchBatchLimit
                         )
-                        guard !page.envelopes.isEmpty else { break }
+                        guard !page.envelopes.isEmpty else {
+                            finishSweep()
+                            break
+                        }
+                        var pageFullyProcessed = true
                         var dispositions: [CoreRelayEnvelopeDisposition] = []
                         for env in page.envelopes {
                             let disposition = await MainActor.run {
@@ -2792,16 +2839,53 @@ final class MeshController: ObservableObject {
                         // shared-mailbox group-hint row is never acked at all
                         // (specs/group-relay-durability.md §5.2) -- see
                         // CoreRelayEnvelopeDisposition's doc comment in engine.rs.
-                        let acks = try store.coreRelayAckIdsWithConsumed(
-                            items: dispositions,
-                            ownUserId: identity.userId,
-                            nowMs: now
-                        )
-                        if !acks.isEmpty {
-                            try RelayClient.ackEnvelopes(config: cfg, ids: acks)
+                        do {
+                            let acks = try store.coreRelayAckIdsWithConsumed(
+                                items: dispositions,
+                                ownUserId: identity.userId,
+                                nowMs: now
+                            )
+                            // An ack that never landed leaves consumed rows in
+                            // the mailbox; skipping past them would strand them
+                            // there until expiry, so the frontier waits for the
+                            // next pass to retry.
+                            if !acks.isEmpty {
+                                try RelayClient.ackEnvelopes(config: cfg, ids: acks)
+                            }
+                        } catch {
+                            pageFullyProcessed = false
+                            noteFailure(error, usedConfig: cfg)
+                            relaySyncLog.warning(
+                                "Relay page ack failed: \(error.localizedDescription, privacy: .public)"
+                            )
+                        }
+                        if !pageFullyProcessed { frontierAdvancing = false }
+                        if frontierAdvancing {
+                            _ = try? store.advanceRelayFetchCursor(
+                                configKey: cursorKey,
+                                pageNextCursor: page.nextCursor,
+                                pageFullyProcessed: true
+                            )
+                        }
+                        // End the walk on an EMPTY page, never on a short one:
+                        // a server may clamp `limit=` below our ask, and
+                        // reading a short page as end-of-mailbox would strand
+                        // every row above it -- in an ascending-id mailbox,
+                        // all the new mail. Reaching here with a non-empty
+                        // page means the cursor stood still, which relayd
+                        // cannot produce -- a bail-out, not end-of-mailbox, so
+                        // it deliberately does not record a completed sweep.
+                        guard relayFetchWalkContinues(
+                            pageEnvelopeCount: UInt32(clamping: page.envelopes.count),
+                            afterId: afterId,
+                            pageNextCursor: page.nextCursor
+                        ) else {
+                            relaySyncLog.warning(
+                                "Relay returned rows without advancing the cursor; ending the walk"
+                            )
+                            break
                         }
                         afterId = page.nextCursor
-                        if page.envelopes.count < fetchBatchLimit { break }
                     }
                     anyRelaySucceeded = true
                     if let own = config, cfg.relayUrl == own.relayUrl, cfg.relayToken == own.relayToken {
@@ -2929,5 +3013,17 @@ private func relayPushHints(ownUserId: Data) -> [Data] {
     // inline loop.
     return (try? store.relaySelfPushHints(ownUserId: ownUserId, nowMs: now))
         ?? recentHintsFor(userId: ownUserId, nowMs: now)
+}
+
+/// The full `/ws` subscribe: `relayPushHints` plus the poll path's persisted
+/// fetch frontier for this relay, so a reconnect asks relayd to replay from
+/// there rather than from 0 (which replayed the entire mailbox as frames the
+/// doorbell then discarded). Free function for the same reason
+/// `relayPushHints` is one: `RelayPushClient` invokes it off the main actor.
+private func relayPushSubscription(ownUserId: Data, config: RelayConfig) -> RelayPushSubscription {
+    let store = AppStore.get()
+    let cursorKey = relayCursorKey(relayUrl: config.relayUrl, relayToken: config.relayToken)
+    let afterId = (try? store.relayFetchCursor(configKey: cursorKey))?.afterId ?? 0
+    return RelayPushSubscription(hints: relayPushHints(ownUserId: ownUserId), afterId: afterId)
 }
 

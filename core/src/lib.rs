@@ -21,6 +21,7 @@ mod limits;
 mod link_detect;
 mod protocol;
 mod recipient_hints;
+mod relay_cursor;
 mod relay_setup;
 mod relay_status;
 mod relay_wire;
@@ -101,6 +102,10 @@ pub use protocol::{
     KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 pub use recipient_hints::{dedupe_hints, recent_hints_for, recent_presence_hints_for};
+pub use relay_cursor::{
+    relay_cursor_advance, relay_cursor_key, relay_fetch_walk_continues, relay_pass_start_cursor,
+    relay_sweep_due, relay_sweep_interval_ms, RELAY_SWEEP_INTERVAL_MS,
+};
 pub use relay_setup::{
     make_relay_setup_card, parse_relay_setup_text, relay_setup_is_official, RelaySetup,
 };
@@ -126,7 +131,7 @@ pub use store::{
     CarriedEnvelope, Contact, ContactDiscoveryPolicy, ContactProvenance, ContactRelayRejection,
     DigestEntry, FriendSuggestion, MessageArrival, MessageOrigin, MessageReference, MessageStore,
     OutboundEnvelope, OutgoingReceiptEnvelope, PeerConnectionEvent, PeerConnectionEventKind,
-    PeerConnectionSummary, PeerConnectionTransport, StoredMessage,
+    PeerConnectionSummary, PeerConnectionTransport, RelayFetchCursor, StoredMessage,
 };
 pub use transport_policy::{
     core_transport_send_plan, digest_is_expected_chat_id, digest_through_lamport_for_sender,

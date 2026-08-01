@@ -1645,6 +1645,22 @@ public func FfiConverterTypeLanNoiseSession_lower(_ value: LanNoiseSession) -> U
 public protocol MessageStoreProtocol : AnyObject {
     
     /**
+     * Persist the frontier after one fetch page, and return what is now
+     * remembered.
+     *
+     * The decision itself is [`crate::relay_cursor_advance`] — the store only
+     * reads, applies it, and writes — so the safety rule (never move past a
+     * page that did not reach a terminal disposition for every envelope, and
+     * never move backwards) is stated once, in policy, and tested there
+     * rather than through SQL.
+     *
+     * A blank `config_key` (an endpoint with no URL or no token) persists
+     * nothing: such a config always walks from 0 rather than sharing one row
+     * with every other incomplete config.
+     */
+    func advanceRelayFetchCursor(configKey: String, pageNextCursor: Int64, pageFullyProcessed: Bool) throws  -> Int64
+    
+    /**
      * T23: apply a contact's relay-change notice to their stored endpoint.
      *
      * Three rules, all enforced here rather than in either shell, because
@@ -1728,6 +1744,25 @@ public protocol MessageStoreProtocol : AnyObject {
      * Writes a transactionally consistent standalone SQLite snapshot.
      * The destination must not already exist; callers should use a unique
      * temporary path and remove it after reading the backup bytes.
+     *
+     * ## Relay fetch cursors do not ride the backup
+     *
+     * Everything else in the store is history and should come back exactly
+     * as it was. A relay fetch cursor is not history — it is a claim about
+     * the *current* state of a remote mailbox, and a backup is the one place
+     * that claim can be carried somewhere it was never true. Restore onto a
+     * second phone, restore months later, or restore after the relay box was
+     * rebuilt (its `families` table emptied and its row ids restarted at 1,
+     * which has happened in this project's own deployment) and an inherited
+     * frontier sits above every row that now exists. The phone would then
+     * fetch nothing, forever, and report perfect health while doing it —
+     * silent non-delivery, the worst failure this app can have.
+     *
+     * So the snapshot is scrubbed of them before it is sealed. The restored
+     * device re-walks each mailbox once from 0 and re-establishes its own
+     * frontier from evidence. That costs one full walk and nothing else:
+     * everything already delivered is recognised and dropped by the seen-id
+     * filter on the way back in.
      */
     func backupTo(destination: String) throws 
     
@@ -1808,6 +1843,19 @@ public protocol MessageStoreProtocol : AnyObject {
     func clearFriendSuggestions() throws 
     
     func clearPeerConnectionHistory() throws 
+    
+    /**
+     * Forget every remembered frontier, so the next pass re-walks each
+     * mailbox from the beginning.
+     *
+     * This is the reset a restored `.cmbak` needs — [`Self::backup_to`]
+     * applies it to the snapshot it writes, so a restore never inherits
+     * another device's (or another relay generation's) idea of where the
+     * mailbox got to. Re-walking once is cheap and self-correcting:
+     * everything already delivered is deduped on the way back in by the
+     * seen-id gossip filter.
+     */
+    func clearRelayFetchCursors() throws 
     
     /**
      * The canonical JPEG avatar bytes for a contact, if one has been synced.
@@ -2328,6 +2376,17 @@ public protocol MessageStoreProtocol : AnyObject {
     func noteContactRelayRejected(userId: Data, nowMs: Int64) throws  -> Int64
     
     /**
+     * Record that a walk from 0 completed for this mailbox, restarting its
+     * sweep interval.
+     *
+     * Called only when the walk actually reached the end of the mailbox. A
+     * sweep cut short — the service stopped, internet went away, the relay
+     * errored — deliberately leaves the timestamp alone, so the next pass
+     * tries again instead of believing a partial re-walk was a full one.
+     */
+    func noteRelaySweepCompleted(configKey: String, nowMs: Int64) throws 
+    
+    /**
      * Exact sealed envelopes for this device's authored messages in
      * `chat_id` whose lamport is above `after_lamport`, oldest first. This
      * is the transport-level counterpart to [`MessageStore::messages_after`]:
@@ -2522,6 +2581,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * an 8-byte hash and no content is kept. See [`delivery_metrics`].
      */
     func recordSentMetric(chatId: Data, lamport: UInt64, sentAtMs: Int64) throws 
+    
+    /**
+     * Where the walk of one relay mailbox got to (see
+     * [`crate::relay_cursor`]). An unknown or empty `config_key` reads as
+     * "nothing remembered": start at 0, sweep is due.
+     */
+    func relayFetchCursor(configKey: String) throws  -> RelayFetchCursor
     
     /**
      * The full deduped hint set a relay mailbox poll fetches: self + groups
@@ -2727,6 +2793,30 @@ public static func `open`(path: String)throws  -> MessageStore {
 
     
     /**
+     * Persist the frontier after one fetch page, and return what is now
+     * remembered.
+     *
+     * The decision itself is [`crate::relay_cursor_advance`] — the store only
+     * reads, applies it, and writes — so the safety rule (never move past a
+     * page that did not reach a terminal disposition for every envelope, and
+     * never move backwards) is stated once, in policy, and tested there
+     * rather than through SQL.
+     *
+     * A blank `config_key` (an endpoint with no URL or no token) persists
+     * nothing: such a config always walks from 0 rather than sharing one row
+     * with every other incomplete config.
+     */
+open func advanceRelayFetchCursor(configKey: String, pageNextCursor: Int64, pageFullyProcessed: Bool)throws  -> Int64 {
+    return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_advance_relay_fetch_cursor(self.uniffiClonePointer(),
+        FfiConverterString.lower(configKey),
+        FfiConverterInt64.lower(pageNextCursor),
+        FfiConverterBool.lower(pageFullyProcessed),$0
+    )
+})
+}
+    
+    /**
      * T23: apply a contact's relay-change notice to their stored endpoint.
      *
      * Three rules, all enforced here rather than in either shell, because
@@ -2894,6 +2984,25 @@ open func backfillPairwiseEnvelope(identity: Identity, contact: Contact, message
      * Writes a transactionally consistent standalone SQLite snapshot.
      * The destination must not already exist; callers should use a unique
      * temporary path and remove it after reading the backup bytes.
+     *
+     * ## Relay fetch cursors do not ride the backup
+     *
+     * Everything else in the store is history and should come back exactly
+     * as it was. A relay fetch cursor is not history — it is a claim about
+     * the *current* state of a remote mailbox, and a backup is the one place
+     * that claim can be carried somewhere it was never true. Restore onto a
+     * second phone, restore months later, or restore after the relay box was
+     * rebuilt (its `families` table emptied and its row ids restarted at 1,
+     * which has happened in this project's own deployment) and an inherited
+     * frontier sits above every row that now exists. The phone would then
+     * fetch nothing, forever, and report perfect health while doing it —
+     * silent non-delivery, the worst failure this app can have.
+     *
+     * So the snapshot is scrubbed of them before it is sealed. The restored
+     * device re-walks each mailbox once from 0 and re-establishes its own
+     * frontier from evidence. That costs one full walk and nothing else:
+     * everything already delivered is recognised and dropped by the seen-id
+     * filter on the way back in.
      */
 open func backupTo(destination: String)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_backup_to(self.uniffiClonePointer(),
@@ -3027,6 +3136,23 @@ open func clearFriendSuggestions()throws  {try rustCallWithError(FfiConverterTyp
     
 open func clearPeerConnectionHistory()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_clear_peer_connection_history(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
+     * Forget every remembered frontier, so the next pass re-walks each
+     * mailbox from the beginning.
+     *
+     * This is the reset a restored `.cmbak` needs — [`Self::backup_to`]
+     * applies it to the snapshot it writes, so a restore never inherits
+     * another device's (or another relay generation's) idea of where the
+     * mailbox got to. Re-walking once is cheap and self-correcting:
+     * everything already delivered is deduped on the way back in by the
+     * seen-id gossip filter.
+     */
+open func clearRelayFetchCursors()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_relay_fetch_cursors(self.uniffiClonePointer(),$0
     )
 }
 }
@@ -3863,6 +3989,23 @@ open func noteContactRelayRejected(userId: Data, nowMs: Int64)throws  -> Int64 {
 }
     
     /**
+     * Record that a walk from 0 completed for this mailbox, restarting its
+     * sweep interval.
+     *
+     * Called only when the walk actually reached the end of the mailbox. A
+     * sweep cut short — the service stopped, internet went away, the relay
+     * errored — deliberately leaves the timestamp alone, so the next pass
+     * tries again instead of believing a partial re-walk was a full one.
+     */
+open func noteRelaySweepCompleted(configKey: String, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_note_relay_sweep_completed(self.uniffiClonePointer(),
+        FfiConverterString.lower(configKey),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
+}
+    
+    /**
      * Exact sealed envelopes for this device's authored messages in
      * `chat_id` whose lamport is above `after_lamport`, oldest first. This
      * is the transport-level counterpart to [`MessageStore::messages_after`]:
@@ -4212,6 +4355,19 @@ open func recordSentMetric(chatId: Data, lamport: UInt64, sentAtMs: Int64)throws
         FfiConverterInt64.lower(sentAtMs),$0
     )
 }
+}
+    
+    /**
+     * Where the walk of one relay mailbox got to (see
+     * [`crate::relay_cursor`]). An unknown or empty `config_key` reads as
+     * "nothing remembered": start at 0, sweep is due.
+     */
+open func relayFetchCursor(configKey: String)throws  -> RelayFetchCursor {
+    return try  FfiConverterTypeRelayFetchCursor.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_relay_fetch_cursor(self.uniffiClonePointer(),
+        FfiConverterString.lower(configKey),$0
+    )
+})
 }
     
     /**
@@ -9320,6 +9476,96 @@ public func FfiConverterTypeRelayEndpoint_lower(_ value: RelayEndpoint) -> RustB
 }
 
 
+/**
+ * How far a relay mailbox has been walked, and when it was last walked in
+ * full. See [`crate::relay_cursor`] for what the two numbers mean and the
+ * rules that move them.
+ *
+ * An unknown mailbox reads as `{ after_id: 0, last_sweep_at_ms: 0 }` — walk
+ * everything, and a sweep is due. That is the correct answer for a first
+ * run, for a rotated credential, and for a restored backup alike, so no
+ * caller needs to special-case any of them.
+ */
+public struct RelayFetchCursor {
+    /**
+     * The highest relay row id whose page was fully processed. A normal
+     * pass resumes its `after=` here.
+     */
+    public var afterId: Int64
+    /**
+     * When a walk from 0 last completed for this mailbox, or 0 if never.
+     */
+    public var lastSweepAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The highest relay row id whose page was fully processed. A normal
+         * pass resumes its `after=` here.
+         */afterId: Int64, 
+        /**
+         * When a walk from 0 last completed for this mailbox, or 0 if never.
+         */lastSweepAtMs: Int64) {
+        self.afterId = afterId
+        self.lastSweepAtMs = lastSweepAtMs
+    }
+}
+
+
+
+extension RelayFetchCursor: Equatable, Hashable {
+    public static func ==(lhs: RelayFetchCursor, rhs: RelayFetchCursor) -> Bool {
+        if lhs.afterId != rhs.afterId {
+            return false
+        }
+        if lhs.lastSweepAtMs != rhs.lastSweepAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(afterId)
+        hasher.combine(lastSweepAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRelayFetchCursor: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayFetchCursor {
+        return
+            try RelayFetchCursor(
+                afterId: FfiConverterInt64.read(from: &buf), 
+                lastSweepAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RelayFetchCursor, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.afterId, into: &buf)
+        FfiConverterInt64.write(value.lastSweepAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayFetchCursor_lift(_ buf: RustBuffer) throws -> RelayFetchCursor {
+    return try FfiConverterTypeRelayFetchCursor.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayFetchCursor_lower(_ value: RelayFetchCursor) -> RustBuffer {
+    return FfiConverterTypeRelayFetchCursor.lower(value)
+}
+
+
 public struct RelaySetup {
     public var relayUrl: String
     public var relayToken: String
@@ -14039,6 +14285,61 @@ public func relayClassifyHttpError(httpStatus: UInt16, relayCode: String?) -> Co
     )
 })
 }
+/**
+ * The frontier to persist after one page, given what was already persisted.
+ *
+ * This is the mirror of the DTN ack-safety invariant, applied to *skipping*
+ * rather than to deleting: moving the cursor past an envelope means no
+ * ordinary pass will ever present it again. So it only moves when the page
+ * reached a terminal disposition for **every** envelope in it — consumed,
+ * carried, expired, seen, or rejected — and when the acks that page earned
+ * were actually delivered. Anything else (a store write that threw, an ack
+ * request that failed) leaves the frontier where it was, and those envelopes
+ * come back next pass.
+ *
+ * It also never moves *backwards*. A sweep walks from 0 and therefore
+ * reports page cursors far below the frontier for most of its run; taking
+ * the maximum means a sweep re-reads the mailbox without ever costing the
+ * frontier its position, so an interrupted sweep cannot turn into a
+ * re-walk-everything-next-pass loop.
+ */
+public func relayCursorAdvance(persistedAfterId: Int64, pageNextCursor: Int64, pageFullyProcessed: Bool) -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_cursor_advance(
+        FfiConverterInt64.lower(persistedAfterId),
+        FfiConverterInt64.lower(pageNextCursor),
+        FfiConverterBool.lower(pageFullyProcessed),$0
+    )
+})
+}
+/**
+ * A stable, credential-free name for one relay mailbox: the URL and the
+ * token that reads it, hashed together.
+ *
+ * Both halves matter. The URL alone would conflate two families hosted on
+ * the same relay, and their mailboxes have unrelated id spaces. The token
+ * alone would survive a host migration it should not survive.
+ *
+ * Hashed rather than stored plainly for two reasons. It keeps a relay
+ * credential out of the message database, which is what a `.cmbak` backup
+ * and every debug DB pull carry around. And it makes *rotation* correct by
+ * construction: a rotated token is a different key, the new key has no row,
+ * an absent row reads as cursor 0, and the first pass after a rotation
+ * therefore walks the mailbox from the beginning — which is exactly right,
+ * because a new credential may see a different set of rows than the old one
+ * did.
+ *
+ * The URL is normalized first, so a config saved as `relay.example` and one
+ * saved as `https://relay.example/` are one mailbox, not two.
+ */
+public func relayCursorKey(relayUrl: String, relayToken: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_cursor_key(
+        FfiConverterString.lower(relayUrl),
+        FfiConverterString.lower(relayToken),$0
+    )
+})
+}
 public func relayDecodeFetchPage(body: Data)throws  -> CoreRelayFetchPage {
     return try  FfiConverterTypeCoreRelayFetchPage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_relay_decode_fetch_page(
@@ -14138,12 +14439,41 @@ public func relayFaultRank(fault: CoreRelayFault) -> UInt8 {
 })
 }
 /**
- * Fetch pages stay deliberately small because every sealed row is controlled
- * by the relay until it has passed the authenticated envelope ingest path.
+ * Rows a shell asks for per fetch page — see [`RELAY_FETCH_MAX_ROWS`] for
+ * why this is 256 and what still bounds the memory a page can cost.
+ *
+ * A shell must not treat a *short* page as end-of-mailbox: a server may
+ * clamp `limit=` below this. [`crate::relay_fetch_walk_continues`] owns that
+ * rule for both shells.
  */
 public func relayFetchBatchLimit() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_relay_fetch_batch_limit($0
+    )
+})
+}
+/**
+ * Should the walk fetch another page?
+ *
+ * Termination is decided by an **empty page**, never by a short one. A
+ * server is free to clamp `limit=` below what we asked for — relayd's own
+ * `MAX_FETCH_LIMIT` does exactly that above 500 — and a client that reads
+ * `page.len() < limit` as end-of-mailbox would stop one page in and silently
+ * never see the rest, which for an ascending-id mailbox means never seeing
+ * anything new at all.
+ *
+ * The cursor check is the other half: a page that returns rows without
+ * advancing `next_cursor` past `after` would loop forever on the same rows.
+ * relayd cannot produce that (its cursor is the last row's id, and ids are
+ * strictly increasing within a page), so this only ever fires against a
+ * broken or hostile server — which is precisely when a client must not spin.
+ */
+public func relayFetchWalkContinues(pageEnvelopeCount: UInt32, afterId: Int64, pageNextCursor: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_fetch_walk_continues(
+        FfiConverterUInt32.lower(pageEnvelopeCount),
+        FfiConverterInt64.lower(afterId),
+        FfiConverterInt64.lower(pageNextCursor),$0
     )
 })
 }
@@ -14155,6 +14485,20 @@ public func relayFetchBatchLimit() -> UInt32 {
 public func relayMaxResponseBytes() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_relay_max_response_bytes($0
+    )
+})
+}
+/**
+ * The `after=` this pass starts its walk at: 0 for a sweep, the remembered
+ * frontier otherwise. A negative persisted value (corrupt row, hand-edited
+ * database) reads as 0 rather than being sent to a relay that would reject
+ * it.
+ */
+public func relayPassStartCursor(sweeping: Bool, persistedAfterId: Int64) -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_pass_start_cursor(
+        FfiConverterBool.lower(sweeping),
+        FfiConverterInt64.lower(persistedAfterId),$0
     )
 })
 }
@@ -14187,6 +14531,39 @@ public func relaySetupIsOfficial(relayUrl: String) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_relay_setup_is_official(
         FfiConverterString.lower(relayUrl),$0
+    )
+})
+}
+/**
+ * Must this pass walk the whole mailbox from 0?
+ *
+ * `swept_this_session` is per-process, not persisted: the first pass after a
+ * cold start always sweeps. That is the cheap, self-healing answer to every
+ * way a persisted cursor can go stale in a way we cannot detect from a
+ * response — most importantly a relay rebuilt from scratch, whose row ids
+ * restart at 1 and would otherwise sit forever below a frontier we still
+ * remember. Restarting the app fixes it; the timer fixes it unattended.
+ *
+ * A `last_sweep_at_ms` in the future (a clock that jumped backwards, a
+ * restore onto a phone set to a different time) sweeps immediately rather
+ * than pinning the mailbox as un-swept until real time catches up — the same
+ * rule [`crate::core_contact_relay_recheck_due`] applies for the same reason.
+ */
+public func relaySweepDue(sweptThisSession: Bool, lastSweepAtMs: Int64, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_sweep_due(
+        FfiConverterBool.lower(sweptThisSession),
+        FfiConverterInt64.lower(lastSweepAtMs),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * [`RELAY_SWEEP_INTERVAL_MS`], for shells that cannot see the constant.
+ */
+public func relaySweepIntervalMs() -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_sweep_interval_ms($0
     )
 })
 }
@@ -14758,6 +15135,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_classify_http_error() != 51460) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_cursor_advance() != 64540) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_cursor_key() != 37643) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_decode_fetch_page() != 49617) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14785,16 +15168,28 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_fault_rank() != 19318) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_fetch_batch_limit() != 7996) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_fetch_batch_limit() != 43600) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_fetch_walk_continues() != 33239) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_pass_start_cursor() != 19739) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_retry_after_ms() != 10198) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 55007) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 2810) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_interval_ms() != 37428) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_token_is_deposit() != 47848) {
@@ -14941,6 +15336,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_write_handshake_message() != 61679) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_advance_relay_fetch_cursor() != 11436) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 21099) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14968,7 +15366,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_envelope() != 41114) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to() != 11698) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to() != 2447) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_block_user() != 63065) {
@@ -14996,6 +15394,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_peer_connection_history() != 2544) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_relay_fetch_cursors() != 5399) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_avatar() != 36175) {
@@ -15133,6 +15534,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_contact_relay_rejected() != 13589) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_sweep_completed() != 49168) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_outbound_envelopes_after() != 35551) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15194,6 +15598,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_sent_metric() != 27687) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_cursor() != 29554) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_hints() != 37028) {
