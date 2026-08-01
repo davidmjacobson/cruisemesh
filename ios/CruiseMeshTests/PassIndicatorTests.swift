@@ -66,18 +66,44 @@ final class PassIndicatorTests: XCTestCase {
         )
     }
 
-    func testCredentialFaultsKeepPreCP2bPrecedence() {
+    func testAnExpiredPassBeatsASuccessfulPoll() {
+        // relayd gives an expired family a seven-day read-only grace
+        // (FAMILY_EXPIRY_GRACE_MS) in which fetch and ack still succeed and
+        // only POST takes the 403 -- so this exact combination is what a
+        // paying family sees for a week after their pass lapses. Folding it
+        // to .ok told them the Cruise Pass was working while nothing they
+        // wrote left the phone.
         XCTAssertEqual(
             RelayHealth.afterSyncPass(
                 fault: .passExpired, ownRelaySucceeded: true, anyRelaySucceeded: true, nowMs: now
             ),
-            .ok(lastSyncMs: now)
+            .expired(lastAttemptMs: now)
         )
+        // Past the grace window relayd rejects reads too -- the same answer
+        // by the other route.
         XCTAssertEqual(
             RelayHealth.afterSyncPass(
                 fault: .passExpired, ownRelaySucceeded: false, anyRelaySucceeded: true, nowMs: now
             ),
             .expired(lastAttemptMs: now)
+        )
+    }
+
+    func testTheOtherCredentialFaultsKeepPreCP2bPrecedence() {
+        // Suspension and token rejection do not move up with expiry:
+        // relayd's authorize_family rejects every op for both, so neither
+        // can co-occur with a successful poll in the first place.
+        XCTAssertEqual(
+            RelayHealth.afterSyncPass(
+                fault: .passSuspended, ownRelaySucceeded: true, anyRelaySucceeded: true, nowMs: now
+            ),
+            .ok(lastSyncMs: now)
+        )
+        XCTAssertEqual(
+            RelayHealth.afterSyncPass(
+                fault: .passSuspended, ownRelaySucceeded: false, anyRelaySucceeded: false, nowMs: now
+            ),
+            .suspended(lastAttemptMs: now)
         )
         XCTAssertEqual(
             RelayHealth.afterSyncPass(

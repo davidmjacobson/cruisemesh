@@ -75,11 +75,18 @@ class RelayFaultPolicyTest {
     }
 
     @Test
-    fun `credential faults keep their pre-CP2b precedence`() {
-        // A fully successful pass stays Ok even if a credential fault was
-        // somehow noted; a failed pass surfaces the credential fault.
+    fun `an expired pass beats a successful poll -- the grace window is not health`() {
+        // The regression this test exists for: relayd gives an expired
+        // family a SEVEN-DAY read-only grace (FAMILY_EXPIRY_GRACE_MS) in
+        // which fetch and ack still succeed and only POST takes the 403.
+        // So this exact combination -- PASS_EXPIRED noted by the uploads,
+        // both success flags true from the polls -- is what a paying family
+        // sees for a week after their pass lapses. Folding it to Ok told
+        // them the Cruise Pass was working while nothing they wrote left
+        // the phone. If this assertion ever reads Ok again, that lie is
+        // back.
         assertEquals(
-            RelayHealth.Ok(now),
+            RelayHealth.Expired(now),
             relayHealthAfterSyncPass(
                 CoreRelayFault.PASS_EXPIRED,
                 ownRelaySucceeded = true,
@@ -87,11 +94,43 @@ class RelayFaultPolicyTest {
                 now = now,
             ),
         )
+        // Past the grace window relayd rejects reads too, so the flags go
+        // false -- the same answer by the other route.
         assertEquals(
             RelayHealth.Expired(now),
             relayHealthAfterSyncPass(
                 CoreRelayFault.PASS_EXPIRED,
                 ownRelaySucceeded = false,
+                anyRelaySucceeded = true,
+                now = now,
+            ),
+        )
+        // Our own relay is the expired one; a contact's relay is still
+        // reachable. The pass is still expired.
+        assertEquals(
+            RelayHealth.Expired(now),
+            relayHealthAfterSyncPass(
+                CoreRelayFault.PASS_EXPIRED,
+                ownRelaySucceeded = false,
+                anyRelaySucceeded = false,
+                now = now,
+            ),
+        )
+    }
+
+    @Test
+    fun `the other credential faults keep their pre-CP2b precedence`() {
+        // Suspension and token rejection do NOT move up with expiry, and
+        // that is load-bearing rather than an oversight: relayd's
+        // authorize_family rejects EVERY op for a suspended family and for
+        // an unknown token, so neither fault can co-occur with a successful
+        // poll at all. Expiry-in-grace is the only credential fault that
+        // can, which is why it is the only one that moved.
+        assertEquals(
+            RelayHealth.Ok(now),
+            relayHealthAfterSyncPass(
+                CoreRelayFault.PASS_SUSPENDED,
+                ownRelaySucceeded = true,
                 anyRelaySucceeded = true,
                 now = now,
             ),

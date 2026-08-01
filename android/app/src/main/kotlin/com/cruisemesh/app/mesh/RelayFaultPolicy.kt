@@ -31,9 +31,21 @@ fun worseRelayFault(current: CoreRelayFault?, observed: CoreRelayFault): CoreRel
  * The mailbox-level faults (quota, oversized, rate-limited) surface even
  * when polling succeeded: relayd keeps serving fetches while rejecting
  * posts, so before CP2b those rejections vanished into a green check and a
- * silent retry loop. The credential faults keep the pre-CP2b precedence --
- * they only show when the pass didn't fully succeed, which with a bad
- * credential it never does.
+ * silent retry loop.
+ *
+ * [CoreRelayFault.PASS_EXPIRED] belongs in that same group, for the same
+ * reason. For relayd's `FAMILY_EXPIRY_GRACE_MS` -- seven days -- an expired
+ * pass keeps fetching and acking so nobody's last messages are stranded
+ * mid-cruise, and only POSTs take the 403. So the pass's success flags say
+ * "reachable" for a week while every new message is rejected, and folding
+ * expiry below them told a paying family their Cruise Pass was working
+ * when nothing they wrote was leaving the phone.
+ *
+ * The other two credential faults keep the pre-CP2b precedence, and that is
+ * not an oversight: relayd rejects EVERY op for a suspended family and for
+ * an unknown token (`authorize_family`), so neither can co-occur with a
+ * successful poll at all. Expiry-in-grace is the only credential fault that
+ * can, which is why it is the only one that moves.
  */
 fun relayHealthAfterSyncPass(
     fault: CoreRelayFault?,
@@ -45,11 +57,11 @@ fun relayHealthAfterSyncPass(
         CoreRelayFault.MAILBOX_FULL -> return RelayHealth.QuotaFull(now)
         CoreRelayFault.MESSAGE_TOO_LARGE -> return RelayHealth.MessageTooLarge(now)
         CoreRelayFault.RATE_LIMITED -> return RelayHealth.RateLimited(now)
+        CoreRelayFault.PASS_EXPIRED -> return RelayHealth.Expired(now)
         else -> {}
     }
     if (ownRelaySucceeded && anyRelaySucceeded) return RelayHealth.Ok(now)
     return when (fault) {
-        CoreRelayFault.PASS_EXPIRED -> RelayHealth.Expired(now)
         CoreRelayFault.PASS_SUSPENDED -> RelayHealth.Suspended(now)
         CoreRelayFault.TOKEN_REJECTED -> RelayHealth.TokenRejected(now)
         else -> RelayHealth.Failing(now)
