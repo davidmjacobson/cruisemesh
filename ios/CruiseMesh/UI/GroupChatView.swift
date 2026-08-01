@@ -485,7 +485,11 @@ private struct GroupMessageRow: View {
                                     )
                                 }
                                 if !attachment.caption.isEmpty {
-                                    MessageBodyText(text: attachment.caption, isOwn: isOwn)
+                                    MessageBodyText(
+                                        text: attachment.caption,
+                                        isOwn: isOwn,
+                                        onStatus: onStatus
+                                    )
                                 }
                             } else {
                                 Text("Unsupported attachment")
@@ -493,7 +497,8 @@ private struct GroupMessageRow: View {
                         } else {
                             MessageBodyText(
                                 text: String(data: message.payload, encoding: .utf8) ?? "",
-                                isOwn: isOwn
+                                isOwn: isOwn,
+                                onStatus: onStatus
                             )
                         }
                         if isOwn {
