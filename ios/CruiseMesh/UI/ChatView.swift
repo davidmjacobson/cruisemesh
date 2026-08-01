@@ -296,7 +296,15 @@ struct ChatView: View {
                     isBlocked = blocked
                 },
                 onReport: {
-                    launchContactReport(contact: displayContact, reporterUserId: identity.userId)
+                    // Nil means a mail app took it. An address back means there
+                    // was none -- it is already on the pasteboard, so say so
+                    // rather than letting the button dead-end.
+                    if let address = launchContactReport(
+                        contact: displayContact,
+                        reporterUserId: identity.userId
+                    ) {
+                        statusMessage = noMailAppMessage(address: address)
+                    }
                 },
                 relayCardIsStale: connectivity.staleRelayContacts.contains(contact.userId)
             ) {
