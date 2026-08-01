@@ -249,7 +249,21 @@ enum RelayClient {
     }
 
     private static func buildURL(_ base: String, path: String) throws -> URL {
-        guard let url = URL(string: normalizeRelayUrl(base) + path) else {
+        // normalizeRelayUrl returns empty for a non-HTTPS base. Every caller
+        // filters those out well before here (RelayConfigStore.load and
+        // resolvedContactRelay both drop them), so this is the backstop that
+        // keeps a future caller from concatenating a bare path and getting an
+        // opaque transport error instead of the reason. Mirrors Android
+        // `RelayClient.buildUrl`.
+        let normalized = normalizeRelayUrl(base)
+        guard !normalized.isEmpty else {
+            throw NSError(
+                domain: "RelayClient",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "Relay URL must use https"]
+            )
+        }
+        guard let url = URL(string: normalized + path) else {
             throw NSError(domain: "RelayClient", code: 1, userInfo: [NSLocalizedDescriptionKey: "bad URL"])
         }
         return url

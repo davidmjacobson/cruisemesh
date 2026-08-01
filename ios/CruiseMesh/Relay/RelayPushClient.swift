@@ -178,7 +178,12 @@ final class RelayPushClient: NSObject {
 
     private static func buildWebSocketURL(config: RelayConfig, hints: [Data]) -> URL? {
         let encodedHints = hints.map(base64URLEncode).joined(separator: ",")
-        let wsBase = toWebSocketScheme(normalizeRelayUrl(config.relayUrl))
+        // Empty means the core refused the URL (non-HTTPS). A bare
+        // "/ws?..." is a relative URL the socket cannot open, so fail to
+        // build here and let the caller log it and back off.
+        let normalized = normalizeRelayUrl(config.relayUrl)
+        guard !normalized.isEmpty else { return nil }
+        let wsBase = toWebSocketScheme(normalized)
         return URL(string: "\(wsBase)/ws?hints=\(encodedHints)&after=0")
     }
 
