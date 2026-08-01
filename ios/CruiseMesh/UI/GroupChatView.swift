@@ -484,12 +484,22 @@ private struct GroupMessageRow: View {
                                         durationMs: attachment.durationMs
                                     )
                                 }
-                                if !attachment.caption.isEmpty { Text(attachment.caption) }
+                                if !attachment.caption.isEmpty {
+                                    MessageBodyText(
+                                        text: attachment.caption,
+                                        isOwn: isOwn,
+                                        onStatus: onStatus
+                                    )
+                                }
                             } else {
                                 Text("Unsupported attachment")
                             }
                         } else {
-                            Text(String(data: message.payload, encoding: .utf8) ?? "")
+                            MessageBodyText(
+                                text: String(data: message.payload, encoding: .utf8) ?? "",
+                                isOwn: isOwn,
+                                onStatus: onStatus
+                            )
                         }
                         if isOwn {
                             // Group receipts aren't on the wire yet (D9), so

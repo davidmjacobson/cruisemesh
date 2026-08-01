@@ -5660,6 +5660,121 @@ public func FfiConverterTypeCoreBackupPayload_lower(_ value: CoreBackupPayload) 
 
 
 /**
+ * One link found in a message body.
+ *
+ * The range is half-open in **UTF-16 code units** over the body that was
+ * passed in, so a shell can style `start_utf16..end_utf16` directly. `url`
+ * is exactly that substring; render the substring, open `url`.
+ */
+public struct CoreDetectedLink {
+    /**
+     * First UTF-16 code unit of the link, inclusive.
+     */
+    public var startUtf16: UInt32
+    /**
+     * One past the last UTF-16 code unit of the link, exclusive.
+     */
+    public var endUtf16: UInt32
+    /**
+     * The link text, byte-for-byte as it appears in the body. This is both
+     * what must be displayed and where the tap must go.
+     */
+    public var url: String
+    /**
+     * Which scheme it uses.
+     */
+    public var scheme: CoreLinkScheme
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * First UTF-16 code unit of the link, inclusive.
+         */startUtf16: UInt32, 
+        /**
+         * One past the last UTF-16 code unit of the link, exclusive.
+         */endUtf16: UInt32, 
+        /**
+         * The link text, byte-for-byte as it appears in the body. This is both
+         * what must be displayed and where the tap must go.
+         */url: String, 
+        /**
+         * Which scheme it uses.
+         */scheme: CoreLinkScheme) {
+        self.startUtf16 = startUtf16
+        self.endUtf16 = endUtf16
+        self.url = url
+        self.scheme = scheme
+    }
+}
+
+
+
+extension CoreDetectedLink: Equatable, Hashable {
+    public static func ==(lhs: CoreDetectedLink, rhs: CoreDetectedLink) -> Bool {
+        if lhs.startUtf16 != rhs.startUtf16 {
+            return false
+        }
+        if lhs.endUtf16 != rhs.endUtf16 {
+            return false
+        }
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.scheme != rhs.scheme {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(startUtf16)
+        hasher.combine(endUtf16)
+        hasher.combine(url)
+        hasher.combine(scheme)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDetectedLink: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDetectedLink {
+        return
+            try CoreDetectedLink(
+                startUtf16: FfiConverterUInt32.read(from: &buf), 
+                endUtf16: FfiConverterUInt32.read(from: &buf), 
+                url: FfiConverterString.read(from: &buf), 
+                scheme: FfiConverterTypeCoreLinkScheme.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreDetectedLink, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.startUtf16, into: &buf)
+        FfiConverterUInt32.write(value.endUtf16, into: &buf)
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterTypeCoreLinkScheme.write(value.scheme, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDetectedLink_lift(_ buf: RustBuffer) throws -> CoreDetectedLink {
+    return try FfiConverterTypeCoreDetectedLink.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDetectedLink_lower(_ value: CoreDetectedLink) -> RustBuffer {
+    return FfiConverterTypeCoreDetectedLink.lower(value)
+}
+
+
+/**
  * Exact frames to emit after accepting a peer's DIGEST.
  *
  * The three lists remain separate for diagnostics, but are selected by one
@@ -10281,6 +10396,81 @@ extension CoreLanHealthAction: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Which of the two allowed schemes a detected link uses. The shells route
+ * on this: `Https` leaves the app (confirm first), `CruiseMesh` is handled
+ * in-app via [`crate::deep_link_route`].
+ */
+
+public enum CoreLinkScheme {
+    
+    /**
+     * `https://` — a web address.
+     */
+    case https
+    /**
+     * `cruisemesh://` — an in-app destination.
+     */
+    case cruiseMesh
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkScheme: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkScheme
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkScheme {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .https
+        
+        case 2: return .cruiseMesh
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLinkScheme, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .https:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .cruiseMesh:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkScheme_lift(_ buf: RustBuffer) throws -> CoreLinkScheme {
+    return try FfiConverterTypeCoreLinkScheme.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkScheme_lower(_ value: CoreLinkScheme) -> RustBuffer {
+    return FfiConverterTypeCoreLinkScheme.lower(value)
+}
+
+
+
+extension CoreLinkScheme: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * One structured relay rejection, classified. Ordered by nothing — use
  * [`relay_fault_rank`] when several faults from one sync pass compete for
  * the single status slot.
@@ -11536,6 +11726,30 @@ fileprivate struct FfiConverterOptionTypeStoredMessage: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreLinkScheme: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkScheme?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreLinkScheme.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreLinkScheme.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreTransport: FfiConverterRustBuffer {
     typealias SwiftType = CoreTransport?
 
@@ -11800,6 +12014,31 @@ fileprivate struct FfiConverterSequenceTypeContactRelayRejection: FfiConverterRu
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeContactRelayRejection.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreDetectedLink: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreDetectedLink]
+
+    public static func write(_ value: [CoreDetectedLink], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreDetectedLink.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreDetectedLink] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreDetectedLink]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreDetectedLink.read(from: &buf))
         }
         return seq
     }
@@ -12533,6 +12772,20 @@ public func coreContactRelayStreakDelta(fault: CoreRelayFault) -> Int64 {
     )
 })
 }
+/**
+ * Find every link in `body`, in order, non-overlapping.
+ *
+ * Returns an empty list for a body with no links (including an empty body).
+ * See the module docs for the scheme allow-list, the UTF-16 offset
+ * contract, and what is deliberately refused.
+ */
+public func coreDetectLinks(body: String) -> [CoreDetectedLink] {
+    return try!  FfiConverterSequenceTypeCoreDetectedLink.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_detect_links(
+        FfiConverterString.lower(body),$0
+    )
+})
+}
 public func coreFormatLanEndpoint(endpoint: CoreLanEndpoint) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_format_lan_endpoint(
@@ -12697,6 +12950,23 @@ public func coreLastVisibleMessage(messages: [StoredMessage]) -> StoredMessage? 
     return try!  FfiConverterOptionTypeStoredMessage.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_last_visible_message(
         FfiConverterSequenceTypeStoredMessage.lower(messages),$0
+    )
+})
+}
+/**
+ * Is this exact string, whole and entire, a link we are willing to open?
+ *
+ * Shells call this at tap time, when all they hold is the destination
+ * string, to decide between "leave the app" and "route in-app" — and to
+ * refuse anything that is not one of the two allowed schemes even if it
+ * somehow reached them. Trailing punctuation, surrounding whitespace or
+ * any trailing text make it `None`, because then the string is not itself
+ * a link.
+ */
+public func coreLinkOpenableScheme(url: String) -> CoreLinkScheme? {
+    return try!  FfiConverterOptionTypeCoreLinkScheme.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_link_openable_scheme(
+        FfiConverterString.lower(url),$0
     )
 })
 }
@@ -14079,6 +14349,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_streak_delta() != 44972) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_detect_links() != 34673) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_format_lan_endpoint() != 59419) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14110,6 +14383,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_last_visible_message() != 29515) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_openable_scheme() != 40398) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_make_lan_endpoint_link() != 27969) {

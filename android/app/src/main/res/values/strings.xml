@@ -390,4 +390,11 @@
     <string name="ui_you_already_have_a_different_friend_named">You already have a different friend named %1$s. This card is someone else, with different security keys.</string>
     <string name="ui_give_one_of_them_a_nickname">Give one of them a nickname so you can tell them apart.</string>
     <string name="ui_this_card">This card</string>
+    <!-- Links in messages. The confirmation shows the whole address, because
+         the address is the thing being agreed to. -->
+    <string name="ui_open_this_link">Open this link?</string>
+    <string name="ui_this_link_opens_outside_the_chat">This link opens outside this chat.\n\n%1$s</string>
+    <string name="ui_open">Open</string>
+    <string name="ui_that_link_could_not_be_opened">That link could not be opened</string>
+    <string name="ui_open_link_named">Open %1$s</string>
 </resources>

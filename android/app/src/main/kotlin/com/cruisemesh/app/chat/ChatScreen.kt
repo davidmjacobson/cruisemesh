@@ -488,6 +488,7 @@ private fun ConversationScreen(
         composerFocus.requestFocus()
     }
     val host = rememberConversationHost(contact.userId)
+    val linkHandler = rememberMessageLinkHandler()
     val displayId = remember(contact.userId) { formatUserId(contact.userId) }
     val resolvedName = remember(contact.name, contact.nickname) {
         coreContactDisplayName(contact)
@@ -602,6 +603,7 @@ private fun ConversationScreen(
                         outboundExpiryMs = if (isOwn) chatExtras.outboundExpiryMs[messageStableKey(message)] else null,
                         onLongPress = { target, bounds -> openOverlay(target, bounds) },
                         onSwipeReply = { startReply(message) },
+                        onLinkClick = { link -> linkHandler.open(link) },
                     )
                 }
             }
@@ -636,6 +638,8 @@ private fun ConversationScreen(
             )
         },
         overlays = {
+            MessageLinkPrompt(linkHandler)
+
             if (showContactDetails) {
                 ContactDetailsSheet(
                     contact = contact,
@@ -1209,6 +1213,7 @@ private fun MessageBubble(
     outboundExpiryMs: Long? = null,
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
     onSwipeReply: () -> Unit = {},
+    onLinkClick: (MessageLink) -> Unit = {},
 ) {
     var showLegend by remember { mutableStateOf(false) }
     var boundsInRoot by remember { mutableStateOf(Rect.Zero) }
@@ -1219,6 +1224,13 @@ private fun MessageBubble(
         MessageTarget(message.senderUserId, message.lamport, message.kind)
     }
     val photoBytes = remember(message.kind, message.payload) { messageImageBytes(message) }
+    val onBubbleClick = {
+        if (photoBytes != null) {
+            onPhotoClick(photoBytes)
+        } else if (tick != null) {
+            showLegend = true
+        }
+    }
 
     // Swipe-to-reply (T1): a rightward drag translates the bubble and reveals a
     // reply arrow; releasing past the threshold starts a reply and opens the
@@ -1286,16 +1298,23 @@ private fun MessageBubble(
                 onReact = onReact,
                 quoted = quoted,
                 onQuotedClick = quoted?.target?.let { target -> { onQuotedClick(target) } },
+                // The body text takes both gestures back over its own glyphs
+                // (a link needs the tap position) and re-emits them, so a tap
+                // off a link and a long-press anywhere behave the same as they
+                // do on the rest of the bubble.
+                bodyActions = MessageBodyActions(
+                    onLinkClick = onLinkClick,
+                    onClick = onBubbleClick,
+                    // No haptic here on purpose: combinedClickable's long-click
+                    // doesn't buzz either (Compose 1.7), and a link that felt
+                    // different from the rest of the bubble would read as a
+                    // different gesture.
+                    onLongClick = { onLongPress(target, boundsInRoot) },
+                ),
                 modifier = Modifier
                     .onGloballyPositioned { coords -> boundsInRoot = coords.unclippedBoundsInRoot() }
                     .messageActions(
-                        onClick = {
-                            if (photoBytes != null) {
-                                onPhotoClick(photoBytes)
-                            } else if (tick != null) {
-                                showLegend = true
-                            }
-                        },
+                        onClick = onBubbleClick,
                         onLongClick = { onLongPress(target, boundsInRoot) },
                     ),
             )
@@ -1354,6 +1373,7 @@ fun MessageBubbleVisual(
     modifier: Modifier = Modifier,
     quoted: QuotedMessagePreview? = null,
     onQuotedClick: (() -> Unit)? = null,
+    bodyActions: MessageBodyActions? = null,
 ) {
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
@@ -1390,11 +1410,20 @@ fun MessageBubbleVisual(
                         if (attachment == null) {
                             Text(stringResource(R.string.ui_unsupported_attachment))
                         } else {
-                            AttachmentBubbleContent(attachment = attachment, contentColor = contentColor)
+                            AttachmentBubbleContent(
+                                attachment = attachment,
+                                contentColor = contentColor,
+                                isOwn = isOwn,
+                                bodyActions = bodyActions,
+                            )
                         }
                     }
                     else -> {
-                        Text(message.payload.toString(Charsets.UTF_8))
+                        MessageBodyText(
+                            body = message.payload.toString(Charsets.UTF_8),
+                            isOwn = isOwn,
+                            actions = bodyActions,
+                        )
                     }
                 }
                 if (tick != null) {
@@ -1606,14 +1635,20 @@ private fun messageArrivalText(arrival: MessageArrival): String {
 internal fun AttachmentBubbleContent(
     attachment: AttachmentPayload,
     contentColor: Color,
+    // A caption is a message body -- iOS linkifies it, so this does too, or a
+    // link is tappable on one platform and dead on the other (6.6).
+    isOwn: Boolean = false,
+    bodyActions: MessageBodyActions? = null,
 ) {
     when (attachment.mediaType) {
         AttachmentPayload.MediaType.IMAGE -> {
             ChatImageAttachment(jpeg = attachment.blob)
             if (attachment.caption.isNotBlank()) {
-                Text(
-                    text = attachment.caption,
+                MessageBodyText(
+                    body = attachment.caption,
+                    isOwn = isOwn,
                     modifier = Modifier.padding(top = 6.dp),
+                    actions = bodyActions,
                 )
             }
         }
@@ -1624,9 +1659,11 @@ internal fun AttachmentBubbleContent(
                 contentColor = contentColor,
             )
             if (attachment.caption.isNotBlank()) {
-                Text(
-                    text = attachment.caption,
+                MessageBodyText(
+                    body = attachment.caption,
+                    isOwn = isOwn,
                     modifier = Modifier.padding(top = 6.dp),
+                    actions = bodyActions,
                 )
             }
         }

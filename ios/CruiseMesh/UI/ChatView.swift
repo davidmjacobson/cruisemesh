@@ -601,11 +601,16 @@ private struct MessageBubbleView: View {
                         .fill(isOwn ? Color.accentColor : contactColor.opacity(0.24))
                 )
                 .foregroundStyle(isOwn ? Color.white : Color.primary)
-                .onTapGesture {
+                // Simultaneous, not `.onTapGesture`: an exclusive tap gesture
+                // on the bubble swallows taps aimed at a link inside its text
+                // (6.6), and the tick legend is not worth a dead link. Both
+                // recognise, so tapping a link may also flash the legend --
+                // it clears itself after two seconds.
+                .simultaneousGesture(TapGesture().onEnded {
                     if tick != nil {
                         showLegend = true
                     }
-                }
+                })
                 .contextMenu {
                     MessageActionsMenu(
                         canReply: canReply,
@@ -691,13 +696,21 @@ private struct MessageBubbleView: View {
                     VoiceMemoPlayerView(blob: attachment.blob, durationMs: attachment.durationMs)
                 }
                 if !attachment.caption.isEmpty {
-                    Text(attachment.caption)
+                    MessageBodyText(
+                        text: attachment.caption,
+                        isOwn: isOwn,
+                        onStatus: onStatus
+                    )
                 }
             } else {
                 Text("Unsupported attachment")
             }
         } else {
-            Text(String(data: message.payload, encoding: .utf8) ?? "")
+            MessageBodyText(
+                text: String(data: message.payload, encoding: .utf8) ?? "",
+                isOwn: isOwn,
+                onStatus: onStatus
+            )
         }
     }
 

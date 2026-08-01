@@ -18,6 +18,7 @@ mod identity;
 mod lan_session;
 mod lan_util;
 mod limits;
+mod link_detect;
 mod protocol;
 mod recipient_hints;
 mod relay_setup;
@@ -77,6 +78,9 @@ pub use lan_util::{
     core_subnet_24_hosts, lan_endpoint_cache_is_fresh, should_resend_lan_endpoint, CoreLanEndpoint,
 };
 pub use limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
+pub use link_detect::{
+    core_detect_links, core_link_openable_scheme, CoreDetectedLink, CoreLinkScheme,
+};
 pub use protocol::{
     compute_recipient_hint, core_is_hidden_spray_kind, core_own_capabilities,
     create_introduction_ticket, decode_extended_message_body, decode_friend_directory_content,

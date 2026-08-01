@@ -411,6 +411,16 @@
         }
       }
     },
+    "Copied": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Copied"
+          }
+        }
+      }
+    },
     "Copy": {
       "localizations": {
         "en": {
@@ -447,6 +457,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Could not display photo"
+          }
+        }
+      }
+    },
+    "Couldn't open that link": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couldn't open that link"
           }
         }
       }
@@ -1341,6 +1361,16 @@
         }
       }
     },
+    "Open in browser": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open in browser"
+          }
+        }
+      }
+    },
     "Open the app when you sit down with family so phones can sync over Bluetooth.": {
       "localizations": {
         "en": {
@@ -1357,6 +1387,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Open the setup link from your purchase email. CruiseMesh checks and saves it automatically."
+          }
+        }
+      }
+    },
+    "Open this link?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open this link?"
           }
         }
       }

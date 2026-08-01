@@ -209,6 +209,7 @@ fun GroupChatScreen(
     }
 
     val host = rememberConversationHost(group.id)
+    val linkHandler = rememberMessageLinkHandler()
     val visibleMessages = remember(messages) { messages.filter { isVisibleChatKind(it.kind) } }
     // FA4: same off-main-thread load as ChatScreen -- reply-quote metadata and
     // own-message expiry watermarks, queried once per visible-list change
@@ -288,6 +289,7 @@ fun GroupChatScreen(
                         toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
                     },
                     onLongPress = { target, bounds -> openOverlay(target, bounds) },
+                    onLinkClick = { link -> linkHandler.open(link) },
                 )
             }
         },
@@ -372,6 +374,8 @@ fun GroupChatScreen(
             )
         },
         overlays = {
+            MessageLinkPrompt(linkHandler)
+
         if (showDetails) {
         AlertDialog(
             onDismissRequest = { showDetails = false },
@@ -775,6 +779,7 @@ private fun GroupMessageBubble(
     reactions: List<ReactionSummary> = emptyList(),
     onReact: (String) -> Unit = {},
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
+    onLinkClick: (MessageLink) -> Unit = {},
 ) {
     if (message.kind == KIND_GROUP_INVITE) {
         Box(
@@ -816,6 +821,14 @@ private fun GroupMessageBubble(
             onReact = onReact,
             quoted = quoted,
             onQuotedClick = quoted?.target?.let { target -> { onQuotedClick(target) } },
+            // The body text handles taps on its own glyphs (a link needs the
+            // tap position) and hands the long-press straight back, so the
+            // reaction/copy overlay still opens from anywhere in the bubble.
+            bodyActions = MessageBodyActions(
+                onLinkClick = onLinkClick,
+                onClick = {},
+                onLongClick = { onLongPress(target, boundsInRoot) },
+            ),
             modifier = Modifier
                 .onGloballyPositioned { coords -> boundsInRoot = coords.unclippedBoundsInRoot() }
                 .messageActions(
@@ -843,6 +856,7 @@ fun GroupMessageBubbleVisual(
     modifier: Modifier = Modifier,
     quoted: QuotedMessagePreview? = null,
     onQuotedClick: (() -> Unit)? = null,
+    bodyActions: MessageBodyActions? = null,
 ) {
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
@@ -889,12 +903,19 @@ fun GroupMessageBubbleVisual(
                     if (attachment == null) {
                         Text(stringResource(R.string.ui_unsupported_attachment))
                     } else {
-                        AttachmentBubbleContent(attachment, contentColor)
+                        AttachmentBubbleContent(
+                            attachment = attachment,
+                            contentColor = contentColor,
+                            isOwn = isOwn,
+                            bodyActions = bodyActions,
+                        )
                     }
                 } else {
-                    Text(
-                        text = String(message.payload, Charsets.UTF_8),
+                    MessageBodyText(
+                        body = String(message.payload, Charsets.UTF_8),
+                        isOwn = isOwn,
                         style = MaterialTheme.typography.bodyLarge,
+                        actions = bodyActions,
                     )
                 }
                 if (showTimestamp || isOwn) {
