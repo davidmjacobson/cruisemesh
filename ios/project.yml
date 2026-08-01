@@ -64,6 +64,12 @@ targets:
         CFBundleVersion: "1784405581"
         ITSAppUsesNonExemptEncryption: true
         ITSEncryptionExportComplianceCode: 1b0a6ad4-7ce2-4c33-9c43-3ef15309ce37
+        # canOpenURL answers false for any scheme not listed here, so without
+        # mailto the Report button would always take the no-mail-app path.
+        # Must live here as well as in Info.plist: xcodegen rewrites that file
+        # from this one on every CI build.
+        LSApplicationQueriesSchemes:
+          - mailto
         UILaunchScreen: {}
         UIBackgroundModes:
           - bluetooth-central

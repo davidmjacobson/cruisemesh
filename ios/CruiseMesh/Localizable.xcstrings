@@ -1321,6 +1321,16 @@
         }
       }
     },
+    "No email app found. You can email %@ directly — the address has been copied.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No email app found. You can email %@ directly — the address has been copied."
+          }
+        }
+      }
+    },
     "No friends added yet.": {
       "localizations": {
         "en": {
