@@ -4,6 +4,7 @@ import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.RelayHealth
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -82,15 +83,62 @@ class MeshStatusTextLogicTest {
     }
 
     @Test
-    fun `active with no Cruise Pass configured`() {
+    fun `never set up internet delivery says nothing about it and does not warn`() {
         val status = MeshStatusTextLogic.build(
             MeshRuntimeState.ACTIVE,
             0,
             RelayHealth.NoConfig,
             null,
         )
-        assertEquals("Mesh on · no internet delivery set up", status.text)
-        assertEquals(MeshStatusDotColor.AMBER, status.dot)
+        assertEquals("Mesh on", status.text)
+        assertEquals(MeshStatusDotColor.NEUTRAL, status.dot)
+    }
+
+    @Test
+    fun `never set up internet delivery still reports nearby peers`() {
+        val status = MeshStatusTextLogic.build(
+            MeshRuntimeState.ACTIVE,
+            2,
+            RelayHealth.NoConfig,
+            null,
+        )
+        assertEquals("Mesh on · 2 nearby", status.text)
+        assertEquals(MeshStatusDotColor.GREEN, status.dot)
+    }
+
+    @Test
+    fun `never set up internet delivery is quiet whatever the peer count`() {
+        for (nearby in 0..4) {
+            val status = MeshStatusTextLogic.build(
+                MeshRuntimeState.ACTIVE,
+                nearby,
+                RelayHealth.NoConfig,
+                null,
+            )
+            assertFalse(status.text.contains("set up", ignoreCase = true))
+            assertFalse(status.text.contains("relay", ignoreCase = true))
+            assertFalse(status.text.contains("Cruise Pass", ignoreCase = true))
+            assertNotEquals(MeshStatusDotColor.AMBER, status.dot)
+        }
+    }
+
+    // Characterization: this is what the pill does today for a saved-but-unchecked
+    // card, pinned here so the quiet-when-never-set-up change above cannot silently
+    // swallow it. Whether this copy is right for a card that is merely awaiting its
+    // first check -- Settings says "Setup is saved and will be checked when
+    // CruiseMesh runs" for the same state -- is a separate question.
+    @Test
+    fun `a saved pass the mesh has not checked yet keeps its nudge`() {
+        for (service in InternetDeliveryService.entries) {
+            val status = MeshStatusTextLogic.build(
+                MeshRuntimeState.ACTIVE,
+                0,
+                RelayHealth.NoConfig,
+                service,
+            )
+            assertEquals("Mesh on · no internet delivery set up", status.text)
+            assertEquals(MeshStatusDotColor.AMBER, status.dot)
+        }
     }
 
     @Test
