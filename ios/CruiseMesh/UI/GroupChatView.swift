@@ -99,7 +99,8 @@ struct GroupChatView: View {
                                         withAnimation {
                                             proxy.scrollTo(messageId(target), anchor: .center)
                                         }
-                                    }
+                                    },
+                                    onStatus: { statusMessage = $0 }
                                 )
                                 .swipeToReply {
                                     replyingTo = message
@@ -427,6 +428,7 @@ private struct GroupMessageRow: View {
     let onReply: () -> Void
     let onPhotoTap: (Data) -> Void
     let onQuotedTap: (StoredMessage) -> Void
+    var onStatus: (String) -> Void = { _ in }
     @State private var showInfo = false
 
     var body: some View {
@@ -508,19 +510,18 @@ private struct GroupMessageRow: View {
                         )
                         .foregroundStyle(isOwn ? Color.white : Color.primary)
                         .contextMenu {
-                            if canReply {
-                                Button(action: onReply) {
-                                    Label("Reply", systemImage: "arrowshape.turn.up.left")
-                                }
-                            }
-                            ForEach(reactionChoices, id: \.self) { emoji in
-                                Button(emoji) { onReact(emoji) }
-                            }
-                            Button {
-                                showInfo = true
-                            } label: {
-                                Label("Info", systemImage: "info.circle")
-                            }
+                            MessageActionsMenu(
+                                canReply: canReply,
+                                copyText: messageCopyText(message),
+                                ownReaction: reactions.first(where: { $0.reactedByOwnUser })?.emoji,
+                                onReact: onReact,
+                                onReply: onReply,
+                                onCopy: {
+                                    UIPasteboard.general.string = messageCopyText(message)
+                                    onStatus("Copied")
+                                },
+                                onInfo: { showInfo = true }
+                            )
                         }
                     if !reactions.isEmpty {
                         ReactionPillRow(reactions: reactions, isOwn: isOwn, onReact: onReact)
