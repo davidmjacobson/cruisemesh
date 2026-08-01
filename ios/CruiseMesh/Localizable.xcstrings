@@ -1,6 +1,56 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "%@ expired": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ expired"
+          }
+        }
+      }
+    },
+    "%@ setup was not accepted": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ setup was not accepted"
+          }
+        }
+      }
+    },
+    "%@ storage is full": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ storage is full"
+          }
+        }
+      }
+    },
+    "%@ suspended": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ suspended"
+          }
+        }
+      }
+    },
+    "A message was too large to send": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A message was too large to send"
+          }
+        }
+      }
+    },
     "About & legal": {
       "localizations": {
         "en": {
