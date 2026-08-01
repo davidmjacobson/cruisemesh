@@ -311,9 +311,11 @@ internal class RelaySyncEngine(
      * succeed in.
      *
      * The hint set passed to [RelayPushClient.start] is recomputed on every
-     * (re)connect from [MessageStore.relayFetchHints] (mail addressed to us,
-     * plus mail addressed to a contact we can proxy-fetch for, same as
-     * [pollRelayMailbox]'s doc) so a
+     * (re)connect from [MessageStore.relayFetchPushHints] (mail addressed to
+     * us, plus mail addressed to a contact we can proxy-fetch for, same ids
+     * as [pollRelayMailbox]'s [MessageStore.relayFetchHints] doc, plus one
+     * day ahead -- see that function's doc for why a push *subscription*
+     * safely reaches a day further than a fetch) so a
      * newly added contact or group is picked up the next reconnect without
      * this needing its own change-tracking; until then the 60s poll already
      * covers it.
@@ -352,7 +354,7 @@ internal class RelaySyncEngine(
             assertOffMainThreadForStore("relay push hint computation")
             val now = System.currentTimeMillis()
             val computed = try {
-                store.relayFetchHints(identity.userId, now)
+                store.relayFetchPushHints(identity.userId, now)
             } catch (e: CoreException) {
                 Log.w(TAG, "Failed to compute relay push hints: ${e.message}")
                 emptyList()
