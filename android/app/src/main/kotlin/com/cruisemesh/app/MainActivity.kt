@@ -1064,6 +1064,7 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
 
     AddFriendScreen(
         onScanClick = { navController.navigate("scan") },
+        onShowMyCardClick = { navController.navigate("myQr") },
         onImportText = { text ->
             try {
                 val card = parseFriendText(text)
