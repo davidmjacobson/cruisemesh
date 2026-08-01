@@ -1858,6 +1858,26 @@ public protocol MessageStoreProtocol : AnyObject {
     func clearRelayFetchCursors() throws 
     
     /**
+     * Rows currently in the consumed-hidden-kind set, expired ones included
+     * (diagnostics/tests).
+     */
+    func consumedHiddenMsgIdCount() throws  -> UInt64
+    
+    /**
+     * Whether `msg_id` is in the consumed-hidden-kind set -- i.e. this
+     * device already recorded, via
+     * [`Self::core_record_consumed_hidden_msg_id`], that it consumed that
+     * exact envelope as its sole true endpoint consumer.
+     *
+     * A row that is present but past its `expiry_ms` reads as absent even
+     * before [`Self::prune_expired_consumed_hidden_msg_ids`] gets to it: the
+     * answer must not depend on when the prune last ran, and the safe
+     * direction for an aged-out row is "no evidence" (leave the relay copy
+     * alone).
+     */
+    func consumedHiddenMsgIdRecorded(msgId: Data, nowMs: Int64) throws  -> Bool
+    
+    /**
      * The canonical JPEG avatar bytes for a contact, if one has been synced.
      */
     func contactAvatar(userId: Data) throws  -> Data?
@@ -1944,6 +1964,62 @@ public protocol MessageStoreProtocol : AnyObject {
     func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data]) throws  -> CoreDigestSprayPlan
     
     /**
+     * Record that this device consumed `msg_id` as the envelope's SOLE true
+     * endpoint consumer, for a kind that leaves no `messages` row to prove
+     * it with -- the growth half of the relay-mailbox problem that
+     * [`Self::core_relay_ack_ids_with_consumed`] then acts on.
+     *
+     * **Safety invariant this function exists to enforce, stated verbatim
+     * (DTN_TODOS.md §3.1): never ack a relay copy unless THIS device was the
+     * envelope's sole true endpoint consumer; when in doubt, don't ack.**
+     * Every row written here is a standing licence to DELETE a relay copy
+     * later, so a row must only be written when all of the following hold,
+     * and the function refuses (returns `false`, writes nothing) otherwise:
+     *
+     * 1. **The caller proved consumption.** Call this ONLY from the point
+     * where an envelope was opened with [`crate::open_message`] against
+     * this device's own identity key -- pairwise-sealed to us, so we are
+     * the only party who can open it -- AND the delivery path ran to
+     * completion. A deliberate discard by that path (blocked sender,
+     * unauthorized kind, unhandled kind) counts as consumption for the
+     * same reason it counts as `Consumed`: we were the endpoint and the
+     * envelope is finished with. A group-key open, a mule/carry, a failed
+     * open, or a delivery that threw must never reach this call.
+     * This one condition cannot be re-checked here -- it is the caller's
+     * contract, and it is why both shells call this from exactly one
+     * place each.
+     * 2. **The kind leaves no `messages` row**
+     * ([`crate::core_kind_persists_msg_id_row`]). Chat kinds already have
+     * durable evidence; duplicating it here would only grow the table.
+     * 3. **The `recipient_hint` is one of THIS device's own hints**, over
+     * the backward-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window
+     * ([`core_is_own_fanout_hint`]). This is the belt to condition 1's
+     * braces: a pairwise open already implies the envelope was sealed to
+     * us, and this additionally refuses anything whose *addressing* says
+     * it might be for someone else.
+     * 4. **The `recipient_hint` is not a group's shared hint.** A group hint
+     * names a row every member fetches, so it is never ackable by anyone
+     * -- checked here as well as at ack time, since a hint collision
+     * between our own id and a group's is unlikely but not impossible.
+     * 5. **The envelope has not already expired**, and its recorded expiry
+     * is clamped to [`MAX_CARRY_FUTURE_MS`] -- the same 30-day ceiling
+     * relayd clamps posts to. This is what bounds the table: a row cannot
+     * outlive the relay copy it vouches for.
+     *
+     * Recording is required on BOTH consumption paths -- mesh inbound
+     * (BLE/LAN) and relay-fetch inbound -- and both shells get that for free
+     * by calling from their single shared inbound-envelope processor: a
+     * relay-consumed hidden kind is then equally re-ackable if the same row
+     * is presented again (a cursor reset, or the periodic full sweep).
+     *
+     * Returns `true` if the set now vouches for `msg_id`. Callers should
+     * treat a `false` or an error as ordinary: failing to record costs a
+     * relay re-fetch, which is exactly the cost this whole mechanism trades
+     * against, and never costs a message.
+     */
+    func coreRecordConsumedHiddenMsgId(msgId: Data, kind: UInt8, recipientHint: Data, expiryMs: Int64, ownUserId: Data, nowMs: Int64) throws  -> Bool
+    
+    /**
      * Relay ack ids for one poll pass, folding the consumed-SEEN rule
      * (DTN_TODOS.md §3.1) in on top of [`core_should_ack_inbound`]'s
      * Consumed/Expired rule -- so a device that has already consumed an
@@ -1957,12 +2033,25 @@ public protocol MessageStoreProtocol : AnyObject {
      * - [`CoreInboundDisposition::Carried`]: never ack -- the relay copy is
      * the durable fallback until the real recipient (or another proxy)
      * fetches it.
-     * - [`CoreInboundDisposition::Seen`]: look up
-     * [`Self::message_origin_by_msg_id`] for the item's `msg_id` and ack
-     * only if [`core_consumed_seen_is_ackable`] says so -- i.e. this
-     * device durably stored the envelope as a 1:1 message from someone
-     * else, not merely muled it, echoed its own message back, or read
-     * one copy of a shared-mailbox group envelope.
+     * - [`CoreInboundDisposition::Seen`]: gather two independent pieces of
+     * store evidence and ack only if
+     * [`core_consumed_seen_is_ackable_with_hidden`] says so:
+     * [`Self::message_origin_by_msg_id`] (did we durably store this exact
+     * envelope as a 1:1 message from someone else?) and, for the kinds
+     * that leave no such row, [`Self::consumed_hidden_msg_id_recorded`]
+     * together with an own-self-hint check on the fetched row's
+     * `recipient_hint`. Neither route acks something we merely muled,
+     * echoed back as our own outbound, or read one copy of out of a
+     * shared-mailbox group envelope.
+     *
+     * The own-self-hint check uses [`core_is_own_fanout_hint`], i.e. the
+     * BACKWARD-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window every other
+     * routing-time hint check uses -- deliberately NOT the forward-looking
+     * push-subscription variants ([`MessageStore::relay_self_push_hints`]).
+     * A forward day is safe for *subscribing* to a topic and wrong here:
+     * this is a claim about an envelope that already exists, and envelopes
+     * are only ever created with a backward-looking hint
+     * (`causal_order.rs`).
      *
      * Safety invariant, stated verbatim (DTN_TODOS.md §3.1): "never ack a
      * relay copy unless THIS device was the envelope's sole true endpoint
@@ -2438,6 +2527,15 @@ public protocol MessageStoreProtocol : AnyObject {
      * how many were pruned.
      */
     func pruneExpiredCarried(nowMs: Int64) throws  -> UInt64
+    
+    /**
+     * Drop every consumed-hidden-kind record whose envelope expiry has
+     * passed. Member of the `prune_expired_*` family and called from the same
+     * places: once an envelope is expired its relay copy is ackable on the
+     * `Expired` disposition alone, so the record has nothing left to prove.
+     * Returns how many rows were pruned.
+     */
+    func pruneExpiredConsumedHiddenMsgIds(nowMs: Int64) throws  -> UInt64
     
     /**
      * Delete expired outbound envelopes as of `now_ms`. The plaintext
@@ -3158,6 +3256,38 @@ open func clearRelayFetchCursors()throws  {try rustCallWithError(FfiConverterTyp
 }
     
     /**
+     * Rows currently in the consumed-hidden-kind set, expired ones included
+     * (diagnostics/tests).
+     */
+open func consumedHiddenMsgIdCount()throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_consumed_hidden_msg_id_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Whether `msg_id` is in the consumed-hidden-kind set -- i.e. this
+     * device already recorded, via
+     * [`Self::core_record_consumed_hidden_msg_id`], that it consumed that
+     * exact envelope as its sole true endpoint consumer.
+     *
+     * A row that is present but past its `expiry_ms` reads as absent even
+     * before [`Self::prune_expired_consumed_hidden_msg_ids`] gets to it: the
+     * answer must not depend on when the prune last ran, and the safe
+     * direction for an aged-out row is "no evidence" (leave the relay copy
+     * alone).
+     */
+open func consumedHiddenMsgIdRecorded(msgId: Data, nowMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_consumed_hidden_msg_id_recorded(self.uniffiClonePointer(),
+        FfiConverterData.lower(msgId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * The canonical JPEG avatar bytes for a contact, if one has been synced.
      */
 open func contactAvatar(userId: Data)throws  -> Data? {
@@ -3297,6 +3427,73 @@ open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Dat
 }
     
     /**
+     * Record that this device consumed `msg_id` as the envelope's SOLE true
+     * endpoint consumer, for a kind that leaves no `messages` row to prove
+     * it with -- the growth half of the relay-mailbox problem that
+     * [`Self::core_relay_ack_ids_with_consumed`] then acts on.
+     *
+     * **Safety invariant this function exists to enforce, stated verbatim
+     * (DTN_TODOS.md §3.1): never ack a relay copy unless THIS device was the
+     * envelope's sole true endpoint consumer; when in doubt, don't ack.**
+     * Every row written here is a standing licence to DELETE a relay copy
+     * later, so a row must only be written when all of the following hold,
+     * and the function refuses (returns `false`, writes nothing) otherwise:
+     *
+     * 1. **The caller proved consumption.** Call this ONLY from the point
+     * where an envelope was opened with [`crate::open_message`] against
+     * this device's own identity key -- pairwise-sealed to us, so we are
+     * the only party who can open it -- AND the delivery path ran to
+     * completion. A deliberate discard by that path (blocked sender,
+     * unauthorized kind, unhandled kind) counts as consumption for the
+     * same reason it counts as `Consumed`: we were the endpoint and the
+     * envelope is finished with. A group-key open, a mule/carry, a failed
+     * open, or a delivery that threw must never reach this call.
+     * This one condition cannot be re-checked here -- it is the caller's
+     * contract, and it is why both shells call this from exactly one
+     * place each.
+     * 2. **The kind leaves no `messages` row**
+     * ([`crate::core_kind_persists_msg_id_row`]). Chat kinds already have
+     * durable evidence; duplicating it here would only grow the table.
+     * 3. **The `recipient_hint` is one of THIS device's own hints**, over
+     * the backward-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window
+     * ([`core_is_own_fanout_hint`]). This is the belt to condition 1's
+     * braces: a pairwise open already implies the envelope was sealed to
+     * us, and this additionally refuses anything whose *addressing* says
+     * it might be for someone else.
+     * 4. **The `recipient_hint` is not a group's shared hint.** A group hint
+     * names a row every member fetches, so it is never ackable by anyone
+     * -- checked here as well as at ack time, since a hint collision
+     * between our own id and a group's is unlikely but not impossible.
+     * 5. **The envelope has not already expired**, and its recorded expiry
+     * is clamped to [`MAX_CARRY_FUTURE_MS`] -- the same 30-day ceiling
+     * relayd clamps posts to. This is what bounds the table: a row cannot
+     * outlive the relay copy it vouches for.
+     *
+     * Recording is required on BOTH consumption paths -- mesh inbound
+     * (BLE/LAN) and relay-fetch inbound -- and both shells get that for free
+     * by calling from their single shared inbound-envelope processor: a
+     * relay-consumed hidden kind is then equally re-ackable if the same row
+     * is presented again (a cursor reset, or the periodic full sweep).
+     *
+     * Returns `true` if the set now vouches for `msg_id`. Callers should
+     * treat a `false` or an error as ordinary: failing to record costs a
+     * relay re-fetch, which is exactly the cost this whole mechanism trades
+     * against, and never costs a message.
+     */
+open func coreRecordConsumedHiddenMsgId(msgId: Data, kind: UInt8, recipientHint: Data, expiryMs: Int64, ownUserId: Data, nowMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_record_consumed_hidden_msg_id(self.uniffiClonePointer(),
+        FfiConverterData.lower(msgId),
+        FfiConverterUInt8.lower(kind),
+        FfiConverterData.lower(recipientHint),
+        FfiConverterInt64.lower(expiryMs),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * Relay ack ids for one poll pass, folding the consumed-SEEN rule
      * (DTN_TODOS.md §3.1) in on top of [`core_should_ack_inbound`]'s
      * Consumed/Expired rule -- so a device that has already consumed an
@@ -3310,12 +3507,25 @@ open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Dat
      * - [`CoreInboundDisposition::Carried`]: never ack -- the relay copy is
      * the durable fallback until the real recipient (or another proxy)
      * fetches it.
-     * - [`CoreInboundDisposition::Seen`]: look up
-     * [`Self::message_origin_by_msg_id`] for the item's `msg_id` and ack
-     * only if [`core_consumed_seen_is_ackable`] says so -- i.e. this
-     * device durably stored the envelope as a 1:1 message from someone
-     * else, not merely muled it, echoed its own message back, or read
-     * one copy of a shared-mailbox group envelope.
+     * - [`CoreInboundDisposition::Seen`]: gather two independent pieces of
+     * store evidence and ack only if
+     * [`core_consumed_seen_is_ackable_with_hidden`] says so:
+     * [`Self::message_origin_by_msg_id`] (did we durably store this exact
+     * envelope as a 1:1 message from someone else?) and, for the kinds
+     * that leave no such row, [`Self::consumed_hidden_msg_id_recorded`]
+     * together with an own-self-hint check on the fetched row's
+     * `recipient_hint`. Neither route acks something we merely muled,
+     * echoed back as our own outbound, or read one copy of out of a
+     * shared-mailbox group envelope.
+     *
+     * The own-self-hint check uses [`core_is_own_fanout_hint`], i.e. the
+     * BACKWARD-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window every other
+     * routing-time hint check uses -- deliberately NOT the forward-looking
+     * push-subscription variants ([`MessageStore::relay_self_push_hints`]).
+     * A forward day is safe for *subscribing* to a topic and wrong here:
+     * this is a claim about an envelope that already exists, and envelopes
+     * are only ever created with a backward-looking hint
+     * (`causal_order.rs`).
      *
      * Safety invariant, stated verbatim (DTN_TODOS.md §3.1): "never ack a
      * relay copy unless THIS device was the envelope's sole true endpoint
@@ -4117,6 +4327,21 @@ open func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64)throw
 open func pruneExpiredCarried(nowMs: Int64)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_prune_expired_carried(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Drop every consumed-hidden-kind record whose envelope expiry has
+     * passed. Member of the `prune_expired_*` family and called from the same
+     * places: once an envelope is expired its relay copy is ackable on the
+     * `Expired` disposition alone, so the record has nothing left to prove.
+     * Returns how many rows were pruned.
+     */
+open func pruneExpiredConsumedHiddenMsgIds(nowMs: Int64)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_prune_expired_consumed_hidden_msg_ids(self.uniffiClonePointer(),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -6710,19 +6935,24 @@ public struct CoreRelayEnvelopeDisposition {
     /**
      * Stable envelope id. Only consulted for [`CoreInboundDisposition::Seen`]
      * items, to look up whether THIS device durably consumed this exact
-     * envelope -- see [`MessageStore::core_relay_ack_ids_with_consumed`].
+     * envelope -- either as a `messages` row or, for a kind that leaves
+     * none, in the consumed-hidden-kind set. See
+     * [`MessageStore::core_relay_ack_ids_with_consumed`].
      */
     public var msgId: Data
     public var disposition: CoreInboundDisposition
     /**
      * This fetched envelope's `recipient_hint` off the §6.4 header --
      * whichever hint the fetch actually matched. Used by
-     * [`MessageStore::core_relay_ack_ids_with_consumed`] to recognize a
-     * legacy shared-mailbox group row (`specs/group-relay-durability.md`
-     * §5.2): a hint that matches one of THIS device's imported groups'
-     * recent-day hints, as opposed to a per-member fan-out row (addressed
-     * to a member's own hint, indistinguishable on the wire from ordinary
-     * 1:1 mail).
+     * [`MessageStore::core_relay_ack_ids_with_consumed`] for two checks.
+     * First, to recognize a legacy shared-mailbox group row
+     * (`specs/group-relay-durability.md` §5.2): a hint that matches one of
+     * THIS device's imported groups' recent-day hints, as opposed to a
+     * per-member fan-out row (addressed to a member's own hint,
+     * indistinguishable on the wire from ordinary 1:1 mail). Second, for a
+     * SEEN row with no `messages` row behind it, to confirm the row is
+     * addressed to one of this device's OWN recent-day hints before the
+     * consumed-hidden-kind evidence may ack it.
      */
     public var recipientHint: Data
 
@@ -6732,17 +6962,22 @@ public struct CoreRelayEnvelopeDisposition {
         /**
          * Stable envelope id. Only consulted for [`CoreInboundDisposition::Seen`]
          * items, to look up whether THIS device durably consumed this exact
-         * envelope -- see [`MessageStore::core_relay_ack_ids_with_consumed`].
+         * envelope -- either as a `messages` row or, for a kind that leaves
+         * none, in the consumed-hidden-kind set. See
+         * [`MessageStore::core_relay_ack_ids_with_consumed`].
          */msgId: Data, disposition: CoreInboundDisposition, 
         /**
          * This fetched envelope's `recipient_hint` off the §6.4 header --
          * whichever hint the fetch actually matched. Used by
-         * [`MessageStore::core_relay_ack_ids_with_consumed`] to recognize a
-         * legacy shared-mailbox group row (`specs/group-relay-durability.md`
-         * §5.2): a hint that matches one of THIS device's imported groups'
-         * recent-day hints, as opposed to a per-member fan-out row (addressed
-         * to a member's own hint, indistinguishable on the wire from ordinary
-         * 1:1 mail).
+         * [`MessageStore::core_relay_ack_ids_with_consumed`] for two checks.
+         * First, to recognize a legacy shared-mailbox group row
+         * (`specs/group-relay-durability.md` §5.2): a hint that matches one of
+         * THIS device's imported groups' recent-day hints, as opposed to a
+         * per-member fan-out row (addressed to a member's own hint,
+         * indistinguishable on the wire from ordinary 1:1 mail). Second, for a
+         * SEEN row with no `messages` row behind it, to confirm the row is
+         * addressed to one of this device's OWN recent-day hints before the
+         * consumed-hidden-kind evidence may ack it.
          */recipientHint: Data) {
         self.relayId = relayId
         self.msgId = msgId
@@ -12986,15 +13221,17 @@ public func contactDelivery(contactRelayUrl: String?, contactRelayToken: String?
  * incoming row, recognizable by the local storage convention that a 1:1
  * chat is keyed by the other party, so `chat_id == sender_user_id`:
  *
- * - `origin` is `None` -> NOT ackable. Either we never consumed it (merely
- * muled/flooded a copy -- the relay copy is the real recipient's durable
- * fallback), or it was a hidden kind -- receipts, profile sync, friend
- * requests/directory, group invites, LAN endpoint hints -- which are
- * stored (if at all) via the plain `insert_message` path that never
- * records a `msg_id`. Hidden kinds leave no durable trace tying a
- * specific `msg_id` to "we consumed it," so there is nothing to safely
- * vouch for them with -- correctness over bandwidth, per the invariant
- * on [`core_should_ack_inbound`].
+ * - `origin` is `None` -> NOT ackable *on this evidence*. Either we never
+ * consumed it (merely muled/flooded a copy -- the relay copy is the real
+ * recipient's durable fallback), or it was a hidden kind -- receipts,
+ * profile sync, friend requests/directory, group invites, LAN endpoint
+ * hints, relay-change notices -- which are stored (if at all) via the
+ * plain `insert_message` path that never records a `msg_id`. Hidden kinds
+ * leave no `messages` row tying a specific `msg_id` to "we consumed it",
+ * which is why they get a second, purpose-built evidence source instead:
+ * [`MessageStore::core_record_consumed_hidden_msg_id`], folded in by
+ * [`core_consumed_seen_is_ackable_with_hidden`]. This function stays
+ * `false` here so the `messages`-row rule remains readable on its own.
  * - `sender_user_id == own_user_id` -> NOT ackable. Our own outbound
  * message echoing back (own outbound `msg_id`s are seeded into the
  * gossip-dedupe set at startup, so a relay copy of our own envelope
@@ -13024,12 +13261,67 @@ public func contactDelivery(contactRelayUrl: String?, contactRelayToken: String?
  * Safety invariant, stated verbatim (DTN_TODOS.md §3.1): "never ack a
  * relay copy unless THIS device was the envelope's sole true endpoint
  * consumer; when in doubt, don't ack."
+ *
+ * The `origin is None` arm above is no longer the whole story for hidden
+ * kinds: they still leave no `messages` row, but this device now records
+ * their consumption separately, under the identical sole-consumer rule. See
+ * [`core_consumed_seen_is_ackable_with_hidden`], which is what
+ * [`MessageStore::core_relay_ack_ids_with_consumed`] actually calls; this
+ * function remains the `messages`-row half of that decision, unchanged.
  */
 public func coreConsumedSeenIsAckable(origin: MessageOrigin?, ownUserId: Data) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_consumed_seen_is_ackable(
         FfiConverterOptionTypeMessageOrigin.lower(origin),
         FfiConverterData.lower(ownUserId),$0
+    )
+})
+}
+/**
+ * The complete consumed-SEEN decision: [`core_consumed_seen_is_ackable`]'s
+ * `messages`-row evidence, OR the consumed-hidden-kind evidence this device
+ * records for the kinds that leave no such row.
+ *
+ * Why a second evidence source exists at all: receipts (two per message,
+ * delivered + read), profile sync, the friend directory, LAN endpoint hints,
+ * relay-change notices, group invites and friend requests are all delivered
+ * through paths that persist no `msg_id`
+ * ([`crate::core_kind_persists_msg_id_row`]). Flooding means a phone
+ * normally consumes them over Bluetooth first and only meets the relay copy
+ * later, as a SEEN dedupe -- with no row to vouch for it, so the copy sat in
+ * the mailbox until its 7-day expiry. In a real family mailbox that is most
+ * of the rows.
+ *
+ * The decision table, in full:
+ *
+ * - `origin` is `Some(..)` -> exactly [`core_consumed_seen_is_ackable`]'s
+ * answer, unchanged: a 1:1 incoming row from someone else is ackable; our
+ * own outbound echo and a group row are not. The hidden-kind evidence is
+ * deliberately not consulted in this arm -- an envelope cannot be both,
+ * and if a store ever disagreed with itself the un-acking answer is the
+ * one to keep.
+ * - `origin` is `None` AND `recorded_consumed_hidden` AND
+ * `hint_is_own_self_hint` -> ackable. All three are required:
+ * `recorded_consumed_hidden` means this device opened the envelope with
+ * its OWN pairwise key and consumed it (never muled it, never opened it
+ * with a shared group key), and `hint_is_own_self_hint` means the row the
+ * relay just handed back is addressed to one of this device's own
+ * backward-window hints, so it is a 1:1 row with exactly one reader rather
+ * than a shared group row that other members still need.
+ * - anything else -> NOT ackable, exactly as before.
+ *
+ * Safety invariant, restated because this function is where it now binds:
+ * never ack a relay copy unless THIS device was the envelope's sole true
+ * endpoint consumer; when in doubt, don't ack. Re-fetch churn is
+ * recoverable; a deleted relay copy is not.
+ */
+public func coreConsumedSeenIsAckableWithHidden(origin: MessageOrigin?, ownUserId: Data, recordedConsumedHidden: Bool, hintIsOwnSelfHint: Bool) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_consumed_seen_is_ackable_with_hidden(
+        FfiConverterOptionTypeMessageOrigin.lower(origin),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterBool.lower(recordedConsumedHidden),
+        FfiConverterBool.lower(hintIsOwnSelfHint),$0
     )
 })
 }
@@ -13266,6 +13558,37 @@ public func coreIsVisibleChatKind(kind: UInt8) -> Bool {
     )
 })
 }
+/**
+ * Whether delivering a consumed envelope of this `kind` leaves a durable
+ * `messages` row carrying the envelope's `msg_id` -- i.e. whether
+ * [`crate::MessageStore::message_origin_by_msg_id`] can later be asked "did
+ * THIS device consume that exact envelope?" and answer truthfully.
+ *
+ * Exactly the kinds delivered through `insert_incoming_message` (which takes
+ * a `msg_id`) qualify: 1:1 and group chat text, attachment manifests,
+ * reactions, and group metadata updates. Every other kind -- receipts,
+ * friend requests, group invites, profile sync, the friend directory, LAN
+ * endpoint hints, relay-change notices, and any kind a future build sends
+ * that this one drops as unhandled -- is delivered through paths that
+ * persist no `msg_id` (`insert_message`, or a store write of some other
+ * shape, or nothing at all). Those are the "hidden kinds" whose relay copies
+ * used to be unackable for lack of any evidence, and whose consumption is
+ * instead recorded by
+ * [`crate::MessageStore::core_record_consumed_hidden_msg_id`].
+ *
+ * Deliberately NOT the same set as [`core_is_hidden_spray_kind`], which
+ * answers a different question (which kinds ride `outbound_envelopes` with a
+ * NULL-`msg_id` row and so never advance a peer's DELIVERED watermark).
+ * `KIND_RECEIPT` is the highest-volume kind in a real mailbox and is hidden
+ * *here* while deliberately not being a hidden spray kind.
+ */
+public func coreKindPersistsMsgIdRow(kind: UInt8) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_kind_persists_msg_id_row(
+        FfiConverterUInt8.lower(kind),$0
+    )
+})
+}
 public func coreLanNetworkIdForComponents(components: [String]) -> String? {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_lan_network_id_for_components(
@@ -13370,8 +13693,8 @@ public func coreReactionSummariesByTarget(messages: [StoredMessage], ownUserId: 
  * consumed-SEEN rule (it has no store access to check it): a caller that
  * can look up message origins should prefer
  * [`MessageStore::core_relay_ack_ids_with_consumed`] instead, which folds
- * this same rule in and additionally acks the narrow SEEN case covered by
- * [`consumed_seen_is_ackable`].
+ * this same rule in and additionally acks the narrow SEEN cases covered by
+ * [`core_consumed_seen_is_ackable_with_hidden`].
  */
 public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
     return try!  FfiConverterSequenceInt64.lift(try! rustCall() {
@@ -13398,9 +13721,9 @@ public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
  * (durable storage of a message that was ours failed) is likewise never
  * acked, so the relay copy survives for the retry. [`CoreInboundDisposition::Seen`] also
  * returns `false` here, but it is NOT necessarily a dead end: see
- * [`consumed_seen_is_ackable`] and
- * [`MessageStore::core_relay_ack_ids_with_consumed`] for the narrow,
- * independently store-verified case where a Seen copy is still safe to
+ * [`core_consumed_seen_is_ackable_with_hidden`] and
+ * [`MessageStore::core_relay_ack_ids_with_consumed`] for the two narrow,
+ * independently store-verified cases where a Seen copy is still safe to
  * ack -- this function alone can't tell, since it has no store access.
  *
  * A `Consumed` group envelope was historically ackable here even though
@@ -14835,7 +15158,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_contact_delivery() != 40561) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable() != 8907) {
+    if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable() != 63440) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable_with_hidden() != 10881) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_contact_display_name() != 41746) {
@@ -14880,6 +15206,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_is_visible_chat_kind() != 47018) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_kind_persists_msg_id_row() != 53607) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_lan_network_id_for_components() != 6078) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14910,10 +15239,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_reaction_summaries_by_target() != 52182) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 13964) {
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 51054) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 45795) {
+    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 5043) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_subnet_24_hosts() != 3135) {
@@ -15399,6 +15728,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_relay_fetch_cursors() != 5399) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_consumed_hidden_msg_id_count() != 12326) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_consumed_hidden_msg_id_recorded() != 24623) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_avatar() != 36175) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15420,7 +15755,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 37814) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 62249) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_record_consumed_hidden_msg_id() != 37215) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 39762) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 22558) {
@@ -15562,6 +15900,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_carried() != 12206) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_consumed_hidden_msg_ids() != 10762) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_outbound_envelopes() != 46023) {

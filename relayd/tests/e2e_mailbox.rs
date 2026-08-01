@@ -422,6 +422,107 @@ async fn expiry_pruning_drops_stale_sealed_envelopes() {
     assert_eq!(body.content, b"still good");
 }
 
+/// The mailbox-growth fix, end to end against the real relay.
+///
+/// Receipts are the highest-volume kind and they leave no `messages` row, so
+/// a phone that consumed one over Bluetooth first used to have no way to
+/// vouch for the relay copy: it deduped as SEEN on every subsequent walk and
+/// sat there for the full expiry. This drives the whole loop for real --
+/// post, consume the "Bluetooth" copy, fetch, decide, ack -- and asserts the
+/// row is gone, while a second receipt this device never consumed survives
+/// untouched.
+#[tokio::test]
+async fn a_bluetooth_consumed_receipt_is_acked_off_the_relay_but_a_muled_one_is_not() {
+    use cruisemesh_core::{
+        core_kind_persists_msg_id_row, CoreInboundDisposition, CoreRelayEnvelopeDisposition,
+        MessageStore,
+    };
+
+    let alice = generate_identity();
+    let bob = generate_identity();
+    let (_db, app) = test_app(&["family-a"]);
+    let now = now_ms();
+
+    // Bob's delivered receipt for Alice's stream, sealed to Alice, plus a
+    // second one Alice will only ever see on the relay.
+    let consumed = author_receipt(
+        &bob,
+        &alice,
+        bob.user_id.clone(),
+        alice.user_id.clone(),
+        3,
+        RECEIPT_TYPE_DELIVERED,
+    );
+    let never_consumed = author_receipt(
+        &bob,
+        &alice,
+        bob.user_id.clone(),
+        alice.user_id.clone(),
+        4,
+        RECEIPT_TYPE_READ,
+    );
+    let consumed_id = post_envelope(&app, "family-a", &consumed).await["id"]
+        .as_i64()
+        .unwrap();
+    let survivor_id = post_envelope(&app, "family-a", &never_consumed).await["id"]
+        .as_i64()
+        .unwrap();
+
+    // Alice's phone meets Bob over Bluetooth and consumes the first receipt.
+    // That is the exact pair of calls both shells make at the one point they
+    // may vouch for an envelope: prove it was sealed to us, then record it.
+    let alice_store = MessageStore::open(":memory:".to_string()).unwrap();
+    let opened = open_message(alice.clone(), consumed.sealed.clone()).unwrap();
+    let body = decode_message_body(opened.payload).unwrap();
+    assert_eq!(body.kind, KIND_RECEIPT);
+    assert!(!core_kind_persists_msg_id_row(body.kind));
+    assert!(alice_store
+        .core_record_consumed_hidden_msg_id(
+            consumed.msg_id.clone(),
+            body.kind,
+            consumed.recipient_hint.clone(),
+            consumed.expiry_ms,
+            alice.user_id.clone(),
+            now,
+        )
+        .unwrap());
+
+    // Next relay walk: both rows come back and both dedupe to SEEN (the
+    // consumed one because it really is a duplicate; the other stands in for
+    // any row this device has no evidence for).
+    let page = get_envelopes(&app, "family-a", &[consumed.recipient_hint.clone()], 0).await;
+    let envs = page["envelopes"].as_array().unwrap();
+    assert_eq!(envs.len(), 2);
+
+    let items: Vec<CoreRelayEnvelopeDisposition> = envs
+        .iter()
+        .map(|env| CoreRelayEnvelopeDisposition {
+            relay_id: env["id"].as_i64().unwrap(),
+            msg_id: URL_SAFE_NO_PAD
+                .decode(env["msg_id"].as_str().unwrap())
+                .unwrap(),
+            disposition: CoreInboundDisposition::Seen,
+            recipient_hint: URL_SAFE_NO_PAD
+                .decode(env["recipient_hint"].as_str().unwrap())
+                .unwrap(),
+        })
+        .collect();
+    let acks = alice_store
+        .core_relay_ack_ids_with_consumed(items, alice.user_id.clone(), now)
+        .unwrap();
+    assert_eq!(acks, vec![consumed_id], "only the consumed copy is ackable");
+
+    assert_eq!(ack(&app, "family-a", &acks).await, 1);
+
+    // The consumed row is gone from the mailbox for good; the other one is
+    // still there for whoever still needs it.
+    let after = get_envelopes(&app, "family-a", &[consumed.recipient_hint.clone()], 0).await;
+    let remaining = after["envelopes"].as_array().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0]["id"].as_i64().unwrap(), survivor_id);
+    assert_eq!(remaining[0]["msg_id"], b64(&never_consumed.msg_id));
+}
+
 async fn spawn_app_with_router(tokens: &[&str]) -> (NamedTempFile, Router, String) {
     let db = NamedTempFile::new().unwrap();
     let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();

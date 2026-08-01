@@ -353,6 +353,36 @@ pub fn core_is_hidden_spray_kind(kind: u8) -> bool {
     )
 }
 
+/// Whether delivering a consumed envelope of this `kind` leaves a durable
+/// `messages` row carrying the envelope's `msg_id` -- i.e. whether
+/// [`crate::MessageStore::message_origin_by_msg_id`] can later be asked "did
+/// THIS device consume that exact envelope?" and answer truthfully.
+///
+/// Exactly the kinds delivered through `insert_incoming_message` (which takes
+/// a `msg_id`) qualify: 1:1 and group chat text, attachment manifests,
+/// reactions, and group metadata updates. Every other kind -- receipts,
+/// friend requests, group invites, profile sync, the friend directory, LAN
+/// endpoint hints, relay-change notices, and any kind a future build sends
+/// that this one drops as unhandled -- is delivered through paths that
+/// persist no `msg_id` (`insert_message`, or a store write of some other
+/// shape, or nothing at all). Those are the "hidden kinds" whose relay copies
+/// used to be unackable for lack of any evidence, and whose consumption is
+/// instead recorded by
+/// [`crate::MessageStore::core_record_consumed_hidden_msg_id`].
+///
+/// Deliberately NOT the same set as [`core_is_hidden_spray_kind`], which
+/// answers a different question (which kinds ride `outbound_envelopes` with a
+/// NULL-`msg_id` row and so never advance a peer's DELIVERED watermark).
+/// `KIND_RECEIPT` is the highest-volume kind in a real mailbox and is hidden
+/// *here* while deliberately not being a hidden spray kind.
+#[uniffi::export]
+pub fn core_kind_persists_msg_id_row(kind: u8) -> bool {
+    matches!(
+        kind,
+        KIND_TEXT | KIND_ATTACHMENT_MANIFEST | KIND_REACTION | KIND_GROUP_METADATA_UPDATE
+    )
+}
+
 const MSG_ID_LEN: usize = 16;
 const RECIPIENT_HINT_LEN: usize = 8;
 const LAN_INSTANCE_TOKEN_LEN: usize = 8;

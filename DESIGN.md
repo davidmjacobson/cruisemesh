@@ -428,6 +428,28 @@ A deliberately dumb mailbox:
 - Phones poll it whenever internet appears and also push all queued outbound —
   including envelopes they're muling for family members, which is how one phone with
   a Wi-Fi package uplinks the whole family.
+- **A row is deleted only by the phone that was its sole reader.** The ack
+  rule is deliberately narrow: a phone may delete a relay row only when it can
+  prove *it* was the envelope's sole true endpoint consumer, and when it
+  cannot prove that, it leaves the row alone. Re-fetching costs bandwidth; a
+  wrong delete costs someone their message. Proof comes from one of two
+  places. Chat messages leave a durable local row keyed by the envelope's
+  `msg_id`, so the phone can ask its own store "did I store this exact
+  envelope, as a 1:1 message from someone else?". Everything else — receipts
+  (two per message, and so the highest-volume traffic on the wire), profile
+  sync, friend requests and directory updates, group invites, LAN endpoint
+  hints, relay-change notices — persists no such row, so the phone instead
+  records the `msg_id` in a small dedicated set at the moment it opens the
+  envelope with its own key and consumes it. That set expires with the
+  envelopes it describes, so it stays bounded without any upkeep of its own.
+  Without it, those rows were undeletable *even though they had already been
+  delivered over Bluetooth* — which is most of what a real mailbox fills up
+  with. Still never acked, on purpose: anything merely muled for someone else
+  (the relay copy is that person's durable fallback), anything opened with a
+  shared group key or addressed to a group's shared hint (every member fetches
+  that row), a phone's own outbound copy echoing back (it exists for the
+  recipient), and anything whose local storage failed (it must be re-presented
+  and retried).
 - **Clients keep a fetch frontier, and sweep occasionally.** Most rows in a
   real mailbox are deliberately never acked — a proxy-fetched copy stays as the
   durable fallback, a legacy group-hint row is never acked at all — so the

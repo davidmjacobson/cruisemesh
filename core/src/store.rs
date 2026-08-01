@@ -3326,6 +3326,62 @@ impl MessageStore {
         Ok(pruned as u64)
     }
 
+    /// Whether `msg_id` is in the consumed-hidden-kind set -- i.e. this
+    /// device already recorded, via
+    /// [`Self::core_record_consumed_hidden_msg_id`], that it consumed that
+    /// exact envelope as its sole true endpoint consumer.
+    ///
+    /// A row that is present but past its `expiry_ms` reads as absent even
+    /// before [`Self::prune_expired_consumed_hidden_msg_ids`] gets to it: the
+    /// answer must not depend on when the prune last ran, and the safe
+    /// direction for an aged-out row is "no evidence" (leave the relay copy
+    /// alone).
+    pub fn consumed_hidden_msg_id_recorded(
+        &self,
+        msg_id: Vec<u8>,
+        now_ms: i64,
+    ) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM consumed_hidden_msg_ids
+                 WHERE msg_id = ?1 AND expiry_ms > ?2",
+                params![msg_id, now_ms],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(found.is_some())
+    }
+
+    /// Drop every consumed-hidden-kind record whose envelope expiry has
+    /// passed. Member of the `prune_expired_*` family and called from the same
+    /// places: once an envelope is expired its relay copy is ackable on the
+    /// `Expired` disposition alone, so the record has nothing left to prove.
+    /// Returns how many rows were pruned.
+    pub fn prune_expired_consumed_hidden_msg_ids(&self, now_ms: i64) -> Result<u64, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let pruned = conn
+            .execute(
+                "DELETE FROM consumed_hidden_msg_ids WHERE expiry_ms <= ?1",
+                params![now_ms],
+            )
+            .map_err(store_err)?;
+        Ok(pruned as u64)
+    }
+
+    /// Rows currently in the consumed-hidden-kind set, expired ones included
+    /// (diagnostics/tests).
+    pub fn consumed_hidden_msg_id_count(&self) -> Result<u64, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM consumed_hidden_msg_ids", [], |row| {
+                row.get(0)
+            })
+            .map_err(store_err)?;
+        Ok(count as u64)
+    }
+
     /// Number of envelopes currently in the carry queue (diagnostics/tests).
     pub fn carried_len(&self) -> Result<u64, CoreError> {
         let conn = lock_conn(&self.conn);
@@ -3364,6 +3420,92 @@ impl MessageStore {
             .query_map(params![now_ms, limit as i64], row_to_carried)
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+}
+
+/// Hard ceiling on `consumed_hidden_msg_ids` rows, as a backstop under the
+/// expiry bound rather than instead of it.
+///
+/// Ordinary traffic is nowhere near this: every row costs one envelope this
+/// device opened with its own key and consumed, and the whole set ages out
+/// within the envelope expiry (7 days by default). The cap exists for the one
+/// shape an *unknown* sender can drive -- [`crate::KIND_FRIEND_REQUEST`] and
+/// [`crate::KIND_INTRODUCED_FRIEND_REQUEST`] are deliberately accepted from
+/// strangers (see `core_pairwise_sender_authorized`), so without a ceiling a
+/// stranger could grow this table without an accepted contact relationship.
+/// Eviction drops the soonest-to-expire rows first, which is the safe
+/// direction: a dropped row can only cost a relay re-fetch, never a deletion.
+const CONSUMED_HIDDEN_MSG_ID_LIMIT: i64 = 20_000;
+
+/// Internal-only helpers, never exported over UniFFI.
+impl MessageStore {
+    /// Raw insert behind [`MessageStore::core_record_consumed_hidden_msg_id`],
+    /// which owns every safety condition. Deliberately `pub(crate)`: nothing
+    /// outside core may write this table, because a row here is a licence to
+    /// DELETE a relay copy and the licence is only valid under the sole-true-
+    /// endpoint-consumer rule that lives on the caller.
+    ///
+    /// Idempotent on `msg_id`, keeping the later expiry if the same envelope
+    /// is consumed twice with different clamps. Returns `true` when the set
+    /// now vouches for `msg_id`.
+    pub(crate) fn insert_consumed_hidden_msg_id(
+        &self,
+        msg_id: Vec<u8>,
+        expiry_ms: i64,
+    ) -> Result<bool, CoreError> {
+        self.insert_consumed_hidden_msg_id_capped(msg_id, expiry_ms, CONSUMED_HIDDEN_MSG_ID_LIMIT)
+    }
+
+    /// [`Self::insert_consumed_hidden_msg_id`] with the row cap injected, so
+    /// the eviction rule can be tested at a handful of rows instead of
+    /// [`CONSUMED_HIDDEN_MSG_ID_LIMIT`] of them.
+    pub(crate) fn insert_consumed_hidden_msg_id_capped(
+        &self,
+        msg_id: Vec<u8>,
+        expiry_ms: i64,
+        limit: i64,
+    ) -> Result<bool, CoreError> {
+        let mut conn = lock_conn(&self.conn);
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
+            "INSERT INTO consumed_hidden_msg_ids (msg_id, expiry_ms)
+             VALUES (?1, ?2)
+             ON CONFLICT(msg_id) DO UPDATE SET
+                 expiry_ms = MAX(expiry_ms, excluded.expiry_ms)",
+            params![&msg_id, expiry_ms],
+        )
+        .map_err(store_err)?;
+        // Only walk the eviction query when the table is actually over the
+        // cap. The count is an index-only scan of a table that ordinarily
+        // holds a few hundred rows; the eviction below is the expensive part
+        // and, outside an abuse case, never runs at all.
+        let rows: i64 = tx
+            .query_row("SELECT COUNT(*) FROM consumed_hidden_msg_ids", [], |row| {
+                row.get(0)
+            })
+            .map_err(store_err)?;
+        if rows > limit {
+            tx.execute(
+                "DELETE FROM consumed_hidden_msg_ids
+                 WHERE msg_id NOT IN (
+                     SELECT msg_id FROM consumed_hidden_msg_ids
+                     ORDER BY expiry_ms DESC, msg_id ASC
+                     LIMIT ?1
+                 )",
+                params![limit],
+            )
+            .map_err(store_err)?;
+        }
+        let kept: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM consumed_hidden_msg_ids WHERE msg_id = ?1",
+                params![&msg_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(kept.is_some())
     }
 }
 
@@ -4331,6 +4473,25 @@ CREATE TABLE IF NOT EXISTS relay_fetch_cursors (
     after_id      INTEGER NOT NULL DEFAULT 0,
     last_sweep_at INTEGER NOT NULL DEFAULT 0
 );
+
+-- `msg_id`s this device consumed as the envelope's SOLE true endpoint
+-- consumer, for kinds that leave no `messages` row to prove it with (see
+-- `core_kind_persists_msg_id_row`). Written only by
+-- `MessageStore::core_record_consumed_hidden_msg_id`, which owns the safety
+-- rule; read only by `core_relay_ack_ids_with_consumed`, which uses it to ack
+-- an already-consumed relay copy instead of re-fetching it until expiry.
+--
+-- Bounded by construction: `expiry_ms` is the envelope's own expiry (7 days
+-- by default, clamped to relayd's 30-day ceiling), and rows are dropped by
+-- `prune_expired_consumed_hidden_msg_ids` on the same schedule as every other
+-- expiry prune. A hard row cap backstops the one kind an unknown sender can
+-- inject (friend requests).
+CREATE TABLE IF NOT EXISTS consumed_hidden_msg_ids (
+    msg_id    BLOB PRIMARY KEY,
+    expiry_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consumed_hidden_expiry
+    ON consumed_hidden_msg_ids(expiry_ms);
 ";
 
 #[cfg(test)]
@@ -8724,6 +8885,115 @@ mod tests {
              one that overflows the budget, decoded only to learn its size) \
              account for the other two"
         );
+    }
+
+    #[test]
+    fn consumed_hidden_msg_ids_evict_the_soonest_to_expire_when_over_the_cap() {
+        // The cap is a backstop under the expiry bound (see
+        // CONSUMED_HIDDEN_MSG_ID_LIMIT). Eviction must drop the rows with the
+        // least life left, because a dropped row costs only a relay re-fetch.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for (id, expiry) in [(1_u8, 5_000_i64), (2, 1_000), (3, 9_000), (4, 3_000)] {
+            assert!(store
+                .insert_consumed_hidden_msg_id_capped(vec![id; 16], expiry, 3)
+                .unwrap());
+        }
+        assert_eq!(store.consumed_hidden_msg_id_count().unwrap(), 3);
+        // The 1_000-expiry row is the one that went.
+        assert!(!store
+            .consumed_hidden_msg_id_recorded(vec![2; 16], 0)
+            .unwrap());
+        for id in [1_u8, 3, 4] {
+            assert!(store
+                .consumed_hidden_msg_id_recorded(vec![id; 16], 0)
+                .unwrap());
+        }
+        // An insert that is itself the soonest to expire reports that it was
+        // NOT kept, so no caller ever believes in evidence that isn't there.
+        assert!(!store
+            .insert_consumed_hidden_msg_id_capped(vec![5; 16], 1, 3)
+            .unwrap());
+        assert_eq!(store.consumed_hidden_msg_id_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn consumed_hidden_msg_ids_keep_the_later_expiry_on_reinsert() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .insert_consumed_hidden_msg_id(vec![1; 16], 9_000)
+            .unwrap();
+        store
+            .insert_consumed_hidden_msg_id(vec![1; 16], 2_000)
+            .unwrap();
+        assert_eq!(store.consumed_hidden_msg_id_count().unwrap(), 1);
+        assert!(store
+            .consumed_hidden_msg_id_recorded(vec![1; 16], 8_999)
+            .unwrap());
+    }
+
+    #[test]
+    fn open_migrates_a_store_that_predates_the_consumed_hidden_msg_id_table() {
+        // A populated store written before this feature has no
+        // `consumed_hidden_msg_ids` table at all. Opening it must add the
+        // table without disturbing existing rows, and the new path must work
+        // against the migrated schema immediately.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cruisemesh-store-migration-consumed-hidden-{unique}.sqlite"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        {
+            let store = MessageStore::open(path_str.clone()).unwrap();
+            store
+                .insert_message(msg(b"bob", b"alice", 1, "before the upgrade"))
+                .unwrap();
+            store
+                .insert_consumed_hidden_msg_id(vec![1; 16], 9_000)
+                .unwrap();
+        }
+        // Simulate the older schema by removing the table (and its index)
+        // from the on-disk file, leaving everything else populated.
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_consumed_hidden_expiry;
+                 DROP TABLE IF EXISTS consumed_hidden_msg_ids;",
+            )
+            .unwrap();
+            let missing: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'consumed_hidden_msg_ids'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(missing, 0, "fixture must actually predate the table");
+        }
+
+        let store = MessageStore::open(path_str).unwrap();
+        assert_eq!(
+            store.messages_for_chat(b"bob".to_vec()).unwrap().len(),
+            1,
+            "migration must not disturb existing rows",
+        );
+        assert_eq!(store.consumed_hidden_msg_id_count().unwrap(), 0);
+        assert!(store
+            .insert_consumed_hidden_msg_id(vec![7; 16], 9_000)
+            .unwrap());
+        assert!(store
+            .consumed_hidden_msg_id_recorded(vec![7; 16], 1_000)
+            .unwrap());
+        assert_eq!(
+            store.prune_expired_consumed_hidden_msg_ids(9_000).unwrap(),
+            1
+        );
+
+        drop(store);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

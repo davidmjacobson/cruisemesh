@@ -112,17 +112,22 @@ pub struct CoreRelayEnvelopeDisposition {
     pub relay_id: i64,
     /// Stable envelope id. Only consulted for [`CoreInboundDisposition::Seen`]
     /// items, to look up whether THIS device durably consumed this exact
-    /// envelope -- see [`MessageStore::core_relay_ack_ids_with_consumed`].
+    /// envelope -- either as a `messages` row or, for a kind that leaves
+    /// none, in the consumed-hidden-kind set. See
+    /// [`MessageStore::core_relay_ack_ids_with_consumed`].
     pub msg_id: Vec<u8>,
     pub disposition: CoreInboundDisposition,
     /// This fetched envelope's `recipient_hint` off the §6.4 header --
     /// whichever hint the fetch actually matched. Used by
-    /// [`MessageStore::core_relay_ack_ids_with_consumed`] to recognize a
-    /// legacy shared-mailbox group row (`specs/group-relay-durability.md`
-    /// §5.2): a hint that matches one of THIS device's imported groups'
-    /// recent-day hints, as opposed to a per-member fan-out row (addressed
-    /// to a member's own hint, indistinguishable on the wire from ordinary
-    /// 1:1 mail).
+    /// [`MessageStore::core_relay_ack_ids_with_consumed`] for two checks.
+    /// First, to recognize a legacy shared-mailbox group row
+    /// (`specs/group-relay-durability.md` §5.2): a hint that matches one of
+    /// THIS device's imported groups' recent-day hints, as opposed to a
+    /// per-member fan-out row (addressed to a member's own hint,
+    /// indistinguishable on the wire from ordinary 1:1 mail). Second, for a
+    /// SEEN row with no `messages` row behind it, to confirm the row is
+    /// addressed to one of this device's OWN recent-day hints before the
+    /// consumed-hidden-kind evidence may ack it.
     pub recipient_hint: Vec<u8>,
 }
 
@@ -299,9 +304,9 @@ pub fn core_inbound_gate(
 /// (durable storage of a message that was ours failed) is likewise never
 /// acked, so the relay copy survives for the retry. [`CoreInboundDisposition::Seen`] also
 /// returns `false` here, but it is NOT necessarily a dead end: see
-/// [`consumed_seen_is_ackable`] and
-/// [`MessageStore::core_relay_ack_ids_with_consumed`] for the narrow,
-/// independently store-verified case where a Seen copy is still safe to
+/// [`core_consumed_seen_is_ackable_with_hidden`] and
+/// [`MessageStore::core_relay_ack_ids_with_consumed`] for the two narrow,
+/// independently store-verified cases where a Seen copy is still safe to
 /// ack -- this function alone can't tell, since it has no store access.
 ///
 /// A `Consumed` group envelope was historically ackable here even though
@@ -332,8 +337,8 @@ pub fn core_should_ack_inbound(disposition: CoreInboundDisposition) -> bool {
 /// consumed-SEEN rule (it has no store access to check it): a caller that
 /// can look up message origins should prefer
 /// [`MessageStore::core_relay_ack_ids_with_consumed`] instead, which folds
-/// this same rule in and additionally acks the narrow SEEN case covered by
-/// [`consumed_seen_is_ackable`].
+/// this same rule in and additionally acks the narrow SEEN cases covered by
+/// [`core_consumed_seen_is_ackable_with_hidden`].
 #[uniffi::export]
 pub fn core_relay_ack_ids(items: Vec<CoreRelayEnvelopeDisposition>) -> Vec<i64> {
     items
@@ -359,15 +364,17 @@ pub fn core_relay_ack_ids(items: Vec<CoreRelayEnvelopeDisposition>) -> Vec<i64> 
 /// incoming row, recognizable by the local storage convention that a 1:1
 /// chat is keyed by the other party, so `chat_id == sender_user_id`:
 ///
-/// - `origin` is `None` -> NOT ackable. Either we never consumed it (merely
-///   muled/flooded a copy -- the relay copy is the real recipient's durable
-///   fallback), or it was a hidden kind -- receipts, profile sync, friend
-///   requests/directory, group invites, LAN endpoint hints -- which are
-///   stored (if at all) via the plain `insert_message` path that never
-///   records a `msg_id`. Hidden kinds leave no durable trace tying a
-///   specific `msg_id` to "we consumed it," so there is nothing to safely
-///   vouch for them with -- correctness over bandwidth, per the invariant
-///   on [`core_should_ack_inbound`].
+/// - `origin` is `None` -> NOT ackable *on this evidence*. Either we never
+///   consumed it (merely muled/flooded a copy -- the relay copy is the real
+///   recipient's durable fallback), or it was a hidden kind -- receipts,
+///   profile sync, friend requests/directory, group invites, LAN endpoint
+///   hints, relay-change notices -- which are stored (if at all) via the
+///   plain `insert_message` path that never records a `msg_id`. Hidden kinds
+///   leave no `messages` row tying a specific `msg_id` to "we consumed it",
+///   which is why they get a second, purpose-built evidence source instead:
+///   [`MessageStore::core_record_consumed_hidden_msg_id`], folded in by
+///   [`core_consumed_seen_is_ackable_with_hidden`]. This function stays
+///   `false` here so the `messages`-row rule remains readable on its own.
 /// - `sender_user_id == own_user_id` -> NOT ackable. Our own outbound
 ///   message echoing back (own outbound `msg_id`s are seeded into the
 ///   gossip-dedupe set at startup, so a relay copy of our own envelope
@@ -397,6 +404,13 @@ pub fn core_relay_ack_ids(items: Vec<CoreRelayEnvelopeDisposition>) -> Vec<i64> 
 /// Safety invariant, stated verbatim (DTN_TODOS.md §3.1): "never ack a
 /// relay copy unless THIS device was the envelope's sole true endpoint
 /// consumer; when in doubt, don't ack."
+///
+/// The `origin is None` arm above is no longer the whole story for hidden
+/// kinds: they still leave no `messages` row, but this device now records
+/// their consumption separately, under the identical sole-consumer rule. See
+/// [`core_consumed_seen_is_ackable_with_hidden`], which is what
+/// [`MessageStore::core_relay_ack_ids_with_consumed`] actually calls; this
+/// function remains the `messages`-row half of that decision, unchanged.
 #[uniffi::export]
 pub fn core_consumed_seen_is_ackable(origin: Option<MessageOrigin>, own_user_id: Vec<u8>) -> bool {
     match origin {
@@ -405,6 +419,55 @@ pub fn core_consumed_seen_is_ackable(origin: Option<MessageOrigin>, own_user_id:
         }
         None => false,
     }
+}
+
+/// The complete consumed-SEEN decision: [`core_consumed_seen_is_ackable`]'s
+/// `messages`-row evidence, OR the consumed-hidden-kind evidence this device
+/// records for the kinds that leave no such row.
+///
+/// Why a second evidence source exists at all: receipts (two per message,
+/// delivered + read), profile sync, the friend directory, LAN endpoint hints,
+/// relay-change notices, group invites and friend requests are all delivered
+/// through paths that persist no `msg_id`
+/// ([`crate::core_kind_persists_msg_id_row`]). Flooding means a phone
+/// normally consumes them over Bluetooth first and only meets the relay copy
+/// later, as a SEEN dedupe -- with no row to vouch for it, so the copy sat in
+/// the mailbox until its 7-day expiry. In a real family mailbox that is most
+/// of the rows.
+///
+/// The decision table, in full:
+///
+/// - `origin` is `Some(..)` -> exactly [`core_consumed_seen_is_ackable`]'s
+///   answer, unchanged: a 1:1 incoming row from someone else is ackable; our
+///   own outbound echo and a group row are not. The hidden-kind evidence is
+///   deliberately not consulted in this arm -- an envelope cannot be both,
+///   and if a store ever disagreed with itself the un-acking answer is the
+///   one to keep.
+/// - `origin` is `None` AND `recorded_consumed_hidden` AND
+///   `hint_is_own_self_hint` -> ackable. All three are required:
+///   `recorded_consumed_hidden` means this device opened the envelope with
+///   its OWN pairwise key and consumed it (never muled it, never opened it
+///   with a shared group key), and `hint_is_own_self_hint` means the row the
+///   relay just handed back is addressed to one of this device's own
+///   backward-window hints, so it is a 1:1 row with exactly one reader rather
+///   than a shared group row that other members still need.
+/// - anything else -> NOT ackable, exactly as before.
+///
+/// Safety invariant, restated because this function is where it now binds:
+/// never ack a relay copy unless THIS device was the envelope's sole true
+/// endpoint consumer; when in doubt, don't ack. Re-fetch churn is
+/// recoverable; a deleted relay copy is not.
+#[uniffi::export]
+pub fn core_consumed_seen_is_ackable_with_hidden(
+    origin: Option<MessageOrigin>,
+    own_user_id: Vec<u8>,
+    recorded_consumed_hidden: bool,
+    hint_is_own_self_hint: bool,
+) -> bool {
+    if origin.is_some() {
+        return core_consumed_seen_is_ackable(origin, own_user_id);
+    }
+    recorded_consumed_hidden && hint_is_own_self_hint
 }
 
 /// A link may establish its identity once. Repeating the same HELLO is
@@ -712,12 +775,25 @@ impl MessageStore {
     /// - [`CoreInboundDisposition::Carried`]: never ack -- the relay copy is
     ///   the durable fallback until the real recipient (or another proxy)
     ///   fetches it.
-    /// - [`CoreInboundDisposition::Seen`]: look up
-    ///   [`Self::message_origin_by_msg_id`] for the item's `msg_id` and ack
-    ///   only if [`core_consumed_seen_is_ackable`] says so -- i.e. this
-    ///   device durably stored the envelope as a 1:1 message from someone
-    ///   else, not merely muled it, echoed its own message back, or read
-    ///   one copy of a shared-mailbox group envelope.
+    /// - [`CoreInboundDisposition::Seen`]: gather two independent pieces of
+    ///   store evidence and ack only if
+    ///   [`core_consumed_seen_is_ackable_with_hidden`] says so:
+    ///   [`Self::message_origin_by_msg_id`] (did we durably store this exact
+    ///   envelope as a 1:1 message from someone else?) and, for the kinds
+    ///   that leave no such row, [`Self::consumed_hidden_msg_id_recorded`]
+    ///   together with an own-self-hint check on the fetched row's
+    ///   `recipient_hint`. Neither route acks something we merely muled,
+    ///   echoed back as our own outbound, or read one copy of out of a
+    ///   shared-mailbox group envelope.
+    ///
+    /// The own-self-hint check uses [`core_is_own_fanout_hint`], i.e. the
+    /// BACKWARD-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window every other
+    /// routing-time hint check uses -- deliberately NOT the forward-looking
+    /// push-subscription variants ([`MessageStore::relay_self_push_hints`]).
+    /// A forward day is safe for *subscribing* to a topic and wrong here:
+    /// this is a claim about an envelope that already exists, and envelopes
+    /// are only ever created with a backward-looking hint
+    /// (`causal_order.rs`).
     ///
     /// Safety invariant, stated verbatim (DTN_TODOS.md §3.1): "never ack a
     /// relay copy unless THIS device was the envelope's sole true endpoint
@@ -766,13 +842,112 @@ impl MessageStore {
                 continue;
             }
             if item.disposition == CoreInboundDisposition::Seen {
-                let origin = self.message_origin_by_msg_id(item.msg_id)?;
-                if core_consumed_seen_is_ackable(origin, own_user_id.clone()) {
+                let origin = self.message_origin_by_msg_id(item.msg_id.clone())?;
+                // Only pay for the hidden-kind lookups when the cheap
+                // `messages`-row route has nothing to say (the common case
+                // for chat mail is `Some(..)`, which short-circuits).
+                let (recorded_hidden, hint_is_own) = if origin.is_none() {
+                    (
+                        self.consumed_hidden_msg_id_recorded(item.msg_id, now_ms)?,
+                        core_is_own_fanout_hint(item.recipient_hint, own_user_id.clone(), now_ms),
+                    )
+                } else {
+                    (false, false)
+                };
+                if core_consumed_seen_is_ackable_with_hidden(
+                    origin,
+                    own_user_id.clone(),
+                    recorded_hidden,
+                    hint_is_own,
+                ) {
                     acked.push(item.relay_id);
                 }
             }
         }
         Ok(acked)
+    }
+
+    /// Record that this device consumed `msg_id` as the envelope's SOLE true
+    /// endpoint consumer, for a kind that leaves no `messages` row to prove
+    /// it with -- the growth half of the relay-mailbox problem that
+    /// [`Self::core_relay_ack_ids_with_consumed`] then acts on.
+    ///
+    /// **Safety invariant this function exists to enforce, stated verbatim
+    /// (DTN_TODOS.md §3.1): never ack a relay copy unless THIS device was the
+    /// envelope's sole true endpoint consumer; when in doubt, don't ack.**
+    /// Every row written here is a standing licence to DELETE a relay copy
+    /// later, so a row must only be written when all of the following hold,
+    /// and the function refuses (returns `false`, writes nothing) otherwise:
+    ///
+    /// 1. **The caller proved consumption.** Call this ONLY from the point
+    ///    where an envelope was opened with [`crate::open_message`] against
+    ///    this device's own identity key -- pairwise-sealed to us, so we are
+    ///    the only party who can open it -- AND the delivery path ran to
+    ///    completion. A deliberate discard by that path (blocked sender,
+    ///    unauthorized kind, unhandled kind) counts as consumption for the
+    ///    same reason it counts as `Consumed`: we were the endpoint and the
+    ///    envelope is finished with. A group-key open, a mule/carry, a failed
+    ///    open, or a delivery that threw must never reach this call.
+    ///    This one condition cannot be re-checked here -- it is the caller's
+    ///    contract, and it is why both shells call this from exactly one
+    ///    place each.
+    /// 2. **The kind leaves no `messages` row**
+    ///    ([`crate::core_kind_persists_msg_id_row`]). Chat kinds already have
+    ///    durable evidence; duplicating it here would only grow the table.
+    /// 3. **The `recipient_hint` is one of THIS device's own hints**, over
+    ///    the backward-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window
+    ///    ([`core_is_own_fanout_hint`]). This is the belt to condition 1's
+    ///    braces: a pairwise open already implies the envelope was sealed to
+    ///    us, and this additionally refuses anything whose *addressing* says
+    ///    it might be for someone else.
+    /// 4. **The `recipient_hint` is not a group's shared hint.** A group hint
+    ///    names a row every member fetches, so it is never ackable by anyone
+    ///    -- checked here as well as at ack time, since a hint collision
+    ///    between our own id and a group's is unlikely but not impossible.
+    /// 5. **The envelope has not already expired**, and its recorded expiry
+    ///    is clamped to [`MAX_CARRY_FUTURE_MS`] -- the same 30-day ceiling
+    ///    relayd clamps posts to. This is what bounds the table: a row cannot
+    ///    outlive the relay copy it vouches for.
+    ///
+    /// Recording is required on BOTH consumption paths -- mesh inbound
+    /// (BLE/LAN) and relay-fetch inbound -- and both shells get that for free
+    /// by calling from their single shared inbound-envelope processor: a
+    /// relay-consumed hidden kind is then equally re-ackable if the same row
+    /// is presented again (a cursor reset, or the periodic full sweep).
+    ///
+    /// Returns `true` if the set now vouches for `msg_id`. Callers should
+    /// treat a `false` or an error as ordinary: failing to record costs a
+    /// relay re-fetch, which is exactly the cost this whole mechanism trades
+    /// against, and never costs a message.
+    pub fn core_record_consumed_hidden_msg_id(
+        &self,
+        msg_id: Vec<u8>,
+        kind: u8,
+        recipient_hint: Vec<u8>,
+        expiry_ms: i64,
+        own_user_id: Vec<u8>,
+        now_ms: i64,
+    ) -> Result<bool, CoreError> {
+        if msg_id.is_empty() || recipient_hint.is_empty() || own_user_id.is_empty() {
+            return Ok(false);
+        }
+        if crate::protocol::core_kind_persists_msg_id_row(kind) {
+            return Ok(false);
+        }
+        if expiry_ms <= now_ms {
+            return Ok(false);
+        }
+        if !core_is_own_fanout_hint(recipient_hint.clone(), own_user_id, now_ms) {
+            return Ok(false);
+        }
+        if !self
+            .groups_matching_hint(recipient_hint, now_ms)?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        let expiry = expiry_ms.min(now_ms.saturating_add(MAX_CARRY_FUTURE_MS));
+        self.insert_consumed_hidden_msg_id(msg_id, expiry)
     }
 }
 
@@ -1003,6 +1178,464 @@ mod tests {
             .core_relay_ack_ids_with_consumed(items, own_user_id, 1_000)
             .unwrap();
         assert_eq!(acked, vec![100, 500]);
+    }
+
+    // -- consumed hidden-kind relay ack rule --------------------------------
+
+    const HIDDEN_NOW: i64 = 1_700_000_000_000;
+
+    /// Store fixture for the hidden-kind tests: an empty store plus this
+    /// device's own user id.
+    fn hidden_store() -> (MessageStore, Vec<u8>) {
+        (
+            MessageStore::open(":memory:".to_string()).unwrap(),
+            vec![0x09_u8; 16],
+        )
+    }
+
+    fn own_hint_at(own: &[u8], days_ago: i64) -> Vec<u8> {
+        compute_recipient_hint(own.to_vec(), HIDDEN_NOW - days_ago * MS_PER_DAY)
+    }
+
+    /// A relay-fetched SEEN row with an explicit `recipient_hint`.
+    fn seen_at_hint(relay_id: i64, msg_id: Vec<u8>, hint: Vec<u8>) -> CoreRelayEnvelopeDisposition {
+        CoreRelayEnvelopeDisposition {
+            relay_id,
+            msg_id,
+            disposition: CoreInboundDisposition::Seen,
+            recipient_hint: hint,
+        }
+    }
+
+    #[test]
+    fn consumed_seen_with_hidden_needs_both_the_record_and_an_own_hint() {
+        let own = vec![0x09_u8; 16];
+        // The full None-origin truth table: only "recorded AND own hint" acks.
+        assert!(core_consumed_seen_is_ackable_with_hidden(
+            None,
+            own.clone(),
+            true,
+            true
+        ));
+        assert!(!core_consumed_seen_is_ackable_with_hidden(
+            None,
+            own.clone(),
+            true,
+            false
+        ));
+        assert!(!core_consumed_seen_is_ackable_with_hidden(
+            None,
+            own.clone(),
+            false,
+            true
+        ));
+        assert!(!core_consumed_seen_is_ackable_with_hidden(
+            None,
+            own.clone(),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn consumed_seen_with_hidden_defers_to_the_messages_row_whenever_one_exists() {
+        let own = vec![0x09_u8; 16];
+        let them = vec![0x01_u8; 16];
+        // A 1:1 row is ackable on its own evidence, hidden flags irrelevant.
+        let one_to_one = MessageOrigin {
+            chat_id: them.clone(),
+            sender_user_id: them,
+        };
+        assert!(core_consumed_seen_is_ackable_with_hidden(
+            Some(one_to_one),
+            own.clone(),
+            false,
+            false
+        ));
+        // A group row is NOT ackable, and the hidden evidence must not be
+        // able to override that -- the un-acking answer always wins.
+        let group_row = MessageOrigin {
+            chat_id: vec![0x77_u8; 16],
+            sender_user_id: vec![0x01_u8; 16],
+        };
+        assert!(!core_consumed_seen_is_ackable_with_hidden(
+            Some(group_row),
+            own.clone(),
+            true,
+            true
+        ));
+        // Our own outbound echo likewise stays un-ackable.
+        let own_echo = MessageOrigin {
+            chat_id: vec![0x01_u8; 16],
+            sender_user_id: own.clone(),
+        };
+        assert!(!core_consumed_seen_is_ackable_with_hidden(
+            Some(own_echo),
+            own,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn recording_accepts_a_receipt_consumed_under_our_own_hint() {
+        let (store, own) = hidden_store();
+        let msg_id = vec![0x21_u8; 16];
+        assert!(store
+            .core_record_consumed_hidden_msg_id(
+                msg_id.clone(),
+                KIND_RECEIPT,
+                own_hint_at(&own, 0),
+                HIDDEN_NOW + crate::DEFAULT_EXPIRY_MS,
+                own.clone(),
+                HIDDEN_NOW,
+            )
+            .unwrap());
+        assert!(store
+            .consumed_hidden_msg_id_recorded(msg_id.clone(), HIDDEN_NOW)
+            .unwrap());
+        // Idempotent: consuming a second copy of the same envelope is a no-op
+        // that still leaves the set vouching for it.
+        assert!(store
+            .core_record_consumed_hidden_msg_id(
+                msg_id,
+                KIND_RECEIPT,
+                own_hint_at(&own, 0),
+                HIDDEN_NOW + crate::DEFAULT_EXPIRY_MS,
+                own,
+                HIDDEN_NOW,
+            )
+            .unwrap());
+        assert_eq!(store.consumed_hidden_msg_id_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn recording_accepts_an_own_hint_from_anywhere_in_the_backward_window() {
+        let (store, own) = hidden_store();
+        // An envelope authored a week ago and only now consumed still carries
+        // its creation-day hint; the backward window must cover it.
+        for days_ago in 0..=CARRY_HINT_DAY_WINDOW_DAYS {
+            let msg_id = vec![days_ago as u8; 16];
+            assert!(
+                store
+                    .core_record_consumed_hidden_msg_id(
+                        msg_id,
+                        KIND_RECEIPT,
+                        own_hint_at(&own, days_ago),
+                        HIDDEN_NOW + 60_000,
+                        own.clone(),
+                        HIDDEN_NOW,
+                    )
+                    .unwrap(),
+                "day {days_ago} of the carry window must be recordable",
+            );
+        }
+        // One day past the window is not one of our hints any more.
+        assert!(!store
+            .core_record_consumed_hidden_msg_id(
+                vec![0xFF; 16],
+                KIND_RECEIPT,
+                own_hint_at(&own, CARRY_HINT_DAY_WINDOW_DAYS + 1),
+                HIDDEN_NOW + 60_000,
+                own,
+                HIDDEN_NOW,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn recording_refuses_a_group_hint_a_foreign_hint_a_chat_kind_and_a_dead_envelope() {
+        let own = vec![0x09_u8; 16];
+        let (store, group_id) = store_with_group(vec![own.clone(), vec![0x01; 16]]);
+        let live_expiry = HIDDEN_NOW + crate::DEFAULT_EXPIRY_MS;
+
+        // A group's shared hint: that row is every member's, never ours alone.
+        assert!(!store
+            .core_record_consumed_hidden_msg_id(
+                vec![0x01; 16],
+                KIND_RECEIPT,
+                compute_recipient_hint(group_id, HIDDEN_NOW),
+                live_expiry,
+                own.clone(),
+                HIDDEN_NOW,
+            )
+            .unwrap());
+
+        // A hint that isn't ours at all -- what a muled/proxy-fetched
+        // envelope carries. We are not its endpoint; the real recipient
+        // still needs the relay copy.
+        assert!(!store
+            .core_record_consumed_hidden_msg_id(
+                vec![0x02; 16],
+                KIND_RECEIPT,
+                compute_recipient_hint(vec![0x01_u8; 16], HIDDEN_NOW),
+                live_expiry,
+                own.clone(),
+                HIDDEN_NOW,
+            )
+            .unwrap());
+
+        // Chat kinds already leave a `messages` row; recording them here
+        // would only grow the table for no new evidence.
+        for kind in [
+            KIND_TEXT,
+            KIND_ATTACHMENT_MANIFEST,
+            KIND_REACTION,
+            crate::KIND_GROUP_METADATA_UPDATE,
+        ] {
+            assert!(
+                !store
+                    .core_record_consumed_hidden_msg_id(
+                        vec![kind; 16],
+                        kind,
+                        own_hint_at(&own, 0),
+                        live_expiry,
+                        own.clone(),
+                        HIDDEN_NOW,
+                    )
+                    .unwrap(),
+                "kind {kind} persists a messages row and must not be recorded",
+            );
+        }
+
+        // Already expired: the relay copy is ackable on `Expired` alone, so
+        // there is nothing for a record to prove.
+        assert!(!store
+            .core_record_consumed_hidden_msg_id(
+                vec![0x03; 16],
+                KIND_RECEIPT,
+                own_hint_at(&own, 0),
+                HIDDEN_NOW,
+                own.clone(),
+                HIDDEN_NOW,
+            )
+            .unwrap());
+
+        // Degenerate inputs fail closed rather than writing a row that could
+        // later license a delete.
+        assert!(!store
+            .core_record_consumed_hidden_msg_id(
+                Vec::new(),
+                KIND_RECEIPT,
+                own_hint_at(&own, 0),
+                live_expiry,
+                own.clone(),
+                HIDDEN_NOW,
+            )
+            .unwrap());
+        assert!(!store
+            .core_record_consumed_hidden_msg_id(
+                vec![0x04; 16],
+                KIND_RECEIPT,
+                Vec::new(),
+                live_expiry,
+                own,
+                HIDDEN_NOW,
+            )
+            .unwrap());
+        assert_eq!(store.consumed_hidden_msg_id_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn recording_clamps_the_stored_expiry_to_the_relay_retention_ceiling() {
+        let (store, own) = hidden_store();
+        let msg_id = vec![0x31_u8; 16];
+        // An attacker-authored far-future expiry must not buy a permanent row.
+        assert!(store
+            .core_record_consumed_hidden_msg_id(
+                msg_id.clone(),
+                KIND_RECEIPT,
+                own_hint_at(&own, 0),
+                HIDDEN_NOW + 10 * 365 * MS_PER_DAY,
+                own,
+                HIDDEN_NOW,
+            )
+            .unwrap());
+        let ceiling = HIDDEN_NOW + MAX_CARRY_FUTURE_MS;
+        assert!(store
+            .consumed_hidden_msg_id_recorded(msg_id.clone(), ceiling - 1)
+            .unwrap());
+        assert!(!store
+            .consumed_hidden_msg_id_recorded(msg_id, ceiling)
+            .unwrap());
+    }
+
+    #[test]
+    fn recorded_hidden_kinds_expire_and_are_pruned_with_the_envelope() {
+        let (store, own) = hidden_store();
+        let short = vec![0x41_u8; 16];
+        let long = vec![0x42_u8; 16];
+        store
+            .core_record_consumed_hidden_msg_id(
+                short.clone(),
+                KIND_RECEIPT,
+                own_hint_at(&own, 0),
+                HIDDEN_NOW + 1_000,
+                own.clone(),
+                HIDDEN_NOW,
+            )
+            .unwrap();
+        store
+            .core_record_consumed_hidden_msg_id(
+                long.clone(),
+                KIND_PROFILE_SYNC,
+                own_hint_at(&own, 0),
+                HIDDEN_NOW + crate::DEFAULT_EXPIRY_MS,
+                own,
+                HIDDEN_NOW,
+            )
+            .unwrap();
+
+        // A row past its expiry reads as absent even before the prune runs:
+        // the answer must not depend on prune timing.
+        assert!(!store
+            .consumed_hidden_msg_id_recorded(short.clone(), HIDDEN_NOW + 1_000)
+            .unwrap());
+        assert_eq!(store.consumed_hidden_msg_id_count().unwrap(), 2);
+
+        assert_eq!(
+            store
+                .prune_expired_consumed_hidden_msg_ids(HIDDEN_NOW + 1_000)
+                .unwrap(),
+            1,
+        );
+        assert_eq!(store.consumed_hidden_msg_id_count().unwrap(), 1);
+        assert!(store
+            .consumed_hidden_msg_id_recorded(long, HIDDEN_NOW + 1_000)
+            .unwrap());
+        assert!(!store
+            .consumed_hidden_msg_id_recorded(short, HIDDEN_NOW)
+            .unwrap());
+    }
+
+    #[test]
+    fn relay_ack_ids_with_consumed_acks_a_ble_consumed_receipt_but_not_an_unrecorded_one() {
+        // The field symptom this whole mechanism exists for: a receipt (the
+        // highest-volume kind) consumed over BLE first, whose relay copy then
+        // dedupes as SEEN on the next mailbox walk. Before the consumed-set
+        // it was unackable and sat there for the full 7-day expiry.
+        let (store, own) = hidden_store();
+        let consumed_receipt = vec![0x51_u8; 16];
+        let never_seen_here = vec![0x52_u8; 16];
+        store
+            .core_record_consumed_hidden_msg_id(
+                consumed_receipt.clone(),
+                KIND_RECEIPT,
+                own_hint_at(&own, 0),
+                HIDDEN_NOW + crate::DEFAULT_EXPIRY_MS,
+                own.clone(),
+                HIDDEN_NOW,
+            )
+            .unwrap();
+
+        let items = vec![
+            seen_at_hint(100, consumed_receipt.clone(), own_hint_at(&own, 0)),
+            // Same shape, never recorded: this is what a copy we only muled
+            // past looks like, and it must stay in the mailbox.
+            seen_at_hint(200, never_seen_here, own_hint_at(&own, 0)),
+            // Recorded, but the relay handed it back under a hint that is not
+            // ours -- so this row is not the one we consumed. Never ack.
+            seen_at_hint(
+                300,
+                consumed_receipt.clone(),
+                compute_recipient_hint(vec![0x01_u8; 16], HIDDEN_NOW),
+            ),
+        ];
+        let acked = store
+            .core_relay_ack_ids_with_consumed(items, own.clone(), HIDDEN_NOW)
+            .unwrap();
+        assert_eq!(acked, vec![100]);
+
+        // And once the envelope's expiry has passed, the evidence lapses with
+        // it -- by then the row is ackable as Expired instead.
+        let later = HIDDEN_NOW + crate::DEFAULT_EXPIRY_MS + 1;
+        let acked = store
+            .core_relay_ack_ids_with_consumed(
+                vec![seen_at_hint(100, consumed_receipt, own_hint_at(&own, 0))],
+                own,
+                later,
+            )
+            .unwrap();
+        assert!(acked.is_empty());
+    }
+
+    #[test]
+    fn a_recorded_hidden_kind_is_never_acked_under_a_group_hint() {
+        // Belt-and-braces against the one way a recorded msg_id could still
+        // name a row other members depend on: the relay hands the row back
+        // under a group's shared hint. The legacy-group-row rule must win
+        // over the consumed evidence.
+        let own = vec![0x09_u8; 16];
+        let (store, group_id) = store_with_group(vec![own.clone(), vec![0x01; 16]]);
+        let msg_id = vec![0x61_u8; 16];
+        store
+            .core_record_consumed_hidden_msg_id(
+                msg_id.clone(),
+                KIND_GROUP_INVITE,
+                own_hint_at(&own, 0),
+                HIDDEN_NOW + crate::DEFAULT_EXPIRY_MS,
+                own.clone(),
+                HIDDEN_NOW,
+            )
+            .unwrap();
+        let items = vec![seen_at_hint(
+            700,
+            msg_id,
+            compute_recipient_hint(group_id, HIDDEN_NOW),
+        )];
+        assert!(store
+            .core_relay_ack_ids_with_consumed(items, own, HIDDEN_NOW)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn the_messages_row_ack_path_is_unchanged_by_the_hidden_set() {
+        // Regression guard for the pre-existing rule: a 1:1 chat message
+        // consumed over BLE still acks with no hidden record at all, and a
+        // group `messages` row still does not.
+        let (store, own) = hidden_store();
+        let them = vec![0x01_u8; 16];
+        let one_to_one = vec![0x71_u8; 16];
+        let group_row = vec![0x72_u8; 16];
+        store
+            .insert_incoming_message(
+                crate::StoredMessage {
+                    chat_id: them.clone(),
+                    sender_user_id: them,
+                    lamport: 1,
+                    timestamp: 1,
+                    kind: KIND_TEXT,
+                    payload: b"hi".to_vec(),
+                },
+                one_to_one.clone(),
+                None,
+            )
+            .unwrap();
+        store
+            .insert_incoming_message(
+                crate::StoredMessage {
+                    chat_id: vec![0x77_u8; 16],
+                    sender_user_id: vec![0x02_u8; 16],
+                    lamport: 1,
+                    timestamp: 1,
+                    kind: KIND_TEXT,
+                    payload: b"hi all".to_vec(),
+                },
+                group_row.clone(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.consumed_hidden_msg_id_count().unwrap(), 0);
+
+        let items = vec![
+            seen_at_hint(10, one_to_one, own_hint_at(&own, 0)),
+            seen_at_hint(20, group_row, own_hint_at(&own, 0)),
+        ];
+        let acked = store
+            .core_relay_ack_ids_with_consumed(items, own, HIDDEN_NOW)
+            .unwrap();
+        assert_eq!(acked, vec![10]);
     }
 
     // -- D6 group relay durability (specs/group-relay-durability.md) --------

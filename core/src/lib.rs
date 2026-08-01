@@ -49,10 +49,11 @@ pub use content::{
 pub use crypto::{open_message, seal_message, OpenedMessage};
 pub use deep_link::{deep_link_route, DeepLinkRoute};
 pub use engine::{
+    core_consumed_seen_is_ackable, core_consumed_seen_is_ackable_with_hidden,
     core_group_fanout_rows, core_hello_identity_matches, core_inbound_gate,
-    core_pairwise_sender_authorized, core_relay_ack_ids, core_should_ack_inbound,
-    CoreDigestSprayPlan, CoreGroupFanoutRow, CoreInboundDisposition, CoreInboundGate,
-    CoreRelayEnvelopeDisposition, MAX_CARRY_FUTURE_MS,
+    core_is_own_fanout_hint, core_pairwise_sender_authorized, core_relay_ack_ids,
+    core_should_ack_inbound, CoreDigestSprayPlan, CoreGroupFanoutRow, CoreInboundDisposition,
+    CoreInboundGate, CoreRelayEnvelopeDisposition, MAX_CARRY_FUTURE_MS,
 };
 pub use framing::{
     ble_att_header_overhead, ble_default_att_mtu, ble_max_att_value_len, fragment_ble_frame,
@@ -83,16 +84,16 @@ pub use link_detect::{
     core_detect_links, core_link_openable_scheme, CoreDetectedLink, CoreLinkScheme,
 };
 pub use protocol::{
-    compute_recipient_hint, core_is_hidden_spray_kind, core_own_capabilities,
-    create_introduction_ticket, decode_extended_message_body, decode_friend_directory_content,
-    decode_introduced_friend_request, decode_lan_endpoint_content, decode_message_body,
-    decode_profile_sync_content, decode_receipt_content, decode_relay_update_content,
-    default_expiry, encode_digest, encode_envelope_frame, encode_friend_directory_content,
-    encode_hello, encode_hello2, encode_introduced_friend_request, encode_lan_endpoint,
-    encode_lan_endpoint_content, encode_message_body, encode_message_body_with_reply,
-    encode_profile_sync_content, encode_receipt_content, encode_relay_update_content,
-    encode_transport_probe, fanout_msg_id, generate_msg_id, parse_frame,
-    verify_introduction_ticket, ExtendedMessageBody, Frame, FriendDirectoryContent,
+    compute_recipient_hint, core_is_hidden_spray_kind, core_kind_persists_msg_id_row,
+    core_own_capabilities, create_introduction_ticket, decode_extended_message_body,
+    decode_friend_directory_content, decode_introduced_friend_request, decode_lan_endpoint_content,
+    decode_message_body, decode_profile_sync_content, decode_receipt_content,
+    decode_relay_update_content, default_expiry, encode_digest, encode_envelope_frame,
+    encode_friend_directory_content, encode_hello, encode_hello2, encode_introduced_friend_request,
+    encode_lan_endpoint, encode_lan_endpoint_content, encode_message_body,
+    encode_message_body_with_reply, encode_profile_sync_content, encode_receipt_content,
+    encode_relay_update_content, encode_transport_probe, fanout_msg_id, generate_msg_id,
+    parse_frame, verify_introduction_ticket, ExtendedMessageBody, Frame, FriendDirectoryContent,
     FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket, LanEndpointContent,
     MessageBody, ProfileSyncContent, ReceiptContent, RelayUpdateContent, SuggestedFriendCard,
     CAP_ACKS_HIDDEN_KINDS, CAP_RELAY_UPDATE, DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL,
