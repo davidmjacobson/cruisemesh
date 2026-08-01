@@ -409,7 +409,7 @@ internal class InboundEnvelopeProcessor(
             return finishAdmission(CoreInboundDisposition.CARRIED, terminal = carried)
         }
         val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
-        try {
+        val consumedKind = try {
             deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
         } catch (e: CoreException) {
             // T4-06: [deliverOpenedEnvelope] does not swallow store exceptions
@@ -422,9 +422,48 @@ internal class InboundEnvelopeProcessor(
             Log.w(TAG, "Deferring envelope from $sourceLabel: durable delivery failed (${e.message})")
             return finishAdmission(CoreInboundDisposition.FAILED, terminal = false)
         }
+        // The ONE place this device may vouch for a hidden kind's relay copy:
+        // reaching here means [openMessage] succeeded against our own identity
+        // key (so the envelope was pairwise-sealed to us and nobody else can
+        // open it) and delivery ran to completion. Both consumption paths pass
+        // through here -- BLE/LAN frames and [handleRelayEnvelope] alike -- so
+        // a relay-consumed hidden kind is equally re-ackable if the mailbox
+        // ever re-presents it. See
+        // [MessageStore.coreRecordConsumedHiddenMsgId] for every condition
+        // core re-checks and for why anything unprovable must not be recorded.
+        if (consumedKind != null) {
+            recordConsumedHiddenKind(envelope, consumedKind, identity)
+        }
         // DTN D4: reaching here means the message was durably stored -- safe,
         // and required, to record.
         return finishAdmission(CoreInboundDisposition.CONSUMED, terminal = true)
+    }
+
+    /**
+     * Best-effort note that this device consumed [envelope] as its sole true
+     * endpoint consumer, so a later relay copy of the same `msg_id` can be
+     * acked away instead of sitting in the mailbox until expiry.
+     *
+     * Deliberately swallows store failures: a missing record costs one relay
+     * re-fetch, which is precisely the cost this mechanism trades against,
+     * and must never turn into a failed delivery. Core owns every safety
+     * condition (kind, own-hint, group-hint, expiry) and simply declines to
+     * write a row when one doesn't hold, so this call site's only job is to
+     * be reached exclusively from the proven-consumption path above.
+     */
+    private fun recordConsumedHiddenKind(envelope: Frame.Envelope, kind: UByte, identity: Identity) {
+        try {
+            store.coreRecordConsumedHiddenMsgId(
+                envelope.msgId,
+                kind,
+                envelope.recipientHint,
+                envelope.expiry,
+                identity.userId,
+                System.currentTimeMillis(),
+            )
+        } catch (e: CoreException) {
+            Log.w(TAG, "Failed to record consumed hidden-kind msg_id: ${e.message}")
+        }
     }
 
     private fun messageArrival(
@@ -688,6 +727,14 @@ internal class InboundEnvelopeProcessor(
      * `body.chatId == opened.senderUserId` is the correct sanity check here.
      * Reached only for envelopes addressed to us; foreign traffic never gets
      * here (see [processInboundEnvelope]).
+     *
+     * Returns the body's `kind` once it is known, or `null` if the body could
+     * not even be decoded. Every other early return still reports its kind:
+     * a deliberate discard (blocked sender, unauthorized sender, unhandled
+     * kind) is consumption by an endpoint that is finished with the envelope,
+     * which is exactly what [processInboundEnvelope] treats as CONSUMED and
+     * what may be recorded as a consumed hidden kind. Only "we could not tell
+     * what this was" withholds that.
      */
     private fun deliverOpenedEnvelope(
         address: String,
@@ -696,12 +743,12 @@ internal class InboundEnvelopeProcessor(
         identity: Identity,
         arrival: MessageArrival,
         msgId: ByteArray,
-    ) {
+    ): UByte? {
         val extendedBody = try {
             decodeExtendedMessageBody(opened.payload)
         } catch (e: CoreException) {
             Log.w(TAG, "Dropping envelope from $address: failed to decode body (${e.message})")
-            return
+            return null
         }
         val body = MessageBody(
             kind = extendedBody.kind,
@@ -712,7 +759,7 @@ internal class InboundEnvelopeProcessor(
         )
         if (!body.chatId.contentEquals(opened.senderUserId)) {
             Log.w(TAG, "Dropping envelope from $address: chatId does not match the verified sender")
-            return
+            return body.kind
         }
         val senderIsContact = store.getContact(opened.senderUserId) != null
         if (
@@ -723,7 +770,7 @@ internal class InboundEnvelopeProcessor(
             )
         ) {
             Log.w(TAG, "Dropping envelope from $address: sender is not authorized for kind=${body.kind}")
-            return
+            return body.kind
         }
 
         // Blocked identities are dropped before ANY kind handler runs: a
@@ -733,7 +780,7 @@ internal class InboundEnvelopeProcessor(
         // discard is consumption, so the mailbox doesn't refetch it forever.
         if (store.isUserBlocked(opened.senderUserId)) {
             Log.i(TAG, "Dropping envelope from $address: sender is blocked")
-            return
+            return body.kind
         }
 
         when (body.kind) {
@@ -799,6 +846,7 @@ internal class InboundEnvelopeProcessor(
             )
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
         }
+        return body.kind
     }
 
     private fun handleIncomingLanEndpointHint(

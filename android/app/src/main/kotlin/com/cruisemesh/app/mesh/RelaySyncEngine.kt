@@ -441,6 +441,10 @@ internal class RelaySyncEngine(
         store.pruneExpiredOutboundEnvelopes(now)
         store.pruneExpiredOutgoingReceiptEnvelopes(now)
         store.pruneExpiredCarried(now)
+        // Same expiry-driven family: once an envelope is expired its relay
+        // copy is ackable on the EXPIRED disposition alone, so the record that
+        // this device consumed it has nothing left to prove.
+        store.pruneExpiredConsumedHiddenMsgIds(now)
         val contacts = store.listContacts()
         val fallbackConfig = RelayConfigStore.load(context)
         // Bind this whole pass to a validated network when the default can't be
@@ -701,9 +705,12 @@ internal class RelaySyncEngine(
      * delivery to its real recipient, and the relay copy remains the durable
      * fallback until they (or another proxy) fetch and consume it, or it
      * expires. A SEEN envelope this device already consumed as a 1:1 message
-     * over BLE/LAN is now also acked (DTN_TODOS.md §3.1) instead of being
-     * re-fetched on every pass until expiry -- see
-     * [CoreRelayEnvelopeDisposition]'s KDoc for the exact rule.
+     * over BLE/LAN is also acked (DTN_TODOS.md §3.1) instead of being
+     * re-fetched on every pass until expiry -- including receipts and the
+     * other service kinds that leave no `messages` row, on the strength of
+     * the consumed-set [InboundEnvelopeProcessor] records under the same
+     * sole-endpoint-consumer rule. See [CoreRelayEnvelopeDisposition]'s KDoc
+     * and [MessageStore.coreRecordConsumedHiddenMsgId] for the exact rule.
      *
      * ### Where the walk starts (the persistent frontier)
      *

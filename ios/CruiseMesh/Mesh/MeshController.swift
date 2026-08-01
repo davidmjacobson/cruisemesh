@@ -822,8 +822,9 @@ final class MeshController: ObservableObject {
             senderUserId: opened.senderUserId,
             receivedHopTtl: hopTtl
         )
+        let consumedKind: UInt8?
         do {
-            try deliverOpened(
+            consumedKind = try deliverOpened(
                 sourceLabel: sourceLabel,
                 sourceAddress: sourceAddress,
                 opened: opened,
@@ -835,9 +836,56 @@ final class MeshController: ObservableObject {
             log.warning("Deferring envelope from \(sourceLabel, privacy: .public): durable delivery failed")
             return .failed
         }
+        // The ONE place this device may vouch for a hidden kind's relay copy:
+        // reaching here means `openMessage` succeeded against our own identity
+        // key (so the envelope was pairwise-sealed to us and nobody else can
+        // open it) and delivery ran to completion. Both consumption paths pass
+        // through here -- BLE/LAN frames and relay-fetched envelopes alike --
+        // so a relay-consumed hidden kind is equally re-ackable if the mailbox
+        // ever re-presents it. Mirrors InboundEnvelopeProcessor.kt; see
+        // `coreRecordConsumedHiddenMsgId` for every condition core re-checks
+        // and for why anything unprovable must not be recorded.
+        if let consumedKind {
+            recordConsumedHiddenKind(
+                msgId: msgId,
+                kind: consumedKind,
+                recipientHint: recipientHint,
+                expiry: expiry,
+                identity: identity,
+                now: now
+            )
+        }
         // DTN D4: delivery ran to completion -- safe, and required, to record.
         GossipState.seenIds.record(msgId: msgId)
         return .consumed
+    }
+
+    /// Best-effort note that this device consumed this envelope as its sole
+    /// true endpoint consumer, so a later relay copy of the same `msgId` can
+    /// be acked away instead of sitting in the mailbox until expiry.
+    ///
+    /// Deliberately swallows store failures: a missing record costs one relay
+    /// re-fetch, which is precisely the cost this mechanism trades against,
+    /// and must never turn into a failed delivery. Core owns every safety
+    /// condition (kind, own-hint, group-hint, expiry) and simply declines to
+    /// write a row when one doesn't hold, so this call site's only job is to
+    /// be reached exclusively from the proven-consumption path above.
+    private func recordConsumedHiddenKind(
+        msgId: Data,
+        kind: UInt8,
+        recipientHint: Data,
+        expiry: Int64,
+        identity: Identity,
+        now: Int64
+    ) {
+        _ = try? store.coreRecordConsumedHiddenMsgId(
+            msgId: msgId,
+            kind: kind,
+            recipientHint: recipientHint,
+            expiryMs: expiry,
+            ownUserId: identity.userId,
+            nowMs: now
+        )
     }
 
     private func messageArrival(
@@ -890,6 +938,15 @@ final class MeshController: ObservableObject {
         return nil
     }
 
+    /// Returns the body's `kind` once it is known, or `nil` if the body could
+    /// not even be decoded. Every other early return still reports its kind:
+    /// a deliberate discard (blocked sender, unauthorized sender, unhandled
+    /// kind) is consumption by an endpoint that is finished with the envelope,
+    /// which is exactly what `processInboundEnvelope` treats as `.consumed`
+    /// and what may be recorded as a consumed hidden kind. Only "we could not
+    /// tell what this was" withholds that. Mirrors
+    /// InboundEnvelopeProcessor.kt's `deliverOpenedEnvelope`.
+    @discardableResult
     private func deliverOpened(
         sourceLabel: String,
         sourceAddress: String?,
@@ -897,14 +954,14 @@ final class MeshController: ObservableObject {
         identity: Identity,
         msgId: Data,
         arrival: MessageArrival
-    ) throws {
+    ) throws -> UInt8? {
         let extendedBody: ExtendedMessageBody
         do {
             extendedBody = try decodeExtendedMessageBody(bytes: opened.payload)
         } catch {
             // Undecodable body from a verified sender: deterministic reject,
             // terminal handled state (not a store failure).
-            return
+            return nil
         }
         let body = MessageBody(
             kind: extendedBody.kind,
@@ -913,7 +970,7 @@ final class MeshController: ObservableObject {
             timestamp: extendedBody.timestamp,
             content: extendedBody.content
         )
-        guard body.chatId == opened.senderUserId else { return }
+        guard body.chatId == opened.senderUserId else { return body.kind }
         let senderIsContact = (try? store.getContact(userId: opened.senderUserId)) != nil
         guard corePairwiseSenderAuthorized(
             kind: body.kind,
@@ -921,7 +978,7 @@ final class MeshController: ObservableObject {
             senderIsSelf: opened.senderUserId == identity.userId
         ) else {
             log.warning("Dropping pairwise envelope from unauthorized sender on \(sourceLabel, privacy: .public)")
-            return
+            return body.kind
         }
 
         // Blocked identities are dropped before ANY kind handler runs: a
@@ -931,7 +988,7 @@ final class MeshController: ObservableObject {
         // discard is consumption, so the mailbox doesn't refetch it forever.
         if (try? store.isUserBlocked(userId: opened.senderUserId)) == true {
             log.info("Dropping envelope from blocked sender on \(sourceLabel, privacy: .public)")
-            return
+            return body.kind
         }
 
         switch body.kind {
@@ -1006,6 +1063,7 @@ final class MeshController: ObservableObject {
         default:
             log.info("Unhandled kind=\(body.kind) from \(sourceLabel, privacy: .public)")
         }
+        return body.kind
     }
 
     /// Delivers a group-sealed envelope we opened with an imported group key
@@ -2489,6 +2547,10 @@ final class MeshController: ObservableObject {
             _ = try store.pruneExpiredOutgoingReceiptEnvelopes(nowMs: now)
             _ = try store.pruneExpiredOutboundEnvelopes(nowMs: now)
             _ = try store.pruneExpiredCarried(nowMs: now)
+            // Same expiry-driven family: once an envelope is expired its relay
+            // copy is ackable on the `.expired` disposition alone, so the
+            // record that this device consumed it has nothing left to prove.
+            _ = try store.pruneExpiredConsumedHiddenMsgIds(nowMs: now)
             let contacts = try store.listContacts()
             let contactsById = Dictionary(
                 uniqueKeysWithValues: contacts.map { ($0.userId, $0) }
