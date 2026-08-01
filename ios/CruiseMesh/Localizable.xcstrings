@@ -211,6 +211,16 @@
         }
       }
     },
+    "Bluetooth audio connected": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bluetooth audio connected"
+          }
+        }
+      }
+    },
     "Cancel": {
       "localizations": {
         "en": {
@@ -617,6 +627,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Display name"
+          }
+        }
+      }
+    },
+    "Don't show this again": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Don't show this again"
           }
         }
       }
@@ -2037,6 +2057,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Test encrypted LAN link"
+          }
+        }
+      }
+    },
+    "The mesh is still running, but wireless earbuds/speakers can slow nearby delivery. Watch for glitches.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The mesh is still running, but wireless earbuds/speakers can slow nearby delivery. Watch for glitches."
           }
         }
       }
