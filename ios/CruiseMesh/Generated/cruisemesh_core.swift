@@ -9573,6 +9573,12 @@ public func FfiConverterTypePeerConnectionEvent_lower(_ value: PeerConnectionEve
 }
 
 
+/**
+ * The newest moment each kind of evidence was recorded for one peer on one
+ * path. `last_delivered_at_ms` is OUR message reaching THEM (their receipt
+ * came back); `last_received_at_ms` is THEIR visible chat message reaching
+ * US. Both are `None` until the corresponding event has actually happened.
+ */
 public struct PeerConnectionSummary {
     public var userId: Data
     public var transport: PeerConnectionTransport
@@ -9580,16 +9586,18 @@ public struct PeerConnectionSummary {
     public var lastDisconnectedAtMs: Int64?
     public var lastSeenAtMs: Int64?
     public var lastDeliveredAtMs: Int64?
+    public var lastReceivedAtMs: Int64?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(userId: Data, transport: PeerConnectionTransport, lastConnectedAtMs: Int64?, lastDisconnectedAtMs: Int64?, lastSeenAtMs: Int64?, lastDeliveredAtMs: Int64?) {
+    public init(userId: Data, transport: PeerConnectionTransport, lastConnectedAtMs: Int64?, lastDisconnectedAtMs: Int64?, lastSeenAtMs: Int64?, lastDeliveredAtMs: Int64?, lastReceivedAtMs: Int64?) {
         self.userId = userId
         self.transport = transport
         self.lastConnectedAtMs = lastConnectedAtMs
         self.lastDisconnectedAtMs = lastDisconnectedAtMs
         self.lastSeenAtMs = lastSeenAtMs
         self.lastDeliveredAtMs = lastDeliveredAtMs
+        self.lastReceivedAtMs = lastReceivedAtMs
     }
 }
 
@@ -9615,6 +9623,9 @@ extension PeerConnectionSummary: Equatable, Hashable {
         if lhs.lastDeliveredAtMs != rhs.lastDeliveredAtMs {
             return false
         }
+        if lhs.lastReceivedAtMs != rhs.lastReceivedAtMs {
+            return false
+        }
         return true
     }
 
@@ -9625,6 +9636,7 @@ extension PeerConnectionSummary: Equatable, Hashable {
         hasher.combine(lastDisconnectedAtMs)
         hasher.combine(lastSeenAtMs)
         hasher.combine(lastDeliveredAtMs)
+        hasher.combine(lastReceivedAtMs)
     }
 }
 
@@ -9641,7 +9653,8 @@ public struct FfiConverterTypePeerConnectionSummary: FfiConverterRustBuffer {
                 lastConnectedAtMs: FfiConverterOptionInt64.read(from: &buf), 
                 lastDisconnectedAtMs: FfiConverterOptionInt64.read(from: &buf), 
                 lastSeenAtMs: FfiConverterOptionInt64.read(from: &buf), 
-                lastDeliveredAtMs: FfiConverterOptionInt64.read(from: &buf)
+                lastDeliveredAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                lastReceivedAtMs: FfiConverterOptionInt64.read(from: &buf)
         )
     }
 
@@ -9652,6 +9665,7 @@ public struct FfiConverterTypePeerConnectionSummary: FfiConverterRustBuffer {
         FfiConverterOptionInt64.write(value.lastDisconnectedAtMs, into: &buf)
         FfiConverterOptionInt64.write(value.lastSeenAtMs, into: &buf)
         FfiConverterOptionInt64.write(value.lastDeliveredAtMs, into: &buf)
+        FfiConverterOptionInt64.write(value.lastReceivedAtMs, into: &buf)
     }
 }
 
@@ -11861,6 +11875,16 @@ extension FriendCardMatch: Equatable, Hashable {}
 /**
  * A metadata-only connection event. No addresses, network names, tokens, or
  * message content are retained.
+ *
+ * The two message kinds are opposite directions and must not be confused --
+ * getting them the wrong way round is a user-visible lie, since the
+ * Connection details screen names them:
+ * - [`PeerConnectionEventKind::MessageDelivered`]: a message *we sent* reached
+ * *them*. Recorded when their delivery receipt comes back, so the peer named
+ * on the event is the one who received our message.
+ * - [`PeerConnectionEventKind::MessageReceived`]: a message *they sent* reached
+ * *us*. Recorded where a genuinely visible inbound chat message is stored,
+ * never for receipts, profile sync, relay updates or any other hidden kind.
  */
 
 public enum PeerConnectionEventKind {
@@ -11869,6 +11893,7 @@ public enum PeerConnectionEventKind {
     case disconnected
     case presenceSeen
     case messageDelivered
+    case messageReceived
 }
 
 
@@ -11889,6 +11914,8 @@ public struct FfiConverterTypePeerConnectionEventKind: FfiConverterRustBuffer {
         case 3: return .presenceSeen
         
         case 4: return .messageDelivered
+        
+        case 5: return .messageReceived
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -11912,6 +11939,10 @@ public struct FfiConverterTypePeerConnectionEventKind: FfiConverterRustBuffer {
         
         case .messageDelivered:
             writeInt(&buf, Int32(4))
+        
+        
+        case .messageReceived:
+            writeInt(&buf, Int32(5))
         
         }
     }
@@ -14005,6 +14036,19 @@ public func coreParseLanEndpointLink(fragment: String?) -> CoreLanEndpoint? {
     )
 })
 }
+/**
+ * Maps the [`MessageArrival::transport`] encoding (0/1 BLE direct/muled,
+ * 2 relay, 3/4 LAN direct/muled) onto the coarse, privacy-preserving path
+ * shown in connection history. Lives in core so both shells label an arrival
+ * identically -- the mapping used to be copy-pasted per platform.
+ */
+public func corePeerTransportForArrival(transport: UInt8) -> PeerConnectionTransport {
+    return try!  FfiConverterTypePeerConnectionTransport.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_peer_transport_for_arrival(
+        FfiConverterUInt8.lower(transport),$0
+    )
+})
+}
 public func coreReactionSummariesByTarget(messages: [StoredMessage], ownUserId: Data) -> [CoreReactionTargetSummary] {
     return try!  FfiConverterSequenceTypeCoreReactionTargetSummary.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_reaction_summaries_by_target(
@@ -15728,6 +15772,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_parse_lan_endpoint_link() != 63195) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_peer_transport_for_arrival() != 37624) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_reaction_summaries_by_target() != 52182) {

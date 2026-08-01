@@ -32,7 +32,6 @@ import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.PeerConnectionEventKind
-import uniffi.cruisemesh_core.PeerConnectionTransport
 import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OpenedMessage
@@ -43,6 +42,7 @@ import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.coreInboundGate
 import uniffi.cruisemesh_core.coreIsOwnFanoutHint
 import uniffi.cruisemesh_core.corePairwiseSenderAuthorized
+import uniffi.cruisemesh_core.corePeerTransportForArrival
 import uniffi.cruisemesh_core.decodeExtendedMessageBody
 import uniffi.cruisemesh_core.decodeFriendDirectoryContent
 import uniffi.cruisemesh_core.decodeGroupInviteContent
@@ -1048,6 +1048,7 @@ internal class InboundEnvelopeProcessor(
             "Stored group kind=${body.kind} in ${group.name} from $address " +
                 "sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
         )
+        recordInboundChatArrival(senderUserId, body.kind, arrival)
         ChatEvents.notifyChatChanged(group.id)
 
         // Local read watermark only (group wire receipts are deferred). Uses
@@ -1622,6 +1623,7 @@ internal class InboundEnvelopeProcessor(
             Log.i(TAG, "Stored a message from unrecognized userId=${UserIdHex.encode(senderUserId)}; no receipt/notification")
             return
         }
+        recordInboundChatArrival(senderUserId, kind, arrival)
 
         relayQueueChanged = queueOutgoingReceiptForRelay(
             identity = identity,
@@ -1658,6 +1660,40 @@ internal class InboundEnvelopeProcessor(
                 else -> body.content.toString(Charsets.UTF_8)
             }
             announcer.announceDirectMessage(contact, preview)
+        }
+    }
+
+    /**
+     * Records that a friend's own message landed on this phone, for the
+     * Connection details screen.
+     *
+     * Deliberately narrow. Only kinds a person actually sees in a
+     * conversation count ([isVisibleChatKind]) -- receipts, profile sync,
+     * relay updates, endpoint hints, reactions and every other hidden kind
+     * are machine chatter and would make the screen claim a friend had
+     * written when nobody did. Unknown senders are skipped too: the screen
+     * only lists friends, so an event for anyone else could never be shown
+     * against a name.
+     *
+     * Best-effort: connection history is a diagnostic, never worth failing a
+     * real message delivery over.
+     */
+    private fun recordInboundChatArrival(
+        senderUserId: ByteArray,
+        kind: UByte,
+        arrival: MessageArrival,
+    ) {
+        if (!isVisibleChatKind(kind)) return
+        if (store.getContact(senderUserId) == null) return
+        runCatching {
+            store.recordPeerConnectionEvent(
+                senderUserId,
+                corePeerTransportForArrival(arrival.transport),
+                PeerConnectionEventKind.MESSAGE_RECEIVED,
+                arrival.receivedAt,
+            )
+        }.onFailure { error ->
+            Log.w(TAG, "Could not record inbound arrival in connection history: ${error.message}")
         }
     }
 
@@ -1738,13 +1774,12 @@ internal class InboundEnvelopeProcessor(
                     deliveredAtMs = arrival.receivedAt,
                     viaTransport = arrival.transport,
                 )
+                // MESSAGE_DELIVERED is the OUTBOUND direction: this receipt
+                // proves a message *we* sent reached them. The inbound
+                // direction is recorded in handleIncomingChatMessage.
                 store.recordPeerConnectionEvent(
                     envelopeSenderUserId,
-                    when (arrival.transport.toInt()) {
-                        0, 1 -> PeerConnectionTransport.BLUETOOTH
-                        3, 4 -> PeerConnectionTransport.LOCAL_WIFI
-                        else -> PeerConnectionTransport.CRUISE_PASS
-                    },
+                    corePeerTransportForArrival(arrival.transport),
                     PeerConnectionEventKind.MESSAGE_DELIVERED,
                     arrival.receivedAt,
                 )

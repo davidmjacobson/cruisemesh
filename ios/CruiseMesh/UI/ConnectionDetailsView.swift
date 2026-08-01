@@ -197,62 +197,59 @@ struct ConnectionDetailsView: View {
     private func personStatus(_ contact: Contact) -> String {
         switch connectivity.directPaths[contact.userId] {
         case .localWifi:
-            return "Connected now via local Wi-Fi"
+            return String(localized: "Connected now via local Wi-Fi")
         case .bluetooth:
-            return "Connected now via Bluetooth"
+            return String(localized: "Connected now via Bluetooth")
         case nil:
             break
         }
         let rows = summaries.filter { $0.userId == contact.userId }
-        guard let latest = rows.max(by: { summaryTime($0) < summaryTime($1) }),
-              summaryTime(latest) > 0 else {
-            return "No connection history yet"
+        guard let latest = ConnectionActivityLogic.latestPeerStatus(rows) else {
+            return String(localized: "No connection history yet")
         }
-        return summaryText(latest)
+        let path = transportLabel(latest.transport)
+        let time = formatTime(latest.atMs)
+        switch latest.evidence {
+        // "Sent you a message" is THEIR message landing here; "Received your
+        // message" is a message THIS phone sent arriving at theirs. Swapping
+        // them is the bug this wording exists to prevent.
+        case .messageReceived:
+            return String(localized: "Sent you a message via \(path) · \(time)")
+        case .messageDelivered:
+            return String(localized: "Received your message via \(path) · \(time)")
+        case .presenceSeen:
+            return String(localized: "Seen online through \(path) · \(time)")
+        case .connected:
+            return String(localized: "Last connected via \(path) · \(time)")
+        case .disconnected:
+            return String(localized: "Last disconnected from \(path) · \(time)")
+        }
     }
 
     private func eventText(_ event: PeerConnectionEvent) -> String {
         let name = contacts.first(where: { $0.userId == event.userId })
-            .map { coreContactDisplayName(contact: $0) } ?? "Friend"
-        let action: String
-        switch event.kind {
-        case .connected: action = "connected"
-        case .disconnected: action = "disconnected"
-        case .presenceSeen: action = "was reachable"
-        case .messageDelivered: action = "message arrived"
+            .map { coreContactDisplayName(contact: $0) } ?? String(localized: "Friend")
+        let path = transportLabel(event.transport)
+        let time = formatTime(event.occurredAtMs)
+        switch ConnectionActivityLogic.evidence(of: event.kind) {
+        case .messageReceived:
+            return String(localized: "\(name) sent you a message via \(path) · \(time)")
+        case .messageDelivered:
+            return String(localized: "\(name) received your message via \(path) · \(time)")
+        case .presenceSeen:
+            return String(localized: "\(name) was reachable via \(path) · \(time)")
+        case .connected:
+            return String(localized: "\(name) connected via \(path) · \(time)")
+        case .disconnected:
+            return String(localized: "\(name) disconnected via \(path) · \(time)")
         }
-        return "\(name) \(action) via \(transportLabel(event.transport)) · \(formatTime(event.occurredAtMs))"
-    }
-
-    private func summaryTime(_ summary: PeerConnectionSummary) -> Int64 {
-        [
-            summary.lastConnectedAtMs,
-            summary.lastDisconnectedAtMs,
-            summary.lastSeenAtMs,
-            summary.lastDeliveredAtMs,
-        ].compactMap { $0 }.max() ?? 0
-    }
-
-    private func summaryText(_ summary: PeerConnectionSummary) -> String {
-        let timestamp = summaryTime(summary)
-        let evidence: String
-        if summary.lastDeliveredAtMs == timestamp {
-            evidence = "Message arrived via \(transportLabel(summary.transport))"
-        } else if summary.lastSeenAtMs == timestamp {
-            evidence = "Seen online through \(transportLabel(summary.transport))"
-        } else if summary.lastConnectedAtMs == timestamp {
-            evidence = "Last connected via \(transportLabel(summary.transport))"
-        } else {
-            evidence = "Last disconnected from \(transportLabel(summary.transport))"
-        }
-        return "\(evidence) · \(formatTime(timestamp))"
     }
 
     private func transportLabel(_ transport: PeerConnectionTransport) -> String {
         switch transport {
-        case .bluetooth: return "Bluetooth"
-        case .localWifi: return "local Wi-Fi"
-        case .cruisePass: return "Cruise Pass"
+        case .bluetooth: return String(localized: "Bluetooth")
+        case .localWifi: return String(localized: "local Wi-Fi")
+        case .cruisePass: return String(localized: "Cruise Pass")
         }
     }
 

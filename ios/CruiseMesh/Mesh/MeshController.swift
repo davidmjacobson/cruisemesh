@@ -1265,6 +1265,7 @@ final class MeshController: ObservableObject {
                 arrival: arrival
             )
         }
+        recordInboundChatArrival(senderUserId: senderUserId, kind: body.kind, arrival: arrival)
         ChatEvents.notifyChatChanged(group.id)
 
         // Local read watermark only (group wire receipts are deferred).
@@ -1410,6 +1411,7 @@ final class MeshController: ObservableObject {
             )
         }
         guard let contact = try? store.getContact(userId: senderUserId) else { return }
+        recordInboundChatArrival(senderUserId: senderUserId, kind: kind, arrival: arrival)
         _ = queueOutgoingReceiptForRelay(
             identity: identity,
             contact: contact,
@@ -1507,15 +1509,12 @@ final class MeshController: ObservableObject {
                 deliveredAtMs: arrival.receivedAt,
                 viaTransport: arrival.transport
             )
+            // .messageDelivered is the OUTBOUND direction: this receipt proves
+            // a message *we* sent reached them. The inbound direction is
+            // recorded in recordInboundChatArrival.
             try? store.recordPeerConnectionEvent(
                 userId: envelopeSender,
-                transport: {
-                    switch arrival.transport {
-                    case 0, 1: return .bluetooth
-                    case 3, 4: return .localWifi
-                    default: return .cruisePass
-                    }
-                }(),
+                transport: corePeerTransportForArrival(transport: arrival.transport),
                 kind: .messageDelivered,
                 occurredAtMs: arrival.receivedAt
             )
@@ -3223,6 +3222,34 @@ final class MeshController: ObservableObject {
         } else {
             relayRateLimitedUntilMs = 0
         }
+    }
+
+    /// Records that a friend's own message landed on this phone, for the
+    /// Connection details screen.
+    ///
+    /// Deliberately narrow. Only kinds a person actually sees in a
+    /// conversation count (`isVisibleChatKind`) -- receipts, profile sync,
+    /// relay updates, endpoint hints, reactions and every other hidden kind
+    /// are machine chatter and would make the screen claim a friend had
+    /// written when nobody did. Unknown senders are skipped too: the screen
+    /// only lists friends, so an event for anyone else could never be shown
+    /// against a name.
+    ///
+    /// Best-effort: connection history is a diagnostic, never worth failing a
+    /// real message delivery over.
+    private func recordInboundChatArrival(
+        senderUserId: Data,
+        kind: UInt8,
+        arrival: MessageArrival?
+    ) {
+        guard isVisibleChatKind(kind), let arrival else { return }
+        guard (try? store.getContact(userId: senderUserId)) != nil else { return }
+        try? store.recordPeerConnectionEvent(
+            userId: senderUserId,
+            transport: corePeerTransportForArrival(transport: arrival.transport),
+            kind: .messageReceived,
+            occurredAtMs: arrival.receivedAt
+        )
     }
 
     private func recordPeerDisconnected(address: String) {

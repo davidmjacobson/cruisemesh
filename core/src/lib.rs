@@ -133,10 +133,11 @@ pub use semantic::{
     CoreReactionSummary, CoreReactionTargetSummary, CoreReplyMetadata, CoreTickStatus,
 };
 pub use store::{
-    CarriedEnvelope, Contact, ContactDiscoveryPolicy, ContactProvenance, ContactRelayRejection,
-    DigestEntry, FriendSuggestion, MessageArrival, MessageOrigin, MessageReference, MessageStore,
-    OutboundEnvelope, OutgoingReceiptEnvelope, PeerConnectionEvent, PeerConnectionEventKind,
-    PeerConnectionSummary, PeerConnectionTransport, RelayFetchCursor, StoredMessage,
+    core_peer_transport_for_arrival, CarriedEnvelope, Contact, ContactDiscoveryPolicy,
+    ContactProvenance, ContactRelayRejection, DigestEntry, FriendSuggestion, MessageArrival,
+    MessageOrigin, MessageReference, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
+    PeerConnectionEvent, PeerConnectionEventKind, PeerConnectionSummary, PeerConnectionTransport,
+    RelayFetchCursor, StoredMessage,
 };
 pub use transport_policy::{
     core_transport_send_plan, digest_is_expected_chat_id, digest_through_lamport_for_sender,

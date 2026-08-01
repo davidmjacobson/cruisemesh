@@ -1,6 +1,7 @@
 package com.cruisemesh.app.ui
 
 import android.content.Intent
+import androidx.annotation.StringRes
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -45,9 +46,6 @@ import com.cruisemesh.app.mesh.DirectPath
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
 import com.cruisemesh.app.relay.RelayConfigStore
-import uniffi.cruisemesh_core.PeerConnectionEvent
-import uniffi.cruisemesh_core.PeerConnectionEventKind
-import uniffi.cruisemesh_core.PeerConnectionSummary
 import uniffi.cruisemesh_core.PeerConnectionTransport
 import uniffi.cruisemesh_core.coreContactDisplayName
 import java.text.DateFormat
@@ -121,11 +119,18 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                     for (contact in contacts) {
                         val hex = UserIdHex.encode(contact.userId)
                         val pathRows = summaries.filter { it.userId.contentEquals(contact.userId) }
+                        val latest = latestPeerStatus(pathRows)
                         val status = when {
-                            directPaths[hex] == DirectPath.LOCAL_WIFI -> "Connected now via local Wi-Fi"
-                            directPaths[hex] == DirectPath.BLUETOOTH -> "Connected now via Bluetooth"
-                            pathRows.isEmpty() -> "No connection history yet"
-                            else -> latestSummary(pathRows)
+                            directPaths[hex] == DirectPath.LOCAL_WIFI ->
+                                stringResource(R.string.ui_connected_now_via_local_wifi)
+                            directPaths[hex] == DirectPath.BLUETOOTH ->
+                                stringResource(R.string.ui_connected_now_via_bluetooth)
+                            latest == null -> stringResource(R.string.ui_no_connection_history_yet)
+                            else -> stringResource(
+                                statusTextId(latest.evidence),
+                                stringResource(transportLabelId(latest.transport)),
+                                formatTime(latest.atMs),
+                            )
                         }
                         Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                             Text(coreContactDisplayName(contact))
@@ -146,9 +151,15 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                 } else {
                     val visibleEvents =
                         if (showAllActivity) events else events.take(RECENT_ACTIVITY_PREVIEW_COUNT)
+                    val unnamedFriend = stringResource(R.string.ui_unnamed_friend)
                     visibleEvents.forEach { event ->
                         Text(
-                            eventText(event, names),
+                            stringResource(
+                                activityTextId(peerEvidenceOf(event.kind)),
+                                names[UserIdHex.encode(event.userId)] ?: unnamedFriend,
+                                stringResource(transportLabelId(event.transport)),
+                                formatTime(event.occurredAtMs),
+                            ),
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.padding(vertical = 5.dp),
                         )
@@ -324,45 +335,29 @@ private fun relayLabel(
     }
 }
 
-private fun latestSummary(rows: List<PeerConnectionSummary>): String {
-    val latest = rows.maxByOrNull {
-        listOfNotNull(
-            it.lastConnectedAtMs,
-            it.lastDisconnectedAtMs,
-            it.lastSeenAtMs,
-            it.lastDeliveredAtMs,
-        ).maxOrNull() ?: 0L
-    } ?: return "No connection history yet"
-    val timestamp = listOfNotNull(
-        latest.lastDeliveredAtMs,
-        latest.lastSeenAtMs,
-        latest.lastConnectedAtMs,
-        latest.lastDisconnectedAtMs,
-    ).maxOrNull() ?: return "No connection history yet"
-    val evidence = when (timestamp) {
-        latest.lastDeliveredAtMs -> "Message arrived via ${transportLabel(latest.transport)}"
-        latest.lastSeenAtMs -> "Seen online through ${transportLabel(latest.transport)}"
-        latest.lastConnectedAtMs -> "Last connected via ${transportLabel(latest.transport)}"
-        else -> "Last disconnected from ${transportLabel(latest.transport)}"
-    }
-    return "$evidence · ${formatTime(timestamp)}"
+@StringRes
+private fun statusTextId(evidence: PeerEvidence): Int = when (evidence) {
+    PeerEvidence.MESSAGE_RECEIVED -> R.string.ui_peer_status_sent_you_a_message
+    PeerEvidence.MESSAGE_DELIVERED -> R.string.ui_peer_status_received_your_message
+    PeerEvidence.PRESENCE_SEEN -> R.string.ui_peer_status_seen_online
+    PeerEvidence.CONNECTED -> R.string.ui_peer_status_last_connected
+    PeerEvidence.DISCONNECTED -> R.string.ui_peer_status_last_disconnected
 }
 
-private fun eventText(event: PeerConnectionEvent, names: Map<String, String>): String {
-    val name = names[UserIdHex.encode(event.userId)] ?: "Friend"
-    val action = when (event.kind) {
-        PeerConnectionEventKind.CONNECTED -> "connected"
-        PeerConnectionEventKind.DISCONNECTED -> "disconnected"
-        PeerConnectionEventKind.PRESENCE_SEEN -> "was reachable"
-        PeerConnectionEventKind.MESSAGE_DELIVERED -> "message arrived"
-    }
-    return "$name $action via ${transportLabel(event.transport)} · ${formatTime(event.occurredAtMs)}"
+@StringRes
+private fun activityTextId(evidence: PeerEvidence): Int = when (evidence) {
+    PeerEvidence.MESSAGE_RECEIVED -> R.string.ui_peer_activity_sent_you_a_message
+    PeerEvidence.MESSAGE_DELIVERED -> R.string.ui_peer_activity_received_your_message
+    PeerEvidence.PRESENCE_SEEN -> R.string.ui_peer_activity_was_reachable
+    PeerEvidence.CONNECTED -> R.string.ui_peer_activity_connected
+    PeerEvidence.DISCONNECTED -> R.string.ui_peer_activity_disconnected
 }
 
-private fun transportLabel(transport: PeerConnectionTransport): String = when (transport) {
-    PeerConnectionTransport.BLUETOOTH -> "Bluetooth"
-    PeerConnectionTransport.LOCAL_WIFI -> "local Wi-Fi"
-    PeerConnectionTransport.CRUISE_PASS -> "Cruise Pass"
+@StringRes
+private fun transportLabelId(transport: PeerConnectionTransport): Int = when (transport) {
+    PeerConnectionTransport.BLUETOOTH -> R.string.ui_path_bluetooth
+    PeerConnectionTransport.LOCAL_WIFI -> R.string.ui_path_local_wifi
+    PeerConnectionTransport.CRUISE_PASS -> R.string.ui_path_cruise_pass
 }
 
 private fun formatTime(ms: Long): String =
