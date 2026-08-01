@@ -77,6 +77,20 @@ targets:
         NSLocalNetworkUsageDescription: CruiseMesh uses your local Wi-Fi network to find and securely exchange messages with accepted contacts nearby.
         NSBonjourServices:
           - _cruisemesh._tcp
+        # T20: cruisemesh:// carries the same destinations as the https
+        # Universal Links (see core/src/deep_link.rs). It exists because iOS
+        # does not fire a Universal Link for a same-domain navigation, so the
+        # website's "Open in CruiseMesh" button cannot reach the app over https
+        # once the user is already on cruisemesh.app in Safari.
+        # This MUST live here, not only in the committed Info.plist: xcodegen
+        # rewrites that file from this one on every CI build, so a plist-only
+        # declaration ships as nothing at all. The iOS workflow asserts the
+        # generated plist still carries the scheme.
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: com.cruisemesh.app
+            CFBundleURLSchemes:
+              - cruisemesh
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

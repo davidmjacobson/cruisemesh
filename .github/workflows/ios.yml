@@ -69,6 +69,17 @@ jobs:
         working-directory: ios
         run: xcodegen generate
 
+      # The cruisemesh:// scheme was declared only in the committed
+      # Info.plist, which the step above overwrites from project.yml -- so no
+      # CI-built IPA ever registered it, and the website's "Open in CruiseMesh"
+      # button was inert in Safari for two releases because nothing checked.
+      # Asserts on the GENERATED plist, which is what actually ships.
+      - name: Assert the generated Info.plist declares cruisemesh://
+        run: |
+          set -o pipefail
+          plutil -extract CFBundleURLTypes json -o - ios/CruiseMesh/Info.plist \
+            | python3 -c "import json,sys; t=json.load(sys.stdin); sys.exit(0) if any('cruisemesh' in d.get('CFBundleURLSchemes', []) for d in t) else sys.exit('Generated Info.plist does not declare the cruisemesh:// URL scheme -- check CFBundleURLTypes in ios/project.yml')"
+
       - name: Pick an available iPhone simulator
         id: sim
         run: |
