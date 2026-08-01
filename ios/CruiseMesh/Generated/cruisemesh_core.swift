@@ -2530,6 +2530,21 @@ public protocol MessageStoreProtocol : AnyObject {
     func relayFetchHints(ownUserId: Data, nowMs: Int64) throws  -> [Data]
     
     /**
+     * [`Self::relay_fetch_hints`] plus one day ahead
+     * ([`PUSH_HINT_FORWARD_DAYS`]) for every id -- the hint set Android's
+     * relay push subscription uses (unlike iOS, Android's push subscription
+     * includes proxy hints, matching its existing `relayFetchHints`-based
+     * fetch; see [`Self::relay_self_push_hints`] for why the forward day is
+     * safe).
+     *
+     * Budget: each id contributes `CARRY_HINT_DAY_WINDOW_DAYS + 1 +
+     * PUSH_HINT_FORWARD_DAYS` = 9 hints (was 8 pre-fix) against relayd's
+     * `MAX_FETCH_HINTS` = 256, so this stays under the cap for up to ~28
+     * combined self/group/contact ids -- comfortably above family scale.
+     */
+    func relayFetchPushHints(ownUserId: Data, nowMs: Int64) throws  -> [Data]
+    
+    /**
      * Relay proxy-polling hints: the recent-day hints of every contact that
      * isn't us, so an internet-connected phone in a BLE-only contact's
      * cluster can fetch mail addressed to *them* out of the shared
@@ -2544,9 +2559,31 @@ public protocol MessageStoreProtocol : AnyObject {
      * with other sets go through [`relay_fetch_hints`] / [`dedupe_hints`].
      * This narrower set is what the relay *push* subscription uses on iOS
      * (deliberately without proxy hints -- see `MeshController`'s
-     * `relayPushHints` doc for that platform decision).
+     * `relayPushHints` doc for that platform decision). For the push
+     * subscription itself, use [`Self::relay_self_push_hints`] instead --
+     * this function's hints must never gain a forward-looking day (see that
+     * function's doc and `causal_order.rs`).
      */
     func relaySelfHints(ownUserId: Data, nowMs: Int64) throws  -> [Data]
+    
+    /**
+     * [`Self::relay_self_hints`] plus one day *ahead* of `now_ms`
+     * ([`PUSH_HINT_FORWARD_DAYS`]) for the same ids -- the hint set the
+     * relay push subscription (not fetch, not carry) should subscribe to.
+     *
+     * Why: `hints_over_window`'s day-salt rotates on the UTC day boundary,
+     * but a push subscription is computed once per socket connect and the
+     * socket then stays open indefinitely (relayd pings keep it alive). A
+     * socket opened at, say, 6pm US time is still open after the UTC
+     * rollover a few hours later, subscribed only to hints that no longer
+     * match anything relayd pushes -- new envelopes silently fall back to
+     * the periodic poll until the next reconnect. Subscribing one day ahead
+     * is safe because it only widens what the *subscription* matches;
+     * envelopes are still ever created with a backward-looking hint (see
+     * `causal_order.rs`'s module doc), so there is nothing for the extra
+     * hint to match until the day actually rolls over.
+     */
+    func relaySelfPushHints(ownUserId: Data, nowMs: Int64) throws  -> [Data]
     
     /**
      * Drop a carried envelope by `msg_id` -- called once it's been handed to
@@ -4191,6 +4228,28 @@ open func relayFetchHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
 }
     
     /**
+     * [`Self::relay_fetch_hints`] plus one day ahead
+     * ([`PUSH_HINT_FORWARD_DAYS`]) for every id -- the hint set Android's
+     * relay push subscription uses (unlike iOS, Android's push subscription
+     * includes proxy hints, matching its existing `relayFetchHints`-based
+     * fetch; see [`Self::relay_self_push_hints`] for why the forward day is
+     * safe).
+     *
+     * Budget: each id contributes `CARRY_HINT_DAY_WINDOW_DAYS + 1 +
+     * PUSH_HINT_FORWARD_DAYS` = 9 hints (was 8 pre-fix) against relayd's
+     * `MAX_FETCH_HINTS` = 256, so this stays under the cap for up to ~28
+     * combined self/group/contact ids -- comfortably above family scale.
+     */
+open func relayFetchPushHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_relay_fetch_push_hints(self.uniffiClonePointer(),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * Relay proxy-polling hints: the recent-day hints of every contact that
      * isn't us, so an internet-connected phone in a BLE-only contact's
      * cluster can fetch mail addressed to *them* out of the shared
@@ -4212,11 +4271,40 @@ open func relayProxyHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
      * with other sets go through [`relay_fetch_hints`] / [`dedupe_hints`].
      * This narrower set is what the relay *push* subscription uses on iOS
      * (deliberately without proxy hints -- see `MeshController`'s
-     * `relayPushHints` doc for that platform decision).
+     * `relayPushHints` doc for that platform decision). For the push
+     * subscription itself, use [`Self::relay_self_push_hints`] instead --
+     * this function's hints must never gain a forward-looking day (see that
+     * function's doc and `causal_order.rs`).
      */
 open func relaySelfHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
     return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_relay_self_hints(self.uniffiClonePointer(),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * [`Self::relay_self_hints`] plus one day *ahead* of `now_ms`
+     * ([`PUSH_HINT_FORWARD_DAYS`]) for the same ids -- the hint set the
+     * relay push subscription (not fetch, not carry) should subscribe to.
+     *
+     * Why: `hints_over_window`'s day-salt rotates on the UTC day boundary,
+     * but a push subscription is computed once per socket connect and the
+     * socket then stays open indefinitely (relayd pings keep it alive). A
+     * socket opened at, say, 6pm US time is still open after the UTC
+     * rollover a few hours later, subscribed only to hints that no longer
+     * match anything relayd pushes -- new envelopes silently fall back to
+     * the periodic poll until the next reconnect. Subscribing one day ahead
+     * is safe because it only widens what the *subscription* matches;
+     * envelopes are still ever created with a backward-looking hint (see
+     * `causal_order.rs`'s module doc), so there is nothing for the extra
+     * hint to match until the day actually rolls over.
+     */
+open func relaySelfPushHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_relay_self_push_hints(self.uniffiClonePointer(),
         FfiConverterData.lower(ownUserId),
         FfiConverterInt64.lower(nowMs),$0
     )
@@ -15111,10 +15199,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_hints() != 37028) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_push_hints() != 47587) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_proxy_hints() != 50484) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_self_hints() != 38105) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_self_hints() != 33679) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_self_push_hints() != 55237) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_remove_carried_envelope() != 52788) {

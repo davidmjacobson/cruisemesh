@@ -2912,12 +2912,22 @@ final class MeshController: ObservableObject {
 /// recent day), and the 60s poll already covers proxy-fetched mail without
 /// needing a push nudge for it. Revisit if proxy-fetch latency ever needs to
 /// beat the poll interval.
+///
+/// Uses `relaySelfPushHints`, not `relaySelfHints`: the push subscription is
+/// computed once per socket connect and the socket then stays open
+/// indefinitely (relayd keepalive pings), so a socket opened before the UTC
+/// day rollover would otherwise subscribe only to hints that stop matching
+/// anything the moment the day-salt rotates. `relaySelfPushHints` adds one
+/// day ahead for the same ids so the subscription survives the rollover;
+/// see its doc for why that's safe (it only widens what the subscription
+/// matches -- envelopes are still ever created with a backward-looking
+/// hint).
 private func relayPushHints(ownUserId: Data) -> [Data] {
     let store = AppStore.get()
     let now = Int64(Date().timeIntervalSince1970 * 1000)
-    // Core's relaySelfHints = own + member-group hints; on a store error
-    // fall back to just our own hints, matching the old inline loop.
-    return (try? store.relaySelfHints(ownUserId: ownUserId, nowMs: now))
+    // On a store error fall back to just our own hints, matching the old
+    // inline loop.
+    return (try? store.relaySelfPushHints(ownUserId: ownUserId, nowMs: now))
         ?? recentHintsFor(userId: ownUserId, nowMs: now)
 }
 

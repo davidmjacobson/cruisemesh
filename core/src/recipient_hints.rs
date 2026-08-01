@@ -25,8 +25,32 @@ use crate::{RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ};
 pub(crate) const CARRY_HINT_DAY_WINDOW_DAYS: i64 = 7;
 pub(crate) const PRESENCE_HINT_DAY_WINDOW_DAYS: i64 = 3;
 
+/// How far ahead of `now_ms` a relay *push-subscription* hint set reaches --
+/// see [`hints_over_range`]. One day covers the UTC day rollover (a socket
+/// opened earlier today is still subscribed after midnight) plus modest
+/// clock skew; it must stay small since relayd's `MAX_FETCH_HINTS` bounds the
+/// subscribed set (see `relay_self_push_hints` / `relay_fetch_push_hints`
+/// doc for the budget math).
+pub(crate) const PUSH_HINT_FORWARD_DAYS: i64 = 1;
+
 fn hints_over_window(user_id: &[u8], now_ms: i64, window_days: i64) -> Vec<Vec<u8>> {
-    (0..=window_days)
+    hints_over_range(user_id, now_ms, window_days, 0)
+}
+
+/// [`hints_over_window`] extended `forward_days` days into the future.
+///
+/// Envelopes must NEVER be created with a hint from this forward range (see
+/// `causal_order.rs`'s module doc: routing time only ever looks backwards) --
+/// this exists solely for hint sets that *subscribe* to a relay-push topic,
+/// where matching a not-yet-used future hint is harmless (it simply matches
+/// nothing until the day rolls over).
+fn hints_over_range(
+    user_id: &[u8],
+    now_ms: i64,
+    window_days: i64,
+    forward_days: i64,
+) -> Vec<Vec<u8>> {
+    (-forward_days..=window_days)
         .map(|days_ago| compute_recipient_hint(user_id.to_vec(), now_ms - days_ago * MS_PER_DAY))
         .collect()
 }
@@ -57,6 +81,60 @@ pub fn dedupe_hints(hints: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         .collect()
 }
 
+impl MessageStore {
+    /// Shared by [`Self::relay_self_hints`] (fetch/carry, `forward_days: 0`)
+    /// and [`Self::relay_self_push_hints`] (push subscription, `forward_days:
+    /// `[`PUSH_HINT_FORWARD_DAYS`]``) so the "own id + member groups" id set
+    /// is computed in exactly one place.
+    fn self_hints_with_forward(
+        &self,
+        own_user_id: &[u8],
+        now_ms: i64,
+        forward_days: i64,
+    ) -> Result<Vec<Vec<u8>>, CoreError> {
+        let mut hints = hints_over_range(
+            own_user_id,
+            now_ms,
+            CARRY_HINT_DAY_WINDOW_DAYS,
+            forward_days,
+        );
+        for group in self.list_groups()? {
+            if group.member_user_ids.iter().any(|m| m == own_user_id) {
+                hints.extend(hints_over_range(
+                    &group.id,
+                    now_ms,
+                    CARRY_HINT_DAY_WINDOW_DAYS,
+                    forward_days,
+                ));
+            }
+        }
+        Ok(hints)
+    }
+
+    /// Shared by [`Self::relay_proxy_hints`] and the proxy leg of
+    /// [`Self::relay_fetch_push_hints`].
+    fn proxy_hints_with_forward(
+        &self,
+        own_user_id: &[u8],
+        now_ms: i64,
+        forward_days: i64,
+    ) -> Result<Vec<Vec<u8>>, CoreError> {
+        let mut hints = Vec::new();
+        for contact in self.list_contacts()? {
+            if contact.user_id == own_user_id {
+                continue;
+            }
+            hints.extend(hints_over_range(
+                &contact.user_id,
+                now_ms,
+                CARRY_HINT_DAY_WINDOW_DAYS,
+                forward_days,
+            ));
+        }
+        Ok(hints)
+    }
+}
+
 #[uniffi::export]
 impl MessageStore {
     /// Mail addressed to us: our own hints, plus every imported group we
@@ -64,23 +142,39 @@ impl MessageStore {
     /// with other sets go through [`relay_fetch_hints`] / [`dedupe_hints`].
     /// This narrower set is what the relay *push* subscription uses on iOS
     /// (deliberately without proxy hints -- see `MeshController`'s
-    /// `relayPushHints` doc for that platform decision).
+    /// `relayPushHints` doc for that platform decision). For the push
+    /// subscription itself, use [`Self::relay_self_push_hints`] instead --
+    /// this function's hints must never gain a forward-looking day (see that
+    /// function's doc and `causal_order.rs`).
     pub fn relay_self_hints(
         &self,
         own_user_id: Vec<u8>,
         now_ms: i64,
     ) -> Result<Vec<Vec<u8>>, CoreError> {
-        let mut hints = hints_over_window(&own_user_id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS);
-        for group in self.list_groups()? {
-            if group.member_user_ids.iter().any(|m| *m == own_user_id) {
-                hints.extend(hints_over_window(
-                    &group.id,
-                    now_ms,
-                    CARRY_HINT_DAY_WINDOW_DAYS,
-                ));
-            }
-        }
-        Ok(hints)
+        self.self_hints_with_forward(&own_user_id, now_ms, 0)
+    }
+
+    /// [`Self::relay_self_hints`] plus one day *ahead* of `now_ms`
+    /// ([`PUSH_HINT_FORWARD_DAYS`]) for the same ids -- the hint set the
+    /// relay push subscription (not fetch, not carry) should subscribe to.
+    ///
+    /// Why: `hints_over_window`'s day-salt rotates on the UTC day boundary,
+    /// but a push subscription is computed once per socket connect and the
+    /// socket then stays open indefinitely (relayd pings keep it alive). A
+    /// socket opened at, say, 6pm US time is still open after the UTC
+    /// rollover a few hours later, subscribed only to hints that no longer
+    /// match anything relayd pushes -- new envelopes silently fall back to
+    /// the periodic poll until the next reconnect. Subscribing one day ahead
+    /// is safe because it only widens what the *subscription* matches;
+    /// envelopes are still ever created with a backward-looking hint (see
+    /// `causal_order.rs`'s module doc), so there is nothing for the extra
+    /// hint to match until the day actually rolls over.
+    pub fn relay_self_push_hints(
+        &self,
+        own_user_id: Vec<u8>,
+        now_ms: i64,
+    ) -> Result<Vec<Vec<u8>>, CoreError> {
+        self.self_hints_with_forward(&own_user_id, now_ms, PUSH_HINT_FORWARD_DAYS)
     }
 
     /// Relay proxy-polling hints: the recent-day hints of every contact that
@@ -93,18 +187,7 @@ impl MessageStore {
         own_user_id: Vec<u8>,
         now_ms: i64,
     ) -> Result<Vec<Vec<u8>>, CoreError> {
-        let mut hints = Vec::new();
-        for contact in self.list_contacts()? {
-            if contact.user_id == own_user_id {
-                continue;
-            }
-            hints.extend(hints_over_window(
-                &contact.user_id,
-                now_ms,
-                CARRY_HINT_DAY_WINDOW_DAYS,
-            ));
-        }
-        Ok(hints)
+        self.proxy_hints_with_forward(&own_user_id, now_ms, 0)
     }
 
     /// The full deduped hint set a relay mailbox poll fetches: self + groups
@@ -116,6 +199,32 @@ impl MessageStore {
     ) -> Result<Vec<Vec<u8>>, CoreError> {
         let mut hints = self.relay_self_hints(own_user_id.clone(), now_ms)?;
         hints.extend(self.relay_proxy_hints(own_user_id, now_ms)?);
+        Ok(dedupe_hints(hints))
+    }
+
+    /// [`Self::relay_fetch_hints`] plus one day ahead
+    /// ([`PUSH_HINT_FORWARD_DAYS`]) for every id -- the hint set Android's
+    /// relay push subscription uses (unlike iOS, Android's push subscription
+    /// includes proxy hints, matching its existing `relayFetchHints`-based
+    /// fetch; see [`Self::relay_self_push_hints`] for why the forward day is
+    /// safe).
+    ///
+    /// Budget: each id contributes `CARRY_HINT_DAY_WINDOW_DAYS + 1 +
+    /// PUSH_HINT_FORWARD_DAYS` = 9 hints (was 8 pre-fix) against relayd's
+    /// `MAX_FETCH_HINTS` = 256, so this stays under the cap for up to ~28
+    /// combined self/group/contact ids -- comfortably above family scale.
+    pub fn relay_fetch_push_hints(
+        &self,
+        own_user_id: Vec<u8>,
+        now_ms: i64,
+    ) -> Result<Vec<Vec<u8>>, CoreError> {
+        let mut hints =
+            self.self_hints_with_forward(&own_user_id, now_ms, PUSH_HINT_FORWARD_DAYS)?;
+        hints.extend(self.proxy_hints_with_forward(
+            &own_user_id,
+            now_ms,
+            PUSH_HINT_FORWARD_DAYS,
+        )?);
         Ok(dedupe_hints(hints))
     }
 
@@ -507,6 +616,82 @@ mod tests {
             .group_open_candidates(expired, me.user_id, NOW)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn self_push_hints_add_tomorrow_for_own_id_and_member_groups_only() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let me = generate_identity();
+        let friend = generate_identity();
+        store
+            .upsert_contact(contact_for(&friend, "Friend"))
+            .unwrap();
+        let group = Group {
+            id: b"group-id-0123456".to_vec(),
+            name: "Fam".to_string(),
+            key: vec![7u8; 32],
+            member_user_ids: vec![me.user_id.clone(), friend.user_id.clone()],
+            metadata_revision: 0,
+            metadata_changed_by: Vec::new(),
+        };
+        store.upsert_group(group).unwrap();
+
+        let plain = store.relay_self_hints(me.user_id.clone(), NOW).unwrap();
+        let push = store
+            .relay_self_push_hints(me.user_id.clone(), NOW)
+            .unwrap();
+        // One extra hint (tomorrow) per id: self + the one member group.
+        assert_eq!(push.len(), plain.len() + 2);
+
+        let self_tomorrow = compute_recipient_hint(me.user_id.clone(), NOW + MS_PER_DAY);
+        let group_tomorrow = compute_recipient_hint(b"group-id-0123456".to_vec(), NOW + MS_PER_DAY);
+        assert!(push.contains(&self_tomorrow));
+        assert!(push.contains(&group_tomorrow));
+        // The backward-looking window itself is unchanged for callers that
+        // never switched to the push variant.
+        for hint in &plain {
+            assert!(push.contains(hint));
+        }
+        assert!(!plain.contains(&self_tomorrow));
+
+        // A contact we're not proxying for contributes nothing here: the
+        // push subscription for self hints deliberately excludes proxy
+        // hints, same as the pre-existing (non-push) relay_self_hints.
+        let friend_tomorrow = compute_recipient_hint(friend.user_id.clone(), NOW + MS_PER_DAY);
+        assert!(!push.contains(&friend_tomorrow));
+    }
+
+    #[test]
+    fn fetch_push_hints_add_tomorrow_for_self_groups_and_proxy_contacts() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let me = generate_identity();
+        let friend = generate_identity();
+        store
+            .upsert_contact(contact_for(&friend, "Friend"))
+            .unwrap();
+
+        let plain = store.relay_fetch_hints(me.user_id.clone(), NOW).unwrap();
+        let push = store
+            .relay_fetch_push_hints(me.user_id.clone(), NOW)
+            .unwrap();
+        // self + friend, one extra (tomorrow) hint each, deduped like the
+        // plain fetch set.
+        assert_eq!(push.len(), plain.len() + 2);
+
+        let self_tomorrow = compute_recipient_hint(me.user_id.clone(), NOW + MS_PER_DAY);
+        let friend_tomorrow = compute_recipient_hint(friend.user_id.clone(), NOW + MS_PER_DAY);
+        assert!(push.contains(&self_tomorrow));
+        assert!(push.contains(&friend_tomorrow));
+        for hint in &plain {
+            assert!(push.contains(hint));
+        }
+
+        // Still deduped: no id contributes the same hint twice even though
+        // two windows (backward + forward) are merged.
+        let mut sorted = push.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), push.len());
     }
 
     #[test]
