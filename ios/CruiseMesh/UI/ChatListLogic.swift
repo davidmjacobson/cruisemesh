@@ -7,16 +7,27 @@ enum ChatListLogic {
         return displayId
     }
 
+    /// Avatar colour, plus the initials to draw inside it.
+    ///
+    /// The initials are empty whenever there is no usable name: `AvatarView`
+    /// then draws a neutral person glyph instead. This used to fall back to the
+    /// first two characters of the user id, which rendered as `7B` — meaningless
+    /// to anyone reading it, and on the onboarding profile slide it was the
+    /// first thing a new tester ever saw of their own identity, before they had
+    /// typed a name. PR #178 fixed the contact half of the same problem.
+    ///
+    /// `displayId` is kept in the signature for the call sites that still pass
+    /// it; nothing derived from an identifier is shown to a person any more.
     static func avatarHueAndInitials(userId: Data, name: String, displayId: String) -> (Color, String) {
         let sum = userId.reduce(0) { $0 + Int($1) }
         let hue = Double(sum & 0xFF) / 255.0
         let color = Color(hue: hue, saturation: 0.5, brightness: 0.7)
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let initials: String
-        if !name.isEmpty && name != "Unknown" {
-            initials = String(name.prefix(2)).uppercased()
+        if !trimmed.isEmpty && trimmed != "Unknown" {
+            initials = String(trimmed.prefix(2)).uppercased()
         } else {
-            let cleaned = displayId.hasPrefix("CM-") ? String(displayId.dropFirst(3)) : displayId
-            initials = String(cleaned.prefix(2)).uppercased()
+            initials = ""
         }
         return (color, initials)
     }

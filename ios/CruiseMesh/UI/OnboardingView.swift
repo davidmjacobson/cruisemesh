@@ -1,6 +1,8 @@
+import CoreBluetooth
 import PhotosUI
 import SwiftUI
 import UIKit
+import UserNotifications
 
 struct OnboardingView: View {
     let identity: Identity
@@ -180,12 +182,78 @@ private struct OnboardingSlide: View {
     }
 }
 
+/// What the permissions slide can usefully offer, given the decisions iOS has
+/// already recorded.
+///
+/// Asking again after the system has recorded an answer is a silent no-op: no
+/// prompt, no state change, nothing. So once every answer is in, the primary
+/// button must stop being a re-request — either there is nothing left to do, or
+/// the only place that can change the answer is Settings.
+enum OnboardingPermissionAction: Equatable {
+    /// At least one decision is still open, so asking can still show a prompt.
+    case request
+    /// Every decision is in and at least one was "no".
+    case openSettings
+    /// Every decision is in and all of them were "yes".
+    case allSet
+}
+
+/// Pure mapping from the two system authorization states to what the slide
+/// should show. Kept free of any view or framework state so it can be tested.
+enum OnboardingPermissions {
+    static func isBluetoothUndecided(_ bluetooth: CBManagerAuthorization) -> Bool {
+        bluetooth == .notDetermined
+    }
+
+    static func isBluetoothBlocked(_ bluetooth: CBManagerAuthorization) -> Bool {
+        bluetooth == .denied || bluetooth == .restricted
+    }
+
+    static func areNotificationsUndecided(_ notifications: UNAuthorizationStatus) -> Bool {
+        notifications == .notDetermined
+    }
+
+    /// Only an explicit denial counts as blocked: provisional and ephemeral
+    /// authorizations still deliver, and an unrecognised future case must not
+    /// send anyone to Settings for a permission that may well be granted.
+    static func areNotificationsBlocked(_ notifications: UNAuthorizationStatus) -> Bool {
+        notifications == .denied
+    }
+
+    static func action(
+        bluetooth: CBManagerAuthorization,
+        notifications: UNAuthorizationStatus
+    ) -> OnboardingPermissionAction {
+        // Undecided wins over denied in the mixed case: the prompt for the open
+        // one is still worth showing, and once it is answered this returns
+        // `.openSettings` for whatever was refused.
+        if isBluetoothUndecided(bluetooth) || areNotificationsUndecided(notifications) {
+            return .request
+        }
+        if isBluetoothBlocked(bluetooth) || areNotificationsBlocked(notifications) {
+            return .openSettings
+        }
+        return .allSet
+    }
+}
+
 private struct PermissionsSlide: View {
     let onEnable: () -> Void
 
+    @Environment(\.scenePhase) private var scenePhase
+    // Read statically rather than through `BluetoothAccess.shared`: this slide
+    // only needs the recorded decision, and touching that singleton would spin
+    // up a `CBCentralManager` before the user has agreed to anything.
+    @State private var bluetooth: CBManagerAuthorization = CBCentralManager.authorization
+    @State private var notifications: UNAuthorizationStatus = .notDetermined
+
+    private var action: OnboardingPermissionAction {
+        OnboardingPermissions.action(bluetooth: bluetooth, notifications: notifications)
+    }
+
     var body: some View {
         VStack(spacing: 20) {
-            Image(systemName: "checkmark.shield")
+            Image(systemName: action == .allSet ? "checkmark.circle.fill" : "checkmark.shield")
                 .font(.system(size: 58, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
             Text("Give CruiseMesh more ways to connect")
@@ -194,14 +262,78 @@ private struct PermissionsSlide: View {
             Text("Each of these opens up another path for your messages.")
                 .font(.title3)
                 .multilineTextAlignment(.center)
-            Button("Enable Bluetooth and notifications", action: onEnable)
-                .buttonStyle(.borderedProminent)
-            Text("You can turn these on later in Settings — CruiseMesh just has fewer ways to reach people until you do.")
+            callToAction
+            footnote
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
         }
         .padding(28)
+        .onAppear(perform: refreshPermissions)
+        .onChange(of: scenePhase) { phase in
+            // The permission alerts, and a trip to Settings, both take the
+            // scene out of `.active` and bring it back. Re-deriving here is what
+            // makes the control reflect the answer without leaving the slide.
+            guard phase == .active else { return }
+            refreshPermissions()
+        }
+    }
+
+    @ViewBuilder private var callToAction: some View {
+        switch action {
+        case .request:
+            Button("Enable Bluetooth and notifications") {
+                onEnable()
+                refreshPermissions()
+            }
+            .buttonStyle(.borderedProminent)
+        case .openSettings:
+            Button("Open Settings") {
+                openSettings()
+            }
+            .buttonStyle(.borderedProminent)
+        case .allSet:
+            // Deliberately not a button: pressing one here would do nothing.
+            Label("Bluetooth and notifications are on", systemImage: "checkmark.circle.fill")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.green)
+        }
+    }
+
+    @ViewBuilder private var footnote: some View {
+        switch action {
+        case .request:
+            Text("You can turn these on later in Settings — CruiseMesh just has fewer ways to reach people until you do.")
+        case .openSettings:
+            if OnboardingPermissions.isBluetoothBlocked(bluetooth)
+                && OnboardingPermissions.areNotificationsBlocked(notifications) {
+                Text("Bluetooth and notifications are turned off for CruiseMesh. Turn them on in Settings to add those ways of reaching people.")
+            } else if OnboardingPermissions.isBluetoothBlocked(bluetooth) {
+                Text("Bluetooth is turned off for CruiseMesh. Turn it on in Settings to reach people nearby without any network.")
+            } else {
+                Text("Notifications are turned off for CruiseMesh. Turn them on in Settings to hear about messages as they arrive.")
+            }
+        case .allSet:
+            Text("You can change these anytime in Settings.")
+        }
+    }
+
+    private func refreshPermissions() {
+        let bluetoothNow = CBCentralManager.authorization
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let status = settings.authorizationStatus
+            Task { @MainActor in
+                bluetooth = bluetoothNow
+                notifications = status
+            }
+        }
+    }
+
+    /// Same destination as `BluetoothAccess.openSystemSettings()`, kept as its
+    /// own function so this slide does not have to construct that singleton.
+    private func openSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
     }
 }
 
@@ -224,14 +356,17 @@ private struct ProfileSetupSlide: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            // An empty name is fine here: AvatarView falls back to initials
-            // derived from the user id, so the preview is never blank.
+            // With no name yet the avatar draws a neutral person glyph. Its own
+            // accessibility label would fall back to the formatted user id, so
+            // override it here: nowhere in onboarding should a person be read
+            // their own identifier.
             AvatarView(
                 userId: identity.userId,
                 name: displayName,
                 size: 92,
                 photo: avatarImage
             )
+            .accessibilityLabel("Your profile picture")
             TextField("Your name", text: $displayName)
                 .textFieldStyle(.roundedBorder)
             if isNameEmpty {

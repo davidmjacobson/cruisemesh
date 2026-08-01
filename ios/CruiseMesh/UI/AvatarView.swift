@@ -27,6 +27,14 @@ struct AvatarView: View {
                         .foregroundStyle(.white)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Circle().fill(color))
+                } else if initials.isEmpty {
+                    // No name yet: a neutral person glyph, never two characters
+                    // of a user id. Mirrors the group case just above.
+                    Image(systemName: "person.fill")
+                        .font(.system(size: size * 0.42, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Circle().fill(color))
                 } else {
                     Text(initials)
                         .font(.system(size: size * 0.35, weight: .semibold))
