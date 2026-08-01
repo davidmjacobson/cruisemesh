@@ -2782,7 +2782,9 @@ final class MeshController: ObservableObject {
                 recentPresenceHintsFor(userId: userId, nowMs: timestamp)
             }
             let fetchHints = try store.relayFetchHints(ownUserId: identity.userId, nowMs: now)
-            let fetchBatchLimit = Int(relayFetchBatchLimit())
+            // Not a `let`: a page too big for this client to decode halves
+            // the ask and retries the same cursor (see the walk below).
+            var fetchBatchLimit = Int(relayFetchBatchLimit())
             var anyRelaySucceeded = false
             var ownRelaySucceeded = config == nil
             for cfg in distinctConfigs {
@@ -2886,12 +2888,23 @@ final class MeshController: ObservableObject {
                         try? store.noteRelaySweepCompleted(configKey: cursorKey, nowMs: now)
                     }
                     while true {
-                        let page = try RelayClient.fetchEnvelopes(
+                        let fetched = try RelayClient.fetchEnvelopesWithinResponseCap(
                             config: cfg,
                             hints: fetchHints,
                             afterId: afterId,
                             limit: fetchBatchLimit
-                        )
+                        ) { tried, smaller in
+                            relaySyncLog.warning(
+                                "Relay page exceeded the response cap at limit=\(tried, privacy: .public); retrying with limit=\(smaller, privacy: .public)"
+                            )
+                        }
+                        let page = fetched.page
+                        // The reduced limit is kept for the rest of this pass
+                        // rather than reset per page: a mailbox that produced
+                        // one oversize window usually produces the next one
+                        // too, and rediscovering that costs a wasted request
+                        // every page. The next pass starts full-size again.
+                        fetchBatchLimit = fetched.limit
                         guard !page.envelopes.isEmpty else {
                             finishSweep()
                             break

@@ -118,8 +118,8 @@ pub use relay_wire::{
     normalize_relay_url, relay_build_fetch_path, relay_decode_fetch_page,
     relay_decode_post_response, relay_decode_presence_page, relay_deposit_token_for,
     relay_encode_ack_request, relay_encode_post_envelope, relay_encode_presence_request,
-    relay_fetch_batch_limit, relay_max_response_bytes, relay_token_is_deposit,
-    resolved_contact_delivery_poll_relay, resolved_contact_delivery_relay,
+    relay_fetch_batch_limit, relay_fetch_shrunk_limit, relay_max_response_bytes,
+    relay_token_is_deposit, resolved_contact_delivery_poll_relay, resolved_contact_delivery_relay,
     resolved_contact_poll_relay, resolved_contact_relay, CoreRelayFetchPage,
     CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage, RelayEndpoint,
 };

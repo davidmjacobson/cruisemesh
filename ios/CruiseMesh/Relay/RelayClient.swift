@@ -74,13 +74,33 @@ private final class BoundedRelayResponseDelegate: NSObject, URLSessionDataDelega
         semaphore.signal()
     }
 
-    private static func tooLarge(_ maxBytes: Int) -> NSError {
-        NSError(
-            domain: "RelayClient",
-            code: 3,
-            userInfo: [NSLocalizedDescriptionKey: "relay response exceeds \(maxBytes) bytes"]
-        )
+    private static func tooLarge(_ maxBytes: Int) -> RelayResponseTooLargeError {
+        RelayResponseTooLargeError(maxBytes: maxBytes)
     }
+}
+
+/// The relay's answer was larger than `relayMaxResponseBytes()`, so it was
+/// refused before the whole thing could be accumulated.
+///
+/// Its own type rather than an opaque `NSError` because it is the one
+/// transport failure a caller can act on: a fetch page that blows the cap is
+/// recoverable by asking the same cursor for fewer rows (see
+/// `RelayClient.fetchEnvelopesWithinResponseCap`). Every other error here
+/// means "try again later"; this one means "ask for less". Mirrors Android
+/// `RelayResponseTooLargeException`.
+struct RelayResponseTooLargeError: LocalizedError {
+    let maxBytes: Int
+
+    var errorDescription: String? {
+        "relay response exceeds \(maxBytes) bytes"
+    }
+}
+
+/// A fetched page plus the row limit that actually produced it. Mirrors
+/// Android `RelayCappedFetch`.
+struct RelayCappedFetch {
+    let page: RelayFetchPage
+    let limit: Int
 }
 
 struct RelayFetchedEnvelope {
@@ -189,6 +209,48 @@ enum RelayClient {
             )
         }
         return RelayFetchPage(envelopes: envelopes, nextCursor: page.nextCursor)
+    }
+
+    /// Fetch one page, halving `limit` and retrying the *same* cursor
+    /// whenever the relay's answer is too big for this client to decode.
+    /// Returns the page together with the limit that actually produced it.
+    ///
+    /// The stall this prevents: `limit` bounds a page's row count, not its
+    /// size, and one sealed payload may be 512 KiB. A mailbox holding enough
+    /// large attachment chunks can therefore produce a full-size window whose
+    /// body is past `relayMaxResponseBytes()`. Without a retry the pass simply
+    /// fails there; the next pass asks the same relay for the same window from
+    /// the same cursor and fails identically, so the frontier never advances
+    /// and nothing behind those rows is delivered until they expire.
+    ///
+    /// Current relayd carries a byte budget and never builds such a page, but
+    /// family relays are self-hosted and older builds exist in the field, so
+    /// the client cannot assume the server-side fix is there.
+    ///
+    /// `relayFetchShrunkLimit` returning nil means one row was already the
+    /// ask: nothing smaller exists, so this is not a paging problem and the
+    /// failure is raised rather than retried forever. Mirrors Android
+    /// `RelayClient.fetchEnvelopesWithinResponseCap`.
+    static func fetchEnvelopesWithinResponseCap(
+        config: RelayConfig,
+        hints: [Data],
+        afterId: Int64,
+        limit: Int,
+        onShrink: (Int, Int) -> Void = { _, _ in }
+    ) throws -> RelayCappedFetch {
+        var attempt = limit
+        while true {
+            do {
+                let page = try fetchEnvelopes(config: config, hints: hints, afterId: afterId, limit: attempt)
+                return RelayCappedFetch(page: page, limit: attempt)
+            } catch let error as RelayResponseTooLargeError {
+                guard let smaller = relayFetchShrunkLimit(currentLimit: UInt32(clamping: attempt)) else {
+                    throw error
+                }
+                onShrink(attempt, Int(smaller))
+                attempt = Int(smaller)
+            }
+        }
     }
 
     static func ackEnvelopes(config: RelayConfig, ids: [Int64]) throws {

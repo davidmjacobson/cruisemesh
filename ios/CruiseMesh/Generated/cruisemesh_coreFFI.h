@@ -1752,6 +1752,11 @@ uint32_t uniffi_cruisemesh_core_fn_func_relay_fetch_batch_limit(RustCallStatus *
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FETCH_SHRUNK_LIMIT
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FETCH_SHRUNK_LIMIT
+RustBuffer uniffi_cruisemesh_core_fn_func_relay_fetch_shrunk_limit(uint32_t current_limit, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FETCH_WALK_CONTINUES
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_RELAY_FETCH_WALK_CONTINUES
 int8_t uniffi_cruisemesh_core_fn_func_relay_fetch_walk_continues(uint32_t page_envelope_count, int64_t after_id, int64_t page_next_cursor, RustCallStatus *_Nonnull out_status
@@ -2881,6 +2886,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_relay_fault_rank(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FETCH_BATCH_LIMIT
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FETCH_BATCH_LIMIT
 uint16_t uniffi_cruisemesh_core_checksum_func_relay_fetch_batch_limit(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FETCH_SHRUNK_LIMIT
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_RELAY_FETCH_SHRUNK_LIMIT
+uint16_t uniffi_cruisemesh_core_checksum_func_relay_fetch_shrunk_limit(void
     
 );
 #endif

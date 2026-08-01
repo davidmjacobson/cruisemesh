@@ -14776,6 +14776,44 @@ public func relayFetchBatchLimit() -> UInt32 {
 })
 }
 /**
+ * The `limit=` to retry a fetch with after the relay's answer came back
+ * bigger than [`relay_max_response_bytes`] — or `None` when there is nothing
+ * left to shrink.
+ *
+ * ## Why the client needs this at all
+ *
+ * A row-counted page has no byte bound. `sealed` may be up to 512 KiB
+ * ([`RELAY_MAX_SEALED_BYTES`]) and rides base64 inside JSON, so a mailbox
+ * holding enough large attachment chunks can produce a 256-row window whose
+ * body is past the 12 MiB cap. The shells refuse that body at the transport
+ * (they must — it is the only thing bounding how much a hostile or
+ * misbehaving relay can make a phone allocate), and because the next pass
+ * asks the same relay for the same window from the same cursor, it fails
+ * identically. The frontier never advances and the mailbox is stuck until
+ * those rows expire.
+ *
+ * Current relayd carries a byte budget of its own and never builds such a
+ * page. That fixes the relays we run — but family relays are self-hosted,
+ * nobody is obliged to upgrade one, and a phone cannot tell a
+ * budget-enforcing relayd from an older build until a page has already blown
+ * the cap. So the client keeps its own escape hatch: ask for half as many
+ * rows and try the very same cursor again. Halving reaches a single row in
+ * at most eight steps from 256, and one row is always fetchable, because a
+ * single `sealed` maxes out at 512 KiB — over twenty times under the cap
+ * even after base64.
+ *
+ * `None` means *stop*: a one-row page that still exceeds the cap is not a
+ * paging problem at all (nothing smaller can be asked for), so the caller
+ * should surface the failure rather than spin.
+ */
+public func relayFetchShrunkLimit(currentLimit: UInt32) -> UInt32? {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_fetch_shrunk_limit(
+        FfiConverterUInt32.lower(currentLimit),$0
+    )
+})
+}
+/**
  * Should the walk fetch another page?
  *
  * Termination is decided by an **empty page**, never by a short one. A
@@ -14784,6 +14822,12 @@ public func relayFetchBatchLimit() -> UInt32 {
  * `page.len() < limit` as end-of-mailbox would stop one page in and silently
  * never see the rest, which for an ascending-id mailbox means never seeing
  * anything new at all.
+ *
+ * Short pages are not an edge case any more, either: relayd now stops
+ * filling a page once its cumulative `sealed` bytes would push the response
+ * past what a client will decode, so a mailbox holding large attachment
+ * chunks routinely answers a 256-row ask with a handful of rows. That page is
+ * complete and its cursor is sound — the walk simply continues from it.
  *
  * The cursor check is the other half: a page that returns rows without
  * advancing `next_cursor` past `after` would loop forever on the same rows.
@@ -15500,7 +15544,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_fetch_batch_limit() != 43600) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_fetch_walk_continues() != 33239) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_fetch_shrunk_limit() != 2046) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_fetch_walk_continues() != 16691) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {

@@ -183,6 +183,12 @@ pub fn relay_cursor_advance(
 /// never see the rest, which for an ascending-id mailbox means never seeing
 /// anything new at all.
 ///
+/// Short pages are not an edge case any more, either: relayd now stops
+/// filling a page once its cumulative `sealed` bytes would push the response
+/// past what a client will decode, so a mailbox holding large attachment
+/// chunks routinely answers a 256-row ask with a handful of rows. That page is
+/// complete and its cursor is sound — the walk simply continues from it.
+///
 /// The cursor check is the other half: a page that returns rows without
 /// advancing `next_cursor` past `after` would loop forever on the same rows.
 /// relayd cannot produce that (its cursor is the last row's id, and ids are
@@ -334,6 +340,22 @@ mod tests {
         // id 50 — which, in an ascending-id mailbox, is all the new mail.
         assert!(relay_fetch_walk_continues(50, 0, 50));
         assert!(relay_fetch_walk_continues(1, 0, 1));
+    }
+
+    /// A byte-budgeted server returns short pages *by design*, so the
+    /// short-page rule is load-bearing rather than defensive. A mailbox of
+    /// large attachment chunks answers a 256-row ask with a few rows every
+    /// time; if that ended the walk, the newest mail — which has the highest
+    /// ids — would never be reached at all.
+    #[test]
+    fn a_page_truncated_by_a_byte_budget_keeps_the_walk_going() {
+        // 12 rows out of an ask of 256, then 9, then 1: each one continues,
+        // and each hands the next page the cursor it advanced to.
+        assert!(relay_fetch_walk_continues(12, 0, 12));
+        assert!(relay_fetch_walk_continues(9, 12, 21));
+        assert!(relay_fetch_walk_continues(1, 21, 22));
+        // Only running out of rows ends it.
+        assert!(!relay_fetch_walk_continues(0, 22, 22));
     }
 
     #[test]

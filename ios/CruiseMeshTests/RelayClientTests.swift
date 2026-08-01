@@ -267,6 +267,73 @@ final class RelayClientTests: XCTestCase {
         XCTAssertThrowsError(try RelayClient.postOutboundEnvelope(config: config, envelope: sampleOutboundEnvelope()))
     }
 
+    func testAFetchPageTooBigToDecodeIsRetriedAtHalfTheLimitNotFailed() throws {
+        // The stall: `limit` bounds rows, not bytes, so a mailbox of large
+        // attachment chunks can produce a window past the response cap. The
+        // next pass would ask the same relay for the same window from the
+        // same cursor and fail identically -- the frontier never advances.
+        // A self-hosted relay predating the server-side byte budget is
+        // exactly this case, so the client must recover on its own.
+        // Mirrors the Android RelayClientTest of the same name.
+        RelayMockURLProtocol.responses = [
+            .init(
+                statusCode: 200,
+                body: Data(#"{"envelopes":[],"next_cursor":0}"#.utf8),
+                headers: ["Content-Length": "\(relayMaxResponseBytes() + 1)"]
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(#"{"envelopes":[],"next_cursor":42}"#.utf8),
+                headers: [:]
+            ),
+        ]
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+
+        let fetched = try RelayClient.fetchEnvelopesWithinResponseCap(
+            config: config,
+            hints: [Data(repeating: 2, count: 8)],
+            afterId: 42,
+            limit: 256
+        )
+
+        XCTAssertEqual(fetched.limit, 128)
+        XCTAssertEqual(fetched.page.nextCursor, 42)
+        XCTAssertEqual(RelayMockURLProtocol.requests.count, 2)
+        let first = RelayMockURLProtocol.requests[0].url!.absoluteString
+        XCTAssertTrue(first.contains("limit=256"))
+        XCTAssertTrue(first.contains("after=42"))
+        // Same cursor, half the rows: nothing is skipped by recovering.
+        let second = RelayMockURLProtocol.requests[1].url!.absoluteString
+        XCTAssertTrue(second.contains("limit=128"))
+        XCTAssertTrue(second.contains("after=42"))
+    }
+
+    func testAnOversizeSingleRowPageIsReportedRatherThanRetriedForever() {
+        // Nothing smaller than one row can be asked for, so retrying would
+        // just spin. Surface it instead.
+        let oversize = RelayMockURLProtocol.CannedResponse(
+            statusCode: 200,
+            body: Data(#"{"envelopes":[],"next_cursor":0}"#.utf8),
+            headers: ["Content-Length": "\(relayMaxResponseBytes() + 1)"]
+        )
+        RelayMockURLProtocol.responses = [oversize, oversize]
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+
+        XCTAssertThrowsError(
+            try RelayClient.fetchEnvelopesWithinResponseCap(
+                config: config,
+                hints: [Data(repeating: 2, count: 8)],
+                afterId: 7,
+                limit: 2
+            )
+        ) { error in
+            XCTAssertTrue(error is RelayResponseTooLargeError)
+        }
+        XCTAssertEqual(RelayMockURLProtocol.requests.count, 2)
+        XCTAssertTrue(RelayMockURLProtocol.requests[0].url!.absoluteString.contains("limit=2"))
+        XCTAssertTrue(RelayMockURLProtocol.requests[1].url!.absoluteString.contains("limit=1"))
+    }
+
     private func sampleOutboundEnvelope() -> OutboundEnvelope {
         OutboundEnvelope(
             msgId: Data(repeating: 1, count: 16),

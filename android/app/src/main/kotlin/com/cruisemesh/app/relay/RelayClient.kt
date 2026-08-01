@@ -19,6 +19,7 @@ import uniffi.cruisemesh_core.relayDecodePresencePage
 import uniffi.cruisemesh_core.relayEncodeAckRequest
 import uniffi.cruisemesh_core.relayEncodePostEnvelope
 import uniffi.cruisemesh_core.relayEncodePresenceRequest
+import uniffi.cruisemesh_core.relayFetchShrunkLimit
 import uniffi.cruisemesh_core.relayMaxResponseBytes
 
 private const val CONNECT_TIMEOUT_MS = 10_000
@@ -40,6 +41,12 @@ data class RelayFetchPage(
     val nextCursor: Long,
 )
 
+/** A fetched page plus the row limit that actually produced it. */
+data class RelayCappedFetch(
+    val page: RelayFetchPage,
+    val limit: Int,
+)
+
 /**
  * Relay HTTP failure carrying the status, relayd's stable error code, and --
  * for 429s -- the raw `Retry-After` header (CP2b; parsed/clamped by the
@@ -51,6 +58,19 @@ class RelayHttpException(
     message: String,
     val retryAfter: String? = null,
 ) : IOException(message)
+
+/**
+ * The relay's answer was larger than [relayMaxResponseBytes], so it was
+ * refused before the whole thing could be accumulated.
+ *
+ * Its own type rather than a bare [IOException] because it is the one
+ * transport failure a caller can actually do something about: a fetch page
+ * that blows the cap is recoverable by asking the same cursor for fewer rows
+ * (see [RelayClient.fetchEnvelopesWithinResponseCap]). Every other
+ * IOException here means "try again later"; this one means "ask for less".
+ */
+class RelayResponseTooLargeException(val maxBytes: Int) :
+    IOException("Relay response exceeds $maxBytes bytes")
 
 data class RelayPresence(
     val hint: ByteArray,
@@ -145,6 +165,47 @@ object RelayClient {
         }
     }
 
+    /**
+     * Fetch one page, halving `limit` and retrying the *same* cursor whenever
+     * the relay's answer is too big for this client to decode. Returns the
+     * page together with the limit that actually produced it.
+     *
+     * The stall this prevents: `limit` bounds a page's row count, not its
+     * size, and one sealed payload may be 512 KiB. A mailbox holding enough
+     * large attachment chunks can therefore produce a full-size window whose
+     * body is past [relayMaxResponseBytes]. Without a retry the pass simply
+     * fails there; the next pass asks the same relay for the same window from
+     * the same cursor and fails identically, so the frontier never advances
+     * and nothing behind those rows is delivered until they expire.
+     *
+     * Current relayd carries a byte budget and never builds such a page, but
+     * family relays are self-hosted and older builds exist in the field, so
+     * the client cannot assume the server-side fix is there.
+     *
+     * `relayFetchShrunkLimit` returning null means one row was already the
+     * ask: nothing smaller exists, so this is not a paging problem and the
+     * failure is raised rather than retried forever.
+     */
+    fun fetchEnvelopesWithinResponseCap(
+        config: RelayConfig,
+        hints: List<ByteArray>,
+        afterId: Long,
+        limit: Int,
+        network: Network? = null,
+        onShrink: (Int, Int) -> Unit = { _, _ -> },
+    ): RelayCappedFetch {
+        var attempt = limit
+        while (true) {
+            try {
+                return RelayCappedFetch(fetchEnvelopes(config, hints, afterId, attempt, network), attempt)
+            } catch (e: RelayResponseTooLargeException) {
+                val smaller = relayFetchShrunkLimit(attempt.toUInt())?.toInt() ?: throw e
+                onShrink(attempt, smaller)
+                attempt = smaller
+            }
+        }
+    }
+
     fun ackEnvelopes(config: RelayConfig, ids: List<Long>, network: Network? = null) {
         if (ids.isEmpty()) return
         val body = relayEncodeAckRequest(ids)
@@ -222,7 +283,7 @@ object RelayClient {
             val code = responseCode
             val maxBytes = relayMaxResponseBytes().toInt()
             if (contentLengthLong > maxBytes) {
-                throw IOException("Relay response exceeds $maxBytes bytes")
+                throw RelayResponseTooLargeException(maxBytes)
             }
             val stream = if (code in 200..299) inputStream else errorStream
             val body = stream?.use { it.readBounded(maxBytes) } ?: ByteArray(0)
@@ -270,7 +331,7 @@ internal fun InputStream.readBounded(maxBytes: Int): ByteArray {
         if (read < 0) break
         if (read == 0) continue
         if (read > maxBytes - total) {
-            throw IOException("Relay response exceeds $maxBytes bytes")
+            throw RelayResponseTooLargeException(maxBytes)
         }
         output.write(buffer, 0, read)
         total += read
