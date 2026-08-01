@@ -95,6 +95,14 @@ internal class RelaySyncEngine(
     @Volatile private var lastKnownPushHealthy: Boolean? = null
 
     /**
+     * Whether the last config sweep found any relay at all, ours or a
+     * contact's. Refreshed wherever [distinctRelayConfigs] is computed, and
+     * read by [offlineRelayHealth] from callbacks that cannot touch the store.
+     * Null until the first sweep runs.
+     */
+    @Volatile private var anyRelayConfigKnown: Boolean? = null
+
+    /**
      * DTN audit finding F1: the 60s poll is correctness-authoritative but
      * slow. When validated internet is up, this opens relayd's `GET /ws`
      * push socket (relayd/src/lib.rs) and, on every pushed envelope, calls
@@ -134,7 +142,7 @@ internal class RelaySyncEngine(
         override fun onLost(network: Network) {
             if (relayBindNetwork == network) relayBindNetwork = null
             if (!hasValidatedInternet()) {
-                MeshConnectivityStatus.setRelayHealth(RelayHealth.NoInternet)
+                MeshConnectivityStatus.setRelayHealth(offlineRelayHealth(anyRelayConfigKnown))
             }
             onRelayNetworkChanged()
             updateRelayPushSubscription()
@@ -207,6 +215,7 @@ internal class RelaySyncEngine(
             emptyList()
         }
         val configs = distinctRelayConfigs(contacts, RelayConfigStore.load(context))
+        anyRelayConfigKnown = configs.isNotEmpty()
         MeshConnectivityStatus.setRelayHealth(
             when {
                 configs.isEmpty() -> RelayHealth.NoConfig
@@ -355,7 +364,7 @@ internal class RelaySyncEngine(
     fun requestRelaySync(reason: String) {
         if (!isRunning() || identityProvider() == null) return
         if (!hasValidatedInternet()) {
-            MeshConnectivityStatus.setRelayHealth(RelayHealth.NoInternet)
+            MeshConnectivityStatus.setRelayHealth(offlineRelayHealth(anyRelayConfigKnown))
             return
         }
         // CP2b: honor relayd's Retry-After. Every nudge that arrives inside
@@ -430,6 +439,7 @@ internal class RelaySyncEngine(
         uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now, network)
 
         val configs = distinctRelayConfigs(contacts, fallbackConfig)
+        anyRelayConfigKnown = configs.isNotEmpty()
         if (configs.isEmpty()) {
             MeshConnectivityStatus.setRelayHealth(RelayHealth.NoConfig)
             return
