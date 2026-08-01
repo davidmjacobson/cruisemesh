@@ -37,9 +37,13 @@ enum RelayHealth: Equatable {
     /// `relayHealthAfterSyncPass` (RelayFaultPolicy.kt): the mailbox-level
     /// faults (quota, oversized, rate-limited) surface even when polling
     /// succeeded, because relayd keeps serving fetches while rejecting
-    /// posts; the credential faults keep the pre-CP2b precedence and only
-    /// show when the pass didn't fully succeed. Classification itself lives
-    /// in the core (`core/src/relay_status.rs`).
+    /// posts. `.passExpired` is in that group too: for relayd's seven-day
+    /// `FAMILY_EXPIRY_GRACE_MS` an expired pass still fetches and acks and
+    /// only POSTs take the 403, so the success flags read "reachable" for a
+    /// week while every new message is rejected. `.passSuspended` and
+    /// `.tokenRejected` keep the pre-CP2b precedence because relayd rejects
+    /// every op for both, so neither can co-occur with a successful poll.
+    /// Classification itself lives in the core (`core/src/relay_status.rs`).
     static func afterSyncPass(
         fault: CoreRelayFault?,
         ownRelaySucceeded: Bool,
@@ -50,11 +54,11 @@ enum RelayHealth: Equatable {
         case .mailboxFull: return .quotaFull(lastAttemptMs: nowMs)
         case .messageTooLarge: return .messageTooLarge(lastAttemptMs: nowMs)
         case .rateLimited: return .rateLimited(lastAttemptMs: nowMs)
+        case .passExpired: return .expired(lastAttemptMs: nowMs)
         default: break
         }
         if ownRelaySucceeded && anyRelaySucceeded { return .ok(lastSyncMs: nowMs) }
         switch fault {
-        case .passExpired: return .expired(lastAttemptMs: nowMs)
         case .passSuspended: return .suspended(lastAttemptMs: nowMs)
         case .tokenRejected: return .tokenRejected(lastAttemptMs: nowMs)
         default: return .failing(lastAttemptMs: nowMs)
