@@ -1,6 +1,14 @@
 import Foundation
 
-private final class BoundedRelayResponseDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+/// Accumulates one bounded relay response and decides what its failures mean.
+///
+/// Internal rather than file-private only so the tests can drive its callbacks
+/// by hand. That matters here: the cases worth pinning are "the body stopped
+/// after the head arrived" and "nothing arrived at all", and staging those
+/// through a mock `URLProtocol` means racing the URL loading system's own
+/// callback scheduling. Called directly, the same decisions are exercised with
+/// no timers and no ordering to lose.
+final class BoundedRelayResponseDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let maxBytes: Int
     private let errorPreviewBytes: Int
     private let semaphore: DispatchSemaphore
