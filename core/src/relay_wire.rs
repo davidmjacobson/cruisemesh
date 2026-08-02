@@ -463,6 +463,46 @@ pub fn relay_fetch_batch_limit() -> u32 {
     RELAY_FETCH_MAX_ROWS as u32
 }
 
+/// The `limit=` to retry a fetch with after the relay's answer came back
+/// bigger than [`relay_max_response_bytes`] — or `None` when there is nothing
+/// left to shrink.
+///
+/// ## Why the client needs this at all
+///
+/// A row-counted page has no byte bound. `sealed` may be up to 512 KiB
+/// ([`RELAY_MAX_SEALED_BYTES`]) and rides base64 inside JSON, so a mailbox
+/// holding enough large attachment chunks can produce a 256-row window whose
+/// body is past the 12 MiB cap. The shells refuse that body at the transport
+/// (they must — it is the only thing bounding how much a hostile or
+/// misbehaving relay can make a phone allocate), and because the next pass
+/// asks the same relay for the same window from the same cursor, it fails
+/// identically. The frontier never advances and the mailbox is stuck until
+/// those rows expire.
+///
+/// Current relayd carries a byte budget of its own and never builds such a
+/// page. That fixes the relays we run — but family relays are self-hosted,
+/// nobody is obliged to upgrade one, and a phone cannot tell a
+/// budget-enforcing relayd from an older build until a page has already blown
+/// the cap. So the client keeps its own escape hatch: ask for half as many
+/// rows and try the very same cursor again. Halving reaches a single row in
+/// at most eight steps from 256, and one row is always fetchable, because a
+/// single `sealed` maxes out at 512 KiB — over twenty times under the cap
+/// even after base64.
+///
+/// `None` means *stop*: a one-row page that still exceeds the cap is not a
+/// paging problem at all (nothing smaller can be asked for), so the caller
+/// should surface the failure rather than spin.
+#[uniffi::export]
+pub fn relay_fetch_shrunk_limit(current_limit: u32) -> Option<u32> {
+    // Clamp first: a caller that somehow asked above our own ceiling must
+    // come back with something `relay_build_fetch_path` will accept.
+    let current = current_limit.min(RELAY_FETCH_MAX_ROWS as u32);
+    if current <= 1 {
+        return None;
+    }
+    Some((current / 2).max(1))
+}
+
 #[uniffi::export]
 pub fn relay_encode_post_envelope(
     msg_id: Vec<u8>,
@@ -1075,6 +1115,56 @@ mod tests {
         // more than the deployed server accepts would rely on its clamp.
         assert!(RELAY_FETCH_MAX_ROWS <= 500);
         assert_eq!(relay_fetch_batch_limit() as usize, RELAY_FETCH_MAX_ROWS);
+    }
+
+    #[test]
+    fn an_oversize_page_shrinks_by_halving_and_bottoms_out_at_one_row() {
+        // The recovery ladder from a full page: eight halvings reach one row,
+        // and every rung is a limit the path builder will accept.
+        let mut limit = relay_fetch_batch_limit();
+        let mut ladder = vec![limit];
+        while let Some(next) = relay_fetch_shrunk_limit(limit) {
+            assert!(next < limit, "shrinking must make progress");
+            assert!(relay_build_fetch_path(vec![], 0, next).is_ok());
+            limit = next;
+            ladder.push(limit);
+        }
+        assert_eq!(ladder, vec![256, 128, 64, 32, 16, 8, 4, 2, 1]);
+    }
+
+    #[test]
+    fn a_single_row_page_that_is_still_too_big_stops_instead_of_spinning() {
+        // Nothing smaller than one row can be asked for. Reporting "no
+        // smaller ask exists" lets the caller surface the failure rather than
+        // retry the identical request forever.
+        assert_eq!(relay_fetch_shrunk_limit(1), None);
+        assert_eq!(relay_fetch_shrunk_limit(0), None);
+        // Odd limits still descend rather than sticking.
+        assert_eq!(relay_fetch_shrunk_limit(3), Some(1));
+        assert_eq!(relay_fetch_shrunk_limit(2), Some(1));
+        // A limit above our own ceiling is clamped into range first, so the
+        // retry is always something `relay_build_fetch_path` accepts.
+        assert_eq!(relay_fetch_shrunk_limit(u32::MAX), Some(128));
+    }
+
+    /// A single maximum-size row must survive the smallest possible ask, or
+    /// the shrink ladder would bottom out on a page that still cannot be
+    /// decoded and the row would be unreachable forever.
+    #[test]
+    fn one_maximum_size_row_fits_the_body_cap_with_room_to_spare() {
+        let encoded_msg_id = b64(&[1; 16]);
+        let encoded_hint = b64(&[2; 8]);
+        let sealed = b64(&vec![3; RELAY_MAX_SEALED_BYTES]);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "envelopes": [{"id": 1, "msg_id": encoded_msg_id, "hop_ttl": 7,
+                "recipient_hint": encoded_hint, "sealed": sealed, "expiry_ms": 9}],
+            "next_cursor": 1
+        }))
+        .unwrap();
+        assert!(body.len() < RELAY_MAX_RESPONSE_BODY_BYTES);
+        let page = relay_decode_fetch_page(body).unwrap();
+        assert_eq!(page.envelopes.len(), 1);
+        assert_eq!(page.envelopes[0].sealed.len(), RELAY_MAX_SEALED_BYTES);
     }
 
     #[test]

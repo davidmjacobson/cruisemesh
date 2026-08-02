@@ -196,6 +196,30 @@ final class RelayFetchCursorTests: XCTestCase {
         XCTAssertTrue(relayFetchWalkContinues(pageEnvelopeCount: 256, afterId: 100, pageNextCursor: 356))
     }
 
+    func testAPageTruncatedByTheServersByteBudgetKeepsTheWalkGoing() {
+        // relayd stops filling a page once its cumulative sealed bytes would
+        // push the response past what this client will decode, so a mailbox
+        // of large attachment chunks answers a 256-row ask with a handful of
+        // rows every time. Reading that as end-of-mailbox would strand the
+        // newest mail, which in an ascending-id mailbox has the highest ids.
+        XCTAssertTrue(relayFetchWalkContinues(pageEnvelopeCount: 12, afterId: 0, pageNextCursor: 12))
+        XCTAssertTrue(relayFetchWalkContinues(pageEnvelopeCount: 9, afterId: 12, pageNextCursor: 21))
+        XCTAssertTrue(relayFetchWalkContinues(pageEnvelopeCount: 1, afterId: 21, pageNextCursor: 22))
+        XCTAssertFalse(relayFetchWalkContinues(pageEnvelopeCount: 0, afterId: 22, pageNextCursor: 22))
+    }
+
+    func testAnOversizePageHalvesTheAskDownToOneRowAndThenStops() {
+        var limit = relayFetchBatchLimit()
+        var ladder: [UInt32] = [limit]
+        while let next = relayFetchShrunkLimit(currentLimit: limit) {
+            limit = next
+            ladder.append(limit)
+        }
+        XCTAssertEqual(ladder, [256, 128, 64, 32, 16, 8, 4, 2, 1])
+        // One row is the floor: nothing smaller exists to ask for.
+        XCTAssertNil(relayFetchShrunkLimit(currentLimit: 1))
+    }
+
     func testACursorThatDoesNotAdvanceEndsTheWalkInsteadOfLooping() {
         XCTAssertFalse(relayFetchWalkContinues(pageEnvelopeCount: 16, afterId: 100, pageNextCursor: 100))
         XCTAssertFalse(relayFetchWalkContinues(pageEnvelopeCount: 16, afterId: 100, pageNextCursor: 99))

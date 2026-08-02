@@ -2782,7 +2782,6 @@ final class MeshController: ObservableObject {
                 recentPresenceHintsFor(userId: userId, nowMs: timestamp)
             }
             let fetchHints = try store.relayFetchHints(ownUserId: identity.userId, nowMs: now)
-            let fetchBatchLimit = Int(relayFetchBatchLimit())
             var anyRelaySucceeded = false
             var ownRelaySucceeded = config == nil
             for cfg in distinctConfigs {
@@ -2880,18 +2879,40 @@ final class MeshController: ObservableObject {
                     // walk itself continues, so one bad page never blocks the
                     // mail behind it.
                     var frontierAdvancing = true
+                    // Not a `let`: a page too big for this client to decode
+                    // halves the ask and retries the same cursor, and the
+                    // reduced limit is kept for the rest of this mailbox's
+                    // walk rather than reset per page -- a mailbox that
+                    // produced one oversize window usually produces the next
+                    // one too, and rediscovering that costs a wasted request
+                    // every page. Scoped to THIS mailbox, exactly as in
+                    // RelaySyncEngine.kt, where it is a local of
+                    // `pollRelayMailbox`: one relay's oversize page says
+                    // nothing about the next relay's, and carrying the
+                    // reduction across configs would shrink every other
+                    // mailbox's pages for the rest of the pass. The next pass
+                    // starts from the full limit again.
+                    var fetchBatchLimit = Int(relayFetchBatchLimit())
                     func finishSweep() {
                         guard sweeping else { return }
                         RelaySweepSession.shared.noteSwept(cursorKey)
                         try? store.noteRelaySweepCompleted(configKey: cursorKey, nowMs: now)
                     }
                     while true {
-                        let page = try RelayClient.fetchEnvelopes(
+                        let fetched = try RelayClient.fetchEnvelopesWithinResponseCap(
                             config: cfg,
                             hints: fetchHints,
                             afterId: afterId,
                             limit: fetchBatchLimit
-                        )
+                        ) { tried, smaller in
+                            relaySyncLog.warning(
+                                "Relay page exceeded the response cap at limit=\(tried, privacy: .public); retrying with limit=\(smaller, privacy: .public)"
+                            )
+                        }
+                        let page = fetched.page
+                        // Carried to the next page of THIS mailbox only; see
+                        // the declaration above for why.
+                        fetchBatchLimit = fetched.limit
                         guard !page.envelopes.isEmpty else {
                             finishSweep()
                             break

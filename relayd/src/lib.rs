@@ -76,6 +76,92 @@ const RECIPIENT_HINT_LEN: usize = 8;
 const MSG_ID_LEN: usize = 16;
 const DEFAULT_FETCH_LIMIT: usize = 100;
 const MAX_FETCH_LIMIT: usize = 500;
+
+/// The response body ceiling every first-party client enforces before it will
+/// decode a fetch page (`core/src/relay_wire.rs`
+/// `RELAY_MAX_RESPONSE_BODY_BYTES`, exported as `relay_max_response_bytes()`).
+/// Duplicated rather than imported because `cruisemesh-core` is a dev
+/// dependency here, not a runtime one; `client_body_cap_matches_the_core`
+/// pins the two values together the same way the deposit-token golden vector
+/// pins that derivation.
+const CLIENT_MAX_RESPONSE_BODY_BYTES: usize = 12 * 1024 * 1024;
+
+/// Upper bound on the JSON scaffolding one `EnvelopeResponse` costs, on top
+/// of the base64 `sealed` string.
+///
+/// Counted, not guessed: field names and punctuation
+/// (`{"id":,"msg_id":"","hop_ttl":,"recipient_hint":"","sealed":"","expiry_ms":,"created_at_ms":},`)
+/// are 110 bytes; `msg_id` is 16 bytes base64url-unpadded = 22 chars;
+/// `recipient_hint` is 8 bytes = 11 chars; the four numbers are at most 20 +
+/// 3 + 20 + 20 digits. That is 206. Rounded up to 256 for headroom.
+const MAX_FETCH_ROW_OVERHEAD_BYTES: usize = 256;
+
+/// Cumulative budget, in *decoded* `sealed` bytes, for one fetch page.
+///
+/// ### Why a byte budget exists at all
+///
+/// `LIMIT` bounds a page's row count, not its size. `sealed` may be up to
+/// `MAX_ENVELOPE_SEALED_BYTES` (512 KiB) and goes out base64-encoded inside
+/// JSON, so a mailbox holding enough large attachment chunks can fill a
+/// row-counted window with a body far past what a client will accept. The
+/// client then rejects the body, retries the identical window from the
+/// identical cursor on the next pass, and gets the identical answer: the
+/// frontier never moves and the mailbox stalls until those rows expire.
+///
+/// ### Deriving the number
+///
+/// Work backwards from the client's 12 MiB body cap
+/// (`CLIENT_MAX_RESPONSE_BODY_BYTES` = 12,582,912) and require the worst-case
+/// page built under the budget to fit inside it:
+///
+/// 1. base64 of B decoded bytes is `ceil(B / 3) * 4` — a 4/3 expansion.
+/// 2. Row scaffolding costs at most `MAX_FETCH_ROW_OVERHEAD_BYTES` (256) per
+///    row, and a page holds at most `MAX_FETCH_LIMIT` (500) rows, so at most
+///    128,000 bytes.
+/// 3. The response wrapper (`{"next_cursor":N,"envelopes":[…]}`) is under 64
+///    bytes.
+///
+/// So the largest B that fits is `(12,582,912 - 128,000 - 64) * 3 / 4` ≈
+/// 9,341,136 bytes ≈ 8.9 MiB. Taking **8 MiB (8,388,608)** lands under that
+/// with ~10% of the cap left spare: the worst case serializes to
+/// 11,184,812 + 128,000 + 64 = 11,312,876 bytes, against a cap of 12,582,912.
+/// The margin absorbs a future field on `EnvelopeResponse` and any slop in
+/// the per-row estimate. `page_worst_case_fits_the_client_body_cap` computes
+/// this rather than restating it, so changing any input fails the test
+/// instead of quietly eating the headroom.
+///
+/// The always-take-the-first-row rule cannot break this for any envelope that
+/// could be POSTed: admission caps one at `MAX_ENVELOPE_SEALED_BYTES`, and the
+/// assert below pins that under the page budget, so a page forced to carry one
+/// such row stays far inside the client's cap.
+///
+/// It is NOT an unconditional guarantee, and the gap is worth naming. A row
+/// written by an older build can exceed today's admission limit (see
+/// `a_single_row_over_the_whole_budget_is_still_returned_alone`); returning it
+/// alone is deliberate, because refusing would stall every client's cursor on
+/// it forever. Such a row only decodes if it fits the client cap on its own —
+/// roughly 9 MiB of sealed bytes. Past that it is genuinely unreachable, and no
+/// client-side shrink helps, since the limit is already down to one row. Retire
+/// it by expiry, not by paging.
+const MAX_FETCH_PAGE_SEALED_BYTES: usize = 8 * 1024 * 1024;
+
+/// The derivation above, as a compile-time check rather than a comment:
+/// worst-case base64 of the budget, plus worst-case row scaffolding for a
+/// maximum-length page, plus the response wrapper, must fit the client's body
+/// cap. Raising the budget or the row limit past what a client will decode is
+/// then a build failure, not a mailbox that stalls in the field.
+const _: () = assert!(
+    MAX_FETCH_PAGE_SEALED_BYTES.div_ceil(3) * 4
+        + MAX_FETCH_LIMIT * MAX_FETCH_ROW_OVERHEAD_BYTES
+        + 64
+        <= CLIENT_MAX_RESPONSE_BODY_BYTES,
+    "a fetch page built to the byte budget must fit the client's response cap"
+);
+
+/// A single envelope must always fit the budget on its own, or the
+/// always-take-the-first-row rule in `fetch_envelopes` could hand a client a
+/// page it cannot decode.
+const _: () = assert!(MAX_ENVELOPE_SEALED_BYTES <= MAX_FETCH_PAGE_SEALED_BYTES);
 pub const MAX_FETCH_HINTS: usize = 256;
 pub const MAX_ACK_IDS: usize = 512;
 const MAX_PRESENCE_ANNOUNCE: usize = 4;
@@ -1269,8 +1355,26 @@ impl RelayStore {
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())
+        // The row limit alone is not a bound on the *response*, only on its
+        // length. Stop filling the page once one more row would push its
+        // cumulative sealed bytes past the budget, so no client is ever handed
+        // a page it will refuse to decode (see `MAX_FETCH_PAGE_SEALED_BYTES`).
+        // The first matching row is always taken, whatever its size: a page
+        // may be short but never empty while rows match, or an oversized
+        // envelope would be permanently unreachable and would stall the
+        // caller's cursor on it forever.
+        let mut page: Vec<StoredEnvelope> = Vec::new();
+        let mut sealed_bytes = 0usize;
+        for row in rows {
+            let row = row.map_err(|e| e.to_string())?;
+            let next = sealed_bytes.saturating_add(row.sealed.len());
+            if !page.is_empty() && next > MAX_FETCH_PAGE_SEALED_BYTES {
+                break;
+            }
+            sealed_bytes = next;
+            page.push(row);
+        }
+        Ok(page)
     }
 
     pub fn ack_envelopes(&self, family_token: &str, ids: Vec<i64>) -> Result<u64, String> {
@@ -2826,7 +2930,6 @@ async fn handle_ws(
         if rows.is_empty() {
             break;
         }
-        let n = rows.len();
         for row in rows {
             let env = EnvelopeResponse {
                 id: row.id,
@@ -2846,9 +2949,16 @@ async fn handle_ws(
                 return;
             }
         }
-        if n < DEFAULT_FETCH_LIMIT {
-            break;
-        }
+        // Replay ends on an EMPTY batch (checked above), never on a short
+        // one. This used to break out at `rows.len() < DEFAULT_FETCH_LIMIT`,
+        // which was sound only while a batch was bounded by row count alone.
+        // `fetch_envelopes` now also stops on a cumulative byte budget, so a
+        // mailbox of large attachment chunks returns short batches routinely
+        // — and treating one as end-of-backlog would silently truncate the
+        // replay, stranding exactly the newest mail (an ascending-id mailbox
+        // puts it last). The cost of dropping the shortcut is one extra
+        // empty query per WebSocket connect. Both mobile shells apply the
+        // same rule to HTTP paging (`relay_fetch_walk_continues`).
     }
 
     // --- Live push ---
@@ -5053,6 +5163,250 @@ mod tests {
 
         assert_eq!(store.family_sealed_bytes("family-a").unwrap(), 350);
         assert_eq!(store.family_sealed_bytes("family-b").unwrap(), 9_999);
+    }
+
+    // -- fetch page byte budget ------------------------------------------
+
+    /// The budget is only meaningful if the page it permits actually fits
+    /// what a client will decode. Recomputed here from its inputs rather than
+    /// restated, so raising the row limit, the per-row overhead, or the
+    /// budget itself fails here instead of in somebody's mailbox.
+    #[test]
+    fn page_worst_case_fits_the_client_body_cap() {
+        let base64_of_budget = MAX_FETCH_PAGE_SEALED_BYTES.div_ceil(3) * 4;
+        let scaffolding = MAX_FETCH_LIMIT * MAX_FETCH_ROW_OVERHEAD_BYTES;
+        let wrapper = 64;
+        let worst_case = base64_of_budget + scaffolding + wrapper;
+        assert!(
+            worst_case <= CLIENT_MAX_RESPONSE_BODY_BYTES,
+            "worst-case page of {worst_case} bytes exceeds the {CLIENT_MAX_RESPONSE_BODY_BYTES}-byte client cap"
+        );
+        // And it is not so tight that a single added field would break it:
+        // keep at least 5% of the cap spare.
+        assert!(worst_case + CLIENT_MAX_RESPONSE_BODY_BYTES / 20 <= CLIENT_MAX_RESPONSE_BODY_BYTES);
+        // That one maximum-size envelope fits the budget on its own -- the
+        // premise of the always-return-one-row rule -- is asserted at compile
+        // time next to the constants themselves.
+    }
+
+    /// Duplicated from `core/src/relay_wire.rs`'s
+    /// `RELAY_MAX_RESPONSE_BODY_BYTES`; the core's own
+    /// `exposes_bounded_fetch_policy` pins its side. If either moves without
+    /// the other, one of the two tests fails.
+    #[test]
+    fn client_body_cap_matches_the_core() {
+        assert_eq!(
+            CLIENT_MAX_RESPONSE_BODY_BYTES as u32,
+            cruisemesh_core::relay_max_response_bytes()
+        );
+    }
+
+    #[test]
+    fn a_byte_heavy_page_is_truncated_by_bytes_and_the_cursor_still_advances() {
+        let (_db, store) = test_store();
+        let now = 1_700_000_000_000i64;
+        // 20 maximum-size envelopes = 10 MiB, comfortably past the 8 MiB
+        // page budget but only 20 rows — nothing a row limit would catch.
+        let mut ids = Vec::new();
+        for index in 0..20u8 {
+            ids.push(
+                store
+                    .insert_envelope(
+                        "family-a",
+                        sample_msg_id(index),
+                        7,
+                        sample_hint(1),
+                        vec![index; MAX_ENVELOPE_SEALED_BYTES],
+                        now + 60_000,
+                        now,
+                    )
+                    .unwrap(),
+            );
+        }
+
+        let rows_per_page = MAX_FETCH_PAGE_SEALED_BYTES / MAX_ENVELOPE_SEALED_BYTES;
+        let first = store
+            .fetch_envelopes("family-a", vec![sample_hint(1)], 0, MAX_FETCH_LIMIT, now)
+            .unwrap();
+        assert_eq!(
+            first.len(),
+            rows_per_page,
+            "the page must be cut by bytes, not by the row limit"
+        );
+        let first_bytes: usize = first.iter().map(|row| row.sealed.len()).sum();
+        assert!(first_bytes <= MAX_FETCH_PAGE_SEALED_BYTES);
+        assert_eq!(first.first().unwrap().id, ids[0]);
+
+        // The cursor the handler derives is the last returned row's id, and
+        // resuming from it picks up exactly where the truncation stopped —
+        // no row skipped, none repeated.
+        let cursor = first.last().unwrap().id;
+        assert_eq!(cursor, ids[rows_per_page - 1]);
+        let second = store
+            .fetch_envelopes(
+                "family-a",
+                vec![sample_hint(1)],
+                cursor,
+                MAX_FETCH_LIMIT,
+                now,
+            )
+            .unwrap();
+        assert_eq!(second.len(), 20 - rows_per_page);
+        assert_eq!(second.first().unwrap().id, ids[rows_per_page]);
+
+        // Walking to the end sees every row exactly once.
+        let mut walked: Vec<i64> = first
+            .iter()
+            .chain(second.iter())
+            .map(|row| row.id)
+            .collect();
+        walked.dedup();
+        assert_eq!(walked, ids);
+        assert!(store
+            .fetch_envelopes(
+                "family-a",
+                vec![sample_hint(1)],
+                *ids.last().unwrap(),
+                MAX_FETCH_LIMIT,
+                now
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_single_row_over_the_whole_budget_is_still_returned_alone() {
+        // Rows this large cannot be posted today (`MAX_ENVELOPE_SEALED_BYTES`
+        // rejects them at the door) but may exist in a database written by an
+        // older build. Refusing to return one would make it permanently
+        // unreachable AND stall every client's cursor on it forever, which is
+        // strictly worse than handing over one oversized page.
+        let (_db, store) = test_store();
+        let now = 1_700_000_000_000i64;
+        let big = store
+            .insert_envelope(
+                "family-a",
+                sample_msg_id(1),
+                7,
+                sample_hint(1),
+                vec![9u8; MAX_FETCH_PAGE_SEALED_BYTES + 1],
+                now + 60_000,
+                now,
+            )
+            .unwrap();
+        let follower = store
+            .insert_envelope(
+                "family-a",
+                sample_msg_id(2),
+                7,
+                sample_hint(1),
+                sample_sealed(2),
+                now + 60_000,
+                now,
+            )
+            .unwrap();
+
+        let page = store
+            .fetch_envelopes("family-a", vec![sample_hint(1)], 0, MAX_FETCH_LIMIT, now)
+            .unwrap();
+        assert_eq!(page.len(), 1, "the oversized row must come back on its own");
+        assert_eq!(page[0].id, big);
+
+        // And the row behind it is not stranded: the next page returns it.
+        let next = store
+            .fetch_envelopes("family-a", vec![sample_hint(1)], big, MAX_FETCH_LIMIT, now)
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].id, follower);
+    }
+
+    #[tokio::test]
+    async fn get_envelopes_returns_a_short_page_that_the_client_can_decode() {
+        let app = test_app();
+        let expiry = now_ms() + 600_000;
+        // Twenty maximum-size envelopes: 10 MiB, which a row-counted page
+        // would hand back in one response of roughly 13.6 MiB -- past the
+        // client's 12 MiB cap, and so a page it would refuse to decode on
+        // this pass and identically on every pass after it.
+        let total_rows = 20u8;
+        for index in 0..total_rows {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/envelopes")
+                .header("authorization", "Bearer family-a")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "msg_id": encode_base64_field(&sample_msg_id(index)),
+                        "hop_ttl": 7,
+                        "recipient_hint": encode_base64_field(&sample_hint(1)),
+                        "sealed": encode_base64_field(&vec![index; MAX_ENVELOPE_SEALED_BYTES]),
+                        "expiry_ms": expiry,
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+
+        let fetch = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/envelopes?hints={}&after=0&limit=500",
+                encode_base64_field(&sample_hint(1))
+            ))
+            .header("authorization", "Bearer family-a")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(fetch).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            bytes.len() <= CLIENT_MAX_RESPONSE_BODY_BYTES,
+            "a page the client would refuse to decode is a stalled mailbox"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let envelopes = json["envelopes"].as_array().unwrap();
+        assert!(!envelopes.is_empty());
+        // Short of the ask, and short of what is in the mailbox: the client's
+        // walk continues from the cursor rather than reading this as the end
+        // (core `relay_fetch_walk_continues`).
+        assert!(envelopes.len() < usize::from(total_rows));
+        assert_eq!(
+            json["next_cursor"].as_i64().unwrap(),
+            envelopes.last().unwrap()["id"].as_i64().unwrap(),
+            "the cursor must name the last row actually returned"
+        );
+
+        // Resuming from that cursor drains the rest, so nothing is stranded.
+        let mut cursor = json["next_cursor"].as_i64().unwrap();
+        let mut seen = envelopes.len();
+        loop {
+            let next = Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/envelopes?hints={}&after={cursor}&limit=500",
+                    encode_base64_field(&sample_hint(1))
+                ))
+                .header("authorization", "Bearer family-a")
+                .body(Body::empty())
+                .unwrap();
+            let json = body_json(app.clone().oneshot(next).await.unwrap()).await;
+            let page = json["envelopes"].as_array().unwrap().clone();
+            if page.is_empty() {
+                break;
+            }
+            seen += page.len();
+            cursor = json["next_cursor"].as_i64().unwrap();
+        }
+        assert_eq!(
+            seen,
+            usize::from(total_rows),
+            "every row must be reachable across pages"
+        );
     }
 
     #[test]

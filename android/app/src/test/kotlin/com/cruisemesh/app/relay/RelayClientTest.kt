@@ -6,9 +6,11 @@ import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.OutgoingReceiptEnvelope
+import uniffi.cruisemesh_core.relayMaxResponseBytes
 import java.nio.charset.StandardCharsets
 import java.io.ByteArrayInputStream
 import java.io.IOException
@@ -232,9 +234,89 @@ class RelayClientTest {
             ByteArrayInputStream(ByteArray(9)).readBounded(8)
         }.exceptionOrNull()
 
-        assertEquals(IOException::class.java, error?.javaClass)
+        // Its own IOException subtype, not a bare one: an oversize *fetch*
+        // page is recoverable by asking for fewer rows, and the walk can only
+        // tell that failure apart from "the network broke" by its type.
+        assertEquals(RelayResponseTooLargeException::class.java, error?.javaClass)
+        assertEquals(8, (error as RelayResponseTooLargeException).maxBytes)
+        // Still an IOException, so every existing "the relay call failed"
+        // catch keeps working unchanged.
+        assertTrue(IOException::class.java.isAssignableFrom(error.javaClass))
         val exact = ByteArray(8) { it.toByte() }
         assertArrayEquals(exact, ByteArrayInputStream(exact).readBounded(8))
+    }
+
+    @Test
+    fun `a fetch page too big to decode is retried at half the limit, not failed`() {
+        // The stall: `limit` bounds rows, not bytes, so a mailbox of large
+        // attachment chunks can produce a window past the response cap. The
+        // next pass would ask the same relay for the same window from the
+        // same cursor and fail identically -- the frontier never advances.
+        // A self-hosted relay predating the server-side byte budget is
+        // exactly this case, so the client must recover on its own.
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("""{"envelopes":[],"next_cursor":0}""")
+                .setHeader("Content-Length", (relayMaxResponseBytes().toLong() + 1).toString()),
+        )
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody("""{"envelopes":[],"next_cursor":42}"""),
+        )
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val fetched = RelayClient.fetchEnvelopesWithinResponseCap(
+                config,
+                listOf(ByteArray(8) { 2 }),
+                afterId = 42L,
+                limit = 256,
+            )
+
+            assertEquals(128, fetched.limit)
+            assertEquals(42L, fetched.page.nextCursor)
+            val first = server.takeRequest()
+            assertTrue(first.path!!.contains("limit=256"))
+            assertTrue(first.path!!.contains("after=42"))
+            val second = server.takeRequest()
+            // Same cursor, half the rows: nothing is skipped by recovering.
+            assertTrue(second.path!!.contains("limit=128"))
+            assertTrue(second.path!!.contains("after=42"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `an oversize single-row page is reported rather than retried forever`() {
+        // Nothing smaller than one row can be asked for, so retrying would
+        // just spin. Surface it instead.
+        val server = MockWebServer()
+        repeat(2) {
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setBody("""{"envelopes":[],"next_cursor":0}""")
+                    .setHeader("Content-Length", (relayMaxResponseBytes().toLong() + 1).toString()),
+            )
+        }
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            assertThrows(RelayResponseTooLargeException::class.java) {
+                RelayClient.fetchEnvelopesWithinResponseCap(
+                    config,
+                    listOf(ByteArray(8) { 2 }),
+                    afterId = 7L,
+                    limit = 2,
+                )
+            }
+            assertTrue(server.takeRequest().path!!.contains("limit=2"))
+            assertTrue(server.takeRequest().path!!.contains("limit=1"))
+        } finally {
+            server.shutdown()
+        }
     }
 
     private fun sampleOutboundEnvelope() = OutboundEnvelope(

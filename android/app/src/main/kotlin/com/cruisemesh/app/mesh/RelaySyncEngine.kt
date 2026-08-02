@@ -762,13 +762,33 @@ internal class RelaySyncEngine(
         // skip the failed one forever. The walk itself continues, so one bad
         // envelope never blocks the mail behind it.
         var frontierAdvancing = true
-        val fetchBatchLimit = relayFetchBatchLimit().toInt()
+        // Not a val: a page too big for this client to decode halves the ask
+        // and retries the same cursor, and the reduced limit is kept for the
+        // rest of this pass rather than reset per page -- a mailbox that
+        // produced one oversize window usually produces the next one too, and
+        // rediscovering that costs a wasted request every page. The next pass
+        // starts from the full limit again.
+        var fetchBatchLimit = relayFetchBatchLimit().toInt()
         Log.i(
             TAG,
             "Relay mailbox walk on ${config.relayUrl}: ${if (sweeping) "sweep" else "frontier"} from after=$after",
         )
         while (isRunning() && hasValidatedInternet()) {
-            val page = RelayClient.fetchEnvelopes(config, fetchHints, after, fetchBatchLimit, network)
+            val fetched = RelayClient.fetchEnvelopesWithinResponseCap(
+                config,
+                fetchHints,
+                after,
+                fetchBatchLimit,
+                network,
+            ) { tried, smaller ->
+                Log.w(
+                    TAG,
+                    "Relay ${config.relayUrl} page after=$after exceeded the response cap at limit=$tried; " +
+                        "retrying with limit=$smaller",
+                )
+            }
+            val page = fetched.page
+            fetchBatchLimit = fetched.limit
             Log.i(
                 TAG,
                 "Fetched ${page.envelopes.size} relay envelope(s) from ${config.relayUrl} after=$after next=${page.nextCursor}",

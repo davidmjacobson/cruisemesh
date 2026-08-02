@@ -409,6 +409,17 @@ A deliberately dumb mailbox:
   `recipient_hint`, `sealed`) rather than plaintext message metadata; relay-side
   dedupe is by `(family_token, msg_id)`, fetch is by `recipient_hint` since cursor,
   delete-on-ack, 30-day retention.
+- **A fetch page is bounded by bytes as well as rows.** `limit=` caps the row
+  count, but one `sealed` payload may be 512 KiB, so a row-counted window over
+  a backlog of large attachments can exceed what a client will decode — and
+  because the next poll asks for the same window from the same cursor, that
+  mailbox stalls permanently. The server therefore stops filling a page once
+  its cumulative sealed bytes would push the response past the client's cap,
+  always returning at least one row so an oversized envelope is never
+  unreachable. Consequently **a short page is never end-of-mailbox**: both
+  shells end a walk only on an *empty* page, and a client that meets an
+  oversize page anyway (a self-hosted relay on an older build) halves `limit=`
+  and retries the same cursor.
 - **Two credential classes per family** (the SMTP/IMAP split — see §9.2): the
   **member token** authorizes everything (post, fetch, ack, WebSocket) and
   rides only the family's own setup card; the **deposit token** is post-only

@@ -5,6 +5,7 @@ import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.MessageStore
@@ -12,6 +13,7 @@ import uniffi.cruisemesh_core.relayBuildFetchPath
 import uniffi.cruisemesh_core.relayCursorAdvance
 import uniffi.cruisemesh_core.relayCursorKey
 import uniffi.cruisemesh_core.relayFetchBatchLimit
+import uniffi.cruisemesh_core.relayFetchShrunkLimit
 import uniffi.cruisemesh_core.relayFetchWalkContinues
 import uniffi.cruisemesh_core.relayPassStartCursor
 import uniffi.cruisemesh_core.relaySweepDue
@@ -194,6 +196,33 @@ class RelayFetchCursorTest {
     fun `only an empty page ends the walk`() {
         assertFalse(relayFetchWalkContinues(0u, 100L, 100L))
         assertTrue(relayFetchWalkContinues(256u, 100L, 356L))
+    }
+
+    @Test
+    fun `a page truncated by the server's byte budget keeps the walk going`() {
+        // relayd stops filling a page once its cumulative sealed bytes would
+        // push the response past what this client will decode, so a mailbox
+        // of large attachment chunks answers a 256-row ask with a handful of
+        // rows every time. Reading that as end-of-mailbox would strand the
+        // newest mail, which in an ascending-id mailbox has the highest ids.
+        assertTrue(relayFetchWalkContinues(12u, 0L, 12L))
+        assertTrue(relayFetchWalkContinues(9u, 12L, 21L))
+        assertTrue(relayFetchWalkContinues(1u, 21L, 22L))
+        assertFalse(relayFetchWalkContinues(0u, 22L, 22L))
+    }
+
+    @Test
+    fun `an oversize page halves the ask down to one row and then stops`() {
+        var limit = relayFetchBatchLimit()
+        val ladder = mutableListOf(limit)
+        while (true) {
+            val next = relayFetchShrunkLimit(limit) ?: break
+            limit = next
+            ladder += limit
+        }
+        assertEquals(listOf(256u, 128u, 64u, 32u, 16u, 8u, 4u, 2u, 1u), ladder)
+        // One row is the floor: nothing smaller exists to ask for.
+        assertNull(relayFetchShrunkLimit(1u))
     }
 
     @Test
