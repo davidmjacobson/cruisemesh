@@ -2,14 +2,33 @@ import Foundation
 
 private final class BoundedRelayResponseDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let maxBytes: Int
+    private let errorPreviewBytes: Int
     private let semaphore: DispatchSemaphore
     private let lock = NSLock()
     private var data = Data()
     private var response: URLResponse?
     private var completedResult: Result<(Data, URLResponse), Error>?
+    /// Bumped on every piece of progress the transfer makes. `RelayClient`
+    /// polls it to tell "this download is slow" apart from "this download
+    /// stopped", so a big page on a weak ship Wi-Fi is waited out rather than
+    /// killed. Guarded by `lock`: it is written on the delegate queue and read
+    /// from the calling thread.
+    private var activity: UInt64 = 0
+    /// Whether the response head arrived. A transfer that stops *after* the
+    /// head is a page that will not move over this link; one that stops before
+    /// it is a relay that cannot be reached at all. The two want different
+    /// recoveries.
+    private var headReceived = false
+    /// How much of the body this response is willing to keep: the whole cap
+    /// for a success, a short preview for an HTTP error (see `didReceive
+    /// response`).
+    private var acceptBytes: Int
+    private var isErrorStatus = false
 
-    init(maxBytes: Int, semaphore: DispatchSemaphore) {
+    init(maxBytes: Int, errorPreviewBytes: Int, semaphore: DispatchSemaphore) {
         self.maxBytes = maxBytes
+        self.errorPreviewBytes = errorPreviewBytes
+        self.acceptBytes = maxBytes
         self.semaphore = semaphore
     }
 
@@ -19,19 +38,43 @@ private final class BoundedRelayResponseDelegate: NSObject, URLSessionDataDelega
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
+        noteProgress(head: true)
+        self.response = response
+        // Status before size. A captive portal notice, a proxy banner or a
+        // gateway error page can be any size at all, and calling one an
+        // oversized *page* sends the fetch down the shrink ladder -- eight
+        // more round trips that were never going to succeed -- and throws away
+        // a 429's `Retry-After` on the way. A non-2xx body is only ever read
+        // to name the failure, so a short preview of it is all this keeps.
+        let status = (response as? HTTPURLResponse)?.statusCode
+        isErrorStatus = status.map { !(200..<300).contains($0) } ?? false
+        if isErrorStatus {
+            acceptBytes = errorPreviewBytes
+            completionHandler(.allow)
+            return
+        }
+        acceptBytes = maxBytes
         if response.expectedContentLength > Int64(maxBytes) {
             finish(.failure(Self.tooLarge(maxBytes)))
             completionHandler(.cancel)
             return
         }
-        self.response = response
         completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
-        guard completedResult == nil else { return }
-        guard chunk.count <= maxBytes - data.count else {
-            finish(.failure(Self.tooLarge(maxBytes)))
+        guard result() == nil else { return }
+        noteProgress(head: false)
+        guard chunk.count <= acceptBytes - data.count else {
+            guard isErrorStatus, let response else {
+                finish(.failure(Self.tooLarge(maxBytes)))
+                dataTask.cancel()
+                return
+            }
+            // Enough of the error page to quote in the failure; the rest is
+            // noise nobody reads, so stop here instead of buffering it.
+            data.append(chunk.prefix(acceptBytes - data.count))
+            finish(.success((data, response)))
             dataTask.cancel()
             return
         }
@@ -43,9 +86,9 @@ private final class BoundedRelayResponseDelegate: NSObject, URLSessionDataDelega
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
-        guard completedResult == nil else { return }
+        guard result() == nil else { return }
         if let error {
-            finish(.failure(error))
+            finish(.failure(classify(error)))
         } else if let response {
             finish(.success((data, response)))
         } else {
@@ -61,6 +104,42 @@ private final class BoundedRelayResponseDelegate: NSObject, URLSessionDataDelega
         lock.lock()
         defer { lock.unlock() }
         return completedResult
+    }
+
+    /// A monotonically increasing marker of transfer progress. Two reads that
+    /// return the same value mean nothing moved in between.
+    func activityMarker() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return activity
+    }
+
+    /// Describes the stall if -- and only if -- the response head is already
+    /// in. Before that there is no page to shrink, just an unreachable relay.
+    func stalledMidResponse() -> RelayResponseStalledError? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard headReceived else { return nil }
+        return RelayResponseStalledError(bytesReceived: data.count)
+    }
+
+    /// URLSession applies `timeoutIntervalForRequest` as its own inactivity
+    /// timeout, so it can raise `.timedOut` mid-body before this client's
+    /// watchdog does. Same situation, same recovery.
+    private func classify(_ error: Error) -> Error {
+        guard (error as? URLError)?.code == .timedOut, let stalled = stalledMidResponse() else {
+            return error
+        }
+        return stalled
+    }
+
+    private func noteProgress(head: Bool) {
+        lock.lock()
+        activity &+= 1
+        if head {
+            headReceived = true
+        }
+        lock.unlock()
     }
 
     private func finish(_ result: Result<(Data, URLResponse), Error>) {
@@ -79,20 +158,41 @@ private final class BoundedRelayResponseDelegate: NSObject, URLSessionDataDelega
     }
 }
 
-/// The relay's answer was larger than `relayMaxResponseBytes()`, so it was
-/// refused before the whole thing could be accumulated.
+/// A fetch failure that asking for fewer rows can fix.
 ///
-/// Its own type rather than an opaque `NSError` because it is the one
-/// transport failure a caller can act on: a fetch page that blows the cap is
-/// recoverable by asking the same cursor for fewer rows (see
-/// `RelayClient.fetchEnvelopesWithinResponseCap`). Every other error here
-/// means "try again later"; this one means "ask for less". Mirrors Android
+/// These are the transport failures a caller can act on, as opposed to the
+/// ones that only mean "try again later": a page can be too big to decode, or
+/// too big to move over the link it was asked for, and both are answered the
+/// same way -- same cursor, smaller window (see
+/// `RelayClient.fetchEnvelopesWithinResponseCap`). Mirrors Android
+/// `RelayPageTooBigException`.
+protocol RelayPageTooBigError: Error {}
+
+/// The relay's answer was larger than `relayMaxResponseBytes()`, so it was
+/// refused before the whole thing could be accumulated. Mirrors Android
 /// `RelayResponseTooLargeException`.
-struct RelayResponseTooLargeError: LocalizedError {
+struct RelayResponseTooLargeError: RelayPageTooBigError, LocalizedError {
     let maxBytes: Int
 
     var errorDescription: String? {
         "relay response exceeds \(maxBytes) bytes"
+    }
+}
+
+/// The relay answered, and then the body stopped arriving.
+///
+/// On a ship's Wi-Fi a full page can be megabytes, and a link that cannot
+/// carry it in the time allowed will fail the same way on the next pass, from
+/// the same cursor -- the same permanent stall an undecodable page causes. So
+/// it gets the same treatment: ask for fewer rows and let the mail through
+/// slowly rather than not at all. Distinguished from a plain connect timeout,
+/// which says nothing about page size. Mirrors Android
+/// `RelayResponseStalledException`.
+struct RelayResponseStalledError: RelayPageTooBigError, LocalizedError {
+    let bytesReceived: Int
+
+    var errorDescription: String? {
+        "relay response stalled after \(bytesReceived) bytes"
     }
 }
 
@@ -139,6 +239,16 @@ struct RelayHTTPError: LocalizedError {
 /// HTTPS client for `cruisemesh-relayd` (DESIGN.md §9). Mirrors Android `RelayClient`.
 enum RelayClient {
     private static let connectTimeout: TimeInterval = 10
+    /// How long the transfer may make *no progress at all* before it is given
+    /// up on. Deliberately not a wall-clock budget for the whole request: a
+    /// full fetch page can be megabytes, and a ship's Wi-Fi that needs a
+    /// minute to carry it is slow, not broken. Killing it on the clock would
+    /// fail the same window from the same cursor on every pass forever.
+    /// Matches Android, whose `readTimeout` is likewise per-read.
+    private static let inactivityTimeout: TimeInterval = 15
+    /// How much of a non-2xx body is kept -- enough to quote the relay's
+    /// reason in the error, not enough for an error page to cost memory.
+    private static let errorBodyPreviewBytes = 2_048
     private static let userAgent = "CruiseMeshRelayClient-iOS/0.1"
 
     /// Overridable for unit tests (URLProtocol / mock sessions).
@@ -212,20 +322,24 @@ enum RelayClient {
     }
 
     /// Fetch one page, halving `limit` and retrying the *same* cursor
-    /// whenever the relay's answer is too big for this client to decode.
+    /// whenever the relay's answer is too big for this client to take --
+    /// either too big to decode, or too big to finish moving over this link.
     /// Returns the page together with the limit that actually produced it.
     ///
     /// The stall this prevents: `limit` bounds a page's row count, not its
     /// size, and one sealed payload may be 512 KiB. A mailbox holding enough
     /// large attachment chunks can therefore produce a full-size window whose
-    /// body is past `relayMaxResponseBytes()`. Without a retry the pass simply
-    /// fails there; the next pass asks the same relay for the same window from
-    /// the same cursor and fails identically, so the frontier never advances
-    /// and nothing behind those rows is delivered until they expire.
+    /// body is past `relayMaxResponseBytes()`, or simply past what a ship's
+    /// Wi-Fi will carry before the transfer is written off. Without a retry
+    /// the pass simply fails there; the next pass asks the same relay for the
+    /// same window from the same cursor and fails identically, so the frontier
+    /// never advances and nothing behind those rows is delivered until they
+    /// expire.
     ///
-    /// Current relayd carries a byte budget and never builds such a page, but
-    /// family relays are self-hosted and older builds exist in the field, so
-    /// the client cannot assume the server-side fix is there.
+    /// Current relayd carries a byte budget and never builds an undecodable
+    /// page, but family relays are self-hosted and older builds exist in the
+    /// field, so the client cannot assume the server-side fix is there -- and
+    /// no server-side budget can make a slow link fast.
     ///
     /// `relayFetchShrunkLimit` returning nil means one row was already the
     /// ask: nothing smaller exists, so this is not a paging problem and the
@@ -243,7 +357,7 @@ enum RelayClient {
             do {
                 let page = try fetchEnvelopes(config: config, hints: hints, afterId: afterId, limit: attempt)
                 return RelayCappedFetch(page: page, limit: attempt)
-            } catch let error as RelayResponseTooLargeError {
+            } catch let error as RelayPageTooBigError {
                 guard let smaller = relayFetchShrunkLimit(currentLimit: UInt32(clamping: attempt)) else {
                     throw error
                 }
@@ -335,6 +449,7 @@ enum RelayClient {
         let sem = DispatchSemaphore(value: 0)
         let delegate = BoundedRelayResponseDelegate(
             maxBytes: Int(relayMaxResponseBytes()),
+            errorPreviewBytes: errorBodyPreviewBytes,
             semaphore: sem
         )
         let session = URLSession(
@@ -344,9 +459,30 @@ enum RelayClient {
         )
         let task = session.dataTask(with: request)
         task.resume()
-        guard sem.wait(timeout: .now() + connectTimeout + 5) == .success else {
+        // The wait is bounded by inactivity, not by total time. Each slice
+        // that expires without the task finishing asks the delegate whether
+        // anything arrived meanwhile; as long as bytes keep coming the
+        // download is left alone, however long it takes. Connecting stays
+        // bounded as before -- `URLRequest.timeoutInterval` is `connectTimeout`
+        // and URLSession enforces it -- and a transfer that truly goes quiet
+        // is still cut off here.
+        var lastActivity = delegate.activityMarker()
+        while sem.wait(timeout: .now() + inactivityTimeout) != .success {
+            let marker = delegate.activityMarker()
+            guard marker == lastActivity else {
+                lastActivity = marker
+                continue
+            }
+            let stalled = delegate.stalledMidResponse()
             task.cancel()
             session.invalidateAndCancel()
+            // A body that stopped part-way is a page this link will not carry:
+            // reported as its own type so the fetch walk shrinks the window
+            // instead of retrying the identical one forever. Nothing arriving
+            // at all says nothing about page size, and stays a plain timeout.
+            if let stalled {
+                throw stalled
+            }
             throw URLError(.timedOut)
         }
         session.finishTasksAndInvalidate()
@@ -361,7 +497,9 @@ enum RelayClient {
             throw malformedResponse("non-HTTP relay response")
         }
         guard (200..<300).contains(http.statusCode) else {
-            let body = String(data: data.prefix(2_048), encoding: .utf8) ?? ""
+            // Already truncated to a preview by the delegate; bounded again
+            // here so this stays correct for any other caller.
+            let body = String(data: data.prefix(errorBodyPreviewBytes), encoding: .utf8) ?? ""
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             throw RelayHTTPError(
                 statusCode: http.statusCode,

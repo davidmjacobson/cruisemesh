@@ -2980,7 +2980,8 @@ final class MeshController: ObservableObject {
                     // walk itself continues, so one bad page never blocks the
                     // mail behind it.
                     var frontierAdvancing = true
-                    // Not a `let`: a page too big for this client to decode
+                    // Not a `let`: a page this client cannot take -- too big to
+                    // decode, or too big to finish moving over this link --
                     // halves the ask and retries the same cursor, and the
                     // reduced limit is kept for the rest of this mailbox's
                     // walk rather than reset per page -- a mailbox that
@@ -3011,7 +3012,7 @@ final class MeshController: ObservableObject {
                             limit: fetchBatchLimit
                         ) { tried, smaller in
                             relaySyncLog.warning(
-                                "Relay page exceeded the response cap at limit=\(tried, privacy: .public); retrying with limit=\(smaller, privacy: .public)"
+                                "Relay page was too big to take at limit=\(tried, privacy: .public); retrying with limit=\(smaller, privacy: .public)"
                             )
                         }
                         let page = fetched.page
