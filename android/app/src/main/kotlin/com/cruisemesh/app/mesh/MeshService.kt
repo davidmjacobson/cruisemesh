@@ -279,6 +279,18 @@ class MeshService : Service() {
     // when that association drops so we can nudge the user (see refreshWifiHold).
     private val wifiHold by lazy { WifiAssociationHold(connectivityManager, ::onWifiAssociationLost) }
     @Volatile private var meshJoinedAtMs: Long = 0L
+
+    /**
+     * Contacts that have demonstrated LAN support, as UserID hex to the
+     * millisecond that support was last seen. Cached because
+     * [countUnlinkedCapableContacts] answers the LAN transport's
+     * automatic-scan gate on the main handler every few seconds, and
+     * recomputing it there means a SQLite contact list plus a
+     * SharedPreferences read per contact on the UI thread. Refreshed off the
+     * main thread by [refreshLanCapableContacts]; recency is applied at read
+     * time so an entry going stale needs no refresh at all.
+     */
+    @Volatile private var lanCapableContacts: Map<String, Long> = emptyMap()
     private val lanEndpointCache by lazy { LanEndpointCache(this) }
     private val a2dpAudioBackoff = A2dpAudioBackoff()
 
@@ -543,6 +555,8 @@ class MeshService : Service() {
                     lanEndpointCache.save(networkId, userId, endpoint)
 
                 override fun currentLanNetworkId(): String? = lanTransport?.currentNetworkId()
+
+                override fun onLanCapabilityChanged() = refreshLanCapableContacts()
             },
         )
         envelopeProcessor = processor
@@ -566,19 +580,7 @@ class MeshService : Service() {
             trustedPeerForStaticKey = { remoteStaticKey ->
                 trustedLanPeerUserId(store.listContacts(), remoteStaticKey)
             },
-            unlinkedCapableContacts = {
-                // The automatic sweep keeps looking while any contact that
-                // has demonstrated LAN support is not linked over LAN --
-                // one connected peer must not stop discovery of the rest.
-                val linked = MeshRouter.identifiedRoutes()
-                    .filter { it.transport == MeshRouterState.Transport.LAN }
-                    .map { UserIdHex.encode(it.userId) }
-                    .toSet()
-                store.listContacts().count { contact ->
-                    LanCapabilityStore.isSupported(this, contact.userId) &&
-                        UserIdHex.encode(contact.userId) !in linked
-                }
-            },
+            unlinkedCapableContacts = ::countUnlinkedCapableContacts,
             onNetworkReady = ::onLanNetworkReady,
             onEndpointObserved = { userId, endpoint, networkId ->
                 lanEndpointCache.save(networkId, userId, endpoint)
@@ -1087,6 +1089,11 @@ class MeshService : Service() {
         }
         val contact = store.getContact(userId)
         if (contact != null) {
+            // An authenticated LAN link is the strongest possible evidence
+            // this contact shares a LAN with us, so it also refreshes the
+            // capability recency the automatic-scan gate reads.
+            LanCapabilityStore.markSupported(this, userId)
+            refreshLanCapableContacts()
             recordPeerConnection(
                 userId,
                 MeshRouterState.Transport.LAN,
@@ -1221,6 +1228,7 @@ class MeshService : Service() {
             return
         }
         LanCapabilityStore.markSupported(this, peerUserId)
+        refreshLanCapableContacts()
         val localHint = lanTransport?.currentEndpointHint()
         val networkId = lanTransport?.currentNetworkId()
         val ownIdentity = identity
@@ -1285,7 +1293,53 @@ class MeshService : Service() {
         }
     }
 
+    /**
+     * The LAN transport's automatic-scan gate: how many contacts that have
+     * recently demonstrated LAN support still have no authenticated LAN link.
+     * One connected family member must not stop discovery of the rest, but a
+     * contact who is ashore (or simply hasn't been on a shared LAN for a
+     * fortnight) must not keep the subnet sweep running on battery forever --
+     * see [lanCapabilityMotivatesScan].
+     *
+     * Runs on the LAN transport's main handler, so it only touches the
+     * in-memory router state and the [lanCapableContacts] cache.
+     */
+    private fun countUnlinkedCapableContacts(): Int {
+        val capable = lanCapableContacts
+        if (capable.isEmpty()) return 0
+        val nowMs = System.currentTimeMillis()
+        val linked = MeshRouter.identifiedRoutes()
+            .asSequence()
+            .filter { it.transport == MeshRouterState.Transport.LAN }
+            .mapTo(mutableSetOf()) { UserIdHex.encode(it.userId) }
+        return capable.count { (userIdHex, lastSupportedAtMs) ->
+            userIdHex !in linked && lanCapabilityMotivatesScan(lastSupportedAtMs, nowMs)
+        }
+    }
+
+    /**
+     * Rebuilds [lanCapableContacts] off the main thread. Called whenever a
+     * peer demonstrates LAN support and on the periodic LAN health tick, so
+     * a deleted or blocked contact drops out of the sweep gate without any
+     * extra plumbing from the screens that delete or block.
+     */
+    private fun refreshLanCapableContacts() {
+        runOnStoreExecutor("lan capability cache") {
+            val blocked = store.listBlockedUsers().map(UserIdHex::encode).toSet()
+            lanCapableContacts = store.listContacts()
+                .asSequence()
+                .mapNotNull { contact ->
+                    val userIdHex = UserIdHex.encode(contact.userId)
+                    if (userIdHex in blocked) return@mapNotNull null
+                    LanCapabilityStore.lastSupportedAtMs(this, contact.userId)
+                        ?.let { userIdHex to it }
+                }
+                .toMap()
+        }
+    }
+
     private fun checkLanHealth() {
+        refreshLanCapableContacts()
         for (route in MeshRouter.identifiedRoutes()) {
             if (route.transport != MeshRouterState.Transport.LAN) continue
             when (val decision = nextLanHealthDecision(route.address)) {

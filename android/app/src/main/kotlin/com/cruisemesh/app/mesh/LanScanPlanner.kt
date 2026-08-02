@@ -37,7 +37,13 @@ internal enum class LanScanBreadth {
  *    an endpoint hint -- proof peers exist here) resets that backoff, but
  *    callers must only invoke it for genuinely NEW evidence: repeated
  *    evidence about an already-connected/linked peer (e.g. its Bonjour/NSD
- *    record refreshing) must not keep re-triggering sweeps.
+ *    record refreshing) must not keep re-triggering sweeps. Evidence is also
+ *    only trusted [maxPeerEvidenceResets] times per network join: the
+ *    "genuinely new" test is a token another device on the Wi-Fi chooses, so
+ *    an unbounded reset budget would let anything on a shared network keep
+ *    every phone in range sweeping back to back. Past the budget the
+ *    evidence still drives ordinary discovery and connection attempts --
+ *    it just stops rewinding the sweep schedule.
  *
  * Methods are @Synchronized leaf-monitor style: callers are the main handler
  * plus scan worker threads (sweep completion).
@@ -46,6 +52,7 @@ internal class LanScanPlanner(
     private val localIntervalMs: Long = LOCAL_SCAN_INTERVAL_MS,
     private val fullBackoffMs: List<Long> = FULL_SCAN_BACKOFF_MS,
     private val emptyLocalSweepFullDelayMs: Long = EMPTY_LOCAL_SWEEP_FULL_DELAY_MS,
+    private val maxPeerEvidenceResets: Int = MAX_PEER_EVIDENCE_RESETS,
 ) {
     private var joined = false
     private var localDueAtMs = 0L
@@ -55,6 +62,9 @@ internal class LanScanPlanner(
     private var fullDueAtMs = 0L
     private var fullBackoffIndex = 0
 
+    /** How much of this network join's [maxPeerEvidenceResets] budget is spent. */
+    private var peerEvidenceResets = 0
+
     /** A LAN session came up on a (new or rejoined) network: both tiers re-anchor to now. */
     @Synchronized
     fun onNetworkJoined(nowMs: Long) {
@@ -63,6 +73,7 @@ internal class LanScanPlanner(
         fullEligible = false
         fullDueAtMs = 0L
         fullBackoffIndex = 0
+        peerEvidenceResets = 0
     }
 
     /** The LAN session tore down; nothing is due until the next [onNetworkJoined]. */
@@ -113,17 +124,25 @@ internal class LanScanPlanner(
     /**
      * Evidence a peer is on this network right now (NSD resolved a CruiseMesh
      * service, or a contact's endpoint hint arrived): a full sweep is worth
-     * retrying promptly if the direct connection doesn't pan out. Only
-     * meaningful once the full tier is already eligible ([onScanCompleted]) --
-     * before that, evidence doesn't change anything, since the full sweep
-     * isn't on the table yet. Callers are responsible for only calling this
-     * for genuinely NEW evidence (see the class doc).
+     * retrying promptly if the direct connection doesn't pan out. Callers are
+     * responsible for only calling this for genuinely NEW evidence (see the
+     * class doc), and it is trusted at most [maxPeerEvidenceResets] times per
+     * network join.
+     *
+     * Returns whether this evidence changed the schedule, so the caller knows
+     * whether to bring its own next scan check forward. False once the budget
+     * is spent, and false before the full tier is eligible ([onScanCompleted])
+     * -- evidence can't conjure a full sweep out of nowhere, so there is
+     * nothing to hurry towards yet.
      */
     @Synchronized
-    fun onPeerEvidence(nowMs: Long) {
-        if (!joined || !fullEligible) return
+    fun onPeerEvidence(nowMs: Long): Boolean {
+        if (!joined || !fullEligible) return false
+        if (peerEvidenceResets >= maxPeerEvidenceResets) return false
+        peerEvidenceResets++
         fullBackoffIndex = 0
         fullDueAtMs = minOf(fullDueAtMs, nowMs)
+        return true
     }
 
     /**
@@ -147,5 +166,13 @@ internal class LanScanPlanner(
         // rush to fire the expensive tier the instant the cheap one comes
         // back clean.
         const val EMPTY_LOCAL_SWEEP_FULL_DELAY_MS = 60_000L
+
+        // How many times peer evidence may rewind the full-sweep schedule on
+        // one network join. Matched to the transport's simultaneous-link
+        // ceiling (8): a whole family fleet announcing itself on arrival
+        // still gets a prompt sweep each time, while anything else on the
+        // Wi-Fi runs out of budget long before the expensive tier can be
+        // driven back to back.
+        const val MAX_PEER_EVIDENCE_RESETS = 8
     }
 }

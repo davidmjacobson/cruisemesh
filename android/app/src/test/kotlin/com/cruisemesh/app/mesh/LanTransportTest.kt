@@ -162,6 +162,151 @@ class LanTransportTest {
         )
     }
 
+    @Test
+    fun `a contact last seen on a LAN long ago stops motivating sweeps`() {
+        val day = 24 * 60 * 60 * 1_000L
+        val now = 100 * day
+
+        // Seen on a LAN within the window: still worth sweeping for.
+        assertTrue(lanCapabilityMotivatesScan(now, now))
+        assertTrue(lanCapabilityMotivatesScan(now - 13 * day, now))
+        // A family member who went ashore two weeks ago does not keep every
+        // remaining phone sweeping the subnet forever.
+        assertTrue(!lanCapabilityMotivatesScan(now - 14 * day, now))
+        assertTrue(!lanCapabilityMotivatesScan(now - 400 * day, now))
+        // Never demonstrated LAN support at all (including capability
+        // recorded before this timestamp existed).
+        assertTrue(!lanCapabilityMotivatesScan(null, now))
+        // A clock that moved backwards must not expire a fresh sighting.
+        assertTrue(lanCapabilityMotivatesScan(now + day, now))
+    }
+
+    @Test
+    fun `the sweep gate closes once every capable contact has gone stale`() {
+        val now = 50L * 24 * 60 * 60 * 1_000
+        val stale = now - 30L * 24 * 60 * 60 * 1_000
+        val capable = mapOf("aa" to stale, "bb" to stale)
+        val motivating = capable.count { (_, lastSeen) ->
+            lanCapabilityMotivatesScan(lastSeen, now)
+        }
+
+        assertEquals(0, motivating)
+        // A live link plus no motivating contact means no sweep at all.
+        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0, motivating))
+    }
+
+    @Test
+    fun `per-network bookkeeping forgets its oldest key instead of refusing new ones`() {
+        val keys = BoundedLanKeySet(limit = 4)
+        val forgotten = mutableListOf<String>()
+
+        repeat(4) { assertTrue(keys.claim("token-$it", forgotten::add)) }
+        assertEquals(4, keys.size())
+        assertEquals(emptyList<String>(), forgotten)
+
+        // A key already claimed is not new work, and costs nothing.
+        assertTrue(!keys.claim("token-0", forgotten::add))
+        assertEquals(4, keys.size())
+        assertEquals(emptyList<String>(), forgotten)
+
+        // At the cap a brand-new key is still accepted -- the OLDEST is
+        // forgotten to make room. Refusing instead would let a flood of
+        // made-up names lock a real family member out of discovery for the
+        // rest of the network join.
+        assertTrue(keys.claim("token-4", forgotten::add))
+        assertEquals(listOf("token-0"), forgotten)
+        assertEquals(4, keys.size())
+        assertTrue(!keys.contains("token-0"))
+        assertTrue(keys.contains("token-4"))
+
+        // A real peer arriving after a 100-name spray still reads as new.
+        repeat(100) { keys.claim("spray-$it") }
+        assertEquals(4, keys.size())
+        assertTrue(keys.claim("family-phone"))
+    }
+
+    @Test
+    fun `a removed or cleared bookkeeping key can be claimed again`() {
+        val keys = BoundedLanKeySet(limit = 4)
+
+        assertTrue(keys.claim("service-a"))
+        assertTrue(!keys.claim("service-a"))
+        keys.remove("service-a")
+        assertTrue(keys.claim("service-a"))
+
+        keys.clear()
+        assertEquals(0, keys.size())
+        assertTrue(keys.claim("service-a"))
+    }
+
+    @Test
+    fun `a sweep probe that cannot open a link still counts an already-linked friend`() {
+        // The probe collided with a service key an authenticated link already
+        // holds: a healthy link keeps its key for its whole life, so this is
+        // how every sweep after the one that linked the family sees them.
+        assertTrue(
+            lanSweepProbeFoundFriend(
+                keyAlreadyAuthenticated = true,
+                linkTableFull = false,
+                authenticatedLinks = 1,
+            ),
+        )
+        // The link table is full and a friend is on it: the healthiest
+        // network there is, not an empty one.
+        assertTrue(
+            lanSweepProbeFoundFriend(
+                keyAlreadyAuthenticated = false,
+                linkTableFull = true,
+                authenticatedLinks = 2,
+            ),
+        )
+        // A full table of in-flight handshakes to unrelated services proves
+        // nothing about friends being here.
+        assertTrue(
+            !lanSweepProbeFoundFriend(
+                keyAlreadyAuthenticated = false,
+                linkTableFull = true,
+                authenticatedLinks = 0,
+            ),
+        )
+        // Colliding with an attempt that has not authenticated is not a find
+        // either, however many other links exist.
+        assertTrue(
+            !lanSweepProbeFoundFriend(
+                keyAlreadyAuthenticated = false,
+                linkTableFull = false,
+                authenticatedLinks = 3,
+            ),
+        )
+    }
+
+    @Test
+    fun `a sweep is only credited with a find while it is still the running sweep`() {
+        assertTrue(
+            lanSweepCreditApplies(
+                sweepGeneration = 7,
+                currentGeneration = 7,
+                sweepStillRunning = true,
+            ),
+        )
+        // Completed or cancelled: nothing to credit.
+        assertTrue(
+            !lanSweepCreditApplies(
+                sweepGeneration = 7,
+                currentGeneration = 7,
+                sweepStillRunning = false,
+            ),
+        )
+        // A late handshake from a replaced sweep must not credit the new one.
+        assertTrue(
+            !lanSweepCreditApplies(
+                sweepGeneration = 7,
+                currentGeneration = 8,
+                sweepStillRunning = true,
+            ),
+        )
+    }
+
     /** The outbound bookkeeping LanTransport keeps for the scan gate. */
     private class OutboundLinks {
         private val dialled = mutableSetOf<String>()

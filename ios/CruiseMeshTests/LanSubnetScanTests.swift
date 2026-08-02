@@ -104,6 +104,137 @@ final class LanSubnetScanTests: XCTestCase {
         ))
     }
 
+    func testContactLastSeenOnALanLongAgoStopsMotivatingSweeps() {
+        let day: Int64 = 24 * 60 * 60 * 1_000
+        let now = 100 * day
+
+        // Seen on a LAN within the window: still worth sweeping for.
+        XCTAssertTrue(lanCapabilityMotivatesScan(lastSupportedAtMs: now, nowMs: now))
+        XCTAssertTrue(lanCapabilityMotivatesScan(lastSupportedAtMs: now - 13 * day, nowMs: now))
+        // A family member who went ashore two weeks ago does not keep every
+        // remaining phone sweeping the subnet forever.
+        XCTAssertFalse(lanCapabilityMotivatesScan(lastSupportedAtMs: now - 14 * day, nowMs: now))
+        XCTAssertFalse(lanCapabilityMotivatesScan(lastSupportedAtMs: now - 400 * day, nowMs: now))
+        // Never demonstrated LAN support at all (including capability
+        // recorded before this timestamp existed).
+        XCTAssertFalse(lanCapabilityMotivatesScan(lastSupportedAtMs: nil, nowMs: now))
+        // A clock that moved backwards must not expire a fresh sighting.
+        XCTAssertTrue(lanCapabilityMotivatesScan(lastSupportedAtMs: now + day, nowMs: now))
+    }
+
+    func testSweepGateClosesOnceEveryCapableContactHasGoneStale() {
+        let now: Int64 = 50 * 24 * 60 * 60 * 1_000
+        let stale = now - 30 * 24 * 60 * 60 * 1_000
+        let capable: [Data: Int64] = [Data([1]): stale, Data([2]): stale]
+        let motivating = capable.filter {
+            lanCapabilityMotivatesScan(lastSupportedAtMs: $0.value, nowMs: now)
+        }.count
+
+        XCTAssertEqual(motivating, 0)
+        // A live link plus no motivating contact means no sweep at all.
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            activeConnections: 1,
+            pendingOutboundAttempts: 0,
+            scanRemaining: 0,
+            unlinkedCapableContacts: motivating
+        ))
+    }
+
+    func testPerNetworkBookkeepingForgetsItsOldestKeyInsteadOfRefusingNewOnes() {
+        var keys = BoundedLanKeySet(limit: 4)
+
+        for index in 0..<4 {
+            XCTAssertEqual(
+                keys.claim("token-\(index)"),
+                BoundedLanKeySet.Claim(isNew: true, evicted: nil)
+            )
+        }
+        XCTAssertEqual(keys.count, 4)
+
+        // A key already claimed is not new work, and costs nothing.
+        XCTAssertEqual(keys.claim("token-0"), BoundedLanKeySet.Claim(isNew: false, evicted: nil))
+        XCTAssertEqual(keys.count, 4)
+
+        // At the cap a brand-new key is still accepted -- the OLDEST is
+        // forgotten to make room. Refusing instead would let a flood of
+        // made-up names lock a real family member out of the election
+        // fallback for the rest of the network join.
+        XCTAssertEqual(
+            keys.claim("token-4"),
+            BoundedLanKeySet.Claim(isNew: true, evicted: "token-0")
+        )
+        XCTAssertEqual(keys.count, 4)
+        XCTAssertFalse(keys.contains("token-0"))
+        XCTAssertTrue(keys.contains("token-4"))
+
+        // A real peer arriving after a 100-name spray still reads as new.
+        for index in 0..<100 { _ = keys.claim("spray-\(index)") }
+        XCTAssertEqual(keys.count, 4)
+        XCTAssertTrue(keys.claim("family-phone").isNew)
+    }
+
+    func testRemovedOrClearedBookkeepingKeyCanBeClaimedAgain() {
+        var keys = BoundedLanKeySet(limit: 4)
+
+        XCTAssertTrue(keys.claim("service-a").isNew)
+        XCTAssertFalse(keys.claim("service-a").isNew)
+        keys.remove("service-a")
+        XCTAssertTrue(keys.claim("service-a").isNew)
+
+        keys.removeAll()
+        XCTAssertEqual(keys.count, 0)
+        XCTAssertTrue(keys.claim("service-a").isNew)
+    }
+
+    func testSweepProbeThatCannotOpenALinkStillCountsAnAlreadyLinkedFriend() {
+        // The probe collided with a service key an authenticated link already
+        // holds: a healthy link keeps its key for its whole life, so this is
+        // how every sweep after the one that linked the family sees them.
+        XCTAssertTrue(lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated: true, linkTableFull: false, authenticatedLinks: 1
+        ))
+        // The link table is full and a friend is on it: the healthiest
+        // network there is, not an empty one.
+        XCTAssertTrue(lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated: false, linkTableFull: true, authenticatedLinks: 2
+        ))
+        // A full table of in-flight handshakes to unrelated services proves
+        // nothing about friends being here.
+        XCTAssertFalse(lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated: false, linkTableFull: true, authenticatedLinks: 0
+        ))
+        // Colliding with an attempt that has not authenticated is not a find
+        // either, however many other links exist.
+        XCTAssertFalse(lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated: false, linkTableFull: false, authenticatedLinks: 3
+        ))
+    }
+
+    func testSweepIsOnlyCreditedWithAFindWhileItIsStillTheRunningSweep() {
+        let running = UUID()
+        let replaced = UUID()
+
+        XCTAssertTrue(lanSweepCreditApplies(
+            sweepGeneration: running,
+            runningSweepGeneration: running
+        ))
+        // A late handshake from a replaced sweep must not credit the new one.
+        XCTAssertFalse(lanSweepCreditApplies(
+            sweepGeneration: replaced,
+            runningSweepGeneration: running
+        ))
+        // Completed or cancelled: nothing to credit.
+        XCTAssertFalse(lanSweepCreditApplies(
+            sweepGeneration: replaced,
+            runningSweepGeneration: nil
+        ))
+        // A link no sweep dialed never credits one.
+        XCTAssertFalse(lanSweepCreditApplies(
+            sweepGeneration: nil,
+            runningSweepGeneration: running
+        ))
+    }
+
     func testBonjourPeerTokenRequiresVersionAndInstanceTxtRecords() {
         XCTAssertEqual(lanBonjourPeerToken(["v": "1", "i": "0011"]), "0011")
         XCTAssertNil(lanBonjourPeerToken(["v": "2", "i": "0011"]))

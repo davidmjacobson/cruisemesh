@@ -1,7 +1,9 @@
 package com.cruisemesh.app.mesh
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LanScanPlannerTest {
@@ -127,6 +129,97 @@ class LanScanPlannerTest {
             LanScanBreadth.FULL_SUBNET,
             planner.takeDueScan(evidenceAt + 15 * minute),
         )
+    }
+
+    @Test
+    fun aSweepThatMeetsAFriendItIsAlreadyLinkedToNeverArmsTheFullTier() {
+        val planner = LanScanPlanner(localIntervalMs = Long.MAX_VALUE / 2)
+        planner.onNetworkJoined(0)
+        assertEquals(LanScanBreadth.LOCAL_24, planner.takeDueScan(0))
+
+        // The sweep probed a friend an EARLIER sweep had already linked, so
+        // it never reached a handshake at all -- and that still credits the
+        // sweep (LanTransport.markSweepFoundFriend), because discovery
+        // demonstrably works on this network.
+        val foundPeer = lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated = true,
+            linkTableFull = false,
+            authenticatedLinks = 1,
+        ) &&
+            lanSweepCreditApplies(
+                sweepGeneration = 3,
+                currentGeneration = 3,
+                sweepStillRunning = true,
+            )
+        planner.onScanCompleted(LanScanBreadth.LOCAL_24, 1_000, foundPeer = foundPeer)
+
+        // A healthy network must not arm the expensive /20 tier.
+        assertNull(planner.takeDueScan(1_000 + emptyDelay))
+        assertNull(planner.takeDueScan(10 * 60 * minute))
+    }
+
+    @Test
+    fun peerEvidenceStopsRewindingTheScheduleOnceItsPerNetworkBudgetIsSpent() {
+        val budget = 3
+        val planner = LanScanPlanner(
+            localIntervalMs = Long.MAX_VALUE / 2,
+            maxPeerEvidenceResets = budget,
+        )
+        planner.onNetworkJoined(0)
+        assertEquals(LanScanBreadth.LOCAL_24, planner.takeDueScan(0))
+        planner.onScanCompleted(LanScanBreadth.LOCAL_24, 0, foundPeer = false)
+        assertEquals(LanScanBreadth.FULL_SUBNET, planner.takeDueScan(emptyDelay))
+
+        // Every advertisement carries an instance token its sender picks, so
+        // "brand-new evidence" alone cannot bound this: a spray of fresh
+        // tokens would otherwise reset the backoff and re-fire the /20 sweep
+        // over and over on every phone in range.
+        var now = emptyDelay
+        repeat(budget) {
+            now += 1_000
+            assertTrue(planner.onPeerEvidence(now))
+            assertEquals(LanScanBreadth.FULL_SUBNET, planner.takeDueScan(now))
+        }
+
+        repeat(50) {
+            now += 1_000
+            assertFalse(planner.onPeerEvidence(now))
+        }
+        // Back on the ordinary backoff ladder: nothing until the step elapses.
+        assertNull(planner.takeDueScan(now))
+        assertNull(planner.takeDueScan(now + 14 * minute))
+    }
+
+    @Test
+    fun theEvidenceBudgetRefillsWhenTheNetworkIsRejoined() {
+        val planner = LanScanPlanner(localIntervalMs = Long.MAX_VALUE / 2, maxPeerEvidenceResets = 1)
+        planner.onNetworkJoined(0)
+        assertEquals(LanScanBreadth.LOCAL_24, planner.takeDueScan(0))
+        planner.onScanCompleted(LanScanBreadth.LOCAL_24, 0, foundPeer = false)
+        assertEquals(LanScanBreadth.FULL_SUBNET, planner.takeDueScan(emptyDelay))
+        assertTrue(planner.onPeerEvidence(emptyDelay + 1_000))
+        assertFalse(planner.onPeerEvidence(emptyDelay + 2_000))
+
+        val rejoinAt = 26 * 60 * minute
+        planner.onNetworkJoined(rejoinAt)
+        assertEquals(LanScanBreadth.LOCAL_24, planner.takeDueScan(rejoinAt))
+        planner.onScanCompleted(LanScanBreadth.LOCAL_24, rejoinAt, foundPeer = false)
+        assertEquals(LanScanBreadth.FULL_SUBNET, planner.takeDueScan(rejoinAt + emptyDelay))
+        assertTrue(planner.onPeerEvidence(rejoinAt + emptyDelay + 1_000))
+    }
+
+    @Test
+    fun peerEvidenceReportsNoScheduleChangeBeforeTheFullTierIsEligible() {
+        val planner = LanScanPlanner(localIntervalMs = Long.MAX_VALUE / 2)
+        planner.onNetworkJoined(0)
+        assertEquals(LanScanBreadth.LOCAL_24, planner.takeDueScan(0))
+
+        // Nothing armed yet, so there is nothing to hurry towards -- and the
+        // budget stays intact for evidence that could actually matter.
+        assertFalse(planner.onPeerEvidence(500))
+        planner.onScanCompleted(LanScanBreadth.LOCAL_24, 1_000, foundPeer = false)
+        assertEquals(LanScanBreadth.FULL_SUBNET, planner.takeDueScan(1_000 + emptyDelay))
+        assertTrue(planner.onPeerEvidence(1_000 + emptyDelay + 1_000))
     }
 
     @Test

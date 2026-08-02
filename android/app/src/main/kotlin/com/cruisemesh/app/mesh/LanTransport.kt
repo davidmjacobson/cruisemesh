@@ -105,14 +105,16 @@ internal class LanTransport(
     // this network join -- repeated evidence about the same token (an
     // already-connected/linked peer's NSD record refreshing, or a resent
     // endpoint hint) must not keep resetting the full-sweep backoff. Cleared
-    // alongside the other per-network state in teardownNetworkSession.
-    private val knownPeerInstanceTokens = ConcurrentHashMap.newKeySet<String>()
+    // alongside the other per-network state in teardownNetworkSession, and
+    // bounded (oldest forgotten first) because the token is chosen by
+    // whatever is advertising -- see BoundedLanKeySet.
+    private val knownPeerInstanceTokens = BoundedLanKeySet(MAX_TRACKED_PEER_KEYS)
 
     // Keys an election-loser fallback connect has already been scheduled for
     // on this network join, so repeated NSD re-resolves of the same service
     // don't stack duplicate fallback timers. Cleared with the other
-    // per-network state in teardownNetworkSession.
-    private val electionFallbackKeys = ConcurrentHashMap.newKeySet<String>()
+    // per-network state in teardownNetworkSession, and bounded the same way.
+    private val electionFallbackKeys = BoundedLanKeySet(MAX_TRACKED_PEER_KEYS)
 
     // Outbound service keys whose connection completed the Noise handshake.
     // outboundServiceKeys retains a key for the whole life of a healthy
@@ -157,7 +159,11 @@ internal class LanTransport(
     // the other per-network state in teardownNetworkSession.
     private val serviceInfoCallbacks = mutableMapOf<String, NsdManager.ServiceInfoCallback>()
     private val pendingServices = ArrayDeque<NsdServiceInfo>()
-    private val queuedServiceNames = mutableSetOf<String>()
+    // Service names discovery has already queued for resolution on this
+    // network join. Bounded (oldest forgotten first) rather than add-only:
+    // the names come from whatever advertises here, and refusing new ones at
+    // a cap would silently lock out a real family member arriving later.
+    private val queuedServiceNames = BoundedLanKeySet(MAX_TRACKED_PEER_KEYS)
     private val eligibleWifiNetworks = linkedSetOf<Network>()
     private val instanceTokenBytes = ByteArray(8).also(secureRandom::nextBytes)
     private val instanceToken = instanceTokenBytes.toHex()
@@ -348,10 +354,38 @@ internal class LanTransport(
                 return
             }
             if (!outboundServiceKeys.add(serviceKey)) {
+                // A healthy scan-dialled link holds its key for its whole
+                // life, so an authenticated key here means this probe just
+                // re-found a friend an earlier sweep already linked. That is
+                // a find -- without crediting it, every sweep after the one
+                // that linked the family reports "nobody home" and arms the
+                // expensive tier on a demonstrably working network.
+                if (
+                    lanSweepProbeFoundFriend(
+                        keyAlreadyAuthenticated = serviceKey in authenticatedOutboundKeys,
+                        linkTableFull = false,
+                        authenticatedLinks = authenticatedUserIds.size,
+                    )
+                ) {
+                    markSweepFoundFriend(sweep)
+                }
                 socket.closeQuietly()
                 return
             }
             if (!tryAcquireSocketSlot()) {
+                // The link table is full, which with a friend on one of those
+                // links is the healthiest network there is -- not an empty
+                // one. A table of in-flight handshakes to unrelated services
+                // is not, hence the authenticated-link requirement.
+                if (
+                    lanSweepProbeFoundFriend(
+                        keyAlreadyAuthenticated = false,
+                        linkTableFull = true,
+                        authenticatedLinks = authenticatedUserIds.size,
+                    )
+                ) {
+                    markSweepFoundFriend(sweep)
+                }
                 outboundServiceKeys.remove(serviceKey)
                 socket.closeQuietly()
                 return
@@ -363,6 +397,7 @@ internal class LanTransport(
                 outboundServiceKey = serviceKey,
                 expectedUserId = null,
                 advertisedEndpoint = endpoint,
+                sweep = sweep,
             )
         } catch (error: Exception) {
             if (!outcomeRecorded) {
@@ -432,14 +467,7 @@ internal class LanTransport(
             val endpoint = LanManualEndpoint(hint.host, hint.port.toInt())
             onEndpointObserved(expectedUserId, endpoint, currentNetworkId)
             if (!started) return@post
-            // Only genuinely NEW evidence resets the sweep backoff -- a
-            // token already seen this network join (already connected, or
-            // already hinted before) must not re-trigger it.
-            if (knownPeerInstanceTokens.add(remoteToken)) {
-                scanPlanner.onPeerEvidence(System.currentTimeMillis())
-                LanTransportDiagnostics.peerEvidence()
-                scheduleAutomaticSubnetScan(PEER_EVIDENCE_SCAN_DELAY_MS)
-            }
+            notePeerEvidence(remoteToken)
             if (!shouldInitiateLanConnection(instanceToken, remoteToken)) {
                 Log.i(
                     TAG,
@@ -726,6 +754,8 @@ internal class LanTransport(
         outboundServiceKey: String?,
         expectedUserId: ByteArray?,
         advertisedEndpoint: InetSocketAddress?,
+        /** The sweep that dialed this candidate, if any -- see [markSweepFoundFriend]. */
+        sweep: RunningSweep? = null,
     ) {
         sockets += socket
         val peerEndpoint = socket.remoteSocketAddress?.toString()?.removePrefix("/") ?: "peer"
@@ -759,7 +789,13 @@ internal class LanTransport(
                 if (authenticatedUserIds.containsValue(userId.toHex())) {
                     // Election fallbacks and sweeps may dial a contact that
                     // connected to us in the meantime. Close the redundant
-                    // socket before it becomes a second live link.
+                    // socket before it becomes a second live link -- but a
+                    // sweep that ran into a friend it is already linked to
+                    // has still proved discovery works on this network, so
+                    // credit it exactly as an authenticated find would.
+                    // Otherwise every sweep on a healthy network reports
+                    // "found nobody" and arms the expensive full tier.
+                    markSweepFoundFriend(sweep)
                     abortedDuplicateLink = true
                     throw IOException("Contact already has an active LAN link")
                 }
@@ -812,9 +848,7 @@ internal class LanTransport(
                     // Only an authenticated friend counts as a sweep find --
                     // see onScanCompleted. Harmless no-op if the sweep has
                     // already completed or been replaced.
-                    runningSweep
-                        ?.takeIf { it.outcomes.generation == scanGeneration.get() }
-                        ?.authenticatedFriend = true
+                    markSweepFoundFriend(sweep)
                 }
             }
             scheduleAutomaticSubnetScan(AUTO_SCAN_RETRY_INTERVAL_MS)
@@ -907,7 +941,7 @@ internal class LanTransport(
     ) {
         if (endpoints.isEmpty()) return
         val scheduledNetwork = wifiNetwork ?: return
-        if (!electionFallbackKeys.add(key)) return
+        if (!electionFallbackKeys.claim(key, ::logForgottenLanKey)) return
         mainHandler.postDelayed(
             {
                 if (!started || wifiNetwork != scheduledNetwork) return@postDelayed
@@ -955,6 +989,57 @@ internal class LanTransport(
         )
     }
 
+    /**
+     * A peer advertised itself (NSD resolution or an endpoint hint) under
+     * [token]. Only genuinely NEW evidence is worth reacting to: an
+     * already-connected/linked peer's record keeps reappearing (re-resolves,
+     * periodic discovery updates, resent hints) and must not keep
+     * re-triggering full sweeps.
+     *
+     * The token is chosen by whatever is advertising, so "new" is not a
+     * trustworthy signal on a busy or hostile network: the remembered set is
+     * bounded ([BoundedLanKeySet]) and [LanScanPlanner.onPeerEvidence] only
+     * rewinds the sweep schedule a bounded number of times per network join.
+     * Past either bound the caller still discovers and dials the peer
+     * normally -- only the schedule pull-forward stops.
+     */
+    private fun notePeerEvidence(token: String) {
+        if (!knownPeerInstanceTokens.claim(token, ::logForgottenLanKey)) return
+        LanTransportDiagnostics.peerEvidence()
+        if (!scanPlanner.onPeerEvidence(System.currentTimeMillis())) return
+        scheduleAutomaticSubnetScan(PEER_EVIDENCE_SCAN_DELAY_MS)
+    }
+
+    /**
+     * A per-network-join key was forgotten to stay inside [BoundedLanKeySet]'s
+     * bound, which only happens when far more distinct services or tokens
+     * have appeared on this Wi-Fi than any real fleet produces.
+     */
+    private fun logForgottenLanKey(key: String) {
+        Log.i(TAG, "Forgetting the oldest tracked local Wi-Fi peer to make room (${key.take(8)})")
+    }
+
+    /**
+     * Credits [sweep] with having found a friend on this LAN. Only an
+     * authenticated friend -- or one this sweep discovered is already linked
+     * -- counts; see [onScanCompleted]. The generation check keeps a
+     * handshake that finishes after its own sweep was replaced or cancelled
+     * from crediting whatever sweep is running now.
+     */
+    private fun markSweepFoundFriend(sweep: RunningSweep?) {
+        val dialed = sweep ?: return
+        if (
+            !lanSweepCreditApplies(
+                sweepGeneration = dialed.outcomes.generation,
+                currentGeneration = scanGeneration.get(),
+                sweepStillRunning = runningSweep === dialed,
+            )
+        ) {
+            return
+        }
+        dialed.authenticatedFriend = true
+    }
+
     private fun scheduleAutomaticSubnetScan(delayMs: Long) {
         mainHandler.removeCallbacks(automaticScanRunnable)
         if (!started || wifiNetwork == null) return
@@ -994,7 +1079,9 @@ internal class LanTransport(
                 if (!started || !sameLanServiceType(serviceInfo.serviceType)) return@post
                 val name = serviceInfo.serviceName
                 if (name == requestedServiceName || name == registeredServiceName) return@post
-                if (!queuedServiceNames.add(name)) return@post
+                // Bounded: the discovered-service set is fed by whatever
+                // advertises on this Wi-Fi, and every entry costs a resolve.
+                if (!queuedServiceNames.claim(name, ::logForgottenLanKey)) return@post
                 when (
                     lanServiceRoute(
                         sdkInt = Build.VERSION.SDK_INT,
@@ -1052,15 +1139,7 @@ internal class LanTransport(
         ) {
             return
         }
-        // Only genuinely NEW evidence resets the sweep backoff -- an
-        // already-connected/linked peer's NSD record keeps reappearing here
-        // (re-resolves, service-info updates, periodic discovery updates)
-        // and must not keep re-triggering full sweeps.
-        if (knownPeerInstanceTokens.add(token)) {
-            scanPlanner.onPeerEvidence(System.currentTimeMillis())
-            LanTransportDiagnostics.peerEvidence()
-            scheduleAutomaticSubnetScan(PEER_EVIDENCE_SCAN_DELAY_MS)
-        }
+        notePeerEvidence(token)
         if (shouldInitiateLanConnection(instanceToken, token)) {
             connectToService(serviceInfo)
         } else {
@@ -1411,6 +1490,13 @@ internal class LanTransport(
         // the planner and loneliness gate still decide whether anything runs.
         private const val PEER_EVIDENCE_SCAN_DELAY_MS = 2_000L
 
+        // Ceiling on the per-network-join bookkeeping sets (seen peer
+        // tokens, scheduled election fallbacks, queued service names). Their
+        // keys come from whatever advertises on the Wi-Fi, so they are only
+        // as bounded as the network is honest; 256 is far above any real
+        // fleet and keeps a busy network from growing them without limit.
+        private const val MAX_TRACKED_PEER_KEYS = 256
+
         // Consecutive ISOLATION_SUSPECTED sweep verdicts required before the
         // planner defers full sweeps to its backoff cap.
         private const val ISOLATION_CONFIRM_SWEEPS = 2
@@ -1514,10 +1600,118 @@ internal fun pendingLanOutboundAttempts(
 ): Int = outboundServiceKeys.count { it !in authenticatedOutboundKeys }
 
 /**
+ * The "have I already handled this?" memory the transport keeps for one
+ * network join: seen peer tokens, scheduled election fallbacks, queued
+ * service names.
+ *
+ * Every key comes from something a device on the Wi-Fi chose, so the set
+ * cannot be bounded by honesty alone -- a network full of made-up names
+ * would grow it without limit. It is therefore capped at [limit], and at the
+ * cap the OLDEST key is forgotten rather than the newest refused. That
+ * direction matters: refusing new keys would let a flood of made-up ones
+ * permanently lock out a real family member who joins afterwards, silently.
+ * Forgetting the oldest only risks repeating work already done once, which
+ * every caller here tolerates.
+ */
+internal class BoundedLanKeySet(private val limit: Int) {
+    private val keys = LinkedHashSet<String>()
+
+    /**
+     * Records [key] and reports whether it is brand-new work. [onEvicted]
+     * runs for a key forgotten to make room (for logging; it is never the
+     * key just claimed).
+     */
+    @Synchronized
+    fun claim(key: String, onEvicted: (String) -> Unit = {}): Boolean {
+        if (!keys.add(key)) return false
+        while (keys.size > limit) {
+            val oldest = keys.iterator().next()
+            keys.remove(oldest)
+            onEvicted(oldest)
+        }
+        return true
+    }
+
+    @Synchronized
+    fun contains(key: String): Boolean = key in keys
+
+    @Synchronized
+    fun remove(key: String) {
+        keys.remove(key)
+    }
+
+    @Synchronized
+    fun clear() {
+        keys.clear()
+    }
+
+    @Synchronized
+    fun size(): Int = keys.size
+}
+
+/**
+ * Whether a sweep probe that stopped before it could open a link still found
+ * a friend on this network.
+ *
+ * Both stopping points look like "nothing here" from inside the probe and
+ * are anything but: [keyAlreadyAuthenticated] means the address is already
+ * carrying an authenticated link to a friend (a healthy link holds its
+ * service key for its whole life, so every sweep after the one that linked
+ * the family collides here), and a full link table with a friend on it is
+ * the healthiest network there is. A full table of in-flight handshakes to
+ * unrelated services is not, hence [authenticatedLinks].
+ */
+internal fun lanSweepProbeFoundFriend(
+    keyAlreadyAuthenticated: Boolean,
+    linkTableFull: Boolean,
+    authenticatedLinks: Int,
+): Boolean = keyAlreadyAuthenticated || (linkTableFull && authenticatedLinks > 0)
+
+/**
+ * Whether a connection dialed by the sweep at [sweepGeneration] may still
+ * credit that sweep with a find. A handshake can finish after its own sweep
+ * completed, was cancelled, or was replaced by a newer one; crediting then
+ * would either do nothing useful or, worse, mark a sweep that never met the
+ * peer.
+ */
+internal fun lanSweepCreditApplies(
+    sweepGeneration: Int,
+    currentGeneration: Int,
+    sweepStillRunning: Boolean,
+): Boolean = sweepStillRunning && sweepGeneration == currentGeneration
+
+/**
+ * Whether a contact that once demonstrated LAN support should still keep the
+ * automatic sweep running. Capability itself never expires -- a contact who
+ * supports LAN endpoints always will -- but "might be on this Wi-Fi right
+ * now" does, and that is what the sweep is spending battery on. Without a
+ * bound, one family member who stayed ashore keeps every remaining phone
+ * sweeping the subnet forever.
+ *
+ * [LAN_CAPABILITY_RECENCY_WINDOW_MS] is deliberately generous: any LAN link,
+ * any endpoint hint over BLE, and any hint through the relay all refresh the
+ * timestamp, so a contact who is genuinely nearby re-motivates sweeps within
+ * seconds of the first contact of a trip. A contact with no such evidence for
+ * two weeks is not worth a subnet sweep every five minutes.
+ */
+internal fun lanCapabilityMotivatesScan(
+    lastSupportedAtMs: Long?,
+    nowMs: Long,
+    windowMs: Long = LAN_CAPABILITY_RECENCY_WINDOW_MS,
+): Boolean {
+    val lastSeen = lastSupportedAtMs ?: return false
+    return nowMs - lastSeen < windowMs
+}
+
+/** Two weeks; see [lanCapabilityMotivatesScan]. */
+internal const val LAN_CAPABILITY_RECENCY_WINDOW_MS = 14L * 24 * 60 * 60 * 1_000
+
+/**
  * Whether the periodic check may claim a scan from [LanScanPlanner]. A scan
  * is worthwhile while the transport has no links at all, OR while some
- * contact that has demonstrated LAN support still has no authenticated LAN
- * link -- one connected family member must not stop discovery of the rest.
+ * contact that has recently demonstrated LAN support still has no
+ * authenticated LAN link ([lanCapabilityMotivatesScan]) -- one connected
+ * family member must not stop discovery of the rest.
  * In-flight work (pending outbound attempts, a running sweep) always defers.
  */
 internal fun shouldRunAutomaticLanScan(
