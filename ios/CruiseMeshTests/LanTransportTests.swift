@@ -24,6 +24,15 @@ final class LanTransportTests: XCTestCase {
         XCTAssertFalse(shouldInitiateLanConnection(localToken: "aabb", remoteToken: "aabb"))
     }
 
+    func testHintedAddressIsTriedOnceAndNeverRemembered() {
+        XCTAssertTrue(isSingleShotLanConnectKey(lanHintConnectKey("10.0.0.5:45892")))
+        // Keys this phone found itself keep retrying: Bonjour discovery,
+        // subnet sweep hits, and the manual/cached endpoint.
+        XCTAssertFalse(isSingleShotLanConnectKey("endpoint:10.0.0.5:45892"))
+        XCTAssertFalse(isSingleShotLanConnectKey("scan:10.0.0.2"))
+        XCTAssertFalse(isSingleShotLanConnectKey("CruiseMesh-abc123"))
+    }
+
     func testNoiseStaticKeyResolvesOnlyAcceptedContact() {
         let alice = contact(userByte: 1, agreeByte: 7)
         let bob = contact(userByte: 2, agreeByte: 8)

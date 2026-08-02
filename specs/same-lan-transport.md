@@ -39,6 +39,15 @@ does not implement this transport remains fully compatible over BLE and relay.
   endpoint the contact sealed pairwise, and the Noise handshake still
   authenticates. This allows two accepted contacts on the same LAN to find
   each other before BLE or mDNS succeeds.
+- A hint carries the sender's own address on the local network and nothing
+  else. The receiver accepts only an address literal in a range a phone's own
+  interface address can be in -- RFC1918, `169.254/16`, RFC 6598 `100.64/10`,
+  IPv6 `fe80::/10` (with an optional scope id) and `fc00::/7` -- so a hint can
+  never name a public address and never causes a name to be resolved. The same
+  rule applies to the `LAN_ENDPOINT` link-control frame.
+- Dialing a hint is single-shot. A hinted address is never installed as a
+  reconnect target, so a failed attempt is not retried on a timer; a later
+  hint, mDNS discovery, or the cached endpoint starts the next attempt.
 - A manual `IP[:port]` field and endpoint QR are available for diagnosis when
   automatic discovery is unavailable.
 - The user may explicitly search the phone's current IPv4 `/24`. The search is
