@@ -40,8 +40,8 @@ import uniffi.cruisemesh_core.ContactRelayRejection
 import uniffi.cruisemesh_core.coreContactRelayEndpointUsable
 import uniffi.cruisemesh_core.coreContactRelayIsStale
 import uniffi.cruisemesh_core.coreContactRelayStreakDelta
-import uniffi.cruisemesh_core.coreContactRelayUnreachableDelta
-import uniffi.cruisemesh_core.coreContactRelayUnreachableEndpointUsable
+import uniffi.cruisemesh_core.coreGroupFanoutRelayTarget
+import uniffi.cruisemesh_core.GroupRelayMember
 import uniffi.cruisemesh_core.resolvedContactDeliveryPollRelay
 import uniffi.cruisemesh_core.resolvedContactDeliveryRelay
 import java.util.concurrent.ConcurrentHashMap
@@ -635,18 +635,40 @@ internal class RelaySyncEngine(
         }
     }
 
+    /**
+     * Which single mailbox a group envelope's fan-out rows go to, or null for
+     * "post nothing this pass" -- which leaves the envelope queued for a later
+     * pass and for the BLE/LAN paths, exactly as the 1:1 skip does.
+     *
+     * The choice itself is core's ([coreGroupFanoutRelayTarget]) because the
+     * rule that matters is easy to get subtly wrong in one shell: a member
+     * whose endpoint is *resting for silence* contributes no fallback to our
+     * own mailbox. Falling back for them would post a cross-family member's
+     * copy where they never read, and `relay_posted_at` is terminal, so that
+     * is a permanent misroute rather than a retry. A member written off for
+     * *rejection* still falls back, unchanged.
+     */
     private fun relayConfigForGroupRecipient(
         groupId: ByteArray,
         contacts: List<Contact>,
         fallbackConfig: RelayConfig?,
     ): RelayConfig? {
         val group = store.getGroup(groupId) ?: return fallbackConfig
-        for (memberId in group.memberUserIds) {
-            val contact = contacts.firstOrNull { it.userId.contentEquals(memberId) } ?: continue
-            val config = resolvedRelayConfig(contact, fallbackConfig)
-            if (config != null) return config
+        val members = group.memberUserIds.mapNotNull { memberId ->
+            val contact = contacts.firstOrNull { it.userId.contentEquals(memberId) }
+                ?: return@mapNotNull null
+            GroupRelayMember(
+                contact.relayUrl,
+                contact.relayToken,
+                contactEndpointUsable(contact),
+                contactEndpointAnswering(contact),
+            )
         }
-        return fallbackConfig
+        return coreGroupFanoutRelayTarget(
+            members,
+            fallbackConfig?.relayUrl,
+            fallbackConfig?.relayToken,
+        )?.let { RelayConfig(it.url, it.token) }
     }
 
     private fun uploadFamilyCarriedEnvelopes(
@@ -981,14 +1003,21 @@ internal class RelaySyncEngine(
      * opens, which is what stops an address that will never respond from being
      * dialled on every pass forever.
      */
-    private fun contactEndpointAnswering(contact: Contact): Boolean {
-        val rested = contactRelayUnreachable[UserIdHex.encode(contact.userId)] ?: return true
-        return coreContactRelayUnreachableEndpointUsable(
-            rested.rejectStreak,
-            rested.rejectedAtMs,
+    private fun contactEndpointAnswering(contact: Contact): Boolean =
+        contactRelaySilence.endpointAnswering(
+            UserIdHex.encode(contact.userId),
+            contactEndpointKey(contact),
             passNowMs,
         )
-    }
+
+    /**
+     * A rest belongs to an *address*, not to a person: `relayCursorKey` hashes
+     * the contact's current endpoint so a card or a T23 notice that moves them
+     * to a different host is tried again immediately instead of serving out
+     * the old host's rest window.
+     */
+    private fun contactEndpointKey(contact: Contact): String =
+        relayCursorKey(contact.relayUrl.orEmpty(), contact.relayToken.orEmpty())
 
     /**
      * CP4: fetch/ack/presence resolution. Post-CP4 friend cards carry
@@ -1043,21 +1072,13 @@ internal class RelaySyncEngine(
      * [commitUnreachableContactRelays], which is where they are either
      * counted or discarded.
      */
-    private val contactRelayUnreachableThisPass: MutableMap<String, ByteArray> = mutableMapOf()
+    private val contactRelayUnreachableThisPass: MutableMap<String, String> = mutableMapOf()
 
     /**
      * Per-process streaks of passes in which a contact's endpoint said
-     * nothing, and when each last advanced.
-     *
-     * Deliberately not persisted, unlike the rejection streaks: a host that is
-     * down is usually down for minutes, so re-learning it after a restart
-     * costs two passes and avoids carrying a stale verdict across days. It
-     * also keeps "not answering right now" out of the persisted stale-card set
-     * the contact sheet reads, where the message is "ask them to share their
-     * card again" — right for a revoked token, wrong for a relay that is
-     * rebooting.
+     * nothing. See [ContactRelaySilence] for why this is not persisted.
      */
-    private val contactRelayUnreachable: MutableMap<String, ContactRelayRejection> = mutableMapOf()
+    private val contactRelaySilence = ContactRelaySilence()
 
     /** This pass's `now`, so streak timestamps and re-probe windows agree within a pass. */
     private var passNowMs: Long = 0L
@@ -1117,7 +1138,8 @@ internal class RelaySyncEngine(
             // evidence about the card on its own, so it is only remembered
             // here; commitUnreachableContactRelays decides at the end of the
             // pass whether this device had any business believing it.
-            contactRelayUnreachableThisPass[UserIdHex.encode(contact.userId)] = contact.userId
+            contactRelayUnreachableThisPass[UserIdHex.encode(contact.userId)] =
+                contactEndpointKey(contact)
             return
         }
         val fault = relayClassifyHttpError(http.code.toUShort(), http.relayCode)
@@ -1155,7 +1177,7 @@ internal class RelaySyncEngine(
         if (config == fallbackConfig) return
         val key = UserIdHex.encode(contact.userId)
         contactRelayUnreachableThisPass.remove(key)
-        contactRelayUnreachable.remove(key)
+        contactRelaySilence.noteAnswered(key)
         if (!contactRelayRejections.containsKey(key)) return
         store.clearContactRelayRejection(contact.userId)
         contactRelayRejections.remove(key)
@@ -1163,26 +1185,26 @@ internal class RelaySyncEngine(
     }
 
     /**
-     * Turns this pass's silent endpoints into unreachable streaks -- but only
-     * when [ownRelayAnswered] proves a different relay answered this device in
-     * the same pass.
+     * Turns this pass's silent endpoints into unreachable streaks.
      *
-     * Without that proof the silence says nothing about any particular
-     * endpoint: a phone in a tunnel fails every one of them, and resting them
-     * all would take the relay path away from every contact at once, for the
-     * whole rest window, the moment connectivity came back. With it the
-     * comparison is real -- our own relay answered, theirs did not.
+     * [ownRelayAnswered] is handed straight to the core rather than tested
+     * here: whether same-pass proof of working internet is required, and what
+     * the absence of it means, is one rule that both shells must answer
+     * identically, so `core_contact_relay_unreachable_delta` is the only place
+     * it is decided. Without the proof the delta is 0, nothing is recorded,
+     * and the observation is discarded -- a phone in a tunnel fails every
+     * endpoint at once, and resting them all would take the relay path away
+     * from every contact for the whole rest window the moment connectivity
+     * came back.
      */
     private fun commitUnreachableContactRelays(ownRelayAnswered: Boolean) {
-        if (contactRelayUnreachableThisPass.isEmpty()) return
-        if (!ownRelayAnswered) {
-            contactRelayUnreachableThisPass.clear()
-            return
-        }
-        for ((key, userId) in contactRelayUnreachableThisPass) {
-            val streak = (contactRelayUnreachable[key]?.rejectStreak ?: 0L) +
-                coreContactRelayUnreachableDelta(true)
-            contactRelayUnreachable[key] = ContactRelayRejection(userId, streak, passNowMs)
+        for ((key, endpointKey) in contactRelayUnreachableThisPass) {
+            val streak = contactRelaySilence.noteSilentPass(
+                key,
+                endpointKey,
+                ownRelayAnswered,
+                passNowMs,
+            ) ?: continue
             Log.w(
                 TAG,
                 "Contact $key relay endpoint did not answer while our own relay did " +

@@ -2602,12 +2602,26 @@ final class MeshController: ObservableObject {
             /// Contacts whose endpoint failed this pass without answering at
             /// all. Held to the end of the pass because the observation only
             /// means anything next to proof that this device's internet works.
-            var silentThisPass: Set<Data> = []
+            var silentThisPass: [Data: String] = [:]
+            /// A rest belongs to an *address*, not to a person: `relayCursorKey`
+            /// hashes the contact's current endpoint so a card or a T23 notice
+            /// that moves them to a different host is tried again immediately
+            /// instead of serving out the old host's rest window.
+            func endpointKey(_ contact: Contact) -> String {
+                relayCursorKey(
+                    relayUrl: contact.relayUrl ?? "",
+                    relayToken: contact.relayToken ?? ""
+                )
+            }
             /// Whether this contact's endpoint has answered recently enough to
             /// be worth a request. The counterpart to `endpointUsable` for the
             /// failure mode with no HTTP answer to classify.
             func endpointAnswering(_ contact: Contact) -> Bool {
-                ContactRelaySilence.shared.endpointAnswering(userId: contact.userId, nowMs: now)
+                ContactRelaySilence.shared.endpointAnswering(
+                    userId: contact.userId,
+                    endpointKey: endpointKey(contact),
+                    nowMs: now
+                )
             }
             /// Where a send to this contact should go, or nil for "no relay
             /// attempt right now", which leaves the envelope queued for a
@@ -2644,7 +2658,7 @@ final class MeshController: ObservableObject {
                     // own, so it is only remembered here; the end of the pass
                     // decides whether this device had any business believing
                     // it.
-                    silentThisPass.insert(contact.userId)
+                    silentThisPass[contact.userId] = endpointKey(contact)
                     return
                 }
                 let fault = relayClassifyHttpError(
@@ -2670,7 +2684,7 @@ final class MeshController: ObservableObject {
                    usedConfig.relayToken == own.relayToken { return }
                 // The endpoint answering settles the silence question outright,
                 // whatever this pass had provisionally observed.
-                silentThisPass.remove(contact.userId)
+                silentThisPass[contact.userId] = nil
                 ContactRelaySilence.shared.noteAnswered(userId: contact.userId)
                 guard rejections[contact.userId] != nil else { return }
                 try? store.clearContactRelayRejection(userId: contact.userId)
@@ -2702,15 +2716,36 @@ final class MeshController: ObservableObject {
             let groupsById = Dictionary(
                 uniqueKeysWithValues: importedGroups.map { ($0.id, $0) }
             )
+            /// Which single mailbox a group envelope's fan-out rows go to, or
+            /// nil for "post nothing this pass" -- which leaves the envelope
+            /// queued for a later pass and for the BLE/LAN paths, exactly as
+            /// the 1:1 skip does.
+            ///
+            /// The choice itself is core's because the rule that matters is
+            /// easy to get subtly wrong in one shell: a member whose endpoint
+            /// is *resting for silence* contributes no fallback to our own
+            /// mailbox. Falling back for them would post a cross-family
+            /// member's copy where they never read, and `relayPostedAt` is
+            /// terminal, so that is a permanent misroute rather than a retry.
+            /// A member written off for *rejection* still falls back,
+            /// unchanged. Mirrors RelaySyncEngine.kt.
             func relayConfigForGroupRecipient(_ groupId: Data) -> RelayConfig? {
                 guard let group = groupsById[groupId] else { return config }
-                for member in group.memberUserIds {
-                    if let contact = contactsById[member],
-                       let resolved = sendConfig(for: contact) {
-                        return resolved
-                    }
+                let members = group.memberUserIds.compactMap { member -> GroupRelayMember? in
+                    guard let contact = contactsById[member] else { return nil }
+                    return GroupRelayMember(
+                        relayUrl: contact.relayUrl,
+                        relayToken: contact.relayToken,
+                        endpointUsable: endpointUsable(contact),
+                        endpointAnswering: endpointAnswering(contact)
+                    )
                 }
-                return config
+                guard let target = coreGroupFanoutRelayTarget(
+                    members: members,
+                    fallbackUrl: config?.relayUrl,
+                    fallbackToken: config?.relayToken
+                ) else { return nil }
+                return RelayConfig(relayUrl: target.url, relayToken: target.token)
             }
             for env in outbound {
                 guard let contact = contactsById[env.recipientUserId] else {
@@ -3060,18 +3095,25 @@ final class MeshController: ObservableObject {
             }
             // Now that the pass knows whether our own mailbox answered, this
             // pass's silent contact endpoints can be judged -- or discarded.
-            // Without that proof the silence says nothing about any particular
-            // endpoint: a phone in a tunnel fails every one of them, and
-            // resting them all would take the relay path away from every
-            // contact at once for the whole rest window. Mirrors
-            // RelaySyncEngine.kt's commitUnreachableContactRelays.
-            if ownRelayAnswered {
-                for userId in silentThisPass {
-                    let streak = ContactRelaySilence.shared.noteSilentPass(userId: userId, nowMs: now)
-                    relaySyncLog.warning(
-                        "A contact's relay endpoint did not answer while our own did (silent passes=\(streak, privacy: .public)); resting it rather than retrying every pass"
-                    )
-                }
+            // `ownRelayAnswered` is handed straight to the core rather than
+            // tested here: whether same-pass proof of working internet is
+            // required, and what its absence means, is one rule both shells
+            // must answer identically, so coreContactRelayUnreachableDelta is
+            // the only place it is decided. Without the proof nothing is
+            // recorded -- a phone in a tunnel fails every endpoint at once,
+            // and resting them all would take the relay path away from every
+            // contact for the whole rest window. Mirrors RelaySyncEngine.kt's
+            // commitUnreachableContactRelays.
+            for (userId, key) in silentThisPass {
+                guard let streak = ContactRelaySilence.shared.noteSilentPass(
+                    userId: userId,
+                    endpointKey: key,
+                    otherRelayAnswered: ownRelayAnswered,
+                    nowMs: now
+                ) else { continue }
+                relaySyncLog.warning(
+                    "A contact's relay endpoint did not answer while our own did (silent passes=\(streak, privacy: .public)); resting it rather than retrying every pass"
+                )
             }
             silentThisPass.removeAll()
             let syncedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)

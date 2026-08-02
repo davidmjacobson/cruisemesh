@@ -78,7 +78,11 @@ final class RelaySweepSession: @unchecked Sendable {
 final class ContactRelaySilence: @unchecked Sendable {
     static let shared = ContactRelaySilence()
 
+    /// `endpointKey` is `relayCursorKey(relayUrl:relayToken:)` -- a hash,
+    /// never the credential -- for the endpoint that was silent, so a rest is
+    /// tied to the address that earned it rather than to the person.
     private struct State {
+        var endpointKey: String
         var streak: Int64
         var restedAtMs: Int64
     }
@@ -90,10 +94,23 @@ final class ContactRelaySilence: @unchecked Sendable {
     /// worth spending a request on. True below the core's streak, and true
     /// again once the rest window is up so a recovered host is picked back up
     /// with nobody touching the phone.
-    func endpointAnswering(userId: Data, nowMs: Int64) -> Bool {
+    ///
+    /// Also true the moment the contact's endpoint *moves*, which is the same
+    /// rule core applies to the persisted rejection streak: a new friend card
+    /// or a T23 relay-update notice that changes the address gives it a clean
+    /// slate, because a host that has never been tried cannot have been
+    /// silent. Without this a contact who migrated to a working relay would
+    /// keep being skipped for the rest of the half-hour window. Re-importing a
+    /// card that re-states the *same* endpoint changes nothing, exactly as it
+    /// does not launder a rejection streak.
+    func endpointAnswering(userId: Data, endpointKey: String, nowMs: Int64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard let state = silent[userId] else { return true }
+        guard state.endpointKey == endpointKey else {
+            silent[userId] = nil
+            return true
+        }
         return coreContactRelayUnreachableEndpointUsable(
             unreachableStreak: state.streak,
             restedAtMs: state.restedAtMs,
@@ -101,15 +118,33 @@ final class ContactRelaySilence: @unchecked Sendable {
         )
     }
 
-    /// Records one whole pass in which this endpoint said nothing while
-    /// another relay answered. Returns the new streak.
+    /// Records one whole pass in which this endpoint said nothing.
+    ///
+    /// `otherRelayAnswered` is passed through to the core rather than tested
+    /// here: without same-pass proof that a different relay answered this
+    /// device, the core's delta is 0 and nothing is recorded, because the
+    /// failure is then most likely our own connectivity -- a phone in a tunnel
+    /// fails every endpoint at once. Returns the new streak, or nil when the
+    /// observation was not counted.
     @discardableResult
-    func noteSilentPass(userId: Data, nowMs: Int64) -> Int64 {
+    func noteSilentPass(
+        userId: Data,
+        endpointKey: String,
+        otherRelayAnswered: Bool,
+        nowMs: Int64
+    ) -> Int64? {
         lock.lock()
         defer { lock.unlock() }
-        let streak = (silent[userId]?.streak ?? 0)
-            + coreContactRelayUnreachableDelta(otherRelayAnswered: true)
-        silent[userId] = State(streak: streak, restedAtMs: nowMs)
+        let delta = coreContactRelayUnreachableDelta(otherRelayAnswered: otherRelayAnswered)
+        guard delta != 0 else { return nil }
+        // A rest recorded against a different address says nothing about this
+        // one, so the streak restarts rather than resuming.
+        var prior: Int64 = 0
+        if let state = silent[userId], state.endpointKey == endpointKey {
+            prior = state.streak
+        }
+        let streak = prior + delta
+        silent[userId] = State(endpointKey: endpointKey, streak: streak, restedAtMs: nowMs)
         return streak
     }
 

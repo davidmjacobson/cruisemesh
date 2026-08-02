@@ -198,6 +198,12 @@ pub const CONTACT_RELAY_UNREACHABLE_REST_MS: i64 = 30 * 60 * 1000;
 /// Note the asymmetry with [`core_contact_relay_streak_delta`], which needs
 /// no such proof: a 401 is the endpoint speaking, so it is evidence about the
 /// card no matter what the rest of the network is doing.
+///
+/// Callers pass the observation and act on the delta; they must not test
+/// `other_relay_answered` themselves first. A shell that guards the call with
+/// its own `if` and then passes a literal `true` has moved the rule back into
+/// both shells, where the two copies can drift — which is the whole reason
+/// this module exists.
 #[uniffi::export]
 pub fn core_contact_relay_unreachable_delta(other_relay_answered: bool) -> i64 {
     if other_relay_answered {

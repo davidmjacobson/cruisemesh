@@ -2,13 +2,16 @@ package com.cruisemesh.app.mesh
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.CoreRelayFault
+import uniffi.cruisemesh_core.GroupRelayMember
 import uniffi.cruisemesh_core.coreContactRelayEndpointUsable
 import uniffi.cruisemesh_core.coreContactRelayStreakDelta
 import uniffi.cruisemesh_core.coreContactRelayUnreachableDelta
 import uniffi.cruisemesh_core.coreContactRelayUnreachableEndpointUsable
+import uniffi.cruisemesh_core.coreGroupFanoutRelayTarget
 import uniffi.cruisemesh_core.relayClassifyHttpError
 
 /**
@@ -32,6 +35,10 @@ class ContactRelayHealthPolicyTest {
     ): Boolean =
         coreContactRelayEndpointUsable(rejectStreak, rejectedAtMs, nowMs) &&
             coreContactRelayUnreachableEndpointUsable(silentStreak, restedAtMs, nowMs)
+
+    /** One group member as [RelaySyncEngine.relayConfigForGroupRecipient] builds them. */
+    private fun member(url: String?, usable: Boolean, answering: Boolean) =
+        GroupRelayMember(url, "their-token", usable, answering)
 
     @Test
     fun `a healthy endpoint is left entirely alone`() {
@@ -88,6 +95,50 @@ class ContactRelayHealthPolicyTest {
         // close it independently.
         assertFalse("a rejected card", pollable(2, now, 0, 0))
         assertFalse("a silent host", pollable(0, 0, 2, now))
+    }
+
+    @Test
+    fun `a group whose only card member is resting is not posted at all`() {
+        // The 1:1 paths skip a resting endpoint; the group fan-out used to
+        // fall through to our own mailbox instead. That post succeeds, the
+        // envelope is marked relay-posted -- which is terminal -- and a
+        // cross-family member's copy is stranded in a mailbox they never
+        // read, with no later pass to repair it. Null means "post nothing
+        // this pass", leaving it queued for BLE/LAN and for a later pass.
+        assertNull(
+            coreGroupFanoutRelayTarget(
+                listOf(member("https://silent.example", usable = true, answering = false)),
+                "https://ours.example",
+                "our-token",
+            ),
+        )
+    }
+
+    @Test
+    fun `a member written off for rejection still falls back to our own mailbox`() {
+        // Deliberately not the same answer: a 401 proves the card is wrong,
+        // and our own relay really delivers when both sides have since moved
+        // to the same new host. Pinned so the resting fix above cannot
+        // quietly take this path with it.
+        val target = coreGroupFanoutRelayTarget(
+            listOf(member("https://revoked.example", usable = false, answering = true)),
+            "https://ours.example",
+            "our-token",
+        )
+        assertEquals("https://ours.example", target?.url)
+    }
+
+    @Test
+    fun `a group with a healthy member still rides that member's relay`() {
+        val target = coreGroupFanoutRelayTarget(
+            listOf(
+                member("https://silent.example", usable = true, answering = false),
+                member("https://live.example", usable = true, answering = true),
+            ),
+            "https://ours.example",
+            "our-token",
+        )
+        assertEquals("https://live.example", target?.url)
     }
 
     @Test

@@ -307,6 +307,74 @@ pub fn resolved_contact_delivery_relay(
     }
 }
 
+/// One group member's relay situation, as the shell resolved it this pass.
+///
+/// The two health flags are deliberately separate rather than pre-combined:
+/// they justify different answers when the member's endpoint is out of
+/// service, and collapsing them into one "unusable" bit is exactly how the
+/// fan-out path came to redirect a resting member's mail to our own mailbox.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct GroupRelayMember {
+    pub relay_url: Option<String>,
+    pub relay_token: Option<String>,
+    /// False once this member's card endpoint has been written off for
+    /// authoritative rejections — [`crate::contact_relay_health::core_contact_relay_endpoint_usable`].
+    pub endpoint_usable: bool,
+    /// False while this member's card endpoint is resting because it stopped
+    /// answering — [`crate::contact_relay_health::core_contact_relay_unreachable_endpoint_usable`].
+    pub endpoint_answering: bool,
+}
+
+/// Which single mailbox a group envelope's fan-out rows go to, or `None` for
+/// "post nothing this pass".
+///
+/// Group text is addressed to the group id, not to a person, so the shells
+/// pick one mailbox and post every per-member row there
+/// (specs/group-relay-durability.md §4.2). The choice walks the membership in
+/// order and takes the first member that resolves to somewhere worth posting,
+/// falling back to our own configured relay when none of them carries a card
+/// endpoint of their own.
+///
+/// The rule this exists to hold is the last one. A member whose endpoint is
+/// *resting for silence* contributes no fallback: if nobody else in the group
+/// resolves, the answer is `None` and the envelope simply is not posted this
+/// pass. Falling back would put a cross-family member's copy in our own
+/// mailbox, which they never read — and because `relay_posted_at` is
+/// terminal, that is not a retry but a permanent misroute. `None` leaves the
+/// envelope queued for a later pass and for the BLE/LAN paths, so a host that
+/// comes back still receives it.
+///
+/// A member written off for *rejection* keeps falling back, unchanged: a 401
+/// proves the card is wrong, and our own relay really delivers when both
+/// sides have since moved to the same new host.
+#[uniffi::export]
+pub fn core_group_fanout_relay_target(
+    members: Vec<GroupRelayMember>,
+    fallback_url: Option<String>,
+    fallback_token: Option<String>,
+) -> Option<RelayEndpoint> {
+    let mut any_member_resting = false;
+    for member in members {
+        if !member.endpoint_answering {
+            any_member_resting = true;
+            continue;
+        }
+        if let Some(endpoint) = resolved_contact_delivery_relay(
+            member.relay_url,
+            member.relay_token,
+            fallback_url.clone(),
+            fallback_token.clone(),
+            member.endpoint_usable,
+        ) {
+            return Some(endpoint);
+        }
+    }
+    if any_member_resting {
+        return None;
+    }
+    relay_endpoint_from(fallback_url, fallback_token)
+}
+
 /// Poll-path routing with the same written-off rule.
 ///
 /// Proxy-polling a written-off endpoint is pure waste — it rejects every
@@ -1517,6 +1585,96 @@ mod tests {
             ),
             None
         );
+    }
+
+    fn member(url: Option<String>, usable: bool, answering: bool) -> GroupRelayMember {
+        GroupRelayMember {
+            relay_url: url,
+            relay_token: some("their-token"),
+            endpoint_usable: usable,
+            endpoint_answering: answering,
+        }
+    }
+
+    #[test]
+    fn a_group_posts_to_the_first_member_endpoint_that_is_worth_a_request() {
+        // The first member carries no card endpoint, so they resolve to our
+        // own mailbox and the walk stops there -- unchanged behaviour.
+        let target = core_group_fanout_relay_target(
+            vec![
+                member(None, true, true),
+                member(some("https://theirs.example"), true, true),
+            ],
+            some("https://ours.example"),
+            some("our-token"),
+        )
+        .unwrap();
+        assert_eq!(target.url, "https://ours.example");
+
+        let target = core_group_fanout_relay_target(
+            vec![member(some("https://theirs.example"), true, true)],
+            some("https://ours.example"),
+            some("our-token"),
+        )
+        .unwrap();
+        assert_eq!(target.url, "https://theirs.example");
+    }
+
+    #[test]
+    fn a_group_with_no_card_members_at_all_still_uses_our_own_mailbox() {
+        let target =
+            core_group_fanout_relay_target(vec![], some("https://ours.example"), some("our-token"))
+                .unwrap();
+        assert_eq!(target.url, "https://ours.example");
+        assert_eq!(target.token, "our-token");
+    }
+
+    #[test]
+    fn a_resting_member_never_redirects_the_group_to_our_own_mailbox() {
+        // The bug this function exists to prevent. A member whose endpoint
+        // had gone silent used to fall through to our own relay, where the
+        // post succeeded and the envelope was marked relay-posted -- which is
+        // terminal -- so their copy was never offered to the relay path
+        // again. Posting nothing leaves it queued for a later pass and for
+        // the BLE/LAN paths, so a host that comes back still receives it.
+        assert_eq!(
+            core_group_fanout_relay_target(
+                vec![member(some("https://silent.example"), true, false)],
+                some("https://ours.example"),
+                some("our-token"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rejected_member_still_falls_back_even_alongside_a_resting_one() {
+        // The asymmetry, pinned: a 401 proves the card is wrong, so our own
+        // mailbox is a real answer for that member and the group rides it.
+        let target = core_group_fanout_relay_target(
+            vec![
+                member(some("https://silent.example"), true, false),
+                member(some("https://revoked.example"), false, true),
+            ],
+            some("https://ours.example"),
+            some("our-token"),
+        )
+        .unwrap();
+        assert_eq!(target.url, "https://ours.example");
+    }
+
+    #[test]
+    fn a_healthy_member_beside_a_resting_one_carries_the_whole_group() {
+        let target = core_group_fanout_relay_target(
+            vec![
+                member(some("https://silent.example"), true, false),
+                member(some("https://live.example"), true, true),
+            ],
+            some("https://ours.example"),
+            some("our-token"),
+        )
+        .unwrap();
+        assert_eq!(target.url, "https://live.example");
     }
 
     #[test]
