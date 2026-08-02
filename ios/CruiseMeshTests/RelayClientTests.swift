@@ -7,9 +7,6 @@ private final class RelayMockURLProtocol: URLProtocol {
         let statusCode: Int
         let body: Data
         let headers: [String: String]
-        /// Delivers the head and part of the body, then reports a timeout --
-        /// a page that started arriving over a link too slow to finish it.
-        var stallAfterHeaders: Bool = false
     }
 
     static var responses: [CannedResponse] = []
@@ -41,10 +38,6 @@ private final class RelayMockURLProtocol: URLProtocol {
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: canned.body)
-        guard !canned.stallAfterHeaders else {
-            client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
-            return
-        }
         client?.urlProtocolDidFinishLoading(self)
     }
 
@@ -341,49 +334,74 @@ final class RelayClientTests: XCTestCase {
         XCTAssertTrue(RelayMockURLProtocol.requests[1].url!.absoluteString.contains("limit=1"))
     }
 
-    func testAPageThatStopsArrivingIsRetriedAtHalfTheLimitNotFailed() throws {
+    func testABodyThatStopsAfterTheHeadIsReportedAsAPageTooBigToTake() throws {
         // A full page is megabytes. On a ship's Wi-Fi the transfer can start
         // and then not finish in time, and nothing about that changes on the
         // next pass: the same cursor asks for the same window and stops in the
         // same place, so the frontier never advances and the mail behind it is
         // never delivered. The link is telling us the window is too big, which
-        // is the same thing an undecodable page says, so it gets the same
-        // answer -- fewer rows, same cursor.
-        RelayMockURLProtocol.responses = [
-            .init(
-                statusCode: 200,
-                body: Data(#"{"envelopes":"#.utf8),
-                headers: [:],
-                stallAfterHeaders: true
-            ),
-            .init(
-                statusCode: 200,
-                body: Data(#"{"envelopes":[],"next_cursor":9}"#.utf8),
-                headers: [:]
-            ),
-        ]
-        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+        // is the same thing an undecodable page says, so it must arrive at the
+        // caller as the same kind of failure and get the same answer.
+        //
+        // Driven through the delegate rather than through the mock protocol on
+        // purpose: staging "head, then a body that stops" over URLSession means
+        // reporting the failure in the same breath as the head, and the loading
+        // system is free to drop the head callback when the task has already
+        // failed. That is a race, not a behaviour, and it belongs in no test.
+        let partial = Data(#"{"envelopes":"#.utf8)
+        let delegate = makeResponseDelegate()
+        let task = idleDataTask()
 
-        let fetched = try RelayClient.fetchEnvelopesWithinResponseCap(
-            config: config,
-            hints: [Data(repeating: 2, count: 8)],
-            afterId: 9,
-            limit: 64
+        delegate.urlSession(
+            RelayClient.urlSession,
+            dataTask: task,
+            didReceive: httpResponse(statusCode: 200)
+        ) { disposition in
+            XCTAssertEqual(disposition, .allow)
+        }
+        delegate.urlSession(RelayClient.urlSession, dataTask: task, didReceive: partial)
+        delegate.urlSession(RelayClient.urlSession, task: task, didCompleteWithError: URLError(.timedOut))
+
+        switch try XCTUnwrap(delegate.result()) {
+        case .success:
+            XCTFail("a body that stopped part-way is not a complete page")
+        case .failure(let error):
+            let stalled = try XCTUnwrap(error as? RelayResponseStalledError)
+            XCTAssertEqual(stalled.bytesReceived, partial.count)
+            // Shares the type `fetchEnvelopesWithinResponseCap` retries on, so
+            // the recovery proven by the oversize-page tests above covers this
+            // failure too -- there is one catch, not two.
+            XCTAssertTrue(error is RelayPageTooBigError)
+            let oversize: Error = RelayResponseTooLargeError(maxBytes: 8)
+            XCTAssertTrue(oversize is RelayPageTooBigError)
+        }
+    }
+
+    func testATimeoutBeforeTheHeadStaysAnOrdinaryTransportFailure() throws {
+        // Nothing came back at all, so there is no evidence the window was too
+        // big -- shrinking would only make the next attempt at an unreachable
+        // relay smaller.
+        let delegate = makeResponseDelegate()
+
+        delegate.urlSession(
+            RelayClient.urlSession,
+            task: idleDataTask(),
+            didCompleteWithError: URLError(.timedOut)
         )
 
-        XCTAssertEqual(fetched.limit, 32)
-        XCTAssertEqual(fetched.page.nextCursor, 9)
-        XCTAssertEqual(RelayMockURLProtocol.requests.count, 2)
-        let second = RelayMockURLProtocol.requests[1].url!.absoluteString
-        XCTAssertTrue(second.contains("limit=32"))
-        // Same cursor: recovering from a slow link skips nothing.
-        XCTAssertTrue(second.contains("after=9"))
+        switch try XCTUnwrap(delegate.result()) {
+        case .success:
+            XCTFail("a failed request is not a page")
+        case .failure(let error):
+            XCTAssertFalse(error is RelayPageTooBigError)
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
     }
 
     func testATimeoutBeforeAnyResponseIsNotTreatedAsAPageProblem() {
-        // Nothing came back at all, so there is no evidence the window was too
-        // big -- shrinking would just make the next attempt at an unreachable
-        // relay smaller. It stays an ordinary transport failure.
+        // The same rule seen from the fetch walk: an unreachable relay is
+        // reported once, and the shrink ladder is never entered on the strength
+        // of a request that produced nothing.
         RelayMockURLProtocol.responses = []
         let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
 
@@ -459,6 +477,31 @@ final class RelayClientTests: XCTestCase {
             // an oversize page would have thrown it away.
             XCTAssertEqual(relay?.retryAfter, "42")
         }
+    }
+
+    /// A response accumulator configured exactly as `RelayClient` builds one.
+    private func makeResponseDelegate() -> BoundedRelayResponseDelegate {
+        BoundedRelayResponseDelegate(
+            maxBytes: Int(relayMaxResponseBytes()),
+            errorPreviewBytes: 2_048,
+            semaphore: DispatchSemaphore(value: 0)
+        )
+    }
+
+    /// A data task that is never resumed: the delegate callbacks take one as an
+    /// argument, and nothing under test does anything with it beyond cancelling
+    /// it, which on an unstarted task is a no-op.
+    private func idleDataTask() -> URLSessionDataTask {
+        RelayClient.urlSession.dataTask(with: URL(string: "https://relay.test/envelopes")!)
+    }
+
+    private func httpResponse(statusCode: Int, headers: [String: String] = [:]) -> HTTPURLResponse {
+        HTTPURLResponse(
+            url: URL(string: "https://relay.test/envelopes")!,
+            statusCode: statusCode,
+            httpVersion: "HTTP/1.1",
+            headerFields: headers
+        )!
     }
 
     private func sampleOutboundEnvelope() -> OutboundEnvelope {
