@@ -204,11 +204,31 @@ struct ConnectionDetailsView: View {
             break
         }
         let rows = summaries.filter { $0.userId == contact.userId }
-        guard let latest = ConnectionActivityLogic.latestPeerStatus(rows) else {
+        // A zero timestamp is not evidence. `recordPeerConnectionEvent` only
+        // rejects negative values, and an arrival is stamped with raw wall
+        // clock, so a phone with an unset clock can persist 0 -- which would
+        // otherwise render as a confident "1 Jan 1970".
+        guard let latest = ConnectionActivityLogic.latestPeerStatus(rows), latest.atMs > 0 else {
             return String(localized: "No connection history yet")
         }
-        let path = transportLabel(latest.transport)
         let time = formatTime(latest.atMs)
+        guard let path = transportLabel(latest.transport) else {
+            // Another device carried it: we saw a hop to the phone in the
+            // middle, never a path to this friend. Say what happened and stop
+            // there rather than naming a radio they may be nowhere near.
+            switch latest.evidence {
+            case .messageReceived:
+                return String(localized: "Sent you a message · \(time)")
+            case .messageDelivered:
+                return String(localized: "Received your message · \(time)")
+            case .presenceSeen:
+                return String(localized: "Seen online · \(time)")
+            case .connected:
+                return String(localized: "Last connected · \(time)")
+            case .disconnected:
+                return String(localized: "Last disconnected · \(time)")
+            }
+        }
         switch latest.evidence {
         // "Sent you a message" is THEIR message landing here; "Received your
         // message" is a message THIS phone sent arriving at theirs. Swapping
@@ -229,8 +249,21 @@ struct ConnectionDetailsView: View {
     private func eventText(_ event: PeerConnectionEvent) -> String {
         let name = contacts.first(where: { $0.userId == event.userId })
             .map { coreContactDisplayName(contact: $0) } ?? String(localized: "Friend")
-        let path = transportLabel(event.transport)
         let time = formatTime(event.occurredAtMs)
+        guard let path = transportLabel(event.transport) else {
+            switch ConnectionActivityLogic.evidence(of: event.kind) {
+            case .messageReceived:
+                return String(localized: "\(name) sent you a message · \(time)")
+            case .messageDelivered:
+                return String(localized: "\(name) received your message · \(time)")
+            case .presenceSeen:
+                return String(localized: "\(name) was reachable · \(time)")
+            case .connected:
+                return String(localized: "\(name) connected · \(time)")
+            case .disconnected:
+                return String(localized: "\(name) disconnected · \(time)")
+            }
+        }
         switch ConnectionActivityLogic.evidence(of: event.kind) {
         case .messageReceived:
             return String(localized: "\(name) sent you a message via \(path) · \(time)")
@@ -245,12 +278,26 @@ struct ConnectionDetailsView: View {
         }
     }
 
-    private func transportLabel(_ transport: PeerConnectionTransport) -> String {
+    /// The copy naming this path, or nil when there is no path to name.
+    ///
+    /// Nil exactly when core says the path was not observed
+    /// (`corePeerTransportIsObserved`) -- pinned by
+    /// `ConnectionActivityLogicTests`, so the two cannot drift apart. A caller
+    /// that gets nil must switch to the wordless variant rather than
+    /// substituting a plausible-looking radio; that substitution is the bug
+    /// this screen was fixed for. Mirrors `transportLabelId` in
+    /// ConnectionDetailsScreen.kt.
+    static func transportLabel(_ transport: PeerConnectionTransport) -> String? {
         switch transport {
         case .bluetooth: return String(localized: "Bluetooth")
         case .localWifi: return String(localized: "local Wi-Fi")
         case .cruisePass: return String(localized: "Cruise Pass")
+        case .carried: return nil
         }
+    }
+
+    private func transportLabel(_ transport: PeerConnectionTransport) -> String? {
+        Self.transportLabel(transport)
     }
 
     private func formatTime(_ milliseconds: Int64) -> String {

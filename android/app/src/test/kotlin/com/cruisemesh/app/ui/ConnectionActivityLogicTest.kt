@@ -6,6 +6,7 @@ import org.junit.Test
 import uniffi.cruisemesh_core.PeerConnectionEventKind
 import uniffi.cruisemesh_core.PeerConnectionSummary
 import uniffi.cruisemesh_core.PeerConnectionTransport
+import uniffi.cruisemesh_core.corePeerTransportIsObserved
 
 class ConnectionActivityLogicTest {
 
@@ -124,6 +125,30 @@ class ConnectionActivityLogicTest {
         assertEquals(
             PeerEvidence.MESSAGE_RECEIVED,
             peerEvidenceOf(PeerConnectionEventKind.MESSAGE_RECEIVED),
+        )
+    }
+
+    @Test
+    fun `a path is named exactly when core says it was observed`() {
+        // The screen decides between "… via Bluetooth" and the wordless
+        // variant by whether transportLabelId returns a string. That decision
+        // must agree with core, or one surface starts naming a path the other
+        // says was never seen. Every transport is checked, so a variant added
+        // later cannot silently pick a default.
+        for (transport in PeerConnectionTransport.entries) {
+            assertEquals(
+                "transportLabelId disagrees with core for $transport",
+                corePeerTransportIsObserved(transport),
+                transportLabelId(transport) != null,
+            )
+        }
+    }
+
+    @Test
+    fun `a carried message names no path`() {
+        assertNull(
+            "a message another device carried must not be labelled with a radio",
+            transportLabelId(PeerConnectionTransport.CARRIED),
         )
     }
 }

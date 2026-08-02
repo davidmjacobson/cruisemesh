@@ -1684,8 +1684,14 @@ internal class InboundEnvelopeProcessor(
         arrival: MessageArrival,
     ) {
         if (!isVisibleChatKind(kind)) return
-        if (store.getContact(senderUserId) == null) return
+        // Everything here is best-effort, the contact lookup included. This
+        // runs after the message row is already committed, so letting a store
+        // error escape would abandon the receipt and notification that follow
+        // it -- and the retry hits the duplicate early-return, stranding them
+        // for good. Connection history is diagnostics; it must never cost a
+        // message its delivery path. Swift's `try?` covers the same two calls.
         runCatching {
+            if (store.getContact(senderUserId) == null) return
             store.recordPeerConnectionEvent(
                 senderUserId,
                 corePeerTransportForArrival(arrival.transport),

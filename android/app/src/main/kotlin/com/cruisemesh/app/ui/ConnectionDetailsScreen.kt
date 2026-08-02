@@ -126,11 +126,21 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                             directPaths[hex] == DirectPath.BLUETOOTH ->
                                 stringResource(R.string.ui_connected_now_via_bluetooth)
                             latest == null -> stringResource(R.string.ui_no_connection_history_yet)
-                            else -> stringResource(
-                                statusTextId(latest.evidence),
-                                stringResource(transportLabelId(latest.transport)),
-                                formatTime(latest.atMs),
-                            )
+                            else -> {
+                                val pathId = transportLabelId(latest.transport)
+                                if (pathId == null) {
+                                    stringResource(
+                                        statusTextNoPathId(latest.evidence),
+                                        formatTime(latest.atMs),
+                                    )
+                                } else {
+                                    stringResource(
+                                        statusTextId(latest.evidence),
+                                        stringResource(pathId),
+                                        formatTime(latest.atMs),
+                                    )
+                                }
+                            }
                         }
                         Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                             Text(coreContactDisplayName(contact))
@@ -153,13 +163,24 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                         if (showAllActivity) events else events.take(RECENT_ACTIVITY_PREVIEW_COUNT)
                     val unnamedFriend = stringResource(R.string.ui_unnamed_friend)
                     visibleEvents.forEach { event ->
-                        Text(
+                        val who = names[UserIdHex.encode(event.userId)] ?: unnamedFriend
+                        val pathId = transportLabelId(event.transport)
+                        val line = if (pathId == null) {
+                            stringResource(
+                                activityTextNoPathId(peerEvidenceOf(event.kind)),
+                                who,
+                                formatTime(event.occurredAtMs),
+                            )
+                        } else {
                             stringResource(
                                 activityTextId(peerEvidenceOf(event.kind)),
-                                names[UserIdHex.encode(event.userId)] ?: unnamedFriend,
-                                stringResource(transportLabelId(event.transport)),
+                                who,
+                                stringResource(pathId),
                                 formatTime(event.occurredAtMs),
-                            ),
+                            )
+                        }
+                        Text(
+                            line,
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.padding(vertical = 5.dp),
                         )
@@ -344,6 +365,16 @@ private fun statusTextId(evidence: PeerEvidence): Int = when (evidence) {
     PeerEvidence.DISCONNECTED -> R.string.ui_peer_status_last_disconnected
 }
 
+/** [statusTextId]'s wording for evidence whose path we never observed. */
+@StringRes
+private fun statusTextNoPathId(evidence: PeerEvidence): Int = when (evidence) {
+    PeerEvidence.MESSAGE_RECEIVED -> R.string.ui_peer_status_sent_you_a_message_no_path
+    PeerEvidence.MESSAGE_DELIVERED -> R.string.ui_peer_status_received_your_message_no_path
+    PeerEvidence.PRESENCE_SEEN -> R.string.ui_peer_status_seen_online_no_path
+    PeerEvidence.CONNECTED -> R.string.ui_peer_status_last_connected_no_path
+    PeerEvidence.DISCONNECTED -> R.string.ui_peer_status_last_disconnected_no_path
+}
+
 @StringRes
 private fun activityTextId(evidence: PeerEvidence): Int = when (evidence) {
     PeerEvidence.MESSAGE_RECEIVED -> R.string.ui_peer_activity_sent_you_a_message
@@ -353,11 +384,32 @@ private fun activityTextId(evidence: PeerEvidence): Int = when (evidence) {
     PeerEvidence.DISCONNECTED -> R.string.ui_peer_activity_disconnected
 }
 
+/** [activityTextId]'s wording for evidence whose path we never observed. */
 @StringRes
-private fun transportLabelId(transport: PeerConnectionTransport): Int = when (transport) {
+private fun activityTextNoPathId(evidence: PeerEvidence): Int = when (evidence) {
+    PeerEvidence.MESSAGE_RECEIVED -> R.string.ui_peer_activity_sent_you_a_message_no_path
+    PeerEvidence.MESSAGE_DELIVERED -> R.string.ui_peer_activity_received_your_message_no_path
+    PeerEvidence.PRESENCE_SEEN -> R.string.ui_peer_activity_was_reachable_no_path
+    PeerEvidence.CONNECTED -> R.string.ui_peer_activity_connected_no_path
+    PeerEvidence.DISCONNECTED -> R.string.ui_peer_activity_disconnected_no_path
+}
+
+/**
+ * The copy naming this path, or null when there is no path to name.
+ *
+ * Null exactly when core says the path was not observed
+ * (`core_peer_transport_is_observed`) -- pinned by
+ * `ConnectionActivityLogicTest`, so the two cannot drift apart. A caller that
+ * gets null must switch to the no-path wording rather than substituting a
+ * plausible-looking radio; that substitution is the bug this screen was fixed
+ * for.
+ */
+@StringRes
+internal fun transportLabelId(transport: PeerConnectionTransport): Int? = when (transport) {
     PeerConnectionTransport.BLUETOOTH -> R.string.ui_path_bluetooth
     PeerConnectionTransport.LOCAL_WIFI -> R.string.ui_path_local_wifi
     PeerConnectionTransport.CRUISE_PASS -> R.string.ui_path_cruise_pass
+    PeerConnectionTransport.CARRIED -> null
 }
 
 private fun formatTime(ms: Long): String =

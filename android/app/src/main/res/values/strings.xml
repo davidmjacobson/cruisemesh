@@ -363,6 +363,21 @@
     <string name="ui_peer_activity_was_reachable">%1$s was reachable via %2$s · %3$s</string>
     <string name="ui_peer_activity_connected">%1$s connected via %2$s · %3$s</string>
     <string name="ui_peer_activity_disconnected">%1$s disconnected via %2$s · %3$s</string>
+    <!-- Same lines, for when another device carried the message the last hop
+         and no path to this friend was ever observed. Naming a path here would
+         say the friend was in range when they may be nowhere near. %1$s is a
+         date and time for the status lines; for the activity lines %1$s is a
+         friend\'s name and %2$s the date and time. -->
+    <string name="ui_peer_status_received_your_message_no_path">Received your message · %1$s</string>
+    <string name="ui_peer_status_sent_you_a_message_no_path">Sent you a message · %1$s</string>
+    <string name="ui_peer_status_seen_online_no_path">Seen online · %1$s</string>
+    <string name="ui_peer_status_last_connected_no_path">Last connected · %1$s</string>
+    <string name="ui_peer_status_last_disconnected_no_path">Last disconnected · %1$s</string>
+    <string name="ui_peer_activity_received_your_message_no_path">%1$s received your message · %2$s</string>
+    <string name="ui_peer_activity_sent_you_a_message_no_path">%1$s sent you a message · %2$s</string>
+    <string name="ui_peer_activity_was_reachable_no_path">%1$s was reachable · %2$s</string>
+    <string name="ui_peer_activity_connected_no_path">%1$s connected · %2$s</string>
+    <string name="ui_peer_activity_disconnected_no_path">%1$s disconnected · %2$s</string>
     <string name="ui_unnamed_friend">Friend</string>
     <string name="ui_share_diagnostics">Share diagnostics</string>
     <string name="ui_show_recent_activity">Show %1$d recent entries</string>

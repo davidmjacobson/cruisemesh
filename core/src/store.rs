@@ -166,6 +166,31 @@ pub enum PeerConnectionTransport {
     Bluetooth,
     LocalWifi,
     CruisePass,
+    /// Another device carried this the last hop, so no path to the friend was
+    /// observed at all.
+    ///
+    /// Not a fourth way of reaching someone — the absence of one. A muled
+    /// message says a phone in the middle had Bluetooth to us; it says nothing
+    /// about whether the *sender* was ever nearby, and for group chat muling is
+    /// the ordinary case rather than the exception. Folding these into
+    /// Bluetooth or local Wi-Fi is how connection history ends up telling
+    /// someone their friend was in Bluetooth range of them when that friend was
+    /// on the other side of the ship.
+    ///
+    /// Surfaces have to render this as no claim, not as a path name. See
+    /// [`core_peer_transport_is_observed`].
+    Carried,
+}
+
+/// Did we actually observe the path this evidence arrived on?
+///
+/// False only for [`PeerConnectionTransport::Carried`]. A surface that names a
+/// path must ask this first and drop the "via ..." clause when the answer is
+/// no; saying less is the only honest option, because the hop we saw belongs to
+/// whichever phone relayed it and not to the friend the line is about.
+#[uniffi::export]
+pub fn core_peer_transport_is_observed(transport: PeerConnectionTransport) -> bool {
+    !matches!(transport, PeerConnectionTransport::Carried)
 }
 
 /// A metadata-only connection event. No addresses, network names, tokens, or
@@ -216,11 +241,20 @@ pub struct PeerConnectionSummary {
 /// 2 relay, 3/4 LAN direct/muled) onto the coarse, privacy-preserving path
 /// shown in connection history. Lives in core so both shells label an arrival
 /// identically -- the mapping used to be copy-pasted per platform.
+///
+/// The muled encodings (1, 4) map to [`PeerConnectionTransport::Carried`]
+/// rather than to the radio the last hop happened to use. That hop was between
+/// us and the phone in the middle; the friend whose line this becomes may never
+/// have been in range of us at all. The message-info sheet already draws this
+/// distinction ("another device over BLE"), and connection history contradicting
+/// it is exactly the kind of confident wrong answer this screen exists to stop
+/// giving.
 #[uniffi::export]
 pub fn core_peer_transport_for_arrival(transport: u8) -> PeerConnectionTransport {
     match transport {
-        0 | 1 => PeerConnectionTransport::Bluetooth,
-        3 | 4 => PeerConnectionTransport::LocalWifi,
+        0 => PeerConnectionTransport::Bluetooth,
+        3 => PeerConnectionTransport::LocalWifi,
+        1 | 4 => PeerConnectionTransport::Carried,
         _ => PeerConnectionTransport::CruisePass,
     }
 }
@@ -4140,11 +4174,13 @@ fn row_to_contact(row: &rusqlite::Row) -> rusqlite::Result<Contact> {
     })
 }
 
+// Stored on disk, so these numbers are frozen: only ever append.
 fn peer_transport_value(transport: PeerConnectionTransport) -> i64 {
     match transport {
         PeerConnectionTransport::Bluetooth => 0,
         PeerConnectionTransport::LocalWifi => 1,
         PeerConnectionTransport::CruisePass => 2,
+        PeerConnectionTransport::Carried => 3,
     }
 }
 
@@ -4153,6 +4189,7 @@ fn peer_transport_from_value(value: i64) -> rusqlite::Result<PeerConnectionTrans
         0 => Ok(PeerConnectionTransport::Bluetooth),
         1 => Ok(PeerConnectionTransport::LocalWifi),
         2 => Ok(PeerConnectionTransport::CruisePass),
+        3 => Ok(PeerConnectionTransport::Carried),
         _ => Err(rusqlite::Error::IntegralValueOutOfRange(1, value)),
     }
 }
@@ -4923,10 +4960,6 @@ mod tests {
             PeerConnectionTransport::Bluetooth
         );
         assert_eq!(
-            core_peer_transport_for_arrival(1),
-            PeerConnectionTransport::Bluetooth
-        );
-        assert_eq!(
             core_peer_transport_for_arrival(2),
             PeerConnectionTransport::CruisePass
         );
@@ -4934,10 +4967,102 @@ mod tests {
             core_peer_transport_for_arrival(3),
             PeerConnectionTransport::LocalWifi
         );
+    }
+
+    #[test]
+    fn a_muled_arrival_claims_no_path() {
+        // The hop we saw was between us and the phone in the middle. Reporting
+        // it as Bluetooth would tell someone their friend was in range when
+        // that friend may be nowhere near -- and for group chat, muling is the
+        // ordinary case, not the exception.
+        assert_eq!(
+            core_peer_transport_for_arrival(1),
+            PeerConnectionTransport::Carried,
+            "BLE through another device is not Bluetooth to this friend"
+        );
         assert_eq!(
             core_peer_transport_for_arrival(4),
-            PeerConnectionTransport::LocalWifi
+            PeerConnectionTransport::Carried,
+            "LAN through another device is not local Wi-Fi to this friend"
         );
+        assert!(!core_peer_transport_is_observed(
+            PeerConnectionTransport::Carried
+        ));
+        for observed in [
+            PeerConnectionTransport::Bluetooth,
+            PeerConnectionTransport::LocalWifi,
+            PeerConnectionTransport::CruisePass,
+        ] {
+            assert!(core_peer_transport_is_observed(observed));
+        }
+    }
+
+    #[test]
+    fn a_carried_path_survives_a_round_trip_through_the_database() {
+        // The on-disk numbering is append-only; Carried is 3. A row written as
+        // Carried must not read back as one of the real paths.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .record_peer_connection_event(
+                vec![7; 16],
+                PeerConnectionTransport::Carried,
+                PeerConnectionEventKind::MessageReceived,
+                1_700_000_000_000,
+            )
+            .unwrap();
+        let summaries = store.peer_connection_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].transport, PeerConnectionTransport::Carried);
+        assert_eq!(summaries[0].last_received_at_ms, Some(1_700_000_000_000));
+
+        // And it is a distinct row from a genuinely observed Bluetooth hop with
+        // the same peer, so one cannot overwrite the other's evidence.
+        store
+            .record_peer_connection_event(
+                vec![7; 16],
+                PeerConnectionTransport::Bluetooth,
+                PeerConnectionEventKind::MessageReceived,
+                1_700_000_050_000,
+            )
+            .unwrap();
+        let summaries = store.peer_connection_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+    }
+
+    #[test]
+    fn only_kinds_a_person_sees_in_a_conversation_can_report_an_arrival() {
+        // The safety-relevant half of the arrival event: a receipt, a profile
+        // sync or a relay update landing must never become "sent you a
+        // message". This pins the gate's contract at the kind level -- the
+        // shells consult exactly this function before recording.
+        // Two judgment calls worth naming rather than discovering later. A
+        // group invite counts: it is a line the person sees appear in the
+        // conversation, even though nobody typed it. A reaction does not: it
+        // renders as a chip on an existing bubble, so reporting it as a message
+        // arriving would overstate what happened.
+        for visible in [
+            crate::KIND_TEXT,
+            crate::KIND_ATTACHMENT_MANIFEST,
+            crate::KIND_GROUP_INVITE,
+        ] {
+            assert!(
+                crate::core_is_visible_chat_kind(visible),
+                "kind {visible} is shown in a conversation and should report an arrival"
+            );
+        }
+        for quiet in [
+            crate::KIND_RECEIPT,
+            crate::KIND_PROFILE_SYNC,
+            crate::KIND_RELAY_UPDATE,
+            crate::KIND_FRIEND_DIRECTORY,
+            crate::KIND_LAN_ENDPOINT_HINT,
+            crate::KIND_REACTION,
+        ] {
+            assert!(
+                !crate::core_is_visible_chat_kind(quiet),
+                "kind {quiet} must never say a friend sent a message"
+            );
+        }
     }
 
     #[test]
