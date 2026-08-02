@@ -140,20 +140,74 @@ final class LanSubnetScanTests: XCTestCase {
         ))
     }
 
-    func testPerNetworkBookkeepingSetsStopGrowingAtTheirCap() {
-        var keys = Set<String>()
+    func testPerNetworkBookkeepingForgetsItsOldestKeyInsteadOfRefusingNewOnes() {
+        var keys = BoundedLanKeySet(limit: 4)
 
         for index in 0..<4 {
-            XCTAssertTrue(claimBoundedLanKey(&keys, "token-\(index)", limit: 4))
+            XCTAssertEqual(
+                keys.claim("token-\(index)"),
+                BoundedLanKeySet.Claim(isNew: true, evicted: nil)
+            )
         }
         XCTAssertEqual(keys.count, 4)
-        // At the cap a brand-new key is refused rather than remembered, so a
-        // network full of fresh advertisements cannot grow this without end.
-        XCTAssertFalse(claimBoundedLanKey(&keys, "token-4", limit: 4))
+
+        // A key already claimed is not new work, and costs nothing.
+        XCTAssertEqual(keys.claim("token-0"), BoundedLanKeySet.Claim(isNew: false, evicted: nil))
         XCTAssertEqual(keys.count, 4)
-        // A key already claimed still reads as "not new work", cap or no cap.
-        XCTAssertFalse(claimBoundedLanKey(&keys, "token-0", limit: 4))
-        XCTAssertFalse(claimBoundedLanKey(&keys, "token-0", limit: 99))
+
+        // At the cap a brand-new key is still accepted -- the OLDEST is
+        // forgotten to make room. Refusing instead would let a flood of
+        // made-up names lock a real family member out of the election
+        // fallback for the rest of the network join.
+        XCTAssertEqual(
+            keys.claim("token-4"),
+            BoundedLanKeySet.Claim(isNew: true, evicted: "token-0")
+        )
+        XCTAssertEqual(keys.count, 4)
+        XCTAssertFalse(keys.contains("token-0"))
+        XCTAssertTrue(keys.contains("token-4"))
+
+        // A real peer arriving after a 100-name spray still reads as new.
+        for index in 0..<100 { _ = keys.claim("spray-\(index)") }
+        XCTAssertEqual(keys.count, 4)
+        XCTAssertTrue(keys.claim("family-phone").isNew)
+    }
+
+    func testRemovedOrClearedBookkeepingKeyCanBeClaimedAgain() {
+        var keys = BoundedLanKeySet(limit: 4)
+
+        XCTAssertTrue(keys.claim("service-a").isNew)
+        XCTAssertFalse(keys.claim("service-a").isNew)
+        keys.remove("service-a")
+        XCTAssertTrue(keys.claim("service-a").isNew)
+
+        keys.removeAll()
+        XCTAssertEqual(keys.count, 0)
+        XCTAssertTrue(keys.claim("service-a").isNew)
+    }
+
+    func testSweepProbeThatCannotOpenALinkStillCountsAnAlreadyLinkedFriend() {
+        // The probe collided with a service key an authenticated link already
+        // holds: a healthy link keeps its key for its whole life, so this is
+        // how every sweep after the one that linked the family sees them.
+        XCTAssertTrue(lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated: true, linkTableFull: false, authenticatedLinks: 1
+        ))
+        // The link table is full and a friend is on it: the healthiest
+        // network there is, not an empty one.
+        XCTAssertTrue(lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated: false, linkTableFull: true, authenticatedLinks: 2
+        ))
+        // A full table of in-flight handshakes to unrelated services proves
+        // nothing about friends being here.
+        XCTAssertFalse(lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated: false, linkTableFull: true, authenticatedLinks: 0
+        ))
+        // Colliding with an attempt that has not authenticated is not a find
+        // either, however many other links exist.
+        XCTAssertFalse(lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated: false, linkTableFull: false, authenticatedLinks: 3
+        ))
     }
 
     func testSweepIsOnlyCreditedWithAFindWhileItIsStillTheRunningSweep() {

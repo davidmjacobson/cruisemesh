@@ -53,15 +53,20 @@ does not implement this transport remains fully compatible over BLE and relay.
     is a bounded window (two weeks); any link or endpoint hint refreshes it,
     so someone who is ashore stops motivating sweeps instead of keeping the
     phone searching forever.
-  - A sweep that reaches an accepted friend -- including one this phone is
-    already linked to -- counts as a find and leaves the wider sweep
-    unarmed. A bare TCP response does not: an unrelated service on the
-    default port must not disarm it either way.
+  - A sweep that reaches an accepted friend counts as a find and leaves the
+    wider sweep unarmed. So does reaching a friend this phone is already
+    linked to, whether that link came from this sweep or an earlier one, and
+    so does running out of link slots while a friend is connected: a full
+    link table is the healthiest network there is, not an empty one. A bare
+    TCP response is never a find -- an unrelated service on the default port
+    must not disarm the wider sweep either way.
   - Evidence that peers exist here (a resolved service or an endpoint hint)
     brings the next sweep forward, but only a small number of times per
-    network join, and the per-network bookkeeping it feeds is capped. The
-    evidence is data other devices choose, so it can shorten a wait but
-    cannot drive repeated searching.
+    network join. The evidence is data other devices choose, so it can
+    shorten a wait but cannot drive repeated searching. The per-network
+    bookkeeping it feeds is bounded the same way, forgetting its oldest
+    entries first: a network full of made-up advertisements must never lock
+    out a real family member who arrives afterwards.
 - Every endpoint mechanism is reachability data, not authentication. A TCP
   responder must still present the agreement key of an accepted friend during
   the Noise handshake.

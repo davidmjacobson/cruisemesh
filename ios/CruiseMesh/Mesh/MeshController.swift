@@ -488,8 +488,22 @@ final class MeshController: ObservableObject {
     /// simply isn't in the list, so deleting or blocking someone lets the
     /// gate close. Also runs on the periodic LAN health tick, which is what
     /// makes that true without every screen having to say so.
+    ///
+    /// The reading itself is a contact-list query plus a stored value per
+    /// contact, so it runs off the main actor (same pattern as the relay
+    /// sync pass, and matching Android's move of this work onto its store
+    /// executor). The transport's setter is queue-hopping and safe to call
+    /// from there.
     private func refreshLanCapableContacts() {
-        guard let lan = lanTransport else { return }
+        guard lanTransport != nil else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            let capable = MeshController.lanCapableContacts()
+            await MainActor.run { self?.lanTransport?.updateLanCapableContacts(capable) }
+        }
+    }
+
+    private nonisolated static func lanCapableContacts() -> [Data: Int64] {
+        let store = AppStore.get()
         let contacts = (try? store.listContacts()) ?? []
         let blocked = Set((try? store.listBlockedUsers()) ?? [])
         var capable: [Data: Int64] = [:]
@@ -498,7 +512,7 @@ final class MeshController: ObservableObject {
                 capable[contact.userId] = lastSupportedAtMs
             }
         }
-        lan.updateLanCapableContacts(capable)
+        return capable
     }
 
     /// The contact list changed (a contact was deleted, blocked, or

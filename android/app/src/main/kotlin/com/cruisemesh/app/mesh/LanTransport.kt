@@ -106,15 +106,15 @@ internal class LanTransport(
     // already-connected/linked peer's NSD record refreshing, or a resent
     // endpoint hint) must not keep resetting the full-sweep backoff. Cleared
     // alongside the other per-network state in teardownNetworkSession, and
-    // capped at MAX_TRACKED_PEER_KEYS: the token is chosen by whatever is
-    // advertising, so an unbounded set is unbounded memory.
-    private val knownPeerInstanceTokens = ConcurrentHashMap.newKeySet<String>()
+    // bounded (oldest forgotten first) because the token is chosen by
+    // whatever is advertising -- see BoundedLanKeySet.
+    private val knownPeerInstanceTokens = BoundedLanKeySet(MAX_TRACKED_PEER_KEYS)
 
     // Keys an election-loser fallback connect has already been scheduled for
     // on this network join, so repeated NSD re-resolves of the same service
     // don't stack duplicate fallback timers. Cleared with the other
-    // per-network state in teardownNetworkSession, and capped the same way.
-    private val electionFallbackKeys = ConcurrentHashMap.newKeySet<String>()
+    // per-network state in teardownNetworkSession, and bounded the same way.
+    private val electionFallbackKeys = BoundedLanKeySet(MAX_TRACKED_PEER_KEYS)
 
     // Outbound service keys whose connection completed the Noise handshake.
     // outboundServiceKeys retains a key for the whole life of a healthy
@@ -159,7 +159,11 @@ internal class LanTransport(
     // the other per-network state in teardownNetworkSession.
     private val serviceInfoCallbacks = mutableMapOf<String, NsdManager.ServiceInfoCallback>()
     private val pendingServices = ArrayDeque<NsdServiceInfo>()
-    private val queuedServiceNames = mutableSetOf<String>()
+    // Service names discovery has already queued for resolution on this
+    // network join. Bounded (oldest forgotten first) rather than add-only:
+    // the names come from whatever advertises here, and refusing new ones at
+    // a cap would silently lock out a real family member arriving later.
+    private val queuedServiceNames = BoundedLanKeySet(MAX_TRACKED_PEER_KEYS)
     private val eligibleWifiNetworks = linkedSetOf<Network>()
     private val instanceTokenBytes = ByteArray(8).also(secureRandom::nextBytes)
     private val instanceToken = instanceTokenBytes.toHex()
@@ -350,10 +354,38 @@ internal class LanTransport(
                 return
             }
             if (!outboundServiceKeys.add(serviceKey)) {
+                // A healthy scan-dialled link holds its key for its whole
+                // life, so an authenticated key here means this probe just
+                // re-found a friend an earlier sweep already linked. That is
+                // a find -- without crediting it, every sweep after the one
+                // that linked the family reports "nobody home" and arms the
+                // expensive tier on a demonstrably working network.
+                if (
+                    lanSweepProbeFoundFriend(
+                        keyAlreadyAuthenticated = serviceKey in authenticatedOutboundKeys,
+                        linkTableFull = false,
+                        authenticatedLinks = authenticatedUserIds.size,
+                    )
+                ) {
+                    markSweepFoundFriend(sweep)
+                }
                 socket.closeQuietly()
                 return
             }
             if (!tryAcquireSocketSlot()) {
+                // The link table is full, which with a friend on one of those
+                // links is the healthiest network there is -- not an empty
+                // one. A table of in-flight handshakes to unrelated services
+                // is not, hence the authenticated-link requirement.
+                if (
+                    lanSweepProbeFoundFriend(
+                        keyAlreadyAuthenticated = false,
+                        linkTableFull = true,
+                        authenticatedLinks = authenticatedUserIds.size,
+                    )
+                ) {
+                    markSweepFoundFriend(sweep)
+                }
                 outboundServiceKeys.remove(serviceKey)
                 socket.closeQuietly()
                 return
@@ -909,7 +941,7 @@ internal class LanTransport(
     ) {
         if (endpoints.isEmpty()) return
         val scheduledNetwork = wifiNetwork ?: return
-        if (!claimBoundedLanKey(electionFallbackKeys, key, MAX_TRACKED_PEER_KEYS)) return
+        if (!electionFallbackKeys.claim(key, ::logForgottenLanKey)) return
         mainHandler.postDelayed(
             {
                 if (!started || wifiNetwork != scheduledNetwork) return@postDelayed
@@ -966,16 +998,25 @@ internal class LanTransport(
      *
      * The token is chosen by whatever is advertising, so "new" is not a
      * trustworthy signal on a busy or hostile network: the remembered set is
-     * capped ([claimBoundedLanKey]) and [LanScanPlanner.onPeerEvidence] only
+     * bounded ([BoundedLanKeySet]) and [LanScanPlanner.onPeerEvidence] only
      * rewinds the sweep schedule a bounded number of times per network join.
      * Past either bound the caller still discovers and dials the peer
      * normally -- only the schedule pull-forward stops.
      */
     private fun notePeerEvidence(token: String) {
-        if (!claimBoundedLanKey(knownPeerInstanceTokens, token, MAX_TRACKED_PEER_KEYS)) return
+        if (!knownPeerInstanceTokens.claim(token, ::logForgottenLanKey)) return
         LanTransportDiagnostics.peerEvidence()
         if (!scanPlanner.onPeerEvidence(System.currentTimeMillis())) return
         scheduleAutomaticSubnetScan(PEER_EVIDENCE_SCAN_DELAY_MS)
+    }
+
+    /**
+     * A per-network-join key was forgotten to stay inside [BoundedLanKeySet]'s
+     * bound, which only happens when far more distinct services or tokens
+     * have appeared on this Wi-Fi than any real fleet produces.
+     */
+    private fun logForgottenLanKey(key: String) {
+        Log.i(TAG, "Forgetting the oldest tracked local Wi-Fi peer to make room (${key.take(8)})")
     }
 
     /**
@@ -1040,7 +1081,7 @@ internal class LanTransport(
                 if (name == requestedServiceName || name == registeredServiceName) return@post
                 // Bounded: the discovered-service set is fed by whatever
                 // advertises on this Wi-Fi, and every entry costs a resolve.
-                if (!claimBoundedLanKey(queuedServiceNames, name, MAX_TRACKED_PEER_KEYS)) return@post
+                if (!queuedServiceNames.claim(name, ::logForgottenLanKey)) return@post
                 when (
                     lanServiceRoute(
                         sdkInt = Build.VERSION.SDK_INT,
@@ -1559,16 +1600,72 @@ internal fun pendingLanOutboundAttempts(
 ): Int = outboundServiceKeys.count { it !in authenticatedOutboundKeys }
 
 /**
- * Adds [key] to [keys] unless it is already there or [keys] is already at
- * [limit]. Returns whether the caller now owns brand-new work for [key].
+ * The "have I already handled this?" memory the transport keeps for one
+ * network join: seen peer tokens, scheduled election fallbacks, queued
+ * service names.
  *
- * Every one of these sets is keyed by something a device on the Wi-Fi
- * chooses, so "have I seen this before?" cannot bound them on a busy or
- * hostile network. At the limit the answer becomes a flat no: the caller
- * skips the extra work rather than tracking more keys.
+ * Every key comes from something a device on the Wi-Fi chose, so the set
+ * cannot be bounded by honesty alone -- a network full of made-up names
+ * would grow it without limit. It is therefore capped at [limit], and at the
+ * cap the OLDEST key is forgotten rather than the newest refused. That
+ * direction matters: refusing new keys would let a flood of made-up ones
+ * permanently lock out a real family member who joins afterwards, silently.
+ * Forgetting the oldest only risks repeating work already done once, which
+ * every caller here tolerates.
  */
-internal fun claimBoundedLanKey(keys: MutableSet<String>, key: String, limit: Int): Boolean =
-    keys.size < limit && keys.add(key)
+internal class BoundedLanKeySet(private val limit: Int) {
+    private val keys = LinkedHashSet<String>()
+
+    /**
+     * Records [key] and reports whether it is brand-new work. [onEvicted]
+     * runs for a key forgotten to make room (for logging; it is never the
+     * key just claimed).
+     */
+    @Synchronized
+    fun claim(key: String, onEvicted: (String) -> Unit = {}): Boolean {
+        if (!keys.add(key)) return false
+        while (keys.size > limit) {
+            val oldest = keys.iterator().next()
+            keys.remove(oldest)
+            onEvicted(oldest)
+        }
+        return true
+    }
+
+    @Synchronized
+    fun contains(key: String): Boolean = key in keys
+
+    @Synchronized
+    fun remove(key: String) {
+        keys.remove(key)
+    }
+
+    @Synchronized
+    fun clear() {
+        keys.clear()
+    }
+
+    @Synchronized
+    fun size(): Int = keys.size
+}
+
+/**
+ * Whether a sweep probe that stopped before it could open a link still found
+ * a friend on this network.
+ *
+ * Both stopping points look like "nothing here" from inside the probe and
+ * are anything but: [keyAlreadyAuthenticated] means the address is already
+ * carrying an authenticated link to a friend (a healthy link holds its
+ * service key for its whole life, so every sweep after the one that linked
+ * the family collides here), and a full link table with a friend on it is
+ * the healthiest network there is. A full table of in-flight handshakes to
+ * unrelated services is not, hence [authenticatedLinks].
+ */
+internal fun lanSweepProbeFoundFriend(
+    keyAlreadyAuthenticated: Boolean,
+    linkTableFull: Boolean,
+    authenticatedLinks: Int,
+): Boolean = keyAlreadyAuthenticated || (linkTableFull && authenticatedLinks > 0)
 
 /**
  * Whether a connection dialed by the sweep at [sweepGeneration] may still

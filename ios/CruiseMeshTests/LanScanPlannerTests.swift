@@ -103,12 +103,16 @@ final class LanScanPlannerTests: XCTestCase {
         planner.onNetworkJoined(nowMs: 0)
         XCTAssertEqual(planner.takeDueScan(nowMs: 0), .local24)
 
-        // The sweep dialed a friend who already had a live LAN link, so the
-        // handshake aborted as a duplicate -- which still credits the sweep
-        // (LanTransport.markSweepFoundFriend), because discovery demonstrably
-        // works on this network.
+        // The sweep probed a friend an EARLIER sweep had already linked, so
+        // it never reached a handshake at all -- and that still credits the
+        // sweep (LanTransport.markSweepFoundFriend), because discovery
+        // demonstrably works on this network.
         let generation = UUID()
-        let foundPeer = lanSweepCreditApplies(
+        let foundPeer = lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated: true,
+            linkTableFull: false,
+            authenticatedLinks: 1
+        ) && lanSweepCreditApplies(
             sweepGeneration: generation,
             runningSweepGeneration: generation
         )

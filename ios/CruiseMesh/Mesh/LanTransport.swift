@@ -36,14 +36,16 @@ final class LanTransport {
     /// already-connected/linked peer's Bonjour record refreshing, or a
     /// resent endpoint hint) must not keep resetting the full-sweep
     /// backoff. Reset alongside `discoveredEndpoints` on network change, and
-    /// capped at `maxTrackedPeerKeys`: the key comes from whatever is
-    /// advertising, so an unbounded set is unbounded memory.
-    private var peerEvidenceSeenKeys = Set<String>()
+    /// bounded (oldest forgotten first) because the key comes from whatever
+    /// is advertising -- see `BoundedLanKeySet`.
+    private var peerEvidenceSeenKeys = BoundedLanKeySet(limit: LanTransport.maxTrackedPeerKeys)
     /// Keys an election-loser fallback connect has already been scheduled
     /// for on this network join, so repeated browse updates for the same
     /// service don't stack duplicate fallback timers. Reset alongside
-    /// `discoveredEndpoints` on network change, and capped the same way.
-    private var electionFallbackKeys = Set<String>()
+    /// `discoveredEndpoints` on network change, and bounded the same way --
+    /// refusing new keys at a cap would cost real peers the asymmetric-mDNS
+    /// rescue this fallback exists to provide.
+    private var electionFallbackKeys = BoundedLanKeySet(limit: LanTransport.maxTrackedPeerKeys)
     /// Accepted contacts that have demonstrated LAN support, as UserID to the
     /// millisecond that support was last seen, pushed in by MeshController
     /// (`updateLanCapableContacts`). The automatic sweep keeps looking while
@@ -419,10 +421,6 @@ final class LanTransport {
                   let remoteToken = lanBonjourPeerToken(txtRecord.dictionary),
                   remoteToken != instanceTokenString else { continue }
             let key = serviceKey(result.endpoint)
-            // Bounded per network join: the browse result set is whatever is
-            // advertising on this Wi-Fi, and each new key costs a connect
-            // attempt or a fallback timer.
-            guard current[key] != nil || current.count < Self.maxTrackedPeerKeys else { continue }
             notePeerEvidence(key: key)
             guard shouldInitiateLanConnection(
                 localToken: instanceTokenString,
@@ -457,9 +455,9 @@ final class LanTransport {
     /// deduplication), and the duplicate-link guard in the Noise handshake
     /// closes a redundant socket before it becomes a second live link.
     private func scheduleElectionFallback(key: String, endpoint: NWEndpoint) {
-        guard claimBoundedLanKey(&electionFallbackKeys, key, limit: Self.maxTrackedPeerKeys) else {
-            return
-        }
+        let claim = electionFallbackKeys.claim(key)
+        if let evicted = claim.evicted { logForgottenLanKey(evicted) }
+        guard claim.isNew else { return }
         queue.asyncAfter(deadline: .now() + Self.electionFallbackDelay) { [weak self] in
             guard let self,
                   started,
@@ -479,28 +477,41 @@ final class LanTransport {
     ///
     /// The key comes from whatever is advertising, so "new" is not a
     /// trustworthy signal on a busy or hostile network: the remembered set is
-    /// capped and `LanScanPlanner.onPeerEvidence` only rewinds the sweep
-    /// schedule a bounded number of times per network join. Past either bound
-    /// the caller still discovers and dials the peer normally -- only the
-    /// schedule pull-forward stops.
+    /// bounded (`BoundedLanKeySet`) and `LanScanPlanner.onPeerEvidence` only
+    /// rewinds the sweep schedule a bounded number of times per network join.
+    /// Past either bound the caller still discovers and dials the peer
+    /// normally -- only the schedule pull-forward stops.
     private func notePeerEvidence(key: String) {
-        guard claimBoundedLanKey(&peerEvidenceSeenKeys, key, limit: Self.maxTrackedPeerKeys) else {
-            return
-        }
+        let claim = peerEvidenceSeenKeys.claim(key)
+        if let evicted = claim.evicted { logForgottenLanKey(evicted) }
+        guard claim.isNew else { return }
         diagnostics.peerEvidence()
         guard scanPlanner.onPeerEvidence(nowMs: Self.nowMs) else { return }
         scheduleAutomaticScan(after: Self.peerEvidenceScanDelay)
     }
 
+    /// A per-network-join key was forgotten to stay inside
+    /// `BoundedLanKeySet`'s bound, which only happens when far more distinct
+    /// services have appeared on this Wi-Fi than any real fleet produces.
+    private func logForgottenLanKey(_ key: String) {
+        let shortened = String(key.prefix(8))
+        log.info("Forgetting the oldest tracked local Wi-Fi peer to make room (\(shortened, privacy: .public))")
+    }
+
     /// Credits the sweep that dialed `link` with having found a friend on
     /// this LAN. Only an authenticated friend -- or one the sweep discovered
-    /// is already linked -- counts; see `scanCandidateCompleted`. The
-    /// generation check keeps a handshake that finishes after its own sweep
-    /// was replaced or cancelled from crediting whatever sweep is running now.
+    /// is already linked -- counts; see `scanCandidateCompleted`.
     fileprivate func markSweepFoundFriend(dialedBy link: LanConnection) {
+        markSweepFoundFriend(scanGeneration: link.scanGeneration)
+    }
+
+    /// As above, for the sweep-dialed paths that stop before a connection
+    /// object exists. The generation check keeps a probe whose sweep was
+    /// replaced or cancelled from crediting whatever sweep is running now.
+    private func markSweepFoundFriend(scanGeneration: UUID?) {
         guard var scan = runningScan,
               lanSweepCreditApplies(
-                sweepGeneration: link.scanGeneration,
+                sweepGeneration: scanGeneration,
                 runningSweepGeneration: scan.generation
               ) else { return }
         scan.foundPeer = true
@@ -512,17 +523,46 @@ final class LanTransport {
     }
 
     private func connect(to endpoint: NWEndpoint, serviceKey: String, scanGeneration: UUID? = nil) {
-        guard started,
-              connections.count < Self.maxConnections,
-              outboundAddresses[serviceKey] == nil else { return }
-        diagnostics.connecting(String(describing: endpoint))
-        let connection = NWConnection(to: endpoint, using: lanParameters())
-        addConnection(
-            connection,
-            initiator: true,
-            serviceKey: serviceKey,
-            scanGeneration: scanGeneration
-        )
+        guard started else { return }
+        guard connections.count < Self.maxConnections else {
+            // The link table is full, which with a friend on one of those
+            // links is the healthiest network there is -- not an empty one.
+            if lanSweepProbeFoundFriend(
+                keyAlreadyAuthenticated: false,
+                linkTableFull: true,
+                authenticatedLinks: authenticatedLinkCount
+            ) {
+                markSweepFoundFriend(scanGeneration: scanGeneration)
+            }
+            return
+        }
+        guard let existing = outboundAddresses[serviceKey] else {
+            diagnostics.connecting(String(describing: endpoint))
+            let connection = NWConnection(to: endpoint, using: lanParameters())
+            addConnection(
+                connection,
+                initiator: true,
+                serviceKey: serviceKey,
+                scanGeneration: scanGeneration
+            )
+            return
+        }
+        // A healthy link holds its service key for its whole life, so an
+        // authenticated one here means this probe just re-found a friend an
+        // earlier sweep already linked. That is a find -- without crediting
+        // it, every sweep after the one that linked the family reports
+        // "nobody home" and arms the expensive tier on a working network.
+        if lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated: connections[existing]?.wasAuthenticated == true,
+            linkTableFull: false,
+            authenticatedLinks: authenticatedLinkCount
+        ) {
+            markSweepFoundFriend(scanGeneration: scanGeneration)
+        }
+    }
+
+    private var authenticatedLinkCount: Int {
+        connections.values.filter(\.wasAuthenticated).count
     }
 
     private func accept(_ connection: NWConnection) {
@@ -1216,16 +1256,74 @@ func lanBonjourPeerToken(_ txtRecord: [String: String]) -> String? {
     return token
 }
 
-/// Adds `key` to `keys` unless it is already there or `keys` is already at
-/// `limit`. Returns whether the caller now owns brand-new work for `key`.
+/// The "have I already handled this?" memory the transport keeps for one
+/// network join: seen peer keys and scheduled election fallbacks.
 ///
-/// Every one of these sets is keyed by something a device on the Wi-Fi
-/// chooses, so "have I seen this before?" cannot bound them on a busy or
-/// hostile network. At the limit the answer becomes a flat no: the caller
-/// skips the extra work rather than tracking more keys.
-func claimBoundedLanKey(_ keys: inout Set<String>, _ key: String, limit: Int) -> Bool {
-    guard keys.count < limit else { return false }
-    return keys.insert(key).inserted
+/// Every key comes from something a device on the Wi-Fi chose, so the set
+/// cannot be bounded by honesty alone -- a network full of made-up service
+/// names would grow it without limit. It is therefore capped at `limit`, and
+/// at the cap the OLDEST key is forgotten rather than the newest refused.
+/// That direction matters: refusing new keys would let a flood of made-up
+/// ones permanently lock out a real family member who joins afterwards,
+/// silently. Forgetting the oldest only risks repeating work already done
+/// once, which every caller here tolerates.
+struct BoundedLanKeySet {
+    /// Whether the claimed key is brand-new work, and which key (if any) was
+    /// forgotten to make room for it.
+    struct Claim: Equatable {
+        let isNew: Bool
+        let evicted: String?
+    }
+
+    private let limit: Int
+    private var keys = Set<String>()
+    private var order: [String] = []
+
+    init(limit: Int) {
+        precondition(limit > 0)
+        self.limit = limit
+    }
+
+    var count: Int { keys.count }
+
+    mutating func claim(_ key: String) -> Claim {
+        guard keys.insert(key).inserted else { return Claim(isNew: false, evicted: nil) }
+        order.append(key)
+        guard keys.count > limit else { return Claim(isNew: true, evicted: nil) }
+        let oldest = order.removeFirst()
+        keys.remove(oldest)
+        return Claim(isNew: true, evicted: oldest)
+    }
+
+    func contains(_ key: String) -> Bool { keys.contains(key) }
+
+    mutating func remove(_ key: String) {
+        guard keys.remove(key) != nil else { return }
+        if let index = order.firstIndex(of: key) { order.remove(at: index) }
+    }
+
+    mutating func removeAll() {
+        keys.removeAll()
+        order.removeAll()
+    }
+}
+
+/// Whether a sweep probe that stopped before it could open a link still
+/// found a friend on this network.
+///
+/// Both stopping points look like "nothing here" from inside the probe and
+/// are anything but: `keyAlreadyAuthenticated` means the address is already
+/// carrying an authenticated link to a friend (a healthy link holds its
+/// service key for its whole life, so every sweep after the one that linked
+/// the family collides here), and a full link table with a friend on it is
+/// the healthiest network there is. A full table of in-flight handshakes to
+/// unrelated services is not, hence `authenticatedLinks`.
+func lanSweepProbeFoundFriend(
+    keyAlreadyAuthenticated: Bool,
+    linkTableFull: Bool,
+    authenticatedLinks: Int
+) -> Bool {
+    keyAlreadyAuthenticated || (linkTableFull && authenticatedLinks > 0)
 }
 
 /// Whether a connection dialed by the sweep at `sweepGeneration` may still

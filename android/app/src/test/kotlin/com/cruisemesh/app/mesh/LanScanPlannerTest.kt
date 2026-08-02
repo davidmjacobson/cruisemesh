@@ -137,15 +137,20 @@ class LanScanPlannerTest {
         planner.onNetworkJoined(0)
         assertEquals(LanScanBreadth.LOCAL_24, planner.takeDueScan(0))
 
-        // The sweep dialed a friend who already had a live LAN link, so the
-        // handshake aborted as a duplicate -- which still credits the sweep
-        // (LanTransport.markSweepFoundFriend), because discovery demonstrably
-        // works on this network.
-        val foundPeer = lanSweepCreditApplies(
-            sweepGeneration = 3,
-            currentGeneration = 3,
-            sweepStillRunning = true,
-        )
+        // The sweep probed a friend an EARLIER sweep had already linked, so
+        // it never reached a handshake at all -- and that still credits the
+        // sweep (LanTransport.markSweepFoundFriend), because discovery
+        // demonstrably works on this network.
+        val foundPeer = lanSweepProbeFoundFriend(
+            keyAlreadyAuthenticated = true,
+            linkTableFull = false,
+            authenticatedLinks = 1,
+        ) &&
+            lanSweepCreditApplies(
+                sweepGeneration = 3,
+                currentGeneration = 3,
+                sweepStillRunning = true,
+            )
         planner.onScanCompleted(LanScanBreadth.LOCAL_24, 1_000, foundPeer = foundPeer)
 
         // A healthy network must not arm the expensive /20 tier.
