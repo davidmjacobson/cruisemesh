@@ -40,6 +40,8 @@ import uniffi.cruisemesh_core.ContactRelayRejection
 import uniffi.cruisemesh_core.coreContactRelayEndpointUsable
 import uniffi.cruisemesh_core.coreContactRelayIsStale
 import uniffi.cruisemesh_core.coreContactRelayStreakDelta
+import uniffi.cruisemesh_core.coreGroupFanoutRelayTarget
+import uniffi.cruisemesh_core.GroupRelayMember
 import uniffi.cruisemesh_core.resolvedContactDeliveryPollRelay
 import uniffi.cruisemesh_core.resolvedContactDeliveryRelay
 import java.util.concurrent.ConcurrentHashMap
@@ -455,7 +457,9 @@ internal class RelaySyncEngine(
         ownRetryAfterMs = 0L
         passNowMs = now
         contactRelayRejections = store.listContactRelayRejections()
-            .associateBy { UserIdHex.encode(it.userId) }
+            .associateByTo(mutableMapOf()) { UserIdHex.encode(it.userId) }
+        contactRelayCountedThisPass.clear()
+        contactRelayUnreachableThisPass.clear()
         publishStaleContactRelays()
         backfillOutgoingReceipts(identity, now)
         // T23: if our own endpoint changed since the last announcement, queue
@@ -496,12 +500,21 @@ internal class RelaySyncEngine(
         }
         var anyRelaySucceeded = false
         var ownRelaySucceeded = fallbackConfig == null
+        // Distinct from ownRelaySucceeded, which starts true when there is no
+        // own relay at all and can also be satisfied by a pass that issued no
+        // request. Only a mailbox that actually answered counts as proof this
+        // device has working internet, so only that may license resting a
+        // contact's silent endpoint.
+        var ownRelayAnswered = false
         for (config in configs) {
             try {
-                pollRelayMailbox(config, identity, now, network)
+                val answered = pollRelayMailbox(config, identity, now, network)
                 syncRelayPresence(config, identity, contacts, fallbackConfig, now, network)
                 anyRelaySucceeded = true
-                if (config == fallbackConfig) ownRelaySucceeded = true
+                if (config == fallbackConfig) {
+                    ownRelaySucceeded = true
+                    if (answered) ownRelayAnswered = true
+                }
             } catch (e: Exception) {
                 // A contact can carry stale relay credentials from an older
                 // friend card. That relay failing must not abort polling of
@@ -522,11 +535,14 @@ internal class RelaySyncEngine(
         } else {
             0L
         }
+        // Now that the pass knows whether our own mailbox answered, this
+        // pass's silent contact endpoints can be judged (or discarded).
+        commitUnreachableContactRelays(ownRelayAnswered)
         // Re-read: the uploads above may have advanced or cleared streaks, and
         // a person who just watched a message fail should not have to wait a
         // whole poll interval for the explanation to appear.
         contactRelayRejections = store.listContactRelayRejections()
-            .associateBy { UserIdHex.encode(it.userId) }
+            .associateByTo(mutableMapOf()) { UserIdHex.encode(it.userId) }
         publishStaleContactRelays()
         val netDesc = if (network != null) "${networkLabel(network)}(pinned)" else "${networkLabel(connectivityManager.activeNetwork)}(default)"
         Log.i(TAG, "Relay sync complete: configs=${configs.size} net=$netDesc reason=$reason")
@@ -636,18 +652,40 @@ internal class RelaySyncEngine(
         }
     }
 
+    /**
+     * Which single mailbox a group envelope's fan-out rows go to, or null for
+     * "post nothing this pass" -- which leaves the envelope queued for a later
+     * pass and for the BLE/LAN paths, exactly as the 1:1 skip does.
+     *
+     * The choice itself is core's ([coreGroupFanoutRelayTarget]) because the
+     * rule that matters is easy to get subtly wrong in one shell: a member
+     * whose endpoint is *resting for silence* contributes no fallback to our
+     * own mailbox. Falling back for them would post a cross-family member's
+     * copy where they never read, and `relay_posted_at` is terminal, so that
+     * is a permanent misroute rather than a retry. A member written off for
+     * *rejection* still falls back, unchanged.
+     */
     private fun relayConfigForGroupRecipient(
         groupId: ByteArray,
         contacts: List<Contact>,
         fallbackConfig: RelayConfig?,
     ): RelayConfig? {
         val group = store.getGroup(groupId) ?: return fallbackConfig
-        for (memberId in group.memberUserIds) {
-            val contact = contacts.firstOrNull { it.userId.contentEquals(memberId) } ?: continue
-            val config = resolvedRelayConfig(contact, fallbackConfig)
-            if (config != null) return config
+        val members = group.memberUserIds.mapNotNull { memberId ->
+            val contact = contacts.firstOrNull { it.userId.contentEquals(memberId) }
+                ?: return@mapNotNull null
+            GroupRelayMember(
+                contact.relayUrl,
+                contact.relayToken,
+                contactEndpointUsable(contact),
+                contactEndpointAnswering(contact),
+            )
         }
-        return fallbackConfig
+        return coreGroupFanoutRelayTarget(
+            members,
+            fallbackConfig?.relayUrl,
+            fallbackConfig?.relayToken,
+        )?.let { RelayConfig(it.url, it.token) }
     }
 
     private fun uploadFamilyCarriedEnvelopes(
@@ -689,12 +727,18 @@ internal class RelaySyncEngine(
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
                 val relayId = RelayClient.postCarriedEnvelope(config, envelope, network)
+                noteContactRelaySuccess(contact, config, fallbackConfig)
                 Log.i(
                     TAG,
                     "Uploaded carried envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
                 noteOwnRelayFault(config, fallbackConfig, e)
+                // Parity with the other two upload loops and with
+                // MeshController.swift, which already counted this path: a
+                // mule posting to a contact's endpoint is exactly as good a
+                // witness to that endpoint's health as a sender is.
+                noteContactRelayFault(contact, config, fallbackConfig, e)
                 Log.w(TAG, "Failed to upload carried envelope to relay ${config.relayUrl}: ${e.message}")
             }
         }
@@ -771,9 +815,9 @@ internal class RelaySyncEngine(
         identity: Identity,
         now: Long,
         network: Network?,
-    ) {
+    ): Boolean {
         val fetchHints = store.relayFetchHints(identity.userId, now)
-        if (fetchHints.isEmpty()) return
+        if (fetchHints.isEmpty()) return false
         val cursorKey = relayCursorKey(config.relayUrl, config.relayToken)
         val cursor = store.relayFetchCursor(cursorKey)
         val sweeping = relaySweepDue(sweptThisSession.contains(cursorKey), cursor.lastSweepAtMs, now)
@@ -794,6 +838,10 @@ internal class RelaySyncEngine(
             TAG,
             "Relay mailbox walk on ${config.relayUrl}: ${if (sweeping) "sweep" else "frontier"} from after=$after",
         )
+        // Set the moment a page comes back: the caller uses this as proof that
+        // this device's internet works, so it must mean "this mailbox
+        // answered", not "the walk was attempted".
+        var answered = false
         while (isRunning() && hasValidatedInternet()) {
             val fetched = RelayClient.fetchEnvelopesWithinResponseCap(
                 config,
@@ -810,13 +858,14 @@ internal class RelaySyncEngine(
             }
             val page = fetched.page
             fetchBatchLimit = fetched.limit
+            answered = true
             Log.i(
                 TAG,
                 "Fetched ${page.envelopes.size} relay envelope(s) from ${config.relayUrl} after=$after next=${page.nextCursor}",
             )
             if (page.envelopes.isEmpty()) {
                 if (sweeping) noteSweepCompleted(cursorKey, now)
-                return
+                return true
             }
             var pageFullyProcessed = true
             val dispositions = ArrayList<CoreRelayEnvelopeDisposition>(page.envelopes.size)
@@ -873,10 +922,11 @@ internal class RelaySyncEngine(
             // deliberately does NOT record a completed sweep.
             if (!relayFetchWalkContinues(page.envelopes.size.toUInt(), after, page.nextCursor)) {
                 Log.w(TAG, "Relay ${config.relayUrl} returned rows without advancing the cursor; ending the walk")
-                return
+                return true
             }
             after = page.nextCursor
         }
+        return answered
     }
 
     /**
@@ -911,15 +961,31 @@ internal class RelaySyncEngine(
             }
         }
 
-    /** Core owns the mailbox-routing policy (T11) so both shells resolve identically. */
-    private fun resolvedRelayConfig(contact: Contact, fallbackConfig: RelayConfig?): RelayConfig? =
-        resolvedContactDeliveryRelay(
+    /**
+     * Core owns the mailbox-routing policy (T11) so both shells resolve
+     * identically.
+     *
+     * Null here means "no relay attempt for this contact right now", which
+     * leaves the envelope queued for a later pass and for the BLE/LAN paths.
+     * That is deliberately the answer for a *silent* endpoint, and it is not
+     * the same answer a rejected one gets. A rejection proves the card is
+     * wrong, so falling back to our own relay costs nothing and delivers
+     * outright when both sides have since moved to the same new host. Silence
+     * proves nothing -- the host may be rebooting -- and falling back would
+     * post a cross-family contact's mail into our own mailbox, which they
+     * never read. `relay_posted_at` is terminal, so that misroute would not be
+     * a retry: the envelope would never be offered to the relay path again.
+     */
+    private fun resolvedRelayConfig(contact: Contact, fallbackConfig: RelayConfig?): RelayConfig? {
+        if (!contactEndpointAnswering(contact)) return null
+        return resolvedContactDeliveryRelay(
             contact.relayUrl,
             contact.relayToken,
             fallbackConfig?.relayUrl,
             fallbackConfig?.relayToken,
             contactEndpointUsable(contact),
         )?.let { RelayConfig(it.url, it.token) }
+    }
 
     /**
      * Mirrors the written-off set into the observable the UI reads. Computed
@@ -952,6 +1018,32 @@ internal class RelaySyncEngine(
     }
 
     /**
+     * Whether this contact's card endpoint has answered recently enough to be
+     * worth spending a request on.
+     *
+     * The counterpart to [contactEndpointUsable] for the failure mode that has
+     * no HTTP answer to classify: a host that was retired rather than a token
+     * that was revoked. False rests the endpoint until the core's probe window
+     * opens, which is what stops an address that will never respond from being
+     * dialled on every pass forever.
+     */
+    private fun contactEndpointAnswering(contact: Contact): Boolean =
+        contactRelaySilence.endpointAnswering(
+            UserIdHex.encode(contact.userId),
+            contactEndpointKey(contact),
+            passNowMs,
+        )
+
+    /**
+     * A rest belongs to an *address*, not to a person: `relayCursorKey` hashes
+     * the contact's current endpoint so a card or a T23 notice that moves them
+     * to a different host is tried again immediately instead of serving out
+     * the old host's rest window.
+     */
+    private fun contactEndpointKey(contact: Contact): String =
+        relayCursorKey(contact.relayUrl.orEmpty(), contact.relayToken.orEmpty())
+
+    /**
      * CP4: fetch/ack/presence resolution. Post-CP4 friend cards carry
      * post-only deposit tokens, which cannot read a mailbox — the core
      * resolves a same-family card back to our own member config and drops
@@ -965,7 +1057,9 @@ internal class RelaySyncEngine(
             contact.relayToken,
             fallbackConfig?.relayUrl,
             fallbackConfig?.relayToken,
-            contactEndpointUsable(contact),
+            // Reading a mailbox that is not answering is the same waste as
+            // posting to it; there is no fallback on this path either way.
+            contactEndpointUsable(contact) && contactEndpointAnswering(contact),
         )?.let { RelayConfig(it.url, it.token) }
 
     /** Worst structured rejection of our own saved config during this pass (CP2b). */
@@ -974,8 +1068,41 @@ internal class RelaySyncEngine(
     /**
      * Rejection streaks against contacts' card endpoints, read once per pass
      * and consulted per contact (only contacts with a non-zero streak appear).
+     * Kept up to date *within* a pass by [advanceContactRelayStreak] so the
+     * envelopes after the one that tripped the threshold already route the new
+     * way instead of finishing the pass against an endpoint we just wrote off.
      */
-    private var contactRelayRejections: Map<String, ContactRelayRejection> = emptyMap()
+    private var contactRelayRejections: MutableMap<String, ContactRelayRejection> = mutableMapOf()
+
+    /**
+     * Contacts whose streak already advanced during this pass.
+     *
+     * The core's threshold is worded in *passes* ("requiring the next pass to
+     * agree" — see `CONTACT_RELAY_STALE_STREAK`), and that guarantee is what
+     * rules out a relay answering mid-redeploy from a half-initialised
+     * process. Counting per envelope quietly broke it: a contact with two
+     * queued messages was written off inside a single pass, which is exactly
+     * the false positive the second pass exists to prevent. One contact
+     * contributes at most one step per pass, however many envelopes are
+     * waiting for them.
+     */
+    private val contactRelayCountedThisPass: MutableSet<String> = mutableSetOf()
+
+    /**
+     * Contacts whose card endpoint failed this pass without answering at all.
+     *
+     * Held until the end of the pass because the observation is only
+     * meaningful next to proof that this device's internet works — see
+     * [commitUnreachableContactRelays], which is where they are either
+     * counted or discarded.
+     */
+    private val contactRelayUnreachableThisPass: MutableMap<String, String> = mutableMapOf()
+
+    /**
+     * Per-process streaks of passes in which a contact's endpoint said
+     * nothing. See [ContactRelaySilence] for why this is not persisted.
+     */
+    private val contactRelaySilence = ContactRelaySilence()
 
     /** This pass's `now`, so streak timestamps and re-probe windows agree within a pass. */
     private var passNowMs: Long = 0L
@@ -1028,10 +1155,20 @@ internal class RelaySyncEngine(
         error: Exception,
     ) {
         if (config == fallbackConfig) return
-        val http = error as? RelayHttpException ?: return
+        val http = error as? RelayHttpException
+        if (http == null) {
+            // No HTTP answer at all -- a retired host, dead DNS, a refused
+            // connection, or a card URL this client will not dial. Not
+            // evidence about the card on its own, so it is only remembered
+            // here; commitUnreachableContactRelays decides at the end of the
+            // pass whether this device had any business believing it.
+            contactRelayUnreachableThisPass[UserIdHex.encode(contact.userId)] =
+                contactEndpointKey(contact)
+            return
+        }
         val fault = relayClassifyHttpError(http.code.toUShort(), http.relayCode)
         if (coreContactRelayStreakDelta(fault) == 0L) return
-        val streak = store.noteContactRelayRejected(contact.userId, passNowMs)
+        val streak = advanceContactRelayStreak(contact) ?: return
         Log.w(
             TAG,
             "Contact ${UserIdHex.encode(contact.userId)} relay ${config.relayUrl} rejected us " +
@@ -1040,14 +1177,65 @@ internal class RelaySyncEngine(
     }
 
     /**
+     * Advances one contact's persisted rejection streak, at most once per
+     * pass, and reflects the new value in [contactRelayRejections] so the rest
+     * of this pass already sees it. Returns the new streak, or null if this
+     * contact was already counted.
+     */
+    private fun advanceContactRelayStreak(contact: Contact): Long? {
+        val key = UserIdHex.encode(contact.userId)
+        if (!contactRelayCountedThisPass.add(key)) return null
+        val streak = store.noteContactRelayRejected(contact.userId, passNowMs)
+        contactRelayRejections[key] = ContactRelayRejection(contact.userId, streak, passNowMs)
+        return streak
+    }
+
+    /**
      * A successful post to a contact's own endpoint is the only thing that
      * clears its streak -- see `clear_contact_relay_rejection`'s doc for why
-     * a transient fault deliberately does not.
+     * a transient fault deliberately does not. The endpoint answering also
+     * settles the unreachable question outright, whatever this pass had
+     * provisionally observed.
      */
     private fun noteContactRelaySuccess(contact: Contact, config: RelayConfig, fallbackConfig: RelayConfig?) {
         if (config == fallbackConfig) return
-        if (!contactRelayRejections.containsKey(UserIdHex.encode(contact.userId))) return
+        val key = UserIdHex.encode(contact.userId)
+        contactRelayUnreachableThisPass.remove(key)
+        contactRelaySilence.noteAnswered(key)
+        if (!contactRelayRejections.containsKey(key)) return
         store.clearContactRelayRejection(contact.userId)
+        contactRelayRejections.remove(key)
+        contactRelayCountedThisPass.remove(key)
+    }
+
+    /**
+     * Turns this pass's silent endpoints into unreachable streaks.
+     *
+     * [ownRelayAnswered] is handed straight to the core rather than tested
+     * here: whether same-pass proof of working internet is required, and what
+     * the absence of it means, is one rule that both shells must answer
+     * identically, so `core_contact_relay_unreachable_delta` is the only place
+     * it is decided. Without the proof the delta is 0, nothing is recorded,
+     * and the observation is discarded -- a phone in a tunnel fails every
+     * endpoint at once, and resting them all would take the relay path away
+     * from every contact for the whole rest window the moment connectivity
+     * came back.
+     */
+    private fun commitUnreachableContactRelays(ownRelayAnswered: Boolean) {
+        for ((key, endpointKey) in contactRelayUnreachableThisPass) {
+            val streak = contactRelaySilence.noteSilentPass(
+                key,
+                endpointKey,
+                ownRelayAnswered,
+                passNowMs,
+            ) ?: continue
+            Log.w(
+                TAG,
+                "Contact $key relay endpoint did not answer while our own relay did " +
+                    "(silent passes=$streak); resting it rather than retrying every pass",
+            )
+        }
+        contactRelayUnreachableThisPass.clear()
     }
 
     private fun syncRelayPresence(

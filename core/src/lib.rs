@@ -39,7 +39,9 @@ pub use causal_order::{causal_display_timestamp, CAUSAL_ORDER_MAX_SKEW_MS};
 pub use contact_relay_health::{
     contact_relay_fault_is_authoritative, core_contact_relay_endpoint_usable,
     core_contact_relay_is_stale, core_contact_relay_recheck_due, core_contact_relay_streak_delta,
-    CONTACT_RELAY_RECHECK_MS, CONTACT_RELAY_STALE_STREAK,
+    core_contact_relay_unreachable_delta, core_contact_relay_unreachable_endpoint_usable,
+    CONTACT_RELAY_RECHECK_MS, CONTACT_RELAY_STALE_STREAK, CONTACT_RELAY_UNREACHABLE_REST_MS,
+    CONTACT_RELAY_UNREACHABLE_STREAK,
 };
 pub use content::{
     attachment_max_blob_bytes, decode_attachment_payload, decode_reaction_payload,
@@ -115,13 +117,14 @@ pub use relay_status::{
     CoreRelayFault,
 };
 pub use relay_wire::{
-    normalize_relay_url, relay_build_fetch_path, relay_decode_fetch_page,
-    relay_decode_post_response, relay_decode_presence_page, relay_deposit_token_for,
-    relay_encode_ack_request, relay_encode_post_envelope, relay_encode_presence_request,
-    relay_fetch_batch_limit, relay_fetch_shrunk_limit, relay_max_response_bytes,
-    relay_token_is_deposit, resolved_contact_delivery_poll_relay, resolved_contact_delivery_relay,
-    resolved_contact_poll_relay, resolved_contact_relay, CoreRelayFetchPage,
-    CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage, RelayEndpoint,
+    core_group_fanout_relay_target, normalize_relay_url, relay_build_fetch_path,
+    relay_decode_fetch_page, relay_decode_post_response, relay_decode_presence_page,
+    relay_deposit_token_for, relay_encode_ack_request, relay_encode_post_envelope,
+    relay_encode_presence_request, relay_fetch_batch_limit, relay_fetch_shrunk_limit,
+    relay_max_response_bytes, relay_token_is_deposit, resolved_contact_delivery_poll_relay,
+    resolved_contact_delivery_relay, resolved_contact_poll_relay, resolved_contact_relay,
+    CoreRelayFetchPage, CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage,
+    GroupRelayMember, RelayEndpoint,
 };
 pub use semantic::{
     core_is_visible_chat_kind, core_last_visible_message, core_reaction_summaries_by_target,

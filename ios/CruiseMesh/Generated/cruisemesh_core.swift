@@ -8318,6 +8318,112 @@ public func FfiConverterTypeGroupMetadataUpdate_lower(_ value: GroupMetadataUpda
 
 
 /**
+ * One group member's relay situation, as the shell resolved it this pass.
+ *
+ * The two health flags are deliberately separate rather than pre-combined:
+ * they justify different answers when the member's endpoint is out of
+ * service, and collapsing them into one "unusable" bit is exactly how the
+ * fan-out path came to redirect a resting member's mail to our own mailbox.
+ */
+public struct GroupRelayMember {
+    public var relayUrl: String?
+    public var relayToken: String?
+    /**
+     * False once this member's card endpoint has been written off for
+     * authoritative rejections — [`crate::contact_relay_health::core_contact_relay_endpoint_usable`].
+     */
+    public var endpointUsable: Bool
+    /**
+     * False while this member's card endpoint is resting because it stopped
+     * answering — [`crate::contact_relay_health::core_contact_relay_unreachable_endpoint_usable`].
+     */
+    public var endpointAnswering: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(relayUrl: String?, relayToken: String?, 
+        /**
+         * False once this member's card endpoint has been written off for
+         * authoritative rejections — [`crate::contact_relay_health::core_contact_relay_endpoint_usable`].
+         */endpointUsable: Bool, 
+        /**
+         * False while this member's card endpoint is resting because it stopped
+         * answering — [`crate::contact_relay_health::core_contact_relay_unreachable_endpoint_usable`].
+         */endpointAnswering: Bool) {
+        self.relayUrl = relayUrl
+        self.relayToken = relayToken
+        self.endpointUsable = endpointUsable
+        self.endpointAnswering = endpointAnswering
+    }
+}
+
+
+
+extension GroupRelayMember: Equatable, Hashable {
+    public static func ==(lhs: GroupRelayMember, rhs: GroupRelayMember) -> Bool {
+        if lhs.relayUrl != rhs.relayUrl {
+            return false
+        }
+        if lhs.relayToken != rhs.relayToken {
+            return false
+        }
+        if lhs.endpointUsable != rhs.endpointUsable {
+            return false
+        }
+        if lhs.endpointAnswering != rhs.endpointAnswering {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(relayUrl)
+        hasher.combine(relayToken)
+        hasher.combine(endpointUsable)
+        hasher.combine(endpointAnswering)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupRelayMember: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupRelayMember {
+        return
+            try GroupRelayMember(
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
+                relayToken: FfiConverterOptionString.read(from: &buf), 
+                endpointUsable: FfiConverterBool.read(from: &buf), 
+                endpointAnswering: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupRelayMember, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.relayUrl, into: &buf)
+        FfiConverterOptionString.write(value.relayToken, into: &buf)
+        FfiConverterBool.write(value.endpointUsable, into: &buf)
+        FfiConverterBool.write(value.endpointAnswering, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupRelayMember_lift(_ buf: RustBuffer) throws -> GroupRelayMember {
+    return try FfiConverterTypeGroupRelayMember.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupRelayMember_lower(_ value: GroupRelayMember) -> RustBuffer {
+    return FfiConverterTypeGroupRelayMember.lower(value)
+}
+
+
+/**
  * A locally generated identity: both keypairs, private material included.
  *
  * The app is responsible for persisting `sign_sk` / `agree_sk` securely
@@ -13059,6 +13165,31 @@ fileprivate struct FfiConverterSequenceTypeGroup: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeGroupRelayMember: FfiConverterRustBuffer {
+    typealias SwiftType = [GroupRelayMember]
+
+    public static func write(_ value: [GroupRelayMember], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeGroupRelayMember.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [GroupRelayMember] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [GroupRelayMember]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeGroupRelayMember.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeOutboundEnvelope: FfiConverterRustBuffer {
     typealias SwiftType = [OutboundEnvelope]
 
@@ -13517,6 +13648,50 @@ public func coreContactRelayStreakDelta(fault: CoreRelayFault) -> Int64 {
 })
 }
 /**
+ * Streak delta for an attempt that got no HTTP answer at all.
+ *
+ * Gated on proof, in the same pass, that a *different* relay endpoint did
+ * answer this device — in practice our own configured relay. Without that
+ * proof the failure is most likely our own connectivity, and counting it
+ * would let one flight, tunnel or dead Wi-Fi rest every contact's endpoint
+ * at once. With it, the comparison is meaningful: this device's internet
+ * demonstrably works and that specific host still said nothing.
+ *
+ * Note the asymmetry with [`core_contact_relay_streak_delta`], which needs
+ * no such proof: a 401 is the endpoint speaking, so it is evidence about the
+ * card no matter what the rest of the network is doing.
+ *
+ * Callers pass the observation and act on the delta; they must not test
+ * `other_relay_answered` themselves first. A shell that guards the call with
+ * its own `if` and then passes a literal `true` has moved the rule back into
+ * both shells, where the two copies can drift — which is the whole reason
+ * this module exists.
+ */
+public func coreContactRelayUnreachableDelta(otherRelayAnswered: Bool) -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_relay_unreachable_delta(
+        FfiConverterBool.lower(otherRelayAnswered),$0
+    )
+})
+}
+/**
+ * May we spend a request on an endpoint that has been going unanswered?
+ *
+ * `rested_at_ms` is when the unreachable streak last advanced. Mirrors
+ * [`core_contact_relay_endpoint_usable`]: `true` below the streak, and
+ * `true` again once the rest window is up so a recovered host is found
+ * without anyone touching the phone.
+ */
+public func coreContactRelayUnreachableEndpointUsable(unreachableStreak: Int64, restedAtMs: Int64, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_relay_unreachable_endpoint_usable(
+        FfiConverterInt64.lower(unreachableStreak),
+        FfiConverterInt64.lower(restedAtMs),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
  * Find every link in `body`, in order, non-overlapping.
  *
  * Returns an empty list for a body with no links (including an empty body).
@@ -13534,6 +13709,39 @@ public func coreFormatLanEndpoint(endpoint: CoreLanEndpoint) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_format_lan_endpoint(
         FfiConverterTypeCoreLanEndpoint.lower(endpoint),$0
+    )
+})
+}
+/**
+ * Which single mailbox a group envelope's fan-out rows go to, or `None` for
+ * "post nothing this pass".
+ *
+ * Group text is addressed to the group id, not to a person, so the shells
+ * pick one mailbox and post every per-member row there
+ * (specs/group-relay-durability.md §4.2). The choice walks the membership in
+ * order and takes the first member that resolves to somewhere worth posting,
+ * falling back to our own configured relay when none of them carries a card
+ * endpoint of their own.
+ *
+ * The rule this exists to hold is the last one. A member whose endpoint is
+ * *resting for silence* contributes no fallback: if nobody else in the group
+ * resolves, the answer is `None` and the envelope simply is not posted this
+ * pass. Falling back would put a cross-family member's copy in our own
+ * mailbox, which they never read — and because `relay_posted_at` is
+ * terminal, that is not a retry but a permanent misroute. `None` leaves the
+ * envelope queued for a later pass and for the BLE/LAN paths, so a host that
+ * comes back still receives it.
+ *
+ * A member written off for *rejection* keeps falling back, unchanged: a 401
+ * proves the card is wrong, and our own relay really delivers when both
+ * sides have since moved to the same new host.
+ */
+public func coreGroupFanoutRelayTarget(members: [GroupRelayMember], fallbackUrl: String?, fallbackToken: String?) -> RelayEndpoint? {
+    return try!  FfiConverterOptionTypeRelayEndpoint.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_group_fanout_relay_target(
+        FfiConverterSequenceTypeGroupRelayMember.lower(members),
+        FfiConverterOptionString.lower(fallbackUrl),
+        FfiConverterOptionString.lower(fallbackToken),$0
     )
 })
 }
@@ -15437,10 +15645,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_streak_delta() != 44972) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_unreachable_delta() != 23003) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_unreachable_endpoint_usable() != 17040) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_detect_links() != 34673) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_format_lan_endpoint() != 59419) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_group_fanout_relay_target() != 49092) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_group_fanout_rows() != 44083) {

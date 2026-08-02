@@ -83,13 +83,20 @@ pub fn core_contact_relay_is_stale(reject_streak: i64) -> bool {
 /// a future timestamp re-probes immediately rather than waiting it out.
 #[uniffi::export]
 pub fn core_contact_relay_recheck_due(rejected_at_ms: i64, now_ms: i64) -> bool {
-    if rejected_at_ms <= 0 {
+    probe_due(rejected_at_ms, now_ms, CONTACT_RELAY_RECHECK_MS)
+}
+
+/// Shared "has the rest window elapsed?" test.
+///
+/// An unrecorded mark (`<= 0`) and a mark in the future both probe
+/// immediately: the first has no window to wait out, and the second means
+/// the clock moved backwards under us, which must never be able to pin an
+/// endpoint until real time catches up.
+fn probe_due(marked_at_ms: i64, now_ms: i64, window_ms: i64) -> bool {
+    if marked_at_ms <= 0 || now_ms < marked_at_ms {
         return true;
     }
-    if now_ms < rejected_at_ms {
-        return true;
-    }
-    now_ms - rejected_at_ms >= CONTACT_RELAY_RECHECK_MS
+    now_ms - marked_at_ms >= window_ms
 }
 
 /// The whole per-contact decision for one sync pass, in one call so neither
@@ -125,6 +132,103 @@ pub fn core_contact_relay_streak_delta(fault: CoreRelayFault) -> i64 {
     } else {
         0
     }
+}
+
+// ---------------------------------------------------------------------------
+// The other way a card endpoint dies: it stops answering at all.
+// ---------------------------------------------------------------------------
+//
+// Everything above needs the endpoint to *answer* — the streak only advances
+// on a classified HTTP rejection. A retired host answers nothing: the request
+// fails at the transport (DNS gone, connection refused, TLS failure, an
+// unusable URL), which is not an HTTP rejection and so never reaches
+// `core_contact_relay_streak_delta` at all. That half of the original report
+// — "host retired" as distinct from "token revoked" — was still an unbounded
+// retry loop against an address that will never come back.
+//
+// It is treated separately from a rejection rather than folded into the same
+// streak, because the two justify different responses:
+//
+// * A rejection is the endpoint *disowning the credential*. That is proof the
+//   card is wrong, so delivery falls back to our own relay — which really
+//   delivers when both sides have since moved to the same new host, the exact
+//   shape of the migration that produced the field report.
+//
+// * Silence is not proof of anything about the card. The host may simply be
+//   rebooting. Falling back on that evidence would post a cross-family
+//   contact's mail into *our* mailbox, which they never read — and because
+//   `relay_posted_at` is terminal (a posted envelope is never offered to the
+//   relay path again), that misroute would be permanent message loss, not a
+//   retry. So silence earns only a rest: stop spending requests on the
+//   endpoint, leave the envelope queued for a later pass and for the BLE/LAN
+//   paths, and probe again soon.
+//
+// This state is deliberately per-process and unpersisted, which also keeps it
+// out of the "their card is stale, ask them to re-share it" set the contact
+// sheet reports — the right prompt for a revoked token and the wrong one for
+// a host that is down this afternoon.
+
+/// Consecutive passes an endpoint may fail to answer before we rest it.
+///
+/// Two, matching [`CONTACT_RELAY_STALE_STREAK`], and for the same reason: one
+/// silent pass is ordinary (a dropped packet, a host mid-restart) and the
+/// next pass agreeing costs one sync interval to rule that out.
+pub const CONTACT_RELAY_UNREACHABLE_STREAK: i64 = 2;
+
+/// How long a rested endpoint is left alone before one probe.
+///
+/// Far shorter than [`CONTACT_RELAY_RECHECK_MS`] because the conditions
+/// differ in who has to act. A rejected card stays broken until a human
+/// re-shares it, so probing it often is pure waste; a host that is not
+/// answering usually comes back on its own, and nobody is going to tell us
+/// when it does. Half an hour stops the hammering — the loop this replaces
+/// ran ~10x/minute forever — while still picking a rebooted relay back up
+/// within the hour rather than at the end of a working day.
+pub const CONTACT_RELAY_UNREACHABLE_REST_MS: i64 = 30 * 60 * 1000;
+
+/// Streak delta for an attempt that got no HTTP answer at all.
+///
+/// Gated on proof, in the same pass, that a *different* relay endpoint did
+/// answer this device — in practice our own configured relay. Without that
+/// proof the failure is most likely our own connectivity, and counting it
+/// would let one flight, tunnel or dead Wi-Fi rest every contact's endpoint
+/// at once. With it, the comparison is meaningful: this device's internet
+/// demonstrably works and that specific host still said nothing.
+///
+/// Note the asymmetry with [`core_contact_relay_streak_delta`], which needs
+/// no such proof: a 401 is the endpoint speaking, so it is evidence about the
+/// card no matter what the rest of the network is doing.
+///
+/// Callers pass the observation and act on the delta; they must not test
+/// `other_relay_answered` themselves first. A shell that guards the call with
+/// its own `if` and then passes a literal `true` has moved the rule back into
+/// both shells, where the two copies can drift — which is the whole reason
+/// this module exists.
+#[uniffi::export]
+pub fn core_contact_relay_unreachable_delta(other_relay_answered: bool) -> i64 {
+    if other_relay_answered {
+        1
+    } else {
+        0
+    }
+}
+
+/// May we spend a request on an endpoint that has been going unanswered?
+///
+/// `rested_at_ms` is when the unreachable streak last advanced. Mirrors
+/// [`core_contact_relay_endpoint_usable`]: `true` below the streak, and
+/// `true` again once the rest window is up so a recovered host is found
+/// without anyone touching the phone.
+#[uniffi::export]
+pub fn core_contact_relay_unreachable_endpoint_usable(
+    unreachable_streak: i64,
+    rested_at_ms: i64,
+    now_ms: i64,
+) -> bool {
+    if unreachable_streak < CONTACT_RELAY_UNREACHABLE_STREAK {
+        return true;
+    }
+    probe_due(rested_at_ms, now_ms, CONTACT_RELAY_UNREACHABLE_REST_MS)
 }
 
 #[cfg(test)]
@@ -200,5 +304,79 @@ mod tests {
     #[test]
     fn an_unrecorded_rejection_time_re_probes() {
         assert!(core_contact_relay_recheck_due(0, 0));
+    }
+
+    #[test]
+    fn silence_only_counts_when_another_relay_answered() {
+        // The whole guard: without same-pass proof that this device's
+        // internet works, an unanswered endpoint is our outage, not theirs.
+        // A plane, a tunnel or a dead Wi-Fi association fails every endpoint
+        // at once, and must not rest a single one of them.
+        assert_eq!(core_contact_relay_unreachable_delta(false), 0);
+        assert_eq!(core_contact_relay_unreachable_delta(true), 1);
+    }
+
+    #[test]
+    fn a_rejection_needs_no_connectivity_proof_but_silence_does() {
+        // The asymmetry is the point: a 401 is the endpoint speaking, so it
+        // is evidence about the card whatever the network is doing. If these
+        // two ever agree, one of them has lost its rationale.
+        assert_eq!(
+            core_contact_relay_streak_delta(CoreRelayFault::TokenRejected),
+            1
+        );
+        assert_eq!(core_contact_relay_unreachable_delta(false), 0);
+    }
+
+    #[test]
+    fn one_silent_pass_is_not_enough_but_two_are() {
+        let rested = 1_000_000i64;
+        assert!(core_contact_relay_unreachable_endpoint_usable(0, 0, rested));
+        assert!(core_contact_relay_unreachable_endpoint_usable(
+            1, rested, rested
+        ));
+        assert!(!core_contact_relay_unreachable_endpoint_usable(
+            2, rested, rested
+        ));
+    }
+
+    #[test]
+    fn a_rested_endpoint_is_probed_again_once_the_window_is_up() {
+        let rested = 1_000_000i64;
+        assert!(!core_contact_relay_unreachable_endpoint_usable(
+            2,
+            rested,
+            rested + CONTACT_RELAY_UNREACHABLE_REST_MS - 1
+        ));
+        assert!(core_contact_relay_unreachable_endpoint_usable(
+            2,
+            rested,
+            rested + CONTACT_RELAY_UNREACHABLE_REST_MS
+        ));
+        // Same backwards-clock rule as the rejection side.
+        assert!(core_contact_relay_unreachable_endpoint_usable(
+            2, 5_000_000, 1_000
+        ));
+    }
+
+    #[test]
+    fn a_host_that_is_down_recovers_far_sooner_than_a_revoked_card() {
+        // A rejected card stays broken until a person re-shares it, so
+        // probing it often is waste; an unanswered host usually fixes itself
+        // and nobody will tell us when it does. Pinned through the two
+        // decisions rather than the two constants, so it keeps saying
+        // something if either window changes shape.
+        let marked = 1_000_000i64;
+        let an_hour_later = marked + 60 * 60 * 1_000;
+        assert!(core_contact_relay_unreachable_endpoint_usable(
+            2,
+            marked,
+            an_hour_later
+        ));
+        assert!(!core_contact_relay_endpoint_usable(
+            2,
+            marked,
+            an_hour_later
+        ));
     }
 }

@@ -2589,6 +2589,62 @@ final class MeshController: ObservableObject {
             func endpointUsable(_ contact: Contact) -> Bool {
                 Self.contactEndpointUsable(contact: contact, rejections: rejections, nowMs: now)
             }
+            /// Contacts whose streak already advanced during this pass.
+            ///
+            /// The core's threshold is worded in *passes* ("requiring the next
+            /// pass to agree" -- `CONTACT_RELAY_STALE_STREAK`), which is what
+            /// rules out a relay answering mid-redeploy from a
+            /// half-initialised process. Counting per envelope quietly broke
+            /// that: a contact with two queued messages was written off inside
+            /// a single pass, the exact false positive the second pass exists
+            /// to prevent. Mirrors RelaySyncEngine.kt.
+            var countedThisPass: Set<Data> = []
+            /// Contacts whose endpoint failed this pass without answering at
+            /// all. Held to the end of the pass because the observation only
+            /// means anything next to proof that this device's internet works.
+            var silentThisPass: [Data: String] = [:]
+            /// A rest belongs to an *address*, not to a person: `relayCursorKey`
+            /// hashes the contact's current endpoint so a card or a T23 notice
+            /// that moves them to a different host is tried again immediately
+            /// instead of serving out the old host's rest window.
+            func endpointKey(_ contact: Contact) -> String {
+                relayCursorKey(
+                    relayUrl: contact.relayUrl ?? "",
+                    relayToken: contact.relayToken ?? ""
+                )
+            }
+            /// Whether this contact's endpoint has answered recently enough to
+            /// be worth a request. The counterpart to `endpointUsable` for the
+            /// failure mode with no HTTP answer to classify.
+            func endpointAnswering(_ contact: Contact) -> Bool {
+                ContactRelaySilence.shared.endpointAnswering(
+                    userId: contact.userId,
+                    endpointKey: endpointKey(contact),
+                    nowMs: now
+                )
+            }
+            /// Where a send to this contact should go, or nil for "no relay
+            /// attempt right now", which leaves the envelope queued for a
+            /// later pass and for the BLE/LAN paths.
+            ///
+            /// Nil is deliberately the answer for a *silent* endpoint, and it
+            /// is not the answer a rejected one gets. A rejection proves the
+            /// card is wrong, so falling back to our own relay costs nothing
+            /// and delivers outright when both sides have since moved to the
+            /// same new host. Silence proves nothing -- the host may be
+            /// rebooting -- and falling back would post a cross-family
+            /// contact's mail into our own mailbox, which they never read.
+            /// `relayPostedAt` is terminal, so that misroute would not be a
+            /// retry: the envelope would never be offered to the relay path
+            /// again. Mirrors RelaySyncEngine.kt's resolvedRelayConfig.
+            func sendConfig(for contact: Contact) -> RelayConfig? {
+                guard endpointAnswering(contact) else { return nil }
+                return Self.resolvedRelayConfig(
+                    contact: contact,
+                    fallback: config,
+                    endpointUsable: endpointUsable(contact)
+                )
+            }
             /// Only counts when `usedConfig` is genuinely the contact's own
             /// endpoint: once we have fallen back to our own relay, a failure
             /// there is our relay's health, not evidence about their card.
@@ -2596,12 +2652,21 @@ final class MeshController: ObservableObject {
                 if let own = config,
                    usedConfig.relayUrl == own.relayUrl,
                    usedConfig.relayToken == own.relayToken { return }
-                guard let relay = error as? RelayHTTPError else { return }
+                guard let relay = error as? RelayHTTPError else {
+                    // No HTTP answer at all -- a retired host, dead DNS, a
+                    // refused connection. Not evidence about the card on its
+                    // own, so it is only remembered here; the end of the pass
+                    // decides whether this device had any business believing
+                    // it.
+                    silentThisPass[contact.userId] = endpointKey(contact)
+                    return
+                }
                 let fault = relayClassifyHttpError(
                     httpStatus: UInt16(clamping: relay.statusCode),
                     relayCode: relay.relayCode
                 )
                 guard coreContactRelayStreakDelta(fault: fault) != 0 else { return }
+                guard countedThisPass.insert(contact.userId).inserted else { return }
                 if let streak = try? store.noteContactRelayRejected(userId: contact.userId, nowMs: now) {
                     rejections[contact.userId] = ContactRelayRejection(
                         userId: contact.userId,
@@ -2617,9 +2682,14 @@ final class MeshController: ObservableObject {
                 if let own = config,
                    usedConfig.relayUrl == own.relayUrl,
                    usedConfig.relayToken == own.relayToken { return }
+                // The endpoint answering settles the silence question outright,
+                // whatever this pass had provisionally observed.
+                silentThisPass[contact.userId] = nil
+                ContactRelaySilence.shared.noteAnswered(userId: contact.userId)
                 guard rejections[contact.userId] != nil else { return }
                 try? store.clearContactRelayRejection(userId: contact.userId)
                 rejections[contact.userId] = nil
+                countedThisPass.remove(contact.userId)
             }
             let receipts = try store.pendingRelayOutgoingReceiptEnvelopes(
                 limit: MeshDefaults.relayStoreBatchLimit,
@@ -2627,11 +2697,7 @@ final class MeshController: ObservableObject {
             )
             for env in receipts {
                 guard let contact = contactsById[env.recipientUserId],
-                      let cfg = Self.resolvedRelayConfig(
-                        contact: contact,
-                        fallback: config,
-                        endpointUsable: endpointUsable(contact)
-                      )
+                      let cfg = sendConfig(for: contact)
                 else { continue }
                 do {
                     _ = try RelayClient.postReceiptEnvelope(config: cfg, envelope: env)
@@ -2650,19 +2716,36 @@ final class MeshController: ObservableObject {
             let groupsById = Dictionary(
                 uniqueKeysWithValues: importedGroups.map { ($0.id, $0) }
             )
+            /// Which single mailbox a group envelope's fan-out rows go to, or
+            /// nil for "post nothing this pass" -- which leaves the envelope
+            /// queued for a later pass and for the BLE/LAN paths, exactly as
+            /// the 1:1 skip does.
+            ///
+            /// The choice itself is core's because the rule that matters is
+            /// easy to get subtly wrong in one shell: a member whose endpoint
+            /// is *resting for silence* contributes no fallback to our own
+            /// mailbox. Falling back for them would post a cross-family
+            /// member's copy where they never read, and `relayPostedAt` is
+            /// terminal, so that is a permanent misroute rather than a retry.
+            /// A member written off for *rejection* still falls back,
+            /// unchanged. Mirrors RelaySyncEngine.kt.
             func relayConfigForGroupRecipient(_ groupId: Data) -> RelayConfig? {
                 guard let group = groupsById[groupId] else { return config }
-                for member in group.memberUserIds {
-                    if let contact = contactsById[member],
-                       let resolved = Self.resolvedRelayConfig(
-                        contact: contact,
-                        fallback: config,
-                        endpointUsable: endpointUsable(contact)
-                       ) {
-                        return resolved
-                    }
+                let members = group.memberUserIds.compactMap { member -> GroupRelayMember? in
+                    guard let contact = contactsById[member] else { return nil }
+                    return GroupRelayMember(
+                        relayUrl: contact.relayUrl,
+                        relayToken: contact.relayToken,
+                        endpointUsable: endpointUsable(contact),
+                        endpointAnswering: endpointAnswering(contact)
+                    )
                 }
-                return config
+                guard let target = coreGroupFanoutRelayTarget(
+                    members: members,
+                    fallbackUrl: config?.relayUrl,
+                    fallbackToken: config?.relayToken
+                ) else { return nil }
+                return RelayConfig(relayUrl: target.url, relayToken: target.token)
             }
             for env in outbound {
                 guard let contact = contactsById[env.recipientUserId] else {
@@ -2703,11 +2786,7 @@ final class MeshController: ObservableObject {
                     }
                     continue
                 }
-                guard let cfg = Self.resolvedRelayConfig(
-                    contact: contact,
-                    fallback: config,
-                    endpointUsable: endpointUsable(contact)
-                ) else { continue }
+                guard let cfg = sendConfig(for: contact) else { continue }
                 do {
                     _ = try RelayClient.postOutboundEnvelope(config: cfg, envelope: env)
                     _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
@@ -2729,11 +2808,7 @@ final class MeshController: ObservableObject {
                 // server-side); unrecognizable hints are skipped. Mirrors
                 // RelaySyncEngine.kt.
                 if let contact = (try? store.contactMatchingHint(hint: env.recipientHint, nowMs: now)) ?? nil {
-                    guard let cfg = Self.resolvedRelayConfig(
-                        contact: contact,
-                        fallback: config,
-                        endpointUsable: endpointUsable(contact)
-                    ) else { continue }
+                    guard let cfg = sendConfig(for: contact) else { continue }
                     do {
                         _ = try RelayClient.postCarriedEnvelope(config: cfg, envelope: env)
                         noteContactSuccess(contact: contact, usedConfig: cfg)
@@ -2781,7 +2856,10 @@ final class MeshController: ObservableObject {
             // older build posted to its own family mailbox), so checking one
             // box quietly loses cross-token mail.
             let distinctConfigs = Self.distinctRelayConfigs(
-                contacts: contacts,
+                // Reading a mailbox that is not answering is the same waste as
+                // posting to it, and there is no fallback on the poll path
+                // either way, so a rested endpoint simply drops out of the set.
+                contacts: contacts.filter { endpointAnswering($0) },
                 fallback: config,
                 rejections: rejections,
                 nowMs: now
@@ -2798,6 +2876,11 @@ final class MeshController: ObservableObject {
             let fetchHints = try store.relayFetchHints(ownUserId: identity.userId, nowMs: now)
             var anyRelaySucceeded = false
             var ownRelaySucceeded = config == nil
+            // Distinct from ownRelaySucceeded, which starts true when there is
+            // no own relay at all. Only a mailbox that actually answered
+            // counts as proof this device has working internet, and only that
+            // may license resting a contact's silent endpoint.
+            var ownRelayAnswered = false
             for cfg in distinctConfigs {
                 // Presence rides each mailbox for the contacts resolved to
                 // it; own presence is announced everywhere so contacts on
@@ -2911,6 +2994,10 @@ final class MeshController: ObservableObject {
                     // mailbox's pages for the rest of the pass. The next pass
                     // starts from the full limit again.
                     var fetchBatchLimit = Int(relayFetchBatchLimit())
+                    // Set the moment a page comes back: the caller uses this
+                    // as proof this device's internet works, so it must mean
+                    // "this mailbox answered", not "the walk was attempted".
+                    var mailboxAnswered = false
                     func finishSweep() {
                         guard sweeping else { return }
                         RelaySweepSession.shared.noteSwept(cursorKey)
@@ -2931,6 +3018,7 @@ final class MeshController: ObservableObject {
                         // Carried to the next page of THIS mailbox only; see
                         // the declaration above for why.
                         fetchBatchLimit = fetched.limit
+                        mailboxAnswered = true
                         guard !page.envelopes.isEmpty else {
                             finishSweep()
                             break
@@ -3013,6 +3101,7 @@ final class MeshController: ObservableObject {
                     anyRelaySucceeded = true
                     if let own = config, cfg.relayUrl == own.relayUrl, cfg.relayToken == own.relayToken {
                         ownRelaySucceeded = true
+                        if mailboxAnswered { ownRelayAnswered = true }
                     }
                 } catch {
                     // A contact can carry stale relay credentials from an
@@ -3022,6 +3111,29 @@ final class MeshController: ObservableObject {
                     noteFailure(error, usedConfig: cfg)
                 }
             }
+            // Now that the pass knows whether our own mailbox answered, this
+            // pass's silent contact endpoints can be judged -- or discarded.
+            // `ownRelayAnswered` is handed straight to the core rather than
+            // tested here: whether same-pass proof of working internet is
+            // required, and what its absence means, is one rule both shells
+            // must answer identically, so coreContactRelayUnreachableDelta is
+            // the only place it is decided. Without the proof nothing is
+            // recorded -- a phone in a tunnel fails every endpoint at once,
+            // and resting them all would take the relay path away from every
+            // contact for the whole rest window. Mirrors RelaySyncEngine.kt's
+            // commitUnreachableContactRelays.
+            for (userId, key) in silentThisPass {
+                guard let streak = ContactRelaySilence.shared.noteSilentPass(
+                    userId: userId,
+                    endpointKey: key,
+                    otherRelayAnswered: ownRelayAnswered,
+                    nowMs: now
+                ) else { continue }
+                relaySyncLog.warning(
+                    "A contact's relay endpoint did not answer while our own did (silent passes=\(streak, privacy: .public)); resting it rather than retrying every pass"
+                )
+            }
+            silentThisPass.removeAll()
             let syncedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
             let fault = ownRelayFault
             let retryAfterMs = ownRetryAfterMs
