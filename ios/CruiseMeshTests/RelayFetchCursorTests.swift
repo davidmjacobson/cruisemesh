@@ -112,10 +112,28 @@ final class RelayFetchCursorTests: XCTestCase {
 
     // MARK: - sweep scheduling
 
-    func testTheFirstPassOfAProcessSweepsWhateverTheStoredTimestampSays() {
-        XCTAssertTrue(relaySweepDue(sweptThisSession: false, lastSweepAtMs: 0, nowMs: 1_000))
-        XCTAssertTrue(relaySweepDue(sweptThisSession: false, lastSweepAtMs: 1_000, nowMs: 1_000))
-        XCTAssertTrue(relaySweepDue(sweptThisSession: false, lastSweepAtMs: Int64.max, nowMs: 1_000))
+    func testAColdStartHonoursTheStoredSweepTimestampInsteadOfReWalking() {
+        // A sweep re-downloads the sealed body of every row still in the
+        // mailbox. Forcing one per process start made the restart rate -- not
+        // the interval -- set the bandwidth bill.
+        let sweptAt: Int64 = 1_000_000
+        let interval = relaySweepIntervalMs()
+        XCTAssertFalse(relaySweepDue(sweptThisSession: false, lastSweepAtMs: sweptAt, nowMs: sweptAt))
+        XCTAssertFalse(
+            relaySweepDue(sweptThisSession: false, lastSweepAtMs: sweptAt, nowMs: sweptAt + interval - 1)
+        )
+        // Stale enough, and a cold start sweeps like any other pass.
+        XCTAssertTrue(
+            relaySweepDue(sweptThisSession: false, lastSweepAtMs: sweptAt, nowMs: sweptAt + interval)
+        )
+    }
+
+    func testAMailboxNeverSweptSweepsOnceNotOncePerPass() {
+        // Fresh install, restore (cursor rows never ride a .cmbak), rotated
+        // token, moved host: all read as 0 and must walk from the beginning.
+        XCTAssertTrue(relaySweepDue(sweptThisSession: false, lastSweepAtMs: 0, nowMs: 5_000))
+        // ...but a store write that keeps failing must not re-walk forever.
+        XCTAssertFalse(relaySweepDue(sweptThisSession: true, lastSweepAtMs: 0, nowMs: 5_000))
     }
 
     func testLaterPassesSweepOnlyOnceTheIntervalHasElapsed() {
@@ -133,7 +151,8 @@ final class RelayFetchCursorTests: XCTestCase {
 
     func testABackwardsClockSweepsRatherThanPinningTheMailbox() {
         XCTAssertTrue(relaySweepDue(sweptThisSession: true, lastSweepAtMs: 5_000_000, nowMs: 1_000))
-        XCTAssertTrue(relaySweepDue(sweptThisSession: true, lastSweepAtMs: 0, nowMs: 5_000))
+        XCTAssertTrue(relaySweepDue(sweptThisSession: false, lastSweepAtMs: 5_000_000, nowMs: 1_000))
+        XCTAssertTrue(relaySweepDue(sweptThisSession: false, lastSweepAtMs: Int64.max, nowMs: 1_000))
     }
 
     func testACompletedSweepRestartsTheIntervalWithoutCostingTheFrontier() throws {

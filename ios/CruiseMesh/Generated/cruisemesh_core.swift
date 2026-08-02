@@ -2465,6 +2465,62 @@ public protocol MessageStoreProtocol : AnyObject {
     func noteContactRelayRejected(userId: Data, nowMs: Int64) throws  -> Int64
     
     /**
+     * Notice that the set of ids our relay fetch hints derive from has
+     * changed, and invalidate every remembered frontier if it has. Returns
+     * whether this pass did so.
+     *
+     * Call once at the start of a sync pass, before computing hints. See
+     * [`crate::relay_hint_source_digest`] for why the frontier — not the sweep
+     * schedule — is the thing that has to give here: relayd's `next_cursor` is
+     * the id of the last row matching the hints *you sent*, so rows belonging
+     * to a hint gained later are already behind the frontier, and no sweep
+     * interval, however short, changes that. Only re-walking from 0 finds
+     * them.
+     *
+     * Zeroing the frontier is the whole mechanism, and it is deliberately not
+     * "force a sweep": `after_id = 0` is what a pass reads whether or not it
+     * is flagged as sweeping, so the re-walk does not depend on any
+     * per-process sweep bookkeeping the shells keep. Re-walking is cheap and
+     * self-correcting — everything already delivered is deduped on the way
+     * back in by the seen-id gossip filter.
+     *
+     * It resets `after_id` and nothing else. Deleting the rows outright would
+     * take `last_sweep_at` with it, and that timestamp is the *only* record of
+     * when each mailbox was last walked end to end. Losing it has two bad
+     * consequences and no good one: every mailbox reads as never-swept and so
+     * spends a full flagged sweep on the next cold start, on top of the
+     * re-walk this invalidation already schedules; and, worse, within the
+     * running process [`crate::relay_sweep_due`] answers `!swept_this_session`
+     * for a zeroed timestamp, so a process that had already swept would see
+     * "not due" from then until it restarted — a membership change would
+     * quietly switch the six-hour sweep off for the lifetime of the service.
+     * Keeping the timestamp keeps the cadence honest: the re-walk happens now,
+     * and the next scheduled sweep still lands when it was always going to.
+     *
+     * The re-walk is deliberately not credited as a sweep either. It is not
+     * flagged `sweeping`, so nothing writes `last_sweep_at`, and a walk that
+     * dies half way therefore cannot leave behind a timestamp claiming the
+     * mailbox was covered.
+     *
+     * A mailbox with no row yet is untouched by the `UPDATE` and keeps
+     * reading as `{ after_id: 0, last_sweep_at: 0 }` — already the "walk from
+     * the beginning, sweep on the first pass" state, which is exactly right
+     * for one this device has never fetched from.
+     *
+     * The digest write and the frontier reset share one transaction. Written
+     * separately, a failure or a kill between them would leave the digest
+     * reading as current with the frontiers never reset, and the invalidation
+     * would be lost for good — the newly-visible mail would stay hidden until
+     * the next scheduled sweep or the next membership change.
+     *
+     * The first call on a database with no row stores the digest and reports
+     * `false`. An install has nothing behind a frontier to miss, and reporting
+     * `true` would spend a re-walk of every mailbox on the one case that
+     * already starts from 0.
+     */
+    func noteRelayHintSources(ownUserId: Data) throws  -> Bool
+    
+    /**
      * Record that a walk from 0 completed for this mailbox, restarting its
      * sweep interval.
      *
@@ -4194,6 +4250,68 @@ open func noteContactRelayRejected(userId: Data, nowMs: Int64)throws  -> Int64 {
     uniffi_cruisemesh_core_fn_method_messagestore_note_contact_relay_rejected(self.uniffiClonePointer(),
         FfiConverterData.lower(userId),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Notice that the set of ids our relay fetch hints derive from has
+     * changed, and invalidate every remembered frontier if it has. Returns
+     * whether this pass did so.
+     *
+     * Call once at the start of a sync pass, before computing hints. See
+     * [`crate::relay_hint_source_digest`] for why the frontier — not the sweep
+     * schedule — is the thing that has to give here: relayd's `next_cursor` is
+     * the id of the last row matching the hints *you sent*, so rows belonging
+     * to a hint gained later are already behind the frontier, and no sweep
+     * interval, however short, changes that. Only re-walking from 0 finds
+     * them.
+     *
+     * Zeroing the frontier is the whole mechanism, and it is deliberately not
+     * "force a sweep": `after_id = 0` is what a pass reads whether or not it
+     * is flagged as sweeping, so the re-walk does not depend on any
+     * per-process sweep bookkeeping the shells keep. Re-walking is cheap and
+     * self-correcting — everything already delivered is deduped on the way
+     * back in by the seen-id gossip filter.
+     *
+     * It resets `after_id` and nothing else. Deleting the rows outright would
+     * take `last_sweep_at` with it, and that timestamp is the *only* record of
+     * when each mailbox was last walked end to end. Losing it has two bad
+     * consequences and no good one: every mailbox reads as never-swept and so
+     * spends a full flagged sweep on the next cold start, on top of the
+     * re-walk this invalidation already schedules; and, worse, within the
+     * running process [`crate::relay_sweep_due`] answers `!swept_this_session`
+     * for a zeroed timestamp, so a process that had already swept would see
+     * "not due" from then until it restarted — a membership change would
+     * quietly switch the six-hour sweep off for the lifetime of the service.
+     * Keeping the timestamp keeps the cadence honest: the re-walk happens now,
+     * and the next scheduled sweep still lands when it was always going to.
+     *
+     * The re-walk is deliberately not credited as a sweep either. It is not
+     * flagged `sweeping`, so nothing writes `last_sweep_at`, and a walk that
+     * dies half way therefore cannot leave behind a timestamp claiming the
+     * mailbox was covered.
+     *
+     * A mailbox with no row yet is untouched by the `UPDATE` and keeps
+     * reading as `{ after_id: 0, last_sweep_at: 0 }` — already the "walk from
+     * the beginning, sweep on the first pass" state, which is exactly right
+     * for one this device has never fetched from.
+     *
+     * The digest write and the frontier reset share one transaction. Written
+     * separately, a failure or a kill between them would leave the digest
+     * reading as current with the frontiers never reset, and the invalidation
+     * would be lost for good — the newly-visible mail would stay hidden until
+     * the next scheduled sweep or the next membership change.
+     *
+     * The first call on a database with no row stores the digest and reports
+     * `false`. An install has nothing behind a frontier to miss, and reporting
+     * `true` would spend a re-walk of every mailbox on the one case that
+     * already starts from 0.
+     */
+open func noteRelayHintSources(ownUserId: Data)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_note_relay_hint_sources(self.uniffiClonePointer(),
+        FfiConverterData.lower(ownUserId),$0
     )
 })
 }
@@ -14845,6 +14963,45 @@ public func relayFetchWalkContinues(pageEnvelopeCount: UInt32, afterId: Int64, p
 })
 }
 /**
+ * A stable name for the *set of ids* this device's relay fetch hints are
+ * derived from: our own user id, every group we are a member of, and every
+ * contact we proxy-poll for.
+ *
+ * This exists to solve a gap the frontier has. relayd's `next_cursor` is the
+ * id of the last row matching *the hints you sent*, so an ordinary pass walks
+ * the frontier straight past rows belonging to hints this device did not have
+ * yet. Import a group and up to [`crate::CARRY_HINT_DAY_WINDOW_DAYS`] days of
+ * that group's rows are already sitting below an advanced frontier: no
+ * ordinary pass will ever ask for them again, and the sweep timestamp is
+ * recent, so no valve in [`relay_sweep_due`] fires either. The mail is simply
+ * invisible until the next scheduled sweep — which used to be minutes away on
+ * a phone that restarts constantly, and is now up to
+ * [`RELAY_SWEEP_INTERVAL_MS`].
+ *
+ * So the id set gets a digest, and a change to it invalidates the frontier
+ * (see `MessageStore::note_relay_hint_sources`). Digesting the *sources*
+ * rather than the hints themselves is the whole trick: hints are day-salted
+ * and rotate every UTC midnight, so hashing them would force a re-walk daily
+ * for no reason, while the id set behind them only moves when a contact or
+ * group membership actually changes.
+ *
+ * Any change counts, not only a widening. A digest cannot tell an addition
+ * from a removal, and buying that distinction would mean storing the id set
+ * itself — a contact list, in a database we try to keep free of anything a
+ * leak would enrich. Removing a contact therefore costs one extra re-walk,
+ * which is a rare, user-initiated event and cheap besides.
+ *
+ * Ids are sorted and length-framed before hashing, so the digest depends on
+ * the set and not on row order or on where one id ends and the next begins.
+ */
+public func relayHintSourceDigest(sourceIds: [Data]) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_hint_source_digest(
+        FfiConverterSequenceData.lower(sourceIds),$0
+    )
+})
+}
+/**
  * Maximum response body that either mobile shell may accumulate before
  * cancelling the relay request. The core repeats this check at every decoder
  * so callers outside the first-party shells cannot bypass it.
@@ -14904,17 +15061,74 @@ public func relaySetupIsOfficial(relayUrl: String) -> Bool {
 /**
  * Must this pass walk the whole mailbox from 0?
  *
- * `swept_this_session` is per-process, not persisted: the first pass after a
- * cold start always sweeps. That is the cheap, self-healing answer to every
- * way a persisted cursor can go stale in a way we cannot detect from a
- * response — most importantly a relay rebuilt from scratch, whose row ids
- * restart at 1 and would otherwise sit forever below a frontier we still
- * remember. Restarting the app fixes it; the timer fixes it unattended.
+ * The answer comes from the *persisted* `last_sweep_at_ms`, cold start
+ * included. It used to be an unconditional yes for the first pass of every
+ * process, on the theory that a restart is a cheap moment to re-check
+ * everything. On a phone it is not cheap and it is not occasional: the mesh
+ * service is killed and restarted all day (Doze, swipe-away, memory
+ * pressure), every restart forced a full walk, and a full walk re-downloads
+ * the sealed body of every row still in the mailbox — including all the rows
+ * left there on purpose, which is most of them. So the restart rate, not
+ * [`RELAY_SWEEP_INTERVAL_MS`], was deciding how much data this app moved, and
+ * a churny phone could sweep many times a day instead of four.
  *
- * A `last_sweep_at_ms` in the future (a clock that jumped backwards, a
- * restore onto a phone set to a different time) sweeps immediately rather
- * than pinning the mailbox as un-swept until real time catches up — the same
- * rule [`crate::core_contact_relay_recheck_due`] applies for the same reason.
+ * What that costs, stated plainly: a relay rebuilt from scratch, whose row
+ * ids restart at 1 underneath a frontier we still remember, is no longer
+ * repaired by restarting the app.
+ *
+ * It is worth being precise about what "repaired" ever meant here, because it
+ * is less than it sounds. [`relay_cursor_advance`] never moves the frontier
+ * *backwards*, and a sweep only re-reads pages — it never lowers `after_id`.
+ * So on a mailbox whose ids restarted under a frontier of, say, 29000, that
+ * frontier stays at 29000 for good. Ordinary passes send `after=29000` and see
+ * nothing; relayd's live push gates on the same client-supplied value, so the
+ * socket is blind too. Only a sweep, which starts from 0, sees that mail. The
+ * mailbox is therefore in permanent sweep-cadence delivery either way — this
+ * change moves that cadence from minutes (one forced walk per app restart, and
+ * phones restart all day) to up to [`RELAY_SWEEP_INTERVAL_MS`].
+ *
+ * That is a real regression for one rare operator event, accepted against a
+ * constant cost paid by every phone every day. Lowering the frontier when a
+ * completed sweep proves the mailbox's ids have regressed would fix it
+ * properly and is the obvious follow-up; nothing here forecloses it.
+ *
+ * Two valves stay open, because they are the states a stored timestamp
+ * genuinely cannot speak for:
+ *
+ * - **Never swept** (`last_sweep_at_ms <= 0`) sweeps. This is also,
+ * deliberately, the entire "heal promptly after an install or restore"
+ * story, and the reason no extra cold-start grace period is warranted on
+ * top of it. A fresh install has no `relay_fetch_cursors` row; those rows
+ * deliberately do not ride a `.cmbak` (see `MessageStore::backup_to`), so a
+ * restore has none either; and a rotated token or a moved host hashes to a
+ * different [`relay_cursor_key`], which has no row of its own. All three
+ * read as 0 here and sweep on their first pass. A grace period would buy
+ * those cases nothing they don't already have, and would hand back a share
+ * of exactly the restart-driven cost this rule exists to remove.
+ * `swept_this_session` guards this branch alone, so a store write that
+ * keeps failing costs one walk per process rather than one per pass.
+ * - **A timestamp in the future** (a clock that jumped backwards, a restore
+ * onto a phone set to a different time) sweeps immediately rather than
+ * pinning the mailbox as un-swept until real time catches up — the same
+ * rule [`crate::core_contact_relay_recheck_due`] applies for the same
+ * reason. One completed sweep rewrites the timestamp to now, so it settles;
+ * a sweep that never *finishes* does not, because both shells record
+ * completion only on the empty page that ends the walk. A mailbox too large
+ * to walk inside one service lifetime therefore keeps re-walking from 0.
+ * That predates this change and is not made worse by it, but it is the
+ * reason "one sweep and it stops" is not quite true.
+ *
+ * One case the stored timestamp cannot speak for is deliberately handled
+ * elsewhere rather than by a valve here: gaining a contact or a group widens
+ * the fetch-hint set, and the mail that arrives under a hint we did not have
+ * yet sits *below* an already-advanced frontier where no sweep schedule can
+ * help. `MessageStore::note_relay_hint_sources` invalidates the frontier
+ * itself for that, which is the only thing that actually reaches those rows.
+ * It leaves `last_sweep_at` strictly alone, and the first branch below is why
+ * that matters: a zeroed timestamp reads as never-swept, and a process that
+ * has already swept passes `swept_this_session: true`, so zeroing it here
+ * would answer "not due" from then until the service restarted — a membership
+ * change would quietly retire the schedule for the lifetime of the process.
  */
 public func relaySweepDue(sweptThisSession: Bool, lastSweepAtMs: Int64, nowMs: Int64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -15550,6 +15764,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_fetch_walk_continues() != 16691) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_hint_source_digest() != 28986) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15562,7 +15779,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 55007) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 2810) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 13229) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_interval_ms() != 37428) {
@@ -15917,6 +16134,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_contact_relay_rejected() != 13589) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_hint_sources() != 11955) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_sweep_completed() != 49168) {

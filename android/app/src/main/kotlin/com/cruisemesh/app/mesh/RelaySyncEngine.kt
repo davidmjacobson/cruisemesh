@@ -471,6 +471,23 @@ internal class RelaySyncEngine(
         uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now, network)
         uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now, network)
 
+        // Gaining a contact or a group widens the fetch-hint set, and relayd's
+        // next_cursor only ever covers the hints we sent -- so mail that
+        // arrived under a hint we did not have yet is already *below* the
+        // frontier, where no sweep interval can reach it. Core notices the
+        // change and drops the frontiers; the walks below then start at 0.
+        // Cheap when nothing changed (one digest of the id set, no rows
+        // touched), so it is safe to run every pass.
+        runCatching { store.noteRelayHintSources(identity.userId) }
+            .onSuccess { rewalking ->
+                if (rewalking) {
+                    Log.i(TAG, "Hint sources changed; re-walking every relay mailbox from the start")
+                }
+            }
+            .onFailure { error ->
+                Log.w(TAG, "Could not check relay hint sources: ${error.message}")
+            }
+
         val configs = distinctRelayConfigs(contacts, fallbackConfig)
         anyRelayConfigKnown = configs.isNotEmpty()
         if (configs.isEmpty()) {
@@ -736,8 +753,12 @@ internal class RelaySyncEngine(
      * exactly as before -- so those deliberately-unacked rows stay
      * re-discoverable for the phones that depend on this one re-offering
      * them over Bluetooth, and so a relay rebuilt with its row ids restarted
-     * at 1 heals itself. [relaySweepDue] owns when: the first pass of every
-     * process, then every [uniffi.cruisemesh_core.relaySweepIntervalMs].
+     * at 1 heals itself. [relaySweepDue] owns when, from the *persisted*
+     * sweep timestamp: every [uniffi.cruisemesh_core.relaySweepIntervalMs],
+     * plus the first pass against a mailbox never swept at all. Notably NOT
+     * every process start -- this service is killed and restarted all day, a
+     * sweep re-downloads the sealed body of every row still in the mailbox,
+     * and tying that to the restart rate made the interval meaningless.
      *
      * TODO(relay-proxy-polling follow-up): [MessageStore.relayProxyHints]
      * fetches every contact's hints on every pass, so its cost scales with
@@ -859,11 +880,14 @@ internal class RelaySyncEngine(
     }
 
     /**
-     * Mailboxes this process has already walked in full. Deliberately
-     * in-memory: the first pass after a cold start always sweeps, which is
-     * the self-healing answer to a persisted frontier that has gone stale in
-     * a way no response can reveal (most importantly a relay rebuilt with its
-     * row ids restarted at 1).
+     * Mailboxes this process has already walked in full.
+     *
+     * Deliberately in-memory, and deliberately *narrow*: [relaySweepDue] now
+     * schedules from the persisted timestamp, and consults this only for a
+     * mailbox that has never recorded a completed sweep. There it stops a
+     * store write that keeps failing from turning every pass into a full
+     * walk. A cold start on a mailbox with a recent sweep no longer re-walks
+     * anything.
      */
     private val sweptThisSession: MutableSet<String> = ConcurrentHashMap.newKeySet()
 

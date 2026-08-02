@@ -82,6 +82,46 @@ pub fn dedupe_hints(hints: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 }
 
 impl MessageStore {
+    /// The groups whose mail is addressed to the group id and therefore
+    /// arrives under *our* self hints: every group we are a member of.
+    fn member_group_ids(&self, own_user_id: &[u8]) -> Result<Vec<Vec<u8>>, CoreError> {
+        Ok(self
+            .list_groups()?
+            .into_iter()
+            .filter(|group| group.member_user_ids.iter().any(|m| m == own_user_id))
+            .map(|group| group.id)
+            .collect())
+    }
+
+    /// The ids we proxy-poll a relay for: every contact but ourselves.
+    fn proxy_contact_ids(&self, own_user_id: &[u8]) -> Result<Vec<Vec<u8>>, CoreError> {
+        Ok(self
+            .list_contacts()?
+            .into_iter()
+            .filter(|contact| contact.user_id != own_user_id)
+            .map(|contact| contact.user_id)
+            .collect())
+    }
+
+    /// Every id this device's relay fetch hints are derived from, unsalted:
+    /// our own, the groups we belong to, and the contacts we proxy-poll for.
+    ///
+    /// The hint builders below salt slices of this same set by day;
+    /// [`MessageStore::note_relay_hint_sources`] digests the whole of it raw to
+    /// decide when a remembered frontier has gone stale. Enumerating the
+    /// sources in one place is what keeps those two answers in step — a hint
+    /// source added to the builders later cannot silently escape the digest
+    /// and leave the mail it unlocks sitting invisibly below a frontier.
+    pub(crate) fn relay_hint_source_ids(
+        &self,
+        own_user_id: &[u8],
+    ) -> Result<Vec<Vec<u8>>, CoreError> {
+        let mut ids = vec![own_user_id.to_vec()];
+        ids.extend(self.member_group_ids(own_user_id)?);
+        ids.extend(self.proxy_contact_ids(own_user_id)?);
+        Ok(ids)
+    }
+
     /// Shared by [`Self::relay_self_hints`] (fetch/carry, `forward_days: 0`)
     /// and [`Self::relay_self_push_hints`] (push subscription, `forward_days:
     /// `[`PUSH_HINT_FORWARD_DAYS`]``) so the "own id + member groups" id set
@@ -98,15 +138,13 @@ impl MessageStore {
             CARRY_HINT_DAY_WINDOW_DAYS,
             forward_days,
         );
-        for group in self.list_groups()? {
-            if group.member_user_ids.iter().any(|m| m == own_user_id) {
-                hints.extend(hints_over_range(
-                    &group.id,
-                    now_ms,
-                    CARRY_HINT_DAY_WINDOW_DAYS,
-                    forward_days,
-                ));
-            }
+        for group_id in self.member_group_ids(own_user_id)? {
+            hints.extend(hints_over_range(
+                &group_id,
+                now_ms,
+                CARRY_HINT_DAY_WINDOW_DAYS,
+                forward_days,
+            ));
         }
         Ok(hints)
     }
@@ -120,12 +158,9 @@ impl MessageStore {
         forward_days: i64,
     ) -> Result<Vec<Vec<u8>>, CoreError> {
         let mut hints = Vec::new();
-        for contact in self.list_contacts()? {
-            if contact.user_id == own_user_id {
-                continue;
-            }
+        for contact_id in self.proxy_contact_ids(own_user_id)? {
             hints.extend(hints_over_range(
-                &contact.user_id,
+                &contact_id,
                 now_ms,
                 CARRY_HINT_DAY_WINDOW_DAYS,
                 forward_days,

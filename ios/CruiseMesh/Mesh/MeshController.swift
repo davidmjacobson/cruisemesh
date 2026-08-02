@@ -2760,6 +2760,20 @@ final class MeshController: ObservableObject {
                 }
             }
 
+            // Gaining a contact or a group widens the fetch-hint set, and
+            // relayd's next_cursor only ever covers the hints we sent -- so
+            // mail that arrived under a hint we did not have yet is already
+            // *below* the frontier, where no sweep interval can reach it. Core
+            // notices the change and drops the frontiers; the walks below then
+            // start at 0. Cheap when nothing changed (one digest of the id
+            // set, no rows touched), so it is safe to run every pass.
+            // Mirrors RelaySyncEngine.kt.
+            if (try? store.noteRelayHintSources(ownUserId: identity.userId)) == true {
+                relaySyncLog.info(
+                    "Hint sources changed; re-walking every relay mailbox from the start"
+                )
+            }
+
             // Fetch-side parity with RelaySyncEngine.kt: poll every distinct
             // mailbox we know about -- our own plus each contact's card
             // relay. Mail addressed to us doesn't always reach our own
@@ -2857,10 +2871,14 @@ final class MeshController: ObservableObject {
                 // which never moves past a page that failed to fully process
                 // or to land its acks, and never moves backwards -- the mirror
                 // of the DTN ack-safety rule applied to skipping. Occasionally
-                // (first pass of a process, then every `relaySweepIntervalMs`)
                 // it sweeps the whole mailbox from 0 instead, so the rows that
                 // are supposed to stay there remain re-discoverable and a
-                // rebuilt relay heals itself. Mirrors RelaySyncEngine.kt.
+                // rebuilt relay heals itself. `relaySweepDue` owns when, from
+                // the persisted sweep timestamp: every `relaySweepIntervalMs`,
+                // plus the first pass against a mailbox never swept at all --
+                // notably NOT every process start, which would tie a full
+                // re-download of the mailbox to the restart rate. Mirrors
+                // RelaySyncEngine.kt.
                 let cursorKey = relayCursorKey(relayUrl: cfg.relayUrl, relayToken: cfg.relayToken)
                 do {
                     let cursor = try store.relayFetchCursor(configKey: cursorKey)

@@ -119,13 +119,17 @@ class RelayFetchCursorTest {
     // -- sweep scheduling ------------------------------------------------
 
     @Test
-    fun `the first pass of a process sweeps whatever the stored timestamp says`() {
-        // Cold start is the self-healing answer to a frontier that has gone
-        // stale in a way no response reveals -- most importantly a relay
-        // rebuilt with its row ids restarted at 1.
-        assertTrue(relaySweepDue(false, 0L, 1_000L))
-        assertTrue(relaySweepDue(false, 1_000L, 1_000L))
-        assertTrue(relaySweepDue(false, Long.MAX_VALUE, 1_000L))
+    fun `a cold start honours the stored sweep timestamp instead of re-walking`() {
+        // This service is killed and restarted all day (Doze, swipe-away,
+        // memory pressure). A sweep re-downloads the sealed body of every row
+        // still in the mailbox, so forcing one per process start made the
+        // restart rate -- not the interval -- set the bandwidth bill.
+        val sweptAt = 1_000_000L
+        val interval = relaySweepIntervalMs()
+        assertFalse(relaySweepDue(false, sweptAt, sweptAt))
+        assertFalse(relaySweepDue(false, sweptAt, sweptAt + interval - 1))
+        // Stale enough, and a cold start sweeps like any other pass.
+        assertTrue(relaySweepDue(false, sweptAt, sweptAt + interval))
     }
 
     @Test
@@ -139,9 +143,19 @@ class RelayFetchCursorTest {
     }
 
     @Test
+    fun `a mailbox never swept sweeps once, not once per pass`() {
+        // Fresh install, restore (cursor rows never ride a .cmbak), rotated
+        // token, moved host: all read as 0 and must walk from the beginning.
+        assertTrue(relaySweepDue(false, 0L, 5_000L))
+        // ...but a store write that keeps failing must not re-walk forever.
+        assertFalse(relaySweepDue(true, 0L, 5_000L))
+    }
+
+    @Test
     fun `a backwards clock sweeps rather than pinning the mailbox`() {
         assertTrue(relaySweepDue(true, 5_000_000L, 1_000L))
-        assertTrue(relaySweepDue(true, 0L, 5_000L))
+        assertTrue(relaySweepDue(false, 5_000_000L, 1_000L))
+        assertTrue(relaySweepDue(false, Long.MAX_VALUE, 1_000L))
     }
 
     @Test
