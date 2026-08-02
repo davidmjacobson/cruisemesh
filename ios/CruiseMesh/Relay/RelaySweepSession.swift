@@ -57,3 +57,73 @@ final class RelaySweepSession: @unchecked Sendable {
         swept.removeAll()
     }
 }
+
+/// Contacts whose friend-card relay endpoint has stopped answering this
+/// process, and for how many consecutive sync passes.
+///
+/// The counterpart of the persisted rejection streaks in core
+/// `contact_relay_health`, for the half of the failure that produces no HTTP
+/// answer to classify. A revoked token replies 401; a *retired host* replies
+/// nothing at all, and that transport failure never reached the rejection
+/// streak, so the address was re-dialled on every pass indefinitely.
+///
+/// In memory rather than in the store, on both shells, for two reasons. A host
+/// that is down is usually down for minutes, so re-learning it after a restart
+/// costs two passes and is cheaper than carrying a stale verdict across days.
+/// And it keeps "not answering right now" out of the persisted stale-card set
+/// the contact sheet reads, where the prompt is "ask them to share their card
+/// again" -- correct for a revoked token, wrong for a relay that is rebooting.
+///
+/// Mirrors `RelaySyncEngine.contactRelayUnreachable` on Android.
+final class ContactRelaySilence: @unchecked Sendable {
+    static let shared = ContactRelaySilence()
+
+    private struct State {
+        var streak: Int64
+        var restedAtMs: Int64
+    }
+
+    private let lock = NSLock()
+    private var silent: [Data: State] = [:]
+
+    /// Whether this contact's endpoint has answered recently enough to be
+    /// worth spending a request on. True below the core's streak, and true
+    /// again once the rest window is up so a recovered host is picked back up
+    /// with nobody touching the phone.
+    func endpointAnswering(userId: Data, nowMs: Int64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let state = silent[userId] else { return true }
+        return coreContactRelayUnreachableEndpointUsable(
+            unreachableStreak: state.streak,
+            restedAtMs: state.restedAtMs,
+            nowMs: nowMs
+        )
+    }
+
+    /// Records one whole pass in which this endpoint said nothing while
+    /// another relay answered. Returns the new streak.
+    @discardableResult
+    func noteSilentPass(userId: Data, nowMs: Int64) -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        let streak = (silent[userId]?.streak ?? 0)
+            + coreContactRelayUnreachableDelta(otherRelayAnswered: true)
+        silent[userId] = State(streak: streak, restedAtMs: nowMs)
+        return streak
+    }
+
+    /// The endpoint answered: whatever we thought about its silence is settled.
+    func noteAnswered(userId: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        silent[userId] = nil
+    }
+
+    /// Test seam: forget everything, as though the process had just started.
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        silent.removeAll()
+    }
+}

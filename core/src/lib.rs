@@ -39,7 +39,9 @@ pub use causal_order::{causal_display_timestamp, CAUSAL_ORDER_MAX_SKEW_MS};
 pub use contact_relay_health::{
     contact_relay_fault_is_authoritative, core_contact_relay_endpoint_usable,
     core_contact_relay_is_stale, core_contact_relay_recheck_due, core_contact_relay_streak_delta,
-    CONTACT_RELAY_RECHECK_MS, CONTACT_RELAY_STALE_STREAK,
+    core_contact_relay_unreachable_delta, core_contact_relay_unreachable_endpoint_usable,
+    CONTACT_RELAY_RECHECK_MS, CONTACT_RELAY_STALE_STREAK, CONTACT_RELAY_UNREACHABLE_REST_MS,
+    CONTACT_RELAY_UNREACHABLE_STREAK,
 };
 pub use content::{
     attachment_max_blob_bytes, decode_attachment_payload, decode_reaction_payload,

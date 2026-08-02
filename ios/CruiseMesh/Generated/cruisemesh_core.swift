@@ -13399,6 +13399,44 @@ public func coreContactRelayStreakDelta(fault: CoreRelayFault) -> Int64 {
 })
 }
 /**
+ * Streak delta for an attempt that got no HTTP answer at all.
+ *
+ * Gated on proof, in the same pass, that a *different* relay endpoint did
+ * answer this device — in practice our own configured relay. Without that
+ * proof the failure is most likely our own connectivity, and counting it
+ * would let one flight, tunnel or dead Wi-Fi rest every contact's endpoint
+ * at once. With it, the comparison is meaningful: this device's internet
+ * demonstrably works and that specific host still said nothing.
+ *
+ * Note the asymmetry with [`core_contact_relay_streak_delta`], which needs
+ * no such proof: a 401 is the endpoint speaking, so it is evidence about the
+ * card no matter what the rest of the network is doing.
+ */
+public func coreContactRelayUnreachableDelta(otherRelayAnswered: Bool) -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_relay_unreachable_delta(
+        FfiConverterBool.lower(otherRelayAnswered),$0
+    )
+})
+}
+/**
+ * May we spend a request on an endpoint that has been going unanswered?
+ *
+ * `rested_at_ms` is when the unreachable streak last advanced. Mirrors
+ * [`core_contact_relay_endpoint_usable`]: `true` below the streak, and
+ * `true` again once the rest window is up so a recovered host is found
+ * without anyone touching the phone.
+ */
+public func coreContactRelayUnreachableEndpointUsable(unreachableStreak: Int64, restedAtMs: Int64, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_relay_unreachable_endpoint_usable(
+        FfiConverterInt64.lower(unreachableStreak),
+        FfiConverterInt64.lower(restedAtMs),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
  * Find every link in `body`, in order, non-overlapping.
  *
  * Returns an empty list for a body with no links (including an empty body).
@@ -15221,6 +15259,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_streak_delta() != 44972) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_unreachable_delta() != 59248) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_unreachable_endpoint_usable() != 17040) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_detect_links() != 34673) {
