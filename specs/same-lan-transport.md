@@ -28,7 +28,9 @@ does not implement this transport remains fully compatible over BLE and relay.
   single-initiator election used by DNS-SD.
 - A successful endpoint is cached for seven days under a hash of the local
   IPv4 `/24` and the accepted contact's UserID. The raw network name and raw
-  subnet are not persisted.
+  subnet are not persisted. A cached entry is re-checked against the host rule
+  below every time it is read, so an entry written by an older build is
+  dropped instead of dialed if it names anything but a local address.
 - A peer that has demonstrated `LAN_ENDPOINT` support may receive a short-lived
   endpoint hint through its existing end-to-end-encrypted relay mailbox. The
   hint expires after 15 minutes. A fresh hint is dialed whenever the receiver

@@ -111,6 +111,19 @@ pub fn lan_endpoint_cache_is_fresh(saved_at_ms: i64, now_ms: i64) -> bool {
     now_ms.saturating_sub(saved_at_ms) <= LAN_ENDPOINT_CACHE_MAX_AGE_MS
 }
 
+/// Whether a host may be dialed as a contact's LAN endpoint: an address
+/// literal on the local network, never a name (see
+/// [`crate::protocol`]'s `is_local_lan_host`, which this delegates to).
+///
+/// Exported for the endpoint cache in both apps. Cached entries were written
+/// before this rule existed and are never re-checked on the way out, so a
+/// seven-day-old entry could otherwise keep a host alive that a hint may no
+/// longer carry.
+#[uniffi::export]
+pub fn lan_endpoint_host_is_local(host: String) -> bool {
+    crate::protocol::is_local_lan_host(&host)
+}
+
 #[uniffi::export]
 pub fn should_resend_lan_endpoint(
     previous_signature: Option<String>,
@@ -200,6 +213,24 @@ mod tests {
             core_lan_network_id_for_ipv4("10.154.189.58".into()).as_deref(),
             Some("NcJ68sf-sL-VO63PUTnngg==")
         );
+    }
+
+    #[test]
+    fn exported_host_check_matches_the_hint_rule() {
+        // The apps re-check cached endpoints with this; it must agree with
+        // what a hint itself is allowed to carry.
+        for host in ["10.0.0.7", "192.168.1.7", "169.254.3.4", "fe80::1%wlan0"] {
+            assert!(lan_endpoint_host_is_local(host.into()), "{host}");
+        }
+        for host in [
+            "phone.local",
+            "cruisemesh.app",
+            "8.8.8.8",
+            "2606:4700::1",
+            "",
+        ] {
+            assert!(!lan_endpoint_host_is_local(host.into()), "{host}");
+        }
     }
 
     #[test]

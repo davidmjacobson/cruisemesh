@@ -5,6 +5,18 @@ private struct CachedLanEndpoint: Codable {
     let savedAtMs: Int64
 }
 
+/// Whether a cached endpoint may still be dialed: fresh enough, and a host the
+/// shared core still considers a local network address.
+///
+/// Entries written by older builds hold whatever string arrived at the time,
+/// including a name, and nothing re-checked them on the way out -- so without
+/// this an entry could keep a host alive for seven days after a hint stopped
+/// being allowed to carry it. The core is the authority for both halves; this
+/// only combines them.
+func cachedLanEndpointIsDialable(host: String, savedAtMs: Int64, nowMs: Int64) -> Bool {
+    lanEndpointCacheIsFresh(savedAtMs: savedAtMs, nowMs: nowMs) && lanEndpointHostIsLocal(host: host)
+}
+
 enum LanEndpointCache {
     private static let prefix = "cruisemesh.lan.endpoint."
 
@@ -15,6 +27,7 @@ enum LanEndpointCache {
         nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
     ) {
         guard let networkId,
+              lanEndpointHostIsLocal(host: endpoint.host),
               let encoded = try? JSONEncoder().encode(CachedLanEndpoint(endpoint: endpoint, savedAtMs: nowMs)) else {
             return
         }
@@ -32,7 +45,11 @@ enum LanEndpointCache {
               let cached = try? JSONDecoder().decode(CachedLanEndpoint.self, from: data) else {
             return nil
         }
-        guard lanEndpointCacheIsFresh(savedAtMs: cached.savedAtMs, nowMs: nowMs) else {
+        guard cachedLanEndpointIsDialable(
+            host: cached.endpoint.host,
+            savedAtMs: cached.savedAtMs,
+            nowMs: nowMs
+        ) else {
             UserDefaults.standard.removeObject(forKey: storageKey)
             return nil
         }

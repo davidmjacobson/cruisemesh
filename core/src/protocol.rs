@@ -1515,7 +1515,11 @@ fn validate_lan_endpoint_fields(
 ///
 /// Old senders are unaffected: the addresses both shells actually advertise
 /// (the interface address of the joined Wi-Fi network) already pass.
-fn is_local_lan_host(host: &str) -> bool {
+///
+/// [`crate::lan_endpoint_host_is_local`] exports this rule to the apps so the
+/// endpoint cache can apply it to entries written before it existed. This
+/// function is the authority; nothing else should restate it.
+pub(crate) fn is_local_lan_host(host: &str) -> bool {
     // Android hands back Inet6Address.getHostAddress(), which appends the
     // scope id of a link-local address ("fe80::1%wlan0", or "%3"). Split it
     // off before parsing and accept it only where it is meaningful.

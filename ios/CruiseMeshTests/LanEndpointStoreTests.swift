@@ -41,6 +41,37 @@ final class LanEndpointStoreTests: XCTestCase {
         )
     }
 
+    func testAnEndpointCachedByAnOlderBuildIsDroppedUnlessItIsALocalAddress() {
+        let savedAt: Int64 = 1_000
+        let now: Int64 = 2_000
+        // What older builds could have stored: the cache took any string.
+        XCTAssertFalse(cachedLanEndpointIsDialable(host: "phone.local", savedAtMs: savedAt, nowMs: now))
+        XCTAssertFalse(cachedLanEndpointIsDialable(host: "cruisemesh.app", savedAtMs: savedAt, nowMs: now))
+        XCTAssertFalse(cachedLanEndpointIsDialable(host: "8.8.8.8", savedAtMs: savedAt, nowMs: now))
+        XCTAssertTrue(cachedLanEndpointIsDialable(host: "10.0.0.7", savedAtMs: savedAt, nowMs: now))
+
+        // And end to end: an entry written in the pre-upgrade format, with a
+        // name for a host, is never handed back to be dialed.
+        let networkId = "test-\(UUID().uuidString)"
+        let userId = uuidData()
+        let legacy = try? JSONEncoder().encode(
+            LegacyCachedEndpoint(
+                endpoint: LanManualEndpoint(host: "phone.local", port: 45_892),
+                savedAtMs: savedAt
+            )
+        )
+        UserDefaults.standard.set(
+            legacy,
+            forKey: "cruisemesh.lan.endpoint.\(networkId).\(UserIdHex.encode(userId))"
+        )
+        XCTAssertNil(LanEndpointCache.load(networkId: networkId, userId: userId, nowMs: now))
+    }
+
+    private struct LegacyCachedEndpoint: Codable {
+        let endpoint: LanManualEndpoint
+        let savedAtMs: Int64
+    }
+
     func testEndpointResendDedupeUsesFiveMinuteSignatureWindow() {
         let userId = uuidData()
         let networkId = "test-\(UUID().uuidString)"

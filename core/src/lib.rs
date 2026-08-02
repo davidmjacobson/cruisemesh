@@ -79,7 +79,8 @@ pub use lan_session::{
 pub use lan_util::{
     core_format_lan_endpoint, core_lan_network_id_for_components, core_lan_network_id_for_ipv4,
     core_make_lan_endpoint_link, core_parse_lan_endpoint, core_parse_lan_endpoint_link,
-    core_subnet_24_hosts, lan_endpoint_cache_is_fresh, should_resend_lan_endpoint, CoreLanEndpoint,
+    core_subnet_24_hosts, lan_endpoint_cache_is_fresh, lan_endpoint_host_is_local,
+    should_resend_lan_endpoint, CoreLanEndpoint,
 };
 pub use limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 pub use link_detect::{
