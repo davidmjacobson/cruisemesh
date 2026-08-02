@@ -26,7 +26,13 @@ enum LanScanBreadth: Equatable {
 ///  - `onPeerEvidence` resets that backoff, but callers must only invoke it
 ///    for genuinely NEW peer evidence -- repeated evidence about an
 ///    already-connected/linked peer (e.g. its Bonjour record refreshing)
-///    must not re-trigger sweeps.
+///    must not re-trigger sweeps. Evidence is also only trusted
+///    `maxPeerEvidenceResets` times per network join: the "genuinely new"
+///    test is a token another device on the Wi-Fi chooses, so an unbounded
+///    reset budget would let anything on a shared network keep every phone in
+///    range sweeping back to back. Past the budget the evidence still drives
+///    ordinary discovery and connection attempts -- it just stops rewinding
+///    the sweep schedule.
 final class LanScanPlanner {
     static let localScanIntervalMs: Int64 = 5 * 60_000
     static let fullScanBackoffMs: [Int64] = [
@@ -39,11 +45,18 @@ final class LanScanPlanner {
     /// rush to fire the expensive tier the instant the cheap one comes back
     /// clean.
     static let emptyLocalSweepFullDelayMs: Int64 = 60_000
+    /// How many times peer evidence may rewind the full-sweep schedule on one
+    /// network join. Matched to the transport's simultaneous-link ceiling
+    /// (8): a whole family fleet announcing itself on arrival still gets a
+    /// prompt sweep each time, while anything else on the Wi-Fi runs out of
+    /// budget long before the expensive tier can be driven back to back.
+    static let maxPeerEvidenceResets = 8
 
     private let lock = NSLock()
     private let localIntervalMs: Int64
     private let fullBackoffMs: [Int64]
     private let emptyLocalSweepFullDelayMs: Int64
+    private let maxPeerEvidenceResets: Int
     private var joined = false
     private var localDueAtMs: Int64 = 0
     /// Armed only once a /24 sweep has completed on this network join and
@@ -51,16 +64,20 @@ final class LanScanPlanner {
     private var fullEligible = false
     private var fullDueAtMs: Int64 = 0
     private var fullBackoffIndex = 0
+    /// How much of this network join's `maxPeerEvidenceResets` budget is spent.
+    private var peerEvidenceResets = 0
 
     init(
         localIntervalMs: Int64 = LanScanPlanner.localScanIntervalMs,
         fullBackoffMs: [Int64] = LanScanPlanner.fullScanBackoffMs,
-        emptyLocalSweepFullDelayMs: Int64 = LanScanPlanner.emptyLocalSweepFullDelayMs
+        emptyLocalSweepFullDelayMs: Int64 = LanScanPlanner.emptyLocalSweepFullDelayMs,
+        maxPeerEvidenceResets: Int = LanScanPlanner.maxPeerEvidenceResets
     ) {
         precondition(!fullBackoffMs.isEmpty)
         self.localIntervalMs = localIntervalMs
         self.fullBackoffMs = fullBackoffMs
         self.emptyLocalSweepFullDelayMs = emptyLocalSweepFullDelayMs
+        self.maxPeerEvidenceResets = maxPeerEvidenceResets
     }
 
     func onNetworkJoined(nowMs: Int64) {
@@ -71,6 +88,7 @@ final class LanScanPlanner {
         fullEligible = false
         fullDueAtMs = 0
         fullBackoffIndex = 0
+        peerEvidenceResets = 0
     }
 
     func onNetworkLost() {
@@ -114,17 +132,26 @@ final class LanScanPlanner {
         }
     }
 
-    /// Evidence a peer is on this network right now. Only meaningful once
-    /// the full tier is already eligible (see `onScanCompleted`) -- before
-    /// that, evidence doesn't change anything, since the full sweep isn't
-    /// on the table yet. Callers are responsible for only calling this for
-    /// genuinely NEW evidence.
-    func onPeerEvidence(nowMs: Int64) {
+    /// Evidence a peer is on this network right now. Callers are responsible
+    /// for only calling this for genuinely NEW evidence (see the class doc),
+    /// and it is trusted at most `maxPeerEvidenceResets` times per network
+    /// join.
+    ///
+    /// Returns whether this evidence changed the schedule, so the caller
+    /// knows whether to bring its own next scan check forward. False once the
+    /// budget is spent, and false before the full tier is eligible (see
+    /// `onScanCompleted`) -- evidence can't conjure a full sweep out of
+    /// nowhere, so there is nothing to hurry towards yet.
+    @discardableResult
+    func onPeerEvidence(nowMs: Int64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard joined, fullEligible else { return }
+        guard joined, fullEligible else { return false }
+        guard peerEvidenceResets < maxPeerEvidenceResets else { return false }
+        peerEvidenceResets += 1
         fullBackoffIndex = 0
         fullDueAtMs = min(fullDueAtMs, nowMs)
+        return true
     }
 
     /// A broad-enough sweep received no TCP response at all, which commonly

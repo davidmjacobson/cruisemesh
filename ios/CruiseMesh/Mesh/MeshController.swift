@@ -129,6 +129,12 @@ final class MeshController: ObservableObject {
                 let name = (try? self.store.getContact(userId: userId))?.name
                     ?? String(UserIdHex.encode(userId).prefix(8))
                 if (try? self.store.getContact(userId: userId)) != nil {
+                    // An authenticated LAN link is the strongest possible
+                    // evidence this contact shares a LAN with us, so it also
+                    // refreshes the capability recency the automatic-scan
+                    // gate reads.
+                    LanCapabilityStore.markSupported(userId: userId)
+                    self.refreshLanCapableContacts()
                     self.recordPeerConnection(
                         userId: userId,
                         transport: .lan,
@@ -473,16 +479,32 @@ final class MeshController: ObservableObject {
         lanTransport?.connect(endpoint, remoteInstanceToken: instanceToken)
     }
 
-    /// Pushes the set of contacts that have demonstrated LAN support into
-    /// the transport, whose automatic-scan gate keeps sweeping while any of
-    /// them is not linked over LAN.
+    /// Pushes the contacts that have demonstrated LAN support into the
+    /// transport, each with the millisecond that support was last seen. The
+    /// automatic-scan gate keeps sweeping while any of them is not linked
+    /// over LAN and its evidence is still recent.
+    ///
+    /// Blocked contacts are excluded, and a contact that no longer exists
+    /// simply isn't in the list, so deleting or blocking someone lets the
+    /// gate close. Also runs on the periodic LAN health tick, which is what
+    /// makes that true without every screen having to say so.
     private func refreshLanCapableContacts() {
         guard let lan = lanTransport else { return }
         let contacts = (try? store.listContacts()) ?? []
-        let capable = contacts.map(\.userId).filter {
-            LanCapabilityStore.isSupported(userId: $0)
+        let blocked = Set((try? store.listBlockedUsers()) ?? [])
+        var capable: [Data: Int64] = [:]
+        for contact in contacts where !blocked.contains(contact.userId) {
+            if let lastSupportedAtMs = LanCapabilityStore.lastSupportedAtMs(userId: contact.userId) {
+                capable[contact.userId] = lastSupportedAtMs
+            }
         }
-        lan.updateLanCapableContacts(Set(capable))
+        lan.updateLanCapableContacts(capable)
+    }
+
+    /// The contact list changed (a contact was deleted, blocked, or
+    /// unblocked), so anything derived from it needs rebuilding.
+    func contactListChanged() {
+        refreshLanCapableContacts()
     }
 
     private func handleTransportProbe(address: String, nonce: UInt64, response: Bool) {
@@ -504,6 +526,7 @@ final class MeshController: ObservableObject {
         lanHealthTimer?.invalidate()
         lanHealthTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor in
+                self?.refreshLanCapableContacts()
                 _ = self?.probeLanLinks(manual: false)
             }
         }

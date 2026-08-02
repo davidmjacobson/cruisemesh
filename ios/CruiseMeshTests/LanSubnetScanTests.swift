@@ -104,6 +104,83 @@ final class LanSubnetScanTests: XCTestCase {
         ))
     }
 
+    func testContactLastSeenOnALanLongAgoStopsMotivatingSweeps() {
+        let day: Int64 = 24 * 60 * 60 * 1_000
+        let now = 100 * day
+
+        // Seen on a LAN within the window: still worth sweeping for.
+        XCTAssertTrue(lanCapabilityMotivatesScan(lastSupportedAtMs: now, nowMs: now))
+        XCTAssertTrue(lanCapabilityMotivatesScan(lastSupportedAtMs: now - 13 * day, nowMs: now))
+        // A family member who went ashore two weeks ago does not keep every
+        // remaining phone sweeping the subnet forever.
+        XCTAssertFalse(lanCapabilityMotivatesScan(lastSupportedAtMs: now - 14 * day, nowMs: now))
+        XCTAssertFalse(lanCapabilityMotivatesScan(lastSupportedAtMs: now - 400 * day, nowMs: now))
+        // Never demonstrated LAN support at all (including capability
+        // recorded before this timestamp existed).
+        XCTAssertFalse(lanCapabilityMotivatesScan(lastSupportedAtMs: nil, nowMs: now))
+        // A clock that moved backwards must not expire a fresh sighting.
+        XCTAssertTrue(lanCapabilityMotivatesScan(lastSupportedAtMs: now + day, nowMs: now))
+    }
+
+    func testSweepGateClosesOnceEveryCapableContactHasGoneStale() {
+        let now: Int64 = 50 * 24 * 60 * 60 * 1_000
+        let stale = now - 30 * 24 * 60 * 60 * 1_000
+        let capable: [Data: Int64] = [Data([1]): stale, Data([2]): stale]
+        let motivating = capable.filter {
+            lanCapabilityMotivatesScan(lastSupportedAtMs: $0.value, nowMs: now)
+        }.count
+
+        XCTAssertEqual(motivating, 0)
+        // A live link plus no motivating contact means no sweep at all.
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            activeConnections: 1,
+            pendingOutboundAttempts: 0,
+            scanRemaining: 0,
+            unlinkedCapableContacts: motivating
+        ))
+    }
+
+    func testPerNetworkBookkeepingSetsStopGrowingAtTheirCap() {
+        var keys = Set<String>()
+
+        for index in 0..<4 {
+            XCTAssertTrue(claimBoundedLanKey(&keys, "token-\(index)", limit: 4))
+        }
+        XCTAssertEqual(keys.count, 4)
+        // At the cap a brand-new key is refused rather than remembered, so a
+        // network full of fresh advertisements cannot grow this without end.
+        XCTAssertFalse(claimBoundedLanKey(&keys, "token-4", limit: 4))
+        XCTAssertEqual(keys.count, 4)
+        // A key already claimed still reads as "not new work", cap or no cap.
+        XCTAssertFalse(claimBoundedLanKey(&keys, "token-0", limit: 4))
+        XCTAssertFalse(claimBoundedLanKey(&keys, "token-0", limit: 99))
+    }
+
+    func testSweepIsOnlyCreditedWithAFindWhileItIsStillTheRunningSweep() {
+        let running = UUID()
+        let replaced = UUID()
+
+        XCTAssertTrue(lanSweepCreditApplies(
+            sweepGeneration: running,
+            runningSweepGeneration: running
+        ))
+        // A late handshake from a replaced sweep must not credit the new one.
+        XCTAssertFalse(lanSweepCreditApplies(
+            sweepGeneration: replaced,
+            runningSweepGeneration: running
+        ))
+        // Completed or cancelled: nothing to credit.
+        XCTAssertFalse(lanSweepCreditApplies(
+            sweepGeneration: replaced,
+            runningSweepGeneration: nil
+        ))
+        // A link no sweep dialed never credits one.
+        XCTAssertFalse(lanSweepCreditApplies(
+            sweepGeneration: nil,
+            runningSweepGeneration: running
+        ))
+    }
+
     func testBonjourPeerTokenRequiresVersionAndInstanceTxtRecords() {
         XCTAssertEqual(lanBonjourPeerToken(["v": "1", "i": "0011"]), "0011")
         XCTAssertNil(lanBonjourPeerToken(["v": "2", "i": "0011"]))

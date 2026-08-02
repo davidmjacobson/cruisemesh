@@ -46,14 +46,31 @@ enum LanEndpointCache {
 
 enum LanCapabilityStore {
     private static let supportedPrefix = "cruisemesh.lan.supported."
+    private static let lastSeenPrefix = "cruisemesh.lan.supported.seen."
     private static let sentPrefix = "cruisemesh.lan.sent."
 
-    static func markSupported(userId: Data) {
-        UserDefaults.standard.set(true, forKey: supportedPrefix + UserIdHex.encode(userId))
+    static func markSupported(
+        userId: Data,
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
+    ) {
+        let key = UserIdHex.encode(userId)
+        UserDefaults.standard.set(true, forKey: supportedPrefix + key)
+        UserDefaults.standard.set(NSNumber(value: nowMs), forKey: lastSeenPrefix + key)
     }
 
     static func isSupported(userId: Data) -> Bool {
         UserDefaults.standard.bool(forKey: supportedPrefix + UserIdHex.encode(userId))
+    }
+
+    /// When this contact last demonstrated LAN support, or nil if it never
+    /// has -- including contacts marked supported by a build that predates
+    /// this timestamp, which stop motivating automatic sweeps until the next
+    /// link or endpoint hint records a fresh one. See
+    /// `lanCapabilityMotivatesScan`.
+    static func lastSupportedAtMs(userId: Data) -> Int64? {
+        let stored = UserDefaults.standard.object(forKey: lastSeenPrefix + UserIdHex.encode(userId))
+        guard let lastSeen = (stored as? NSNumber)?.int64Value, lastSeen > 0 else { return nil }
+        return lastSeen
     }
 
     static func shouldSendEndpoint(

@@ -162,6 +162,81 @@ class LanTransportTest {
         )
     }
 
+    @Test
+    fun `a contact last seen on a LAN long ago stops motivating sweeps`() {
+        val day = 24 * 60 * 60 * 1_000L
+        val now = 100 * day
+
+        // Seen on a LAN within the window: still worth sweeping for.
+        assertTrue(lanCapabilityMotivatesScan(now, now))
+        assertTrue(lanCapabilityMotivatesScan(now - 13 * day, now))
+        // A family member who went ashore two weeks ago does not keep every
+        // remaining phone sweeping the subnet forever.
+        assertTrue(!lanCapabilityMotivatesScan(now - 14 * day, now))
+        assertTrue(!lanCapabilityMotivatesScan(now - 400 * day, now))
+        // Never demonstrated LAN support at all (including capability
+        // recorded before this timestamp existed).
+        assertTrue(!lanCapabilityMotivatesScan(null, now))
+        // A clock that moved backwards must not expire a fresh sighting.
+        assertTrue(lanCapabilityMotivatesScan(now + day, now))
+    }
+
+    @Test
+    fun `the sweep gate closes once every capable contact has gone stale`() {
+        val now = 50L * 24 * 60 * 60 * 1_000
+        val stale = now - 30L * 24 * 60 * 60 * 1_000
+        val capable = mapOf("aa" to stale, "bb" to stale)
+        val motivating = capable.count { (_, lastSeen) ->
+            lanCapabilityMotivatesScan(lastSeen, now)
+        }
+
+        assertEquals(0, motivating)
+        // A live link plus no motivating contact means no sweep at all.
+        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0, motivating))
+    }
+
+    @Test
+    fun `per-network bookkeeping sets stop growing at their cap`() {
+        val keys = mutableSetOf<String>()
+
+        repeat(4) { assertTrue(claimBoundedLanKey(keys, "token-$it", limit = 4)) }
+        assertEquals(4, keys.size)
+        // At the cap a brand-new key is refused rather than remembered, so a
+        // network full of fresh advertisements cannot grow this without end.
+        assertTrue(!claimBoundedLanKey(keys, "token-4", limit = 4))
+        assertEquals(4, keys.size)
+        // A key already claimed still reads as "not new work", cap or no cap.
+        assertTrue(!claimBoundedLanKey(keys, "token-0", limit = 4))
+        assertTrue(!claimBoundedLanKey(keys, "token-0", limit = 99))
+    }
+
+    @Test
+    fun `a sweep is only credited with a find while it is still the running sweep`() {
+        assertTrue(
+            lanSweepCreditApplies(
+                sweepGeneration = 7,
+                currentGeneration = 7,
+                sweepStillRunning = true,
+            ),
+        )
+        // Completed or cancelled: nothing to credit.
+        assertTrue(
+            !lanSweepCreditApplies(
+                sweepGeneration = 7,
+                currentGeneration = 7,
+                sweepStillRunning = false,
+            ),
+        )
+        // A late handshake from a replaced sweep must not credit the new one.
+        assertTrue(
+            !lanSweepCreditApplies(
+                sweepGeneration = 7,
+                currentGeneration = 8,
+                sweepStillRunning = true,
+            ),
+        )
+    }
+
     /** The outbound bookkeeping LanTransport keeps for the scan gate. */
     private class OutboundLinks {
         private val dialled = mutableSetOf<String>()

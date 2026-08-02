@@ -315,12 +315,14 @@ struct ChatListView: View {
         summary.isGroup ? .group(summary.chatId) : .contact(summary.chatId)
     }
 
+    @MainActor
     private func delete(_ summary: ChatSummary) {
         if summary.isGroup {
             _ = try? AppStore.get().deleteGroup(groupId: summary.chatId)
         } else {
             try? AppStore.get().deleteContact(userId: summary.chatId)
             FriendDirectorySender.queueToAllContacts(store: AppStore.get(), identity: identity)
+            MeshController.shared.contactListChanged()
         }
         reload()
     }

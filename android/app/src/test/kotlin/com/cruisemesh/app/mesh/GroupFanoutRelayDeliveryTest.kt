@@ -89,6 +89,7 @@ class GroupFanoutRelayDeliveryTest {
             endpoint: LanManualEndpoint,
         ) {}
         override fun currentLanNetworkId(): String? = null
+        override fun onLanCapabilityChanged() {}
     }
 
     @Test

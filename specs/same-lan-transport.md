@@ -45,6 +45,23 @@ does not implement this transport remains fully compatible over BLE and relay.
   bounded to 253 candidate hosts, eight concurrent TCP attempts, and a
   350-millisecond attempt timeout. CruiseMesh never silently expands this to a
   `/16` or broader scan.
+- An automatic fallback sweep runs while discovery has produced nothing. It is
+  deliberately hard to escalate and easy to quiet:
+  - It only runs while the transport has no links at all, or while a contact
+    that recently demonstrated LAN support still has no LAN link -- one
+    connected family member must not stop discovery of the rest. "Recently"
+    is a bounded window (two weeks); any link or endpoint hint refreshes it,
+    so someone who is ashore stops motivating sweeps instead of keeping the
+    phone searching forever.
+  - A sweep that reaches an accepted friend -- including one this phone is
+    already linked to -- counts as a find and leaves the wider sweep
+    unarmed. A bare TCP response does not: an unrelated service on the
+    default port must not disarm it either way.
+  - Evidence that peers exist here (a resolved service or an endpoint hint)
+    brings the next sweep forward, but only a small number of times per
+    network join, and the per-network bookkeeping it feeds is capped. The
+    evidence is data other devices choose, so it can shorten a wait but
+    cannot drive repeated searching.
 - Every endpoint mechanism is reachability data, not authentication. A TCP
   responder must still present the agreement key of an accepted friend during
   the Noise handshake.

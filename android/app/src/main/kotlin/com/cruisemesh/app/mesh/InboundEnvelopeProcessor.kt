@@ -155,6 +155,12 @@ internal class InboundEnvelopeProcessor(
         fun connectToLanHint(hint: Frame.LanEndpoint, peerUserId: ByteArray)
         fun saveLanEndpoint(networkId: String?, userId: ByteArray, endpoint: LanManualEndpoint)
         fun currentLanNetworkId(): String?
+
+        /**
+         * A contact just demonstrated LAN support, so the automatic-scan
+         * gate's cached capability set is stale.
+         */
+        fun onLanCapabilityChanged()
     }
 
     /** FA5: atomic per-msg_id admission gate across the four concurrent receive-path threads -- see [processInboundEnvelope]. */
@@ -878,6 +884,7 @@ internal class InboundEnvelopeProcessor(
         val endpoint = LanManualEndpoint(content.host, content.port.toInt())
         lan.saveLanEndpoint(hintedNetworkId, senderUserId, endpoint)
         LanCapabilityStore.markSupported(context, senderUserId)
+        lan.onLanCapabilityChanged()
         val now = System.currentTimeMillis()
         // The network fingerprint is stored with the cached endpoint but
         // deliberately does NOT gate this dial: requiring an exact match

@@ -294,6 +294,7 @@ struct ChatView: View {
                         _ = try? store.unblockUser(userId: contact.userId)
                     }
                     isBlocked = blocked
+                    MeshController.shared.contactListChanged()
                 },
                 onReport: {
                     // Nil means a mail app took it. An address back means there
@@ -319,6 +320,7 @@ struct ChatView: View {
             Button("Delete", role: .destructive) {
                 try? store.deleteContact(userId: contact.userId)
                 FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
+                MeshController.shared.contactListChanged()
                 dismiss()
             }
             Button("Cancel", role: .cancel) {}

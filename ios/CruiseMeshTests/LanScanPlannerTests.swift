@@ -98,6 +98,87 @@ final class LanScanPlannerTests: XCTestCase {
         XCTAssertEqual(planner.takeDueScan(nowMs: evidenceAt + 15 * minute), .fullSubnet)
     }
 
+    func testSweepThatMeetsAFriendItIsAlreadyLinkedToNeverArmsTheFullTier() {
+        let planner = LanScanPlanner(localIntervalMs: Int64.max / 2)
+        planner.onNetworkJoined(nowMs: 0)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 0), .local24)
+
+        // The sweep dialed a friend who already had a live LAN link, so the
+        // handshake aborted as a duplicate -- which still credits the sweep
+        // (LanTransport.markSweepFoundFriend), because discovery demonstrably
+        // works on this network.
+        let generation = UUID()
+        let foundPeer = lanSweepCreditApplies(
+            sweepGeneration: generation,
+            runningSweepGeneration: generation
+        )
+        planner.onScanCompleted(.local24, nowMs: 1_000, foundPeer: foundPeer)
+
+        // A healthy network must not arm the expensive /20 tier.
+        XCTAssertNil(planner.takeDueScan(nowMs: 1_000 + emptyDelay))
+        XCTAssertNil(planner.takeDueScan(nowMs: 10 * 60 * minute))
+    }
+
+    func testPeerEvidenceStopsRewindingTheScheduleOnceItsPerNetworkBudgetIsSpent() {
+        let budget = 3
+        let planner = LanScanPlanner(
+            localIntervalMs: Int64.max / 2,
+            maxPeerEvidenceResets: budget
+        )
+        planner.onNetworkJoined(nowMs: 0)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 0), .local24)
+        planner.onScanCompleted(.local24, nowMs: 0, foundPeer: false)
+        XCTAssertEqual(planner.takeDueScan(nowMs: emptyDelay), .fullSubnet)
+
+        // Every advertisement carries an instance token its sender picks, so
+        // "brand-new evidence" alone cannot bound this: a spray of fresh
+        // tokens would otherwise reset the backoff and re-fire the /20 sweep
+        // over and over on every phone in range.
+        var now: Int64 = emptyDelay
+        for _ in 0..<budget {
+            now += 1_000
+            XCTAssertTrue(planner.onPeerEvidence(nowMs: now))
+            XCTAssertEqual(planner.takeDueScan(nowMs: now), .fullSubnet)
+        }
+        for _ in 0..<50 {
+            now += 1_000
+            XCTAssertFalse(planner.onPeerEvidence(nowMs: now))
+        }
+        // Back on the ordinary backoff ladder: nothing until the step elapses.
+        XCTAssertNil(planner.takeDueScan(nowMs: now))
+        XCTAssertNil(planner.takeDueScan(nowMs: now + 14 * minute))
+    }
+
+    func testEvidenceBudgetRefillsWhenTheNetworkIsRejoined() {
+        let planner = LanScanPlanner(localIntervalMs: Int64.max / 2, maxPeerEvidenceResets: 1)
+        planner.onNetworkJoined(nowMs: 0)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 0), .local24)
+        planner.onScanCompleted(.local24, nowMs: 0, foundPeer: false)
+        XCTAssertEqual(planner.takeDueScan(nowMs: emptyDelay), .fullSubnet)
+        XCTAssertTrue(planner.onPeerEvidence(nowMs: emptyDelay + 1_000))
+        XCTAssertFalse(planner.onPeerEvidence(nowMs: emptyDelay + 2_000))
+
+        let rejoinAt = 26 * 60 * minute
+        planner.onNetworkJoined(nowMs: rejoinAt)
+        XCTAssertEqual(planner.takeDueScan(nowMs: rejoinAt), .local24)
+        planner.onScanCompleted(.local24, nowMs: rejoinAt, foundPeer: false)
+        XCTAssertEqual(planner.takeDueScan(nowMs: rejoinAt + emptyDelay), .fullSubnet)
+        XCTAssertTrue(planner.onPeerEvidence(nowMs: rejoinAt + emptyDelay + 1_000))
+    }
+
+    func testPeerEvidenceReportsNoScheduleChangeBeforeTheFullTierIsEligible() {
+        let planner = LanScanPlanner(localIntervalMs: Int64.max / 2)
+        planner.onNetworkJoined(nowMs: 0)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 0), .local24)
+
+        // Nothing armed yet, so there is nothing to hurry towards -- and the
+        // budget stays intact for evidence that could actually matter.
+        XCTAssertFalse(planner.onPeerEvidence(nowMs: 500))
+        planner.onScanCompleted(.local24, nowMs: 1_000, foundPeer: false)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 1_000 + emptyDelay), .fullSubnet)
+        XCTAssertTrue(planner.onPeerEvidence(nowMs: 1_000 + emptyDelay + 1_000))
+    }
+
     func testNetworkRejoinReanchorsLocalBeforeFullAndDisarmsTheFullTier() {
         let planner = LanScanPlanner()
         planner.onNetworkJoined(nowMs: 0)

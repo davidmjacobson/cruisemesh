@@ -95,6 +95,7 @@ class ConsumedHiddenKindRelayAckTest {
             endpoint: LanManualEndpoint,
         ) {}
         override fun currentLanNetworkId(): String? = null
+        override fun onLanCapabilityChanged() {}
     }
 
     private fun contactFor(identity: Identity, name: String) = Contact(

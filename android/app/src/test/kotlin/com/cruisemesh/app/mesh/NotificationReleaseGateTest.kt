@@ -110,6 +110,7 @@ class NotificationReleaseGateTest {
             endpoint: LanManualEndpoint,
         ) {}
         override fun currentLanNetworkId(): String? = null
+        override fun onLanCapabilityChanged() {}
     }
 
     /** Records what the delivery path asked the user to be told about. */

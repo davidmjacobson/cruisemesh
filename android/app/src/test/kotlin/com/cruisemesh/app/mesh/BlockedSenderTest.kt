@@ -77,6 +77,7 @@ class BlockedSenderTest {
             endpoint: LanManualEndpoint,
         ) {}
         override fun currentLanNetworkId(): String? = null
+        override fun onLanCapabilityChanged() {}
     }
 
     private fun friendRequestEnvelope(

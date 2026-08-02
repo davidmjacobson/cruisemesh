@@ -35,17 +35,22 @@ final class LanTransport {
     /// this network join -- repeated evidence about the same key (an
     /// already-connected/linked peer's Bonjour record refreshing, or a
     /// resent endpoint hint) must not keep resetting the full-sweep
-    /// backoff. Reset alongside `discoveredEndpoints` on network change.
+    /// backoff. Reset alongside `discoveredEndpoints` on network change, and
+    /// capped at `maxTrackedPeerKeys`: the key comes from whatever is
+    /// advertising, so an unbounded set is unbounded memory.
     private var peerEvidenceSeenKeys = Set<String>()
     /// Keys an election-loser fallback connect has already been scheduled
     /// for on this network join, so repeated browse updates for the same
     /// service don't stack duplicate fallback timers. Reset alongside
-    /// `discoveredEndpoints` on network change.
+    /// `discoveredEndpoints` on network change, and capped the same way.
     private var electionFallbackKeys = Set<String>()
-    /// Accepted contacts that have demonstrated LAN support, pushed in by
-    /// MeshController (`updateLanCapableContacts`). The automatic sweep
-    /// keeps looking while any of them lacks an authenticated LAN link.
-    private var lanCapableContactIds = Set<Data>()
+    /// Accepted contacts that have demonstrated LAN support, as UserID to the
+    /// millisecond that support was last seen, pushed in by MeshController
+    /// (`updateLanCapableContacts`). The automatic sweep keeps looking while
+    /// any of them lacks an authenticated LAN link -- but only while that
+    /// evidence is recent (`lanCapabilityMotivatesScan`), so a contact who is
+    /// ashore does not keep this phone sweeping the subnet forever.
+    private var lanCapableContacts: [Data: Int64] = [:]
     private var bonjourServiceKeys = Set<String>()
     private var outboundAddresses: [String: String] = [:]
     private var reconnectAttempts: [String: Int] = [:]
@@ -86,12 +91,13 @@ final class LanTransport {
         }
     }
 
-    /// MeshController pushes the set of contacts that have demonstrated LAN
-    /// support whenever it changes; the automatic-scan gate compares it
-    /// against currently authenticated links.
-    func updateLanCapableContacts(_ userIds: Set<Data>) {
+    /// MeshController pushes the contacts that have demonstrated LAN support,
+    /// each with the millisecond that support was last seen, whenever the set
+    /// changes; the automatic-scan gate compares it against currently
+    /// authenticated links and against the recency window.
+    func updateLanCapableContacts(_ contacts: [Data: Int64]) {
         queue.async { [weak self] in
-            self?.lanCapableContactIds = userIds
+            self?.lanCapableContacts = contacts
         }
     }
 
@@ -162,15 +168,7 @@ final class LanTransport {
                 port: NWEndpoint.Port(rawValue: endpoint.port) ?? .any
             )
             if let remoteInstanceToken {
-                // Only genuinely NEW evidence about a peer resets the sweep
-                // backoff -- repeated evidence for a key already seen this
-                // network join (whether or not we ended up as the
-                // initiator) must not re-trigger it.
-                if peerEvidenceSeenKeys.insert(key).inserted {
-                    scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
-                    diagnostics.peerEvidence()
-                    scheduleAutomaticScan(after: Self.peerEvidenceScanDelay)
-                }
+                notePeerEvidence(key: key)
                 if !shouldInitiateLanConnection(
                     localToken: instanceTokenString,
                     remoteToken: remoteInstanceToken.map { String(format: "%02x", $0) }.joined()
@@ -421,15 +419,11 @@ final class LanTransport {
                   let remoteToken = lanBonjourPeerToken(txtRecord.dictionary),
                   remoteToken != instanceTokenString else { continue }
             let key = serviceKey(result.endpoint)
-            // Only genuinely NEW evidence resets the sweep backoff -- an
-            // already-connected/linked peer's Bonjour record keeps
-            // reappearing here (TXT refreshes, periodic browse updates)
-            // and must not keep re-triggering full sweeps.
-            if peerEvidenceSeenKeys.insert(key).inserted {
-                scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
-                diagnostics.peerEvidence()
-                scheduleAutomaticScan(after: Self.peerEvidenceScanDelay)
-            }
+            // Bounded per network join: the browse result set is whatever is
+            // advertising on this Wi-Fi, and each new key costs a connect
+            // attempt or a fallback timer.
+            guard current[key] != nil || current.count < Self.maxTrackedPeerKeys else { continue }
+            notePeerEvidence(key: key)
             guard shouldInitiateLanConnection(
                 localToken: instanceTokenString,
                 remoteToken: remoteToken
@@ -463,7 +457,9 @@ final class LanTransport {
     /// deduplication), and the duplicate-link guard in the Noise handshake
     /// closes a redundant socket before it becomes a second live link.
     private func scheduleElectionFallback(key: String, endpoint: NWEndpoint) {
-        guard electionFallbackKeys.insert(key).inserted else { return }
+        guard claimBoundedLanKey(&electionFallbackKeys, key, limit: Self.maxTrackedPeerKeys) else {
+            return
+        }
         queue.asyncAfter(deadline: .now() + Self.electionFallbackDelay) { [weak self] in
             guard let self,
                   started,
@@ -475,17 +471,58 @@ final class LanTransport {
         }
     }
 
+    /// A peer advertised itself (Bonjour result or an endpoint hint) under
+    /// `key`. Only genuinely NEW evidence is worth reacting to: an
+    /// already-connected/linked peer's record keeps reappearing (TXT
+    /// refreshes, periodic browse updates, resent hints) and must not keep
+    /// re-triggering full sweeps.
+    ///
+    /// The key comes from whatever is advertising, so "new" is not a
+    /// trustworthy signal on a busy or hostile network: the remembered set is
+    /// capped and `LanScanPlanner.onPeerEvidence` only rewinds the sweep
+    /// schedule a bounded number of times per network join. Past either bound
+    /// the caller still discovers and dials the peer normally -- only the
+    /// schedule pull-forward stops.
+    private func notePeerEvidence(key: String) {
+        guard claimBoundedLanKey(&peerEvidenceSeenKeys, key, limit: Self.maxTrackedPeerKeys) else {
+            return
+        }
+        diagnostics.peerEvidence()
+        guard scanPlanner.onPeerEvidence(nowMs: Self.nowMs) else { return }
+        scheduleAutomaticScan(after: Self.peerEvidenceScanDelay)
+    }
+
+    /// Credits the sweep that dialed `link` with having found a friend on
+    /// this LAN. Only an authenticated friend -- or one the sweep discovered
+    /// is already linked -- counts; see `scanCandidateCompleted`. The
+    /// generation check keeps a handshake that finishes after its own sweep
+    /// was replaced or cancelled from crediting whatever sweep is running now.
+    fileprivate func markSweepFoundFriend(dialedBy link: LanConnection) {
+        guard var scan = runningScan,
+              lanSweepCreditApplies(
+                sweepGeneration: link.scanGeneration,
+                runningSweepGeneration: scan.generation
+              ) else { return }
+        scan.foundPeer = true
+        runningScan = scan
+    }
+
     fileprivate func hasAuthenticatedLink(userId: Data) -> Bool {
         connections.values.contains { $0.wasAuthenticated && $0.authenticatedUserId == userId }
     }
 
-    private func connect(to endpoint: NWEndpoint, serviceKey: String) {
+    private func connect(to endpoint: NWEndpoint, serviceKey: String, scanGeneration: UUID? = nil) {
         guard started,
               connections.count < Self.maxConnections,
               outboundAddresses[serviceKey] == nil else { return }
         diagnostics.connecting(String(describing: endpoint))
         let connection = NWConnection(to: endpoint, using: lanParameters())
-        addConnection(connection, initiator: true, serviceKey: serviceKey)
+        addConnection(
+            connection,
+            initiator: true,
+            serviceKey: serviceKey,
+            scanGeneration: scanGeneration
+        )
     }
 
     private func accept(_ connection: NWConnection) {
@@ -499,7 +536,8 @@ final class LanTransport {
     private func addConnection(
         _ connection: NWConnection,
         initiator: Bool,
-        serviceKey: String?
+        serviceKey: String?,
+        scanGeneration: UUID? = nil
     ) {
         let address = "lan:\(UUID().uuidString.lowercased())"
         do {
@@ -509,7 +547,8 @@ final class LanTransport {
                 initiator: initiator,
                 localPrivateKey: identity.agreeSk,
                 owner: self,
-                serviceKey: serviceKey
+                serviceKey: serviceKey,
+                scanGeneration: scanGeneration
             )
             connections[address] = link
             if let serviceKey {
@@ -534,14 +573,11 @@ final class LanTransport {
         log.info("Authenticated CruiseMesh peer over local Wi-Fi")
         if let serviceKey = link.serviceKey {
             reconnectAttempts[serviceKey] = 0
-            if serviceKey.hasPrefix("scan:"), var scan = runningScan {
-                // Only an authenticated friend counts as a sweep find -- a
-                // bare TCP connect could be any unrelated service on the
-                // default port, and must not disarm the full-subnet tier.
-                scan.foundPeer = true
-                runningScan = scan
-            }
         }
+        // Only an authenticated friend counts as a sweep find -- a bare TCP
+        // connect could be any unrelated service on the default port, and
+        // must not disarm the full-subnet tier.
+        markSweepFoundFriend(dialedBy: link)
         onAuthenticated?(link.address, userId)
         scheduleAutomaticScan(after: Self.automaticScanRetryInterval)
     }
@@ -672,7 +708,7 @@ final class LanTransport {
                     self.diagnostics.discovered("\(host):\(lanDefaultTcpPort())")
                     let key = "scan:\(host):\(lanDefaultTcpPort())"
                     self.discoveredEndpoints[key] = endpoint
-                    self.connect(to: endpoint, serviceKey: key)
+                    self.connect(to: endpoint, serviceKey: key, scanGeneration: generation)
                     // A bare TCP connect is not a find -- only the Noise
                     // handshake authenticating a friend marks the sweep
                     // (see connectionAuthenticated). It is still a
@@ -776,12 +812,17 @@ final class LanTransport {
         let linked = Set(connections.values.compactMap {
             $0.wasAuthenticated ? $0.authenticatedUserId : nil
         })
+        let nowMs = Self.nowMs
+        let motivating = lanCapableContacts.filter { userId, lastSupportedAtMs in
+            !linked.contains(userId)
+                && lanCapabilityMotivatesScan(lastSupportedAtMs: lastSupportedAtMs, nowMs: nowMs)
+        }.count
         if shouldRunAutomaticLanScan(
             activeConnections: connections.count,
             pendingOutboundAttempts: pendingOutbound,
             scanRemaining: runningScan?.remaining ?? 0,
-            unlinkedCapableContacts: lanCapableContactIds.subtracting(linked).count
-        ), let breadth = scanPlanner.takeDueScan(nowMs: Self.nowMs) {
+            unlinkedCapableContacts: motivating
+        ), let breadth = scanPlanner.takeDueScan(nowMs: nowMs) {
             log.info("Starting automatic local Wi-Fi fallback search (\(String(describing: breadth)))")
             _ = startSubnetScan(breadth, network: network, automatic: true)
         }
@@ -898,6 +939,12 @@ final class LanTransport {
     /// Consecutive `.isolationSuspected` sweep verdicts required before the
     /// planner defers full sweeps to its backoff cap.
     private static let isolationConfirmSweeps = 2
+    /// Ceiling on the per-network-join bookkeeping sets (seen peer keys,
+    /// scheduled election fallbacks, browse results acted on). Their keys
+    /// come from whatever advertises on the Wi-Fi, so they are only as
+    /// bounded as the network is honest; 256 is far above any real fleet and
+    /// keeps a busy network from growing them without limit.
+    static let maxTrackedPeerKeys = 256
 
     private static var nowMs: Int64 {
         Int64(Date().timeIntervalSince1970 * 1_000)
@@ -934,6 +981,10 @@ private final class LanConnection {
 
     let address: String
     let serviceKey: String?
+    /// The sweep generation that dialed this link, if a subnet sweep did.
+    /// Only that sweep may be credited with what this handshake finds -- see
+    /// `LanTransport.markSweepFoundFriend`.
+    let scanGeneration: UUID?
     private(set) var wasAuthenticated = false
     /// The accepted contact this link authenticated as, for the transport's
     /// duplicate-link and unlinked-capable-contact checks.
@@ -957,13 +1008,15 @@ private final class LanConnection {
         initiator: Bool,
         localPrivateKey: Data,
         owner: LanTransport,
-        serviceKey: String?
+        serviceKey: String?,
+        scanGeneration: UUID? = nil
     ) throws {
         self.address = address
         self.connection = connection
         self.initiator = initiator
         self.owner = owner
         self.serviceKey = serviceKey
+        self.scanGeneration = scanGeneration
         noise = try LanNoiseSession(initiator: initiator, localPrivateKey: localPrivateKey)
         phase = initiator ? .awaitMessage2 : .awaitMessage1
     }
@@ -1075,7 +1128,13 @@ private final class LanConnection {
             if owner?.hasAuthenticatedLink(userId: userId) == true {
                 // Election fallbacks and sweeps may dial a contact that
                 // connected to us in the meantime. Close the redundant
-                // socket before it becomes a second live link.
+                // socket before it becomes a second live link -- but a sweep
+                // that ran into a friend it is already linked to has still
+                // proved discovery works on this network, so credit it
+                // exactly as an authenticated find would. Otherwise every
+                // sweep on a healthy network reports "found nobody" and arms
+                // the expensive full tier.
+                owner?.markSweepFoundFriend(dialedBy: self)
                 abortedDuplicateLink = true
                 throw LanTransportError.duplicateLink
             }
@@ -1157,10 +1216,57 @@ func lanBonjourPeerToken(_ txtRecord: [String: String]) -> String? {
     return token
 }
 
+/// Adds `key` to `keys` unless it is already there or `keys` is already at
+/// `limit`. Returns whether the caller now owns brand-new work for `key`.
+///
+/// Every one of these sets is keyed by something a device on the Wi-Fi
+/// chooses, so "have I seen this before?" cannot bound them on a busy or
+/// hostile network. At the limit the answer becomes a flat no: the caller
+/// skips the extra work rather than tracking more keys.
+func claimBoundedLanKey(_ keys: inout Set<String>, _ key: String, limit: Int) -> Bool {
+    guard keys.count < limit else { return false }
+    return keys.insert(key).inserted
+}
+
+/// Whether a connection dialed by the sweep at `sweepGeneration` may still
+/// credit that sweep with a find. A handshake can finish after its own sweep
+/// completed, was cancelled, or was replaced by a newer one; crediting then
+/// would either do nothing useful or, worse, mark a sweep that never met the
+/// peer. A connection no sweep dialed (`nil`) never credits one.
+func lanSweepCreditApplies(sweepGeneration: UUID?, runningSweepGeneration: UUID?) -> Bool {
+    guard let sweepGeneration, let runningSweepGeneration else { return false }
+    return sweepGeneration == runningSweepGeneration
+}
+
+/// Whether a contact that once demonstrated LAN support should still keep the
+/// automatic sweep running. Capability itself never expires -- a contact who
+/// supports LAN endpoints always will -- but "might be on this Wi-Fi right
+/// now" does, and that is what the sweep is spending battery on. Without a
+/// bound, one family member who stayed ashore keeps every remaining phone
+/// sweeping the subnet forever.
+///
+/// `lanCapabilityRecencyWindowMs` is deliberately generous: any LAN link, any
+/// endpoint hint over Bluetooth, and any hint through the relay all refresh
+/// the timestamp, so a contact who is genuinely nearby re-motivates sweeps
+/// within seconds of the first contact of a trip. A contact with no such
+/// evidence for two weeks is not worth a subnet sweep every five minutes.
+func lanCapabilityMotivatesScan(
+    lastSupportedAtMs: Int64?,
+    nowMs: Int64,
+    windowMs: Int64 = lanCapabilityRecencyWindowMs
+) -> Bool {
+    guard let lastSupportedAtMs else { return false }
+    return nowMs - lastSupportedAtMs < windowMs
+}
+
+/// Two weeks; see `lanCapabilityMotivatesScan`.
+let lanCapabilityRecencyWindowMs: Int64 = 14 * 24 * 60 * 60 * 1_000
+
 /// Whether the periodic check may claim a scan from `LanScanPlanner`. A scan
 /// is worthwhile while the transport has no links at all, OR while some
-/// contact that has demonstrated LAN support still has no authenticated LAN
-/// link -- one connected family member must not stop discovery of the rest.
+/// contact that has recently demonstrated LAN support still has no
+/// authenticated LAN link (`lanCapabilityMotivatesScan`) -- one connected
+/// family member must not stop discovery of the rest.
 /// In-flight work (pending outbound attempts, a running sweep) always defers.
 func shouldRunAutomaticLanScan(
     activeConnections: Int,
