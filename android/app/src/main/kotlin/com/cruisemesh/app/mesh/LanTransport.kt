@@ -117,8 +117,13 @@ internal class LanTransport(
     // Outbound service keys whose connection completed the Noise handshake.
     // outboundServiceKeys retains a key for the whole life of a healthy
     // outbound link, so "attempts still in flight" for the automatic-scan
-    // gate is the difference between the two.
-    private val authenticatedOutboundCount = AtomicInteger(0)
+    // gate is the set of outbound keys not yet in here. Tracking the
+    // authenticated keys themselves rather than a count keeps the gate
+    // self-correcting: clearing both sets on teardown while connections are
+    // still winding down leaves a late per-connection cleanup as a harmless
+    // no-op, where a counter would be driven below zero and wedge the gate
+    // shut for the life of the process.
+    private val authenticatedOutboundKeys = ConcurrentHashMap.newKeySet<String>()
 
     // Consecutive completed sweeps whose verdict was ISOLATION_SUSPECTED. A
     // single congested sweep can look isolated (every probe timing out), so
@@ -160,8 +165,10 @@ internal class LanTransport(
         if (
             shouldRunAutomaticLanScan(
                 activeConnections = connections.size,
-                pendingOutboundAttempts =
-                (outboundServiceKeys.size - authenticatedOutboundCount.get()).coerceAtLeast(0),
+                pendingOutboundAttempts = pendingLanOutboundAttempts(
+                    outboundServiceKeys,
+                    authenticatedOutboundKeys,
+                ),
                 scanRemaining = runningSweep?.outcomes?.remainingCandidates() ?: 0,
                 unlinkedCapableContacts = unlinkedCapableContacts(),
             )
@@ -795,7 +802,7 @@ internal class LanTransport(
             outboundServiceKey?.let(connectionBackoff::recordSuccess)
             authenticated = true
             if (outboundServiceKey != null) {
-                authenticatedOutboundCount.incrementAndGet()
+                authenticatedOutboundKeys += outboundServiceKey
                 if (outboundServiceKey.startsWith("scan:")) {
                     // Only an authenticated friend counts as a sweep find --
                     // see onScanCompleted. Harmless no-op if the sweep has
@@ -851,7 +858,7 @@ internal class LanTransport(
             releaseSocketSlot()
             outboundServiceKey?.let {
                 outboundServiceKeys.remove(it)
-                if (authenticated) authenticatedOutboundCount.decrementAndGet()
+                authenticatedOutboundKeys.remove(it)
                 if (abortedDuplicateLink) {
                     // Not a failure: the contact already has a live LAN
                     // link. No backoff, no reconnect -- rediscovery covers
@@ -1097,7 +1104,7 @@ internal class LanTransport(
         knownPeerInstanceTokens.clear()
         electionFallbackKeys.clear()
         consecutiveIsolationVerdicts.set(0)
-        authenticatedOutboundCount.set(0)
+        authenticatedOutboundKeys.clear()
         reconnectTargets.clear()
         outboundServiceKeys.clear()
         serverSocket?.closeQuietly()
@@ -1343,6 +1350,18 @@ internal fun shouldInitiateLanConnection(localToken: String, remoteToken: String
     localToken != remoteToken && localToken < remoteToken
 
 /**
+ * Outbound connection attempts that have not reached an authenticated link
+ * yet: every dialled service key without a live authenticated connection.
+ * Derived from the two live sets rather than tracked as a running total, so
+ * the result can never drift below zero and permanently close the
+ * automatic-scan gate.
+ */
+internal fun pendingLanOutboundAttempts(
+    outboundServiceKeys: Set<String>,
+    authenticatedOutboundKeys: Set<String>,
+): Int = outboundServiceKeys.count { it !in authenticatedOutboundKeys }
+
+/**
  * Whether the periodic check may claim a scan from [LanScanPlanner]. A scan
  * is worthwhile while the transport has no links at all, OR while some
  * contact that has demonstrated LAN support still has no authenticated LAN
@@ -1355,8 +1374,10 @@ internal fun shouldRunAutomaticLanScan(
     scanRemaining: Int,
     unlinkedCapableContacts: Int,
 ): Boolean = (activeConnections == 0 || unlinkedCapableContacts > 0) &&
-    pendingOutboundAttempts == 0 &&
-    scanRemaining == 0
+    // <= 0, not == 0: a caller that ever miscounts in-flight work low must
+    // slow discovery down, never disable it.
+    pendingOutboundAttempts <= 0 &&
+    scanRemaining <= 0
 
 internal fun shouldRetainLanReconnectTarget(
     serviceKey: String,
