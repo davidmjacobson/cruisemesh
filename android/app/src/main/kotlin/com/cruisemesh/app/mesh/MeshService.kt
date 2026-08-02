@@ -678,6 +678,25 @@ class MeshService : Service() {
         // callbacks, so clear the router's mappings wholesale.
         MeshRouter.reset()
         MeshConnectivityStatus.clear()
+        // Belt to the stopForeground brace above, and the last word in this
+        // teardown: stopForeground only removes a notification while the
+        // service still *is* foreground, so it cannot undo a plain notify()
+        // that landed after the service left that state -- and there is a real
+        // window for one. stopSelf() does not destroy the service inline; it
+        // posts, so ACTION_STOP's stopForeground/stopSelf pair (see
+        // onStartCommand) and this method are two separate main-looper turns,
+        // with both broadcast receivers still registered in between and
+        // `running` still true, which is exactly what the refresh guard keys
+        // on. An A2DP or Bluetooth-state broadcast delivered in that gap
+        // re-posts the ongoing notification, and nothing afterwards takes it
+        // down. cancel() is unconditional, so the invariant holds against any
+        // notify() during teardown rather than only the ones known today.
+        // Safe against a restart: a service component's onDestroy always
+        // completes before a new instance's onCreate, so this can never cancel
+        // a successor's notification.
+        runCatching {
+            getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
+        }
         super.onDestroy()
     }
 
@@ -1642,7 +1661,34 @@ class MeshService : Service() {
             .build()
     }
 
+    /**
+     * Updates the ongoing notification in place -- but only while the service
+     * is actually live.
+     *
+     * The guard is the whole point. [onDestroy] removes the notification with
+     * `stopForeground(STOP_FOREGROUND_REMOVE)` and *then*, further down the
+     * same teardown, calls [stopMeshRoles], which ends with a refresh. Without
+     * the guard that refresh re-posted the notification a few milliseconds
+     * after it was removed, from a service that was already dying: tapping
+     * "Stop CruiseMesh" made the notification blink and come straight back,
+     * so the mesh looked like it had refused to stop when it had in fact
+     * stopped. Worse, what came back was an ongoing (undismissable)
+     * notification with no service behind it, and nothing could then take it
+     * down: it arrived by plain notify(), not as a foreground attachment, so
+     * neither teardown's stopForeground nor a second Stop tap touched it (that
+     * tap's fresh service instance no-ops straight back out -- [stopMeshRoles]
+     * early-returns with [meshRolesRunning] false). It survived until the app
+     * was next opened and [clearStaleNotification] reconciled it. Reported by
+     * a tester 2026-08-02.
+     *
+     * Same T21 invariant as the [onDestroy] note: the ongoing mesh
+     * notification must never outlive the service. Removal has to win over
+     * every refresh that teardown itself triggers, so the choke point is
+     * guarded rather than each caller: [running] is cleared as the first
+     * statement of [onDestroy], before anything that can refresh.
+     */
     private fun refreshForegroundNotification() {
+        if (!running) return
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification())
     }
 
