@@ -341,6 +341,16 @@
         }
       }
     },
+    "Checking this network…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Checking this network…"
+          }
+        }
+      }
+    },
     "Checking your Cruise Pass": {
       "localizations": {
         "en": {
@@ -1157,6 +1167,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Local Wi-Fi field tools"
+          }
+        }
+      }
+    },
+    "Local Wi-Fi probes were denied, likely by a VPN or OS policy; nearby delivery will use Bluetooth.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Local Wi-Fi probes were denied, likely by a VPN or OS policy; nearby delivery will use Bluetooth."
           }
         }
       }
@@ -2307,6 +2327,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "They won't be able to message you, and they won't appear as a suggested friend. They won't be told. Scanning their card again unblocks them."
+          }
+        }
+      }
+    },
+    "This Wi-Fi appears to block phone-to-phone traffic; nearby delivery will use Bluetooth.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This Wi-Fi appears to block phone-to-phone traffic; nearby delivery will use Bluetooth."
           }
         }
       }

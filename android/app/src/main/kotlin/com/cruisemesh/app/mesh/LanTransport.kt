@@ -146,6 +146,11 @@ internal class LanTransport(
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private var resolveListener: NsdManager.ResolveListener? = null
     private var resolving = false
+
+    // API 34+ continuous service-info trackers, keyed by service name. Main
+    // handler only; bounded by MAX_SERVICE_INFO_CALLBACKS and cleared with
+    // the other per-network state in teardownNetworkSession.
+    private val serviceInfoCallbacks = mutableMapOf<String, NsdManager.ServiceInfoCallback>()
     private val pendingServices = ArrayDeque<NsdServiceInfo>()
     private val queuedServiceNames = mutableSetOf<String>()
     private val eligibleWifiNetworks = linkedSetOf<Network>()
@@ -983,14 +988,19 @@ internal class LanTransport(
                 val name = serviceInfo.serviceName
                 if (name == requestedServiceName || name == registeredServiceName) return@post
                 if (!queuedServiceNames.add(name)) return@post
-                pendingServices.addLast(serviceInfo)
-                resolveNext()
+                if (supportsServiceInfoCallback(Build.VERSION.SDK_INT)) {
+                    registerServiceInfoCallback(serviceInfo)
+                } else {
+                    pendingServices.addLast(serviceInfo)
+                    resolveNext()
+                }
             }
         }
 
         override fun onServiceLost(serviceInfo: NsdServiceInfo) {
             mainHandler.post {
                 val name = serviceInfo.serviceName
+                unregisterServiceInfoCallback(name)
                 resolvedServices.remove(name)
                 queuedServiceNames.remove(name)
             }
@@ -1003,6 +1013,154 @@ internal class LanTransport(
         }
 
         override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = Unit
+    }
+
+    /**
+     * Service info arrived for a discovered peer, from either resolution
+     * path (the deprecated one-shot resolve below API 34, or the continuous
+     * service-info callback above it). Both paths must behave identically:
+     * TXT version/token validation, the per-network-join peer-evidence
+     * dedup, the initiator election, and the election fallback for the
+     * tie-break loser all live here so neither path can drift.
+     *
+     * Called on the main handler.
+     */
+    private fun handleResolvedService(serviceInfo: NsdServiceInfo) {
+        if (!started) return
+        val token = serviceInfo.attributes[TXT_INSTANCE]?.toString(Charsets.UTF_8)
+        val version = serviceInfo.attributes[TXT_VERSION]?.toString(Charsets.UTF_8)
+        if (
+            token == null ||
+            version != "1" ||
+            serviceInfo.port !in 1..65_535 ||
+            (
+                supportsNetworkScopedServiceInfo() &&
+                    networkCompat(serviceInfo) != null &&
+                    networkCompat(serviceInfo) != wifiNetwork
+                )
+        ) {
+            return
+        }
+        // Only genuinely NEW evidence resets the sweep backoff -- an
+        // already-connected/linked peer's NSD record keeps reappearing here
+        // (re-resolves, service-info updates, periodic discovery updates)
+        // and must not keep re-triggering full sweeps.
+        if (knownPeerInstanceTokens.add(token)) {
+            scanPlanner.onPeerEvidence(System.currentTimeMillis())
+            LanTransportDiagnostics.peerEvidence()
+            scheduleAutomaticSubnetScan(PEER_EVIDENCE_SCAN_DELAY_MS)
+        }
+        if (shouldInitiateLanConnection(instanceToken, token)) {
+            connectToService(serviceInfo)
+        } else {
+            val endpoints = resolvedHosts(serviceInfo)
+                .map { InetSocketAddress(it, serviceInfo.port) }
+            Log.i(
+                TAG,
+                "Resolved LAN peer ${
+                    endpoints.firstOrNull()?.let(::endpointDisplay)
+                        ?: serviceInfo.serviceName
+                }; awaiting their connection (tie-break)",
+            )
+            scheduleElectionFallback(
+                key = serviceInfo.serviceName,
+                endpoints = endpoints,
+                expectedUserId = null,
+            )
+        }
+    }
+
+    /**
+     * API 34+ replacement for [resolveNext]'s deprecated one-shot resolve.
+     *
+     * `registerServiceInfoCallback` keeps delivering service info for as long
+     * as the record lives, so a slow or failed first resolve no longer drops
+     * the peer until mDNS refreshes it. Live callbacks are bounded
+     * ([MAX_SERVICE_INFO_CALLBACKS]) and unregistered on service loss and
+     * network teardown. If registration is rejected the service falls back to
+     * the deprecated queue so discovery still works.
+     *
+     * Called on the main handler.
+     */
+    @SuppressLint("NewApi")
+    private fun registerServiceInfoCallback(found: NsdServiceInfo) {
+        val name = found.serviceName
+        if (serviceInfoCallbacks.containsKey(name)) return
+        if (serviceInfoCallbacks.size >= MAX_SERVICE_INFO_CALLBACKS) {
+            Log.d(TAG, "Ignoring LAN service: already tracking the maximum number of peers")
+            queuedServiceNames.remove(name)
+            return
+        }
+        val request = NsdServiceInfo().apply {
+            serviceName = name
+            serviceType = lanServiceType()
+            wifiNetwork?.let { network ->
+                if (supportsNetworkScopedServiceInfo()) setNetworkCompat(this, network)
+            }
+        }
+        lateinit var callback: NsdManager.ServiceInfoCallback
+        callback = object : NsdManager.ServiceInfoCallback {
+            override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+                mainHandler.post {
+                    if (serviceInfoCallbacks[name] !== callback) return@post
+                    // Never registered, so it must not be unregistered.
+                    serviceInfoCallbacks.remove(name)
+                    Log.w(TAG, "LAN service info callback registration failed: $errorCode")
+                    fallBackToDeprecatedResolve(found)
+                }
+            }
+
+            override fun onServiceUpdated(serviceInfo: NsdServiceInfo) {
+                mainHandler.post {
+                    if (serviceInfoCallbacks[name] !== callback) return@post
+                    handleResolvedService(serviceInfo)
+                }
+            }
+
+            override fun onServiceLost() {
+                mainHandler.post {
+                    if (serviceInfoCallbacks[name] !== callback) return@post
+                    unregisterServiceInfoCallback(name)
+                    resolvedServices.remove(name)
+                    queuedServiceNames.remove(name)
+                }
+            }
+
+            override fun onServiceInfoCallbackUnregistered() = Unit
+        }
+        serviceInfoCallbacks[name] = callback
+        try {
+            nsdManager.registerServiceInfoCallback(request, appContext.mainExecutor, callback)
+        } catch (error: RuntimeException) {
+            serviceInfoCallbacks.remove(name)
+            Log.d(TAG, "Unable to track LAN service info", error)
+            fallBackToDeprecatedResolve(found)
+        }
+    }
+
+    /**
+     * The API 34+ registration was rejected for this service. Discovery must
+     * not simply lose the peer, so hand it to the deprecated one-shot resolve
+     * that every pre-34 device already uses.
+     */
+    private fun fallBackToDeprecatedResolve(found: NsdServiceInfo) {
+        if (!started || !queuedServiceNames.contains(found.serviceName)) return
+        pendingServices.addLast(found)
+        resolveNext()
+    }
+
+    @SuppressLint("NewApi")
+    private fun unregisterServiceInfoCallback(name: String) {
+        // Teardown paths call this on every API level; below 34 nothing was
+        // ever registered and the platform type must not be touched at all.
+        if (!supportsServiceInfoCallback(Build.VERSION.SDK_INT)) return
+        val callback = serviceInfoCallbacks.remove(name) ?: return
+        try {
+            nsdManager.unregisterServiceInfoCallback(callback)
+        } catch (_: RuntimeException) {
+            // Not registered or already unregistered; a late callback is
+            // ignored because the map no longer holds it.
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -1022,47 +1180,7 @@ internal class LanTransport(
             override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
                 mainHandler.post {
                     resolving = false
-                    val token = serviceInfo.attributes[TXT_INSTANCE]?.toString(Charsets.UTF_8)
-                    val version = serviceInfo.attributes[TXT_VERSION]?.toString(Charsets.UTF_8)
-                    if (
-                        token != null &&
-                        version == "1" &&
-                        serviceInfo.port in 1..65_535 &&
-                        (
-                            !supportsNetworkScopedServiceInfo() ||
-                                networkCompat(serviceInfo) == null ||
-                                networkCompat(serviceInfo) == wifiNetwork
-                            )
-                    ) {
-                        // Only genuinely NEW evidence resets the sweep
-                        // backoff -- an already-connected/linked peer's NSD
-                        // record keeps reappearing here (re-resolves,
-                        // periodic discovery updates) and must not keep
-                        // re-triggering full sweeps.
-                        if (knownPeerInstanceTokens.add(token)) {
-                            scanPlanner.onPeerEvidence(System.currentTimeMillis())
-                            LanTransportDiagnostics.peerEvidence()
-                            scheduleAutomaticSubnetScan(PEER_EVIDENCE_SCAN_DELAY_MS)
-                        }
-                        if (shouldInitiateLanConnection(instanceToken, token)) {
-                            connectToService(serviceInfo)
-                        } else {
-                            val endpoints = resolvedHosts(serviceInfo)
-                                .map { InetSocketAddress(it, serviceInfo.port) }
-                            Log.i(
-                                TAG,
-                                "Resolved LAN peer ${
-                                    endpoints.firstOrNull()?.let(::endpointDisplay)
-                                        ?: serviceInfo.serviceName
-                                }; awaiting their connection (tie-break)",
-                            )
-                            scheduleElectionFallback(
-                                key = serviceInfo.serviceName,
-                                endpoints = endpoints,
-                                expectedUserId = null,
-                            )
-                        }
-                    }
+                    handleResolvedService(serviceInfo)
                     resolveNext()
                 }
             }
@@ -1089,6 +1207,8 @@ internal class LanTransport(
         registrationListener = null
         resolveListener = null
         resolving = false
+        serviceInfoCallbacks.keys.toList().forEach(::unregisterServiceInfoCallback)
+        serviceInfoCallbacks.clear()
         pendingServices.clear()
         queuedServiceNames.clear()
         requestedServiceName = null
@@ -1254,6 +1374,12 @@ internal class LanTransport(
         private const val TXT_VERSION = "v"
         private const val TXT_INSTANCE = "i"
         private const val MAX_CONNECTIONS = 8
+
+        // Live API 34+ service-info callbacks. Each one is a standing
+        // platform registration, so the count is bounded the same way live
+        // sockets are; a network with more advertisers than this falls back
+        // to whichever peers were discovered first.
+        private const val MAX_SERVICE_INFO_CALLBACKS = 8
         private const val CONNECT_TIMEOUT_MS = 3_000
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
         private const val SCAN_CONNECT_TIMEOUT_MS = 350

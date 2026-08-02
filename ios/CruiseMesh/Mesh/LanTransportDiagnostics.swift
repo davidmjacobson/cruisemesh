@@ -19,6 +19,10 @@ struct LanTransportSnapshot {
     /// rather than ordinary transient waiting. See
     /// `LanTransport.evaluatePermissionWarning()`.
     var localNetworkPermissionLikelyDenied = false
+    /// What the last completed subnet sweep says about this network. Only a
+    /// sweep that probed every candidate can set it; peer evidence and a
+    /// network change clear it. See `LanSweepDisplayTracker`.
+    var sweepDisplayState = LanSweepDisplayState.none
 }
 
 final class LanTransportDiagnostics: ObservableObject {
@@ -32,6 +36,7 @@ final class LanTransportDiagnostics: ObservableObject {
     private var probeRequester: (() -> String?)?
     private var scanRequester: (() -> String?)?
     private var activePeers: [String: String] = [:]
+    private let sweepDisplayTracker = LanSweepDisplayTracker()
 
     private init() {}
 
@@ -96,7 +101,23 @@ final class LanTransportDiagnostics: ObservableObject {
         lock.lock()
         activePeers.removeAll()
         lock.unlock()
-        publish { _ in LanTransportSnapshot() }
+        let sweepState = sweepDisplayTracker.onNetworkLost()
+        publish { _ in
+            var next = LanTransportSnapshot()
+            next.sweepDisplayState = sweepState
+            return next
+        }
+    }
+
+    /// A LAN session came up on a (new or rejoined) network: any verdict from
+    /// the previous network is stale, so the display goes back to checking.
+    func networkJoined() {
+        let sweepState = sweepDisplayTracker.onNetworkJoined()
+        publish {
+            var next = $0
+            next.sweepDisplayState = sweepState
+            return next
+        }
     }
 
     func listening(localEndpoint: String?) {
@@ -144,11 +165,25 @@ final class LanTransportDiagnostics: ObservableObject {
         activePeers[address] = peerName
         let names = Array(Set(activePeers.values)).sorted()
         lock.unlock()
+        let sweepState = sweepDisplayTracker.onPeerEvidence()
         publish {
             var next = $0
             next.state = "Secure local Wi-Fi link active"
             next.activePeerNames = names
             next.lastError = nil
+            next.sweepDisplayState = sweepState
+            return next
+        }
+    }
+
+    /// A peer is demonstrably on this network right now (a discovery record
+    /// or an endpoint hint), so no sweep verdict about it being empty or
+    /// isolated can still be true.
+    func peerEvidence() {
+        let sweepState = sweepDisplayTracker.onPeerEvidence()
+        publish {
+            var next = $0
+            next.sweepDisplayState = sweepState
             return next
         }
     }
@@ -214,11 +249,24 @@ final class LanTransportDiagnostics: ObservableObject {
     }
 
     func scanStarted(total: Int) {
+        let sweepState = sweepDisplayTracker.onSweepStarted()
         publish {
             var next = $0
             next.scanProgress = 0
             next.scanTotal = total
             next.lastError = nil
+            next.sweepDisplayState = sweepState
+            return next
+        }
+    }
+
+    /// Every candidate of a sweep retired. Only a completed sweep can produce
+    /// a verdict, so this is the sole entry point for one.
+    func sweepCompleted(_ summary: LanSweepOutcomeSummary) {
+        let sweepState = sweepDisplayTracker.onSweepCompleted(summary)
+        publish {
+            var next = $0
+            next.sweepDisplayState = sweepState
             return next
         }
     }

@@ -19,6 +19,18 @@ internal fun supportsNetworkScopedServiceInfo(
             )
 
 /**
+ * `NsdManager.registerServiceInfoCallback` is available in Android 14.
+ *
+ * It replaces the deprecated one-shot `resolveService`: the platform keeps
+ * pushing service-info updates instead of answering once and leaving a failed
+ * resolve to drop the peer until its record refreshes. Unlike
+ * [supportsNetworkScopedServiceInfo] there is no T extension backport, so this
+ * is a plain SDK-level check.
+ */
+internal fun supportsServiceInfoCallback(sdkInt: Int): Boolean =
+    sdkInt >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+
+/**
  * `DiscoveryRequest` is available in Android 15 or T extension 12.
  */
 internal fun supportsNetworkScopedDiscovery(

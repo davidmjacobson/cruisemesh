@@ -52,6 +52,11 @@ final class LanTransport {
     private var runningScan: RunningScan?
     private var scanConnections: [UUID: NWConnection] = [:]
     private var automaticScanWorkItem: DispatchWorkItem?
+    /// Consecutive completed sweeps whose verdict was `.isolationSuspected`.
+    /// A single congested sweep can look isolated (every probe timing out),
+    /// so the planner is only told to back off to its cap once the verdict
+    /// repeats. Reset on a network change and by any other verdict.
+    private var consecutiveIsolationVerdicts = 0
 
     // FI7: track how long the browser/listener has been stuck `.waiting`
     // so a denied Local Network permission (which iOS reports only as a
@@ -120,6 +125,7 @@ final class LanTransport {
             automaticScanWorkItem = nil
             cancelRunningScan(updateDiagnostics: false)
             scanPlanner.onNetworkLost()
+            consecutiveIsolationVerdicts = 0
             activeNetwork = nil
             announcedEndpoint = nil
             announcedNetworkId = nil
@@ -162,6 +168,7 @@ final class LanTransport {
                 // initiator) must not re-trigger it.
                 if peerEvidenceSeenKeys.insert(key).inserted {
                     scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
+                    diagnostics.peerEvidence()
                     scheduleAutomaticScan(after: Self.peerEvidenceScanDelay)
                 }
                 if !shouldInitiateLanConnection(
@@ -349,7 +356,9 @@ final class LanTransport {
             activeNetwork = network
             announcedEndpoint = nil
             announcedNetworkId = nil
+            consecutiveIsolationVerdicts = 0
             scanPlanner.onNetworkJoined(nowMs: Self.nowMs)
+            diagnostics.networkJoined()
             scheduleAutomaticScan(after: Self.initialAutomaticScanDelay)
         }
         guard let port = listener?.port else { return }
@@ -369,6 +378,7 @@ final class LanTransport {
         activeNetwork = nil
         announcedEndpoint = nil
         announcedNetworkId = nil
+        consecutiveIsolationVerdicts = 0
         scanPlanner.onNetworkLost()
         automaticScanWorkItem?.cancel()
         automaticScanWorkItem = nil
@@ -417,6 +427,7 @@ final class LanTransport {
             // and must not keep re-triggering full sweeps.
             if peerEvidenceSeenKeys.insert(key).inserted {
                 scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
+                diagnostics.peerEvidence()
                 scheduleAutomaticScan(after: Self.peerEvidenceScanDelay)
             }
             guard shouldInitiateLanConnection(
@@ -664,13 +675,22 @@ final class LanTransport {
                     self.connect(to: endpoint, serviceKey: key)
                     // A bare TCP connect is not a find -- only the Noise
                     // handshake authenticating a friend marks the sweep
-                    // (see connectionAuthenticated).
-                    self.scanCandidateCompleted(generation: generation, foundPeer: false)
-                case .failed, .cancelled:
+                    // (see connectionAuthenticated). It is still a
+                    // `.connected` probe outcome: the network carried it.
+                    self.scanCandidateCompleted(generation: generation, outcome: .connected)
+                case .failed(let error):
                     completed = true
                     connection.cancel()
                     self.scanConnections.removeValue(forKey: id)
-                    self.scanCandidateCompleted(generation: generation, foundPeer: false)
+                    self.scanCandidateCompleted(
+                        generation: generation,
+                        outcome: classifyLanSweepProbeFailure(error)
+                    )
+                case .cancelled:
+                    completed = true
+                    connection.cancel()
+                    self.scanConnections.removeValue(forKey: id)
+                    self.scanCandidateCompleted(generation: generation, outcome: .other)
                 default:
                     break
                 }
@@ -685,21 +705,39 @@ final class LanTransport {
             completed = true
             connection.cancel()
             scanConnections.removeValue(forKey: id)
-            scanCandidateCompleted(generation: generation, foundPeer: false)
+            // Our own attempt timeout: the probe went out and nothing came
+            // back, which is the signal a client-isolated network produces.
+            scanCandidateCompleted(generation: generation, outcome: .timedOut)
         }
     }
 
-    private func scanCandidateCompleted(generation: UUID, foundPeer: Bool) {
+    /// One candidate of the running sweep retired. When it was the last one,
+    /// the tallied outcomes become the sweep verdict: `foundPeer` (an
+    /// authenticated friend, set by `connectionAuthenticated`) still decides
+    /// whether the full-subnet tier arms, while the verdict decides what
+    /// diagnostics says and whether the planner should defer to its backoff
+    /// cap.
+    private func scanCandidateCompleted(generation: UUID, outcome: LanSweepProbeOutcome) {
         guard var scan = runningScan, scan.generation == generation else { return }
         scan.remaining = max(scan.remaining - 1, 0)
-        if foundPeer { scan.foundPeer = true }
+        scan.outcomes.record(outcome)
         diagnostics.scanAdvanced()
         if scan.remaining == 0 {
             runningScan = nil
             scanPlanner.onScanCompleted(scan.breadth, nowMs: Self.nowMs, foundPeer: scan.foundPeer)
-            log.info(
-                "Sweep complete (/\(scan.prefixLength)): \(scan.candidates.count) probed, \(scan.foundPeer ? "peer found" : "empty")."
-            )
+            log.info("\(scan.outcomes.logLine(prefixLength: scan.prefixLength), privacy: .public)")
+            diagnostics.sweepCompleted(scan.outcomes)
+            if lanSweepVerdict(scan.outcomes) == .isolationSuspected {
+                // One congested sweep can time out every probe and look
+                // isolated; only a repeat verdict jumps the planner to its
+                // backoff cap.
+                consecutiveIsolationVerdicts += 1
+                if consecutiveIsolationVerdicts >= Self.isolationConfirmSweeps {
+                    scanPlanner.onIsolationSuspected(nowMs: Self.nowMs)
+                }
+            } else {
+                consecutiveIsolationVerdicts = 0
+            }
             if scan.breadth == .local24 {
                 scheduleAutomaticScan(after: Self.escalateAutomaticScanDelay)
             }
@@ -857,6 +895,9 @@ final class LanTransport {
     /// Prompt scan-check pull-forward when fresh peer evidence arrives; the
     /// planner and loneliness gate still decide whether anything runs.
     private static let peerEvidenceScanDelay: DispatchTimeInterval = .seconds(2)
+    /// Consecutive `.isolationSuspected` sweep verdicts required before the
+    /// planner defers full sweeps to its backoff cap.
+    private static let isolationConfirmSweeps = 2
 
     private static var nowMs: Int64 {
         Int64(Date().timeIntervalSince1970 * 1_000)
@@ -869,6 +910,10 @@ final class LanTransport {
         let candidates: [String]
         var nextCandidateIndex: Int
         var remaining: Int
+        /// Tally of how each probe finished, which becomes the sweep verdict
+        /// once the last candidate retires. Only touched on the transport
+        /// queue.
+        var outcomes = LanSweepOutcomeSummary()
         /// Whether a "scan:"-keyed connection authenticated an accepted
         /// friend while this sweep ran -- feeds `LanScanPlanner
         /// .onScanCompleted`'s `foundPeer`, which decides whether an empty
