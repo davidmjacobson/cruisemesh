@@ -77,20 +77,32 @@ class LanTransportTest {
 
     @Test
     fun `automatic subnet fallback runs only while LAN discovery is idle`() {
-        assertTrue(shouldRunAutomaticLanScan(0, 0, 0))
-        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0))
-        assertTrue(!shouldRunAutomaticLanScan(0, 1, 0))
-        assertTrue(!shouldRunAutomaticLanScan(0, 0, 12))
+        assertTrue(shouldRunAutomaticLanScan(0, 0, 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(0, 1, 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(0, 0, 12, 0))
     }
 
     @Test
     fun `automatic subnet fallback gate rejects when every busy signal is set`() {
-        assertTrue(!shouldRunAutomaticLanScan(2, 3, 41))
+        assertTrue(!shouldRunAutomaticLanScan(2, 3, 41, 0))
     }
 
     @Test
     fun `automatic subnet fallback gate treats one remaining scan host as busy`() {
-        assertTrue(!shouldRunAutomaticLanScan(0, 0, 1))
+        assertTrue(!shouldRunAutomaticLanScan(0, 0, 1, 0))
+    }
+
+    @Test
+    fun `an unlinked LAN-capable contact keeps the sweep gate open despite live links`() {
+        // One connected family member must not stop discovery of the rest.
+        assertTrue(shouldRunAutomaticLanScan(1, 0, 0, 1))
+        assertTrue(shouldRunAutomaticLanScan(3, 0, 0, 2))
+        // But in-flight work still defers, links or not.
+        assertTrue(!shouldRunAutomaticLanScan(1, 1, 0, 1))
+        assertTrue(!shouldRunAutomaticLanScan(1, 0, 7, 1))
+        // Everyone capable is linked: nothing left to sweep for.
+        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0, 0))
     }
 
     @Test

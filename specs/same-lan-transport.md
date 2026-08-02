@@ -31,9 +31,14 @@ does not implement this transport remains fully compatible over BLE and relay.
   subnet are not persisted.
 - A peer that has demonstrated `LAN_ENDPOINT` support may receive a short-lived
   endpoint hint through its existing end-to-end-encrypted relay mailbox. The
-  hint expires after 15 minutes and is used only when both devices derive the
-  same network fingerprint. This allows two accepted contacts on the same LAN
-  to find each other before BLE or mDNS succeeds.
+  hint expires after 15 minutes. A fresh hint is dialed whenever the receiver
+  is on any Wi-Fi network: the network fingerprint is stored with the cached
+  endpoint but does not gate the dial, because routed multi-subnet LANs (the
+  case the hint exists for) produce different fingerprints on each client
+  subnet. A cross-network false positive costs one bounded TCP attempt to an
+  endpoint the contact sealed pairwise, and the Noise handshake still
+  authenticates. This allows two accepted contacts on the same LAN to find
+  each other before BLE or mDNS succeeds.
 - A manual `IP[:port]` field and endpoint QR are available for diagnosis when
   automatic discovery is unavailable.
 - The user may explicitly search the phone's current IPv4 `/24`. The search is
@@ -105,8 +110,13 @@ parser and mesh sync path exactly as if BLE had reassembled it.
 - Accept, connect, handshake, and idle operations use short timeouts.
 - Concurrent accepted/connecting sockets are bounded.
 - The random discovery tokens are compared lexicographically so exactly one
-  side initiates for each device pair. Duplicate connections remain safe:
-  `msg_id` deduplication and per-peer sync digests make delivery idempotent.
+  side initiates for each device pair. Discovery is often asymmetric (one
+  side resolves the other, but not vice versa), so the electing loser does
+  not wait forever: if the expected connection has not arrived after 15
+  seconds it initiates anyway. Duplicate connections remain safe: `msg_id`
+  deduplication and per-peer sync digests make delivery idempotent, and an
+  initiator that learns mid-handshake that the contact already has a live
+  LAN link closes the redundant socket before it becomes a second link.
 - Socket writes are serialized per connection so Noise record nonces and frame
   chunks remain ordered.
 - Reconnect attempts use exponential backoff. Authenticated links exchange

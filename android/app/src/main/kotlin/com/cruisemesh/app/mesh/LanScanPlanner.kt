@@ -25,9 +25,12 @@ internal enum class LanScanBreadth {
  *    DHCP tends to cluster leases, so a peer that joined around the same time
  *    is disproportionately likely to be in our /24.
  *  - [LanScanBreadth.FULL_SUBNET] only ever becomes eligible after a /24
- *    sweep on this network join has completed and found *zero* peers
- *    ([onScanCompleted]'s `foundPeer`) -- a /24 sweep that finds a peer never
- *    arms it, since that peer is already proof discovery works here. Once
+ *    sweep on this network join has completed and authenticated *zero*
+ *    friends ([onScanCompleted]'s `foundPeer`) -- a sweep that produced an
+ *    authenticated friend never arms it, since that friend is proof
+ *    discovery works here. A bare TCP connect deliberately does not count:
+ *    an unrelated service (or a stranger's CruiseMesh) on the default port
+ *    must not disarm the wider sweep. Once
  *    eligible it waits a real delay ([emptyLocalSweepFullDelayMs], default
  *    60s) before firing, then backs off further ([fullBackoffMs]) each time
  *    it runs and still finds nobody. [onPeerEvidence] (an NSD resolution or
@@ -91,10 +94,11 @@ internal class LanScanPlanner(
 
     /**
      * A sweep of [breadth] finished probing every candidate; [foundPeer]
-     * reports whether any candidate answered. Only a /24 sweep that found
-     * nobody arms the full tier for the first time -- a /24 sweep that finds
-     * a peer, or one that runs after the tier is already armed, leaves the
-     * existing full-sweep schedule untouched.
+     * reports whether the sweep authenticated an accepted friend (not
+     * merely whether some TCP service answered). Only a /24 sweep that
+     * authenticated nobody arms the full tier for the first time -- one
+     * that found a friend, or one that runs after the tier is already
+     * armed, leaves the existing full-sweep schedule untouched.
      */
     @Synchronized
     fun onScanCompleted(breadth: LanScanBreadth, nowMs: Long, foundPeer: Boolean) {
