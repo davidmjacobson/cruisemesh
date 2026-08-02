@@ -1642,7 +1642,30 @@ class MeshService : Service() {
             .build()
     }
 
+    /**
+     * Updates the ongoing notification in place -- but only while the service
+     * is actually live.
+     *
+     * The guard is the whole point. [onDestroy] removes the notification with
+     * `stopForeground(STOP_FOREGROUND_REMOVE)` and *then*, further down the
+     * same teardown, calls [stopMeshRoles], which ends with a refresh. Without
+     * the guard that refresh re-posted the notification a few milliseconds
+     * after it was removed, from a service that was already dying: tapping
+     * "Stop CruiseMesh" made the notification blink and come straight back,
+     * so the mesh looked like it had refused to stop when it had in fact
+     * stopped. Worse, what came back was an ongoing (undismissable)
+     * notification with no service behind it, and tapping Stop on it just ran
+     * the same cycle again -- unclearable until the app was reopened
+     * ([clearStaleNotification]). Reported by a tester 2026-08-02.
+     *
+     * Same T21 invariant as the [onDestroy] note: the ongoing mesh
+     * notification must never outlive the service. Removal has to win over
+     * every refresh that teardown itself triggers, so the choke point is
+     * guarded rather than each caller: [running] is cleared as the first
+     * statement of [onDestroy], before anything that can refresh.
+     */
     private fun refreshForegroundNotification() {
+        if (!running) return
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification())
     }
 
