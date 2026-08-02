@@ -164,7 +164,11 @@ final class LanTransport {
     func connect(_ endpoint: LanManualEndpoint, remoteInstanceToken: Data? = nil, manual: Bool = false) {
         queue.async { [weak self] in
             guard let self, started else { return }
-            let key = "endpoint:\(endpoint.display)"
+            // A hinted address came from the contact, not from anything this
+            // phone observed, so it gets its own single-shot key.
+            let key = remoteInstanceToken == nil
+                ? "endpoint:\(endpoint.display)"
+                : lanHintConnectKey(endpoint.display)
             let networkEndpoint = NWEndpoint.hostPort(
                 host: NWEndpoint.Host(endpoint.host),
                 port: NWEndpoint.Port(rawValue: endpoint.port) ?? .any
@@ -182,7 +186,12 @@ final class LanTransport {
                     return
                 }
             }
-            discoveredEndpoints[key] = networkEndpoint
+            // Only a key this phone found itself is remembered for retry;
+            // without a remembered endpoint the retry after a failed hint
+            // dial finds nothing and stops there.
+            if !isSingleShotLanConnectKey(key) {
+                discoveredEndpoints[key] = networkEndpoint
+            }
             if manual { reconnectAttempts[key] = 0 }
             diagnostics.discovered(endpoint.display)
             connect(to: networkEndpoint, serviceKey: key)
@@ -464,7 +473,9 @@ final class LanTransport {
                   activeNetwork != nil,
                   outboundAddresses[key] == nil else { return }
             log.debug("Tie-break peer never connected; initiating ourselves")
-            discoveredEndpoints[key] = endpoint
+            if !isSingleShotLanConnectKey(key) {
+                discoveredEndpoints[key] = endpoint
+            }
             connect(to: endpoint, serviceKey: key)
         }
     }

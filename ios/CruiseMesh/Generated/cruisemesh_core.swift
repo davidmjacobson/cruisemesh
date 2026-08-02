@@ -14476,9 +14476,11 @@ public func encodeIntroducedFriendRequest(request: IntroducedFriendRequest) -> D
 /**
  * Encode a LAN endpoint introduction. The opaque 8-byte instance token is
  * the same connection-election value advertised through DNS-SD. The host is
- * an IP literal or local hostname, limited to 255 UTF-8 bytes. A receiver
- * must never trust the hint by itself: the resulting TCP connection still
- * has to authenticate the expected accepted contact through Noise.
+ * the sender's own address on the local network, and only that: an address
+ * literal in a local range (see [`is_local_lan_host`]), never a name. A
+ * receiver must never trust the hint by itself either: the resulting TCP
+ * connection still has to authenticate the expected accepted contact through
+ * Noise.
  */
 public func encodeLanEndpoint(instanceToken: Data, host: String, port: UInt16)throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -14702,6 +14704,23 @@ public func lanEndpointCacheIsFresh(savedAtMs: Int64, nowMs: Int64) -> Bool {
     uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_is_fresh(
         FfiConverterInt64.lower(savedAtMs),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * Whether a host may be dialed as a contact's LAN endpoint: an address
+ * literal on the local network, never a name (see
+ * [`crate::protocol`]'s `is_local_lan_host`, which this delegates to).
+ *
+ * Exported for the endpoint cache in both apps. Cached entries were written
+ * before this rule existed and are never re-checked on the way out, so a
+ * seven-day-old entry could otherwise keep a host alive that a hint may no
+ * longer carry.
+ */
+public func lanEndpointHostIsLocal(host: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_endpoint_host_is_local(
+        FfiConverterString.lower(host),$0
     )
 })
 }
@@ -15831,7 +15850,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_introduced_friend_request() != 7571) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_encode_lan_endpoint() != 43015) {
+    if (uniffi_cruisemesh_core_checksum_func_encode_lan_endpoint() != 45507) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_encode_lan_endpoint_content() != 29267) {
@@ -15886,6 +15905,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_is_fresh() != 25415) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_host_is_local() != 16139) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_max_frame_size() != 29933) {

@@ -235,6 +235,7 @@ use blake2::Blake2bVar;
 use ed25519_dalek::{Signature, Signer, Verifier};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::crypto::{signing_key_from_bytes, verifying_key_from_bytes};
 use crate::identity::derive_user_id;
@@ -389,6 +390,9 @@ const LAN_INSTANCE_TOKEN_LEN: usize = 8;
 const LAN_ENDPOINT_VERSION: u8 = 1;
 const TRANSPORT_PROBE_VERSION: u8 = 1;
 const MAX_LAN_HOST_BYTES: usize = u8::MAX as usize;
+/// Longest interface/scope suffix accepted after `%` in an IPv6 link-local
+/// host ("fe80::1%wlan0"). Real interface names are far shorter.
+const MAX_LAN_HOST_ZONE_BYTES: usize = 32;
 const MESSAGE_EXTENSION_REPLY_TO_MSG_ID: u8 = 1;
 /// Milliseconds in a day, for the [`compute_recipient_hint`] daily-rotating
 /// salt. `pub` (not just `const`) so `engine.rs`'s D2 mule-drain-confirm
@@ -1439,9 +1443,11 @@ pub fn encode_digest(
 
 /// Encode a LAN endpoint introduction. The opaque 8-byte instance token is
 /// the same connection-election value advertised through DNS-SD. The host is
-/// an IP literal or local hostname, limited to 255 UTF-8 bytes. A receiver
-/// must never trust the hint by itself: the resulting TCP connection still
-/// has to authenticate the expected accepted contact through Noise.
+/// the sender's own address on the local network, and only that: an address
+/// literal in a local range (see [`is_local_lan_host`]), never a name. A
+/// receiver must never trust the hint by itself either: the resulting TCP
+/// connection still has to authenticate the expected accepted contact through
+/// Noise.
 #[uniffi::export]
 pub fn encode_lan_endpoint(
     instance_token: Vec<u8>,
@@ -1484,7 +1490,82 @@ fn validate_lan_endpoint_fields(
             "LAN endpoint host is empty, too long, or contains whitespace".to_string(),
         ));
     }
+    if !is_local_lan_host(host) {
+        return Err(CoreError::Malformed(
+            "LAN endpoint host must be a local network address".to_string(),
+        ));
+    }
     Ok(())
+}
+
+/// Whether `host` is something a phone can legitimately advertise as *its own*
+/// address on the local network.
+///
+/// A LAN endpoint hint only ever carries the sender's own LAN address, so the
+/// receiver holds it to exactly that: an address literal in a range that a
+/// phone's own interface address lands in. Two consequences matter:
+///
+/// - **No names.** A hostname would make the receiving phone resolve a string
+///   chosen by someone else before it dials, and DNS resolution is not
+///   something an endpoint hint needs. (The Advanced "connect manually"
+///   field, [`crate::core_parse_lan_endpoint`], is a separate, user-typed
+///   path and still accepts names.)
+/// - **No public addresses.** Nothing off the local network can be this
+///   phone's own LAN address, so a hint may not point at one.
+///
+/// Old senders are unaffected: the addresses both shells actually advertise
+/// (the interface address of the joined Wi-Fi network) already pass.
+///
+/// [`crate::lan_endpoint_host_is_local`] exports this rule to the apps so the
+/// endpoint cache can apply it to entries written before it existed. This
+/// function is the authority; nothing else should restate it.
+pub(crate) fn is_local_lan_host(host: &str) -> bool {
+    // Android hands back Inet6Address.getHostAddress(), which appends the
+    // scope id of a link-local address ("fe80::1%wlan0", or "%3"). Split it
+    // off before parsing and accept it only where it is meaningful.
+    let (literal, zone) = match host.split_once('%') {
+        Some((literal, zone)) => (literal, Some(zone)),
+        None => (host, None),
+    };
+    if let Some(zone) = zone {
+        let plausible_zone = !zone.is_empty()
+            && zone.len() <= MAX_LAN_HOST_ZONE_BYTES
+            && zone
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if !plausible_zone {
+            return false;
+        }
+    }
+    match literal.parse::<IpAddr>() {
+        Ok(IpAddr::V4(addr)) => zone.is_none() && is_local_ipv4(addr),
+        // A scope id belongs to a link-local address; anywhere else it is
+        // noise this phone never emits.
+        Ok(IpAddr::V6(addr)) => (zone.is_none() || is_ipv6_link_local(addr)) && is_local_ipv6(addr),
+        Err(_) => false,
+    }
+}
+
+fn is_local_ipv4(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    // 10/8, 172.16/12, 192.168/16.
+    addr.is_private()
+        // 169.254/16: self-assigned when DHCP is absent, still same-link.
+        || addr.is_link_local()
+        // 100.64/10 (RFC 6598): what shared Wi-Fi -- hotels, ships, campus
+        // networks, phone tethering -- hands its clients when it has run out
+        // of RFC1918 space. A phone's own address genuinely lands here, and
+        // the subnet sweep already treats such a network as local.
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+}
+
+fn is_local_ipv6(addr: Ipv6Addr) -> bool {
+    // fe80::/10 link-local, or fc00::/7 unique local.
+    is_ipv6_link_local(addr) || (addr.segments()[0] & 0xfe00) == 0xfc00
+}
+
+fn is_ipv6_link_local(addr: Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
 }
 
 /// Encode an encrypted-link health probe. Callers choose a unique nonce and
@@ -1602,22 +1683,15 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
             }
             let instance_token = cursor.take(LAN_INSTANCE_TOKEN_LEN)?.to_vec();
             let port = cursor.take_u16()?;
-            if port == 0 {
-                return Err(CoreError::Malformed(
-                    "LAN endpoint port must be non-zero".to_string(),
-                ));
-            }
             let host_len = cursor.take_u8()? as usize;
             let host_bytes = cursor.take(host_len)?;
             cursor.finish()?;
             let host = std::str::from_utf8(host_bytes)
                 .map_err(|_| CoreError::Malformed("LAN endpoint host is not UTF-8".to_string()))?
                 .to_string();
-            if host.is_empty() || host.chars().any(char::is_whitespace) {
-                return Err(CoreError::Malformed(
-                    "LAN endpoint host is empty or contains whitespace".to_string(),
-                ));
-            }
+            // Same rules as the sealed hint: a non-zero port and a local
+            // address literal, checked before any caller sees the frame.
+            validate_lan_endpoint_fields(&instance_token, &host, port)?;
             Ok(Frame::LanEndpoint {
                 instance_token,
                 host,
@@ -2818,6 +2892,143 @@ mod tests {
         .unwrap();
         framed.push(0xFF);
         assert!(parse_frame(framed).is_err());
+    }
+
+    /// Hosts a phone can genuinely have as its own address on a local
+    /// network, including the shapes Android's `getHostAddress()` produces.
+    const LOCAL_LAN_HOSTS: &[&str] = &[
+        "10.0.0.2",
+        "10.154.189.58",
+        "172.16.0.9",
+        "172.31.255.254",
+        "192.168.1.7",
+        "169.254.10.3",
+        "100.64.0.5",
+        "100.127.255.254",
+        "fe80::1",
+        "fe80::4ff:fe12:3456%wlan0",
+        "fe80::1%3",
+        "fc00::1",
+        "fd12:3456:789a::1",
+    ];
+
+    /// Everything else: no address off the local network can be the sender's
+    /// own LAN address, and nothing that needs resolving is an address at all.
+    const NON_LOCAL_LAN_HOSTS: &[&str] = &[
+        // Public and otherwise non-local literals.
+        "8.8.8.8",
+        "1.1.1.1",
+        "203.0.113.5",
+        "172.32.0.1",
+        "192.169.1.1",
+        "100.128.0.1",
+        "127.0.0.1",
+        "0.0.0.0",
+        "255.255.255.255",
+        "2606:4700:4700::1111",
+        "2001:db8::1",
+        "::1",
+        "::",
+        "::ffff:10.0.0.1",
+        // Names -- a receiver must never resolve a string a sender chose.
+        "localhost",
+        "phone.local",
+        "cruisemesh.app",
+        "10.0.0.2.example.com",
+        "010.0.0.2",
+        // Malformed, or a scope id where none belongs.
+        "",
+        "10.0.0.2%wlan0",
+        "fe80::1%",
+        "fd00::1%wlan0",
+        "fe80::1%wlan0!",
+        "10.0.0.2:45892",
+    ];
+
+    fn lan_endpoint_frame_bytes(host: &str) -> Vec<u8> {
+        let mut out = vec![FRAME_TYPE_LAN_ENDPOINT, LAN_ENDPOINT_VERSION];
+        out.extend_from_slice(&[0xAB; LAN_INSTANCE_TOKEN_LEN]);
+        out.extend_from_slice(&45_892u16.to_be_bytes());
+        out.push(host.len() as u8);
+        out.extend_from_slice(host.as_bytes());
+        out
+    }
+
+    fn lan_endpoint_content_bytes(host: &str) -> Vec<u8> {
+        let mut out = vec![LAN_ENDPOINT_CONTENT_VERSION];
+        out.extend_from_slice(&[0xAB; LAN_INSTANCE_TOKEN_LEN]);
+        out.extend_from_slice(&45_892u16.to_be_bytes());
+        out.extend_from_slice(&1_700_000_900_000i64.to_be_bytes());
+        out.push(4);
+        out.extend_from_slice(b"netz");
+        out.push(host.len() as u8);
+        out.extend_from_slice(host.as_bytes());
+        out
+    }
+
+    #[test]
+    fn lan_endpoint_accepts_every_local_address_a_phone_can_have() {
+        for host in LOCAL_LAN_HOSTS {
+            let token = vec![0xAB; LAN_INSTANCE_TOKEN_LEN];
+            encode_lan_endpoint(token.clone(), host.to_string(), 45_892)
+                .unwrap_or_else(|error| panic!("{host} should encode: {error:?}"));
+            match parse_frame(lan_endpoint_frame_bytes(host)) {
+                Ok(Frame::LanEndpoint { host: parsed, .. }) => assert_eq!(&parsed, host),
+                other => panic!("{host} should parse, got {other:?}"),
+            }
+            let content = LanEndpointContent {
+                instance_token: token,
+                network_id: b"netz".to_vec(),
+                host: host.to_string(),
+                port: 45_892,
+                expires_at_ms: 1_700_000_900_000,
+            };
+            let encoded = encode_lan_endpoint_content(content.clone())
+                .unwrap_or_else(|error| panic!("{host} should encode sealed: {error:?}"));
+            assert_eq!(decode_lan_endpoint_content(encoded).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn lan_endpoint_rejects_hosts_that_are_not_local_addresses() {
+        for host in NON_LOCAL_LAN_HOSTS {
+            let token = vec![0xAB; LAN_INSTANCE_TOKEN_LEN];
+            assert!(
+                encode_lan_endpoint(token.clone(), host.to_string(), 45_892).is_err(),
+                "{host} must not encode",
+            );
+            assert!(
+                parse_frame(lan_endpoint_frame_bytes(host)).is_err(),
+                "{host} must not parse",
+            );
+            assert!(
+                encode_lan_endpoint_content(LanEndpointContent {
+                    instance_token: token,
+                    network_id: b"netz".to_vec(),
+                    host: host.to_string(),
+                    port: 45_892,
+                    expires_at_ms: 1_700_000_900_000,
+                })
+                .is_err(),
+                "{host} must not encode sealed",
+            );
+            assert!(
+                decode_lan_endpoint_content(lan_endpoint_content_bytes(host)).is_err(),
+                "{host} must not decode sealed",
+            );
+        }
+    }
+
+    #[test]
+    fn lan_endpoint_rejects_whitespace_and_oversized_zone() {
+        for host in [" ", "10.0.0.2 ", "10.0.0.2\n", "\t"] {
+            assert!(
+                parse_frame(lan_endpoint_frame_bytes(host)).is_err(),
+                "{host:?} must not parse",
+            );
+        }
+        let long_zone = format!("fe80::1%{}", "w".repeat(MAX_LAN_HOST_ZONE_BYTES + 1));
+        assert!(parse_frame(lan_endpoint_frame_bytes(&long_zone)).is_err());
     }
 
     #[test]

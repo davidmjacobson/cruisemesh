@@ -23,6 +23,22 @@ func parseLanEndpointLink(_ fragment: String?) -> LanManualEndpoint? {
     return LanManualEndpoint(host: endpoint.host, port: endpoint.port)
 }
 
+/// Prefix marking a connection key that came from a contact's LAN hint.
+let lanHintKeyPrefix = "hint:"
+
+func lanHintConnectKey(_ endpointDisplay: String) -> String {
+    "\(lanHintKeyPrefix)\(endpointDisplay)"
+}
+
+/// Whether a connection key may only ever be attempted once per piece of
+/// evidence. A hint carries an address supplied by the contact rather than one
+/// this phone observed, so it is tried when it arrives and never retried on a
+/// timer; a fresh hint, Bonjour discovery, or the cached endpoint is what
+/// starts another attempt. Keys this phone found itself keep retrying.
+func isSingleShotLanConnectKey(_ serviceKey: String) -> Bool {
+    serviceKey.hasPrefix(lanHintKeyPrefix)
+}
+
 /// The active Wi-Fi IPv4 address and its advertised subnet prefix.
 func localWifiIPv4Network() -> LocalWifiIPv4Network? {
     var firstAddress: UnsafeMutablePointer<ifaddrs>?

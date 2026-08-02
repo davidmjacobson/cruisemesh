@@ -105,6 +105,21 @@ class LanTransportTest {
     }
 
     @Test
+    fun `a hinted address is tried once and never becomes a reconnect target`() {
+        val hintKey = lanHintConnectKey("a1b2c3d4e5f60718")
+        assertTrue(isSingleShotLanConnectKey(hintKey))
+        // Keys this phone found itself keep retrying: mDNS service names,
+        // subnet sweep hits, the cached endpoint, and manual entry.
+        assertTrue(!isSingleShotLanConnectKey("CruiseMesh-abc123._cruisemesh._tcp"))
+        assertTrue(!isSingleShotLanConnectKey("scan:10.0.0.2"))
+        assertTrue(!isSingleShotLanConnectKey("cache:friend:10.0.0.5:45892"))
+        assertTrue(!isSingleShotLanConnectKey("manual:10.0.0.4:45892"))
+        // The hint key stays distinct from the bare instance token so a
+        // hint can never take over a discovered peer's retry state.
+        assertTrue(!isSingleShotLanConnectKey("a1b2c3d4e5f60718"))
+    }
+
+    @Test
     fun `automatic subnet fallback runs only while LAN discovery is idle`() {
         assertTrue(shouldRunAutomaticLanScan(0, 0, 0, 0))
         assertTrue(!shouldRunAutomaticLanScan(1, 0, 0, 0))

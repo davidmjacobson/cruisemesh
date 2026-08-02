@@ -464,6 +464,7 @@ internal class LanTransport(
     fun connectToHint(hint: Frame.LanEndpoint, expectedUserId: ByteArray) {
         mainHandler.post {
             val remoteToken = hint.instanceToken.toHex()
+            val hintKey = lanHintConnectKey(remoteToken)
             val endpoint = LanManualEndpoint(hint.host, hint.port.toInt())
             onEndpointObserved(expectedUserId, endpoint, currentNetworkId)
             if (!started) return@post
@@ -474,7 +475,7 @@ internal class LanTransport(
                     "Resolved LAN peer ${endpoint.display}; awaiting their connection (tie-break)",
                 )
                 scheduleElectionFallback(
-                    key = remoteToken,
+                    key = hintKey,
                     endpoints = listOf(InetSocketAddress(endpoint.host, endpoint.port)),
                     expectedUserId = expectedUserId,
                 )
@@ -484,7 +485,7 @@ internal class LanTransport(
             Log.i(TAG, "BLE introduced LAN peer at ${endpoint.display}")
             connectToEndpoints(
                 network = network,
-                key = remoteToken,
+                key = hintKey,
                 endpoints = listOf(
                     InetSocketAddress(endpoint.host, endpoint.port),
                 ),
@@ -664,7 +665,15 @@ internal class LanTransport(
         expectedUserId: ByteArray? = null,
     ) {
         if (endpoints.isEmpty()) return
-        rememberReconnectTarget(key, endpoints, expectedUserId)
+        // A hinted address is one the contact told us about, not one this
+        // phone discovered for itself, so it gets a single attempt: no
+        // reconnect target means every scheduleReconnect for the key finds
+        // nothing to retry. A later hint (or discovery, or the cached
+        // endpoint) can try again -- the attempt just never reschedules
+        // itself.
+        if (!isSingleShotLanConnectKey(key)) {
+            rememberReconnectTarget(key, endpoints, expectedUserId)
+        }
         if (
             expectedUserId != null &&
             authenticatedUserIds.containsValue(expectedUserId.toHex())
@@ -1729,6 +1738,22 @@ internal fun shouldRetainLanReconnectTarget(
     serviceKey: String,
     wasAuthenticated: Boolean,
 ): Boolean = wasAuthenticated || !serviceKey.startsWith("scan:")
+
+/** Prefix marking a connection key that came from a contact's LAN hint. */
+internal const val LAN_HINT_KEY_PREFIX = "hint:"
+
+internal fun lanHintConnectKey(remoteInstanceToken: String): String =
+    "$LAN_HINT_KEY_PREFIX$remoteInstanceToken"
+
+/**
+ * Whether a connection key may only ever be attempted once per piece of
+ * evidence. A hint carries an address supplied by the contact rather than one
+ * this phone observed, so it is tried when it arrives and never retried on a
+ * timer; a fresh hint, mDNS discovery, or the cached endpoint is what starts
+ * another attempt. Keys this phone found itself keep their reconnect target.
+ */
+internal fun isSingleShotLanConnectKey(serviceKey: String): Boolean =
+    serviceKey.startsWith(LAN_HINT_KEY_PREFIX)
 
 private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
