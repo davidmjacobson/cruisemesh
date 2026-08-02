@@ -5,6 +5,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.util.Log
+import com.cruisemesh.app.persist
 import java.security.GeneralSecurityException
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -56,7 +57,11 @@ object IdentityStore {
         }
     }
 
-    fun save(context: Context, identity: Identity) {
+    /**
+     * @param durable when the caller is about to exit the process (restore),
+     *   write synchronously so the identity cannot be lost in flight.
+     */
+    fun save(context: Context, identity: Identity, durable: Boolean = false) {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
         val ciphertext = cipher.doFinal(encodeIdentity(identity))
@@ -64,7 +69,7 @@ object IdentityStore {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
             .putString(PREF_CIPHERTEXT, encodeBase64(ciphertext))
             .putString(PREF_IV, encodeBase64(cipher.iv))
-            .apply()
+            .persist(durable)
     }
 
     private fun getOrCreateKey(): SecretKey {

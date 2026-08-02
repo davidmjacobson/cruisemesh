@@ -91,16 +91,21 @@ object BackupService {
             sqliteFile.takeIf { it.exists() }?.delete()
         }
 
+        // Every preference write below must be durable. The caller restarts by
+        // hard-exiting the process, which outruns an `apply()` and used to drop
+        // the restored identity, display name and relay endpoint on the floor,
+        // leaving a phone with its old messages but a brand-new `user_id`.
+        //
         // Re-wrap the restored keys under THIS device's fresh Keystore key.
-        IdentityStore.save(context, identity)
-        payload.displayName?.let { ProfileStore.saveDisplayName(context, it) }
+        IdentityStore.save(context, identity, durable = true)
+        payload.displayName?.let { ProfileStore.saveDisplayName(context, it, durable = true) }
         ProfilePhotoStore.restoreBackupBytes(context, payload.ownAvatar)
         ProfileStore.restoreOwnAvatarEpoch(context, payload.ownAvatarEpoch)
         if (payload.relayUrl != null && payload.relayToken != null) {
-            RelayConfigStore.save(context, payload.relayUrl, payload.relayToken)
+            RelayConfigStore.save(context, payload.relayUrl, payload.relayToken, durable = true)
         }
-        RelayConfigStore.setShareOnline(context, payload.shareOnline)
-        OnboardingStore.markCompleted(context)
+        RelayConfigStore.setShareOnline(context, payload.shareOnline, durable = true)
+        OnboardingStore.markCompleted(context, durable = true)
     }
 
     /** Read a SAF document without ever accumulating more than the core's backup cap. */

@@ -1,6 +1,7 @@
 package com.cruisemesh.app.relay
 
 import android.content.Context
+import com.cruisemesh.app.persist
 
 private const val PREFS_NAME = "cruisemesh_relay"
 private const val PREF_RELAY_URL = "relay_url"
@@ -39,7 +40,11 @@ object RelayConfigStore {
         return RelayConfig(relayUrl, relayToken)
     }
 
-    fun save(context: Context, relayUrl: String, relayToken: String) {
+    /**
+     * @param durable when the caller is about to exit the process (restore),
+     *   write synchronously so the endpoint cannot be lost in flight.
+     */
+    fun save(context: Context, relayUrl: String, relayToken: String, durable: Boolean = false) {
         val normalizedUrl = normalizeRelayUrl(relayUrl)
         val normalizedToken = relayToken.trim()
         val cleared = normalizedUrl.isEmpty() || normalizedToken.isEmpty()
@@ -56,7 +61,7 @@ object RelayConfigStore {
             prefs.putString(PREF_RELAY_URL, next.relayUrl)
                 .putString(PREF_RELAY_TOKEN, next.relayToken)
         }
-        prefs.putLong(PREF_RELAY_EPOCH, nextRelayEpoch(context)).apply()
+        prefs.putLong(PREF_RELAY_EPOCH, nextRelayEpoch(context)).persist(durable)
     }
 
     /**
@@ -92,10 +97,14 @@ object RelayConfigStore {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getBoolean(PREF_SHARE_ONLINE, true)
 
-    fun setShareOnline(context: Context, enabled: Boolean) {
+    /**
+     * @param durable when the caller is about to exit the process (restore),
+     *   write synchronously so the choice cannot be lost in flight.
+     */
+    fun setShareOnline(context: Context, enabled: Boolean, durable: Boolean = false) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(PREF_SHARE_ONLINE, enabled)
-            .apply()
+            .persist(durable)
     }
 }
