@@ -143,6 +143,11 @@ const MAX_FETCH_ROW_OVERHEAD_BYTES: usize = 256;
 /// roughly 9 MiB of sealed bytes. Past that it is genuinely unreachable, and no
 /// client-side shrink helps, since the limit is already down to one row. Retire
 /// it by expiry, not by paging.
+///
+/// This budget has a floor as well as a ceiling: clients already in the field
+/// read a short page as the end of the mailbox, so it must stay large enough
+/// that their 16-row ask can never be truncated. See
+/// `the_page_budget_can_never_truncate_a_sixteen_row_ask`.
 const MAX_FETCH_PAGE_SEALED_BYTES: usize = 8 * 1024 * 1024;
 
 /// The derivation above, as a compile-time check rather than a comment:
@@ -5187,6 +5192,37 @@ mod tests {
         // That one maximum-size envelope fits the budget on its own -- the
         // premise of the always-return-one-row rule -- is asserted at compile
         // time next to the constants themselves.
+    }
+
+    /// The page budget also has a *floor*, set by the clients already in the
+    /// field rather than by anything in this file.
+    ///
+    /// The builds shipped before the walk learned to continue past a short
+    /// page ask for 16 rows and stop the moment a page comes back shorter than
+    /// that — a short page is how they recognize the end of the mailbox.
+    /// Truncating one of their asks would therefore not merely slow their walk
+    /// down, it would silence it: everything newer than the truncation point
+    /// goes unseen, with no error raised anywhere, until those rows expire.
+    ///
+    /// The budget is what keeps that from happening. At 16 times the largest
+    /// envelope this server will accept, a 16-row ask cannot be cut by bytes
+    /// no matter how large those 16 rows are, so those clients always get the
+    /// whole window they asked for. Lowering either constant would break that
+    /// silently, in the field, on phones nobody can update — hence a test
+    /// rather than a comment.
+    ///
+    /// Retire this once the oldest build still in use ends a mailbox walk only
+    /// on a genuinely empty page. Until then the budget may rise, never fall.
+    #[test]
+    fn the_page_budget_can_never_truncate_a_sixteen_row_ask() {
+        const DEPLOYED_CLIENT_FETCH_LIMIT: usize = 16;
+        assert!(
+            MAX_FETCH_PAGE_SEALED_BYTES >= DEPLOYED_CLIENT_FETCH_LIMIT * MAX_ENVELOPE_SEALED_BYTES,
+            "the byte budget ({MAX_FETCH_PAGE_SEALED_BYTES}) must cover \
+             {DEPLOYED_CLIENT_FETCH_LIMIT} maximum-size envelopes \
+             ({MAX_ENVELOPE_SEALED_BYTES} each), or deployed clients read a \
+             truncated page as the end of the mailbox"
+        );
     }
 
     /// Duplicated from `core/src/relay_wire.rs`'s

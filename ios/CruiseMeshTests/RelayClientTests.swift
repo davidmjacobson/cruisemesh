@@ -7,6 +7,9 @@ private final class RelayMockURLProtocol: URLProtocol {
         let statusCode: Int
         let body: Data
         let headers: [String: String]
+        /// Delivers the head and part of the body, then reports a timeout --
+        /// a page that started arriving over a link too slow to finish it.
+        var stallAfterHeaders: Bool = false
     }
 
     static var responses: [CannedResponse] = []
@@ -38,6 +41,10 @@ private final class RelayMockURLProtocol: URLProtocol {
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: canned.body)
+        guard !canned.stallAfterHeaders else {
+            client?.urlProtocol(self, didFailWithError: URLError(.timedOut))
+            return
+        }
         client?.urlProtocolDidFinishLoading(self)
     }
 
@@ -332,6 +339,126 @@ final class RelayClientTests: XCTestCase {
         XCTAssertEqual(RelayMockURLProtocol.requests.count, 2)
         XCTAssertTrue(RelayMockURLProtocol.requests[0].url!.absoluteString.contains("limit=2"))
         XCTAssertTrue(RelayMockURLProtocol.requests[1].url!.absoluteString.contains("limit=1"))
+    }
+
+    func testAPageThatStopsArrivingIsRetriedAtHalfTheLimitNotFailed() throws {
+        // A full page is megabytes. On a ship's Wi-Fi the transfer can start
+        // and then not finish in time, and nothing about that changes on the
+        // next pass: the same cursor asks for the same window and stops in the
+        // same place, so the frontier never advances and the mail behind it is
+        // never delivered. The link is telling us the window is too big, which
+        // is the same thing an undecodable page says, so it gets the same
+        // answer -- fewer rows, same cursor.
+        RelayMockURLProtocol.responses = [
+            .init(
+                statusCode: 200,
+                body: Data(#"{"envelopes":"#.utf8),
+                headers: [:],
+                stallAfterHeaders: true
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(#"{"envelopes":[],"next_cursor":9}"#.utf8),
+                headers: [:]
+            ),
+        ]
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+
+        let fetched = try RelayClient.fetchEnvelopesWithinResponseCap(
+            config: config,
+            hints: [Data(repeating: 2, count: 8)],
+            afterId: 9,
+            limit: 64
+        )
+
+        XCTAssertEqual(fetched.limit, 32)
+        XCTAssertEqual(fetched.page.nextCursor, 9)
+        XCTAssertEqual(RelayMockURLProtocol.requests.count, 2)
+        let second = RelayMockURLProtocol.requests[1].url!.absoluteString
+        XCTAssertTrue(second.contains("limit=32"))
+        // Same cursor: recovering from a slow link skips nothing.
+        XCTAssertTrue(second.contains("after=9"))
+    }
+
+    func testATimeoutBeforeAnyResponseIsNotTreatedAsAPageProblem() {
+        // Nothing came back at all, so there is no evidence the window was too
+        // big -- shrinking would just make the next attempt at an unreachable
+        // relay smaller. It stays an ordinary transport failure.
+        RelayMockURLProtocol.responses = []
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+
+        XCTAssertThrowsError(
+            try RelayClient.fetchEnvelopesWithinResponseCap(
+                config: config,
+                hints: [Data(repeating: 2, count: 8)],
+                afterId: 1,
+                limit: 64
+            )
+        ) { error in
+            XCTAssertFalse(error is RelayPageTooBigError)
+        }
+        XCTAssertEqual(RelayMockURLProtocol.requests.count, 1)
+    }
+
+    func testAnErrorPageIsReportedByItsStatusEvenWhenItIsEnormous() {
+        // A captive portal, a proxy notice or a gateway error page can be any
+        // size. Judging size before status would call one an oversized *page*
+        // and send the fetch down the whole shrink ladder -- eight more round
+        // trips that were never going to succeed.
+        RelayMockURLProtocol.responses = [
+            .init(
+                statusCode: 502,
+                body: Data(String(repeating: "x", count: 64 * 1_024).utf8),
+                headers: ["Content-Length": "\(relayMaxResponseBytes() + 1)"]
+            ),
+        ]
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+
+        XCTAssertThrowsError(
+            try RelayClient.fetchEnvelopesWithinResponseCap(
+                config: config,
+                hints: [Data(repeating: 2, count: 8)],
+                afterId: 5,
+                limit: 256
+            )
+        ) { error in
+            XCTAssertEqual((error as? RelayHTTPError)?.statusCode, 502)
+            XCTAssertFalse(error is RelayPageTooBigError)
+            // Only a preview of the page is kept, not all 64 KiB of it.
+            XCTAssertLessThanOrEqual((error as? RelayHTTPError)?.responseBody.count ?? .max, 2_048)
+        }
+        // One request, not nine: the ladder was never entered.
+        XCTAssertEqual(RelayMockURLProtocol.requests.count, 1)
+    }
+
+    func testARateLimitKeepsItsRetryAfterInsteadOfLookingLikeAnOversizePage() {
+        RelayMockURLProtocol.responses = [
+            .init(
+                statusCode: 429,
+                body: Data(#"{"error":"too many requests","code":"rate_limited"}"#.utf8),
+                headers: [
+                    "Retry-After": "42",
+                    "Content-Length": "\(relayMaxResponseBytes() + 1)",
+                ]
+            ),
+        ]
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+
+        XCTAssertThrowsError(
+            try RelayClient.fetchEnvelopes(
+                config: config,
+                hints: [Data(repeating: 2, count: 8)],
+                afterId: 0,
+                limit: 16
+            )
+        ) { error in
+            let relay = error as? RelayHTTPError
+            XCTAssertEqual(relay?.statusCode, 429)
+            XCTAssertEqual(relay?.relayCode, "rate_limited")
+            // The back-off the relay asked for survives; classifying this as
+            // an oversize page would have thrown it away.
+            XCTAssertEqual(relay?.retryAfter, "42")
+        }
     }
 
     private func sampleOutboundEnvelope() -> OutboundEnvelope {

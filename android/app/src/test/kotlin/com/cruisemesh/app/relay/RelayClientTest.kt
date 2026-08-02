@@ -14,6 +14,8 @@ import uniffi.cruisemesh_core.relayMaxResponseBytes
 import java.nio.charset.StandardCharsets
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.io.InputStream
+import java.net.SocketTimeoutException
 import java.util.Base64
 
 class RelayClientTest {
@@ -244,6 +246,119 @@ class RelayClientTest {
         assertTrue(IOException::class.java.isAssignableFrom(error.javaClass))
         val exact = ByteArray(8) { it.toByte() }
         assertArrayEquals(exact, ByteArrayInputStream(exact).readBounded(8))
+    }
+
+    @Test
+    fun `a body that stops arriving part-way is reported as a page too big to take`() {
+        // The relay answered and the head is in, so what stalled is the body:
+        // a page this link will not carry. Left as a bare SocketTimeoutException
+        // it would read as "the network broke", the pass would fail, and the
+        // next pass would ask for the identical window from the identical
+        // cursor and stall identically -- forever. Typed as a page problem, the
+        // walk answers it the way it answers an undecodable page: fewer rows.
+        val stalling = object : InputStream() {
+            private var served = 0
+            override fun read(): Int = throw UnsupportedOperationException()
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (served > 0) throw SocketTimeoutException("Read timed out")
+                served = 4
+                b.fill(1, off, off + 4)
+                return 4
+            }
+        }
+
+        val error = runCatching { stalling.readBounded(1_024) }.exceptionOrNull()
+
+        assertEquals(RelayResponseStalledException::class.java, error?.javaClass)
+        assertEquals(4, (error as RelayResponseStalledException).bytesReceived)
+        assertTrue(error.cause is SocketTimeoutException)
+        // Both failures share the type the fetch walk shrinks on, so the
+        // recovery cannot be wired up for one and forgotten for the other.
+        assertTrue(
+            RelayPageTooBigException::class.java
+                .isAssignableFrom(RelayResponseStalledException::class.java),
+        )
+        assertTrue(
+            RelayPageTooBigException::class.java
+                .isAssignableFrom(RelayResponseTooLargeException::class.java),
+        )
+    }
+
+    @Test
+    fun `an error page is reported by its status even when it is enormous`() {
+        // A captive portal, a proxy notice or a gateway error page can be any
+        // size. Judging size before status would call one an oversized *page*
+        // and send the fetch down the whole shrink ladder -- eight more round
+        // trips that were never going to succeed.
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(502)
+                .setBody("x".repeat(64 * 1024))
+                .setHeader("Content-Length", (relayMaxResponseBytes().toLong() + 1).toString()),
+        )
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val error = runCatching {
+                RelayClient.fetchEnvelopesWithinResponseCap(
+                    config,
+                    listOf(ByteArray(8) { 2 }),
+                    afterId = 5L,
+                    limit = 256,
+                )
+            }.exceptionOrNull()
+
+            assertEquals(RelayHttpException::class.java, error?.javaClass)
+            assertEquals(502, (error as RelayHttpException).code)
+            // One request, not nine: the ladder was never entered.
+            assertEquals(1, server.requestCount)
+            assertTrue(server.takeRequest().path!!.contains("limit=256"))
+            // And only a preview of the page is kept, not all 64 KiB of it.
+            assertTrue(error.message!!.length <= ERROR_BODY_PREVIEW_BYTES + 64)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `a rate limit keeps its retry-after instead of looking like an oversize page`() {
+        val server = MockWebServer()
+        // A body the size of the whole preview budget, announced as far bigger
+        // still: the size-first order would have called this an oversize page
+        // and thrown the back-off away.
+        val body = """{"error":"too many requests","code":"rate_limited"}"""
+            .padEnd(ERROR_BODY_PREVIEW_BYTES, ' ')
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(429)
+                .setBody(body)
+                .setHeader("Retry-After", "42")
+                .setHeader("Content-Length", (relayMaxResponseBytes().toLong() + 1).toString()),
+        )
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val error = runCatching {
+                RelayClient.fetchEnvelopes(config, listOf(ByteArray(8) { 2 }), afterId = 0, limit = 16)
+            }.exceptionOrNull()
+
+            assertEquals(RelayHttpException::class.java, error?.javaClass)
+            assertEquals(429, (error as RelayHttpException).code)
+            assertEquals("rate_limited", error.relayCode)
+            // The back-off the relay asked for survives; classifying this as
+            // an oversize page would have thrown it away.
+            assertEquals("42", error.retryAfter)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `the error preview reader stops at its limit instead of failing`() {
+        val body = ByteArray(64) { it.toByte() }
+        assertArrayEquals(body.copyOfRange(0, 8), ByteArrayInputStream(body).readAtMost(8))
+        assertArrayEquals(body, ByteArrayInputStream(body).readAtMost(1_024))
     }
 
     @Test

@@ -10,6 +10,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.nio.charset.StandardCharsets
 import uniffi.cruisemesh_core.relayBuildFetchPath
@@ -23,7 +24,21 @@ import uniffi.cruisemesh_core.relayFetchShrunkLimit
 import uniffi.cruisemesh_core.relayMaxResponseBytes
 
 private const val CONNECT_TIMEOUT_MS = 10_000
+
+/**
+ * Per-read inactivity budget, not a budget for the whole transfer: a full
+ * fetch page can be megabytes, and a link slow enough to need a minute for it
+ * is slow, not broken. [HttpURLConnection.setReadTimeout] resets on every
+ * read, so a download that keeps trickling in is never cut off. Matches iOS,
+ * whose relay client waits on progress rather than on the clock.
+ */
 private const val READ_TIMEOUT_MS = 10_000
+
+/**
+ * How much of a non-2xx body is kept -- enough to quote the relay's reason in
+ * the error, never enough for an error page to cost memory.
+ */
+internal const val ERROR_BODY_PREVIEW_BYTES = 2_048
 private const val RELAY_USER_AGENT = "CruiseMeshRelayClient/0.1"
 private const val RELAY_BYPASS_TUNNEL_REMINDER = "1"
 
@@ -60,17 +75,39 @@ class RelayHttpException(
 ) : IOException(message)
 
 /**
+ * A fetch failure that asking for fewer rows can fix.
+ *
+ * Its own type rather than a bare [IOException] because these are the
+ * transport failures a caller can actually do something about, as opposed to
+ * the ones that only mean "try again later": a page can be too big to decode,
+ * or too big to finish moving over the link it was asked for, and both are
+ * answered the same way -- same cursor, smaller window (see
+ * [RelayClient.fetchEnvelopesWithinResponseCap]). Mirrors iOS
+ * `RelayPageTooBigError`.
+ */
+sealed class RelayPageTooBigException(message: String, cause: Throwable? = null) :
+    IOException(message, cause)
+
+/**
  * The relay's answer was larger than [relayMaxResponseBytes], so it was
  * refused before the whole thing could be accumulated.
- *
- * Its own type rather than a bare [IOException] because it is the one
- * transport failure a caller can actually do something about: a fetch page
- * that blows the cap is recoverable by asking the same cursor for fewer rows
- * (see [RelayClient.fetchEnvelopesWithinResponseCap]). Every other
- * IOException here means "try again later"; this one means "ask for less".
  */
 class RelayResponseTooLargeException(val maxBytes: Int) :
-    IOException("Relay response exceeds $maxBytes bytes")
+    RelayPageTooBigException("Relay response exceeds $maxBytes bytes")
+
+/**
+ * The relay answered, and then the body stopped arriving before the end.
+ *
+ * On a ship's Wi-Fi a full page can be megabytes, and a link that cannot carry
+ * it inside the read timeout will fail the same way on the next pass, from the
+ * same cursor -- the same permanent stall an undecodable page causes. So it
+ * gets the same treatment: ask for fewer rows and let the mail through slowly
+ * rather than not at all. Distinguished from a timeout while connecting or
+ * waiting for the response head, which says nothing about page size. Mirrors
+ * iOS `RelayResponseStalledError`.
+ */
+class RelayResponseStalledException(val bytesReceived: Int, cause: Throwable?) :
+    RelayPageTooBigException("Relay response stalled after $bytesReceived bytes", cause)
 
 data class RelayPresence(
     val hint: ByteArray,
@@ -167,20 +204,23 @@ object RelayClient {
 
     /**
      * Fetch one page, halving `limit` and retrying the *same* cursor whenever
-     * the relay's answer is too big for this client to decode. Returns the
-     * page together with the limit that actually produced it.
+     * the relay's answer is too big for this client to take -- either too big
+     * to decode, or too big to finish moving over this link. Returns the page
+     * together with the limit that actually produced it.
      *
      * The stall this prevents: `limit` bounds a page's row count, not its
      * size, and one sealed payload may be 512 KiB. A mailbox holding enough
      * large attachment chunks can therefore produce a full-size window whose
-     * body is past [relayMaxResponseBytes]. Without a retry the pass simply
+     * body is past [relayMaxResponseBytes], or simply past what a ship's Wi-Fi
+     * will carry before the read times out. Without a retry the pass simply
      * fails there; the next pass asks the same relay for the same window from
      * the same cursor and fails identically, so the frontier never advances
      * and nothing behind those rows is delivered until they expire.
      *
-     * Current relayd carries a byte budget and never builds such a page, but
-     * family relays are self-hosted and older builds exist in the field, so
-     * the client cannot assume the server-side fix is there.
+     * Current relayd carries a byte budget and never builds an undecodable
+     * page, but family relays are self-hosted and older builds exist in the
+     * field, so the client cannot assume the server-side fix is there -- and
+     * no server-side budget can make a slow link fast.
      *
      * `relayFetchShrunkLimit` returning null means one row was already the
      * ask: nothing smaller exists, so this is not a paging problem and the
@@ -198,7 +238,7 @@ object RelayClient {
         while (true) {
             try {
                 return RelayCappedFetch(fetchEnvelopes(config, hints, afterId, attempt, network), attempt)
-            } catch (e: RelayResponseTooLargeException) {
+            } catch (e: RelayPageTooBigException) {
                 val smaller = relayFetchShrunkLimit(attempt.toUInt())?.toInt() ?: throw e
                 onShrink(attempt, smaller)
                 attempt = smaller
@@ -282,13 +322,19 @@ object RelayClient {
         return try {
             val code = responseCode
             val maxBytes = relayMaxResponseBytes().toInt()
-            if (contentLengthLong > maxBytes) {
-                throw RelayResponseTooLargeException(maxBytes)
-            }
-            val stream = if (code in 200..299) inputStream else errorStream
-            val body = stream?.use { it.readBounded(maxBytes) } ?: ByteArray(0)
+            // Status before size. A captive portal notice, a proxy banner or a
+            // gateway error page can be any size at all, and calling one an
+            // oversized *page* sends a fetch down the shrink ladder -- eight
+            // more round trips that were never going to succeed -- and throws
+            // away a 429's Retry-After on the way. An error body is only ever
+            // read to name the failure, so only a preview of it is taken, and
+            // a body that will not finish arriving does not hide the status.
             if (code !in 200..299) {
-                val preview = String(body, 0, minOf(body.size, 2_048), StandardCharsets.UTF_8)
+                val preview = String(
+                    runCatching { errorStream?.use { it.readAtMost(ERROR_BODY_PREVIEW_BYTES) } }
+                        .getOrNull() ?: ByteArray(0),
+                    StandardCharsets.UTF_8,
+                )
                 val relayCode = runCatching {
                     JsonParser.parseString(preview).asJsonObject.get("code")?.asString
                 }.getOrNull()
@@ -300,7 +346,10 @@ object RelayClient {
                     retryAfter = getHeaderField("Retry-After"),
                 )
             }
-            block(body)
+            if (contentLengthLong > maxBytes) {
+                throw RelayResponseTooLargeException(maxBytes)
+            }
+            block(inputStream?.use { it.readBounded(maxBytes) } ?: ByteArray(0))
         } finally {
             disconnect()
         }
@@ -321,18 +370,54 @@ object RelayClient {
 
 }
 
+/**
+ * Reads a relay response body, refusing anything past [maxBytes].
+ *
+ * A read that times out part-way is reported as a
+ * [RelayResponseStalledException] rather than a bare [SocketTimeoutException]:
+ * by this point the relay has answered and the head is in, so what stalled is
+ * the body -- a page this link will not carry, which the same window from the
+ * same cursor will not carry next pass either. The fetch walk recovers by
+ * asking for fewer rows. A timeout before the head (while connecting, or
+ * waiting on the status line) never reaches here and stays a plain
+ * [SocketTimeoutException]: nothing about it says the page was too big.
+ */
 internal fun InputStream.readBounded(maxBytes: Int): ByteArray {
     require(maxBytes >= 0) { "maxBytes must be non-negative" }
     val output = ByteArrayOutputStream(minOf(maxBytes, 8 * 1024))
     val buffer = ByteArray(8 * 1024)
     var total = 0
     while (true) {
-        val read = read(buffer)
+        val read = try {
+            read(buffer)
+        } catch (e: SocketTimeoutException) {
+            throw RelayResponseStalledException(total, e)
+        }
         if (read < 0) break
         if (read == 0) continue
         if (read > maxBytes - total) {
             throw RelayResponseTooLargeException(maxBytes)
         }
+        output.write(buffer, 0, read)
+        total += read
+    }
+    return output.toByteArray()
+}
+
+/**
+ * Reads at most [maxBytes] and stops, leaving the rest unread. Used only for
+ * the preview of a non-2xx body: enough to quote the relay's reason, never
+ * enough for an error page to cost memory.
+ */
+internal fun InputStream.readAtMost(maxBytes: Int): ByteArray {
+    require(maxBytes >= 0) { "maxBytes must be non-negative" }
+    val output = ByteArrayOutputStream(minOf(maxBytes, 8 * 1024))
+    val buffer = ByteArray(minOf(maxBytes, 8 * 1024).coerceAtLeast(1))
+    var total = 0
+    while (total < maxBytes) {
+        val read = read(buffer, 0, minOf(buffer.size, maxBytes - total))
+        if (read < 0) break
+        if (read == 0) continue
         output.write(buffer, 0, read)
         total += read
     }

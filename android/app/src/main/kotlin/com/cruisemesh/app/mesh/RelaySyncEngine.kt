@@ -762,12 +762,16 @@ internal class RelaySyncEngine(
         // skip the failed one forever. The walk itself continues, so one bad
         // envelope never blocks the mail behind it.
         var frontierAdvancing = true
-        // Not a val: a page too big for this client to decode halves the ask
-        // and retries the same cursor, and the reduced limit is kept for the
-        // rest of this pass rather than reset per page -- a mailbox that
-        // produced one oversize window usually produces the next one too, and
-        // rediscovering that costs a wasted request every page. The next pass
-        // starts from the full limit again.
+        // Not a val: a page this client cannot take halves the ask and retries
+        // the same cursor, and the reduced limit is kept for the rest of this
+        // mailbox's walk rather than reset per page -- a mailbox that produced
+        // one oversize window usually produces the next one too, and
+        // rediscovering that costs a wasted request every page. It is a local
+        // of this function and so scoped to THIS mailbox, exactly as in
+        // MeshController.swift: one relay's oversize page says nothing about
+        // the next relay's, and carrying the reduction across configs would
+        // shrink every other mailbox's pages too. The next pass starts from
+        // the full limit again.
         var fetchBatchLimit = relayFetchBatchLimit().toInt()
         Log.i(
             TAG,
@@ -783,7 +787,7 @@ internal class RelaySyncEngine(
             ) { tried, smaller ->
                 Log.w(
                     TAG,
-                    "Relay ${config.relayUrl} page after=$after exceeded the response cap at limit=$tried; " +
+                    "Relay ${config.relayUrl} page after=$after was too big to take at limit=$tried; " +
                         "retrying with limit=$smaller",
                 )
             }
