@@ -130,9 +130,19 @@ const MAX_FETCH_ROW_OVERHEAD_BYTES: usize = 256;
 /// this rather than restating it, so changing any input fails the test
 /// instead of quietly eating the headroom.
 ///
-/// The always-take-the-first-row rule cannot break any of this: a postable
-/// envelope maxes out at 512 KiB, which is 1/16th of the budget, so a page
-/// forced to carry one oversized row is still nowhere near the client's cap.
+/// The always-take-the-first-row rule cannot break this for any envelope that
+/// could be POSTed: admission caps one at `MAX_ENVELOPE_SEALED_BYTES`, and the
+/// assert below pins that under the page budget, so a page forced to carry one
+/// such row stays far inside the client's cap.
+///
+/// It is NOT an unconditional guarantee, and the gap is worth naming. A row
+/// written by an older build can exceed today's admission limit (see
+/// `a_single_row_over_the_whole_budget_is_still_returned_alone`); returning it
+/// alone is deliberate, because refusing would stall every client's cursor on
+/// it forever. Such a row only decodes if it fits the client cap on its own —
+/// roughly 9 MiB of sealed bytes. Past that it is genuinely unreachable, and no
+/// client-side shrink helps, since the limit is already down to one row. Retire
+/// it by expiry, not by paging.
 const MAX_FETCH_PAGE_SEALED_BYTES: usize = 8 * 1024 * 1024;
 
 /// The derivation above, as a compile-time check rather than a comment:

@@ -17,7 +17,8 @@ use cruisemesh_core::{
     generate_msg_id, seal_message, Identity, MessageBody, DEFAULT_HOP_TTL, KIND_TEXT,
 };
 use cruisemesh_relayd::{
-    app, deposit_token_for, AppState, RelayStore, WsLimitsConfig, WS_MAX_INBOUND_MESSAGE_BYTES,
+    app, deposit_token_for, AppState, RelayStore, WsLimitsConfig, MAX_ENVELOPE_SEALED_BYTES,
+    WS_MAX_INBOUND_MESSAGE_BYTES,
 };
 use futures_util::{SinkExt, StreamExt};
 use tempfile::NamedTempFile;
@@ -254,6 +255,98 @@ async fn ws_replay_on_connect_matches_poll() {
     let msg2 = socket.next().await.unwrap().unwrap();
     assert!(msg2.is_text());
     assert!(msg2.to_text().unwrap().contains(&b64(&env2.msg_id)));
+}
+
+/// Replay must drain a backlog that `fetch_envelopes` cuts by BYTES, not just
+/// one it cuts by row count.
+///
+/// The replay loop pages with `DEFAULT_FETCH_LIMIT` rows. It used to stop as
+/// soon as a batch came back shorter than that ask, which was sound only while
+/// a batch was bounded by row count alone. Now that a cumulative byte budget
+/// can also end a batch, a mailbox holding large attachments returns short
+/// batches routinely — and treating one as end-of-backlog silently truncates
+/// the replay, stranding the NEWEST mail, since ids ascend. A phone on the
+/// push path would then never see those rows until it fell back to polling.
+///
+/// The sizes here are deliberately derived, not hardcoded to the budget: the
+/// test asserts that a single poll page really is short (so the byte cut is
+/// genuinely exercised) before asserting that replay still delivers every row.
+/// If the budget is ever raised past what these envelopes trip, the first
+/// assertion fails and says so, rather than the test quietly proving nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_replay_drains_a_backlog_cut_short_by_the_byte_budget() {
+    let alice = generate_identity();
+    let bob = generate_identity();
+    let db = NamedTempFile::new().unwrap();
+    let store = RelayStore::open(db.path().to_str().unwrap()).unwrap();
+    let (router, ws_url) = spawn_router(AppState::new(
+        store,
+        HashSet::from(["family-a".to_string()]),
+    ))
+    .await;
+
+    // Near-maximum envelopes: big enough that a byte budget bites long before
+    // the row limit does, small enough to still pass admission. The slack
+    // covers message-body framing, the signature, padding and the seal's tag.
+    const ENVELOPE_COUNT: usize = 20;
+    let filler = "x".repeat(MAX_ENVELOPE_SEALED_BYTES - 8192);
+
+    let mut posted: Vec<AuthoredEnvelope> = Vec::new();
+    for index in 0..ENVELOPE_COUNT {
+        let env = author_text(&alice, &bob, &filler, index as u64 + 1);
+        assert!(
+            env.sealed.len() <= MAX_ENVELOPE_SEALED_BYTES,
+            "test envelope must still be postable"
+        );
+        post_envelope(&router, "family-a", &env).await;
+        posted.push(env);
+    }
+    let hint = posted[0].recipient_hint.clone();
+
+    // Precondition: one page really is cut short by bytes. Without this the
+    // rest of the test would pass even against the old break-on-short-batch
+    // replay loop.
+    let polled = get_envelopes_json(&router, "family-a", &[hint.clone()], 0).await;
+    let first_page = polled["envelopes"].as_array().unwrap().len();
+    assert!(
+        first_page > 0 && first_page < ENVELOPE_COUNT,
+        "expected the byte budget to cut the page short; got {first_page} of {ENVELOPE_COUNT}"
+    );
+
+    let url = format!("{ws_url}/ws?hints={}&token=family-a&after=0", b64(&hint));
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+    // Every row must arrive, in id order, across the batch boundary. A
+    // truncated replay stops sending rows rather than sending a wrong one, so
+    // each read is bounded and control frames are skipped: once replay ends
+    // early the connection goes quiet and then starts keepalive pinging, and
+    // blaming the ping would hide the real failure.
+    for (index, env) in posted.iter().enumerate() {
+        let stalled = |detail: &str| -> String {
+            format!(
+                "replay {detail} after {index} of {ENVELOPE_COUNT} rows \
+                 (first poll page held {first_page}) -- a short batch was \
+                 treated as end-of-backlog"
+            )
+        };
+        let text = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(60), socket.next())
+                .await
+                .unwrap_or_else(|_| panic!("{}", stalled("stalled")))
+                .unwrap_or_else(|| panic!("{}", stalled("closed the socket")))
+                .unwrap();
+            match msg {
+                tokio_tungstenite::tungstenite::Message::Text(text) => break text,
+                tokio_tungstenite::tungstenite::Message::Ping(_)
+                | tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
+                other => panic!("{} (got {other:?})", stalled("sent a non-row frame")),
+            }
+        };
+        assert!(
+            text.contains(&b64(&env.msg_id)),
+            "row {index} out of order or missing from replay"
+        );
+    }
 }
 
 // FR5: this timeout guards against a genuine hang (the WS logic itself is
