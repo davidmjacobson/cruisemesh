@@ -15,9 +15,11 @@ enum LanScanBreadth: Equatable {
 /// trigger:
 ///
 ///  - It only ever becomes eligible after a /24 sweep on this network join
-///    has completed and found *zero* peers (`onScanCompleted`). A /24 that
-///    finds a peer never arms it -- that peer is proof discovery already
-///    works here, so there is no case yet for the wider, costlier sweep.
+///    has completed and authenticated *zero* friends (`onScanCompleted`). A
+///    /24 that authenticates a friend never arms it -- that friend is proof
+///    discovery already works here, so there is no case yet for the wider,
+///    costlier sweep. A bare TCP connect deliberately does not count: an
+///    unrelated service on the default port must not disarm the tier.
 ///  - Once eligible, it fires after a real delay (`emptyLocalSweepFullDelayMs`,
 ///    default 60s), not immediately, then backs off further
 ///    (`fullBackoffMs`) each time it runs and still finds nobody.
@@ -96,10 +98,11 @@ final class LanScanPlanner {
     }
 
     /// A sweep of `breadth` finished probing every candidate. `foundPeer`
-    /// reports whether any candidate answered. Only a /24 sweep that found
-    /// nobody arms the full-subnet tier for the first time; a /24 sweep
-    /// that finds a peer, or one that runs after the tier is already armed,
-    /// leaves the existing full-sweep schedule untouched.
+    /// reports whether the sweep authenticated an accepted friend (not
+    /// merely whether some TCP service answered). Only a /24 sweep that
+    /// authenticated nobody arms the full-subnet tier for the first time;
+    /// one that found a friend, or one that runs after the tier is already
+    /// armed, leaves the existing full-sweep schedule untouched.
     func onScanCompleted(_ breadth: LanScanBreadth, nowMs: Int64, foundPeer: Bool) {
         lock.lock()
         defer { lock.unlock() }

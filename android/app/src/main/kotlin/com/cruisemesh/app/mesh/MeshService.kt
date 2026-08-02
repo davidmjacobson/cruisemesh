@@ -566,6 +566,19 @@ class MeshService : Service() {
             trustedPeerForStaticKey = { remoteStaticKey ->
                 trustedLanPeerUserId(store.listContacts(), remoteStaticKey)
             },
+            unlinkedCapableContacts = {
+                // The automatic sweep keeps looking while any contact that
+                // has demonstrated LAN support is not linked over LAN --
+                // one connected peer must not stop discovery of the rest.
+                val linked = MeshRouter.identifiedRoutes()
+                    .filter { it.transport == MeshRouterState.Transport.LAN }
+                    .map { UserIdHex.encode(it.userId) }
+                    .toSet()
+                store.listContacts().count { contact ->
+                    LanCapabilityStore.isSupported(this, contact.userId) &&
+                        UserIdHex.encode(contact.userId) !in linked
+                }
+            },
             onNetworkReady = ::onLanNetworkReady,
             onEndpointObserved = { userId, endpoint, networkId ->
                 lanEndpointCache.save(networkId, userId, endpoint)

@@ -54,6 +54,7 @@ internal class LanTransport(
     context: Context,
     private val identity: Identity,
     private val trustedPeerForStaticKey: (ByteArray) -> ByteArray?,
+    private val unlinkedCapableContacts: () -> Int,
     private val onNetworkReady: (Frame.LanEndpoint, networkId: String?) -> Unit,
     private val onEndpointObserved: (
         userId: ByteArray,
@@ -107,6 +108,24 @@ internal class LanTransport(
     // alongside the other per-network state in teardownNetworkSession.
     private val knownPeerInstanceTokens = ConcurrentHashMap.newKeySet<String>()
 
+    // Keys an election-loser fallback connect has already been scheduled for
+    // on this network join, so repeated NSD re-resolves of the same service
+    // don't stack duplicate fallback timers. Cleared with the other
+    // per-network state in teardownNetworkSession.
+    private val electionFallbackKeys = ConcurrentHashMap.newKeySet<String>()
+
+    // Outbound service keys whose connection completed the Noise handshake.
+    // outboundServiceKeys retains a key for the whole life of a healthy
+    // outbound link, so "attempts still in flight" for the automatic-scan
+    // gate is the difference between the two.
+    private val authenticatedOutboundCount = AtomicInteger(0)
+
+    // Consecutive completed sweeps whose verdict was ISOLATION_SUSPECTED. A
+    // single congested sweep can look isolated (every probe timing out), so
+    // the planner is only told to back off to its cap once the verdict
+    // repeats.
+    private val consecutiveIsolationVerdicts = AtomicInteger(0)
+
     @Volatile
     private var started = false
 
@@ -141,8 +160,10 @@ internal class LanTransport(
         if (
             shouldRunAutomaticLanScan(
                 activeConnections = connections.size,
-                outboundAttempts = outboundServiceKeys.size,
+                pendingOutboundAttempts =
+                (outboundServiceKeys.size - authenticatedOutboundCount.get()).coerceAtLeast(0),
                 scanRemaining = runningSweep?.outcomes?.remainingCandidates() ?: 0,
+                unlinkedCapableContacts = unlinkedCapableContacts(),
             )
         ) {
             scanPlanner.takeDueScan(System.currentTimeMillis())?.let { breadth ->
@@ -351,26 +372,39 @@ internal class LanTransport(
 
     /**
      * Every candidate of the running sweep has been probed. Runs on whichever
-     * scan worker retired the last candidate. A completed, EMPTY local-tier
-     * sweep is what arms the full sweep ([LanScanPlanner.onScanCompleted]'s
-     * `foundPeer`) -- a /24 sweep that found a peer leaves the full tier
-     * disarmed. Also pulls the next check forward so escalation doesn't wait
-     * out the periodic interval -- the check's loneliness gate still
-     * applies, so if this sweep (or NSD) produced a connection, no
-     * escalation happens.
+     * scan worker retired the last candidate. A completed local-tier sweep
+     * that authenticated NO friend is what arms the full sweep
+     * ([LanScanPlanner.onScanCompleted]'s `foundPeer`) -- a raw TCP connect
+     * is deliberately not enough, because any unrelated service (or a
+     * stranger's CruiseMesh) squatting the default port would otherwise
+     * disarm the wider sweep that could still find an actual friend. A
+     * friend whose handshake finishes after the last probe retires can
+     * spuriously arm the tier; the automatic-scan gate keeps that armed
+     * tier from firing unless some capable contact is still unlinked. Also
+     * pulls the next check forward so escalation doesn't wait out the
+     * periodic interval.
      */
     private fun onScanCompleted(sweep: RunningSweep, summary: SweepOutcomeSummary) {
         if (runningSweep !== sweep || sweep.outcomes.generation != scanGeneration.get()) return
         runningSweep = null
         Log.i(TAG, summary.logLine(sweep.prefixLength))
-        scanPlanner.onScanCompleted(sweep.breadth, System.currentTimeMillis(), summary.connected > 0)
+        scanPlanner.onScanCompleted(
+            sweep.breadth,
+            System.currentTimeMillis(),
+            sweep.authenticatedFriend,
+        )
         val verdict = lanSweepVerdict(summary)
         LanTransportDiagnostics.sweepCompleted(summary)
         when (verdict) {
             LanSweepVerdict.ISOLATION_SUSPECTED -> {
-                scanPlanner.onIsolationSuspected(System.currentTimeMillis())
+                // One congested sweep can time out every probe and look
+                // isolated; only a repeat verdict jumps the planner to its
+                // backoff cap.
+                if (consecutiveIsolationVerdicts.incrementAndGet() >= ISOLATION_CONFIRM_SWEEPS) {
+                    scanPlanner.onIsolationSuspected(System.currentTimeMillis())
+                }
             }
-            else -> Unit
+            else -> consecutiveIsolationVerdicts.set(0)
         }
         if (sweep.breadth == LanScanBreadth.LOCAL_24) {
             scheduleAutomaticSubnetScan(AUTO_SCAN_ESCALATE_DELAY_MS)
@@ -392,11 +426,17 @@ internal class LanTransport(
             if (knownPeerInstanceTokens.add(remoteToken)) {
                 scanPlanner.onPeerEvidence(System.currentTimeMillis())
                 LanTransportDiagnostics.peerEvidence()
+                scheduleAutomaticSubnetScan(PEER_EVIDENCE_SCAN_DELAY_MS)
             }
             if (!shouldInitiateLanConnection(instanceToken, remoteToken)) {
                 Log.i(
                     TAG,
                     "Resolved LAN peer ${endpoint.display}; awaiting their connection (tie-break)",
+                )
+                scheduleElectionFallback(
+                    key = remoteToken,
+                    endpoints = listOf(InetSocketAddress(endpoint.host, endpoint.port)),
+                    expectedUserId = expectedUserId,
                 )
                 return@post
             }
@@ -630,6 +670,10 @@ internal class LanTransport(
                     outboundServiceKeys.remove(key)
                     releaseSocketSlot()
                     scheduleReconnect(key)
+                    // A failed direct connect is exactly when a fallback
+                    // sweep becomes worth checking promptly, instead of
+                    // waiting out the periodic interval.
+                    scheduleAutomaticSubnetScan(AUTO_SCAN_RECONNECT_DELAY_MS)
                     return@execute
                 }
                 runConnection(
@@ -677,6 +721,7 @@ internal class LanTransport(
         var connection: LanConnection? = null
         var noise: LanNoiseSession? = null
         var authenticated = false
+        var abortedDuplicateLink = false
         try {
             socket.tcpNoDelay = true
             socket.keepAlive = true
@@ -698,6 +743,13 @@ internal class LanTransport(
                     !userId.contentEquals(expectedUserId)
                 ) {
                     throw IOException("LAN responder does not match the BLE endpoint hint")
+                }
+                if (authenticatedUserIds.containsValue(userId.toHex())) {
+                    // Election fallbacks and sweeps may dial a contact that
+                    // connected to us in the meantime. Close the redundant
+                    // socket before it becomes a second live link.
+                    abortedDuplicateLink = true
+                    throw IOException("Contact already has an active LAN link")
                 }
                 writePacket(output, session.writeHandshakeMessage())
                 userId
@@ -742,6 +794,17 @@ internal class LanTransport(
             )
             outboundServiceKey?.let(connectionBackoff::recordSuccess)
             authenticated = true
+            if (outboundServiceKey != null) {
+                authenticatedOutboundCount.incrementAndGet()
+                if (outboundServiceKey.startsWith("scan:")) {
+                    // Only an authenticated friend counts as a sweep find --
+                    // see onScanCompleted. Harmless no-op if the sweep has
+                    // already completed or been replaced.
+                    runningSweep
+                        ?.takeIf { it.outcomes.generation == scanGeneration.get() }
+                        ?.authenticatedFriend = true
+                }
+            }
             scheduleAutomaticSubnetScan(AUTO_SCAN_RETRY_INTERVAL_MS)
             Log.i(TAG, "Authenticated CruiseMesh peer over local Wi-Fi")
 
@@ -788,7 +851,13 @@ internal class LanTransport(
             releaseSocketSlot()
             outboundServiceKey?.let {
                 outboundServiceKeys.remove(it)
-                if (shouldRetainLanReconnectTarget(it, authenticated)) {
+                if (authenticated) authenticatedOutboundCount.decrementAndGet()
+                if (abortedDuplicateLink) {
+                    // Not a failure: the contact already has a live LAN
+                    // link. No backoff, no reconnect -- rediscovery covers
+                    // a later drop of the surviving link.
+                    reconnectTargets.remove(it)
+                } else if (shouldRetainLanReconnectTarget(it, authenticated)) {
                     connectionBackoff.recordFailure(it, System.currentTimeMillis())
                     scheduleReconnect(it)
                 } else {
@@ -797,8 +866,44 @@ internal class LanTransport(
             }
             if (authenticated) {
                 scheduleAutomaticSubnetScan(AUTO_SCAN_RECONNECT_DELAY_MS)
+            } else if (
+                outboundServiceKey != null &&
+                !abortedDuplicateLink &&
+                !outboundServiceKey.startsWith("scan:")
+            ) {
+                // A failed secure setup to a discovered/hinted peer: check
+                // promptly whether a fallback sweep is due instead of
+                // waiting out the periodic interval.
+                scheduleAutomaticSubnetScan(AUTO_SCAN_RECONNECT_DELAY_MS)
             }
         }
+    }
+
+    /**
+     * The tie-break said the peer initiates -- but discovery is often
+     * asymmetric (the peer may never have resolved us, or its connect may
+     * fail), which used to strand both sides forever. If nothing has
+     * connected for this key within [ELECTION_FALLBACK_DELAY_MS], initiate
+     * anyway: duplicate connections are safe by design (spec: msg_id
+     * deduplication), and [runConnection]'s duplicate-link guard closes a
+     * redundant socket mid-handshake before it becomes a second live link.
+     */
+    private fun scheduleElectionFallback(
+        key: String,
+        endpoints: List<InetSocketAddress>,
+        expectedUserId: ByteArray?,
+    ) {
+        if (endpoints.isEmpty()) return
+        val scheduledNetwork = wifiNetwork ?: return
+        if (!electionFallbackKeys.add(key)) return
+        mainHandler.postDelayed(
+            {
+                if (!started || wifiNetwork != scheduledNetwork) return@postDelayed
+                Log.d(TAG, "Tie-break peer never connected; initiating ourselves")
+                connectToEndpoints(scheduledNetwork, key, endpoints, expectedUserId)
+            },
+            ELECTION_FALLBACK_DELAY_MS,
+        )
     }
 
     private fun scheduleReconnect(serviceKey: String) {
@@ -937,16 +1042,24 @@ internal class LanTransport(
                         if (knownPeerInstanceTokens.add(token)) {
                             scanPlanner.onPeerEvidence(System.currentTimeMillis())
                             LanTransportDiagnostics.peerEvidence()
+                            scheduleAutomaticSubnetScan(PEER_EVIDENCE_SCAN_DELAY_MS)
                         }
                         if (shouldInitiateLanConnection(instanceToken, token)) {
                             connectToService(serviceInfo)
                         } else {
-                            val endpoint = resolvedHosts(serviceInfo).firstOrNull()
-                                ?.let { endpointDisplay(InetSocketAddress(it, serviceInfo.port)) }
-                                ?: serviceInfo.serviceName
+                            val endpoints = resolvedHosts(serviceInfo)
+                                .map { InetSocketAddress(it, serviceInfo.port) }
                             Log.i(
                                 TAG,
-                                "Resolved LAN peer $endpoint; awaiting their connection (tie-break)",
+                                "Resolved LAN peer ${
+                                    endpoints.firstOrNull()?.let(::endpointDisplay)
+                                        ?: serviceInfo.serviceName
+                                }; awaiting their connection (tie-break)",
+                            )
+                            scheduleElectionFallback(
+                                key = serviceInfo.serviceName,
+                                endpoints = endpoints,
+                                expectedUserId = null,
                             )
                         }
                     }
@@ -982,6 +1095,9 @@ internal class LanTransport(
         registeredServiceName = null
         resolvedServices.clear()
         knownPeerInstanceTokens.clear()
+        electionFallbackKeys.clear()
+        consecutiveIsolationVerdicts.set(0)
+        authenticatedOutboundCount.set(0)
         reconnectTargets.clear()
         outboundServiceKeys.clear()
         serverSocket?.closeQuietly()
@@ -1154,6 +1270,19 @@ internal class LanTransport(
         private const val AUTO_SCAN_INITIAL_DELAY_MS = 5_000L
         private const val AUTO_SCAN_RECONNECT_DELAY_MS = 2_000L
 
+        // How long the tie-break loser waits for the elected side's
+        // connection before initiating anyway. Covers the winner's worst
+        // case (connect timeout + handshake timeout) with margin.
+        private const val ELECTION_FALLBACK_DELAY_MS = 15_000L
+
+        // Prompt scan-check pull-forward when fresh peer evidence arrives;
+        // the planner and loneliness gate still decide whether anything runs.
+        private const val PEER_EVIDENCE_SCAN_DELAY_MS = 2_000L
+
+        // Consecutive ISOLATION_SUSPECTED sweep verdicts required before the
+        // planner defers full sweeps to its backoff cap.
+        private const val ISOLATION_CONFIRM_SWEEPS = 2
+
         // A prompt recheck after a /24 sweep completes, not an escalation
         // trigger by itself: LanScanPlanner only arms the full-subnet tier
         // on an empty /24 sweep and holds it off for
@@ -1183,11 +1312,21 @@ internal class LanTransport(
         val expectedUserId: ByteArray?,
     )
 
-    private data class RunningSweep(
+    private class RunningSweep(
         val outcomes: SweepOutcomes,
         val breadth: LanScanBreadth,
         val prefixLength: Int,
-    )
+    ) {
+        /**
+         * A "scan:"-keyed connection completed the Noise handshake with an
+         * accepted friend while this sweep ran. This -- not a bare TCP
+         * connect -- is what [LanScanPlanner.onScanCompleted] receives as
+         * `foundPeer`, so unrelated services on the default port can't
+         * disarm the full-subnet tier.
+         */
+        @Volatile
+        var authenticatedFriend = false
+    }
 }
 
 internal fun trustedLanPeerUserId(contacts: List<Contact>, remoteStaticKey: ByteArray): ByteArray? =
@@ -1203,11 +1342,21 @@ internal fun sameLanServiceType(value: String): Boolean =
 internal fun shouldInitiateLanConnection(localToken: String, remoteToken: String): Boolean =
     localToken != remoteToken && localToken < remoteToken
 
+/**
+ * Whether the periodic check may claim a scan from [LanScanPlanner]. A scan
+ * is worthwhile while the transport has no links at all, OR while some
+ * contact that has demonstrated LAN support still has no authenticated LAN
+ * link -- one connected family member must not stop discovery of the rest.
+ * In-flight work (pending outbound attempts, a running sweep) always defers.
+ */
 internal fun shouldRunAutomaticLanScan(
     activeConnections: Int,
-    outboundAttempts: Int,
+    pendingOutboundAttempts: Int,
     scanRemaining: Int,
-): Boolean = activeConnections == 0 && outboundAttempts == 0 && scanRemaining == 0
+    unlinkedCapableContacts: Int,
+): Boolean = (activeConnections == 0 || unlinkedCapableContacts > 0) &&
+    pendingOutboundAttempts == 0 &&
+    scanRemaining == 0
 
 internal fun shouldRetainLanReconnectTarget(
     serviceKey: String,

@@ -159,6 +159,7 @@ final class MeshController: ObservableObject {
             }
         }
         lan.start(foregroundActive: appForeground)
+        refreshLanCapableContacts()
         startLanHealthLoop()
         startDigestMaintenanceLoop()
 
@@ -461,6 +462,7 @@ final class MeshController: ObservableObject {
         guard let userId = MeshRouter.userIdFor(address: address),
               (try? store.getContact(userId: userId)) != nil else { return }
         LanCapabilityStore.markSupported(userId: userId)
+        refreshLanCapableContacts()
         LanEndpointCache.save(
             networkId: currentLanNetworkId,
             userId: userId,
@@ -469,6 +471,18 @@ final class MeshController: ObservableObject {
         queueCurrentLanEndpoint(to: userId)
         guard MeshRouter.transportFor(address: address) != .lan else { return }
         lanTransport?.connect(endpoint, remoteInstanceToken: instanceToken)
+    }
+
+    /// Pushes the set of contacts that have demonstrated LAN support into
+    /// the transport, whose automatic-scan gate keeps sweeping while any of
+    /// them is not linked over LAN.
+    private func refreshLanCapableContacts() {
+        guard let lan = lanTransport else { return }
+        let contacts = (try? store.listContacts()) ?? []
+        let capable = contacts.map(\.userId).filter {
+            LanCapabilityStore.isSupported(userId: $0)
+        }
+        lan.updateLanCapableContacts(Set(capable))
     }
 
     private func handleTransportProbe(address: String, nonce: UInt64, response: Bool) {
@@ -1592,6 +1606,7 @@ final class MeshController: ObservableObject {
               let networkId = String(data: hint.networkId, encoding: .utf8) else { return }
         let endpoint = LanManualEndpoint(host: hint.host, port: hint.port)
         LanCapabilityStore.markSupported(userId: senderUserId)
+        refreshLanCapableContacts()
         LanEndpointCache.save(networkId: networkId, userId: senderUserId, endpoint: endpoint)
         queueCurrentLanEndpoint(to: senderUserId)
         if let sourceAddress {
@@ -1599,7 +1614,14 @@ final class MeshController: ObservableObject {
         }
 
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
-        if hint.expiresAtMs > now, currentLanNetworkId == networkId {
+        // The network fingerprint is stored with the cached endpoint but
+        // deliberately does NOT gate this dial: requiring an exact match
+        // silently disabled fresh hints on routed multi-subnet LANs -- the
+        // case the sealed hint exists for (mDNS is link-local; TCP may
+        // still route). A cross-network false positive is one bounded TCP
+        // attempt to an endpoint the contact sealed to us, and Noise
+        // authenticates. Being on some Wi-Fi is the only requirement.
+        if hint.expiresAtMs > now, currentLanNetworkId != nil {
             lanTransport?.connect(endpoint, remoteInstanceToken: hint.instanceToken)
         }
 

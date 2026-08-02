@@ -37,6 +37,15 @@ final class LanTransport {
     /// resent endpoint hint) must not keep resetting the full-sweep
     /// backoff. Reset alongside `discoveredEndpoints` on network change.
     private var peerEvidenceSeenKeys = Set<String>()
+    /// Keys an election-loser fallback connect has already been scheduled
+    /// for on this network join, so repeated browse updates for the same
+    /// service don't stack duplicate fallback timers. Reset alongside
+    /// `discoveredEndpoints` on network change.
+    private var electionFallbackKeys = Set<String>()
+    /// Accepted contacts that have demonstrated LAN support, pushed in by
+    /// MeshController (`updateLanCapableContacts`). The automatic sweep
+    /// keeps looking while any of them lacks an authenticated LAN link.
+    private var lanCapableContactIds = Set<Data>()
     private var bonjourServiceKeys = Set<String>()
     private var outboundAddresses: [String: String] = [:]
     private var reconnectAttempts: [String: Int] = [:]
@@ -69,6 +78,15 @@ final class LanTransport {
             startListener(preferDefaultPort: true)
             startBrowser()
             startWifiPathMonitor()
+        }
+    }
+
+    /// MeshController pushes the set of contacts that have demonstrated LAN
+    /// support whenever it changes; the automatic-scan gate compares it
+    /// against currently authenticated links.
+    func updateLanCapableContacts(_ userIds: Set<Data>) {
+        queue.async { [weak self] in
+            self?.lanCapableContactIds = userIds
         }
     }
 
@@ -107,6 +125,7 @@ final class LanTransport {
             announcedNetworkId = nil
             discoveredEndpoints.removeAll()
             peerEvidenceSeenKeys.removeAll()
+            electionFallbackKeys.removeAll()
             bonjourServiceKeys.removeAll()
             outboundAddresses.removeAll()
             reconnectAttempts.removeAll()
@@ -132,6 +151,10 @@ final class LanTransport {
         queue.async { [weak self] in
             guard let self, started else { return }
             let key = "endpoint:\(endpoint.display)"
+            let networkEndpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(endpoint.host),
+                port: NWEndpoint.Port(rawValue: endpoint.port) ?? .any
+            )
             if let remoteInstanceToken {
                 // Only genuinely NEW evidence about a peer resets the sweep
                 // backoff -- repeated evidence for a key already seen this
@@ -139,6 +162,7 @@ final class LanTransport {
                 // initiator) must not re-trigger it.
                 if peerEvidenceSeenKeys.insert(key).inserted {
                     scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
+                    scheduleAutomaticScan(after: Self.peerEvidenceScanDelay)
                 }
                 if !shouldInitiateLanConnection(
                     localToken: instanceTokenString,
@@ -147,13 +171,10 @@ final class LanTransport {
                     log.info(
                         "Resolved LAN peer \(endpoint.display, privacy: .public); awaiting their connection (tie-break)"
                     )
+                    scheduleElectionFallback(key: key, endpoint: networkEndpoint)
                     return
                 }
             }
-            let networkEndpoint = NWEndpoint.hostPort(
-                host: NWEndpoint.Host(endpoint.host),
-                port: NWEndpoint.Port(rawValue: endpoint.port) ?? .any
-            )
             discoveredEndpoints[key] = networkEndpoint
             if manual { reconnectAttempts[key] = 0 }
             diagnostics.discovered(endpoint.display)
@@ -367,6 +388,7 @@ final class LanTransport {
     private func tearDownNetworkLinks() {
         discoveredEndpoints.removeAll()
         peerEvidenceSeenKeys.removeAll()
+        electionFallbackKeys.removeAll()
         bonjourServiceKeys.removeAll()
         outboundAddresses.removeAll()
         reconnectAttempts.removeAll()
@@ -395,6 +417,7 @@ final class LanTransport {
             // and must not keep re-triggering full sweeps.
             if peerEvidenceSeenKeys.insert(key).inserted {
                 scanPlanner.onPeerEvidence(nowMs: Self.nowMs)
+                scheduleAutomaticScan(after: Self.peerEvidenceScanDelay)
             }
             guard shouldInitiateLanConnection(
                 localToken: instanceTokenString,
@@ -403,6 +426,7 @@ final class LanTransport {
                 log.info(
                     "Resolved LAN peer \(String(describing: result.endpoint), privacy: .public); awaiting their connection (tie-break)"
                 )
+                scheduleElectionFallback(key: key, endpoint: result.endpoint)
                 continue
             }
             current[key] = result.endpoint
@@ -418,6 +442,30 @@ final class LanTransport {
         for (key, endpoint) in current {
             discoveredEndpoints[key] = endpoint
         }
+    }
+
+    /// The tie-break said the peer initiates -- but discovery is often
+    /// asymmetric (the peer may never have resolved us, or its connect may
+    /// fail), which used to strand both sides forever. If nothing has
+    /// connected for this key within `electionFallbackDelay`, initiate
+    /// anyway: duplicate connections are safe by design (msg_id
+    /// deduplication), and the duplicate-link guard in the Noise handshake
+    /// closes a redundant socket before it becomes a second live link.
+    private func scheduleElectionFallback(key: String, endpoint: NWEndpoint) {
+        guard electionFallbackKeys.insert(key).inserted else { return }
+        queue.asyncAfter(deadline: .now() + Self.electionFallbackDelay) { [weak self] in
+            guard let self,
+                  started,
+                  activeNetwork != nil,
+                  outboundAddresses[key] == nil else { return }
+            log.debug("Tie-break peer never connected; initiating ourselves")
+            discoveredEndpoints[key] = endpoint
+            connect(to: endpoint, serviceKey: key)
+        }
+    }
+
+    fileprivate func hasAuthenticatedLink(userId: Data) -> Bool {
+        connections.values.contains { $0.wasAuthenticated && $0.authenticatedUserId == userId }
     }
 
     private func connect(to endpoint: NWEndpoint, serviceKey: String) {
@@ -475,6 +523,13 @@ final class LanTransport {
         log.info("Authenticated CruiseMesh peer over local Wi-Fi")
         if let serviceKey = link.serviceKey {
             reconnectAttempts[serviceKey] = 0
+            if serviceKey.hasPrefix("scan:"), var scan = runningScan {
+                // Only an authenticated friend counts as a sweep find -- a
+                // bare TCP connect could be any unrelated service on the
+                // default port, and must not disarm the full-subnet tier.
+                scan.foundPeer = true
+                runningScan = scan
+            }
         }
         onAuthenticated?(link.address, userId)
         scheduleAutomaticScan(after: Self.automaticScanRetryInterval)
@@ -491,7 +546,12 @@ final class LanTransport {
         connections.removeValue(forKey: link.address)
         if let serviceKey = link.serviceKey {
             outboundAddresses.removeValue(forKey: serviceKey)
-            if serviceKey.hasPrefix("scan:"), !link.wasAuthenticated {
+            if link.abortedDuplicateLink {
+                // Not a failure: the contact already has a live LAN link.
+                // No retry -- rediscovery covers a later drop of the
+                // surviving link.
+                reconnectAttempts.removeValue(forKey: serviceKey)
+            } else if serviceKey.hasPrefix("scan:"), !link.wasAuthenticated {
                 // A successful TCP connect can still be an unrelated service
                 // on the default port. Do not retain or retry it after Noise
                 // rejects the peer; explicit scans remain bounded.
@@ -510,6 +570,10 @@ final class LanTransport {
                         discoveredEndpoints[serviceKey].map { String(describing: $0) } ?? serviceKey,
                         reason: "Secure connection failed; CruiseMesh will retry"
                     )
+                    // A failed secure setup to a discovered/hinted peer:
+                    // check promptly whether a fallback sweep is due
+                    // instead of waiting out the periodic interval.
+                    scheduleAutomaticScan(after: Self.reconnectAutomaticScanDelay)
                 }
                 queue.asyncAfter(deadline: .now() + delay) { [weak self] in
                     guard let self,
@@ -598,7 +662,10 @@ final class LanTransport {
                     let key = "scan:\(host):\(lanDefaultTcpPort())"
                     self.discoveredEndpoints[key] = endpoint
                     self.connect(to: endpoint, serviceKey: key)
-                    self.scanCandidateCompleted(generation: generation, foundPeer: true)
+                    // A bare TCP connect is not a find -- only the Noise
+                    // handshake authenticating a friend marks the sweep
+                    // (see connectionAuthenticated).
+                    self.scanCandidateCompleted(generation: generation, foundPeer: false)
                 case .failed, .cancelled:
                     completed = true
                     connection.cancel()
@@ -665,10 +732,17 @@ final class LanTransport {
     private func runAutomaticScanCheck() {
         automaticScanWorkItem = nil
         guard started, foregroundActive, let network = activeNetwork else { return }
+        let pendingOutbound = outboundAddresses.values
+            .filter { connections[$0]?.wasAuthenticated != true }
+            .count
+        let linked = Set(connections.values.compactMap {
+            $0.wasAuthenticated ? $0.authenticatedUserId : nil
+        })
         if shouldRunAutomaticLanScan(
             activeConnections: connections.count,
-            outboundAttempts: outboundAddresses.count,
-            scanRemaining: runningScan?.remaining ?? 0
+            pendingOutboundAttempts: pendingOutbound,
+            scanRemaining: runningScan?.remaining ?? 0,
+            unlinkedCapableContacts: lanCapableContactIds.subtracting(linked).count
         ), let breadth = scanPlanner.takeDueScan(nowMs: Self.nowMs) {
             log.info("Starting automatic local Wi-Fi fallback search (\(String(describing: breadth)))")
             _ = startSubnetScan(breadth, network: network, automatic: true)
@@ -776,6 +850,13 @@ final class LanTransport {
     // recheck will usually find nothing due yet.
     private static let escalateAutomaticScanDelay: DispatchTimeInterval = .seconds(2)
     private static let automaticScanRetryInterval: DispatchTimeInterval = .seconds(5 * 60)
+    /// How long the tie-break loser waits for the elected side's connection
+    /// before initiating anyway -- covers the winner's worst case (connect
+    /// plus handshake timeouts) with margin.
+    private static let electionFallbackDelay: DispatchTimeInterval = .seconds(15)
+    /// Prompt scan-check pull-forward when fresh peer evidence arrives; the
+    /// planner and loneliness gate still decide whether anything runs.
+    private static let peerEvidenceScanDelay: DispatchTimeInterval = .seconds(2)
 
     private static var nowMs: Int64 {
         Int64(Date().timeIntervalSince1970 * 1_000)
@@ -788,9 +869,12 @@ final class LanTransport {
         let candidates: [String]
         var nextCandidateIndex: Int
         var remaining: Int
-        /// Whether any candidate answered so far -- feeds `LanScanPlanner
+        /// Whether a "scan:"-keyed connection authenticated an accepted
+        /// friend while this sweep ran -- feeds `LanScanPlanner
         /// .onScanCompleted`'s `foundPeer`, which decides whether an empty
-        /// /24 sweep arms the full-subnet tier.
+        /// /24 sweep arms the full-subnet tier. A bare TCP connect
+        /// deliberately does not count: any unrelated service on the
+        /// default port must not disarm the wider sweep.
         var foundPeer: Bool
     }
 }
@@ -806,6 +890,12 @@ private final class LanConnection {
     let address: String
     let serviceKey: String?
     private(set) var wasAuthenticated = false
+    /// The accepted contact this link authenticated as, for the transport's
+    /// duplicate-link and unlinked-capable-contact checks.
+    private(set) var authenticatedUserId: Data?
+    /// Set when the initiator-side handshake found the contact already
+    /// linked over LAN: the close is deliberate, not a failure to retry.
+    private(set) var abortedDuplicateLink = false
 
     private weak var owner: LanTransport?
     private let connection: NWConnection
@@ -937,6 +1027,13 @@ private final class LanConnection {
                   let userId = owner?.trustedUserId(for: remoteStatic) else {
                 throw LanTransportError.untrustedPeer
             }
+            if owner?.hasAuthenticatedLink(userId: userId) == true {
+                // Election fallbacks and sweeps may dial a contact that
+                // connected to us in the meantime. Close the redundant
+                // socket before it becomes a second live link.
+                abortedDuplicateLink = true
+                throw LanTransportError.duplicateLink
+            }
             try sendPacket(noise.writeHandshakeMessage())
             try authenticate(userId: userId)
         case .awaitMessage3:
@@ -959,6 +1056,7 @@ private final class LanConnection {
         }
         phase = .transport
         wasAuthenticated = true
+        authenticatedUserId = userId
         setupTimeout?.cancel()
         setupTimeout = nil
         owner?.connectionAuthenticated(self, userId: userId)
@@ -992,6 +1090,7 @@ private enum LanTransportError: Error {
     case incompleteHandshake
     case invalidPacketLength
     case untrustedPeer
+    case duplicateLink
 }
 
 func trustedLanPeerUserId(contacts: [Contact], remoteStaticKey: Data) -> Data? {
@@ -1013,12 +1112,20 @@ func lanBonjourPeerToken(_ txtRecord: [String: String]) -> String? {
     return token
 }
 
+/// Whether the periodic check may claim a scan from `LanScanPlanner`. A scan
+/// is worthwhile while the transport has no links at all, OR while some
+/// contact that has demonstrated LAN support still has no authenticated LAN
+/// link -- one connected family member must not stop discovery of the rest.
+/// In-flight work (pending outbound attempts, a running sweep) always defers.
 func shouldRunAutomaticLanScan(
     activeConnections: Int,
-    outboundAttempts: Int,
-    scanRemaining: Int
+    pendingOutboundAttempts: Int,
+    scanRemaining: Int,
+    unlinkedCapableContacts: Int
 ) -> Bool {
-    activeConnections == 0 && outboundAttempts == 0 && scanRemaining == 0
+    (activeConnections == 0 || unlinkedCapableContacts > 0) &&
+        pendingOutboundAttempts == 0 &&
+        scanRemaining == 0
 }
 
 /// FI7: whether an `NWError` matches one of the documented signals for a

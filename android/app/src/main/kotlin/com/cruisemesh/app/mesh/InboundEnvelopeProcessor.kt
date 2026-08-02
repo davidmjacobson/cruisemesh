@@ -879,9 +879,16 @@ internal class InboundEnvelopeProcessor(
         lan.saveLanEndpoint(hintedNetworkId, senderUserId, endpoint)
         LanCapabilityStore.markSupported(context, senderUserId)
         val now = System.currentTimeMillis()
+        // The network fingerprint is stored with the cached endpoint but
+        // deliberately does NOT gate this dial: requiring an exact match
+        // silently disabled fresh hints on routed multi-subnet LANs -- the
+        // case the sealed hint exists for (mDNS is link-local; TCP may still
+        // route). A cross-network false positive is one bounded TCP attempt
+        // to an endpoint the contact sealed to us, and Noise authenticates.
+        // Being on some Wi-Fi is the only requirement.
         if (
             content.expiresAtMs > now &&
-            hintedNetworkId == lan.currentLanNetworkId()
+            lan.currentLanNetworkId() != null
         ) {
             lan.connectToLanHint(
                 Frame.LanEndpoint(

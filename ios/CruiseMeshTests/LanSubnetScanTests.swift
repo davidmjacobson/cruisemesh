@@ -69,10 +69,39 @@ final class LanSubnetScanTests: XCTestCase {
     }
 
     func testAutomaticScanLonelinessGateMatchesAndroid() {
-        XCTAssertTrue(shouldRunAutomaticLanScan(activeConnections: 0, outboundAttempts: 0, scanRemaining: 0))
-        XCTAssertFalse(shouldRunAutomaticLanScan(activeConnections: 1, outboundAttempts: 0, scanRemaining: 0))
-        XCTAssertFalse(shouldRunAutomaticLanScan(activeConnections: 0, outboundAttempts: 1, scanRemaining: 0))
-        XCTAssertFalse(shouldRunAutomaticLanScan(activeConnections: 0, outboundAttempts: 0, scanRemaining: 1))
+        XCTAssertTrue(shouldRunAutomaticLanScan(
+            activeConnections: 0, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0
+        ))
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0
+        ))
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            activeConnections: 0, pendingOutboundAttempts: 1, scanRemaining: 0, unlinkedCapableContacts: 0
+        ))
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            activeConnections: 0, pendingOutboundAttempts: 0, scanRemaining: 1, unlinkedCapableContacts: 0
+        ))
+    }
+
+    func testUnlinkedCapableContactKeepsSweepGateOpenDespiteLiveLinks() {
+        // One connected family member must not stop discovery of the rest.
+        XCTAssertTrue(shouldRunAutomaticLanScan(
+            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 1
+        ))
+        XCTAssertTrue(shouldRunAutomaticLanScan(
+            activeConnections: 3, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 2
+        ))
+        // But in-flight work still defers, links or not.
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            activeConnections: 1, pendingOutboundAttempts: 1, scanRemaining: 0, unlinkedCapableContacts: 1
+        ))
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 7, unlinkedCapableContacts: 1
+        ))
+        // Everyone capable is linked: nothing left to sweep for.
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0
+        ))
     }
 
     func testBonjourPeerTokenRequiresVersionAndInstanceTxtRecords() {
