@@ -122,6 +122,18 @@ parser and mesh sync path exactly as if BLE had reassembled it.
 - Reconnect attempts use exponential backoff. Authenticated links exchange
   encrypted `TRANSPORT_PROBE` request/response frames; three consecutive probe
   timeouts close the stale socket so discovery can establish a fresh link.
+- Every subnet-sweep probe is classified (connected, refused, timed out,
+  denied, other) and a sweep that probed every candidate produces one verdict,
+  identically on both platforms. A broad sweep where nothing answered and
+  nothing was even refused suggests Wi-Fi client isolation: after the verdict
+  repeats on two consecutive sweeps, further expensive sweeps are deferred to
+  the backoff cap. Fresh peer evidence or a network change lifts that deferral
+  by resetting the scan schedule; the repeat count itself is cleared only by a
+  network change or a sweep that returns some other verdict, so a network that
+  still looks isolated defers again on its very next such sweep. A sweep whose
+  probes were denied outright — a VPN or OS policy refusing the sockets — is
+  reported as such instead, and never changes sweep scheduling. Diagnostics
+  shows the verdict; peer evidence and a network change clear it.
 - Network loss closes every connection and restarts discovery when Wi-Fi
   returns.
 

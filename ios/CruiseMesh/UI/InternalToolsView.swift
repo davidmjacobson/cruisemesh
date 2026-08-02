@@ -86,6 +86,22 @@ struct InternalToolsView: View {
                 if let probe = lanDiagnostics.snapshot.probeStatus {
                     Text(probe).font(.caption).foregroundStyle(.secondary)
                 }
+                switch lanDiagnostics.snapshot.sweepDisplayState {
+                case .none:
+                    EmptyView()
+                case .checking:
+                    Text("Checking this network…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                case .isolationSuspected:
+                    Text("This Wi-Fi appears to block phone-to-phone traffic; nearby delivery will use Bluetooth.")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                case .blockedByPolicy:
+                    Text("Local Wi-Fi probes were denied, likely by a VPN or OS policy; nearby delivery will use Bluetooth.")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
                 Text("Encrypted frames: \(lanDiagnostics.snapshot.sentFrames) sent · \(lanDiagnostics.snapshot.receivedFrames) received")
                     .font(.caption)
                     .foregroundStyle(.secondary)

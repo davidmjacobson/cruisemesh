@@ -114,4 +114,49 @@ final class LanScanPlannerTests: XCTestCase {
         planner.onScanCompleted(.local24, nowMs: rejoinAt + emptyDelay, foundPeer: false)
         XCTAssertEqual(planner.takeDueScan(nowMs: rejoinAt + emptyDelay + emptyDelay), .fullSubnet)
     }
+
+    func testIsolationDefersTheFullSweepToTheCapUntilPeerEvidenceResetsIt() {
+        let planner = LanScanPlanner(localIntervalMs: Int64.max / 2)
+        planner.onNetworkJoined(nowMs: 0)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 0), .local24)
+        planner.onScanCompleted(.local24, nowMs: 0, foundPeer: false)
+
+        let isolationAt: Int64 = 10_000
+        planner.onIsolationSuspected(nowMs: isolationAt)
+        XCTAssertNil(planner.takeDueScan(nowMs: isolationAt + 4 * 60 * minute - 1))
+        XCTAssertEqual(planner.takeDueScan(nowMs: isolationAt + 4 * 60 * minute), .fullSubnet)
+
+        let evidenceAt = isolationAt + 4 * 60 * minute + 1_000
+        planner.onIsolationSuspected(nowMs: evidenceAt)
+        planner.onPeerEvidence(nowMs: evidenceAt + 1_000)
+        XCTAssertEqual(planner.takeDueScan(nowMs: evidenceAt + 1_000), .fullSubnet)
+    }
+
+    func testIsolationIsIgnoredWhileNoNetworkIsJoined() {
+        let planner = LanScanPlanner(localIntervalMs: Int64.max / 2)
+        planner.onNetworkJoined(nowMs: 0)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 0), .local24)
+        planner.onScanCompleted(.local24, nowMs: 0, foundPeer: false)
+        planner.onNetworkLost()
+        planner.onIsolationSuspected(nowMs: 1_000)
+
+        // The deferral must not outlive the network it was measured on.
+        planner.onNetworkJoined(nowMs: 2_000)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 2_000), .local24)
+        planner.onScanCompleted(.local24, nowMs: 2_000, foundPeer: false)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 2_000 + emptyDelay), .fullSubnet)
+    }
+
+    func testNetworkJoinResetsAnIsolationDeferral() {
+        let planner = LanScanPlanner()
+        planner.onNetworkJoined(nowMs: 0)
+        _ = planner.takeDueScan(nowMs: 0)
+        planner.onScanCompleted(.local24, nowMs: 0, foundPeer: false)
+        planner.onIsolationSuspected(nowMs: 1_000)
+
+        planner.onNetworkJoined(nowMs: 2_000)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 2_000), .local24)
+        planner.onScanCompleted(.local24, nowMs: 2_000, foundPeer: false)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 2_000 + emptyDelay), .fullSubnet)
+    }
 }

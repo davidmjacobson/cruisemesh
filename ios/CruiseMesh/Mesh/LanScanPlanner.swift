@@ -126,4 +126,16 @@ final class LanScanPlanner {
         fullBackoffIndex = 0
         fullDueAtMs = min(fullDueAtMs, nowMs)
     }
+
+    /// A broad-enough sweep received no TCP response at all, which commonly
+    /// means Wi-Fi client isolation. Defer further expensive full sweeps to
+    /// the backoff cap until fresh peer evidence or a network join resets the
+    /// plan.
+    func onIsolationSuspected(nowMs: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard joined else { return }
+        fullBackoffIndex = fullBackoffMs.count - 1
+        fullDueAtMs = nowMs + (fullBackoffMs.last ?? 0)
+    }
 }

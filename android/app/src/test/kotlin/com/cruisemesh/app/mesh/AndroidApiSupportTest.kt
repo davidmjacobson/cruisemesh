@@ -35,6 +35,14 @@ class AndroidApiSupportTest {
     }
 
     @Test
+    fun serviceInfoCallbackRequiresAndroid14WithNoExtensionBackport() {
+        assertFalse(supportsServiceInfoCallback(sdkInt = Build.VERSION_CODES.S))
+        assertFalse(supportsServiceInfoCallback(sdkInt = Build.VERSION_CODES.TIRAMISU))
+        assertTrue(supportsServiceInfoCallback(sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE))
+        assertTrue(supportsServiceInfoCallback(sdkInt = Build.VERSION_CODES.VANILLA_ICE_CREAM))
+    }
+
+    @Test
     fun networkScopedDiscoveryRequiresAndroid15OrTExtension12() {
         assertFalse(
             supportsNetworkScopedDiscovery(
