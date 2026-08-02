@@ -2401,32 +2401,50 @@ impl MessageStore {
     /// interval, however short, changes that. Only re-walking from 0 finds
     /// them.
     ///
-    /// Clearing the cursor rows is the whole mechanism, and it is deliberately
-    /// not "force a sweep": a cleared row reads as frontier 0, so the next pass
-    /// starts at 0 whether or not it is flagged as sweeping, and it does not
-    /// depend on any per-process sweep bookkeeping the shells keep. Re-walking
-    /// is cheap and self-correcting — everything already delivered is deduped
-    /// on the way back in by the seen-id gossip filter.
+    /// Zeroing the frontier is the whole mechanism, and it is deliberately not
+    /// "force a sweep": `after_id = 0` is what a pass reads whether or not it
+    /// is flagged as sweeping, so the re-walk does not depend on any
+    /// per-process sweep bookkeeping the shells keep. Re-walking is cheap and
+    /// self-correcting — everything already delivered is deduped on the way
+    /// back in by the seen-id gossip filter.
+    ///
+    /// It resets `after_id` and nothing else. Deleting the rows outright would
+    /// take `last_sweep_at` with it, and that timestamp is the *only* record of
+    /// when each mailbox was last walked end to end. Losing it has two bad
+    /// consequences and no good one: every mailbox reads as never-swept and so
+    /// spends a full flagged sweep on the next cold start, on top of the
+    /// re-walk this invalidation already schedules; and, worse, within the
+    /// running process [`crate::relay_sweep_due`] answers `!swept_this_session`
+    /// for a zeroed timestamp, so a process that had already swept would see
+    /// "not due" from then until it restarted — a membership change would
+    /// quietly switch the six-hour sweep off for the lifetime of the service.
+    /// Keeping the timestamp keeps the cadence honest: the re-walk happens now,
+    /// and the next scheduled sweep still lands when it was always going to.
+    ///
+    /// The re-walk is deliberately not credited as a sweep either. It is not
+    /// flagged `sweeping`, so nothing writes `last_sweep_at`, and a walk that
+    /// dies half way therefore cannot leave behind a timestamp claiming the
+    /// mailbox was covered.
+    ///
+    /// A mailbox with no row yet is untouched by the `UPDATE` and keeps
+    /// reading as `{ after_id: 0, last_sweep_at: 0 }` — already the "walk from
+    /// the beginning, sweep on the first pass" state, which is exactly right
+    /// for one this device has never fetched from.
+    ///
+    /// The digest write and the frontier reset share one transaction. Written
+    /// separately, a failure or a kill between them would leave the digest
+    /// reading as current with the frontiers never reset, and the invalidation
+    /// would be lost for good — the newly-visible mail would stay hidden until
+    /// the next scheduled sweep or the next membership change.
     ///
     /// The first call on a database with no row stores the digest and reports
     /// `false`. An install has nothing behind a frontier to miss, and reporting
     /// `true` would spend a re-walk of every mailbox on the one case that
     /// already starts from 0.
     pub fn note_relay_hint_sources(&self, own_user_id: Vec<u8>) -> Result<bool, CoreError> {
-        let mut sources = vec![own_user_id.clone()];
-        for group in self.list_groups()? {
-            if group.member_user_ids.iter().any(|m| m == &own_user_id) {
-                sources.push(group.id);
-            }
-        }
-        for contact in self.list_contacts()? {
-            if contact.user_id != own_user_id {
-                sources.push(contact.user_id);
-            }
-        }
-        let digest = crate::relay_hint_source_digest(sources);
+        let digest = crate::relay_hint_source_digest(self.relay_hint_source_ids(&own_user_id)?);
 
-        let conn = lock_conn(&self.conn);
+        let mut conn = lock_conn(&self.conn);
         let stored: Option<String> = conn
             .query_row(
                 "SELECT digest FROM relay_hint_source_state WHERE id = 0",
@@ -2438,19 +2456,20 @@ impl MessageStore {
         if stored.as_deref() == Some(digest.as_str()) {
             return Ok(false);
         }
-        let had_row = stored.is_some();
-        conn.execute(
+        let invalidates = stored.is_some();
+        let tx = conn.transaction().map_err(store_err)?;
+        if invalidates {
+            tx.execute("UPDATE relay_fetch_cursors SET after_id = 0", [])
+                .map_err(store_err)?;
+        }
+        tx.execute(
             "INSERT INTO relay_hint_source_state (id, digest) VALUES (0, ?1)
              ON CONFLICT(id) DO UPDATE SET digest = ?1",
             params![digest],
         )
         .map_err(store_err)?;
-        if !had_row {
-            return Ok(false);
-        }
-        conn.execute("DELETE FROM relay_fetch_cursors", [])
-            .map_err(store_err)?;
-        Ok(true)
+        tx.commit().map_err(store_err)?;
+        Ok(invalidates)
     }
 
     /// Set (or clear) the local nickname for a contact (T16). A `None` or
@@ -6913,6 +6932,9 @@ mod tests {
         store
             .advance_relay_fetch_cursor(other.clone(), 4_000, true)
             .unwrap();
+        store
+            .note_relay_sweep_completed(cursor_key(), 1_000_000)
+            .unwrap();
 
         // Importing a contact widens the proxy-poll hints. Mail already in the
         // mailbox under that contact's hints is *below* the frontier, so the
@@ -6923,6 +6945,20 @@ mod tests {
         assert!(store.note_relay_hint_sources(own.clone()).unwrap());
         assert_eq!(store.relay_fetch_cursor(cursor_key()).unwrap().after_id, 0);
         assert_eq!(store.relay_fetch_cursor(other.clone()).unwrap().after_id, 0);
+        // ...and *only* the frontier gives. The sweep timestamp is the only
+        // record of when this mailbox was last walked end to end; dropping it
+        // here would both spend a full sweep on the next cold start and, worse,
+        // read as never-swept inside a process that had already swept -- which
+        // `relay_sweep_due` answers as "not due", switching the schedule off
+        // until the service restarted.
+        assert_eq!(
+            store
+                .relay_fetch_cursor(cursor_key())
+                .unwrap()
+                .last_sweep_at_ms,
+            1_000_000,
+            "invalidating a frontier must not forget when the mailbox was swept"
+        );
 
         // Steady state again: no further re-walks while the set holds still.
         store
@@ -6947,6 +6983,102 @@ mod tests {
             .unwrap();
         assert!(store.note_relay_hint_sources(own.clone()).unwrap());
         assert_eq!(store.relay_fetch_cursor(cursor_key()).unwrap().after_id, 0);
+    }
+
+    #[test]
+    fn the_sweep_is_still_due_on_schedule_after_an_invalidation() {
+        // The regression: a running process sweeps once (so its shell now
+        // passes swept_this_session = true), then the user joins a group. If
+        // the invalidation forgot `last_sweep_at` along with the frontier, the
+        // mailbox would read as never-swept, and `relay_sweep_due(true, 0, _)`
+        // is false forever -- no six-hourly sweep would fire again until the
+        // service restarted. The re-walk would still happen, but nothing would
+        // record it as a sweep, so the clock would never restart either.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let own = vec![9u8; 16];
+        let key = cursor_key();
+        assert!(!store.note_relay_hint_sources(own.clone()).unwrap());
+
+        let swept_at = 1_000_000i64;
+        store
+            .advance_relay_fetch_cursor(key.clone(), 29_000, true)
+            .unwrap();
+        store
+            .note_relay_sweep_completed(key.clone(), swept_at)
+            .unwrap();
+
+        store
+            .upsert_imported_contact(contact(&[7u8; 16], "Newcomer"))
+            .unwrap();
+        assert!(store.note_relay_hint_sources(own).unwrap());
+
+        let cursor = store.relay_fetch_cursor(key).unwrap();
+        // The re-walk happens now, sweep flag or not.
+        assert_eq!(crate::relay_pass_start_cursor(false, cursor.after_id), 0);
+        // And the six-hour cadence is untouched: not due a minute later, due
+        // once the interval measured from the *real* last sweep has elapsed --
+        // asked with swept_this_session = true, the value that made the bug
+        // permanent.
+        assert!(!crate::relay_sweep_due(
+            true,
+            cursor.last_sweep_at_ms,
+            swept_at + 60_000
+        ));
+        assert!(
+            crate::relay_sweep_due(
+                true,
+                cursor.last_sweep_at_ms,
+                swept_at + crate::RELAY_SWEEP_INTERVAL_MS
+            ),
+            "a membership change must not disable the periodic sweep"
+        );
+    }
+
+    #[test]
+    fn an_unswept_mailbox_still_sweeps_on_its_first_pass_after_an_invalidation() {
+        // The other half: a mailbox with no cursor row is not matched by the
+        // reset at all, and must keep reading as "walk from 0, sweep on the
+        // first pass" -- what a fresh install, a restore, a rotated token and a
+        // moved host all look like.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let own = vec![9u8; 16];
+        assert!(!store.note_relay_hint_sources(own.clone()).unwrap());
+        store
+            .upsert_imported_contact(contact(&[7u8; 16], "Newcomer"))
+            .unwrap();
+        assert!(store.note_relay_hint_sources(own).unwrap());
+
+        let cursor = store.relay_fetch_cursor(cursor_key()).unwrap();
+        assert_eq!(cursor.after_id, 0);
+        assert_eq!(cursor.last_sweep_at_ms, 0);
+        assert!(crate::relay_sweep_due(
+            false,
+            cursor.last_sweep_at_ms,
+            10_000
+        ));
+    }
+
+    #[test]
+    fn a_digest_change_and_a_frontier_reset_land_together() {
+        // The two writes are one transaction, so the observable states are
+        // "old digest with the old frontier" and "new digest with a zeroed
+        // frontier" -- never the pairing that loses the invalidation for good
+        // (digest current, frontier never reset, the newly-visible mail hidden
+        // until the next scheduled sweep).
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let own = vec![9u8; 16];
+        assert!(!store.note_relay_hint_sources(own.clone()).unwrap());
+        store
+            .advance_relay_fetch_cursor(cursor_key(), 29_000, true)
+            .unwrap();
+        store
+            .upsert_imported_contact(contact(&[7u8; 16], "Newcomer"))
+            .unwrap();
+
+        assert!(store.note_relay_hint_sources(own.clone()).unwrap());
+        assert_eq!(store.relay_fetch_cursor(cursor_key()).unwrap().after_id, 0);
+        // The digest committed with it: the same set does not re-walk again.
+        assert!(!store.note_relay_hint_sources(own).unwrap());
     }
 
     #[test]

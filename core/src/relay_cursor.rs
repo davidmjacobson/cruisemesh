@@ -238,6 +238,11 @@ pub fn relay_hint_source_digest(mut source_ids: Vec<Vec<u8>>) -> String {
 /// yet sits *below* an already-advanced frontier where no sweep schedule can
 /// help. `MessageStore::note_relay_hint_sources` invalidates the frontier
 /// itself for that, which is the only thing that actually reaches those rows.
+/// It leaves `last_sweep_at` strictly alone, and the first branch below is why
+/// that matters: a zeroed timestamp reads as never-swept, and a process that
+/// has already swept passes `swept_this_session: true`, so zeroing it here
+/// would answer "not due" from then until the service restarted — a membership
+/// change would quietly retire the schedule for the lifetime of the process.
 #[uniffi::export]
 pub fn relay_sweep_due(swept_this_session: bool, last_sweep_at_ms: i64, now_ms: i64) -> bool {
     if last_sweep_at_ms <= 0 {

@@ -2477,12 +2477,41 @@ public protocol MessageStoreProtocol : AnyObject {
      * interval, however short, changes that. Only re-walking from 0 finds
      * them.
      *
-     * Clearing the cursor rows is the whole mechanism, and it is deliberately
-     * not "force a sweep": a cleared row reads as frontier 0, so the next pass
-     * starts at 0 whether or not it is flagged as sweeping, and it does not
-     * depend on any per-process sweep bookkeeping the shells keep. Re-walking
-     * is cheap and self-correcting — everything already delivered is deduped
-     * on the way back in by the seen-id gossip filter.
+     * Zeroing the frontier is the whole mechanism, and it is deliberately not
+     * "force a sweep": `after_id = 0` is what a pass reads whether or not it
+     * is flagged as sweeping, so the re-walk does not depend on any
+     * per-process sweep bookkeeping the shells keep. Re-walking is cheap and
+     * self-correcting — everything already delivered is deduped on the way
+     * back in by the seen-id gossip filter.
+     *
+     * It resets `after_id` and nothing else. Deleting the rows outright would
+     * take `last_sweep_at` with it, and that timestamp is the *only* record of
+     * when each mailbox was last walked end to end. Losing it has two bad
+     * consequences and no good one: every mailbox reads as never-swept and so
+     * spends a full flagged sweep on the next cold start, on top of the
+     * re-walk this invalidation already schedules; and, worse, within the
+     * running process [`crate::relay_sweep_due`] answers `!swept_this_session`
+     * for a zeroed timestamp, so a process that had already swept would see
+     * "not due" from then until it restarted — a membership change would
+     * quietly switch the six-hour sweep off for the lifetime of the service.
+     * Keeping the timestamp keeps the cadence honest: the re-walk happens now,
+     * and the next scheduled sweep still lands when it was always going to.
+     *
+     * The re-walk is deliberately not credited as a sweep either. It is not
+     * flagged `sweeping`, so nothing writes `last_sweep_at`, and a walk that
+     * dies half way therefore cannot leave behind a timestamp claiming the
+     * mailbox was covered.
+     *
+     * A mailbox with no row yet is untouched by the `UPDATE` and keeps
+     * reading as `{ after_id: 0, last_sweep_at: 0 }` — already the "walk from
+     * the beginning, sweep on the first pass" state, which is exactly right
+     * for one this device has never fetched from.
+     *
+     * The digest write and the frontier reset share one transaction. Written
+     * separately, a failure or a kill between them would leave the digest
+     * reading as current with the frontiers never reset, and the invalidation
+     * would be lost for good — the newly-visible mail would stay hidden until
+     * the next scheduled sweep or the next membership change.
      *
      * The first call on a database with no row stores the digest and reports
      * `false`. An install has nothing behind a frontier to miss, and reporting
@@ -4238,12 +4267,41 @@ open func noteContactRelayRejected(userId: Data, nowMs: Int64)throws  -> Int64 {
      * interval, however short, changes that. Only re-walking from 0 finds
      * them.
      *
-     * Clearing the cursor rows is the whole mechanism, and it is deliberately
-     * not "force a sweep": a cleared row reads as frontier 0, so the next pass
-     * starts at 0 whether or not it is flagged as sweeping, and it does not
-     * depend on any per-process sweep bookkeeping the shells keep. Re-walking
-     * is cheap and self-correcting — everything already delivered is deduped
-     * on the way back in by the seen-id gossip filter.
+     * Zeroing the frontier is the whole mechanism, and it is deliberately not
+     * "force a sweep": `after_id = 0` is what a pass reads whether or not it
+     * is flagged as sweeping, so the re-walk does not depend on any
+     * per-process sweep bookkeeping the shells keep. Re-walking is cheap and
+     * self-correcting — everything already delivered is deduped on the way
+     * back in by the seen-id gossip filter.
+     *
+     * It resets `after_id` and nothing else. Deleting the rows outright would
+     * take `last_sweep_at` with it, and that timestamp is the *only* record of
+     * when each mailbox was last walked end to end. Losing it has two bad
+     * consequences and no good one: every mailbox reads as never-swept and so
+     * spends a full flagged sweep on the next cold start, on top of the
+     * re-walk this invalidation already schedules; and, worse, within the
+     * running process [`crate::relay_sweep_due`] answers `!swept_this_session`
+     * for a zeroed timestamp, so a process that had already swept would see
+     * "not due" from then until it restarted — a membership change would
+     * quietly switch the six-hour sweep off for the lifetime of the service.
+     * Keeping the timestamp keeps the cadence honest: the re-walk happens now,
+     * and the next scheduled sweep still lands when it was always going to.
+     *
+     * The re-walk is deliberately not credited as a sweep either. It is not
+     * flagged `sweeping`, so nothing writes `last_sweep_at`, and a walk that
+     * dies half way therefore cannot leave behind a timestamp claiming the
+     * mailbox was covered.
+     *
+     * A mailbox with no row yet is untouched by the `UPDATE` and keeps
+     * reading as `{ after_id: 0, last_sweep_at: 0 }` — already the "walk from
+     * the beginning, sweep on the first pass" state, which is exactly right
+     * for one this device has never fetched from.
+     *
+     * The digest write and the frontier reset share one transaction. Written
+     * separately, a failure or a kill between them would leave the digest
+     * reading as current with the frontiers never reset, and the invalidation
+     * would be lost for good — the newly-visible mail would stay hidden until
+     * the next scheduled sweep or the next membership change.
      *
      * The first call on a database with no row stores the digest and reports
      * `false`. An install has nothing behind a frontier to miss, and reporting
@@ -15066,6 +15124,11 @@ public func relaySetupIsOfficial(relayUrl: String) -> Bool {
  * yet sits *below* an already-advanced frontier where no sweep schedule can
  * help. `MessageStore::note_relay_hint_sources` invalidates the frontier
  * itself for that, which is the only thing that actually reaches those rows.
+ * It leaves `last_sweep_at` strictly alone, and the first branch below is why
+ * that matters: a zeroed timestamp reads as never-swept, and a process that
+ * has already swept passes `swept_this_session: true`, so zeroing it here
+ * would answer "not due" from then until the service restarted — a membership
+ * change would quietly retire the schedule for the lifetime of the process.
  */
 public func relaySweepDue(sweptThisSession: Bool, lastSweepAtMs: Int64, nowMs: Int64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -15716,7 +15779,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 55007) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 26614) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 13229) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_interval_ms() != 37428) {
@@ -16073,7 +16136,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_contact_relay_rejected() != 13589) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_hint_sources() != 55836) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_hint_sources() != 11955) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_sweep_completed() != 49168) {
