@@ -106,6 +106,89 @@ class LanTransportTest {
     }
 
     @Test
+    fun `pending outbound attempts count only keys without an authenticated link`() {
+        assertEquals(0, pendingLanOutboundAttempts(emptySet(), emptySet()))
+        assertEquals(
+            2,
+            pendingLanOutboundAttempts(setOf("scan:10.0.0.2", "scan:10.0.0.3"), emptySet()),
+        )
+        assertEquals(
+            1,
+            pendingLanOutboundAttempts(
+                setOf("scan:10.0.0.2", "scan:10.0.0.3"),
+                setOf("scan:10.0.0.2"),
+            ),
+        )
+        // A stale authenticated key with no matching attempt (a connection
+        // still winding down after the network dropped) cannot push the
+        // count negative and wedge the scan gate.
+        assertEquals(0, pendingLanOutboundAttempts(emptySet(), setOf("scan:10.0.0.2")))
+        assertTrue(
+            shouldRunAutomaticLanScan(
+                0,
+                pendingLanOutboundAttempts(emptySet(), setOf("scan:10.0.0.2")),
+                0,
+                0,
+            ),
+        )
+    }
+
+    /** The outbound bookkeeping LanTransport keeps for the scan gate. */
+    private class OutboundLinks {
+        private val dialled = mutableSetOf<String>()
+        private val authenticated = mutableSetOf<String>()
+
+        fun dial(key: String) { dialled += key }
+        fun authenticate(key: String) { authenticated += key }
+
+        /** Per-connection cleanup, which may land after a teardown. */
+        fun connectionFinished(key: String) {
+            dialled -= key
+            authenticated -= key
+        }
+
+        /** Wi-Fi dropped: per-network state is dropped and sockets closed. */
+        fun networkTornDown() {
+            dialled.clear()
+            authenticated.clear()
+        }
+
+        fun pending(): Int = pendingLanOutboundAttempts(dialled, authenticated)
+    }
+
+    @Test
+    fun `losing Wi-Fi with live links leaves automatic scanning armed on the next join`() {
+        val links = OutboundLinks()
+        links.dial("cache:friend:10.0.0.2")
+        links.authenticate("cache:friend:10.0.0.2")
+        links.dial("scan:10.0.0.3")
+        links.authenticate("scan:10.0.0.3")
+        assertEquals(0, links.pending())
+
+        // A Wi-Fi roam tears the session down while both links are live, and
+        // the reader threads only notice their closed sockets afterwards.
+        links.networkTornDown()
+        links.connectionFinished("cache:friend:10.0.0.2")
+        links.connectionFinished("scan:10.0.0.3")
+
+        // Joining the next network: nothing is in flight, so the periodic
+        // check must be free to sweep again.
+        assertEquals(0, links.pending())
+        assertTrue(shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
+
+        // And the gate still defers while a fresh attempt really is pending.
+        links.dial("scan:10.1.0.4")
+        assertEquals(1, links.pending())
+        assertTrue(!shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
+    }
+
+    @Test
+    fun `automatic subnet fallback gate never reads a negative count as busy`() {
+        assertTrue(shouldRunAutomaticLanScan(0, -3, 0, 0))
+        assertTrue(shouldRunAutomaticLanScan(0, 0, -1, 0))
+    }
+
+    @Test
     fun `authenticated scan endpoints are retained but unrelated TCP services are not`() {
         assertTrue(shouldRetainLanReconnectTarget("scan:10.0.0.2", wasAuthenticated = true))
         assertTrue(!shouldRetainLanReconnectTarget("scan:10.0.0.3", wasAuthenticated = false))
