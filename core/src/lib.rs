@@ -104,8 +104,8 @@ pub use protocol::{
 };
 pub use recipient_hints::{dedupe_hints, recent_hints_for, recent_presence_hints_for};
 pub use relay_cursor::{
-    relay_cursor_advance, relay_cursor_key, relay_fetch_walk_continues, relay_pass_start_cursor,
-    relay_sweep_due, relay_sweep_interval_ms, RELAY_SWEEP_INTERVAL_MS,
+    relay_cursor_advance, relay_cursor_key, relay_fetch_walk_continues, relay_hint_source_digest,
+    relay_pass_start_cursor, relay_sweep_due, relay_sweep_interval_ms, RELAY_SWEEP_INTERVAL_MS,
 };
 pub use relay_setup::{
     make_relay_setup_card, parse_relay_setup_text, relay_setup_is_official, RelaySetup,

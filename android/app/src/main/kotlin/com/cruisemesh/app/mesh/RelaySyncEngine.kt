@@ -471,6 +471,23 @@ internal class RelaySyncEngine(
         uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now, network)
         uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now, network)
 
+        // Gaining a contact or a group widens the fetch-hint set, and relayd's
+        // next_cursor only ever covers the hints we sent -- so mail that
+        // arrived under a hint we did not have yet is already *below* the
+        // frontier, where no sweep interval can reach it. Core notices the
+        // change and drops the frontiers; the walks below then start at 0.
+        // Cheap when nothing changed (one digest of the id set, no rows
+        // touched), so it is safe to run every pass.
+        runCatching { store.noteRelayHintSources(identity.userId) }
+            .onSuccess { rewalking ->
+                if (rewalking) {
+                    Log.i(TAG, "Hint sources changed; re-walking every relay mailbox from the start")
+                }
+            }
+            .onFailure { error ->
+                Log.w(TAG, "Could not check relay hint sources: ${error.message}")
+            }
+
         val configs = distinctRelayConfigs(contacts, fallbackConfig)
         anyRelayConfigKnown = configs.isNotEmpty()
         if (configs.isEmpty()) {

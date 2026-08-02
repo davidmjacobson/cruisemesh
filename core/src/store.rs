@@ -2389,6 +2389,70 @@ impl MessageStore {
         Ok(())
     }
 
+    /// Notice that the set of ids our relay fetch hints derive from has
+    /// changed, and invalidate every remembered frontier if it has. Returns
+    /// whether this pass did so.
+    ///
+    /// Call once at the start of a sync pass, before computing hints. See
+    /// [`crate::relay_hint_source_digest`] for why the frontier — not the sweep
+    /// schedule — is the thing that has to give here: relayd's `next_cursor` is
+    /// the id of the last row matching the hints *you sent*, so rows belonging
+    /// to a hint gained later are already behind the frontier, and no sweep
+    /// interval, however short, changes that. Only re-walking from 0 finds
+    /// them.
+    ///
+    /// Clearing the cursor rows is the whole mechanism, and it is deliberately
+    /// not "force a sweep": a cleared row reads as frontier 0, so the next pass
+    /// starts at 0 whether or not it is flagged as sweeping, and it does not
+    /// depend on any per-process sweep bookkeeping the shells keep. Re-walking
+    /// is cheap and self-correcting — everything already delivered is deduped
+    /// on the way back in by the seen-id gossip filter.
+    ///
+    /// The first call on a database with no row stores the digest and reports
+    /// `false`. An install has nothing behind a frontier to miss, and reporting
+    /// `true` would spend a re-walk of every mailbox on the one case that
+    /// already starts from 0.
+    pub fn note_relay_hint_sources(&self, own_user_id: Vec<u8>) -> Result<bool, CoreError> {
+        let mut sources = vec![own_user_id.clone()];
+        for group in self.list_groups()? {
+            if group.member_user_ids.iter().any(|m| m == &own_user_id) {
+                sources.push(group.id);
+            }
+        }
+        for contact in self.list_contacts()? {
+            if contact.user_id != own_user_id {
+                sources.push(contact.user_id);
+            }
+        }
+        let digest = crate::relay_hint_source_digest(sources);
+
+        let conn = lock_conn(&self.conn);
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT digest FROM relay_hint_source_state WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        if stored.as_deref() == Some(digest.as_str()) {
+            return Ok(false);
+        }
+        let had_row = stored.is_some();
+        conn.execute(
+            "INSERT INTO relay_hint_source_state (id, digest) VALUES (0, ?1)
+             ON CONFLICT(id) DO UPDATE SET digest = ?1",
+            params![digest],
+        )
+        .map_err(store_err)?;
+        if !had_row {
+            return Ok(false);
+        }
+        conn.execute("DELETE FROM relay_fetch_cursors", [])
+            .map_err(store_err)?;
+        Ok(true)
+    }
+
     /// Set (or clear) the local nickname for a contact (T16). A `None` or
     /// blank/whitespace value clears it, falling display back to the card
     /// `name`. Returns whether a row was updated (false = unknown contact).
@@ -4472,6 +4536,17 @@ CREATE TABLE IF NOT EXISTS relay_fetch_cursors (
     config_key    TEXT PRIMARY KEY,
     after_id      INTEGER NOT NULL DEFAULT 0,
     last_sweep_at INTEGER NOT NULL DEFAULT 0
+);
+
+-- One row. The digest of the id set our relay fetch hints derive from (own
+-- user id + member groups + contacts), as `relay_hint_source_digest` computes
+-- it. Compared once per sync pass so that gaining a contact or a group
+-- invalidates the frontiers above, which is the only thing that reaches mail
+-- already sitting under a hint we did not have yet. A digest rather than the
+-- ids themselves, so this is not a second copy of the contact list.
+CREATE TABLE IF NOT EXISTS relay_hint_source_state (
+    id     INTEGER PRIMARY KEY CHECK (id = 0),
+    digest TEXT NOT NULL
 );
 
 -- `msg_id`s this device consumed as the envelope's SOLE true endpoint
@@ -6783,6 +6858,122 @@ mod tests {
         store.clear_relay_fetch_cursors().unwrap();
         assert_eq!(store.relay_fetch_cursor(cursor_key()).unwrap().after_id, 0);
         assert_eq!(store.relay_fetch_cursor(other).unwrap().after_id, 0);
+    }
+
+    #[test]
+    fn a_stored_sweep_timestamp_survives_a_cold_start() {
+        // The regression the cold-start rule exists to prevent, exercised
+        // through the store rather than as pure arithmetic: write a real
+        // timestamp the way a completed walk does, then ask as a *cold start*
+        // (swept_this_session = false, which is what every fresh process
+        // passes). It must not re-walk. If per-process forcing is ever
+        // reintroduced at the store or shell layer, this is the assertion that
+        // fails.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        store
+            .advance_relay_fetch_cursor(key.clone(), 29_000, true)
+            .unwrap();
+        store
+            .note_relay_sweep_completed(key.clone(), 1_000_000)
+            .unwrap();
+
+        let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
+        assert!(
+            !crate::relay_sweep_due(false, cursor.last_sweep_at_ms, 1_000_000 + 60_000),
+            "a restart minutes after a sweep must not re-walk the mailbox"
+        );
+        assert_eq!(
+            crate::relay_pass_start_cursor(false, cursor.after_id),
+            29_000,
+            "and the pass must resume from the frontier, not from 0"
+        );
+        // The interval still governs once it has actually elapsed.
+        assert!(crate::relay_sweep_due(
+            false,
+            cursor.last_sweep_at_ms,
+            1_000_000 + crate::RELAY_SWEEP_INTERVAL_MS
+        ));
+    }
+
+    #[test]
+    fn gaining_a_hint_source_invalidates_every_frontier() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let own = vec![9u8; 16];
+        let other = crate::relay_cursor_key("https://other.example".into(), "tok".into());
+
+        // First call on a fresh database records the set and forces nothing:
+        // an install has nothing sitting behind a frontier to miss.
+        assert!(!store.note_relay_hint_sources(own.clone()).unwrap());
+        assert!(!store.note_relay_hint_sources(own.clone()).unwrap());
+
+        store
+            .advance_relay_fetch_cursor(cursor_key(), 29_000, true)
+            .unwrap();
+        store
+            .advance_relay_fetch_cursor(other.clone(), 4_000, true)
+            .unwrap();
+
+        // Importing a contact widens the proxy-poll hints. Mail already in the
+        // mailbox under that contact's hints is *below* the frontier, so the
+        // frontier -- not the sweep schedule -- is what has to give.
+        store
+            .upsert_imported_contact(contact(&[7u8; 16], "Newcomer"))
+            .unwrap();
+        assert!(store.note_relay_hint_sources(own.clone()).unwrap());
+        assert_eq!(store.relay_fetch_cursor(cursor_key()).unwrap().after_id, 0);
+        assert_eq!(store.relay_fetch_cursor(other.clone()).unwrap().after_id, 0);
+
+        // Steady state again: no further re-walks while the set holds still.
+        store
+            .advance_relay_fetch_cursor(cursor_key(), 30_000, true)
+            .unwrap();
+        assert!(!store.note_relay_hint_sources(own.clone()).unwrap());
+        assert_eq!(
+            store.relay_fetch_cursor(cursor_key()).unwrap().after_id,
+            30_000
+        );
+
+        // Joining a group widens the self hints the same way.
+        store
+            .upsert_group(Group {
+                id: vec![5u8; 16],
+                name: "Deck 9".into(),
+                member_user_ids: vec![own.clone(), vec![7u8; 16]],
+                key: vec![3u8; 32],
+                metadata_revision: 1,
+                metadata_changed_by: own.clone(),
+            })
+            .unwrap();
+        assert!(store.note_relay_hint_sources(own.clone()).unwrap());
+        assert_eq!(store.relay_fetch_cursor(cursor_key()).unwrap().after_id, 0);
+    }
+
+    #[test]
+    fn a_group_we_are_not_in_is_not_one_of_our_hint_sources() {
+        // `relay_self_hints` only contributes groups we are a member of, so a
+        // group imported without us in it must not spend a re-walk.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let own = vec![9u8; 16];
+        assert!(!store.note_relay_hint_sources(own.clone()).unwrap());
+        store
+            .advance_relay_fetch_cursor(cursor_key(), 29_000, true)
+            .unwrap();
+        store
+            .upsert_group(Group {
+                id: vec![6u8; 16],
+                name: "Someone else's group".into(),
+                member_user_ids: vec![vec![7u8; 16], vec![8u8; 16]],
+                key: vec![3u8; 32],
+                metadata_revision: 1,
+                metadata_changed_by: vec![7u8; 16],
+            })
+            .unwrap();
+        assert!(!store.note_relay_hint_sources(own).unwrap());
+        assert_eq!(
+            store.relay_fetch_cursor(cursor_key()).unwrap().after_id,
+            29_000
+        );
     }
 
     #[test]
