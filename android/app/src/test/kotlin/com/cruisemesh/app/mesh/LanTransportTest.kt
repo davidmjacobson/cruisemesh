@@ -1,5 +1,6 @@
 package com.cruisemesh.app.mesh
 
+import android.os.Build
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -37,6 +38,34 @@ class LanTransportTest {
         assertTrue(shouldInitiateLanConnection("0011", "aabb"))
         assertTrue(!shouldInitiateLanConnection("aabb", "0011"))
         assertTrue(!shouldInitiateLanConnection("aabb", "aabb"))
+    }
+
+    @Test
+    fun `a crowded network resolves the peers past the live-callback cap`() {
+        // Ship Wi-Fi advertises far more services than there are callback
+        // slots. The peers found once the cap fills must degrade to the
+        // one-shot resolve, not be dropped for the whole Wi-Fi session.
+        val routes = (0 until 12).map { live ->
+            lanServiceRoute(
+                sdkInt = Build.VERSION_CODES.UPSIDE_DOWN_CAKE,
+                liveServiceInfoCallbacks = live,
+                maxServiceInfoCallbacks = 8,
+            )
+        }
+        assertEquals(List(8) { LanServiceRoute.LIVE_CALLBACK }, routes.take(8))
+        assertEquals(List(4) { LanServiceRoute.ONE_SHOT_RESOLVE }, routes.drop(8))
+    }
+
+    @Test
+    fun `before Android 14 every LAN service takes the one-shot resolve`() {
+        assertEquals(
+            LanServiceRoute.ONE_SHOT_RESOLVE,
+            lanServiceRoute(
+                sdkInt = Build.VERSION_CODES.TIRAMISU,
+                liveServiceInfoCallbacks = 0,
+                maxServiceInfoCallbacks = 8,
+            ),
+        )
     }
 
     @Test

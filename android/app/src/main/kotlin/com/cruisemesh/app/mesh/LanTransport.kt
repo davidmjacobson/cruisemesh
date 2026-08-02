@@ -988,11 +988,15 @@ internal class LanTransport(
                 val name = serviceInfo.serviceName
                 if (name == requestedServiceName || name == registeredServiceName) return@post
                 if (!queuedServiceNames.add(name)) return@post
-                if (supportsServiceInfoCallback(Build.VERSION.SDK_INT)) {
-                    registerServiceInfoCallback(serviceInfo)
-                } else {
-                    pendingServices.addLast(serviceInfo)
-                    resolveNext()
+                when (
+                    lanServiceRoute(
+                        sdkInt = Build.VERSION.SDK_INT,
+                        liveServiceInfoCallbacks = serviceInfoCallbacks.size,
+                        maxServiceInfoCallbacks = MAX_SERVICE_INFO_CALLBACKS,
+                    )
+                ) {
+                    LanServiceRoute.LIVE_CALLBACK -> registerServiceInfoCallback(serviceInfo)
+                    LanServiceRoute.ONE_SHOT_RESOLVE -> fallBackToDeprecatedResolve(serviceInfo)
                 }
             }
         }
@@ -1075,10 +1079,10 @@ internal class LanTransport(
      *
      * `registerServiceInfoCallback` keeps delivering service info for as long
      * as the record lives, so a slow or failed first resolve no longer drops
-     * the peer until mDNS refreshes it. Live callbacks are bounded
-     * ([MAX_SERVICE_INFO_CALLBACKS]) and unregistered on service loss and
-     * network teardown. If registration is rejected the service falls back to
-     * the deprecated queue so discovery still works.
+     * the peer until mDNS refreshes it. Live callbacks are unregistered on
+     * service loss and network teardown. Callers route here only while a slot
+     * is free (see [lanServiceRoute]); if registration is rejected the service
+     * falls back to the deprecated queue so discovery still works.
      *
      * Called on the main handler.
      */
@@ -1086,11 +1090,6 @@ internal class LanTransport(
     private fun registerServiceInfoCallback(found: NsdServiceInfo) {
         val name = found.serviceName
         if (serviceInfoCallbacks.containsKey(name)) return
-        if (serviceInfoCallbacks.size >= MAX_SERVICE_INFO_CALLBACKS) {
-            Log.d(TAG, "Ignoring LAN service: already tracking the maximum number of peers")
-            queuedServiceNames.remove(name)
-            return
-        }
         val request = NsdServiceInfo().apply {
             serviceName = name
             serviceType = lanServiceType()
@@ -1139,9 +1138,10 @@ internal class LanTransport(
     }
 
     /**
-     * The API 34+ registration was rejected for this service. Discovery must
-     * not simply lose the peer, so hand it to the deprecated one-shot resolve
-     * that every pre-34 device already uses.
+     * The deprecated one-shot resolve, which is the only path a pre-34 device
+     * ever had. API 34+ services that cannot hold a live callback -- the cap
+     * is full, or registration was rejected -- come here too, so those peers
+     * degrade to a single resolve instead of never being resolved at all.
      */
     private fun fallBackToDeprecatedResolve(found: NsdServiceInfo) {
         if (!started || !queuedServiceNames.contains(found.serviceName)) return
@@ -1377,8 +1377,7 @@ internal class LanTransport(
 
         // Live API 34+ service-info callbacks. Each one is a standing
         // platform registration, so the count is bounded the same way live
-        // sockets are; a network with more advertisers than this falls back
-        // to whichever peers were discovered first.
+        // sockets are; peers past the cap still get a one-shot resolve.
         private const val MAX_SERVICE_INFO_CALLBACKS = 8
         private const val CONNECT_TIMEOUT_MS = 3_000
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
@@ -1467,6 +1466,33 @@ internal fun sameLanServiceType(value: String): Boolean =
  */
 internal fun shouldInitiateLanConnection(localToken: String, remoteToken: String): Boolean =
     localToken != remoteToken && localToken < remoteToken
+
+internal enum class LanServiceRoute { LIVE_CALLBACK, ONE_SHOT_RESOLVE }
+
+/**
+ * How a newly found LAN service gets resolved.
+ *
+ * A live API 34+ service-info callback is a standing platform registration,
+ * so only so many are held at once. Everything else -- older Android, and the
+ * peers a dense network turns up once the callbacks are full -- takes the
+ * deprecated one-shot resolve. A ship's Wi-Fi can advertise far more services
+ * than the cap (a whole fleet plus strangers on the same service type), and a
+ * peer discovered past it must still be resolved rather than sit invisible
+ * for the rest of the Wi-Fi session.
+ */
+internal fun lanServiceRoute(
+    sdkInt: Int,
+    liveServiceInfoCallbacks: Int,
+    maxServiceInfoCallbacks: Int,
+): LanServiceRoute =
+    if (
+        supportsServiceInfoCallback(sdkInt) &&
+        liveServiceInfoCallbacks < maxServiceInfoCallbacks
+    ) {
+        LanServiceRoute.LIVE_CALLBACK
+    } else {
+        LanServiceRoute.ONE_SHOT_RESOLVE
+    }
 
 /**
  * Whether the periodic check may claim a scan from [LanScanPlanner]. A scan
