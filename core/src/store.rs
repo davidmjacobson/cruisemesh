@@ -468,6 +468,18 @@ impl MessageStore {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&conn, "carried_envelopes", "content_digest", "BLOB")?;
+        // Upload-side twin of the relay fetch cursor: the relay URL this
+        // carried envelope was last confirmed present on -- stamped by a
+        // successful upload or by fetching the same `msg_id` back off a
+        // relay; NULL = never confirmed anywhere. Consulted ONLY by
+        // `family_carried_envelopes` (the relay-upload query); no removal
+        // path reads it -- a carried envelope is still dropped only on
+        // digest-proof of receipt, eviction, or expiry. Without it every
+        // sync pass re-posted the same head-of-queue envelopes for their
+        // whole seven-day life, burning the family's shared relay rate
+        // budget and starving rows behind the batch limit of their first
+        // upload.
+        ensure_column(&conn, "carried_envelopes", "relay_uploaded_to", "TEXT")?;
         migrate_carried_content_digests(&mut conn)?;
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_carried_content_digest
@@ -476,12 +488,15 @@ impl MessageStore {
         )
         .map_err(store_err)?;
         // FC7: supports the relay-upload query in `family_carried_envelopes`
-        // (`WHERE is_family = 1 AND from_relay = 0 AND expiry > ?1 ORDER BY
-        // received_at ASC, msg_id ASC`). Created here (after `from_relay` is
+        // (`WHERE is_family = 1 AND from_relay = 0 AND relay_uploaded_to IS
+        // NULL AND expiry > ?1 ORDER BY received_at ASC, msg_id ASC`).
+        // Created here (after `from_relay` is
         // ensured above) rather than in SCHEMA, since an older on-disk store
         // won't have that column yet when SCHEMA's CREATE TABLE IF NOT EXISTS
-        // runs. `expiry` is deliberately left out of the index: it's a range
-        // predicate (>), and SQLite can use a leading index column for
+        // runs. `expiry` (a range predicate) and `relay_uploaded_to` (added
+        // later; almost every candidate row is NULL anyway) are applied as
+        // cheap residual filters per row rather than indexed:
+        // for `expiry`, SQLite can use a leading index column for
         // either a range filter or to satisfy ORDER BY, not both at once --
         // putting it before `received_at` still leaves the ORDER BY needing
         // a temp b-tree sort (verified empirically). With only the two
@@ -2167,8 +2182,9 @@ impl MessageStore {
         )?;
         let url = (!content.relay_url.is_empty()).then_some(content.relay_url);
         let token = (!content.relay_token.is_empty()).then_some(content.relay_token);
-        let conn = lock_conn(&self.conn);
-        let changed = conn
+        let mut conn = lock_conn(&self.conn);
+        let tx = conn.transaction().map_err(store_err)?;
+        let changed = tx
             .execute(
                 // A newly announced endpoint has never been tried, so it
                 // starts trusted: carrying the old endpoint's rejection
@@ -2181,6 +2197,19 @@ impl MessageStore {
                 params![sender_user_id, url, token, content.relay_epoch],
             )
             .map_err(store_err)?;
+        if changed > 0 {
+            // The contact's mail now targets a different mailbox, so
+            // "already uploaded" no longer holds -- re-offer the carry
+            // queue once (see clear_carried_relay_upload_markers's doc for
+            // why the clear is wholesale rather than per-contact).
+            tx.execute(
+                "UPDATE carried_envelopes SET relay_uploaded_to = NULL
+                 WHERE relay_uploaded_to IS NOT NULL",
+                [],
+            )
+            .map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)?;
         Ok(changed > 0)
     }
 
@@ -3483,7 +3512,14 @@ impl MessageStore {
     /// proxy-polling in the first place (see
     /// [`MessageStore::enqueue_relay_carried_envelope`]), so re-uploading them
     /// here would be pointless churn (and could resurrect an envelope the
-    /// real recipient already acked).
+    /// real recipient already acked). Also excludes rows whose
+    /// `relay_uploaded_to` marker is set (see
+    /// [`MessageStore::mark_carried_envelope_relay_uploaded`]): a relay that
+    /// already holds an envelope dedupes a re-post but still charges the
+    /// family's shared request budget for it, so before the marker existed a
+    /// phone with a deep carry queue re-posted its oldest `limit` rows on
+    /// every single sync pass -- rate-limiting the whole family -- while
+    /// rows behind the batch head never got their first upload at all.
     pub fn family_carried_envelopes(
         &self,
         limit: u64,
@@ -3494,7 +3530,8 @@ impl MessageStore {
             .prepare(
                 "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
                  FROM carried_envelopes
-                 WHERE is_family = 1 AND from_relay = 0 AND expiry > ?1
+                 WHERE is_family = 1 AND from_relay = 0
+                   AND relay_uploaded_to IS NULL AND expiry > ?1
                  ORDER BY received_at ASC, msg_id ASC
                  LIMIT ?2",
             )
@@ -3503,6 +3540,61 @@ impl MessageStore {
             .query_map(params![now_ms, limit as i64], row_to_carried)
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Record that `relay_url` is confirmed to hold this carried envelope --
+    /// either because this device just uploaded it there (2xx) or because it
+    /// just fetched the same `msg_id` off that relay's mailbox. From then on
+    /// [`MessageStore::family_carried_envelopes`] stops offering the row for
+    /// upload, which is the whole fix for the re-post-every-pass storm: an
+    /// upload becomes once per envelope per mailbox instead of once per
+    /// envelope per pass. First writer wins (`relay_uploaded_to IS NULL`
+    /// guard), so a marker never silently moves between relays -- an
+    /// endpoint change instead clears markers wholesale
+    /// ([`MessageStore::clear_carried_relay_upload_markers`]) and the next
+    /// pass re-posts once to the new mailbox.
+    ///
+    /// This gates re-upload ONLY. It must never feed a removal decision: a
+    /// carried envelope still leaves the queue only on digest-proof of
+    /// receipt, eviction, or expiry (DTN ack-safety rule in CLAUDE.md).
+    /// Returns whether a row was newly marked.
+    pub fn mark_carried_envelope_relay_uploaded(
+        &self,
+        msg_id: Vec<u8>,
+        relay_url: String,
+    ) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let changed = conn
+            .execute(
+                "UPDATE carried_envelopes SET relay_uploaded_to = ?2
+                 WHERE msg_id = ?1 AND relay_uploaded_to IS NULL",
+                params![msg_id, relay_url],
+            )
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
+    /// Forget every carried-upload marker, so the next sync pass offers the
+    /// whole (family, non-relay-sourced) carry queue for upload once more.
+    /// Called when a relay endpoint changes -- ours (a new Cruise Pass, a
+    /// manual edit, a restore onto a different config) or a contact's (a
+    /// T23 relay-change notice, applied inside
+    /// [`MessageStore::apply_contact_relay_update`]) -- because "already on
+    /// the old mailbox" says nothing about the new one. Endpoint changes are
+    /// rare and the relay dedupes re-posts, so one wholesale re-offer is the
+    /// simple safe answer; scoping the clear to one contact's envelopes is
+    /// not possible anyway (recipient hints rotate daily and are not
+    /// reversible to a contact). Returns how many rows were cleared.
+    pub fn clear_carried_relay_upload_markers(&self) -> Result<u64, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let changed = conn
+            .execute(
+                "UPDATE carried_envelopes SET relay_uploaded_to = NULL
+                 WHERE relay_uploaded_to IS NOT NULL",
+                [],
+            )
+            .map_err(store_err)?;
+        Ok(changed as u64)
     }
 }
 
@@ -4519,7 +4611,8 @@ CREATE TABLE IF NOT EXISTS carried_envelopes (
     received_at    INTEGER NOT NULL,
     size_bytes     INTEGER NOT NULL,
     from_relay     INTEGER NOT NULL DEFAULT 0,
-    content_digest BLOB
+    content_digest BLOB,
+    relay_uploaded_to TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_carried_hint ON carried_envelopes(recipient_hint);
 CREATE INDEX IF NOT EXISTS idx_carried_expiry ON carried_envelopes(expiry);
@@ -5946,7 +6039,8 @@ mod tests {
                 "EXPLAIN QUERY PLAN
                  SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
                  FROM carried_envelopes
-                 WHERE is_family = 1 AND from_relay = 0 AND expiry > ?1
+                 WHERE is_family = 1 AND from_relay = 0
+                   AND relay_uploaded_to IS NULL AND expiry > ?1
                  ORDER BY received_at ASC, msg_id ASC
                  LIMIT ?2",
             )
@@ -9485,6 +9579,143 @@ mod tests {
 
         let uploadable = store.family_carried_envelopes(10, 2_000).unwrap();
         assert_eq!(uploadable, vec![env]);
+    }
+
+    // --- carried-upload marker (relay_uploaded_to) --------------------------
+
+    #[test]
+    fn marked_carried_envelope_is_never_offered_for_upload_again() {
+        // The core of the re-post-storm fix: once an upload (or a fetch of
+        // the same msg_id) confirms a relay holds the envelope, the upload
+        // query stops offering it -- but it stays deliverable over BLE,
+        // because the marker gates re-upload only, never removal.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let env = carried(b"ble-family", b"hint-a", 9_000, 10);
+        assert!(store
+            .enqueue_carried_envelope(env.clone(), true, 1_000, BIG_BUDGET)
+            .unwrap());
+        assert_eq!(store.family_carried_envelopes(10, 2_000).unwrap().len(), 1);
+
+        assert!(store
+            .mark_carried_envelope_relay_uploaded(
+                b"ble-family".to_vec(),
+                "https://relay.example".to_string(),
+            )
+            .unwrap());
+        assert!(store
+            .family_carried_envelopes(10, 2_000)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .carried_envelopes_for_hints(vec![b"hint-a".to_vec()], 2_000)
+                .unwrap(),
+            vec![env],
+        );
+    }
+
+    #[test]
+    fn marker_is_first_writer_wins_and_marking_nothing_is_not_an_error() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let env = carried(b"ble-family", b"hint-a", 9_000, 10);
+        assert!(store
+            .enqueue_carried_envelope(env, true, 1_000, BIG_BUDGET)
+            .unwrap());
+
+        assert!(store
+            .mark_carried_envelope_relay_uploaded(
+                b"ble-family".to_vec(),
+                "https://first.example".to_string(),
+            )
+            .unwrap());
+        // Second confirmation (e.g. the same envelope fetched back off the
+        // relay a moment after the upload marked it) changes nothing.
+        assert!(!store
+            .mark_carried_envelope_relay_uploaded(
+                b"ble-family".to_vec(),
+                "https://second.example".to_string(),
+            )
+            .unwrap());
+        // Marking an unknown msg_id (a fetched envelope we never carried) is
+        // an ordinary no-op, not an error.
+        assert!(!store
+            .mark_carried_envelope_relay_uploaded(
+                b"never-carried".to_vec(),
+                "https://relay.example".to_string(),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn clearing_markers_reoffers_the_carry_queue_once() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let env = carried(b"ble-family", b"hint-a", 9_000, 10);
+        assert!(store
+            .enqueue_carried_envelope(env.clone(), true, 1_000, BIG_BUDGET)
+            .unwrap());
+        assert!(store
+            .mark_carried_envelope_relay_uploaded(
+                b"ble-family".to_vec(),
+                "https://old.example".to_string(),
+            )
+            .unwrap());
+        assert!(store
+            .family_carried_envelopes(10, 2_000)
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(store.clear_carried_relay_upload_markers().unwrap(), 1);
+        assert_eq!(
+            store.family_carried_envelopes(10, 2_000).unwrap(),
+            vec![env],
+        );
+        // Idempotent: nothing left to clear.
+        assert_eq!(store.clear_carried_relay_upload_markers().unwrap(), 0);
+    }
+
+    #[test]
+    fn contact_relay_update_clears_upload_markers_so_the_new_mailbox_gets_one_post() {
+        // A T23 relay-change notice moves a contact's mailbox; everything
+        // "already uploaded" was uploaded to the OLD one, so the applied
+        // notice must re-offer the carry queue. A stale (not-newer) notice
+        // must not.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        let env = carried(b"ble-family", b"hint-a", 9_000, 10);
+        assert!(store
+            .enqueue_carried_envelope(env.clone(), true, 1_000, BIG_BUDGET)
+            .unwrap());
+        assert!(store
+            .mark_carried_envelope_relay_uploaded(
+                b"ble-family".to_vec(),
+                "https://old.example".to_string(),
+            )
+            .unwrap());
+
+        let notice = relay_notice(b"alice-id", 100, "https://new.relay.example");
+        assert!(store
+            .apply_contact_relay_update(b"alice-id".to_vec(), notice.clone())
+            .unwrap());
+        assert_eq!(
+            store.family_carried_envelopes(10, 2_000).unwrap(),
+            vec![env],
+        );
+
+        // Re-mark, then replay the same (now stale) notice: no endpoint
+        // move, so the marker must survive.
+        assert!(store
+            .mark_carried_envelope_relay_uploaded(
+                b"ble-family".to_vec(),
+                "https://new.relay.example".to_string(),
+            )
+            .unwrap());
+        assert!(!store
+            .apply_contact_relay_update(b"alice-id".to_vec(), notice)
+            .unwrap());
+        assert!(store
+            .family_carried_envelopes(10, 2_000)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

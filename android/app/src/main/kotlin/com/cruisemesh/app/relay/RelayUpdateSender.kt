@@ -45,6 +45,17 @@ object RelayUpdateSender {
     fun announceIfChanged(context: Context, store: MessageStore, identity: Identity) {
         val epoch = RelayConfigStore.relayEpoch(context)
         if (epoch <= RelayConfigStore.announcedRelayEpoch(context)) return
+        // Our own mailbox moved (new pass, manual edit, restore): everything
+        // "already uploaded" was confirmed against the OLD config, so
+        // re-offer the whole carry queue once against the new one -- the
+        // same wholesale clear core performs when a CONTACT's endpoint moves
+        // (apply_contact_relay_update). Runs before this pass's uploads, so
+        // the re-offer rides the very sync that detected the change.
+        try {
+            store.clearCarriedRelayUploadMarkers()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to clear carried-upload markers on endpoint change: ${e.message}")
+        }
         queueToAllContacts(context, store, identity, epoch)
         RelayConfigStore.markRelayEpochAnnounced(context, epoch)
     }

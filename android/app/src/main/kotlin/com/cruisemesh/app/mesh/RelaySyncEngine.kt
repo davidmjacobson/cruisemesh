@@ -424,12 +424,31 @@ internal class RelaySyncEngine(
                     MeshConnectivityStatus.setRelayHealth(RelayHealth.Failing(System.currentTimeMillis()))
                 }
                 val rerun = synchronized(relaySyncLock) {
-                    if (relaySyncPending && isRunning() && hasValidatedInternet()) {
-                        relaySyncPending = false
-                        true
-                    } else {
-                        relaySyncInFlight = false
-                        false
+                    val action = relayRerunAction(
+                        pendingRequested = relaySyncPending,
+                        canSync = isRunning() && hasValidatedInternet(),
+                        backoffRemainingMs = rateLimitedUntilMs - System.currentTimeMillis(),
+                    )
+                    relaySyncPending = false
+                    when (action) {
+                        RelayRerunAction.RUN_AGAIN -> true
+                        RelayRerunAction.SCHEDULE_RATE_LIMIT_RETRY -> {
+                            // See relayRerunAction's KDoc: the pending nudge
+                            // coalesces into the same Retry-After timer the
+                            // front door uses, instead of re-running into a
+                            // relay that just said "too fast".
+                            handler.removeCallbacks(rateLimitRetryRunnable)
+                            handler.postDelayed(
+                                rateLimitRetryRunnable,
+                                rateLimitedUntilMs - System.currentTimeMillis(),
+                            )
+                            relaySyncInFlight = false
+                            false
+                        }
+                        RelayRerunAction.STOP -> {
+                            relaySyncInFlight = false
+                            false
+                        }
                     }
                 }
                 if (!rerun) break
@@ -701,10 +720,11 @@ internal class RelaySyncEngine(
                 // (no contact match). A member mule can now decompose it into
                 // per-member fan-out rows (specs/group-relay-durability.md
                 // §4.2) so the group's mail reaches internet-only members
-                // through this phone's uplink too. No mark-posted concept for
-                // carried rows -- re-posts every pass dedupe server-side via
-                // the deterministic fan-out ids. Non-member mules still can't
-                // recognize the hint and still skip, unchanged.
+                // through this phone's uplink too. Non-member mules still
+                // can't recognize the hint and still skip, unchanged. The
+                // envelope is stamped uploaded only once EVERY fan-out row
+                // landed -- a partial batch re-posts whole next pass, and the
+                // deterministic fan-out ids dedupe the rows that did land.
                 val group = store.groupMatchingHint(envelope.recipientHint, now) ?: continue
                 val config = relayConfigForGroupRecipient(group.id, contacts, fallbackConfig) ?: continue
                 val rows = coreGroupFanoutRowsForCarried(
@@ -714,13 +734,18 @@ internal class RelaySyncEngine(
                     envelope.expiry,
                     envelope.sealed,
                 )
+                var posted = 0
                 for (row in rows) {
                     try {
                         RelayClient.postFanoutRow(config, row, network)
+                        posted++
                     } catch (e: Exception) {
                         noteOwnRelayFault(config, fallbackConfig, e)
                         Log.w(TAG, "Failed to upload carried fan-out row to relay ${config.relayUrl}: ${e.message}")
                     }
+                }
+                if (posted == rows.size && rows.isNotEmpty()) {
+                    store.markCarriedEnvelopeRelayUploaded(envelope.msgId, config.relayUrl)
                 }
                 continue
             }
@@ -728,6 +753,11 @@ internal class RelaySyncEngine(
             try {
                 val relayId = RelayClient.postCarriedEnvelope(config, envelope, network)
                 noteContactRelaySuccess(contact, config, fallbackConfig)
+                // 2xx: the relay holds it now (a dedupe hit counts -- the
+                // response id proves presence either way). Stamp the row so
+                // the next pass offers the NEXT batch instead of re-posting
+                // this one forever; see markCarriedEnvelopeRelayUploaded.
+                store.markCarriedEnvelopeRelayUploaded(envelope.msgId, config.relayUrl)
                 Log.i(
                     TAG,
                     "Uploaded carried envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
@@ -893,6 +923,25 @@ internal class RelaySyncEngine(
                     disposition = disposition,
                     recipientHint = envelope.recipientHint,
                 )
+                // A contact-hinted envelope coming out of THIS mailbox is
+                // proof the mailbox its recipient polls already holds it
+                // (proxy-poll parity: a contact's hints are only ever fetched
+                // against that contact's resolved relay). If we also carry
+                // the same msg_id from a BLE/LAN encounter, stamp that row so
+                // the upload loop stops re-posting a copy the relay
+                // demonstrably has (no-op when we carry nothing). Group-hinted
+                // rows are deliberately NOT stamped here: one mailbox holding
+                // a legacy shared row says nothing about the other members'
+                // mailboxes the fan-out still owes -- they are stamped only by
+                // a complete fan-out post above. Bookkeeping only: a failure
+                // here must not fail the walk.
+                try {
+                    if (store.contactMatchingHint(envelope.recipientHint, now) != null) {
+                        store.markCarriedEnvelopeRelayUploaded(envelope.msgId, config.relayUrl)
+                    }
+                } catch (e: CoreException) {
+                    Log.w(TAG, "Failed to stamp fetched envelope as relay-held: ${e.message}")
+                }
             }
             // Consumed/Expired ack unconditionally; a SEEN envelope is
             // acked only if this device durably consumed it as a 1:1

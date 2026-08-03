@@ -2841,13 +2841,17 @@ final class MeshController: ObservableObject {
                 // Carried mail goes to the mailbox its recipient actually
                 // polls: a contact hint posts to that contact's resolved
                 // relay; a group hint decomposes into per-member fan-out rows
-                // (specs/group-relay-durability.md §4.2, re-posts dedupe
-                // server-side); unrecognizable hints are skipped. Mirrors
-                // RelaySyncEngine.kt.
+                // (specs/group-relay-durability.md §4.2); unrecognizable
+                // hints are skipped. A successful post stamps the row's
+                // upload marker so the next pass offers the NEXT batch
+                // instead of re-posting this one for its whole seven-day
+                // life (see markCarriedEnvelopeRelayUploaded in core).
+                // Mirrors RelaySyncEngine.kt.
                 if let contact = (try? store.contactMatchingHint(hint: env.recipientHint, nowMs: now)) ?? nil {
                     guard let cfg = sendConfig(for: contact) else { continue }
                     do {
                         _ = try RelayClient.postCarriedEnvelope(config: cfg, envelope: env)
+                        _ = try store.markCarriedEnvelopeRelayUploaded(msgId: env.msgId, relayUrl: cfg.relayUrl)
                         noteContactSuccess(contact: contact, usedConfig: cfg)
                     } catch {
                         noteFailure(error, usedConfig: cfg)
@@ -2864,9 +2868,18 @@ final class MeshController: ObservableObject {
                         expiry: env.expiry,
                         sealed: env.sealed
                     )
+                    // Stamped only once EVERY fan-out row landed -- a partial
+                    // batch re-posts whole next pass, and the deterministic
+                    // fan-out ids dedupe the rows that did land.
+                    var posted = 0
                     for row in rows {
-                        do { _ = try RelayClient.postFanoutRow(config: cfg, row: row) }
-                        catch { noteFailure(error, usedConfig: cfg) }
+                        do {
+                            _ = try RelayClient.postFanoutRow(config: cfg, row: row)
+                            posted += 1
+                        } catch { noteFailure(error, usedConfig: cfg) }
+                    }
+                    if posted == rows.count, !rows.isEmpty {
+                        _ = try? store.markCarriedEnvelopeRelayUploaded(msgId: env.msgId, relayUrl: cfg.relayUrl)
                     }
                     continue
                 }
@@ -3081,6 +3094,25 @@ final class MeshController: ObservableObject {
                                 disposition: disposition,
                                 recipientHint: env.recipientHint
                             ))
+                            // A contact-hinted envelope coming out of THIS
+                            // mailbox is proof the mailbox its recipient
+                            // polls already holds it (proxy-poll parity: a
+                            // contact's hints are only ever fetched against
+                            // that contact's resolved relay). If we also
+                            // carry the same msg_id from a BLE/LAN encounter,
+                            // stamp that row so the upload loop stops
+                            // re-posting a copy the relay demonstrably has
+                            // (no-op when we carry nothing). Group-hinted
+                            // rows are deliberately NOT stamped here -- they
+                            // are stamped only by a complete fan-out post.
+                            // Bookkeeping only, so a failure must not fail
+                            // the walk. Mirrors RelaySyncEngine.kt.
+                            if let _ = (try? store.contactMatchingHint(hint: env.recipientHint, nowMs: now)) ?? nil {
+                                _ = try? store.markCarriedEnvelopeRelayUploaded(
+                                    msgId: env.msgId,
+                                    relayUrl: cfg.relayUrl
+                                )
+                            }
                         }
                         // Consumed/Expired ack unconditionally; a SEEN envelope is
                         // acked only if this device durably consumed it as a 1:1
