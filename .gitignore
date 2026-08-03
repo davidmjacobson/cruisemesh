@@ -47,3 +47,4 @@ android/app/src/main/jniLibs/
 
 # Codex remote-session attachments — not project documentation
 /.codex-remote-attachments/
+__pycache__/
