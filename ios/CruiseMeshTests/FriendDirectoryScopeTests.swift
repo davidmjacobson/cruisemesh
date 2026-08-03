@@ -31,14 +31,12 @@ final class FriendDirectoryScopeTests: XCTestCase {
     private func candidates(
         recipient: Contact,
         contacts: [Contact],
-        ownRelay: RelayConfig?,
-        addedNearby: @escaping (Data) -> Bool = { _ in true }
+        ownRelay: RelayConfig?
     ) -> [String] {
         FriendDirectoryScope.candidatesFor(
             recipient: recipient,
             contacts: contacts,
-            ownRelay: ownRelay,
-            addedNearby: addedNearby
+            ownRelay: ownRelay
         ).map(\.name)
     }
 
@@ -70,15 +68,13 @@ final class FriendDirectoryScopeTests: XCTestCase {
         )
     }
 
-    func testHolidayAcquaintanceWithoutAPassIsNotFamilyEvenMetInPerson() {
-        // The cruise case: another family's kid, scanned face to face, no pass
-        // of their own. Being nearby must not buy an exception -- that is
-        // exactly how a relative mid-onboarding looks.
+    func testContactWithoutAPassIsNotIntroducibleHoweverWeMetThem() {
+        // The holiday-acquaintance case and the relative-mid-onboarding case
+        // look identical from the card, so neither is introduced. There is
+        // deliberately no in-person exception.
         let outsider = contact("CruiseKid")
         let parent = cardFor("Parent", memberToken: ownToken)
-        XCTAssertFalse(
-            FriendDirectoryScope.introducible(outsider, ownRelay: ownRelay, addedNearby: true)
-        )
+        XCTAssertFalse(FriendDirectoryScope.introducible(outsider, ownRelay: ownRelay))
         XCTAssertEqual(
             candidates(recipient: parent, contacts: [outsider, parent], ownRelay: ownRelay),
             []
@@ -86,47 +82,35 @@ final class FriendDirectoryScopeTests: XCTestCase {
     }
 
     func testFamilyMemberJoiningOurPassBecomesEligibleAtThatMoment() {
+        // The pass-change re-fan is what replays this without user action.
         let before = contact("NotSetUpYet")
         let after = cardFor("NotSetUpYet", memberToken: ownToken)
-        XCTAssertFalse(FriendDirectoryScope.introducible(before, ownRelay: ownRelay, addedNearby: true))
-        XCTAssertTrue(FriendDirectoryScope.introducible(after, ownRelay: ownRelay, addedNearby: false))
+        XCTAssertFalse(FriendDirectoryScope.introducible(before, ownRelay: ownRelay))
+        XCTAssertTrue(FriendDirectoryScope.introducible(after, ownRelay: ownRelay))
     }
 
-    func testWithNoPassAtAllMeetingInPersonIsTheOnlyBoundaryLeft() {
+    func testWithNoPassOfOurOwnNobodyIsIntroducibleAtAll() {
+        // No family boundary is drawn, so no transitive introduction happens;
+        // people scan a code or share their own friend link instead.
         let met = contact("Met")
-        let neverMet = contact("NeverMet")
-        XCTAssertEqual(
-            candidates(recipient: met, contacts: [met, neverMet], ownRelay: nil),
-            ["NeverMet"]
-        )
-        XCTAssertEqual(
-            candidates(
-                recipient: met,
-                contacts: [met, neverMet],
-                ownRelay: nil,
-                addedNearby: { _ in false }
-            ),
-            []
-        )
-    }
-
-    func testWithoutAPassAContactWhoHasOneBelongsToAFamilyWeCannotSee() {
-        let passHolder = cardFor("HasPass", memberToken: testerToken)
+        let other = contact("Other")
+        XCTAssertEqual(candidates(recipient: met, contacts: [met, other], ownRelay: nil), [])
         XCTAssertFalse(
-            FriendDirectoryScope.introducible(passHolder, ownRelay: nil, addedNearby: true)
+            FriendDirectoryScope.introducible(
+                cardFor("HasPass", memberToken: testerToken),
+                ownRelay: nil
+            )
         )
     }
 
     func testPreCp4CardCarryingTheMemberTokenIsStillOurFamily() {
         let legacy = contact("Legacy", relayUrl: relayUrl, relayToken: ownToken)
-        XCTAssertTrue(FriendDirectoryScope.introducible(legacy, ownRelay: ownRelay, addedNearby: false))
+        XCTAssertTrue(FriendDirectoryScope.introducible(legacy, ownRelay: ownRelay))
     }
 
     func testSameFamilyTokenOnADifferentRelayHostIsNotOurPass() {
         let elsewhere = contact("Elsewhere", relayUrl: "https://other.example", relayToken: ownToken)
-        XCTAssertFalse(
-            FriendDirectoryScope.introducible(elsewhere, ownRelay: ownRelay, addedNearby: true)
-        )
+        XCTAssertFalse(FriendDirectoryScope.introducible(elsewhere, ownRelay: ownRelay))
     }
 
     func testRecipientIsNeverOfferedThemselves() {
