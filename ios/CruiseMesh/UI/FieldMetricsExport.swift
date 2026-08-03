@@ -24,10 +24,15 @@ enum FieldMetricsExport {
     }
 }
 
-/// Identifiable wrapper so a freshly written export file can drive `.sheet(item:)`.
+/// Identifiable wrapper so a freshly written set of export files can drive
+/// `.sheet(item:)`. Plural because "Share diagnostics" shares the log file
+/// alongside any `MetricKitCollector` JSON payloads in one sheet.
 struct ShareableFile: Identifiable {
     let id = UUID()
-    let url: URL
+    let urls: [URL]
+
+    init(url: URL) { self.urls = [url] }
+    init(urls: [URL]) { self.urls = urls }
 }
 
 /// Minimal UIActivityViewController bridge for sharing an on-demand file.

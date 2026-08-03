@@ -177,6 +177,33 @@ enum DiagnosticLogExport {
         try? trimmed.write(to: url, options: .atomic)
     }
 
+    /// Directory `MetricKitCollector` writes its
+    /// JSON payloads into, and where `metricKitFileURLs()` below reads them
+    /// back from for "Share diagnostics" to attach alongside the log file.
+    /// Creates the directory on first use if it doesn't exist yet.
+    static func metricKitDirectory() -> URL? {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "cruisemesh-metrickit",
+            isDirectory: true
+        )
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+        return dir
+    }
+
+    /// Existing `MetricKitCollector` JSON payloads, oldest first (filenames
+    /// are timestamp-ordered), for "Share diagnostics" to attach alongside
+    /// the log file. An empty result means nothing to attach, not an error --
+    /// MetricKit may not have delivered a payload yet this install.
+    static func metricKitFileURLs() -> [URL] {
+        guard let dir = metricKitDirectory() else { return [] }
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        return files.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
     private static func levelLabel(_ level: OSLogEntryLog.Level) -> String {
         switch level {
         case .debug: return "DEBUG"

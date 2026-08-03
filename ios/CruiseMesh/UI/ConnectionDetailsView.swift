@@ -85,11 +85,18 @@ struct ConnectionDetailsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Button {
+                        // Bundles any MetricKit payloads in alongside the log
+                        // file, riding this existing flow with zero new UI.
+                        var urls: [URL] = []
                         if let url = DiagnosticLogExport.writeLogFile() {
-                            shareFile = ShareableFile(url: url)
+                            urls.append(url)
                             hasDiagnosticArchive = true
-                        } else {
+                        }
+                        urls.append(contentsOf: DiagnosticLogExport.metricKitFileURLs())
+                        if urls.isEmpty {
                             supportMessage = String(localized: "No diagnostics captured this session yet.")
+                        } else {
+                            shareFile = ShareableFile(urls: urls)
                         }
                     } label: {
                         Label("Share diagnostics", systemImage: "ladybug")
@@ -145,7 +152,7 @@ struct ConnectionDetailsView: View {
                 Text("This removes local connection events and per-person path summaries. Messages and friends are not affected.")
             }
             .sheet(item: $shareFile) { file in
-                ActivityShareView(items: [file.url])
+                ActivityShareView(items: file.urls)
             }
         }
     }

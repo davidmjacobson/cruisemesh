@@ -44,6 +44,7 @@ targets:
       - sdk: PhotosUI.framework
       - sdk: Photos.framework
       - sdk: Network.framework
+      - sdk: MetricKit.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cruisemesh.app
