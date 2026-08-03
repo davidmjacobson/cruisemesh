@@ -431,6 +431,16 @@
         }
       }
     },
+    "Connect": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connect"
+          }
+        }
+      }
+    },
     "Connect securely": {
       "localizations": {
         "en": {
@@ -737,6 +747,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Display name"
+          }
+        }
+      }
+    },
+    "Don't ask again": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Don't ask again"
           }
         }
       }
@@ -1131,12 +1151,12 @@
         }
       }
     },
-    "Let friends introduce you to people they know. Messages and phone contacts are never shared.": {
+    "Let friends introduce you to people they know, and share your contact card with someone they choose. Messages and phone contacts are never shared.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Let friends introduce you to people they know. Messages and phone contacts are never shared."
+            "value": "Let friends introduce you to people they know, and share your contact card with someone they choose. Messages and phone contacts are never shared."
           }
         }
       }
@@ -1861,6 +1881,16 @@
         }
       }
     },
+    "Request sent": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Request sent"
+          }
+        }
+      }
+    },
     "Restore from backup": {
       "localizations": {
         "en": {
@@ -2087,6 +2117,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Share card text"
+          }
+        }
+      }
+    },
+    "Share contact": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Share contact"
           }
         }
       }
@@ -2507,6 +2547,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Voice memo"
+          }
+        }
+      }
+    },
+    "Waiting to connect": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting to connect"
           }
         }
       }

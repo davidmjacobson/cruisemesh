@@ -30,6 +30,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.Switch
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.ui.platform.LocalContext
+import com.cruisemesh.app.friending.ShareContactAvailability
 import com.cruisemesh.app.relay.RelayConfigStore
 import uniffi.cruisemesh_core.ContactDelivery
 import uniffi.cruisemesh_core.contactDelivery
@@ -71,6 +72,12 @@ fun ContactDetailsSheet(
      * false so previews and existing call sites are unaffected.
      */
     relayCardIsStale: Boolean = false,
+    /**
+     * Whether this contact may be handed on as a shared card, decided from
+     * their advertised discovery policy (specs/share-contact.md decision 4).
+     */
+    shareAvailability: ShareContactAvailability = ShareContactAvailability.HIDDEN,
+    onShareContact: () -> Unit = {},
 ) {
     // skipPartiallyExpanded: expanding "Verify contact" grows the sheet's
     // content height, which makes Material3 recompute the peek/full anchors.
@@ -91,6 +98,8 @@ fun ContactDetailsSheet(
             onBlockedChange = onBlockedChange,
             onReport = onReport,
             relayCardIsStale = relayCardIsStale,
+            shareAvailability = shareAvailability,
+            onShareContact = onShareContact,
             modifier = Modifier.padding(bottom = 24.dp),
         )
     }
@@ -115,6 +124,8 @@ fun ContactDetailsSheetContent(
      * false so previews and existing call sites are unaffected.
      */
     relayCardIsStale: Boolean = false,
+    shareAvailability: ShareContactAvailability = ShareContactAvailability.HIDDEN,
+    onShareContact: () -> Unit = {},
 ) {
     val displayId = formatUserId(contact.userId)
     val displayName = ChatListLogic.displayNameOrId(coreContactDisplayName(contact), displayId)
@@ -330,6 +341,30 @@ fun ContactDetailsSheetContent(
                     }
                 }
             }
+        }
+
+        // Their switch, not ours: when it is off we say so rather than hiding
+        // the action, because "why can't I share this person" is otherwise
+        // unanswerable from the screen (specs/share-contact.md decision 4).
+        when (shareAvailability) {
+            ShareContactAvailability.HIDDEN -> Unit
+            ShareContactAvailability.AVAILABLE -> OutlinedButton(
+                onClick = onShareContact,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 16.dp),
+            ) {
+                Text(stringResource(R.string.ui_share_contact))
+            }
+            ShareContactAvailability.DISCOVERY_OFF -> Text(
+                text = stringResource(R.string.ui_x_has_turned_off_being_introduced, displayName),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 16.dp),
+            )
         }
 
         Row(

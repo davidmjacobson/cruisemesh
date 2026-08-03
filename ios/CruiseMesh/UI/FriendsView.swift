@@ -17,6 +17,13 @@ struct FriendsView: View {
     @State private var chatContact: Contact?
     @State private var suggestions: [FriendSuggestion] = []
     @State private var showAddAllConfirmation = false
+    /// Shared-card requests waiting on an answer from this phone, and the
+    /// requests this phone sent from somebody else's shared code
+    /// (specs/share-contact.md).
+    @State private var pendingShared: [PendingSharedRequest] = []
+    @State private var outgoingShared: [OutgoingSharedRequest] = []
+    @State private var pendingSharedSheet: PendingSharedRequestState?
+    @State private var shareContact: ShareContactState?
     @FocusState private var pasteFocused: Bool
 
     private var groupedSuggestions: [(Data, [FriendSuggestion])] {
@@ -75,6 +82,25 @@ struct FriendsView: View {
                 } header: {
                     Text("Friends of friends")
                 }
+                // A request that is never answered must not be visible only as
+                // a notification that has since been swiped away.
+                if !pendingShared.isEmpty {
+                    Section("Waiting to connect") {
+                        ForEach(pendingShared, id: \.requesterUserId) { request in
+                            Button {
+                                openPendingShared(request)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(request.name)
+                                    Text("Shared by \(sharerLabel(for: request.sharerUserId))")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .tint(.primary)
+                        }
+                    }
+                }
                 Section("Add directly") {
                     Button { showScan = true } label: {
                         Label("Scan friend QR", systemImage: "qrcode.viewfinder")
@@ -120,10 +146,24 @@ struct FriendsView: View {
                                     photo: (try? AppStore.get().contactAvatar(userId: contact.userId))
                                         .flatMap { UIImage(data: $0) }
                                 )
-                                Text(ChatListLogic.displayNameOrId(
-                                    name: contact.name,
-                                    displayId: formatUserId(userId: contact.userId)
-                                ))
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(ChatListLogic.displayNameOrId(
+                                        name: contact.name,
+                                        displayId: formatUserId(userId: contact.userId)
+                                    ))
+                                    if let waiting = waitingText(for: contact) {
+                                        Text(waiting)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                        .contextMenu {
+                            Button {
+                                shareContact = ShareContactState(contact: contact)
+                            } label: {
+                                Label("Share contact", systemImage: "qrcode")
                             }
                         }
                     }
@@ -157,7 +197,18 @@ struct FriendsView: View {
                 }
             }
             .sheet(item: $preview) { state in
-                FriendPreviewView(state: state) { confirm(state.contact, scanned: state.scanned) }
+                FriendPreviewView(state: state) { confirm(state) }
+            }
+            .sheet(item: $shareContact) { state in
+                ShareContactView(contact: state.contact, identity: identity)
+            }
+            .sheet(item: $pendingSharedSheet) { state in
+                PendingSharedRequestView(
+                    state: state,
+                    onConnect: { acceptPendingShared(state.request) },
+                    onNotNow: { dismissPendingShared(state.request) },
+                    onNeverAsk: { suppressPendingShared(state.request) }
+                )
             }
             .sheet(item: $added) { state in
                 FriendConfirmationView(
@@ -214,13 +265,107 @@ struct FriendsView: View {
     }
 
     private func reload() {
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
         contacts = ((try? AppStore.get().listContacts()) ?? [])
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         suggestions = FriendsOfFriendsStore.isEnabled()
-            ? ((try? AppStore.get().listFriendSuggestions(
-                nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
-              )) ?? [])
+            ? ((try? AppStore.get().listFriendSuggestions(nowMs: now)) ?? [])
             : []
+        // Expired rows are swept by the store on read, so this list never shows
+        // a request whose card has already died.
+        pendingShared = (try? AppStore.get().listPendingSharedRequests(nowMs: now)) ?? []
+        outgoingShared = (try? AppStore.get().listOutgoingSharedRequests()) ?? []
+    }
+
+    /// The sharer's name when we still have them, their formatted UserID when
+    /// we do not — never nothing, so "Shared by" is always a real answer.
+    private func sharerLabel(for userId: Data) -> String {
+        let name = (try? AppStore.get().getContact(userId: userId))?.name
+        if let name, !name.isEmpty { return name }
+        return formatUserId(userId: userId)
+    }
+
+    /// Somebody added from a shared code has not agreed to anything yet, and
+    /// every rejection path is silent by design — so say what is true rather
+    /// than letting the row imply a connection, and once the card has expired
+    /// say something they can act on.
+    private func waitingText(for contact: Contact) -> String? {
+        guard let row = outgoingShared.first(where: { $0.candidateUserId == contact.userId }) else {
+            return nil
+        }
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        return row.expiresAtMs > now
+            ? "Waiting for \(contact.name) to accept."
+            : "\(contact.name) didn't respond. Ask them to scan your code directly."
+    }
+
+    private func openPendingShared(_ request: PendingSharedRequest) {
+        let dismissal = (try? AppStore.get().getSharedRequestDismissal(
+            requesterUserId: request.requesterUserId
+        )) ?? nil
+        pendingSharedSheet = PendingSharedRequestState(
+            request: request,
+            sharerLabel: sharerLabel(for: request.sharerUserId),
+            dismissalCount: dismissal?.count ?? 0
+        )
+    }
+
+    private func acceptPendingShared(_ request: PendingSharedRequest) {
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        let candidate = Contact(
+            userId: request.requesterUserId,
+            name: request.name,
+            signPk: request.signPk,
+            agreePk: request.agreePk,
+            relayUrl: request.relayUrl,
+            relayToken: request.relayToken
+        )
+        guard let contact = try? AppStore.get().upsertImportedContact(contact: candidate) else {
+            error = "Could not save this contact. Try again."
+            return
+        }
+        try? AppStore.get().upsertContactProvenance(provenance: ContactProvenance(
+            userId: contact.userId,
+            source: 2,
+            introducerUserId: request.sharerUserId,
+            introducedAtMs: now,
+            addedNearby: MeshConnectivityStatus.shared.nearbyPeerIds.contains(contact.userId)
+        ))
+        FriendRequestSender.sendMutualFriendRequest(
+            store: AppStore.get(),
+            identity: identity,
+            contact: contact,
+            displayName: appModel.displayName
+        )
+        ProfileSyncSender.queueToContact(
+            store: AppStore.get(),
+            identity: identity,
+            contact: contact,
+            displayName: appModel.displayName,
+            epoch: ProfileStore.loadOwnAvatarEpoch()
+        )
+        FriendDirectorySender.queueToAllContacts(store: AppStore.get(), identity: identity)
+        try? AppStore.get().deletePendingSharedRequest(requesterUserId: request.requesterUserId)
+        pendingSharedSheet = nil
+        reload()
+    }
+
+    /// Not now: they may ask again, but the count survives the row it came from,
+    /// so the second ask is the one that offers a way out for good.
+    private func dismissPendingShared(_ request: PendingSharedRequest) {
+        try? AppStore.get().deletePendingSharedRequest(requesterUserId: request.requesterUserId)
+        _ = try? AppStore.get().recordSharedRequestDismissal(requesterUserId: request.requesterUserId)
+        pendingSharedSheet = nil
+        reload()
+    }
+
+    /// A quiet local tombstone. Nobody is told, and scanning that person's own
+    /// code later clears it.
+    private func suppressPendingShared(_ request: PendingSharedRequest) {
+        try? AppStore.get().suppressSharedRequests(requesterUserId: request.requesterUserId)
+        try? AppStore.get().deletePendingSharedRequest(requesterUserId: request.requesterUserId)
+        pendingSharedSheet = nil
+        reload()
     }
 
     private func request(_ suggestion: FriendSuggestion) {
@@ -241,35 +386,67 @@ struct FriendsView: View {
     }
 
     private func previewText(_ text: String, scanned: Bool = false) {
+        let imported: FriendImport
         do {
-            let card = try parseFriendText(text: text)
-            let userId = friendCardUserId(card: card)
-            guard userId != identity.userId else {
-                error = "That is your own card"
-                return
-            }
-            let contact = Contact(
-                userId: userId,
-                name: card.name,
-                signPk: card.signPk,
-                agreePk: card.agreePk,
-                relayUrl: card.relayUrl,
-                relayToken: card.relayToken
-            )
-            let match = friendCardMatch(
-                candidate: contact,
-                existing: (try? AppStore.get().listContacts()) ?? []
-            )
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
-            preview = FriendPreviewState(contact: contact, match: match, scanned: scanned)
+            imported = try parseFriendImport(text: text)
         } catch {
             self.error = text.contains("CMFRIEND")
                 ? "That looks like a friend card but part of it is missing. Copy the whole message and try again."
                 : "Not a CruiseMesh friend card"
+            return
         }
+        let card: FriendCard
+        var shared: SharedFriendCard? = nil
+        switch imported {
+        case let .direct(directCard):
+            card = directCard
+        case let .shared(sharedCard):
+            // An expired share is the common case, not a malformed one, so it
+            // gets its own literal answer instead of a parse failure.
+            guard !sharedCardExpired(
+                shared: sharedCard,
+                nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            ) else {
+                error = "This code has expired. Ask for a new one."
+                return
+            }
+            card = sharedCard.card
+            shared = sharedCard
+        }
+        let userId = friendCardUserId(card: card)
+        guard userId != identity.userId else {
+            error = "That is your own card"
+            return
+        }
+        let contact = Contact(
+            userId: userId,
+            name: card.name,
+            signPk: card.signPk,
+            agreePk: card.agreePk,
+            relayUrl: card.relayUrl,
+            relayToken: card.relayToken
+        )
+        let match = friendCardMatch(
+            candidate: contact,
+            existing: (try? AppStore.get().listContacts()) ?? []
+        )
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        preview = FriendPreviewState(
+            contact: contact,
+            match: match,
+            // Pointing the camera at a shared code is co-presence with the
+            // sharer, not with the person on the card, so it is never `scanned`.
+            scanned: scanned && shared == nil,
+            shared: shared,
+            sharedByLabel: shared.map { sharerLabel(for: $0.sharerUserId) }
+        )
     }
 
-    private func confirm(_ candidate: Contact, scanned: Bool = false) {
+    private func confirm(_ state: FriendPreviewState) {
+        let candidate = state.contact
+        let scanned = state.scanned
+        let shared = state.shared
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
         do {
             let contact = try AppStore.get().upsertImportedContact(contact: candidate)
             // Pointing a camera at their screen means we were standing
@@ -277,11 +454,24 @@ struct FriendsView: View {
             // aeroplane, so only a live link to them counts as having met.
             try? AppStore.get().upsertContactProvenance(provenance: ContactProvenance(
                 userId: contact.userId,
-                source: 0,
-                introducerUserId: nil,
-                introducedAtMs: Int64(Date().timeIntervalSince1970 * 1_000),
+                source: shared == nil ? 0 : 2,
+                introducerUserId: shared?.sharerUserId,
+                introducedAtMs: now,
                 addedNearby: scanned || MeshConnectivityStatus.shared.nearbyPeerIds.contains(contact.userId)
             ))
+            if let shared {
+                // Their phone will hold this request until they answer it, and
+                // may never answer at all, so remember what we are waiting on.
+                try? AppStore.get().upsertOutgoingSharedRequest(request: OutgoingSharedRequest(
+                    candidateUserId: contact.userId,
+                    expiresAtMs: shared.expiresAtMs,
+                    sentAtMs: now
+                ))
+            } else {
+                // Scanning somebody's own code is the escape hatch: it clears
+                // any "Don't ask again" tombstone we once wrote for them.
+                try? AppStore.get().clearSharedRequestDismissal(requesterUserId: contact.userId)
+            }
             try? AppStore.get().removeFriendSuggestion(candidateUserId: contact.userId)
             // CP4: post-CP4 friend cards carry a post-only deposit token —
             // fine for the contact record (sends resolve through it), never
@@ -298,7 +488,8 @@ struct FriendsView: View {
                 store: AppStore.get(),
                 identity: identity,
                 contact: contact,
-                displayName: appModel.displayName
+                displayName: appModel.displayName,
+                shared: shared
             )
             ProfileSyncSender.queueToContact(
                 store: AppStore.get(),
@@ -315,7 +506,8 @@ struct FriendsView: View {
                 added = FriendAddedState(
                     contact: contact,
                     delivery: delivery,
-                    relayConfigured: RelayConfigStore.load() != nil
+                    relayConfigured: RelayConfigStore.load() != nil,
+                    awaitingAcceptance: shared != nil
                 )
             }
         } catch {

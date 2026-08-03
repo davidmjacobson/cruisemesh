@@ -447,4 +447,25 @@
     <string name="ui_open">Open</string>
     <string name="ui_that_link_could_not_be_opened">That link could not be opened</string>
     <string name="ui_open_link_named">Open %1$s</string>
+    <!-- Share contact (specs/share-contact.md). A displayed code only: the copy
+         has to be honest that the shared person, not the sharer, decides. -->
+    <string name="ui_share_contact">Share contact</string>
+    <string name="ui_x_has_turned_off_being_introduced">%1$s has turned off being introduced to others.</string>
+    <plurals name="ui_share_code_explanation">
+        <item quantity="one">Anyone with this code can ask to connect with %1$s. %1$s chooses whether to accept. The code stops working in %2$d day.</item>
+        <item quantity="other">Anyone with this code can ask to connect with %1$s. %1$s chooses whether to accept. The code stops working in %2$d days.</item>
+    </plurals>
+    <string name="ui_this_code_has_expired">This code has expired. Ask for a new one.</string>
+    <string name="ui_thats_your_own_card">That\'s your own card</string>
+    <string name="ui_shared_by">Shared by %1$s</string>
+    <string name="ui_waiting_to_connect">Waiting to connect</string>
+    <string name="ui_waiting_to_connect_count">Waiting to connect (%1$d)</string>
+    <string name="ui_x_wants_to_connect">%1$s wants to connect</string>
+    <string name="ui_connect">Connect</string>
+    <string name="ui_dont_ask_again">Don\'t ask again</string>
+    <string name="ui_waiting_for_x_to_accept">Waiting for %1$s to accept.</string>
+    <string name="ui_x_didnt_respond">%1$s didn\'t respond. Ask them to scan your code directly.</string>
+    <string name="ui_no_one_is_waiting_to_connect">No one is waiting to connect.</string>
+    <string name="ui_share_code_too_large">This contact\'s code is too large to show.</string>
+    <string name="ui_friends_of_friends_detail">Let friends introduce you to people they know, and share your contact card with someone they choose. Messages and phone contacts are never shared.</string>
 </resources>

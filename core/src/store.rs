@@ -113,7 +113,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::groups::{canonicalize_members, validate_group};
 use crate::{
     verify_introduction_ticket, CoreError, FriendDirectoryContent, Group, IntroductionTicket,
-    RelayUpdateContent, SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST,
+    RelayUpdateContent, SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST, MS_PER_DAY,
 };
 
 /// FC6: recover from mutex poisoning instead of propagating it as a panic.
@@ -372,7 +372,8 @@ pub struct FriendSuggestion {
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct ContactProvenance {
     pub user_id: Vec<u8>,
-    /// 0 = direct QR/link, 1 = introduced by another accepted contact.
+    /// 0 = direct QR/link, 1 = introduced by another accepted contact,
+    /// 2 = added from a shared contact card (specs/share-contact.md).
     pub source: u8,
     pub introducer_user_id: Option<Vec<u8>>,
     pub introduced_at_ms: i64,
@@ -387,6 +388,46 @@ pub struct ContactProvenance {
     /// existed read as `false` -- unknown, so say the true thing rather than
     /// assume an in-person encounter we have no record of.
     pub added_nearby: bool,
+}
+
+/// An inbound friend request that originated from a shared contact card and
+/// is waiting for this user's explicit decision (specs/share-contact.md).
+/// Everything needed to build the Contact on accept, held outside `contacts`
+/// until then.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct PendingSharedRequest {
+    pub requester_user_id: Vec<u8>,
+    pub name: String,
+    pub sign_pk: Vec<u8>,
+    pub agree_pk: Vec<u8>,
+    pub relay_url: Option<String>,
+    pub relay_token: Option<String>,
+    pub sharer_user_id: Vec<u8>,
+    pub expires_at_ms: i64,
+    pub first_seen_ms: i64,
+    /// When this request last raised a prompt; 0 = never. Gates the
+    /// one-prompt-per-requester-per-day rule.
+    pub last_prompted_ms: i64,
+}
+
+/// Dismissal state for one requester's shared-card prompts. Survives the
+/// pending row it came from.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct SharedRequestDismissal {
+    pub requester_user_id: Vec<u8>,
+    pub count: u32,
+    /// Once true ("Don't ask again"), matching requests are dropped before
+    /// any prompt. Cleared only by directly scanning that person's own code.
+    pub suppressed: bool,
+}
+
+/// The requester's record of a shared-card request it sent, so the UI can
+/// honestly distinguish "waiting" from "didn't respond" (past expiry).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct OutgoingSharedRequest {
+    pub candidate_user_id: Vec<u8>,
+    pub expires_at_ms: i64,
+    pub sent_at_ms: i64,
 }
 
 /// One entry of a per-chat sync digest (DESIGN.md §7.3): "I have `sender_user_id`'s
@@ -3069,7 +3110,7 @@ impl MessageStore {
         &self,
         provenance: ContactProvenance,
     ) -> Result<(), CoreError> {
-        if provenance.source > 1 {
+        if provenance.source > 2 {
             return Err(CoreError::Malformed(
                 "invalid contact provenance".to_string(),
             ));
@@ -3123,6 +3164,235 @@ impl MessageStore {
         )
         .optional()
         .map_err(store_err)
+    }
+
+    /// Record or refresh an inbound shared-card request. A duplicate delivery
+    /// updates the row rather than stacking prompts: `first_seen_ms` and
+    /// `last_prompted_ms` are preserved so redelivery neither resets the
+    /// prompt-rate clock nor re-raises the sheet.
+    pub fn upsert_pending_shared_request(
+        &self,
+        request: PendingSharedRequest,
+    ) -> Result<(), CoreError> {
+        conn_execute_pending_shared_upsert(&lock_conn(&self.conn), &request)
+    }
+
+    /// All pending shared-card requests, oldest first. Rows past expiry are
+    /// swept here rather than by a background job — read is the only moment
+    /// staleness matters.
+    pub fn list_pending_shared_requests(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<PendingSharedRequest>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "DELETE FROM pending_shared_requests WHERE expires_at_ms < ?1",
+            params![now_ms],
+        )
+        .map_err(store_err)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT requester_user_id, name, sign_pk, agree_pk, relay_url, relay_token,
+                        sharer_user_id, expires_at_ms, first_seen_ms, last_prompted_ms
+                 FROM pending_shared_requests ORDER BY first_seen_ms ASC",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], row_to_pending_shared_request)
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    pub fn get_pending_shared_request(
+        &self,
+        requester_user_id: Vec<u8>,
+    ) -> Result<Option<PendingSharedRequest>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.query_row(
+            "SELECT requester_user_id, name, sign_pk, agree_pk, relay_url, relay_token,
+                    sharer_user_id, expires_at_ms, first_seen_ms, last_prompted_ms
+             FROM pending_shared_requests WHERE requester_user_id = ?1",
+            params![requester_user_id],
+            row_to_pending_shared_request,
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    pub fn delete_pending_shared_request(
+        &self,
+        requester_user_id: Vec<u8>,
+    ) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "DELETE FROM pending_shared_requests WHERE requester_user_id = ?1",
+            params![requester_user_id],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Should this requester's pending request raise a prompt right now, and
+    /// if so, stamp it as prompted. One atomic decision so at most one prompt
+    /// per requester per day survives concurrent deliveries: `false` for a
+    /// suppressed requester, a missing row, or a prompt within the last day.
+    pub fn note_shared_request_prompt(
+        &self,
+        requester_user_id: Vec<u8>,
+        now_ms: i64,
+    ) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let suppressed: bool = conn
+            .query_row(
+                "SELECT suppressed FROM shared_request_dismissals WHERE requester_user_id = ?1",
+                params![requester_user_id],
+                |row| row.get::<_, i64>(0).map(|v| v != 0),
+            )
+            .optional()
+            .map_err(store_err)?
+            .unwrap_or(false);
+        if suppressed {
+            return Ok(false);
+        }
+        let changed = conn
+            .execute(
+                "UPDATE pending_shared_requests SET last_prompted_ms = ?2
+                 WHERE requester_user_id = ?1 AND last_prompted_ms <= ?2 - ?3",
+                params![requester_user_id, now_ms, MS_PER_DAY],
+            )
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
+    /// Record a **Not now** and return the new dismissal count, so the shell
+    /// knows when to start offering "Don't ask again" (from the second one).
+    pub fn record_shared_request_dismissal(
+        &self,
+        requester_user_id: Vec<u8>,
+    ) -> Result<u32, CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "INSERT INTO shared_request_dismissals (requester_user_id, count, suppressed)
+             VALUES (?1, 1, 0)
+             ON CONFLICT(requester_user_id) DO UPDATE SET
+                count = shared_request_dismissals.count + 1",
+            params![requester_user_id],
+        )
+        .map_err(store_err)?;
+        conn.query_row(
+            "SELECT count FROM shared_request_dismissals WHERE requester_user_id = ?1",
+            params![requester_user_id],
+            |row| row.get::<_, i64>(0).map(|v| v as u32),
+        )
+        .map_err(store_err)
+    }
+
+    /// "Don't ask again": a quiet local tombstone, no notification to anyone.
+    pub fn suppress_shared_requests(&self, requester_user_id: Vec<u8>) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "INSERT INTO shared_request_dismissals (requester_user_id, count, suppressed)
+             VALUES (?1, 0, 1)
+             ON CONFLICT(requester_user_id) DO UPDATE SET suppressed = 1",
+            params![requester_user_id],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub fn get_shared_request_dismissal(
+        &self,
+        requester_user_id: Vec<u8>,
+    ) -> Result<Option<SharedRequestDismissal>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.query_row(
+            "SELECT requester_user_id, count, suppressed
+             FROM shared_request_dismissals WHERE requester_user_id = ?1",
+            params![requester_user_id],
+            |row| {
+                Ok(SharedRequestDismissal {
+                    requester_user_id: row.get(0)?,
+                    count: row.get::<_, i64>(1)? as u32,
+                    suppressed: row.get::<_, i64>(2)? != 0,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    /// Directly scanning the person's own QR code is the escape hatch that
+    /// clears both a suppression and any dismissal history.
+    pub fn clear_shared_request_dismissal(
+        &self,
+        requester_user_id: Vec<u8>,
+    ) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "DELETE FROM shared_request_dismissals WHERE requester_user_id = ?1",
+            params![requester_user_id],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Record (or refresh, on a re-send) the requester-side "waiting" state
+    /// for one shared-card connection.
+    pub fn upsert_outgoing_shared_request(
+        &self,
+        request: OutgoingSharedRequest,
+    ) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "INSERT INTO outgoing_shared_requests (candidate_user_id, expires_at_ms, sent_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(candidate_user_id) DO UPDATE SET
+                expires_at_ms = excluded.expires_at_ms,
+                sent_at_ms = excluded.sent_at_ms",
+            params![
+                request.candidate_user_id,
+                request.expires_at_ms,
+                request.sent_at_ms,
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// All outgoing shared-card requests, including expired ones — expiry is
+    /// exactly the state the UI must surface as "didn't respond", so the rows
+    /// outlive it until the connection completes or the user clears them.
+    pub fn list_outgoing_shared_requests(&self) -> Result<Vec<OutgoingSharedRequest>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT candidate_user_id, expires_at_ms, sent_at_ms
+                 FROM outgoing_shared_requests ORDER BY sent_at_ms ASC",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(OutgoingSharedRequest {
+                    candidate_user_id: row.get(0)?,
+                    expires_at_ms: row.get(1)?,
+                    sent_at_ms: row.get(2)?,
+                })
+            })
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    pub fn delete_outgoing_shared_request(
+        &self,
+        candidate_user_id: Vec<u8>,
+    ) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "DELETE FROM outgoing_shared_requests WHERE candidate_user_id = ?1",
+            params![candidate_user_id],
+        )
+        .map_err(store_err)?;
+        Ok(())
     }
 
     /// Add or replace a group definition and its full membership. Updating an
@@ -4266,6 +4536,57 @@ fn row_to_contact(row: &rusqlite::Row) -> rusqlite::Result<Contact> {
     })
 }
 
+fn row_to_pending_shared_request(row: &rusqlite::Row) -> rusqlite::Result<PendingSharedRequest> {
+    Ok(PendingSharedRequest {
+        requester_user_id: row.get(0)?,
+        name: row.get(1)?,
+        sign_pk: row.get(2)?,
+        agree_pk: row.get(3)?,
+        relay_url: row.get(4)?,
+        relay_token: row.get(5)?,
+        sharer_user_id: row.get(6)?,
+        expires_at_ms: row.get(7)?,
+        first_seen_ms: row.get(8)?,
+        last_prompted_ms: row.get(9)?,
+    })
+}
+
+/// Upsert that keeps redelivery quiet: everything the card carries refreshes,
+/// but `first_seen_ms`/`last_prompted_ms` stay put so a duplicate cannot
+/// reset the prompt-rate clock.
+fn conn_execute_pending_shared_upsert(
+    conn: &Connection,
+    request: &PendingSharedRequest,
+) -> Result<(), CoreError> {
+    conn.execute(
+        "INSERT INTO pending_shared_requests
+            (requester_user_id, name, sign_pk, agree_pk, relay_url, relay_token,
+             sharer_user_id, expires_at_ms, first_seen_ms, last_prompted_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+         ON CONFLICT(requester_user_id) DO UPDATE SET
+            name = excluded.name,
+            sign_pk = excluded.sign_pk,
+            agree_pk = excluded.agree_pk,
+            relay_url = excluded.relay_url,
+            relay_token = excluded.relay_token,
+            sharer_user_id = excluded.sharer_user_id,
+            expires_at_ms = excluded.expires_at_ms",
+        params![
+            request.requester_user_id,
+            request.name,
+            request.sign_pk,
+            request.agree_pk,
+            request.relay_url,
+            request.relay_token,
+            request.sharer_user_id,
+            request.expires_at_ms,
+            request.first_seen_ms,
+        ],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
 // Stored on disk, so these numbers are frozen: only ever append.
 fn peer_transport_value(transport: PeerConnectionTransport) -> i64 {
     match transport {
@@ -4594,6 +4915,41 @@ CREATE TABLE IF NOT EXISTS contact_provenance (
     introducer_user_id BLOB,
     introduced_at_ms INTEGER NOT NULL,
     added_nearby INTEGER NOT NULL DEFAULT 0
+);
+
+-- Inbound shared-card friend requests waiting for the user's decision
+-- (specs/share-contact.md decision 5): nothing touches contacts until the
+-- confirmation is accepted, so the request needs its own place to wait.
+CREATE TABLE IF NOT EXISTS pending_shared_requests (
+    requester_user_id BLOB PRIMARY KEY,
+    name TEXT NOT NULL,
+    sign_pk BLOB NOT NULL,
+    agree_pk BLOB NOT NULL,
+    relay_url TEXT,
+    relay_token TEXT,
+    sharer_user_id BLOB NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    first_seen_ms INTEGER NOT NULL,
+    last_prompted_ms INTEGER NOT NULL DEFAULT 0
+);
+
+-- Dismissal bookkeeping for shared-card prompts, kept apart from the pending
+-- row so it survives it: Not now deletes the request but the count must
+-- persist to offer Do-not-ask-again on the second dismissal.
+CREATE TABLE IF NOT EXISTS shared_request_dismissals (
+    requester_user_id BLOB PRIMARY KEY,
+    count INTEGER NOT NULL DEFAULT 0,
+    suppressed INTEGER NOT NULL DEFAULT 0
+);
+
+-- The requester's side of a shared-card connection, so the waiting-to-accept
+-- copy has a machine behind it. Rows are kept past expiry deliberately:
+-- every rejection path drops silently by design, so expiry is the moment the
+-- UI switches from waiting to did-not-respond.
+CREATE TABLE IF NOT EXISTS outgoing_shared_requests (
+    candidate_user_id BLOB PRIMARY KEY,
+    expires_at_ms INTEGER NOT NULL,
+    sent_at_ms INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS groups (
@@ -6654,6 +7010,191 @@ mod tests {
         assert_eq!(provenance.source, 0);
         assert!(provenance.introducer_user_id.is_none());
         assert_eq!(provenance.introduced_at_ms, 10);
+    }
+
+    #[test]
+    fn shared_provenance_persists_and_never_downgrades_direct() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+
+        // source = 2 is now valid and round-trips.
+        let shared_id = vec![9; 16];
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: shared_id.clone(),
+                source: 2,
+                introducer_user_id: Some(vec![4; 16]),
+                introduced_at_ms: 10,
+                added_nearby: false,
+            })
+            .unwrap();
+        let provenance = store.get_contact_provenance(shared_id).unwrap().unwrap();
+        assert_eq!(provenance.source, 2);
+        assert_eq!(provenance.introducer_user_id, Some(vec![4; 16]));
+
+        // The guard widened by exactly one value.
+        assert!(store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: vec![10; 16],
+                source: 3,
+                introducer_user_id: None,
+                introduced_at_ms: 10,
+                added_nearby: false,
+            })
+            .is_err());
+
+        // A later shared import cannot overwrite direct.
+        let direct_id = vec![11; 16];
+        for source in [0u8, 2u8] {
+            store
+                .upsert_contact_provenance(ContactProvenance {
+                    user_id: direct_id.clone(),
+                    source,
+                    introducer_user_id: (source == 2).then(|| vec![4; 16]),
+                    introduced_at_ms: 10 + source as i64,
+                    added_nearby: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .get_contact_provenance(direct_id)
+                .unwrap()
+                .unwrap()
+                .source,
+            0
+        );
+    }
+
+    fn pending_request(requester: u8, expires_at_ms: i64) -> PendingSharedRequest {
+        PendingSharedRequest {
+            requester_user_id: vec![requester; 16],
+            name: "Riley".to_string(),
+            sign_pk: vec![1; 32],
+            agree_pk: vec![2; 32],
+            relay_url: None,
+            relay_token: None,
+            sharer_user_id: vec![5; 16],
+            expires_at_ms,
+            first_seen_ms: 100,
+            last_prompted_ms: 0,
+        }
+    }
+
+    #[test]
+    fn pending_shared_requests_dedupe_and_sweep_on_read() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .upsert_pending_shared_request(pending_request(1, 10_000))
+            .unwrap();
+
+        // Redelivery updates the row instead of stacking, and keeps
+        // first_seen_ms.
+        let mut redelivered = pending_request(1, 20_000);
+        redelivered.first_seen_ms = 999;
+        redelivered.name = "Riley S".to_string();
+        store.upsert_pending_shared_request(redelivered).unwrap();
+        let rows = store.list_pending_shared_requests(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Riley S");
+        assert_eq!(rows[0].first_seen_ms, 100);
+        assert_eq!(rows[0].expires_at_ms, 20_000);
+
+        // Expired rows vanish on read.
+        store
+            .upsert_pending_shared_request(pending_request(2, 5_000))
+            .unwrap();
+        let rows = store.list_pending_shared_requests(6_000).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].requester_user_id, vec![1; 16]);
+        assert!(store
+            .get_pending_shared_request(vec![2; 16])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn shared_request_prompts_are_rate_limited_and_suppressible() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let requester = vec![1; 16];
+        store
+            .upsert_pending_shared_request(pending_request(1, i64::MAX))
+            .unwrap();
+
+        // First prompt fires; a second within the same day does not; a day
+        // later it may fire again.
+        assert!(store
+            .note_shared_request_prompt(requester.clone(), MS_PER_DAY)
+            .unwrap());
+        assert!(!store
+            .note_shared_request_prompt(requester.clone(), MS_PER_DAY + 1000)
+            .unwrap());
+        assert!(store
+            .note_shared_request_prompt(requester.clone(), 2 * MS_PER_DAY + 1000)
+            .unwrap());
+
+        // Not now: count climbs across the row's deletion.
+        assert_eq!(
+            store
+                .record_shared_request_dismissal(requester.clone())
+                .unwrap(),
+            1
+        );
+        store
+            .delete_pending_shared_request(requester.clone())
+            .unwrap();
+        assert_eq!(
+            store
+                .record_shared_request_dismissal(requester.clone())
+                .unwrap(),
+            2
+        );
+
+        // Don't ask again: no prompt ever, even for a fresh pending row.
+        store.suppress_shared_requests(requester.clone()).unwrap();
+        store
+            .upsert_pending_shared_request(pending_request(1, i64::MAX))
+            .unwrap();
+        assert!(!store
+            .note_shared_request_prompt(requester.clone(), 10 * MS_PER_DAY)
+            .unwrap());
+        assert!(
+            store
+                .get_shared_request_dismissal(requester.clone())
+                .unwrap()
+                .unwrap()
+                .suppressed
+        );
+
+        // A direct scan clears the tombstone and the history with it.
+        store
+            .clear_shared_request_dismissal(requester.clone())
+            .unwrap();
+        assert!(store
+            .get_shared_request_dismissal(requester.clone())
+            .unwrap()
+            .is_none());
+        assert!(store
+            .note_shared_request_prompt(requester, 11 * MS_PER_DAY)
+            .unwrap());
+    }
+
+    #[test]
+    fn outgoing_shared_requests_outlive_expiry_until_deleted() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .upsert_outgoing_shared_request(OutgoingSharedRequest {
+                candidate_user_id: vec![1; 16],
+                expires_at_ms: 1_000,
+                sent_at_ms: 500,
+            })
+            .unwrap();
+        // Long past expiry the row is still there: expiry is a UI state
+        // ("didn't respond"), not a deletion trigger.
+        let rows = store.list_outgoing_shared_requests().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].expires_at_ms, 1_000);
+        store.delete_outgoing_shared_request(vec![1; 16]).unwrap();
+        assert!(store.list_outgoing_shared_requests().unwrap().is_empty());
     }
 
     #[test]

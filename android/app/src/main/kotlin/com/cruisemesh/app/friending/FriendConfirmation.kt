@@ -34,6 +34,7 @@ import kotlinx.coroutines.delay
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.FriendCardMatch
 import uniffi.cruisemesh_core.MessageStore
+import uniffi.cruisemesh_core.SharedFriendCard
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.formatUserId
 import androidx.compose.ui.res.stringResource
@@ -59,6 +60,14 @@ data class FriendPreview(
      * (`friend_card_match`) so both shells reach the same verdict.
      */
     val match: FriendCardMatch = FriendCardMatch.New,
+    /**
+     * Non-null when this card arrived as a shared contact card. It rides the
+     * mutual `kind=3` back so the shared person's phone can verify who
+     * authorized the share (specs/share-contact.md).
+     */
+    val shared: SharedFriendCard? = null,
+    /** Who shared it, for the "Shared by ..." line. Never a verified badge. */
+    val sharedByName: String? = null,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -168,7 +177,20 @@ fun FriendPreviewSheet(
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
             )
+            // "Shared by Mom" means Mom passed this card along -- not that Mom
+            // vouches for who this person is. Say only the first thing.
+            preview.sharedByName?.let { sharer ->
+                Text(
+                    stringResource(R.string.ui_shared_by, sharer),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
             FriendIdentityBlock(preview.contact, null)
+            if (preview.shared != null) {
+                SafetyWordsRow(preview.contact.name, preview.contact.userId)
+            }
             FriendMatchNote(preview)
             Button(onClick = onConfirm, modifier = Modifier.fillMaxWidth()) {
                 Text(

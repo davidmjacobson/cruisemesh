@@ -87,13 +87,16 @@ import com.cruisemesh.app.ui.AvatarBadge
 import com.cruisemesh.app.ui.ChatListLogic
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
+import uniffi.cruisemesh_core.FriendImport
 import uniffi.cruisemesh_core.FriendSuggestion
+import uniffi.cruisemesh_core.OutgoingSharedRequest
+import uniffi.cruisemesh_core.SharedFriendCard
 import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.makeFriendCard
 import uniffi.cruisemesh_core.makeFriendLink
-import uniffi.cruisemesh_core.parseFriendText
+import uniffi.cruisemesh_core.parseFriendImport
 import uniffi.cruisemesh_core.relayUrlIsInsecure
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.pluralStringResource
@@ -298,16 +301,25 @@ fun ScanScreen(
     onSayHi: (Contact) -> Unit,
     onDone: () -> Unit,
     onBack: () -> Unit = onDone,
+    /**
+     * A scanned *shared* contact card, which never imports on sight: this
+     * resolves it to the confirmation the user answers, or to the literal
+     * reason it cannot be used (specs/share-contact.md).
+     */
+    onSharedCard: (SharedFriendCard) -> ImportFriendResult = { ImportFriendResult.Error("") },
+    onConfirmShared: (FriendPreview) -> FriendAddedOutcome = { error("no shared import handler") },
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val view = LocalView.current
     var status by remember { mutableStateOf("Point the camera at a CruiseMesh friend card") }
     var added by remember { mutableStateOf<FriendAddedOutcome?>(null) }
+    var sharedPreview by remember { mutableStateOf<FriendPreview?>(null) }
     var frozenFrame by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    val paused = added != null || sharedPreview != null
 
     Box(modifier = Modifier.fillMaxSize()) {
-        if (added == null) {
+        if (!paused) {
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
@@ -324,27 +336,44 @@ fun ScanScreen(
                         analysis.setAnalyzer(
                             ContextCompat.getMainExecutor(ctx),
                             QrAnalyzer { decoded ->
-                                if (added != null) return@QrAnalyzer
+                                if (added != null || sharedPreview != null) return@QrAnalyzer
                                 try {
-                                    val card = parseFriendText(decoded)
-                                    val userId = friendCardUserId(card)
-                                    if (userId.contentEquals(ownUserId)) {
-                                        status = "That's your own card"
-                                        return@QrAnalyzer
+                                    when (val import = parseFriendImport(decoded)) {
+                                        is FriendImport.Direct -> {
+                                            val card = import.card
+                                            val userId = friendCardUserId(card)
+                                            if (userId.contentEquals(ownUserId)) {
+                                                status = "That's your own card"
+                                                return@QrAnalyzer
+                                            }
+                                            val contact = Contact(
+                                                userId = userId,
+                                                name = card.name,
+                                                signPk = card.signPk,
+                                                agreePk = card.agreePk,
+                                                relayUrl = card.relayUrl,
+                                                relayToken = card.relayToken,
+                                            )
+                                            frozenFrame = previewView.bitmap?.asImageBitmap()
+                                            val outcome = onContactAdded(contact)
+                                            added = outcome
+                                            // minSdk is 31, so CONFIRM (added in API 30) is always available.
+                                            view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                                        }
+                                        // A shared card is not self-evidencing the
+                                        // way a scan of somebody's own code is, so
+                                        // it always stops for a confirmation.
+                                        is FriendImport.Shared -> {
+                                            when (val result = onSharedCard(import.shared)) {
+                                                is ImportFriendResult.Preview -> {
+                                                    frozenFrame = previewView.bitmap?.asImageBitmap()
+                                                    sharedPreview = result.preview
+                                                    view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                                                }
+                                                is ImportFriendResult.Error -> status = result.message
+                                            }
+                                        }
                                     }
-                                    val contact = Contact(
-                                        userId = userId,
-                                        name = card.name,
-                                        signPk = card.signPk,
-                                        agreePk = card.agreePk,
-                                        relayUrl = card.relayUrl,
-                                        relayToken = card.relayToken,
-                                    )
-                                    frozenFrame = previewView.bitmap?.asImageBitmap()
-                                    val outcome = onContactAdded(contact)
-                                    added = outcome
-                                    // minSdk is 31, so CONFIRM (added in API 30) is always available.
-                                    view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
                                 } catch (e: Exception) {
                                     status = "Not a CruiseMesh friend card"
                                 }
@@ -368,7 +397,7 @@ fun ScanScreen(
             ScanViewfinderOverlay()
         }
 
-        if (added != null && frozenFrame != null) {
+        if (paused && frozenFrame != null) {
             Image(
                 bitmap = frozenFrame!!,
                 contentDescription = null,
@@ -377,7 +406,7 @@ fun ScanScreen(
             )
         }
 
-        if (added == null) Column(
+        if (!paused) Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(24.dp),
@@ -401,6 +430,21 @@ fun ScanScreen(
                 Button(onClick = onBack, modifier = Modifier.padding(top = 16.dp)) { Text(stringResource(R.string.ui_cancel)) }
             }
         }
+    }
+
+    sharedPreview?.let { current ->
+        FriendPreviewSheet(
+            preview = current,
+            onConfirm = {
+                added = onConfirmShared(current)
+                sharedPreview = null
+            },
+            onDismiss = {
+                sharedPreview = null
+                frozenFrame = null
+                status = "Point the camera at a CruiseMesh friend card"
+            },
+        )
     }
 
     added?.let { outcome ->
@@ -470,7 +514,7 @@ fun AddFriendScreen(
     onScanClick: () -> Unit,
     onShowMyCardClick: () -> Unit,
     onImportText: (String) -> ImportFriendResult,
-    onConfirmContact: (Contact) -> FriendAddedOutcome,
+    onConfirmContact: (FriendPreview) -> FriendAddedOutcome,
     onRequestSuggestion: (FriendSuggestion) -> Boolean,
     onHideSuggestion: (FriendSuggestion) -> Unit,
     ownUserId: ByteArray,
@@ -479,6 +523,9 @@ fun AddFriendScreen(
     onSayHi: (Contact) -> Unit,
     onDone: () -> Unit,
     onBack: () -> Unit,
+    /** How many people are waiting on a decision; 0 hides the entry entirely. */
+    waitingToConnectCount: Int = 0,
+    onWaitingToConnect: () -> Unit = {},
 ) {
     var pasted by remember(initialText) { mutableStateOf(initialText) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -612,6 +659,20 @@ fun AddFriendScreen(
                 }
             }
 
+            // A request nobody has answered must stay reachable, not live only
+            // in a notification that has already been swiped away
+            // (specs/share-contact.md).
+            if (waitingToConnectCount > 0) {
+                OutlinedButton(onClick = onWaitingToConnect, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        stringResource(
+                            R.string.ui_waiting_to_connect_count,
+                            waitingToConnectCount,
+                        ),
+                    )
+                }
+            }
+
             Text(stringResource(R.string.ui_add_directly), style = MaterialTheme.typography.titleMedium)
             Button(onClick = onScanClick, modifier = Modifier.fillMaxWidth()) {
                 Text(stringResource(R.string.ui_scan_qr_code))
@@ -689,7 +750,7 @@ fun AddFriendScreen(
         FriendPreviewSheet(
             preview = current,
             onConfirm = {
-                added = onConfirmContact(current.contact)
+                added = onConfirmContact(current)
                 preview = null
                 pasted = ""
             },
@@ -735,6 +796,12 @@ internal fun contactsScreenDisplayName(contact: Contact): String =
 fun ContactsScreen(
     contacts: List<Contact>,
     avatarBytesByUserId: Map<String, ByteArray> = emptyMap(),
+    /**
+     * Contacts added from a shared card whose mutual request has not come back
+     * yet, keyed by [formatUserId]. Deliberately no promise of delivery:
+     * every rejection path on the other phone is silent by design.
+     */
+    outgoingSharedByUserId: Map<String, OutgoingSharedRequest> = emptyMap(),
     onContactClick: (Contact) -> Unit,
     onContactDelete: (Contact) -> Unit,
     onAddFriendClick: () -> Unit,
@@ -863,10 +930,30 @@ fun ContactsScreen(
                                 photoBytes = avatarBytesByUserId[displayId],
                             )
                             Spacer(modifier = Modifier.width(16.dp))
-                            Text(
-                                displayName,
-                                style = MaterialTheme.typography.bodyLarge
-                            )
+                            Column {
+                                Text(
+                                    displayName,
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+                                val waitingState = ShareContactPolicy.outgoingState(
+                                    outgoingSharedByUserId[displayId],
+                                    System.currentTimeMillis(),
+                                )
+                                if (waitingState != OutgoingSharedState.NONE) {
+                                    Text(
+                                        stringResource(
+                                            if (waitingState == OutgoingSharedState.WAITING) {
+                                                R.string.ui_waiting_for_x_to_accept
+                                            } else {
+                                                R.string.ui_x_didnt_respond
+                                            },
+                                            displayName,
+                                        ),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
                         }
                     }
                 } else {

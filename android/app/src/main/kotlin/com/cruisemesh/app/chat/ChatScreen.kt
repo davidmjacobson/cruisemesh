@@ -110,6 +110,8 @@ import com.cruisemesh.app.notify.ChatMuteStore
 import com.cruisemesh.app.mesh.ReachabilityLevel
 import com.cruisemesh.app.ui.AvatarBadge
 import com.cruisemesh.app.ui.BubbleGrouping
+import com.cruisemesh.app.friending.ShareContactAvailability
+import com.cruisemesh.app.friending.ShareContactPolicy
 import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ComposerCameraIcon
 import com.cruisemesh.app.ui.ComposerMicIcon
@@ -192,6 +194,8 @@ fun ChatScreen(
      * `composer_reach`. Purely local; drives the notice above the composer.
      */
     composerReach: ComposerReach = ComposerReach.FINE,
+    /** Opens the share-contact code for this contact (specs/share-contact.md). */
+    onShareContact: (Contact) -> Unit = {},
 ) {
     val context = LocalContext.current
     var currentContact by remember(contact.userId) { mutableStateOf(contact) }
@@ -210,6 +214,9 @@ fun ChatScreen(
     var draft by remember(contact.userId) { mutableStateOf(DraftStore.load(context, contact.userId)) }
     var isMuted by remember(contact.userId) { mutableStateOf(ChatMuteStore.isMuted(context, contact.userId)) }
     var isBlocked by remember(contact.userId) { mutableStateOf(store.isUserBlocked(contact.userId)) }
+    val shareAvailability = remember(contact.userId, isBlocked) {
+        ShareContactPolicy.availability(store.getContactDiscoveryPolicy(contact.userId), isBlocked)
+    }
     var replyingTo by remember(contact.userId) { mutableStateOf<StoredMessage?>(null) }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
     // A photo picked but not yet sent: shown as a preview card above the composer
@@ -434,6 +441,8 @@ fun ChatScreen(
             isBlocked = blocked
         },
         onReport = { launchContactReport(context, currentContact, ownUserId) },
+        shareAvailability = shareAvailability,
+        onShareContact = { onShareContact(currentContact) },
     )
 }
 
@@ -480,6 +489,8 @@ private fun ConversationScreen(
     isBlocked: Boolean = false,
     onBlockedChange: (Boolean) -> Unit = {},
     onReport: () -> Unit = {},
+    shareAvailability: ShareContactAvailability = ShareContactAvailability.HIDDEN,
+    onShareContact: () -> Unit = {},
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
@@ -653,6 +664,11 @@ private fun ConversationScreen(
                     onBlockedChange = onBlockedChange,
                     onReport = onReport,
                     relayCardIsStale = relayCardIsStale,
+                    shareAvailability = shareAvailability,
+                    onShareContact = {
+                        showContactDetails = false
+                        onShareContact()
+                    },
                     avatarBytes = contactAvatar,
                     onDeleteContact = {
                         showContactDetails = false

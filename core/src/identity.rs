@@ -5,11 +5,13 @@
 //! BLAKE2b(Ed25519 public key). Friending exchanges a FriendCard (JSON, carried
 //! over QR code or pasted text) containing both public keys.
 
+use crate::crypto::{signing_key_from_bytes, verifying_key_from_bytes};
+use crate::protocol::MS_PER_DAY;
 use crate::store::{contact_display_name, Contact};
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
 use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
@@ -22,6 +24,11 @@ const FRIEND_LINK_PREFIX: &str = "CMFRIEND1:";
 /// half the size of v1 because the 32-byte keys are raw bytes instead of JSON
 /// number arrays. This is what [`make_friend_link`] now emits.
 const FRIEND_LINK_PREFIX_V2: &str = "CMFRIEND2:";
+/// Shared-contact code (specs/share-contact.md): base64url of a binary
+/// [`SharedFriendCard`]. Displayed as a QR only, never emitted as copyable
+/// text by any UI surface (decision 2) — the prefix exists so a screenshotted
+/// or hand-typed code still parses.
+const SHARED_CARD_PREFIX: &str = "CMSHARE1:";
 /// Compact link form v3 (`specs/friend-card-v3.md`): the v2 layout with the two
 /// compressible parts squeezed out — the hosted relay URL becomes a single tag
 /// byte, and a lowercase-hex relay token rides as raw bytes instead of ASCII.
@@ -65,7 +72,7 @@ pub struct Identity {
 
 /// The public, shareable half of an identity — what a QR code / friend-request
 /// string actually carries. No secret material.
-#[derive(uniffi::Record, Clone, Debug, Serialize, Deserialize)]
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FriendCard {
     pub name: String,
     pub sign_pk: Vec<u8>,
@@ -666,6 +673,342 @@ fn validate_friend_card(card: &FriendCard) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// How long a shared-contact code stays scannable (decision 6): long enough
+/// for "we'll add each other tomorrow", short enough that a screenshot in an
+/// old chat log goes stale.
+pub(crate) const SHARED_CARD_LIFETIME_MS: i64 = 7 * MS_PER_DAY;
+/// Device clocks drift; tolerate a day either side when the *shared person*
+/// checks expiry, mirroring `INTRODUCTION_CLOCK_SKEW_MS`.
+const SHARED_CARD_CLOCK_SKEW_MS: i64 = 24 * 60 * 60 * 1000;
+const SHARED_CARD_VERSION: u8 = 1;
+const SHARED_CARD_SIGN_DOMAIN: &[u8] = b"CruiseMesh shared contact v1\0";
+
+/// One contact's friend card, deliberately handed to somebody else by a mutual
+/// acquaintance (specs/share-contact.md). Carries the stored card
+/// byte-identical (decision 8: never substitute the sharer's own credentials),
+/// plus who shared it, a validity window, and the sharer's Ed25519 signature
+/// over all of it. The signature is what lets the shared person's phone verify
+/// the request came from a card one of their own accepted contacts actually
+/// issued, rather than from anyone who once saw their link.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct SharedFriendCard {
+    pub version: u8,
+    pub card: FriendCard,
+    pub sharer_user_id: Vec<u8>,
+    /// The shared person's discovery-policy revision at issue time. Checked
+    /// for equality on their phone (decision 10) so an off-then-on cycle
+    /// kills every card issued before it.
+    pub shared_policy_revision: u64,
+    pub issued_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub signature: Vec<u8>,
+}
+
+/// What a scanned/pasted friend text turned out to be. Shells route
+/// `Direct` through the existing confirmation flow and `Shared` through the
+/// shared-card flow (expiry message, "Shared by …" line, tailed request).
+#[derive(uniffi::Enum, Clone, Debug)]
+pub enum FriendImport {
+    Direct { card: FriendCard },
+    Shared { shared: SharedFriendCard },
+}
+
+/// A decoded `kind=3` friend-request payload: the requester's own card, plus
+/// the shared card they imported from, when the request originated from one.
+/// The tail rides as an extra JSON field old clients ignore, so a tailless
+/// request keeps meaning "this person physically scanned your code".
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FriendRequestContent {
+    pub card: FriendCard,
+    pub shared: Option<SharedFriendCard>,
+}
+
+/// Issue a shared card for `card` (a contact's stored friend card), signed by
+/// the sharer. Expiry is fixed at seven days from `now_ms`.
+#[uniffi::export]
+pub fn create_shared_friend_card(
+    sharer: Identity,
+    card: FriendCard,
+    shared_policy_revision: u64,
+    now_ms: i64,
+) -> Result<SharedFriendCard, CoreError> {
+    validate_friend_card(&card)?;
+    if sharer.user_id.len() != USER_ID_LEN {
+        return Err(CoreError::Malformed("invalid sharer UserID".to_string()));
+    }
+    let mut shared = SharedFriendCard {
+        version: SHARED_CARD_VERSION,
+        card,
+        sharer_user_id: sharer.user_id.clone(),
+        shared_policy_revision,
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(SHARED_CARD_LIFETIME_MS),
+        signature: Vec::new(),
+    };
+    let signing_key = signing_key_from_bytes(&sharer.sign_sk)?;
+    shared.signature = signing_key
+        .sign(&shared_card_signed_bytes(&shared)?)
+        .to_bytes()
+        .to_vec();
+    Ok(shared)
+}
+
+/// The scannable text form of a shared card, for QR rendering only.
+#[uniffi::export]
+pub fn make_shared_contact_code(shared: SharedFriendCard) -> Result<String, CoreError> {
+    let binary = encode_shared_friend_card(&shared)?;
+    Ok(format!(
+        "{SHARED_CARD_PREFIX}{}",
+        BASE64URL_NOPAD.encode(&binary)
+    ))
+}
+
+/// Parse anything a scan or paste can produce: a shared-contact code, or any
+/// of the direct friend-card forms `parse_friend_text` accepts.
+#[uniffi::export]
+pub fn parse_friend_import(text: String) -> Result<FriendImport, CoreError> {
+    if text.len() > MAX_FRIEND_TEXT_BYTES {
+        return Err(CoreError::InvalidFriendCard(
+            "shared friend text is too large".to_string(),
+        ));
+    }
+    let trimmed = text.trim();
+    if let Some(encoded) = extract_link_body(trimmed, SHARED_CARD_PREFIX) {
+        let compact: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+        let binary = BASE64URL_NOPAD
+            .decode(compact.as_bytes())
+            .map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+        let shared = decode_shared_friend_card(&binary)?;
+        return Ok(FriendImport::Shared { shared });
+    }
+    parse_friend_text(text).map(|card| FriendImport::Direct { card })
+}
+
+/// Scanner-side expiry check, for the specific "This code has expired. Ask
+/// for a new one." message rather than a generic parse failure. The shared
+/// person's own verification applies clock skew; the scanner does not need to.
+#[uniffi::export]
+pub fn shared_card_expired(shared: SharedFriendCard, now_ms: i64) -> bool {
+    now_ms > shared.expires_at_ms
+}
+
+/// Every check the *shared person's* phone can run from the card alone:
+/// the card really is mine, the named sharer signed exactly this card and
+/// window, it is unexpired within a day of clock skew, and it was issued
+/// under my current discovery-policy revision. The caller supplies the
+/// relationship checks (sharer is an accepted, non-blocked contact; my
+/// discovery switch is on) because they live in the store, not the card.
+/// Any `false` here means: drop the request without a prompt.
+#[uniffi::export]
+pub fn verify_shared_friend_card(
+    shared: SharedFriendCard,
+    sharer_sign_pk: Vec<u8>,
+    expected_card_user_id: Vec<u8>,
+    expected_policy_revision: u64,
+    now_ms: i64,
+) -> Result<bool, CoreError> {
+    if validate_shared_card_shape(&shared).is_err() {
+        return Ok(false);
+    }
+    if derive_user_id(&shared.card.sign_pk).to_vec() != expected_card_user_id
+        || derive_user_id(&sharer_sign_pk).to_vec() != shared.sharer_user_id
+        || shared.shared_policy_revision != expected_policy_revision
+        || now_ms
+            < shared
+                .issued_at_ms
+                .saturating_sub(SHARED_CARD_CLOCK_SKEW_MS)
+        || now_ms
+            > shared
+                .expires_at_ms
+                .saturating_add(SHARED_CARD_CLOCK_SKEW_MS)
+    {
+        return Ok(false);
+    }
+    let verifying_key = verifying_key_from_bytes(&sharer_sign_pk)?;
+    let signature_bytes: [u8; 64] =
+        shared.signature.as_slice().try_into().map_err(|_| {
+            CoreError::Malformed("invalid shared card signature length".to_string())
+        })?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    Ok(verifying_key
+        .verify(&shared_card_signed_bytes(&shared)?, &signature)
+        .is_ok())
+}
+
+/// Build the `kind=3` payload for a request that originated from a shared
+/// card: the requester's ordinary card JSON with the shared card appended as
+/// an extra `shared` field. Old clients deserialize the same JSON into a
+/// plain FriendCard, ignore the unknown field, and auto-import exactly as
+/// today — the confirmation step is a property of updated recipients.
+#[uniffi::export]
+pub fn make_shared_friend_request_payload(
+    card_json: String,
+    shared: SharedFriendCard,
+) -> Result<String, CoreError> {
+    parse_friend_card(card_json.clone())?;
+    let mut value: serde_json::Value = serde_json::from_str(&card_json)
+        .map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| CoreError::InvalidFriendCard("friend card is not an object".to_string()))?;
+    let binary = encode_shared_friend_card(&shared)?;
+    object.insert(
+        "shared".to_string(),
+        serde_json::Value::String(BASE64URL_NOPAD.encode(&binary)),
+    );
+    let json =
+        serde_json::to_string(&value).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+    if json.len() > MAX_FRIEND_CARD_JSON_BYTES {
+        return Err(CoreError::InvalidFriendCard(
+            "friend request payload is too large".to_string(),
+        ));
+    }
+    Ok(json)
+}
+
+/// Decode an inbound `kind=3` payload: the requester's card plus the shared
+/// tail when present. A malformed tail is an error, not a silent downgrade to
+/// the auto-import path — dropping a bad request outright is the fail-closed
+/// direction here.
+#[uniffi::export]
+pub fn parse_friend_request_content(json: String) -> Result<FriendRequestContent, CoreError> {
+    let card = parse_friend_card(json.clone())?;
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+    let shared = match value.get("shared") {
+        None => None,
+        Some(serde_json::Value::String(encoded)) => {
+            let binary = BASE64URL_NOPAD
+                .decode(encoded.as_bytes())
+                .map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+            Some(decode_shared_friend_card(&binary)?)
+        }
+        Some(_) => {
+            return Err(CoreError::InvalidFriendCard(
+                "invalid shared tail".to_string(),
+            ))
+        }
+    };
+    Ok(FriendRequestContent { card, shared })
+}
+
+/// Binary SharedFriendCard layout: `version:u8 ‖ card_len:u16_be ‖
+/// card_binary ‖ sharer_user_id[16] ‖ policy_revision:u64_be ‖
+/// issued_at:i64_be ‖ expires_at:i64_be ‖ signature[64]`, where `card_binary`
+/// is the existing CMFRIEND2 layout.
+fn encode_shared_friend_card(shared: &SharedFriendCard) -> Result<Vec<u8>, CoreError> {
+    validate_shared_card_shape(shared)?;
+    let mut out = shared_card_body_bytes(shared)?;
+    out.extend_from_slice(&shared.signature);
+    Ok(out)
+}
+
+/// Everything except the signature, in wire order. The signed bytes are the
+/// domain separator followed by exactly this, so encode and sign can never
+/// drift apart.
+fn shared_card_body_bytes(shared: &SharedFriendCard) -> Result<Vec<u8>, CoreError> {
+    if shared.sharer_user_id.len() != USER_ID_LEN {
+        return Err(CoreError::Malformed("invalid sharer UserID".to_string()));
+    }
+    let card_binary = encode_friend_card_binary(&shared.card)?;
+    if card_binary.len() > u16::MAX as usize {
+        return Err(CoreError::InvalidFriendCard(
+            "shared card is too large".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(3 + card_binary.len() + 16 + 24 + 64);
+    out.push(shared.version);
+    out.extend_from_slice(&(card_binary.len() as u16).to_be_bytes());
+    out.extend_from_slice(&card_binary);
+    out.extend_from_slice(&shared.sharer_user_id);
+    out.extend_from_slice(&shared.shared_policy_revision.to_be_bytes());
+    out.extend_from_slice(&shared.issued_at_ms.to_be_bytes());
+    out.extend_from_slice(&shared.expires_at_ms.to_be_bytes());
+    Ok(out)
+}
+
+fn shared_card_signed_bytes(shared: &SharedFriendCard) -> Result<Vec<u8>, CoreError> {
+    let mut out = SHARED_CARD_SIGN_DOMAIN.to_vec();
+    out.extend_from_slice(&shared_card_body_bytes(shared)?);
+    Ok(out)
+}
+
+/// Decode runs on untrusted scan input: every read is bounds-checked and a
+/// truncated, trailing-byte, or unknown-version card errors, never panics.
+fn decode_shared_friend_card(bytes: &[u8]) -> Result<SharedFriendCard, CoreError> {
+    let mut pos = 0usize;
+    let version = read_binary_slice(bytes, &mut pos, 1)?[0];
+    if version != SHARED_CARD_VERSION {
+        return Err(CoreError::InvalidFriendCard(format!(
+            "unknown shared card version: {version}"
+        )));
+    }
+    let card_len = u16::from_be_bytes([
+        read_binary_slice(bytes, &mut pos, 1)?[0],
+        read_binary_slice(bytes, &mut pos, 1)?[0],
+    ]) as usize;
+    let card = decode_friend_card_binary(read_binary_slice(bytes, &mut pos, card_len)?)?;
+    let sharer_user_id = read_binary_slice(bytes, &mut pos, USER_ID_LEN)?.to_vec();
+    let shared_policy_revision = u64::from_be_bytes(
+        read_binary_slice(bytes, &mut pos, 8)?
+            .try_into()
+            .expect("read_binary_slice returns exactly 8 bytes"),
+    );
+    let issued_at_ms = i64::from_be_bytes(
+        read_binary_slice(bytes, &mut pos, 8)?
+            .try_into()
+            .expect("read_binary_slice returns exactly 8 bytes"),
+    );
+    let expires_at_ms = i64::from_be_bytes(
+        read_binary_slice(bytes, &mut pos, 8)?
+            .try_into()
+            .expect("read_binary_slice returns exactly 8 bytes"),
+    );
+    let signature = read_binary_slice(bytes, &mut pos, 64)?.to_vec();
+    if pos != bytes.len() {
+        return Err(CoreError::InvalidFriendCard(
+            "trailing bytes after shared card".to_string(),
+        ));
+    }
+    let shared = SharedFriendCard {
+        version,
+        card,
+        sharer_user_id,
+        shared_policy_revision,
+        issued_at_ms,
+        expires_at_ms,
+        signature,
+    };
+    validate_shared_card_shape(&shared)?;
+    Ok(shared)
+}
+
+fn validate_shared_card_shape(shared: &SharedFriendCard) -> Result<(), CoreError> {
+    if shared.version != SHARED_CARD_VERSION {
+        return Err(CoreError::InvalidFriendCard(format!(
+            "unknown shared card version: {}",
+            shared.version
+        )));
+    }
+    validate_friend_card(&shared.card)?;
+    if shared.sharer_user_id.len() != USER_ID_LEN {
+        return Err(CoreError::Malformed("invalid sharer UserID".to_string()));
+    }
+    if shared.signature.len() != 64 {
+        return Err(CoreError::Malformed(
+            "invalid shared card signature length".to_string(),
+        ));
+    }
+    if shared.expires_at_ms <= shared.issued_at_ms
+        || shared.expires_at_ms.saturating_sub(shared.issued_at_ms) > SHARED_CARD_LIFETIME_MS
+    {
+        return Err(CoreError::Malformed(
+            "invalid shared card validity window".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Small nautical/travel-themed wordlist for fingerprint phrases. Not
 /// security-critical (only 4 words are shown), so a compact list is fine.
 const WORDLIST: [&str; 64] = [
@@ -738,6 +1081,210 @@ const WORDLIST: [&str; 64] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stored contact card plus the identities on both ends of a share:
+    /// `sharer` holds `card` (the shared person's card) and hands it on.
+    fn shared_card_fixture() -> (Identity, Identity, FriendCard, SharedFriendCard) {
+        let sharer = generate_identity();
+        let shared_person = generate_identity();
+        let card = FriendCard {
+            name: "Avery".to_string(),
+            sign_pk: shared_person.sign_pk.clone(),
+            agree_pk: shared_person.agree_pk.clone(),
+            relay_url: Some("https://relay.example".to_string()),
+            relay_token: Some("deposit-token".to_string()),
+        };
+        let shared = create_shared_friend_card(sharer.clone(), card.clone(), 7, 1_000_000).unwrap();
+        (sharer, shared_person, card, shared)
+    }
+
+    #[test]
+    fn shared_card_round_trips_through_code() {
+        let (_, _, card, shared) = shared_card_fixture();
+        let code = make_shared_contact_code(shared.clone()).unwrap();
+        assert!(code.starts_with("CMSHARE1:"));
+        match parse_friend_import(code).unwrap() {
+            FriendImport::Shared { shared: decoded } => {
+                assert_eq!(decoded, shared);
+                assert_eq!(decoded.card, card);
+            }
+            FriendImport::Direct { .. } => panic!("expected a shared card"),
+        }
+    }
+
+    #[test]
+    fn parse_friend_import_still_routes_direct_forms() {
+        let id = generate_identity();
+        let json = make_friend_card("Dave".to_string(), id, None, None).unwrap();
+        let link = make_friend_link(json.clone()).unwrap();
+        for text in [json, link] {
+            match parse_friend_import(text).unwrap() {
+                FriendImport::Direct { card } => assert_eq!(card.name, "Dave"),
+                FriendImport::Shared { .. } => panic!("expected a direct card"),
+            }
+        }
+    }
+
+    #[test]
+    fn old_parser_rejects_shared_codes() {
+        // Old clients show "that doesn't look like a friend code" — the
+        // shared form must never half-parse into a direct card there.
+        let (_, _, _, shared) = shared_card_fixture();
+        let code = make_shared_contact_code(shared).unwrap();
+        assert!(parse_friend_text(code).is_err());
+    }
+
+    #[test]
+    fn shared_card_decode_rejects_every_truncation_and_trailing_byte() {
+        let (_, _, _, shared) = shared_card_fixture();
+        let binary = encode_shared_friend_card(&shared).unwrap();
+        for len in 0..binary.len() {
+            assert!(
+                decode_shared_friend_card(&binary[..len]).is_err(),
+                "truncation to {len} bytes must fail"
+            );
+        }
+        let mut trailing = binary.clone();
+        trailing.push(0);
+        assert!(decode_shared_friend_card(&trailing).is_err());
+    }
+
+    #[test]
+    fn shared_card_decode_rejects_unknown_version() {
+        let (_, _, _, shared) = shared_card_fixture();
+        let mut binary = encode_shared_friend_card(&shared).unwrap();
+        binary[0] = 2;
+        assert!(decode_shared_friend_card(&binary).is_err());
+    }
+
+    #[test]
+    fn shared_card_verifies_and_fails_closed_on_every_tamper() {
+        let (sharer, shared_person, _, shared) = shared_card_fixture();
+        let own_id = shared_person.user_id.clone();
+        let now = shared.issued_at_ms + 1;
+        let verify = |card: SharedFriendCard| {
+            verify_shared_friend_card(card, sharer.sign_pk.clone(), own_id.clone(), 7, now).unwrap()
+        };
+
+        assert!(verify(shared.clone()));
+
+        // Forged signature.
+        let mut forged = shared.clone();
+        forged.signature[0] ^= 1;
+        assert!(!verify(forged));
+
+        // Swapped inner card: signed for somebody else entirely.
+        let other = generate_identity();
+        let mut swapped = shared.clone();
+        swapped.card.sign_pk = other.sign_pk.clone();
+        swapped.card.agree_pk = other.agree_pk.clone();
+        assert!(!verify(swapped));
+
+        // Changed sharer id.
+        let mut resharered = shared.clone();
+        resharered.sharer_user_id = other.user_id.clone();
+        assert!(!verify(resharered));
+
+        // Changed expiry (signature no longer covers it).
+        let mut extended = shared.clone();
+        extended.expires_at_ms += 1000;
+        assert!(!verify(extended));
+
+        // Wrong policy revision.
+        assert!(!verify_shared_friend_card(
+            shared.clone(),
+            sharer.sign_pk.clone(),
+            own_id.clone(),
+            8,
+            now
+        )
+        .unwrap());
+
+        // Wrong sharer key: the card names one sharer, the key is another's.
+        assert!(!verify_shared_friend_card(shared, other.sign_pk, own_id, 7, now).unwrap());
+    }
+
+    #[test]
+    fn shared_card_expiry_tolerates_a_day_of_skew_and_no_more() {
+        let (sharer, shared_person, _, shared) = shared_card_fixture();
+        let own_id = shared_person.user_id.clone();
+        let at = |now: i64| {
+            verify_shared_friend_card(
+                shared.clone(),
+                sharer.sign_pk.clone(),
+                own_id.clone(),
+                7,
+                now,
+            )
+            .unwrap()
+        };
+        assert!(at(shared.expires_at_ms + SHARED_CARD_CLOCK_SKEW_MS - 1));
+        assert!(!at(shared.expires_at_ms + SHARED_CARD_CLOCK_SKEW_MS + 1));
+        assert!(at(shared.issued_at_ms - SHARED_CARD_CLOCK_SKEW_MS + 1));
+        assert!(!at(shared.issued_at_ms - SHARED_CARD_CLOCK_SKEW_MS - 1));
+    }
+
+    #[test]
+    fn scanner_side_expiry_check_is_plain() {
+        let (_, _, _, shared) = shared_card_fixture();
+        assert!(!shared_card_expired(shared.clone(), shared.expires_at_ms));
+        assert!(shared_card_expired(
+            shared.clone(),
+            shared.expires_at_ms + 1
+        ));
+    }
+
+    #[test]
+    fn shared_tail_rides_kind3_payload_and_old_clients_ignore_it() {
+        let (_, _, _, shared) = shared_card_fixture();
+        let requester = generate_identity();
+        let card_json = make_friend_card("Riley".to_string(), requester, None, None).unwrap();
+        let payload =
+            make_shared_friend_request_payload(card_json.clone(), shared.clone()).unwrap();
+
+        // New clients see both halves.
+        let content = parse_friend_request_content(payload.clone()).unwrap();
+        assert_eq!(content.card.name, "Riley");
+        assert_eq!(content.shared, Some(shared));
+
+        // Old clients parse the very same payload as a plain card (the
+        // auto-import compatibility path) — the tail is an ignored field.
+        assert_eq!(parse_friend_card(payload).unwrap().name, "Riley");
+
+        // A tailless payload decodes with no shared half.
+        let content = parse_friend_request_content(card_json).unwrap();
+        assert!(content.shared.is_none());
+    }
+
+    #[test]
+    fn malformed_shared_tail_is_an_error_not_an_auto_import() {
+        let requester = generate_identity();
+        let card_json = make_friend_card("Riley".to_string(), requester, None, None).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&card_json).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("shared".to_string(), serde_json::json!("not-base64!!"));
+        assert!(parse_friend_request_content(value.to_string()).is_err());
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("shared".to_string(), serde_json::json!(42));
+        assert!(parse_friend_request_content(value.to_string()).is_err());
+    }
+
+    #[test]
+    fn create_shared_card_pins_the_seven_day_window() {
+        let (_, _, _, shared) = shared_card_fixture();
+        assert_eq!(
+            shared.expires_at_ms - shared.issued_at_ms,
+            SHARED_CARD_LIFETIME_MS
+        );
+        // A hand-built longer window fails shape validation on decode.
+        let mut stretched = shared;
+        stretched.expires_at_ms = stretched.issued_at_ms + SHARED_CARD_LIFETIME_MS + 1;
+        assert!(encode_shared_friend_card(&stretched).is_err());
+    }
 
     #[test]
     fn user_id_is_stable_for_same_key() {

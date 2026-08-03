@@ -1,6 +1,6 @@
 # Spec: Share a contact
 
-**Status:** proposed
+**Status:** implemented
 **Design reference:** `DESIGN.md` §6.2 (identity and friending),
 `specs/friends-of-friends.md` (decision 7 scopes introductions to one pass)
 

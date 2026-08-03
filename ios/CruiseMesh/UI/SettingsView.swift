@@ -72,7 +72,7 @@ struct SettingsView: View {
                 Section("Privacy") {
                     Toggle("Friends of friends", isOn: $friendsOfFriends)
                         .onChange(of: friendsOfFriends) { updateFriendsOfFriends($0) }
-                    Text("Let friends introduce you to people they know. Messages and phone contacts are never shared.")
+                    Text("Let friends introduce you to people they know, and share your contact card with someone they choose. Messages and phone contacts are never shared.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Toggle("Share when I'm online", isOn: $shareOnline)

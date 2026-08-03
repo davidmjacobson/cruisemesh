@@ -1626,8 +1626,21 @@ final class MeshController: ObservableObject {
         // verified sender. Not a store failure -- stays a swallowed terminal
         // state.
         guard let json = String(data: body.content, encoding: .utf8),
-              let card = try? parseFriendCard(json: json),
-              friendCardUserId(card: card) == senderUserId else { return }
+              let content = try? parseFriendRequestContent(json: json),
+              friendCardUserId(card: content.card) == senderUserId else { return }
+        // A request carrying a shared-card tail is never auto-imported: it
+        // waits until this person says yes (specs/share-contact.md decision 5).
+        // A tailless one is a direct scan and keeps today's behaviour, forever.
+        if let shared = content.shared {
+            try handleSharedFriendRequest(
+                senderUserId: senderUserId,
+                card: content.card,
+                shared: shared,
+                identity: identity
+            )
+            return
+        }
+        let card = content.card
         let wasKnown = (try? store.getContact(userId: senderUserId)) != nil
         let contact = Contact(
             userId: senderUserId,
@@ -1638,6 +1651,9 @@ final class MeshController: ObservableObject {
             relayToken: card.relayToken
         )
         _ = try store.upsertImportedContact(contact: contact)
+        // Their plain request answers ours: whatever we were waiting on from a
+        // shared code has now completed, so stop saying "waiting" about it.
+        try? store.deleteOutgoingSharedRequest(candidateUserId: senderUserId)
         if let sourceAddress {
             sendLanEndpointHint(address: sourceAddress)
         }
@@ -1693,6 +1709,66 @@ final class MeshController: ObservableObject {
             MessageNotifier.notifyFriendAdded(contact: contact)
         }
         log.info("Imported contact \(contact.name, privacy: .public) from friend request")
+    }
+
+    /// A `kind=3` that came out of somebody's **Share contact** code
+    /// (specs/share-contact.md). Nothing is written to `contacts` or to chat
+    /// history here: the request waits in `pending_shared_requests` until this
+    /// person answers it, and every check below drops it with no prompt at all.
+    /// Silence is the point -- a prompt for a request that failed verification
+    /// would be the surface an attacker was after.
+    ///
+    /// Returning normally consumes the relay copy, exactly as the tailless path
+    /// does; no delivered receipt is authored, because nothing was stored to
+    /// report a watermark through and a receipt would claim a delivery the user
+    /// has not agreed to. `upsertPendingSharedRequest` is the one write that
+    /// must not be silently lost (FI5), so it propagates. No LAN endpoint hint
+    /// goes back either: this phone advertises its endpoint to contacts, and
+    /// the requester is deliberately not one yet.
+    private func handleSharedFriendRequest(
+        senderUserId: Data,
+        card: FriendCard,
+        shared: SharedFriendCard,
+        identity: Identity
+    ) throws {
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        let dismissal = (try? store.getSharedRequestDismissal(requesterUserId: senderUserId)) ?? nil
+        guard (try? store.isUserBlocked(userId: senderUserId)) != true,
+              dismissal?.suppressed != true,
+              friendCardUserId(card: shared.card) == identity.userId,
+              FriendsOfFriendsStore.isEnabled(),
+              let sharer = try? store.getContact(userId: shared.sharerUserId),
+              (try? store.isUserBlocked(userId: sharer.userId)) != true,
+              (try? verifySharedFriendCard(
+                shared: shared,
+                sharerSignPk: sharer.signPk,
+                expectedCardUserId: identity.userId,
+                expectedPolicyRevision: FriendsOfFriendsStore.revision(),
+                nowMs: now
+              )) == true else { return }
+
+        // A redelivery updates the waiting row rather than stacking a second
+        // prompt; the requester's own card supplies how to reach them if and
+        // when this person accepts.
+        try store.upsertPendingSharedRequest(request: PendingSharedRequest(
+            requesterUserId: senderUserId,
+            name: card.name,
+            signPk: card.signPk,
+            agreePk: card.agreePk,
+            relayUrl: card.relayUrl,
+            relayToken: card.relayToken,
+            sharerUserId: shared.sharerUserId,
+            expiresAtMs: shared.expiresAtMs,
+            firstSeenMs: now,
+            lastPromptedMs: 0
+        ))
+        ChatEvents.notifyChatChanged(senderUserId)
+        // At most one prompt per requester per day (core keeps the clock), so a
+        // resend cannot be used to wear somebody down.
+        if (try? store.noteSharedRequestPrompt(requesterUserId: senderUserId, nowMs: now)) == true {
+            MessageNotifier.notifySharedRequest(name: card.name, userId: senderUserId)
+        }
+        log.info("Holding a shared-card friend request for confirmation from \(sharer.name, privacy: .public)")
     }
 
     // FI5: throws now -- see handleIncomingFriendRequest's doc for the

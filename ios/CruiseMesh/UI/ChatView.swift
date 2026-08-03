@@ -20,6 +20,7 @@ struct ChatView: View {
     @State private var draft = ""
     @State private var showVoice = false
     @State private var showDetails = false
+    @State private var shareContact = false
     @State private var confirmDelete = false
     @State private var photoItem: PhotosPickerItem?
     @State private var showCamera = false
@@ -307,11 +308,23 @@ struct ChatView: View {
                         statusMessage = noMailAppMessage(address: address)
                     }
                 },
-                relayCardIsStale: connectivity.staleRelayContacts.contains(contact.userId)
+                relayCardIsStale: connectivity.staleRelayContacts.contains(contact.userId),
+                onShareContact: {
+                    showDetails = false
+                    // One sheet at a time: let the details sheet finish
+                    // dismissing before the code takes its place.
+                    DispatchQueue.main.async { shareContact = true }
+                }
             ) {
                 showDetails = false
                 confirmDelete = true
             }
+        }
+        .sheet(isPresented: $shareContact) {
+            // The stored contact, not `displayContact`: a shared card carries
+            // the name and keys exactly as they gave them to us, never this
+            // phone's private nickname for them.
+            ShareContactView(contact: contact, identity: identity)
         }
         .fullScreenCover(item: $viewedPhoto) { photo in
             PhotoViewerOverlay(jpeg: photo.jpeg)

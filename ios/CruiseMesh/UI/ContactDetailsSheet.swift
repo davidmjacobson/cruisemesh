@@ -17,6 +17,10 @@ struct ContactDetailsSheet: View {
     /// `contact_relay_health`), so we have stopped posting to it. Defaulted
     /// false so previews and existing call sites are unaffected.
     var relayCardIsStale: Bool = false
+    /// Hand this one contact's card to somebody standing in front of you
+    /// (specs/share-contact.md). Optional so existing call sites that have
+    /// nowhere to show the code are unaffected.
+    var onShareContact: (() -> Void)? = nil
     let onDelete: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var editingNickname = false
@@ -197,6 +201,15 @@ struct ContactDetailsSheet: View {
                             .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 1)
                     )
                     .padding(.top, 24)
+
+                    if let onShareContact {
+                        Button(action: onShareContact) {
+                            Label("Share contact", systemImage: "qrcode")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .padding(.top, 16)
+                    }
 
                     Button(action: onReport) {
                         Text("Report contact")
