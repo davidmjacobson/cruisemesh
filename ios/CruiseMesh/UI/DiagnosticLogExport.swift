@@ -19,6 +19,9 @@ enum DiagnosticLogExport {
     private static let fileName = "cruisemesh-diagnostics.txt"
     private static let lock = NSLock()
 
+    /// Guarded by `lock`, like every other mutable state in here.
+    private static var sessionBannerWritten = false
+
     /// Bound each unified-log read and the persistent archive.
     private static let window: TimeInterval = 6 * 60 * 60
     private static let maxEntries = 5_000
@@ -90,6 +93,10 @@ enum DiagnosticLogExport {
         if records.count > maxEntries { records = Array(records.suffix(maxEntries)) }
 
         var text = records.map(\.line).joined(separator: "\n") + "\n"
+        if !sessionBannerWritten {
+            sessionBannerWritten = true
+            text = sessionBanner() + text
+        }
         if !FileManager.default.fileExists(atPath: url.path) {
             text = "CruiseMesh diagnostics — opt-in archive (metadata only)\n\n" + text
         }
@@ -112,8 +119,46 @@ enum DiagnosticLogExport {
         }
     }
 
-    /// Whether any archive exists to share or delete.
+    /// Written once per launch, ahead of that launch's first batch of entries.
+    ///
+    /// Without it a shared archive is unattributable: the entries carry no app
+    /// version, so a tester's log cannot be told apart from the same log on a
+    /// build three releases newer, and the reader has no idea which binary the
+    /// addresses in a crash report belong to. The archive spans launches and
+    /// survives updates, so the banner has to repeat per launch rather than
+    /// sit once at the top of the file.
+    ///
+    /// Metadata only, consistent with the rest of the archive: app version and
+    /// build, hardware identifier, and OS version. The hardware identifier is
+    /// the model (`iPhone14,2`), not any per-device serial.
+    private static func sessionBanner() -> String {
+        let bundle = Bundle.main
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        return "\n===== launch \(stamp) — CruiseMesh \(version) (\(build)) — "
+            + "\(hardwareIdentifier()) — \(ProcessInfo.processInfo.operatingSystemVersionString) =====\n"
+            + EnvironmentSnapshot.line() + "\n"
+    }
+
+    /// `uname` machine string, e.g. `iPhone14,2`. `UIDevice.current.model`
+    /// only ever returns "iPhone", which cannot distinguish the hardware a
+    /// radio bug reproduces on.
+    private static func hardwareIdentifier() -> String {
+        var info = utsname()
+        uname(&info)
+        let machine = withUnsafeBytes(of: &info.machine) { raw in
+            raw.prefix { $0 != 0 }
+        }
+        return String(decoding: machine, as: UTF8.self)
+    }
+
+    /// Whether anything exists to share or delete. Counts the MetricKit
+    /// payloads too: they now outlive the process the way the log archive
+    /// does, so a tester can have crash reports worth sharing -- and worth
+    /// being able to erase -- on a launch that captured no log entries.
     static func hasArchive() -> Bool {
+        if !metricKitFileURLs().isEmpty { return true }
         guard let url = archiveURL(),
               let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = attributes[.size] as? NSNumber else {
@@ -130,10 +175,18 @@ enum DiagnosticLogExport {
     /// now rather than cleared: clearing it would let the next flush re-read
     /// the unified log back to the start of the window and rewrite the very
     /// entries the user just deleted.
+    ///
+    /// Also clears the MetricKit payloads. Before they moved to Application
+    /// Support the OS eventually reclaimed them on its own; now that they
+    /// persist, "delete captured diagnostics" is the only thing that removes
+    /// them, and a delete that left crash reports behind would be a lie.
     static func deleteArchive() {
         lock.lock()
         defer { lock.unlock() }
         if let url = archiveURL() {
+            try? FileManager.default.removeItem(at: url)
+        }
+        for url in metricKitFileURLs() {
             try? FileManager.default.removeItem(at: url)
         }
         UserDefaults.standard.set(Date(), forKey: lastArchivedAtKey)
@@ -177,15 +230,29 @@ enum DiagnosticLogExport {
         try? trimmed.write(to: url, options: .atomic)
     }
 
-    /// Directory `MetricKitCollector` writes its
-    /// JSON payloads into, and where `metricKitFileURLs()` below reads them
-    /// back from for "Share diagnostics" to attach alongside the log file.
-    /// Creates the directory on first use if it doesn't exist yet.
+    /// Directory `MetricKitCollector` writes its JSON payloads into -- both the
+    /// daily metric summaries and the crash/hang diagnostics for previous
+    /// launches -- and where `metricKitFileURLs()` below reads them back from
+    /// for "Share diagnostics" to attach alongside the log file. Creates the
+    /// directory on first use if it doesn't exist yet.
+    ///
+    /// Deliberately Application Support rather than `temporaryDirectory`: iOS
+    /// may purge tmp whenever the app isn't running, and a crash report has to
+    /// survive from the crash until whenever the tester next has a connection
+    /// and gets around to sharing -- which on a cruise can be days. The daily
+    /// metric payloads were tolerant of a purge; a crash report is the one
+    /// artifact we cannot regenerate.
     static func metricKitDirectory() -> URL? {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "cruisemesh-metrickit",
-            isDirectory: true
-        )
+        guard let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) else {
+            return nil
+        }
+        let dir = base.appendingPathComponent(directoryName, isDirectory: true)
+            .appendingPathComponent("MetricKit", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         } catch {
@@ -194,13 +261,63 @@ enum DiagnosticLogExport {
         return dir
     }
 
+    /// The pre-move location. Read-only now, so payloads an updating tester
+    /// already had on disk still get shared instead of silently disappearing
+    /// on the release that moved the directory.
+    private static func legacyMetricKitDirectory() -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent(
+            "cruisemesh-metrickit",
+            isDirectory: true
+        )
+    }
+
+    /// Newest payloads to keep, per kind.
+    ///
+    /// Moving out of `temporaryDirectory` bought durability -- a crash report
+    /// now survives until the tester has a connection -- but it also removed
+    /// the only thing that ever bounded these files, since the OS used to
+    /// reclaim tmp on its own. MetricKit collection is not gated by the
+    /// diagnostics opt-in, so without a cap every install accumulates a JSON
+    /// per day forever, next to a log archive that caps itself at 4 MB.
+    ///
+    /// Crashes get a larger allowance than the daily metric payloads: they are
+    /// rarer, far more valuable, and a crash loop should not evict its own
+    /// earliest evidence.
+    private static let maxDiagnosticPayloads = 20
+    private static let maxMetricPayloads = 14
+
+    /// Trims each kind to its cap, newest kept. Filenames are ISO-8601 stamped
+    /// so lexicographic order is chronological within a prefix.
+    static func pruneMetricKitFiles() {
+        guard let dir = metricKitDirectory() else { return }
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: nil
+        )) ?? []
+        for (prefix, keep) in [
+            ("diagnostic-", maxDiagnosticPayloads),
+            ("metrickit-", maxMetricPayloads),
+        ] {
+            let matching = files
+                .filter { $0.lastPathComponent.hasPrefix(prefix) }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            guard matching.count > keep else { continue }
+            for url in matching.prefix(matching.count - keep) {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
     /// Existing `MetricKitCollector` JSON payloads, oldest first (filenames
     /// are timestamp-ordered), for "Share diagnostics" to attach alongside
     /// the log file. An empty result means nothing to attach, not an error --
     /// MetricKit may not have delivered a payload yet this install.
     static func metricKitFileURLs() -> [URL] {
-        guard let dir = metricKitDirectory() else { return [] }
-        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        var dirs: [URL] = [legacyMetricKitDirectory()]
+        if let dir = metricKitDirectory() { dirs.append(dir) }
+        let files = dirs.flatMap { dir in
+            (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        }
         return files.sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 

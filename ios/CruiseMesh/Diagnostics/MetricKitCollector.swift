@@ -28,6 +28,16 @@ import os.log
 /// content. `locationActivityMetrics` is deliberately not read here even
 /// though it's nominally "battery data" -- it's about location-service
 /// runtime, not battery/CPU/network, and this stays locationless on purpose.
+///
+/// The subscriber also takes `MXDiagnosticPayload`, which is the *only* way
+/// this app can see why a previous launch died. `DiagnosticLogExport` reads
+/// `OSLogStore(scope: .currentProcessIdentifier)` -- iOS offers no other
+/// scope to a sandboxed app -- so a crash takes its own final log entries
+/// with it, and the archive shows nothing but an unexplained gap followed by
+/// a fresh "Mesh started". MetricKit closes that hole from the other side:
+/// after a crash, hang, or watchdog kill, the *next* launch is handed a
+/// payload describing the previous one, including a call-stack tree that
+/// symbolicates against the dSYMs already uploaded to App Store Connect.
 final class MetricKitCollector: NSObject, MXMetricManagerSubscriber {
     static let shared = MetricKitCollector()
 
@@ -51,6 +61,92 @@ final class MetricKitCollector: NSObject, MXMetricManagerSubscriber {
         }
     }
 
+    /// Crash/hang/exception reports for *previous* launches.
+    ///
+    /// The full `jsonRepresentation()` is written verbatim rather than
+    /// summarized the way `MXMetricPayload` is: the call-stack tree is the
+    /// entire point, it is deeply nested, and any field we dropped would be
+    /// the one needed to read the next crash. It stays metadata by
+    /// construction -- frames are binary UUIDs and offsets, and the
+    /// surrounding fields are OS-authored (`terminationReason`, signal and
+    /// exception numbers, device type, OS and app build version). No field
+    /// carries message text or contact identities.
+    ///
+    /// A one-line summary also goes to the unified log so the human-readable
+    /// archive says *that* the previous launch crashed and how, at the point
+    /// in the timeline where it happened. Without it the JSON is easy to miss
+    /// and the text log still reads as an unexplained restart.
+    func didReceive(_ payloads: [MXDiagnosticPayload]) {
+        for payload in payloads {
+            summarizeToLog(payload)
+            writeDiagnostic(payload)
+        }
+    }
+
+    private func writeDiagnostic(_ payload: MXDiagnosticPayload) {
+        guard let dir = DiagnosticLogExport.metricKitDirectory() else {
+            Self.log.warning("Could not create MetricKit export directory")
+            return
+        }
+        let stamp = Self.iso8601.string(from: payload.timeStampEnd)
+            .replacingOccurrences(of: ":", with: "-")
+        let url = dir.appendingPathComponent("diagnostic-\(stamp).json")
+        do {
+            try payload.jsonRepresentation().write(to: url, options: .atomic)
+            DiagnosticLogExport.pruneMetricKitFiles()
+        } catch {
+            Self.log.warning("Could not write MetricKit diagnostic: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func summarizeToLog(_ payload: MXDiagnosticPayload) {
+        for crash in payload.crashDiagnostics ?? [] {
+            // Every component is an OS-supplied number or short string; mark
+            // them public so they survive `<private>` redaction in the archive.
+            let reason = crash.terminationReason ?? "unknown"
+            let signal = crash.signal?.stringValue ?? "-"
+            let type = crash.exceptionType?.stringValue ?? "-"
+            let code = crash.exceptionCode?.stringValue ?? "-"
+            Self.log.error(
+                """
+                Previous launch CRASHED: \(reason, privacy: .public) \
+                signal=\(signal, privacy: .public) \
+                exceptionType=\(type, privacy: .public) \
+                exceptionCode=\(code, privacy: .public) \
+                build=\(crash.metaData.applicationBuildVersion, privacy: .public) \
+                os=\(crash.metaData.osVersion, privacy: .public)
+                """
+            )
+        }
+        for hang in payload.hangDiagnostics ?? [] {
+            let seconds = hang.hangDuration.converted(to: .seconds).value
+            Self.log.error(
+                """
+                Previous launch HUNG for \(seconds, privacy: .public)s \
+                (build \(hang.metaData.applicationBuildVersion, privacy: .public))
+                """
+            )
+        }
+        for cpu in payload.cpuExceptionDiagnostics ?? [] {
+            let seconds = cpu.totalCPUTime.converted(to: .seconds).value
+            Self.log.error(
+                """
+                Previous launch hit a CPU exception: \(seconds, privacy: .public)s CPU \
+                (build \(cpu.metaData.applicationBuildVersion, privacy: .public))
+                """
+            )
+        }
+        for disk in payload.diskWriteExceptionDiagnostics ?? [] {
+            let bytes = disk.totalWritesCaused.converted(to: .bytes).value
+            Self.log.error(
+                """
+                Previous launch hit a disk-write exception: \(bytes, privacy: .public) bytes \
+                (build \(disk.metaData.applicationBuildVersion, privacy: .public))
+                """
+            )
+        }
+    }
+
     private func write(_ payload: MXMetricPayload) {
         guard let dir = DiagnosticLogExport.metricKitDirectory() else {
             Self.log.warning("Could not create MetricKit export directory")
@@ -65,6 +161,7 @@ final class MetricKitCollector: NSObject, MXMetricManagerSubscriber {
         let url = dir.appendingPathComponent("metrickit-\(stamp).json")
         do {
             try data.write(to: url, options: .atomic)
+            DiagnosticLogExport.pruneMetricKitFiles()
         } catch {
             Self.log.warning("Could not write MetricKit payload: \(error.localizedDescription, privacy: .public)")
         }
