@@ -169,7 +169,7 @@ def main() -> None:
         else:
             draw.rounded_rectangle((0, 0, side - 1, side - 1), radius=side // 4, fill=255)
         preview.paste(shown, (index * (side + 48), 0), mask)
-    preview.save(REPO / "icon-preview.png", optimize=True)
+    preview.save(REPO / "tools" / "icon-preview.png", optimize=True)
     print(f"logo ink {ink}px -> scale {scale:.3f}; wrote layers to {OUT}")
 
 
