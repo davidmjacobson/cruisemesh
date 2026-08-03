@@ -49,8 +49,19 @@ import com.cruisemesh.app.R
 private sealed interface BackupUiState {
     object Idle : BackupUiState
     object Working : BackupUiState
-    data class Error(val message: String) : BackupUiState
+    data class Error(val text: BackupFailureText) : BackupUiState
     object Done : BackupUiState
+}
+
+/**
+ * Resolve a failure to the sentence to display. Never read `message` off the
+ * exception here: the core's typed exceptions carry an empty message, which is
+ * non-null, so a `?:` fallback silently renders nothing at all.
+ */
+@Composable
+private fun BackupFailureText.resolve(): String = when (this) {
+    is BackupFailureText.Resource -> stringResource(resId)
+    is BackupFailureText.Literal -> text
 }
 
 /**
@@ -87,7 +98,7 @@ fun BackupExportScreen(onBack: () -> Unit) {
                 withContext(Dispatchers.IO) { BackupService.writeBytes(context, uri, bytes) }
                 BackupUiState.Done
             } catch (e: Exception) {
-                BackupUiState.Error(e.message ?: "Backup failed")
+                BackupUiState.Error(backupFailureText(e, R.string.ui_couldn_t_save_the_backup))
             }
         }
     }
@@ -183,9 +194,9 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
         scope.launch {
             try {
                 pickedBytes = withContext(Dispatchers.IO) { BackupService.readBytes(context, uri) }
-                pickedName = uri.lastPathSegment?.substringAfterLast('/')
+                pickedName = withContext(Dispatchers.IO) { BackupService.displayName(context, uri) }
             } catch (e: Exception) {
-                state = BackupUiState.Error(e.message ?: "Could not read that file")
+                state = BackupUiState.Error(backupFailureText(e, R.string.ui_couldn_t_read_that_file))
             }
         }
     }
@@ -265,7 +276,9 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                             state = BackupUiState.Done
                             restart()
                         } catch (e: Exception) {
-                            state = BackupUiState.Error(e.message ?: "Restore failed")
+                            state = BackupUiState.Error(
+                                backupFailureText(e, R.string.ui_couldn_t_restore_that_backup),
+                            )
                         }
                     }
                 },
@@ -349,7 +362,7 @@ private fun StatusArea(state: BackupUiState, workingLabel: String, doneLabel: St
             modifier = Modifier.padding(top = 24.dp),
         )
         is BackupUiState.Error -> Text(
-            state.message,
+            state.text.resolve(),
             color = MaterialTheme.colorScheme.error,
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.padding(top = 24.dp),
