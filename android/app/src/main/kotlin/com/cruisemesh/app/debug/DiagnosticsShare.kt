@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.core.content.FileProvider
+import com.cruisemesh.app.AppStore
 import java.io.File
 
 /**
@@ -46,16 +47,28 @@ object DiagnosticsShare {
         }
     }
 
-    /** Whether anything at all has been captured, for gating the delete button. */
-    fun hasAnythingCaptured(context: Context): Boolean = capturedFiles(context).isNotEmpty()
+    /**
+     * Whether anything at all has been captured, for gating the delete button.
+     *
+     * Deliberately does NOT go through [capturedFiles]: that materialises the
+     * CSV on disk, and this runs during Compose composition, where it would
+     * mean a SQLite export plus a file write on the main thread every time the
+     * screen is opened -- and would recreate the very file the delete button
+     * had just removed. [AppStore.hasDeliveryMetrics] stops at the first row
+     * and touches nothing.
+     */
+    fun hasAnythingCaptured(context: Context): Boolean {
+        if (DebugFileLog.hasCapturedLogs(context)) return true
+        return runCatching { AppStore.get(context).hasDeliveryMetrics() }.getOrNull() ?: false
+    }
 
     /**
      * The captured files, in the order a reader wants them: the log first,
      * since it is the narrative, then the metrics CSV.
      *
      * Writing the CSV is a side effect of asking -- it is regenerated from the
-     * core on each call rather than kept on disk -- so this is deliberately
-     * only called from the share and gating paths, not from composition.
+     * core on each call rather than kept on disk -- so this is only ever called
+     * from the share path, never from composition. See [hasAnythingCaptured].
      */
     private fun capturedFiles(context: Context): List<File> {
         val files = mutableListOf<File>()

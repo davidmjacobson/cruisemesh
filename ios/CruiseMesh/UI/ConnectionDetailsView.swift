@@ -96,9 +96,7 @@ struct ConnectionDetailsView: View {
                         Label("Share diagnostics", systemImage: "ladybug")
                     }
                     Button(role: .destructive) {
-                        DiagnosticLogExport.deleteArchive()
-                        try? AppStore.get().clearDeliveryMetrics()
-                        hasDiagnosticArchive = false
+                        deleteEverythingCaptured()
                         supportMessage = String(localized: "Captured diagnostics deleted.")
                     } label: {
                         Label("Delete captured diagnostics", systemImage: "trash")
@@ -206,13 +204,30 @@ struct ConnectionDetailsView: View {
         }
     }
 
-    /// Whether the delete button has anything to act on. Counts the delivery
-    /// metrics too: they are captured unconditionally, so a tester who never
-    /// turned diagnostic logging on can still have rows worth erasing, and a
-    /// delete button greyed out over them would be wrong.
+    /// Whether the delete button has anything to act on.
+    ///
+    /// Has to count everything `shareEverything` sends, or the two buttons
+    /// disagree: a tester whose app crashed but who never turned diagnostic
+    /// logging on would find delete greyed out while crash payloads sat on
+    /// disk, share them, then be told they were deleted when they were not.
+    /// Delivery metrics are captured unconditionally, and MetricKit collection
+    /// is not gated by the logging switch either.
     private func hasAnythingCaptured() -> Bool {
         if DiagnosticLogExport.hasArchive() { return true }
+        if !DiagnosticLogExport.metricKitFileURLs().isEmpty { return true }
         return FieldMetricsExport.hasCapturedMetrics()
+    }
+
+    /// Erases everything `shareEverything` would send. Anything left behind
+    /// here becomes a lie the next share tells.
+    private func deleteEverythingCaptured() {
+        DiagnosticLogExport.deleteArchive()
+        for url in DiagnosticLogExport.metricKitFileURLs() {
+            try? FileManager.default.removeItem(at: url)
+        }
+        try? AppStore.get().clearDeliveryMetrics()
+        FieldMetricsExport.deleteExportedCSV()
+        hasDiagnosticArchive = false
     }
 
     private func personStatus(_ contact: Contact) -> String {

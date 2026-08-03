@@ -2294,6 +2294,19 @@ public protocol MessageStoreProtocol : AnyObject {
     func groupsMatchingHint(hint: Data, nowMs: Int64) throws  -> [Group]
     
     /**
+     * Whether any field-metrics rows exist.
+     *
+     * The cheap question the UI actually wants when deciding whether the
+     * delete button has anything to act on. Asking
+     * [`Self::export_delivery_metrics_csv`] instead means serialising every
+     * row -- thousands of them after a week aboard -- and, on Android, the
+     * caller then had to write that CSV to disk just to count its lines,
+     * during Compose composition. `EXISTS` stops at the first row and touches
+     * no files.
+     */
+    func hasDeliveryMetrics() throws  -> Bool
+    
+    /**
      * The highest lamport value N such that every message `1..=N` from this
      * sender in this chat is present -- the point up to which there's no
      * gap (DESIGN.md §7.3: "message 12 arrived, 11 hasn't -- keep
@@ -4088,6 +4101,24 @@ open func groupsMatchingHint(hint: Data, nowMs: Int64)throws  -> [Group] {
     uniffi_cruisemesh_core_fn_method_messagestore_groups_matching_hint(self.uniffiClonePointer(),
         FfiConverterData.lower(hint),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Whether any field-metrics rows exist.
+     *
+     * The cheap question the UI actually wants when deciding whether the
+     * delete button has anything to act on. Asking
+     * [`Self::export_delivery_metrics_csv`] instead means serialising every
+     * row -- thousands of them after a week aboard -- and, on Android, the
+     * caller then had to write that CSV to disk just to count its lines,
+     * during Compose composition. `EXISTS` stops at the first row and touches
+     * no files.
+     */
+open func hasDeliveryMetrics()throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_has_delivery_metrics(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -17609,6 +17640,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_groups_matching_hint() != 61300) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_has_delivery_metrics() != 11580) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 43009) {

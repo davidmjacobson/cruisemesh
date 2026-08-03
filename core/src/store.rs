@@ -1588,6 +1588,24 @@ impl MessageStore {
         Ok(())
     }
 
+    /// Whether any field-metrics rows exist.
+    ///
+    /// The cheap question the UI actually wants when deciding whether the
+    /// delete button has anything to act on. Asking
+    /// [`Self::export_delivery_metrics_csv`] instead means serialising every
+    /// row -- thousands of them after a week aboard -- and, on Android, the
+    /// caller then had to write that CSV to disk just to count its lines,
+    /// during Compose composition. `EXISTS` stops at the first row and touches
+    /// no files.
+    pub fn has_delivery_metrics(&self) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM delivery_metrics)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|n| n != 0)
+        .map_err(store_err)
+    }
+
     /// First-arrival diagnostics for one message, or `None` for locally
     /// authored/legacy rows that predate diagnostics.
     pub fn message_arrival(
@@ -9513,6 +9531,18 @@ mod tests {
         let csv = store.export_delivery_metrics_csv().unwrap();
         assert_eq!(csv.lines().count(), 1, "only the header should remain");
         assert!(csv.starts_with("direction,chat,lamport,"));
+    }
+
+    #[test]
+    fn has_metrics_answers_without_exporting() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(!store.has_delivery_metrics().unwrap());
+        store
+            .record_sent_metric(b"chat".to_vec(), 1, 1_000)
+            .unwrap();
+        assert!(store.has_delivery_metrics().unwrap());
+        store.clear_delivery_metrics().unwrap();
+        assert!(!store.has_delivery_metrics().unwrap());
     }
 
     #[test]

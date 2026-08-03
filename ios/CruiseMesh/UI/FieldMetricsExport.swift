@@ -23,11 +23,26 @@ enum FieldMetricsExport {
         return url
     }
 
-    /// Whether any metrics rows exist, without writing a file. Drives whether
-    /// "Delete captured diagnostics" has anything to act on.
+    /// Whether any metrics rows exist. Drives whether "Delete captured
+    /// diagnostics" has anything to act on.
+    ///
+    /// Asks the core rather than exporting: `EXISTS` stops at the first row,
+    /// where the CSV export serialises every one of them -- thousands after a
+    /// week aboard -- just to be counted and thrown away.
     static func hasCapturedMetrics() -> Bool {
-        guard let csv = try? AppStore.get().exportDeliveryMetricsCsv() else { return false }
-        return csv.split(separator: "\n", omittingEmptySubsequences: true).count > 1
+        (try? AppStore.get().hasDeliveryMetrics()) ?? false
+    }
+
+    /// Removes the exported CSV written by `writeCSVFile`.
+    ///
+    /// Clearing the rows is not enough: the last export is a full copy of them
+    /// sitting in the temporary directory, and "delete captured diagnostics"
+    /// that left it there would be untrue until the OS happened to reclaim
+    /// tmp. Mirrors Android's `deleteCsvFile`.
+    static func deleteExportedCSV() {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cruisemesh-field-metrics.csv")
+        try? FileManager.default.removeItem(at: url)
     }
 }
 
