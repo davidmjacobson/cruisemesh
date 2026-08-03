@@ -1,6 +1,7 @@
 package com.cruisemesh.app.identity
 
 import android.content.Context
+import com.cruisemesh.app.persist
 
 private const val PREFS_NAME = "cruisemesh_onboarding"
 private const val PREF_COMPLETED = "completed"
@@ -18,10 +19,14 @@ object OnboardingStore {
         return context.applicationContext.filesDir.resolve("cruisemesh.sqlite").exists()
     }
 
-    fun markCompleted(context: Context) {
+    /**
+     * @param durable when the caller is about to exit the process (restore),
+     *   write synchronously so the flag cannot be lost in flight.
+     */
+    fun markCompleted(context: Context, durable: Boolean = false) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(PREF_COMPLETED, true)
-            .apply()
+            .persist(durable)
     }
 }

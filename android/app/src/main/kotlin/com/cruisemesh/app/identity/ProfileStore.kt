@@ -1,6 +1,7 @@
 package com.cruisemesh.app.identity
 
 import android.content.Context
+import com.cruisemesh.app.persist
 
 private const val PREFS_NAME = "cruisemesh_profile"
 private const val PREF_DISPLAY_NAME = "display_name"
@@ -25,14 +26,18 @@ object ProfileStore {
             ?.trim()
             .orEmpty()
 
-    fun saveDisplayName(context: Context, displayName: String) {
+    /**
+     * @param durable when the caller is about to exit the process (restore),
+     *   write synchronously so the name cannot be lost in flight.
+     */
+    fun saveDisplayName(context: Context, displayName: String, durable: Boolean = false) {
         val normalized = displayName.trim()
         val edit = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
         if (normalized.isEmpty()) {
-            edit.remove(PREF_DISPLAY_NAME).apply()
+            edit.remove(PREF_DISPLAY_NAME).persist(durable)
             return
         }
-        edit.putString(PREF_DISPLAY_NAME, normalized).apply()
+        edit.putString(PREF_DISPLAY_NAME, normalized).persist(durable)
     }
 
     fun loadOwnAvatarEpoch(context: Context): Long {
@@ -49,12 +54,15 @@ object ProfileStore {
         return epoch
     }
 
-    /** Reinstalls the profile-photo revision carried by an authenticated backup. */
+    /**
+     * Reinstalls the profile-photo revision carried by an authenticated backup.
+     * Always durable: the only caller is restore, which exits the process.
+     */
     fun restoreOwnAvatarEpoch(context: Context, epoch: Long) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putLong(PREF_OWN_AVATAR_EPOCH, epoch.coerceAtLeast(0L))
-            .apply()
+            .persist(durable = true)
     }
 
     /**
