@@ -116,6 +116,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // launch" guidance needs a hook that always runs. See
         // MetricKitCollector's doc.
         MetricKitCollector.shared.start()
+        // Same reasoning: Background App Refresh has to be sampled on the main
+        // actor, and a headless relaunch is exactly the case where knowing it
+        // is denied matters most.
+        EnvironmentSnapshot.start()
         let isBluetoothRelaunch = launchOptions?[.bluetoothCentrals] != nil
             || launchOptions?[.bluetoothPeripherals] != nil
         // Onboarding gates mesh startup deliberately (permissions are

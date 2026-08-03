@@ -159,8 +159,10 @@ object DebugFileLog {
                 "CruiseMesh $version " +
                 "${Build.MANUFACTURER} ${Build.MODEL} Android ${Build.VERSION.RELEASE} =====\n",
         )
-        // Why the last process died -- see ProcessExitHistory for why logcat
-        // alone cannot answer that.
+        // The device conditions that silently stop the mesh working, and why
+        // the last process died -- neither is inferable from the log lines
+        // themselves. See EnvironmentSnapshot and ProcessExitHistory.
+        file.appendText(EnvironmentSnapshot.format(EnvironmentSnapshot.capture(context)))
         file.appendText(ProcessExitHistory.format(ProcessExitHistory.recentExits(context)))
 
         // -v threadtime keeps timestamps + tid; --pid restricts to us even on

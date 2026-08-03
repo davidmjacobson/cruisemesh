@@ -2534,6 +2534,9 @@ final class MeshController: ObservableObject {
         }
         pathMonitor = NWPathMonitor()
         pathMonitor?.pathUpdateHandler = { [weak self] path in
+            // Keep the diagnostics banner's view of the network current
+            // without standing up a second NWPathMonitor just to print it.
+            EnvironmentSnapshot.record(path: path)
             if path.status == .satisfied {
                 Task { @MainActor in self?.runRelaySync() }
             }

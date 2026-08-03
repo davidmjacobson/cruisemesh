@@ -138,6 +138,7 @@ enum DiagnosticLogExport {
         let stamp = ISO8601DateFormatter().string(from: Date())
         return "\n===== launch \(stamp) — CruiseMesh \(version) (\(build)) — "
             + "\(hardwareIdentifier()) — \(ProcessInfo.processInfo.operatingSystemVersionString) =====\n"
+            + EnvironmentSnapshot.line() + "\n"
     }
 
     /// `uname` machine string, e.g. `iPhone14,2`. `UIDevice.current.model`
