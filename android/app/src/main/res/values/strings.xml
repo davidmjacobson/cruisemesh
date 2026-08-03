@@ -338,6 +338,47 @@
     <string name="ui_cruisemesh_chooses_the_best_available_path_automatically_a">CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Cruise Pass.</string>
     <string name="ui_no_friends_added_yet">No friends added yet.</string>
     <string name="ui_connection_activity_will_appear_here_as_cruisemesh_reaches">Connection activity will appear here as CruiseMesh reaches your friends.</string>
+    <!-- Connection paths, written to sit mid-sentence in the activity lines
+         below ("… via local Wi-Fi"). -->
+    <string name="ui_path_bluetooth">Bluetooth</string>
+    <string name="ui_path_local_wifi">local Wi-Fi</string>
+    <string name="ui_path_cruise_pass">Cruise Pass</string>
+    <string name="ui_connected_now_via_local_wifi">Connected now via local Wi-Fi</string>
+    <string name="ui_connected_now_via_bluetooth">Connected now via Bluetooth</string>
+    <string name="ui_no_connection_history_yet">No connection history yet</string>
+    <!-- Per-friend status under their name. %1$s is a connection path,
+         %2$s a date and time. The two message lines are opposite directions
+         and must stay that way round: "received your message" is a message
+         this phone SENT arriving at theirs (their phone confirmed it), while
+         "sent you a message" is their message arriving here. -->
+    <string name="ui_peer_status_received_your_message">Received your message via %1$s · %2$s</string>
+    <string name="ui_peer_status_sent_you_a_message">Sent you a message via %1$s · %2$s</string>
+    <string name="ui_peer_status_seen_online">Seen online through %1$s · %2$s</string>
+    <string name="ui_peer_status_last_connected">Last connected via %1$s · %2$s</string>
+    <string name="ui_peer_status_last_disconnected">Last disconnected from %1$s · %2$s</string>
+    <!-- Recent activity entries. %1$s is a friend\'s name, %2$s a connection
+         path, %3$s a date and time. Same direction rule as above. -->
+    <string name="ui_peer_activity_received_your_message">%1$s received your message via %2$s · %3$s</string>
+    <string name="ui_peer_activity_sent_you_a_message">%1$s sent you a message via %2$s · %3$s</string>
+    <string name="ui_peer_activity_was_reachable">%1$s was reachable via %2$s · %3$s</string>
+    <string name="ui_peer_activity_connected">%1$s connected via %2$s · %3$s</string>
+    <string name="ui_peer_activity_disconnected">%1$s disconnected via %2$s · %3$s</string>
+    <!-- Same lines, for when another device carried the message the last hop
+         and no path to this friend was ever observed. Naming a path here would
+         say the friend was in range when they may be nowhere near. %1$s is a
+         date and time for the status lines; for the activity lines %1$s is a
+         friend\'s name and %2$s the date and time. -->
+    <string name="ui_peer_status_received_your_message_no_path">Received your message · %1$s</string>
+    <string name="ui_peer_status_sent_you_a_message_no_path">Sent you a message · %1$s</string>
+    <string name="ui_peer_status_seen_online_no_path">Seen online · %1$s</string>
+    <string name="ui_peer_status_last_connected_no_path">Last connected · %1$s</string>
+    <string name="ui_peer_status_last_disconnected_no_path">Last disconnected · %1$s</string>
+    <string name="ui_peer_activity_received_your_message_no_path">%1$s received your message · %2$s</string>
+    <string name="ui_peer_activity_sent_you_a_message_no_path">%1$s sent you a message · %2$s</string>
+    <string name="ui_peer_activity_was_reachable_no_path">%1$s was reachable · %2$s</string>
+    <string name="ui_peer_activity_connected_no_path">%1$s connected · %2$s</string>
+    <string name="ui_peer_activity_disconnected_no_path">%1$s disconnected · %2$s</string>
+    <string name="ui_unnamed_friend">Friend</string>
     <string name="ui_share_diagnostics">Share diagnostics</string>
     <string name="ui_show_recent_activity">Show %1$d recent entries</string>
     <string name="ui_show_less">Show less</string>

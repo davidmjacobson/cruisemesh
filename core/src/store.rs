@@ -166,16 +166,52 @@ pub enum PeerConnectionTransport {
     Bluetooth,
     LocalWifi,
     CruisePass,
+    /// Another device carried this the last hop, so no path to the friend was
+    /// observed at all.
+    ///
+    /// Not a fourth way of reaching someone — the absence of one. A muled
+    /// message says a phone in the middle had Bluetooth to us; it says nothing
+    /// about whether the *sender* was ever nearby, and for group chat muling is
+    /// the ordinary case rather than the exception. Folding these into
+    /// Bluetooth or local Wi-Fi is how connection history ends up telling
+    /// someone their friend was in Bluetooth range of them when that friend was
+    /// on the other side of the ship.
+    ///
+    /// Surfaces have to render this as no claim, not as a path name. See
+    /// [`core_peer_transport_is_observed`].
+    Carried,
+}
+
+/// Did we actually observe the path this evidence arrived on?
+///
+/// False only for [`PeerConnectionTransport::Carried`]. A surface that names a
+/// path must ask this first and drop the "via ..." clause when the answer is
+/// no; saying less is the only honest option, because the hop we saw belongs to
+/// whichever phone relayed it and not to the friend the line is about.
+#[uniffi::export]
+pub fn core_peer_transport_is_observed(transport: PeerConnectionTransport) -> bool {
+    !matches!(transport, PeerConnectionTransport::Carried)
 }
 
 /// A metadata-only connection event. No addresses, network names, tokens, or
 /// message content are retained.
+///
+/// The two message kinds are opposite directions and must not be confused --
+/// getting them the wrong way round is a user-visible lie, since the
+/// Connection details screen names them:
+/// - [`PeerConnectionEventKind::MessageDelivered`]: a message *we sent* reached
+///   *them*. Recorded when their delivery receipt comes back, so the peer named
+///   on the event is the one who received our message.
+/// - [`PeerConnectionEventKind::MessageReceived`]: a message *they sent* reached
+///   *us*. Recorded where a genuinely visible inbound chat message is stored,
+///   never for receipts, profile sync, relay updates or any other hidden kind.
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerConnectionEventKind {
     Connected,
     Disconnected,
     PresenceSeen,
     MessageDelivered,
+    MessageReceived,
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
@@ -186,6 +222,10 @@ pub struct PeerConnectionEvent {
     pub occurred_at_ms: i64,
 }
 
+/// The newest moment each kind of evidence was recorded for one peer on one
+/// path. `last_delivered_at_ms` is OUR message reaching THEM (their receipt
+/// came back); `last_received_at_ms` is THEIR visible chat message reaching
+/// US. Both are `None` until the corresponding event has actually happened.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct PeerConnectionSummary {
     pub user_id: Vec<u8>,
@@ -194,6 +234,29 @@ pub struct PeerConnectionSummary {
     pub last_disconnected_at_ms: Option<i64>,
     pub last_seen_at_ms: Option<i64>,
     pub last_delivered_at_ms: Option<i64>,
+    pub last_received_at_ms: Option<i64>,
+}
+
+/// Maps the [`MessageArrival::transport`] encoding (0/1 BLE direct/muled,
+/// 2 relay, 3/4 LAN direct/muled) onto the coarse, privacy-preserving path
+/// shown in connection history. Lives in core so both shells label an arrival
+/// identically -- the mapping used to be copy-pasted per platform.
+///
+/// The muled encodings (1, 4) map to [`PeerConnectionTransport::Carried`]
+/// rather than to the radio the last hop happened to use. That hop was between
+/// us and the phone in the middle; the friend whose line this becomes may never
+/// have been in range of us at all. The message-info sheet already draws this
+/// distinction ("another device over BLE"), and connection history contradicting
+/// it is exactly the kind of confident wrong answer this screen exists to stop
+/// giving.
+#[uniffi::export]
+pub fn core_peer_transport_for_arrival(transport: u8) -> PeerConnectionTransport {
+    match transport {
+        0 => PeerConnectionTransport::Bluetooth,
+        3 => PeerConnectionTransport::LocalWifi,
+        1 | 4 => PeerConnectionTransport::Carried,
+        _ => PeerConnectionTransport::CruisePass,
+    }
 }
 
 /// Stable envelope identity for a stored message and, for replies, the
@@ -520,6 +583,15 @@ impl MessageStore {
             "added_nearby",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // Inbound-arrival rollup. Stores written before this column existed
+        // simply have no inbound evidence to show, which is the honest
+        // reading: nothing recorded it back then.
+        ensure_column(
+            &conn,
+            "peer_connection_summary",
+            "last_received_at_ms",
+            "INTEGER",
+        )?;
         ensure_column(&conn, "messages", "arrival_transport", "INTEGER")?;
         ensure_column(&conn, "receipts", "via_transport", "INTEGER")?;
         ensure_column(&conn, "messages", "hops_taken", "INTEGER")?;
@@ -622,13 +694,15 @@ impl MessageStore {
         tx.execute(
             "INSERT INTO peer_connection_summary
                 (user_id, transport, last_connected_at_ms,
-                 last_disconnected_at_ms, last_seen_at_ms, last_delivered_at_ms)
+                 last_disconnected_at_ms, last_seen_at_ms, last_delivered_at_ms,
+                 last_received_at_ms)
              VALUES (
                 ?1, ?2,
                 CASE WHEN ?3 = 0 THEN ?4 END,
                 CASE WHEN ?3 = 1 THEN ?4 END,
                 CASE WHEN ?3 = 2 THEN ?4 END,
-                CASE WHEN ?3 = 3 THEN ?4 END
+                CASE WHEN ?3 = 3 THEN ?4 END,
+                CASE WHEN ?3 = 4 THEN ?4 END
              )
              ON CONFLICT(user_id, transport) DO UPDATE SET
                 last_connected_at_ms = COALESCE(
@@ -642,7 +716,10 @@ impl MessageStore {
                     last_seen_at_ms, excluded.last_seen_at_ms),
                 last_delivered_at_ms = COALESCE(
                     MAX(last_delivered_at_ms, excluded.last_delivered_at_ms),
-                    last_delivered_at_ms, excluded.last_delivered_at_ms)",
+                    last_delivered_at_ms, excluded.last_delivered_at_ms),
+                last_received_at_ms = COALESCE(
+                    MAX(last_received_at_ms, excluded.last_received_at_ms),
+                    last_received_at_ms, excluded.last_received_at_ms)",
             params![&user_id, transport_value, kind_value, occurred_at_ms],
         )
         .map_err(store_err)?;
@@ -708,10 +785,16 @@ impl MessageStore {
         let mut stmt = conn
             .prepare(
                 "SELECT user_id, transport, last_connected_at_ms,
-                        last_disconnected_at_ms, last_seen_at_ms, last_delivered_at_ms
+                        last_disconnected_at_ms, last_seen_at_ms, last_delivered_at_ms,
+                        last_received_at_ms
                  FROM peer_connection_summary
-                 ORDER BY COALESCE(last_delivered_at_ms, last_seen_at_ms,
-                                   last_connected_at_ms, last_disconnected_at_ms) DESC",
+                 ORDER BY MAX(
+                     COALESCE(last_received_at_ms, 0),
+                     COALESCE(last_delivered_at_ms, 0),
+                     COALESCE(last_seen_at_ms, 0),
+                     COALESCE(last_connected_at_ms, 0),
+                     COALESCE(last_disconnected_at_ms, 0)
+                 ) DESC",
             )
             .map_err(store_err)?;
         let rows = stmt
@@ -723,6 +806,7 @@ impl MessageStore {
                     last_disconnected_at_ms: row.get(3)?,
                     last_seen_at_ms: row.get(4)?,
                     last_delivered_at_ms: row.get(5)?,
+                    last_received_at_ms: row.get(6)?,
                 })
             })
             .map_err(store_err)?;
@@ -4182,11 +4266,13 @@ fn row_to_contact(row: &rusqlite::Row) -> rusqlite::Result<Contact> {
     })
 }
 
+// Stored on disk, so these numbers are frozen: only ever append.
 fn peer_transport_value(transport: PeerConnectionTransport) -> i64 {
     match transport {
         PeerConnectionTransport::Bluetooth => 0,
         PeerConnectionTransport::LocalWifi => 1,
         PeerConnectionTransport::CruisePass => 2,
+        PeerConnectionTransport::Carried => 3,
     }
 }
 
@@ -4195,16 +4281,20 @@ fn peer_transport_from_value(value: i64) -> rusqlite::Result<PeerConnectionTrans
         0 => Ok(PeerConnectionTransport::Bluetooth),
         1 => Ok(PeerConnectionTransport::LocalWifi),
         2 => Ok(PeerConnectionTransport::CruisePass),
+        3 => Ok(PeerConnectionTransport::Carried),
         _ => Err(rusqlite::Error::IntegralValueOutOfRange(1, value)),
     }
 }
 
+// Stored on disk, so these numbers are frozen: only ever append.
+// `record_peer_connection_event`'s summary upsert switches on the same values.
 fn peer_event_kind_value(kind: PeerConnectionEventKind) -> i64 {
     match kind {
         PeerConnectionEventKind::Connected => 0,
         PeerConnectionEventKind::Disconnected => 1,
         PeerConnectionEventKind::PresenceSeen => 2,
         PeerConnectionEventKind::MessageDelivered => 3,
+        PeerConnectionEventKind::MessageReceived => 4,
     }
 }
 
@@ -4214,6 +4304,7 @@ fn peer_event_kind_from_value(value: i64) -> rusqlite::Result<PeerConnectionEven
         1 => Ok(PeerConnectionEventKind::Disconnected),
         2 => Ok(PeerConnectionEventKind::PresenceSeen),
         3 => Ok(PeerConnectionEventKind::MessageDelivered),
+        4 => Ok(PeerConnectionEventKind::MessageReceived),
         _ => Err(rusqlite::Error::IntegralValueOutOfRange(2, value)),
     }
 }
@@ -4629,6 +4720,8 @@ CREATE INDEX IF NOT EXISTS idx_peer_connection_events_recent
 CREATE INDEX IF NOT EXISTS idx_peer_connection_events_user_recent
     ON peer_connection_events(user_id, occurred_at_ms DESC, id DESC);
 
+-- `last_delivered_at_ms` is OUR message reaching THEM (their receipt came
+-- back); `last_received_at_ms` is THEIR visible chat message reaching US.
 CREATE TABLE IF NOT EXISTS peer_connection_summary (
     user_id                 BLOB NOT NULL,
     transport               INTEGER NOT NULL,
@@ -4636,6 +4729,7 @@ CREATE TABLE IF NOT EXISTS peer_connection_summary (
     last_disconnected_at_ms INTEGER,
     last_seen_at_ms         INTEGER,
     last_delivered_at_ms    INTEGER,
+    last_received_at_ms     INTEGER,
     PRIMARY KEY(user_id, transport)
 );
 
@@ -4827,6 +4921,241 @@ mod tests {
         store.clear_peer_connection_history().unwrap();
         assert!(store.peer_connection_events(None, 50).unwrap().is_empty());
         assert!(store.peer_connection_summaries().unwrap().is_empty());
+    }
+
+    /// The two message directions roll up into separate columns. Conflating
+    /// them is what made the Connection details screen claim a friend had
+    /// messaged us when in truth our own message had merely got through.
+    #[test]
+    fn connection_summary_keeps_the_two_message_directions_apart() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let alice = test_user_id(b"alice");
+        store
+            .record_peer_connection_event(
+                alice.clone(),
+                PeerConnectionTransport::Bluetooth,
+                PeerConnectionEventKind::MessageDelivered,
+                1_700_000_000_000,
+            )
+            .unwrap();
+        store
+            .record_peer_connection_event(
+                alice.clone(),
+                PeerConnectionTransport::Bluetooth,
+                PeerConnectionEventKind::MessageReceived,
+                1_700_000_060_000,
+            )
+            .unwrap();
+
+        let events = store
+            .peer_connection_events(Some(alice.clone()), 50)
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        // Both survive the 30s coalescing window: different kinds never merge.
+        assert_eq!(events[0].kind, PeerConnectionEventKind::MessageReceived);
+        assert_eq!(events[1].kind, PeerConnectionEventKind::MessageDelivered);
+
+        let summaries = store.peer_connection_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].last_delivered_at_ms, Some(1_700_000_000_000));
+        assert_eq!(summaries[0].last_received_at_ms, Some(1_700_000_060_000));
+        assert_eq!(summaries[0].last_seen_at_ms, None);
+        assert_eq!(summaries[0].last_connected_at_ms, None);
+    }
+
+    /// Summaries are ordered by the newest evidence of ANY kind. The old
+    /// COALESCE-based ordering picked the first non-null column instead, so a
+    /// row with stale delivery evidence outranked a row seen seconds ago.
+    #[test]
+    fn connection_summaries_order_by_newest_evidence_of_any_kind() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let stale = test_user_id(b"stale");
+        let fresh = test_user_id(b"fresh");
+        store
+            .record_peer_connection_event(
+                stale.clone(),
+                PeerConnectionTransport::Bluetooth,
+                PeerConnectionEventKind::MessageDelivered,
+                1_700_000_000_000,
+            )
+            .unwrap();
+        store
+            .record_peer_connection_event(
+                fresh.clone(),
+                PeerConnectionTransport::Bluetooth,
+                PeerConnectionEventKind::MessageReceived,
+                1_700_000_500_000,
+            )
+            .unwrap();
+
+        let summaries = store.peer_connection_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].user_id, fresh);
+        assert_eq!(summaries[1].user_id, stale);
+    }
+
+    /// A store created before `last_received_at_ms` existed must gain the
+    /// column on reopen rather than failing every summary read.
+    #[test]
+    fn open_migrates_an_old_peer_connection_summary_to_add_last_received() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("cruisemesh-peer-summary-{unique}.sqlite"));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE peer_connection_summary (
+                user_id                 BLOB NOT NULL,
+                transport               INTEGER NOT NULL,
+                last_connected_at_ms    INTEGER,
+                last_disconnected_at_ms INTEGER,
+                last_seen_at_ms         INTEGER,
+                last_delivered_at_ms    INTEGER,
+                PRIMARY KEY(user_id, transport)
+            );
+            INSERT INTO peer_connection_summary
+                (user_id, transport, last_delivered_at_ms)
+                VALUES (X'0102', 0, 1700000000000);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        let summaries = store.peer_connection_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].last_delivered_at_ms, Some(1_700_000_000_000));
+        assert_eq!(summaries[0].last_received_at_ms, None);
+
+        store
+            .record_peer_connection_event(
+                vec![1, 2],
+                PeerConnectionTransport::Bluetooth,
+                PeerConnectionEventKind::MessageReceived,
+                1_700_000_090_000,
+            )
+            .unwrap();
+        let summaries = store.peer_connection_summaries().unwrap();
+        assert_eq!(summaries[0].last_received_at_ms, Some(1_700_000_090_000));
+        assert_eq!(summaries[0].last_delivered_at_ms, Some(1_700_000_000_000));
+
+        drop(store);
+        let _ = fs::remove_file(&path_str);
+    }
+
+    #[test]
+    fn arrival_transport_maps_onto_the_coarse_connection_path() {
+        assert_eq!(
+            core_peer_transport_for_arrival(0),
+            PeerConnectionTransport::Bluetooth
+        );
+        assert_eq!(
+            core_peer_transport_for_arrival(2),
+            PeerConnectionTransport::CruisePass
+        );
+        assert_eq!(
+            core_peer_transport_for_arrival(3),
+            PeerConnectionTransport::LocalWifi
+        );
+    }
+
+    #[test]
+    fn a_muled_arrival_claims_no_path() {
+        // The hop we saw was between us and the phone in the middle. Reporting
+        // it as Bluetooth would tell someone their friend was in range when
+        // that friend may be nowhere near -- and for group chat, muling is the
+        // ordinary case, not the exception.
+        assert_eq!(
+            core_peer_transport_for_arrival(1),
+            PeerConnectionTransport::Carried,
+            "BLE through another device is not Bluetooth to this friend"
+        );
+        assert_eq!(
+            core_peer_transport_for_arrival(4),
+            PeerConnectionTransport::Carried,
+            "LAN through another device is not local Wi-Fi to this friend"
+        );
+        assert!(!core_peer_transport_is_observed(
+            PeerConnectionTransport::Carried
+        ));
+        for observed in [
+            PeerConnectionTransport::Bluetooth,
+            PeerConnectionTransport::LocalWifi,
+            PeerConnectionTransport::CruisePass,
+        ] {
+            assert!(core_peer_transport_is_observed(observed));
+        }
+    }
+
+    #[test]
+    fn a_carried_path_survives_a_round_trip_through_the_database() {
+        // The on-disk numbering is append-only; Carried is 3. A row written as
+        // Carried must not read back as one of the real paths.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .record_peer_connection_event(
+                vec![7; 16],
+                PeerConnectionTransport::Carried,
+                PeerConnectionEventKind::MessageReceived,
+                1_700_000_000_000,
+            )
+            .unwrap();
+        let summaries = store.peer_connection_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].transport, PeerConnectionTransport::Carried);
+        assert_eq!(summaries[0].last_received_at_ms, Some(1_700_000_000_000));
+
+        // And it is a distinct row from a genuinely observed Bluetooth hop with
+        // the same peer, so one cannot overwrite the other's evidence.
+        store
+            .record_peer_connection_event(
+                vec![7; 16],
+                PeerConnectionTransport::Bluetooth,
+                PeerConnectionEventKind::MessageReceived,
+                1_700_000_050_000,
+            )
+            .unwrap();
+        let summaries = store.peer_connection_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+    }
+
+    #[test]
+    fn only_kinds_a_person_sees_in_a_conversation_can_report_an_arrival() {
+        // The safety-relevant half of the arrival event: a receipt, a profile
+        // sync or a relay update landing must never become "sent you a
+        // message". This pins the gate's contract at the kind level -- the
+        // shells consult exactly this function before recording.
+        // Two judgment calls worth naming rather than discovering later. A
+        // group invite counts: it is a line the person sees appear in the
+        // conversation, even though nobody typed it. A reaction does not: it
+        // renders as a chip on an existing bubble, so reporting it as a message
+        // arriving would overstate what happened.
+        for visible in [
+            crate::KIND_TEXT,
+            crate::KIND_ATTACHMENT_MANIFEST,
+            crate::KIND_GROUP_INVITE,
+        ] {
+            assert!(
+                crate::core_is_visible_chat_kind(visible),
+                "kind {visible} is shown in a conversation and should report an arrival"
+            );
+        }
+        for quiet in [
+            crate::KIND_RECEIPT,
+            crate::KIND_PROFILE_SYNC,
+            crate::KIND_RELAY_UPDATE,
+            crate::KIND_FRIEND_DIRECTORY,
+            crate::KIND_LAN_ENDPOINT_HINT,
+            crate::KIND_REACTION,
+        ] {
+            assert!(
+                !crate::core_is_visible_chat_kind(quiet),
+                "kind {quiet} must never say a friend sent a message"
+            );
+        }
     }
 
     #[test]
