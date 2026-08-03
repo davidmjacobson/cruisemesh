@@ -38,6 +38,7 @@ import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OpenedMessage
 import uniffi.cruisemesh_core.OutboundEnvelope
+import uniffi.cruisemesh_core.PendingSharedRequest
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.applyGroupMetadataUpdate
 import uniffi.cruisemesh_core.coreContactDisplayName
@@ -59,8 +60,10 @@ import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.openGroupMessage
 import uniffi.cruisemesh_core.openMessage
 import uniffi.cruisemesh_core.parseFriendCard
+import uniffi.cruisemesh_core.parseFriendRequestContent
 import uniffi.cruisemesh_core.recentHintsFor
 import uniffi.cruisemesh_core.verifyIntroductionTicket
+import uniffi.cruisemesh_core.verifySharedFriendCard
 
 // Deliberately MeshService's tag, not this class's name: this code moved here
 // verbatim in the FA15 extraction, and field tooling (logcat filters, the
@@ -1168,14 +1171,21 @@ internal class InboundEnvelopeProcessor(
         val pendingSuggestion = store.listFriendSuggestions(System.currentTimeMillis()).firstOrNull {
             it.state == 1.toUByte() && it.candidate.userId.contentEquals(senderUserId)
         }
-        val card = try {
-            parseFriendCard(body.content.toString(Charsets.UTF_8))
+        val content = try {
+            parseFriendRequestContent(body.content.toString(Charsets.UTF_8))
         } catch (e: CoreException) {
             Log.w(TAG, "Dropping friend request from $address: failed to parse FriendCard (${e.message})")
             return
         }
+        val card = content.card
         if (!friendCardUserId(card).contentEquals(senderUserId)) {
             Log.w(TAG, "Dropping friend request from $address: payload identity doesn't match verified sender")
+            return
+        }
+        // A tail means this request came from a card somebody shared, and the
+        // whole point of the marker is that it does NOT auto-import.
+        content.shared?.let { shared ->
+            holdSharedFriendRequest(address, senderUserId, body, identity, card, shared)
             return
         }
 
@@ -1202,6 +1212,9 @@ internal class InboundEnvelopeProcessor(
             ),
         )
         if (pendingSuggestion != null) store.removeFriendSuggestion(senderUserId)
+        // Their mutual request is the only answer a shared-card import ever
+        // gets, so it is what ends this side's "waiting" state.
+        store.deleteOutgoingSharedRequest(senderUserId)
         ProfileSyncSender.queueToContact(
             context,
             store,
@@ -1229,6 +1242,116 @@ internal class InboundEnvelopeProcessor(
             announcer.announceFriendAdded(contact)
         }
         Log.i(TAG, "Imported contact ${contact.name} from friend request on $address")
+    }
+
+    /**
+     * A `kind=3` carrying a shared-card tail (specs/share-contact.md decision
+     * 5): nothing may touch `contacts` until this user says yes, so the request
+     * parks in `pending_shared_requests` and the only user-visible effect is a
+     * rate-limited notification.
+     *
+     * Every check below drops the request without a prompt, deliberately: a
+     * failure here is either somebody else's expired artifact or an attempt to
+     * get in, and neither is worth a question the user cannot evaluate. The
+     * envelope is still acked and stored in the hidden stream so the requester
+     * stops re-spraying it -- silence about the *decision* is not silence about
+     * receipt, and the alternative is an endless resend loop for a request
+     * whose answer is "no".
+     */
+    private fun holdSharedFriendRequest(
+        address: String,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+        card: uniffi.cruisemesh_core.FriendCard,
+        shared: uniffi.cruisemesh_core.SharedFriendCard,
+    ) {
+        // The requester themselves is already gated upstream (blocked senders
+        // never reach any kind handler); the sharer is the one nobody has
+        // checked yet.
+        val sharer = store.getContact(shared.sharerUserId)
+        if (sharer == null) {
+            Log.i(TAG, "Dropping shared friend request from $address: sharer is not a contact")
+            return
+        }
+        if (store.isUserBlocked(shared.sharerUserId)) {
+            Log.i(TAG, "Dropping shared friend request from $address: sharer is blocked")
+            return
+        }
+        if (!friendCardUserId(shared.card).contentEquals(identity.userId)) {
+            Log.w(TAG, "Dropping shared friend request from $address: the shared card is not ours")
+            return
+        }
+        if (!FriendsOfFriendsStore.isEnabled(context)) {
+            Log.i(TAG, "Dropping shared friend request from $address: introductions are off")
+            return
+        }
+        val now = System.currentTimeMillis()
+        val valid = try {
+            verifySharedFriendCard(
+                shared,
+                sharer.signPk,
+                identity.userId,
+                FriendsOfFriendsStore.revision(context),
+                now,
+            )
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping shared friend request from $address: ${e.message}")
+            return
+        }
+        if (!valid) {
+            Log.w(TAG, "Dropping shared friend request from $address: shared card failed validation")
+            return
+        }
+        if (store.getSharedRequestDismissal(senderUserId)?.suppressed == true) {
+            Log.i(TAG, "Dropping shared friend request from $address: requester was suppressed")
+            return
+        }
+
+        store.upsertPendingSharedRequest(
+            PendingSharedRequest(
+                requesterUserId = senderUserId,
+                name = card.name,
+                signPk = card.signPk,
+                agreePk = card.agreePk,
+                relayUrl = card.relayUrl,
+                relayToken = card.relayToken,
+                sharerUserId = shared.sharerUserId,
+                expiresAtMs = shared.expiresAtMs,
+                firstSeenMs = now,
+                lastPromptedMs = 0L,
+            ),
+        )
+        store.insertMessage(
+            StoredMessage(
+                chatId = senderUserId,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_FRIEND_REQUEST,
+                payload = body.content,
+            ),
+        )
+        // Not a contact, so the receipt is sealed to the card in the request
+        // itself. Nothing about this transient is persisted.
+        acknowledgeHiddenMessage(
+            address,
+            senderUserId,
+            identity,
+            Contact(
+                userId = senderUserId,
+                name = card.name,
+                signPk = card.signPk,
+                agreePk = card.agreePk,
+                relayUrl = card.relayUrl,
+                relayToken = card.relayToken,
+            ),
+        )
+        ChatEvents.notifyChatChanged(senderUserId)
+        if (store.noteSharedRequestPrompt(senderUserId, now)) {
+            announcer.announceSharedRequest(senderUserId, card.name)
+        }
+        Log.i(TAG, "Holding shared friend request from $address for confirmation")
     }
 
     private fun handleIncomingProfileSync(

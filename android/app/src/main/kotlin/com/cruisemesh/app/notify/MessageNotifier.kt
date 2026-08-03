@@ -252,6 +252,48 @@ object MessageNotifier {
         manager.notify(notificationTag, MESSAGE_NOTIFICATION_ID, notification)
     }
 
+    /**
+     * A shared-card request is waiting for a decision (specs/share-contact.md).
+     *
+     * Deliberately not [postChatNotification]: there is no chat and no contact
+     * yet, so reply / mark-as-read would act on a stream that does not exist,
+     * and the tap must land in the app rather than deep-link a chat route that
+     * would find no contact. Rate limiting is the caller's
+     * (`note_shared_request_prompt` — at most one prompt per requester per day).
+     */
+    fun notifySharedRequest(context: Context, requesterUserId: ByteArray, requesterName: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.i(TAG, "POST_NOTIFICATIONS not granted; skipping shared-request notification")
+            return
+        }
+        val manager = context.getSystemService(NotificationManager::class.java)
+        ensureChannel(manager)
+
+        val tag = UserIdHex.encode(requesterUserId)
+        val tapIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val contentIntent = PendingIntent.getActivity(
+            context,
+            requestCodes.requestCodeFor(tag, "shared_request"),
+            tapIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(context, MESSAGE_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification_message)
+            .setContentTitle(requesterName)
+            .setContentText(context.getString(R.string.ui_x_wants_to_connect, requesterName))
+            .setCategory(NotificationCompat.CATEGORY_SOCIAL)
+            .setContentIntent(contentIntent)
+            .setAutoCancel(true)
+            .setGroup("cruisemesh_conversations")
+            .build()
+        manager.notify(tag, MESSAGE_NOTIFICATION_ID, notification)
+    }
+
     /** Idempotent: `createNotificationChannel` is a no-op for an existing id. */
     private fun ensureChannel(manager: NotificationManager) {
         val channel = NotificationChannel(

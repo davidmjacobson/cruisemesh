@@ -67,6 +67,12 @@ import com.cruisemesh.app.friending.ProfileSyncSender
 import com.cruisemesh.app.friending.FriendDirectorySender
 import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.friending.ScanScreen
+import com.cruisemesh.app.friending.PendingSharedRequestRow
+import com.cruisemesh.app.friending.ShareContactAvailability
+import com.cruisemesh.app.friending.ShareContactPolicy
+import com.cruisemesh.app.friending.ShareContactScreen
+import com.cruisemesh.app.friending.SharedCardImport
+import com.cruisemesh.app.friending.WaitingToConnectScreen
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.OnboardingStore
 import com.cruisemesh.app.identity.TermsAcceptanceStore
@@ -125,6 +131,9 @@ import uniffi.cruisemesh_core.contactDelivery
 import uniffi.cruisemesh_core.composerReach
 import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.friendCardUserId
+import uniffi.cruisemesh_core.FriendImport
+import uniffi.cruisemesh_core.OutgoingSharedRequest
+import uniffi.cruisemesh_core.parseFriendImport
 import uniffi.cruisemesh_core.parseFriendText
 import uniffi.cruisemesh_core.parseRelaySetupText
 import uniffi.cruisemesh_core.relaySetupIsOfficial
@@ -315,6 +324,14 @@ fun CruiseMeshApp(
         ) { entry -> AddFriendRoute(identity, navController, entry.arguments?.getString("token")) }
         composable("scan") { ScanRoute(identity, navController) }
         composable("contacts") { ContactsRoute(identity, navController) }
+        composable("waitingToConnect") { WaitingToConnectRoute(identity, navController) }
+        composable("shareContact/{userIdHex}") { entry ->
+            ShareContactRoute(
+                identity,
+                entry.arguments?.getString("userIdHex").orEmpty(),
+                navController,
+            )
+        }
         composable("newGroup") { NewGroupRoute(identity, navController) }
         composable("chat/{userIdHex}") { backStackEntry ->
             val userIdHex = backStackEntry.arguments?.getString("userIdHex").orEmpty()
@@ -1018,24 +1035,22 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
             ownUserId = identity.userId,
             store = store,
             onContactAdded = { scanned ->
-                val contact = RelayImport.reconcileOnImport(context, store, scanned)
                 // Pointing a camera at their screen is co-presence by
                 // construction -- no need to consult the peer set, which may
                 // not have HELLO'd them yet.
-                store.upsertContactProvenance(
-                    ContactProvenance(contact.userId, 0u, null, System.currentTimeMillis(), addedNearby = true),
-                )
-                store.removeFriendSuggestion(contact.userId)
-                val delivery = FriendRequestSender.queueForScannedContact(context, store, identity, contact)
-                ProfileSyncSender.queueToContact(
+                SharedCardImport.confirm(
                     context,
                     store,
                     identity,
-                    contact,
-                    ProfileStore.loadOwnAvatarEpoch(context),
+                    FriendPreview(scanned),
+                    addedNearby = true,
                 )
-                FriendDirectorySender.queueToAllContacts(context, store, identity)
-                FriendAddedOutcome(contact, delivery, RelayConfigStore.load(context) != null)
+            },
+            onSharedCard = { shared ->
+                SharedCardImport.previewShared(context, store, identity.userId, shared)
+            },
+            onConfirmShared = { preview ->
+                SharedCardImport.confirm(context, store, identity, preview, addedNearby = true)
             },
             onSayHi = { openFriendChat(navController, it) },
             onDone = { returnToContacts(navController) },
@@ -1062,27 +1077,48 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
     val context = LocalContext.current
     val store = remember { AppStore.get(context) }
 
+    // Re-read on every return to this screen: answering a request elsewhere
+    // must not leave a stale "(1)" pointing at an empty list.
+    var waitingCount by remember { mutableStateOf(0) }
+    DisposableEffect(navController) {
+        fun refresh() {
+            waitingCount = store.listPendingSharedRequests(System.currentTimeMillis()).size
+        }
+        refresh()
+        val listener = NavController.OnDestinationChangedListener { _, dest, _ ->
+            if (dest.route?.startsWith("addFriend") == true) refresh()
+        }
+        navController.addOnDestinationChangedListener(listener)
+        onDispose { navController.removeOnDestinationChangedListener(listener) }
+    }
+
     AddFriendScreen(
         onScanClick = { navController.navigate("scan") },
         onShowMyCardClick = { navController.navigate("myQr") },
         onImportText = { text ->
             try {
-                val card = parseFriendText(text)
-                val userId = friendCardUserId(card)
-                if (userId.contentEquals(identity.userId)) {
-                    ImportFriendResult.Error("That's your own card")
-                } else {
-                    val candidate = Contact(
-                            userId = userId,
-                            name = card.name,
-                            signPk = card.signPk,
-                            agreePk = card.agreePk,
-                            relayUrl = card.relayUrl,
-                            relayToken = card.relayToken,
-                    )
-                    ImportFriendResult.Preview(
-                        FriendPreview(candidate, friendCardMatch(candidate, store.listContacts())),
-                    )
+                when (val import = parseFriendImport(text)) {
+                    is FriendImport.Shared ->
+                        SharedCardImport.previewShared(context, store, identity.userId, import.shared)
+                    is FriendImport.Direct -> {
+                        val card = import.card
+                        val userId = friendCardUserId(card)
+                        if (userId.contentEquals(identity.userId)) {
+                            ImportFriendResult.Error("That's your own card")
+                        } else {
+                            val candidate = Contact(
+                                    userId = userId,
+                                    name = card.name,
+                                    signPk = card.signPk,
+                                    agreePk = card.agreePk,
+                                    relayUrl = card.relayUrl,
+                                    relayToken = card.relayToken,
+                            )
+                            ImportFriendResult.Preview(
+                                FriendPreview(candidate, friendCardMatch(candidate, store.listContacts())),
+                            )
+                        }
+                    }
                 }
             } catch (_: Exception) {
                 if (text.contains("CMFRIEND")) {
@@ -1092,33 +1128,21 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
                 }
             }
         },
-        onConfirmContact = { candidate ->
-            val contact = RelayImport.reconcileOnImport(context, store, candidate)
+        onConfirmContact = { preview ->
             // A pasted card says nothing about where its owner is: it may have
             // been handed over in person or forwarded from an aeroplane. Only
             // a live link to them counts as having met.
-            store.upsertContactProvenance(
-                ContactProvenance(
-                    contact.userId,
-                    0u,
-                    null,
-                    System.currentTimeMillis(),
-                    addedNearby = MeshConnectivityStatus.nearbyPeerIds.value
-                        .contains(UserIdHex.encode(contact.userId)),
-                ),
-            )
-            store.removeFriendSuggestion(contact.userId)
-            val delivery = FriendRequestSender.queueForScannedContact(context, store, identity, contact)
-            ProfileSyncSender.queueToContact(
+            SharedCardImport.confirm(
                 context,
                 store,
                 identity,
-                contact,
-                ProfileStore.loadOwnAvatarEpoch(context),
+                preview,
+                addedNearby = MeshConnectivityStatus.nearbyPeerIds.value
+                    .contains(UserIdHex.encode(preview.contact.userId)),
             )
-            FriendDirectorySender.queueToAllContacts(context, store, identity)
-            FriendAddedOutcome(contact, delivery, RelayConfigStore.load(context) != null)
         },
+        waitingToConnectCount = waitingCount,
+        onWaitingToConnect = { navController.navigate("waitingToConnect") },
         onRequestSuggestion = { suggestion ->
             FriendDirectorySender.requestSuggestedFriend(context, store, identity, suggestion)
         },
@@ -1130,6 +1154,110 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
         initialText = initialToken.orEmpty(),
         onSayHi = { openFriendChat(navController, it) },
         onDone = { returnToContacts(navController) },
+        onBack = { navController.popBackStack() },
+    )
+}
+
+/**
+ * The pending shared-card requests and their decisions
+ * (specs/share-contact.md). Nothing here is written to `contacts` until
+ * **Connect**.
+ */
+@Composable
+private fun WaitingToConnectRoute(identity: Identity, navController: NavHostController) {
+    val context = LocalContext.current
+    val store = remember { AppStore.get(context) }
+    var rows by remember { mutableStateOf(emptyList<PendingSharedRequestRow>()) }
+
+    fun reload() {
+        rows = store.listPendingSharedRequests(System.currentTimeMillis()).map { request ->
+            PendingSharedRequestRow(
+                request = request,
+                sharerName = store.getContact(request.sharerUserId)?.let(::coreContactDisplayName)
+                    ?: formatUserId(request.sharerUserId),
+                offerSuppression = ShareContactPolicy.offerSuppression(
+                    store.getSharedRequestDismissal(request.requesterUserId),
+                ),
+            )
+        }
+    }
+
+    LaunchedEffect(Unit) { reload() }
+
+    WaitingToConnectScreen(
+        rows = rows,
+        onConnect = { request ->
+            val contact = RelayImport.reconcileOnImport(
+                context,
+                store,
+                Contact(
+                    userId = request.requesterUserId,
+                    name = request.name,
+                    signPk = request.signPk,
+                    agreePk = request.agreePk,
+                    relayUrl = request.relayUrl,
+                    relayToken = request.relayToken,
+                ),
+            )
+            store.upsertContactProvenance(
+                ContactProvenance(
+                    userId = contact.userId,
+                    source = 2u,
+                    introducerUserId = request.sharerUserId,
+                    introducedAtMs = System.currentTimeMillis(),
+                    addedNearby = MeshConnectivityStatus.nearbyPeerIds.value
+                        .contains(UserIdHex.encode(contact.userId)),
+                ),
+            )
+            store.removeFriendSuggestion(contact.userId)
+            FriendRequestSender.queueForScannedContact(context, store, identity, contact)
+            ProfileSyncSender.queueToContact(
+                context,
+                store,
+                identity,
+                contact,
+                ProfileStore.loadOwnAvatarEpoch(context),
+            )
+            FriendDirectorySender.queueToAllContacts(context, store, identity)
+            store.deletePendingSharedRequest(contact.userId)
+            reload()
+        },
+        onNotNow = { request ->
+            store.deletePendingSharedRequest(request.requesterUserId)
+            store.recordSharedRequestDismissal(request.requesterUserId)
+            reload()
+        },
+        onDontAskAgain = { request ->
+            // Quiet by construction: nothing is sent, nobody is told.
+            store.suppressSharedRequests(request.requesterUserId)
+            store.deletePendingSharedRequest(request.requesterUserId)
+            reload()
+        },
+        onBack = { navController.popBackStack() },
+    )
+}
+
+/** Hands one contact's card on as a signed, expiring QR code (specs/share-contact.md). */
+@Composable
+private fun ShareContactRoute(identity: Identity, userIdHex: String, navController: NavHostController) {
+    val context = LocalContext.current
+    val store = remember { AppStore.get(context) }
+    val contact = remember(userIdHex) { store.getContact(UserIdHex.decode(userIdHex)) }
+    val policy = remember(userIdHex) { contact?.let { store.getContactDiscoveryPolicy(it.userId) } }
+
+    // Their switch could have gone off between opening the chat and getting
+    // here; issuing a card then would be issuing one they had just refused.
+    if (contact == null ||
+        ShareContactPolicy.availability(policy, store.isUserBlocked(contact.userId)) !=
+        ShareContactAvailability.AVAILABLE
+    ) {
+        LaunchedEffect(userIdHex) { navController.popBackStack() }
+        return
+    }
+    ShareContactScreen(
+        identity = identity,
+        contact = contact,
+        sharedPolicyRevision = policy?.revision ?: 0uL,
         onBack = { navController.popBackStack() },
     )
 }
@@ -1156,12 +1284,16 @@ private fun ContactsRoute(identity: Identity, navController: NavHostController) 
     var avatars by remember {
         mutableStateOf(contacts.associate { formatUserId(it.userId) to store.contactAvatar(it.userId) }.filterValues { it != null }.mapValues { it.value!! })
     }
+    var outgoingShared by remember { mutableStateOf(emptyMap<String, OutgoingSharedRequest>()) }
     fun reloadContacts() {
         contacts = store.listContacts()
         avatars = contacts.associate { formatUserId(it.userId) to store.contactAvatar(it.userId) }
             .filterValues { it != null }
             .mapValues { it.value!! }
+        outgoingShared = store.listOutgoingSharedRequests()
+            .associateBy { formatUserId(it.candidateUserId) }
     }
+    LaunchedEffect(Unit) { reloadContacts() }
     
     // Refresh list when resuming screen
     DisposableEffect(navController) {
@@ -1177,6 +1309,7 @@ private fun ContactsRoute(identity: Identity, navController: NavHostController) 
     ContactsScreen(
         contacts = contacts,
         avatarBytesByUserId = avatars,
+        outgoingSharedByUserId = outgoingShared,
         onContactClick = { contact -> navController.navigate("chat/${UserIdHex.encode(contact.userId)}") },
         onContactDelete = { contact ->
             store.deleteContact(contact.userId)
@@ -1356,6 +1489,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             reachabilityDetailsText = reachabilityDetailsText,
             relayCardIsStale = staleRelayContacts.contains(UserIdHex.encode(contact.userId)),
             composerReach = composerReachVerdict,
+            onShareContact = { navController.navigate("shareContact/${UserIdHex.encode(it.userId)}") },
         )
     } else {
         LaunchedEffect(Unit) { navController.popBackStack() }

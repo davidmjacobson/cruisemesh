@@ -61,6 +61,14 @@ interface IncomingMessageAnnouncer {
 
     /** A mutual friend request completed and imported a new contact. */
     fun announceFriendAdded(contact: Contact)
+
+    /**
+     * Somebody a contact shared this user's card with is asking to connect
+     * (specs/share-contact.md). Nothing has been written to `contacts`: this
+     * only points at the pending decision. Defaulted to a no-op so a fake
+     * announcer written before this existed still compiles.
+     */
+    fun announceSharedRequest(requesterUserId: ByteArray, requesterName: String) = Unit
 }
 
 /**
@@ -80,4 +88,7 @@ class NotificationAnnouncer(private val context: Context) : IncomingMessageAnnou
 
     override fun announceFriendAdded(contact: Contact) =
         MessageNotifier.notifyFriendAdded(context, contact)
+
+    override fun announceSharedRequest(requesterUserId: ByteArray, requesterName: String) =
+        MessageNotifier.notifySharedRequest(context, requesterUserId, requesterName)
 }

@@ -138,8 +138,11 @@ fun SettingsScreen(
             SettingsGap()
             SettingsGroup("Privacy") {
                 SettingsSwitch(
-                    title = "Friends of friends",
-                    detail = "Let friends introduce you to people they know. Messages and phone contacts are never shared.",
+                    // One switch, one meaning: it governs manual "Share
+                    // contact" as well as automatic introductions
+                    // (specs/share-contact.md decision 4).
+                    title = stringResource(R.string.ui_friends_of_friends),
+                    detail = stringResource(R.string.ui_friends_of_friends_detail),
                     checked = friendsOfFriends,
                     onCheckedChange = {
                         friendsOfFriends = it
