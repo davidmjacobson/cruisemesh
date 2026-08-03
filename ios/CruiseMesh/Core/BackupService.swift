@@ -133,10 +133,11 @@ enum BackupServiceError: LocalizedError, Equatable {
     case fileTooLarge
 
     var errorDescription: String? {
+        // One source of copy: the same sentences the backup screens show.
         switch self {
-        case .noIdentity: return "No identity is available to back up."
-        case .newerBackup: return "This backup was created by a newer version of CruiseMesh. Update the app first."
-        case .fileTooLarge: return String(localized: "This backup file is too large.")
+        case .noIdentity: return BackupFailureReason.noAccountToBackUp.text
+        case .newerBackup: return BackupFailureReason.newerVersion.text
+        case .fileTooLarge: return BackupFailureReason.tooLarge.text
         }
     }
 }

@@ -53,7 +53,9 @@ struct BackupExportView: View {
             contentType: BackupDocument.readableContentTypes[0],
             defaultFilename: BackupService.suggestedFileName
         ) { result in
-            if case .failure(let failure) = result { error = failure.localizedDescription }
+            if case .failure(let failure) = result {
+                error = backupFailureText(failure, fallback: .couldNotSave).text
+            }
         }
     }
 
@@ -76,7 +78,7 @@ struct BackupExportView: View {
                 document = BackupDocument(data: data)
                 showExporter = true
             } catch {
-                self.error = error.localizedDescription
+                self.error = backupFailureText(error, fallback: .couldNotSave).text
             }
             exporting = false
         }
@@ -128,7 +130,7 @@ struct BackupRestoreView: View {
                     fileName = url.lastPathComponent
                     error = nil
                 } catch {
-                    self.error = error.localizedDescription
+                    self.error = backupFailureText(error, fallback: .couldNotReadFile).text
                 }
             }
             .alert("Restore ready", isPresented: $restartRequired) {
@@ -154,7 +156,7 @@ struct BackupRestoreView: View {
                 }.value
                 restartRequired = true
             } catch {
-                self.error = error.localizedDescription
+                self.error = backupFailureText(error, fallback: .couldNotRestore).text
             }
             restoring = false
         }
