@@ -42,13 +42,19 @@ feedback on the terms is welcome.
 See [README.md](README.md) for full build instructions. The short version:
 
 ```sh
+cargo fmt --all               # a hard CI gate — run it before every commit
 cargo test --workspace        # Rust core + relayd (run this before every PR)
 core/build-android.sh         # regenerate Kotlin bindings after core changes
 core/build-ios.sh             # regenerate Swift bindings (macOS + Xcode)
 ```
 
 If you change anything in `core/`, the generated bindings and JNI libs must
-be regenerated or CI will disagree with you.
+be regenerated or CI will disagree with you. [AGENTS.md](AGENTS.md) has the
+faster host-only bindgen path for when you only need JVM unit tests, and the
+Swift-binding regeneration that works without a Mac.
+
+User-facing copy belongs in `strings.xml` / `Localizable.xcstrings`, never as
+a literal in code — CI rejects hardcoded literals.
 
 ## What makes a good PR here
 
@@ -75,4 +81,10 @@ public issue** — see [SECURITY.md](SECURITY.md).
 Real-world reports (cruise ships, hikes, festivals — anywhere BLE and
 patience got tested) are uniquely valuable to this project. There's a
 dedicated issue template; delivery-mode mix, latency, battery, and device
-models are the gold.
+models are the gold. Whether a particular ship's Wi-Fi isolates clients from
+each other is something only someone aboard can find out.
+
+## Code of Conduct
+
+The [Code of Conduct](CODE_OF_CONDUCT.md) applies to issues, pull requests,
+and discussions.

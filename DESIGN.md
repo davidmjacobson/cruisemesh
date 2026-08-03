@@ -12,7 +12,7 @@ there the feature is **internet delivery**, the hosted option is **Cruise
 Pass**, and the credential is a **setup card** (`CMRELAY1:`). Same objects,
 two vocabularies, on purpose.
 
-Last updated: 2026-07-27
+Last updated: 2026-08-03
 
 ---
 
@@ -41,7 +41,9 @@ text each other "meet at the buffet at 6" and know whether the message got throu
 
 - General media attachments (photos, audio memos) — but the wire format and
   storage must leave room. Contact profile photos are a separate, tiny metadata
-  path. §6.2.1 and §8.
+  path. §6.2.1 and §8. *(Partly overtaken by events: small photos and voice
+  memos now travel inline inside the sealed envelope, §8. What stays out of
+  v1 is media too large to inline, which needs the manifest/chunk machinery.)*
 - Anonymity / censorship resistance (Briar's threat model). Our adversary is "no
   internet," not a nation-state. We still encrypt end-to-end because relays and
   strangers' phones carry our ciphertext.
@@ -331,9 +333,15 @@ Optional passworded channels later (Argon2id password → channel key, as bitcha
 version | sender UserID | chat id (peer or group) | lamport counter |
 timestamp | kind | payload
 kinds: text=1, receipt=2, friend-request=3, group-invite=4,
-       profile-sync=5, [reserved: attachment-manifest=16,
-       attachment-chunk=17]
+       profile-sync=5, friend-directory=6,
+       introduced-friend-request=7, lan-endpoint-hint=8,
+       relay-update=9, attachment-manifest=16,
+       reaction=18, group-metadata-update=19,
+       [reserved: attachment-chunk=17]
 ```
+
+The allocation lives in `core/src/protocol.rs` (`KIND_*`); that file is
+authoritative if this list ever drifts from it.
 
 The per-chat **lamport counter** orders messages when clocks drift and lets a
 recipient detect gaps ("message 12 arrived, 11 hasn't — keep waiting" shown as a
@@ -571,8 +579,8 @@ crypto/protocol logic that must behave identically on both platforms.
 | 1 | **Core + 1:1 direct** | Rust core, identity, QR friending, sealed text, ✓/✓✓/read over direct BLE | Two-phone family dogfood in the house | ✅ Done |
 | 2 | **DTN** | Carry queue, digests, dedupe, cumulative receipts, 3-phone mule delivery | Phone C carries A→B message between rooms; simulated 50-node churn test passes | ✅ Done |
 | 3 | **Relay** | `relayd` on a VPS, internet flush, mixed BLE+relay delivery with dedupe | Message delivered city-to-city; duplicates never render twice | ✅ Done |
-| 4 | **Groups + broadcast** | Group keys, rotation, per-member ticks; public channel | 4-person family group; broadcast between two unfriended installs | ✅ Groups shipped (membership enforcement pinned by tests; per-member read aggregation is the open D9 item). Broadcast deferred. |
-| 5 | **🚢 Field test** | Everything, on an actual cruise | Family uses it for a week; log delivery latency, battery, mode mix (direct/mule/relay); probe ship-LAN client isolation while aboard | ⏳ Upcoming — meanwhile the family runs CruiseMesh as its daily messenger at home, incl. organic multi-hop deliveries |
+| 4 | **Groups + broadcast** | Group keys, rotation, per-member ticks; public channel | 4-person family group; broadcast between two unfriended installs | 🔨 Groups shipped (membership enforcement pinned by tests; per-member read aggregation still open). Broadcast deferred. |
+| 5 | **🚢 Field test** | Everything, on an actual cruise | Family uses it for a week; log delivery latency, battery, mode mix (direct/mule/relay); probe ship-LAN client isolation while aboard | 🔨 One sailing answered the LAN-isolation question and made the same-LAN transport a field-validated design input (§5.4). The instrumented week — latency, battery, mode mix — is still ahead. Meanwhile the family runs CruiseMesh as its daily messenger at home, incl. organic multi-hop deliveries |
 | 6 | Media (per §8) | — | after the field test says the foundation holds | 🔨 Inline attachments shipped; chunked media designed |
 
 Milestone 0 was the go/no-go gate: it de-risked the only thing that couldn't be

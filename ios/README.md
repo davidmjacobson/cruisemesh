@@ -1,6 +1,6 @@
 # CruiseMesh iOS
 
-SwiftUI + CoreBluetooth shell covering the current 1:1 messaging feature set:
+SwiftUI + CoreBluetooth shell, at feature parity with the Android app:
 
 | Feature | iOS |
 |---|---|
@@ -11,9 +11,13 @@ SwiftUI + CoreBluetooth shell covering the current 1:1 messaging feature set:
 | Photos (library + camera) + voice memos | ✓ |
 | QR friending + mutual `kind=3` friend request | ✓ |
 | Friends-of-friends suggestions + introductions | ✓ |
+| Deliberate contact sharing (QR + approval) | ✓ |
 | BLE dual-role mesh (central + peripheral) | ✓ |
+| Same-LAN transport (Bonjour + subnet sweep, Noise XX) | ✓ |
 | Digest sync, receipts, carry queue | ✓ |
 | Internet relay poll/upload | ✓ |
+| Passphrase-encrypted local backup + restore (`.cmbak`) | ✓ |
+| Block and report a contact | ✓ |
 | Profile, mesh status pill, notifications | ✓ |
 | Contact details (fingerprint / delete) | ✓ |
 | Bluetooth-audio coexistence pause | ✓ (AVAudioSession route; see note) |
@@ -107,5 +111,7 @@ ios/
 - Wire `MessageBody.chatId` = **sender's** UserID
 - Kinds: text=1, receipt=2, friend-request=3, group-invite=4,
   profile-sync=5, friend-directory=6, introduced-friend-request=7,
-  attachment-manifest=16
+  lan-endpoint-hint=8, relay-update=9, attachment-manifest=16,
+  reaction=18, group-metadata-update=19. `core/src/protocol.rs`
+  (`KIND_*`) is authoritative; `Core/ProtocolKinds.swift` mirrors it.
 - BLE service/characteristic UUIDs match Android `MeshConstants`
