@@ -722,6 +722,12 @@ mod tests {
             urls("https://cruisemesh.app/f#CMFRIEND2:aB-_cD"),
             ["https://cruisemesh.app/f#CMFRIEND2:aB-_cD"]
         );
+        // The compact v3 card form is just another fragment: same treatment.
+        assert_eq!(
+            urls("https://cruisemesh.app/f#CMFRIEND3:aB-_cD"),
+            ["https://cruisemesh.app/f#CMFRIEND3:aB-_cD"]
+        );
+        assert_spans_match_text("Add me: https://cruisemesh.app/f#CMFRIEND3:aB-_cD thanks");
     }
 
     #[test]

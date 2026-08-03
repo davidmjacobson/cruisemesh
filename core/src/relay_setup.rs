@@ -13,7 +13,22 @@ const RELAY_SETUP_PREFIX: &str = "CMRELAY1:";
 const MAX_RELAY_SETUP_TEXT_BYTES: usize = 8 * 1024;
 const MAX_RELAY_URL_BYTES: usize = 2 * 1024;
 const MAX_RELAY_TOKEN_BYTES: usize = 1024;
-const OFFICIAL_RELAY_HOST: &str = "relay.cruisemesh.app";
+/// The hosted relay's host name, kept as a macro so both the host and the full
+/// URL below come from one literal. Anything needing the official relay must
+/// use one of the two consts rather than its own copy of the string: the
+/// friend-card v3 encoder compresses that URL to a single tag byte on exact
+/// string equality (`specs/friend-card-v3.md`), so a second copy that drifted
+/// would quietly cost every shared card ~31 bytes.
+macro_rules! official_relay_host {
+    () => {
+        "relay.cruisemesh.app"
+    };
+}
+
+const OFFICIAL_RELAY_HOST: &str = official_relay_host!();
+
+/// Canonical base URL of the hosted relay — the single source of truth.
+pub(crate) const OFFICIAL_RELAY_URL: &str = concat!("https://", official_relay_host!());
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct RelaySetup {
