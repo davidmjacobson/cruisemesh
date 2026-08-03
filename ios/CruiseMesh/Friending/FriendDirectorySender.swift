@@ -14,11 +14,34 @@ enum FriendDirectorySender {
         let revision = FriendsOfFriendsStore.nextDirectoryRevision()
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
         let enabled = FriendsOfFriendsStore.isEnabled()
+        let ownRelay = RelayConfigStore.load()
 
+        // Off-pass recipients stay in this loop deliberately, receiving an
+        // empty snapshot rather than being skipped. A newer empty revision is
+        // the protocol's own retraction (specs/friends-of-friends.md), so a
+        // phone already holding suggestions we should never have sent drops
+        // them on the next pass instead of keeping them until the tickets
+        // expire a month later. Mirrors FriendDirectorySender.kt.
+        // Cached: with no pass on either side, eligibility turns on whether we
+        // actually met, and the same contacts are re-checked once per
+        // recipient across the whole fan-out.
+        var nearbyCache: [Data: Bool] = [:]
+        let addedNearby: (Data) -> Bool = { userId in
+            if let known = nearbyCache[userId] { return known }
+            let nearby = ((try? store.getContactProvenance(userId: userId)) ?? nil)?.addedNearby ?? false
+            nearbyCache[userId] = nearby
+            return nearby
+        }
         for recipient in contacts {
             var entries: [FriendDirectoryEntry] = []
             if enabled {
-                for candidate in contacts where candidate.userId != recipient.userId {
+                let eligible = FriendDirectoryScope.candidatesFor(
+                    recipient: recipient,
+                    contacts: contacts,
+                    ownRelay: ownRelay,
+                    addedNearby: addedNearby
+                )
+                for candidate in eligible {
                     guard entries.count < 64,
                           let policy = (try? store.getContactDiscoveryPolicy(userId: candidate.userId)) ?? nil,
                           policy.protocolVersion >= 1,

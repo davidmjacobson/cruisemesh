@@ -41,11 +41,32 @@ object FriendDirectorySender {
             .filterNot { contact -> blocked.any { it.contentEquals(contact.userId) } }
         val revision = FriendsOfFriendsStore.nextDirectoryRevision(context)
         val enabled = FriendsOfFriendsStore.isEnabled(context)
+        val ownRelay = RelayConfigStore.load(context)
         val now = System.currentTimeMillis()
+        // Off-pass recipients stay in this loop deliberately, receiving an
+        // empty snapshot rather than being skipped. A newer empty revision is
+        // the protocol's own retraction (specs/friends-of-friends.md), so a
+        // phone already holding suggestions we should never have sent drops
+        // them on the next pass instead of keeping them until the tickets
+        // expire a month later.
+        // Cached: with no pass on either side, eligibility turns on whether we
+        // actually met, and the same contacts are re-checked once per
+        // recipient across the whole fan-out.
+        val nearbyCache = HashMap<String, Boolean>()
+        val addedNearby: (ByteArray) -> Boolean = { userId ->
+            nearbyCache.getOrPut(UserIdHex.encode(userId)) {
+                store.getContactProvenance(userId)?.addedNearby ?: false
+            }
+        }
         for (recipient in recipients) {
             val entries = if (enabled) {
-                recipients.asSequence()
-                    .filterNot { it.userId.contentEquals(recipient.userId) }
+                FriendDirectoryScope.candidatesFor(
+                    recipient = recipient,
+                    contacts = recipients,
+                    ownRelayUrl = ownRelay?.relayUrl,
+                    ownRelayToken = ownRelay?.relayToken,
+                    addedNearby = addedNearby,
+                ).asSequence()
                     .mapNotNull { candidate ->
                         val policy = store.getContactDiscoveryPolicy(candidate.userId)
                             ?: return@mapNotNull null

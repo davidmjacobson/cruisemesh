@@ -36,6 +36,12 @@ enum RelayUpdateSender {
         // change. Mirrors RelayUpdateSender.kt.
         _ = try? store.clearCarriedRelayUploadMarkers()
         queueToAllContacts(store: store, identity: identity, epoch: epoch)
+        // Which contacts may be introduced to each other is scoped by our own
+        // pass (FriendDirectoryScope), so the pass moving changes every
+        // snapshot we have ever sent. Re-fan here -- the one place that knows
+        // our mailbox changed -- or the old scoping stands until some
+        // unrelated contact edit happens to trigger a rebuild.
+        FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
         RelayConfigStore.markRelayEpochAnnounced(epoch)
     }
 

@@ -50,6 +50,48 @@ all** before their phone requests the suggested connections.
    The request uses the recipient's current relay or BLE muling. Ordinary
    friend-card/profile exchange reconciles relay details after the introduction
    completes.
+7. **Introductions stay inside one Cruise Pass.** A contact is offered as a
+   candidate, and sent a snapshot at all, only when they are on the sharer's
+   own pass. The contact graph does not stop at a household: one person who has
+   scanned somebody outside the family is enough for that outside circle to
+   start propagating into family suggestion lists. In a field test a shared
+   tester pass reached a child's phone exactly this way. The pass is the
+   boundary the product already draws around a family, so introductions use it.
+
+   An **absent** pass is where this gets decided rather than assumed, because
+   a relative who has not finished onboarding and a family met on holiday who
+   never bought a pass look identical from the card alone. The rule:
+
+   - **We have a pass.** Eligible only if the contact is on it. A contact with
+     no pass is *not yet* in the family rather than outside it, and becomes
+     eligible the moment they enter the pass we gave them — the pass-change
+     re-fan below replays that with no user action. Meeting them in person
+     buys no exception; that is exactly what the holiday case looks like.
+   - **Neither side has a pass.** No family boundary is drawn yet, so fall
+     back to the only one that exists: whether we actually met.
+     `ContactProvenance::added_nearby` is that stored fact, and a remote
+     re-add never unmakes it.
+   - **They have a pass and we do not.** Not eligible — they belong to a
+     family whose boundary we cannot see.
+
+   The cost is deliberate: a family that never buys a pass gets introductions
+   only among people they met face to face. The alternative was letting every
+   passless contact count as family, which is precisely the leak.
+
+   This is scoping, not access control: reading another family's mailbox is
+   prevented by the token class itself (CP4). `friend_introduction_eligible`
+   in the core is the single rule both shells use, over the pure comparison
+   `relay_contact_shares_own_family`.
+
+   Enforced on both sides. A sender never puts an off-pass candidate in a
+   snapshot; a receiver applies an off-pass introducer's snapshot as an *empty*
+   one, which retracts anything that introducer supplied before the rule
+   existed, so a phone heals on its own next pass rather than waiting for every
+   other phone in the graph to update.
+
+   Deliberately meeting somebody outside your pass is a separate, explicit act
+   (sharing a specific contact's card), not something suggestions should do on
+   your behalf.
 
 The default-on choice deserves clear disclosure. New installs should explain it
 in onboarding, and upgraded installs should show a one-time informational card
@@ -366,6 +408,9 @@ Queue a new directory revision, debounced into one update, when:
 - a contact is added, updated, deleted, blocked, or unblocked;
 - a contact's discovery policy changes;
 - the local friends-of-friends setting changes;
+- the local Cruise Pass changes, since it decides who is eligible at all
+  (decision 7) — driven from the same endpoint-change announcement that already
+  fans a new endpoint out to contacts;
 - an app upgrade first advertises v1 support; or
 - periodic repair detects that a current contact has never received a snapshot.
 

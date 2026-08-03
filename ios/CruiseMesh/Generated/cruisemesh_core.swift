@@ -14860,6 +14860,46 @@ public func friendCardUserId(card: FriendCard) -> Data {
 })
 }
 /**
+ * May this contact take part in friends-of-friends introductions with us —
+ * as a candidate we offer, or as a recipient we send a directory to?
+ *
+ * Introductions are scoped to one Cruise Pass (specs/friends-of-friends.md
+ * decision 7), because the contact graph does not stop at a household: one
+ * person who has scanned somebody outside the family is otherwise enough for
+ * that outside circle to propagate into family suggestion lists.
+ *
+ * The rule, and why an absent pass is not simply "ours":
+ *
+ * - **We have a pass.** Eligible only if the contact is on it. A contact with
+ * no pass is *not yet* in the family rather than outside it, and becomes
+ * eligible the moment they enter the pass we gave them — the pass-change
+ * re-fan handles that automatically. Counting them in meanwhile is what
+ * reopened the leak: a family met on holiday who never bought a pass looks
+ * identical to a relative who has not finished onboarding.
+ * - **Neither of us has a pass.** There is no family boundary drawn yet, so
+ * fall back to the only boundary that exists — whether we actually met.
+ * `contact_added_nearby` is the stored fact that this contact was added
+ * over a nearby transport (`ContactProvenance::added_nearby`), which a
+ * remote re-add never unmakes.
+ * - **They have a pass and we do not.** Not eligible: they belong to a family
+ * whose boundary we cannot see, and we are in no position to introduce
+ * across it.
+ *
+ * Still scoping, not access control. Reading another family's mailbox is
+ * prevented by the token class itself (see [`resolved_contact_poll_relay`]).
+ */
+public func friendIntroductionEligible(contactRelayUrl: String?, contactRelayToken: String?, ownRelayUrl: String?, ownRelayToken: String?, contactAddedNearby: Bool) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_friend_introduction_eligible(
+        FfiConverterOptionString.lower(contactRelayUrl),
+        FfiConverterOptionString.lower(contactRelayToken),
+        FfiConverterOptionString.lower(ownRelayUrl),
+        FfiConverterOptionString.lower(ownRelayToken),
+        FfiConverterBool.lower(contactAddedNearby),$0
+    )
+})
+}
+/**
  * Generate a fresh identity: Ed25519 signing keypair + X25519 agreement keypair.
  */
 public func generateIdentity() -> Identity {
@@ -15135,6 +15175,28 @@ public func relayClassifyHttpError(httpStatus: UInt16, relayCode: String?) -> Co
     uniffi_cruisemesh_core_fn_func_relay_classify_http_error(
         FfiConverterUInt16.lower(httpStatus),
         FfiConverterOptionString.lower(relayCode),$0
+    )
+})
+}
+/**
+ * Does this contact's card credential belong to the *same* Cruise Pass as
+ * ours? Both classes of card count: a post-CP4 card carries our family's
+ * deposit token (the attenuation of our member token), a pre-CP4 one carries
+ * the member token itself.
+ *
+ * A pure comparison, and `false` whenever either side has no pass — "not
+ * known to be the same family" rather than "known to be a different one".
+ * Deciding what an *absent* pass should mean is a policy question with a
+ * different answer per caller, so it lives in
+ * [`friend_introduction_eligible`] rather than here.
+ */
+public func relayContactSharesOwnFamily(contactRelayUrl: String?, contactRelayToken: String?, ownRelayUrl: String?, ownRelayToken: String?) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_contact_shares_own_family(
+        FfiConverterOptionString.lower(contactRelayUrl),
+        FfiConverterOptionString.lower(contactRelayToken),
+        FfiConverterOptionString.lower(ownRelayUrl),
+        FfiConverterOptionString.lower(ownRelayToken),$0
     )
 })
 }
@@ -16086,6 +16148,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_friend_card_user_id() != 30116) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_friend_introduction_eligible() != 47391) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_generate_identity() != 63024) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16150,6 +16215,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_classify_http_error() != 51460) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_contact_shares_own_family() != 30457) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_cursor_advance() != 64540) {
