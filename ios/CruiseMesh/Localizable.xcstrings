@@ -2311,6 +2311,76 @@
         }
       }
     },
+    "That backup couldn't be read. The file may be damaged.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "That backup couldn't be read. The file may be damaged."
+          }
+        }
+      }
+    },
+    "That backup couldn't be restored. Try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "That backup couldn't be restored. Try again."
+          }
+        }
+      }
+    },
+    "That backup file is incomplete. It may not have finished copying — try the original file again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "That backup file is incomplete. It may not have finished copying — try the original file again."
+          }
+        }
+      }
+    },
+    "That file couldn't be read. Pick it again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "That file couldn't be read. Pick it again."
+          }
+        }
+      }
+    },
+    "That file isn't a CruiseMesh backup. Pick the file you saved from CruiseMesh.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "That file isn't a CruiseMesh backup. Pick the file you saved from CruiseMesh."
+          }
+        }
+      }
+    },
+    "That passphrase didn't work, or the file is damaged. Check the passphrase and try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "That passphrase didn't work, or the file is damaged. Check the passphrase and try again."
+          }
+        }
+      }
+    },
+    "The backup couldn't be saved. Try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The backup couldn't be saved. Try again."
+          }
+        }
+      }
+    },
     "The mesh is still running, but wireless earbuds/speakers can slow nearby delivery. Watch for glitches.": {
       "localizations": {
         "en": {
@@ -2361,6 +2431,16 @@
         }
       }
     },
+    "There's no account on this phone to back up yet.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "There's no account on this phone to back up yet."
+          }
+        }
+      }
+    },
     "They won't be able to message you, and they won't appear as a suggested friend. They won't be told. Scanning their card again unblocks them.": {
       "localizations": {
         "en": {
@@ -2377,6 +2457,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "This Wi-Fi appears to block phone-to-phone traffic; nearby delivery will use Bluetooth."
+          }
+        }
+      }
+    },
+    "This backup file is too large.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This backup file is too large."
+          }
+        }
+      }
+    },
+    "This backup was made by a newer version of CruiseMesh. Update the app, then try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This backup was made by a newer version of CruiseMesh. Update the app, then try again."
           }
         }
       }
