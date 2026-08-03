@@ -21,7 +21,7 @@ carried as raw bytes. A typical hosted-relay card drops to ~175 characters
 (~35% shorter), and the QR code loses a density tier. Cards naming a
 self-hosted relay or a non-hex token still encode, just without the savings.
 
-This is the same playbook as v1→v2 (T12): a new emitted form, and
+This is the same playbook as v1→v2: a new emitted form, and
 `parse_friend_text` accepts every form ever emitted, forever.
 
 ## Wire layout
@@ -74,7 +74,7 @@ expansion is provably byte-identical:
 ## Decoder rules (liberal, hardened)
 
 * Every read bounds-checked; truncation, unknown tags, or trailing bytes are
-  errors, never panics — same standard as the v2 decoder (T4).
+  errors, never panics — the same standard the v2 decoder is held to.
 * `0x02` token with `len == 0` is an error (a token is never empty).
 * Non-minimal encodings are accepted: an official URL spelled out via `0x01`,
   or an all-hex token carried via `0x01`, decode fine. Only the encoder is

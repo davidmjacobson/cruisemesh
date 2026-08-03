@@ -71,10 +71,12 @@ and voice memos (inline, up to 180 KiB), QR friending with a spoken 4-word
 fingerprint, friends-of-friends introductions, all four delivery routes above,
 block and report, and passphrase-encrypted local backup and restore.
 
-What isn't here yet: the public broadcast channel, chunked transfer for media
-too large to inline, multi-device identity, and history sync for someone who
-joins a group late. [ROADMAP.md](ROADMAP.md) has the milestone view;
-DESIGN.md §13 explains the deferrals.
+What isn't here: chunked transfer for media too large to inline, multi-device
+identity, and history sync for someone who joins a group late. There is no
+public broadcast channel and there won't be one — a channel strangers can post
+to is a moderation surface this project isn't going to grow (DESIGN.md §6.6).
+[ROADMAP.md](ROADMAP.md) has the milestone view; DESIGN.md §13 explains the
+deferrals.
 
 **No independent security review has happened yet.** The design is deliberately
 boring — libsodium primitives used whole, no bespoke constructions, the whole

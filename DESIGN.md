@@ -35,7 +35,8 @@ text each other "meet at the buffet at 6" and know whether the message got throu
 - Internet-assisted delivery: when any phone gets internet (ship Wi-Fi package, port
   cellular), it flushes queued messages through a relay server.
 - A relay daemon that runs on a cheap Linux VPS; self-hostable per family.
-- Broadcast mode: unauthenticated local "shout" channel, Bridgefy/bitchat style.
+- ~~Broadcast mode: unauthenticated local "shout" channel, Bridgefy/bitchat
+  style.~~ Dropped as a goal; see §6.6.
 
 **Explicit non-goals (v1)**
 
@@ -47,7 +48,8 @@ text each other "meet at the buffet at 6" and know whether the message got throu
 - Anonymity / censorship resistance (Briar's threat model). Our adversary is "no
   internet," not a nation-state. We still encrypt end-to-end because relays and
   strangers' phones carry our ciphertext.
-- Ship-wide stranger-to-stranger social features (beyond broadcast mode).
+- Ship-wide stranger-to-stranger social features. (Broadcast mode was once the
+  one exception to this; it no longer is. See §6.6.)
 - Real-time anything: no typing indicators, no calls, no presence guarantees.
 
 ---
@@ -316,12 +318,26 @@ works when announcing is off.
   removed member able to read only pre-rotation traffic). Family-scale simplicity;
   no MLS.
 
-### 6.6 Broadcast mode
+### 6.6 Broadcast mode — designed, not planned for release
 
-A well-known "public" channel: envelopes signed but **encrypted with a fixed public
-key** (i.e., readable by any CruiseMesh app), `recipient_hint` = broadcast constant,
-flooded with normal TTL. UI labels it clearly as public-to-anyone-with-the-app.
-Optional passworded channels later (Argon2id password → channel key, as bitchat does).
+The original design: a well-known "public" channel, envelopes signed but
+**encrypted with a fixed public key** (i.e., readable by any CruiseMesh app),
+`recipient_hint` = broadcast constant, flooded with normal TTL, labeled in the
+UI as public-to-anyone-with-the-app.
+
+**This is no longer planned.** A channel any stranger can post to is a
+moderation surface that a family messenger with one maintainer should not
+grow, and it buys nothing for the use case the product is actually for. The
+one variant still under consideration is a broadcast **scoped to a single
+Cruise Pass** — everyone on one pass can post to a shared channel, nobody
+outside it can — which inherits the boundary the product already draws around
+a family and is not open to strangers at all. That variant isn't specified
+yet; if it happens it gets its own spec.
+
+The wire design above is kept here because the `recipient_hint` constant and
+the fixed-key construction would be reused by the pass-scoped version, and
+because "why isn't there a public channel" is a reasonable question to have an
+answer to.
 
 ---
 
@@ -579,7 +595,7 @@ crypto/protocol logic that must behave identically on both platforms.
 | 1 | **Core + 1:1 direct** | Rust core, identity, QR friending, sealed text, ✓/✓✓/read over direct BLE | Two-phone family dogfood in the house | ✅ Done |
 | 2 | **DTN** | Carry queue, digests, dedupe, cumulative receipts, 3-phone mule delivery | Phone C carries A→B message between rooms; simulated 50-node churn test passes | ✅ Done |
 | 3 | **Relay** | `relayd` on a VPS, internet flush, mixed BLE+relay delivery with dedupe | Message delivered city-to-city; duplicates never render twice | ✅ Done |
-| 4 | **Groups + broadcast** | Group keys, rotation, per-member ticks; public channel | 4-person family group; broadcast between two unfriended installs | 🔨 Groups shipped (membership enforcement pinned by tests; per-member read aggregation still open). Broadcast deferred. |
+| 4 | **Groups** (was: groups + broadcast) | Group keys, rotation, per-member ticks | 4-person family group | 🔨 Groups shipped; membership enforcement pinned by tests. Per-member read aggregation still open. Broadcast dropped from the milestone, §6.6. |
 | 5 | **🚢 Field test** | Everything, on an actual cruise | Family uses it for a week; log delivery latency, battery, mode mix (direct/mule/relay); probe ship-LAN client isolation while aboard | 🔨 One sailing answered the LAN-isolation question and made the same-LAN transport a field-validated design input (§5.4). The instrumented week — latency, battery, mode mix — is still ahead. Meanwhile the family runs CruiseMesh as its daily messenger at home, incl. organic multi-hop deliveries |
 | 6 | Media (per §8) | — | after the field test says the foundation holds | 🔨 Inline attachments shipped; chunked media designed |
 
@@ -623,7 +639,9 @@ designed around (iOS background BLE) before any real investment.
   remains open is two live devices sharing one identity.)
 - Message history sync for a group member who joins late.
 - Ratchet / post-quantum upgrade timing (envelope `version` byte reserves the path).
-- Passworded broadcast channels; relay federation.
+- Relay federation.
+- A broadcast channel scoped to one Cruise Pass (§6.6). The public,
+  anyone-with-the-app version is not deferred, it is dropped.
 
 ---
 
@@ -655,7 +673,8 @@ pattern — contacts live one tap away behind the compose FAB, with friend manag
 
 ### 14.2 Home: conversation list
 
-One row per chat (1:1 now; groups and broadcast slot in later, §14.6), sorted by
+One row per chat (1:1 and groups today; a broadcast row would slot in the same
+way if the pass-scoped variant is ever built, §14.6), sorted by
 last activity, newest first.
 
 - **Avatar bubble**: shared contact photo when present; otherwise a colored
@@ -704,8 +723,10 @@ legend on tap, and a bubble palette coherent with the avatar hue.
 - **Groups (M4)**: "New group" action alongside the friends list under the FAB;
   group rows use the same bubble with a group glyph; per-member receipt detail on
   tap in-chat (§7.2).
-- **Broadcast (M4)**: a clearly labeled "Ship broadcast" row pinned at the bottom of
-  home, visually distinct (public-to-anyone framing per §6.6), collapsed by default.
+- **Broadcast**: a clearly labeled row pinned at the bottom of home, visually
+  distinct, collapsed by default. Held in reserve for the pass-scoped variant
+  in §6.6; the public-to-anyone version it was originally drawn for is
+  dropped.
 
 Both slot into the §14.2 list without re-architecting the home screen.
 

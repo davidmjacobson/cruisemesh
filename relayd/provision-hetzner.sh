@@ -19,7 +19,10 @@
 set -euo pipefail
 
 ### ---- Settings (override via env before running if needed) ----
-RELAY_DOMAIN="${RELAY_DOMAIN:-relay.cruisemesh.app}"
+# RELAY_DOMAIN is required: the hostname whose DNS you pointed at this box in
+# step 1, e.g. RELAY_DOMAIN=relay.example.com. There is no default, because a
+# wrong one fails at the TLS challenge after everything else has been built.
+RELAY_DOMAIN="${RELAY_DOMAIN:-}"
 REPO_URL="${REPO_URL:-https://github.com/davidmjacobson/cruisemesh.git}"
 BRANCH="${BRANCH:-master}"
 APP_DIR="${APP_DIR:-/opt/cruisemesh}"
@@ -27,6 +30,11 @@ APP_DIR="${APP_DIR:-/opt/cruisemesh}"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Run as root (e.g. 'sudo -i' first)." >&2
+  exit 1
+fi
+
+if [ -z "$RELAY_DOMAIN" ]; then
+  echo "Set RELAY_DOMAIN first, e.g. export RELAY_DOMAIN=relay.example.com" >&2
   exit 1
 fi
 

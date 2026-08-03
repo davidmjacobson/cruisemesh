@@ -22,11 +22,11 @@ openssl rand -hex 32
 ```
 
 **Use a long random value, not a memorable phrase.** Beyond ordinary
-credential hygiene, CP4 (next section) derives a semi-public deposit token
+credential hygiene, relayd derives a semi-public deposit token (next section)
 from this one with a plain hash — a guessable member token could be
 brute-forced offline by anyone holding the deposit token.
 
-### Token classes (CP4)
+### Token classes
 
 Every family has **two** credentials:
 
@@ -51,11 +51,11 @@ Envelopes posted with a deposit token land in the family's one mailbox
 (keyed by the member token), count against the same storage quota, and obey
 the same suspension/expiry rules; only the rate-limit buckets differ (§10).
 
-This closes the pre-CP4 hole where friend cards carried the full family
+This closes the older hole where friend cards carried the full family
 token, so a publicly posted card let strangers fetch and ack (= delete)
-family mail. **Upgrade the relay before (or with) the phones**: post-CP4
-apps put deposit tokens on friend cards, and a pre-CP4 relayd does not
-recognize them (contacts' posts would 401). All existing tokens migrate as
+family mail. **Upgrade the relay before (or with) the phones**: current
+apps put deposit tokens on friend cards, and a relayd predating the split
+does not recognize them (contacts' posts would 401). All existing tokens migrate as
 member class — zero behavior change for existing families — and old
 full-token friend cards keep working, since member tokens still post.
 
@@ -82,7 +82,7 @@ Optional: put the exports in a root-only `.env` next to `docker-compose.yml`
 
 ```sh
 # Optional but recommended: bakes the exact commit into the image so
-# /healthz reports what's actually running (FR4) instead of "unknown".
+# /healthz reports what's actually running instead of "unknown".
 export GIT_SHA=$(git rev-parse --short HEAD)
 
 docker compose up -d --build
@@ -106,7 +106,7 @@ should be:
 | relay token | the same family **member** token from step 1 |
 
 Friend cards take care of themselves: when a phone with this config shares
-a card, it stamps the derived **deposit** token onto it (CP4) — contacts can
+a card, it stamps the derived **deposit** token onto it — contacts can
 post into the family mailbox but never read it. Do not hand the member
 token to people outside the family.
 
@@ -128,8 +128,8 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 | `CRUISEMESH_RELAY_WS_GLOBAL_MAX_CONNECTIONS` | `256` | Max concurrent `GET /ws` connections across all family tokens combined. See §7. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN` | `600` | Requests per minute allowed for a single family **member** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_RATE_BYTES_PER_MIN` | `67108864` (64 MiB) | Uploaded `sealed` bytes per minute allowed for a single family **member** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
-| `CRUISEMESH_RELAY_DEPOSIT_RATE_REQUESTS_PER_MIN` | `60` | CP4: requests per minute allowed for a single family **deposit** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
-| `CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN` | `6291456` (6 MiB) | CP4: uploaded `sealed` bytes per minute allowed for a single family **deposit** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_DEPOSIT_RATE_REQUESTS_PER_MIN` | `60` | Requests per minute allowed for a single family **deposit** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN` | `6291456` (6 MiB) | Uploaded `sealed` bytes per minute allowed for a single family **deposit** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` | `6000` | Requests per minute across all tokens combined — the coarse backstop. See §10. Must be a positive integer; unset uses the default. |
 | `RELAY_DOMAIN` | *(compose required)* | Hostname in the Caddyfile for TLS. |
 
@@ -214,7 +214,7 @@ compose + Caddy path above instead.
 
 ## 9. Backup
 
-The SQLite file is the entire mailbox state. **FR8: relayd runs SQLite in
+The SQLite file is the entire mailbox state. **relayd runs SQLite in
 WAL mode**, so recently-written rows can live in a `cruisemesh-relayd.sqlite-wal`
 sidecar file rather than the main file until SQLite checkpoints it back in
 — a plain `cp` of only the `.sqlite` file while the process is live can
@@ -331,7 +331,7 @@ rm /tmp/restore.sqlite
 curl -fsS "https://${RELAY_DOMAIN}/healthz"
 ```
 
-## 10. Resource limits (DTN_TODOS.md D7)
+## 10. Resource limits
 
 The relay is content-agnostic (§6) and never inspects `sealed`, so the only
 protection against unbounded SQLite growth on the $4 VPS is server-side
@@ -402,7 +402,7 @@ parsing `message` text.
 envelope re-uploaded every sync) adds zero bytes and must not start
 failing once a family's mailbox is merely full.
 
-**Client-side handling shipped with CP2b**: both apps classify these
+**Client-side handling has shipped**: both apps classify these
 bodies in the core (`core/src/relay_status.rs`, keyed on the `code` field)
 and surface them through the Cruise Pass status indicator — 507 as a
 persistent "storage full" state, 413 as a persistent "message too large"
@@ -425,11 +425,11 @@ connection on a $4 VPS. Three token buckets close it:
 |---|---|---|
 | Requests, per member token | 600/min | `CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN` |
 | Uploaded `sealed` bytes, per member token | 64 MiB/min | `CRUISEMESH_RELAY_RATE_BYTES_PER_MIN` |
-| Requests, per deposit token (CP4) | 60/min | `CRUISEMESH_RELAY_DEPOSIT_RATE_REQUESTS_PER_MIN` |
-| Uploaded `sealed` bytes, per deposit token (CP4) | 6 MiB/min | `CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN` |
+| Requests, per deposit token | 60/min | `CRUISEMESH_RELAY_DEPOSIT_RATE_REQUESTS_PER_MIN` |
+| Uploaded `sealed` bytes, per deposit token | 6 MiB/min | `CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN` |
 | Requests, all tokens combined | 6,000/min | `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` |
 
-CP4: buckets are keyed by the *presented* credential, so a family's deposit
+Buckets are keyed by the *presented* credential, so a family's deposit
 traffic (friend cards, i.e. what strangers can hold) exhausts its own
 tighter allowance and never spends the family's member-class budget — and
 vice versa. The deposit defaults are a tenth of the member ones: one post a
@@ -508,7 +508,7 @@ Notes an operator will care about:
   does not also burn a request token; and a family that is over its own
   limit never eats into the global backstop.
 
-## 11. Background maintenance (FR7)
+## 11. Background maintenance
 
 `GET /envelopes` only ever `SELECT`s now — physical row deletion and disk
 reclamation happen in a detached background task, started once at process
@@ -518,7 +518,7 @@ startup and running for the process's lifetime (default cadence: hourly,
 1. `prune_expired(now)` — deletes envelope rows past `expiry_ms` or the
    30-day retention ceiling, and presence rows past their own retention
    window. Only logs when it actually deletes something (same convention
-   as every other FR2-era log line — a zero-count line every hour would
+   as the other periodic log lines — a zero-count line every hour would
    just be noise).
 2. `PRAGMA incremental_vacuum` — reclaims the pages that delete just freed,
    shrinking the file on disk. Only effective once the database is in
@@ -579,7 +579,7 @@ implicit always-active families). Semantics:
 - **Revocation** (`DELETE`) removes the family **and purges its stored
   envelopes and presence rows** — both credentials die together, since the
   deposit token is resolved through the same row.
-- **Two-token response (CP4)**: provisioning mints both credentials — you
+- **Two-token response**: provisioning mints both credentials — you
   supply the member `token`, relayd derives and stores its post-only
   `deposit_token` — and every family object in every response carries both
   fields. The purchase flow keeps putting `token` on the setup card; nothing
@@ -635,6 +635,6 @@ output somewhere you would put a password.
 - Multi-region / federation — single VPS is the intended family-scale deploy.
 - Android/iOS clients still primarily poll today; wiring the phone apps to
   `GET /ws` is a client change, not a server gap.
-- ~~Client-side handling of the D7 413/507 error bodies (see §10)~~ —
-  shipped with CP2b: both apps now surface distinct storage-full /
+- ~~Client-side handling of the 413/507 error bodies (see §10)~~ —
+  shipped: both apps now surface distinct storage-full /
   too-large / rate-limited states through the Cruise Pass indicator.

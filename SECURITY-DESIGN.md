@@ -194,11 +194,17 @@ post-quantum upgrade can ship later without a flag day.
 This is a considered position, not an oversight — but it is exactly the kind
 of judgment an independent review should probe.
 
-## Broadcast mode
+## Broadcast mode (not shipped, not planned)
 
-The public "shout" channel is signed but encrypted to a fixed, well-known
-key — i.e., **readable by anyone with the app, by design**. The UI labels it
-as public. Do not put anything private in broadcast.
+The design called for a public "shout" channel signed but encrypted to a
+fixed, well-known key — readable by anyone with the app, by design. **It was
+never built, and it is no longer planned** (DESIGN.md §6.6). Nothing in the
+app today is readable by anyone other than its intended recipients.
+
+If a broadcast channel ever ships it will be scoped to a single Cruise Pass
+rather than open to anyone with the app, and this section gets rewritten
+before that happens. The rule for any such channel stands: anything encrypted
+to a key many people hold is not private, and the UI has to say so.
 
 ## Design principles (and their origin story)
 

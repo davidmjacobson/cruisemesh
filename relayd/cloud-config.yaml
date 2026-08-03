@@ -6,7 +6,11 @@
 # DEPLOY.md.
 #
 # Approach mirrors https://community.hetzner.com/tutorials/basic-cloud-config
-# with the relay's SSH key baked in.
+# with an SSH key baked in.
+#
+# BEFORE PASTING: replace both REPLACE_WITH_YOUR_PUBLIC_KEY occurrences below
+# (the deploy user and the root fallback) with your own SSH public key. The
+# box is key-only, so a placeholder left in place means you cannot log in.
 
 # --- non-root sudo user; the relay SSH key is authorized for it ---
 users:
@@ -15,7 +19,7 @@ users:
     shell: /bin/bash
     sudo: "ALL=(ALL) NOPASSWD:ALL"
     ssh_authorized_keys:
-      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAgjpE3B6mH6NXe1/WsF4uJ8zWzFEtT0jzB8PZP0j/3B cruisemesh-relay
+      - ssh-ed25519 AAAA...REPLACE_WITH_YOUR_PUBLIC_KEY relay-admin
 
 # key-based auth only; no passwords anywhere
 ssh_pwauth: false
@@ -52,7 +56,7 @@ runcmd:
   # root gets the same key as a fallback login.
   - [ mkdir, -p, /root/.ssh ]
   - [ chmod, "700", /root/.ssh ]
-  - bash -c "echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAgjpE3B6mH6NXe1/WsF4uJ8zWzFEtT0jzB8PZP0j/3B cruisemesh-relay' > /root/.ssh/authorized_keys"
+  - bash -c "echo 'ssh-ed25519 AAAA...REPLACE_WITH_YOUR_PUBLIC_KEY relay-admin' > /root/.ssh/authorized_keys"
   - [ chmod, "600", /root/.ssh/authorized_keys ]
   # Firewall: SSH + HTTP/HTTPS (Caddy) only.
   - ufw allow OpenSSH
@@ -67,8 +71,8 @@ runcmd:
   - systemctl restart ssh || systemctl restart sshd
   - systemctl enable --now fail2ban
 
-  # --- OPTIONAL: auto-deploy the relay at first boot. Only uncomment if DNS
-  #     relay.cruisemesh.app already points at this box (else the TLS cert
+  # --- OPTIONAL: auto-deploy the relay at first boot. Only uncomment if your
+  #     relay hostname already points at this box in DNS (else the TLS cert
   #     will fail). Prints the generated admin token into
   #     /var/log/cloud-init-output.log.
   # - curl -fsSL https://raw.githubusercontent.com/davidmjacobson/cruisemesh/master/relayd/provision-hetzner.sh -o /root/provision.sh

@@ -40,7 +40,7 @@ Concurrent same-revision updates resolve by lexicographically comparing
 members converge.
 
 Renaming authors kind 19 through the existing group encryption, store, BLE
-flood, carry, and D6 relay fan-out paths. It does not rotate the group key.
+flood, carry, and per-member relay fan-out paths. It does not rotate the group key.
 
 ## Adding members
 
