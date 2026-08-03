@@ -86,6 +86,33 @@ mod tests {
         }
     }
 
+    /// Routing looks at scheme/host/path only, so which friend-card form the
+    /// fragment carries cannot change where the link lands. Pinned because the
+    /// v3 card form ships parser-first and must reach the same screen as v2.
+    #[test]
+    fn a_friend_link_routes_the_same_whichever_card_form_it_carries() {
+        for path in ["/f", "/f/"] {
+            assert_eq!(
+                deep_link_route("https".into(), WEB_HOST.into(), path.into()),
+                Some(DeepLinkRoute::Friend),
+            );
+        }
+        for card in [
+            "CMFRIEND1:eyJuYW1lIjoiRGF2ZSJ9",
+            "CMFRIEND2:aB-_cD",
+            "CMFRIEND3:aB-_cD",
+        ] {
+            let url = format!("https://{WEB_HOST}/f#{card}");
+            let (before_fragment, _) = url.split_once('#').unwrap();
+            let path = before_fragment.trim_start_matches(&format!("https://{WEB_HOST}"));
+            assert_eq!(
+                deep_link_route("https".into(), WEB_HOST.into(), path.into()),
+                Some(DeepLinkRoute::Friend),
+                "{url}"
+            );
+        }
+    }
+
     #[test]
     fn app_scheme_routes_from_the_host() {
         for (host, want) in [
