@@ -67,6 +67,28 @@ enum MessageNotifier {
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
 
+    /// Somebody a friend passed our card to is asking to connect. Nothing has
+    /// been imported yet -- tapping through lands on the confirmation, which is
+    /// the whole point of a shared card (specs/share-contact.md decision 5).
+    static func notifySharedRequest(name: String, userId: Data) {
+        let content = UNMutableNotificationContent()
+        content.title = name
+        content.body = "\(name) wants to connect"
+        content.sound = .default
+        // Deliberately no chat userInfo and no reply/mark-read category: there
+        // is no chat to open, and offering Reply on a request nobody accepted
+        // would be a lie. Tapping it just opens the app, where the request is
+        // waiting under Friends.
+        // Own identifier prefix (FI11), and a fixed one per requester: a
+        // redelivery must replace the waiting prompt, never stack another.
+        let request = UNNotificationRequest(
+            identifier: "shared-request:" + UserIdHex.encode(userId),
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+    }
+
     static func notifyIncomingGroupMessage(group: Group, senderName: String, preview: String) {
         guard !ChatMuteStore.isMuted(group.id) else { return }
         let content = UNMutableNotificationContent()

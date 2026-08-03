@@ -10,6 +10,12 @@ struct FriendPreviewState: Identifiable {
     /// construction. Recorded in `ContactProvenance.addedNearby`; a pasted or
     /// linked card says nothing about where its owner is, so it defaults false.
     var scanned: Bool = false
+    /// Set when this card came out of somebody's **Share contact** code. It
+    /// rides back out on the mutual request so the other phone can ask before
+    /// importing (specs/share-contact.md).
+    var shared: SharedFriendCard? = nil
+    /// Who passed the card along, for the "Shared by Mom" line.
+    var sharedByLabel: String? = nil
     var id: String { UserIdHex.encode(contact.userId) }
 }
 
@@ -17,6 +23,10 @@ struct FriendAddedState: Identifiable {
     let contact: Contact
     let delivery: FriendRequestDelivery
     let relayConfigured: Bool
+    /// The card arrived from a shared code, so they have not agreed to
+    /// anything yet. Every rejection path is silent by design, so this screen
+    /// must not promise a connection it cannot see.
+    var awaitingAcceptance: Bool = false
     var id: String { UserIdHex.encode(contact.userId) }
 }
 
@@ -70,6 +80,13 @@ struct FriendPreviewView: View {
         ScrollView {
             VStack(spacing: 18) {
                 Text(isUpdate ? "Update this friend?" : "Add this friend?").font(.title.bold())
+                // Honest provenance, never a verified badge: whoever shared
+                // this card vouched for passing it on, nothing more.
+                if let sharedByLabel = state.sharedByLabel {
+                    Text("Shared by \(sharedByLabel)")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 FriendIdentityBlock(contact: state.contact)
                 matchNote
                 Button(isUpdate ? "Update this friend" : "Add this friend", action: onConfirm)
@@ -148,12 +165,20 @@ struct FriendConfirmationView: View {
         self.onSayHi = onSayHi
         self.onAddAnother = onAddAnother
         self.onDone = onDone
-        _connected = State(initialValue: state.delivery.lamport == 0 && state.delivery.reachedDirectly)
+        _connected = State(
+            initialValue: !state.awaitingAcceptance
+                && state.delivery.lamport == 0
+                && state.delivery.reachedDirectly
+        )
     }
 
     var body: some View {
         VStack(spacing: 18) {
-            Text(connected ? "You're connected" : "Friend added").font(.title.bold())
+            if state.awaitingAcceptance {
+                Text("Request sent").font(.title.bold())
+            } else {
+                Text(connected ? "You're connected" : "Friend added").font(.title.bold())
+            }
             FriendIdentityBlock(contact: state.contact)
             Label(statusText, systemImage: connected ? "checkmark.circle.fill" : "clock.arrow.circlepath")
                 .font(.callout)
@@ -166,7 +191,9 @@ struct FriendConfirmationView: View {
         .presentationDetents([.medium, .large])
         .interactiveDismissDisabled(false)
         .task(id: state.id) {
-            while !connected && state.delivery.lamport > 0 {
+            // A delivered receipt would only prove the request arrived, not
+            // that they said yes, so a shared import never polls for one.
+            while !connected && !state.awaitingAcceptance && state.delivery.lamport > 0 {
                 let delivered = (try? AppStore.get().receiptThrough(
                     chatId: state.contact.userId,
                     senderUserId: ownUserId,
@@ -179,6 +206,9 @@ struct FriendConfirmationView: View {
     }
 
     private var statusText: String {
+        if state.awaitingAcceptance {
+            return "Waiting for \(state.contact.name) to accept."
+        }
         if connected { return "You're connected. \(state.contact.name) has your card too." }
         if state.relayConfigured {
             return "Sending \(state.contact.name) your card through the relay so they can message you back."
