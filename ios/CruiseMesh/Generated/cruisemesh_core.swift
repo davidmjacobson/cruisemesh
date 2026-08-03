@@ -14988,8 +14988,11 @@ public func makeFriendCard(name: String, identity: Identity, relayUrl: String?, 
 /**
  * Compact, chat-app-safe text form of a FriendCard (T12). Emits the binary
  * `CMFRIEND2:` form, which is ~half the size of the legacy JSON `CMFRIEND1:`
- * form and so produces a much less dense QR code. `parse_friend_text` still
- * accepts both forms, so cards already shared in the field keep working.
+ * form and so produces a much less dense QR code. A third, smaller form
+ * (`CMFRIEND3:`, `specs/friend-card-v3.md`) is fully implemented behind
+ * [`EMIT_FRIEND_LINK_V3`] but not emitted yet, because a build that predates
+ * it cannot read it. `parse_friend_text` accepts every form ever emitted, so
+ * cards already shared in the field keep working.
  */
 public func makeFriendLink(cardJson: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -15107,10 +15110,11 @@ public func parseFriendCard(json: String)throws  -> FriendCard {
 })
 }
 /**
- * Parse a shared friend card in any form: the compact binary `CMFRIEND2:`
- * link (what we emit now), the legacy `CMFRIEND1:` JSON link, either one
- * embedded in a `https://cruisemesh.app/f#…` URL or surrounding prose, or a
- * raw FriendCard JSON blob.
+ * Parse a shared friend card in any form ever emitted: the compact binary
+ * `CMFRIEND3:` link (smallest, parsed here before anything emits it), the
+ * binary `CMFRIEND2:` link (what we emit now), the legacy `CMFRIEND1:` JSON
+ * link, any of them embedded in a `https://cruisemesh.app/f#…` URL or
+ * surrounding prose, or a raw FriendCard JSON blob.
  */
 public func parseFriendText(text: String)throws  -> FriendCard {
     return try  FfiConverterTypeFriendCard.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -16175,7 +16179,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_make_friend_card() != 17109) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 33620) {
+    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 21406) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_make_relay_setup_card() != 25797) {
@@ -16199,7 +16203,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_parse_friend_card() != 1373) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_parse_friend_text() != 63241) {
+    if (uniffi_cruisemesh_core_checksum_func_parse_friend_text() != 40105) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_parse_relay_setup_text() != 37250) {
