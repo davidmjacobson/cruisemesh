@@ -93,6 +93,7 @@ final class MetricKitCollector: NSObject, MXMetricManagerSubscriber {
         let url = dir.appendingPathComponent("diagnostic-\(stamp).json")
         do {
             try payload.jsonRepresentation().write(to: url, options: .atomic)
+            DiagnosticLogExport.pruneMetricKitFiles()
         } catch {
             Self.log.warning("Could not write MetricKit diagnostic: \(error.localizedDescription, privacy: .public)")
         }
@@ -160,6 +161,7 @@ final class MetricKitCollector: NSObject, MXMetricManagerSubscriber {
         let url = dir.appendingPathComponent("metrickit-\(stamp).json")
         do {
             try data.write(to: url, options: .atomic)
+            DiagnosticLogExport.pruneMetricKitFiles()
         } catch {
             Self.log.warning("Could not write MetricKit payload: \(error.localizedDescription, privacy: .public)")
         }

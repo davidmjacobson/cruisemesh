@@ -63,7 +63,21 @@ object ProcessExitHistory {
         return out.toString()
     }
 
-    /** Reads the platform's exit records for this app. */
+    private const val PREFS_NAME = "process_exit_history"
+    private const val KEY_NEWEST_WRITTEN = "newest_written_ms"
+
+    /**
+     * Exits not already written to the log, newest first.
+     *
+     * Capture restarts on every process start and after every delete-and-rearm,
+     * and the platform keeps returning the same history each time. Writing all
+     * of it unconditionally would re-append up to five traces of up to 64 KB on
+     * every relaunch -- worst precisely during a native-crash loop, which is the
+     * case this whole feature exists for, where the duplicates would churn the
+     * 4 MB rotation budget and evict the log lines the traces are meant to
+     * explain. So remember the newest exit already recorded and skip anything
+     * at or below it.
+     */
     fun recentExits(context: Context): List<Exit> {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
             ?: return emptyList()
@@ -72,7 +86,13 @@ object ProcessExitHistory {
         } catch (e: Exception) {
             return emptyList()
         }
-        return infos.map { info ->
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val newestWritten = prefs.getLong(KEY_NEWEST_WRITTEN, 0L)
+        val fresh = infos.filter { it.timestamp > newestWritten }
+        if (fresh.isNotEmpty()) {
+            prefs.edit().putLong(KEY_NEWEST_WRITTEN, fresh.maxOf { it.timestamp }).apply()
+        }
+        return fresh.map { info ->
             Exit(
                 timestampMs = info.timestamp,
                 reasonLabel = reasonLabel(info.reason),

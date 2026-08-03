@@ -271,6 +271,43 @@ enum DiagnosticLogExport {
         )
     }
 
+    /// Newest payloads to keep, per kind.
+    ///
+    /// Moving out of `temporaryDirectory` bought durability -- a crash report
+    /// now survives until the tester has a connection -- but it also removed
+    /// the only thing that ever bounded these files, since the OS used to
+    /// reclaim tmp on its own. MetricKit collection is not gated by the
+    /// diagnostics opt-in, so without a cap every install accumulates a JSON
+    /// per day forever, next to a log archive that caps itself at 4 MB.
+    ///
+    /// Crashes get a larger allowance than the daily metric payloads: they are
+    /// rarer, far more valuable, and a crash loop should not evict its own
+    /// earliest evidence.
+    private static let maxDiagnosticPayloads = 20
+    private static let maxMetricPayloads = 14
+
+    /// Trims each kind to its cap, newest kept. Filenames are ISO-8601 stamped
+    /// so lexicographic order is chronological within a prefix.
+    static func pruneMetricKitFiles() {
+        guard let dir = metricKitDirectory() else { return }
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: nil
+        )) ?? []
+        for (prefix, keep) in [
+            ("diagnostic-", maxDiagnosticPayloads),
+            ("metrickit-", maxMetricPayloads),
+        ] {
+            let matching = files
+                .filter { $0.lastPathComponent.hasPrefix(prefix) }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            guard matching.count > keep else { continue }
+            for url in matching.prefix(matching.count - keep) {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
     /// Existing `MetricKitCollector` JSON payloads, oldest first (filenames
     /// are timestamp-ordered), for "Share diagnostics" to attach alongside
     /// the log file. An empty result means nothing to attach, not an error --

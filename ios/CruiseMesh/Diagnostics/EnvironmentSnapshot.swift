@@ -19,18 +19,31 @@ import UIKit
 /// nothing while the app runs. Metadata only: interface *types*, never an
 /// SSID, and never an address.
 enum EnvironmentSnapshot {
+    /// Guards the two cached strings below.
+    ///
+    /// Not optional, and not a "diagnostics code doesn't need locks" tradeoff:
+    /// these are written from an `NWPathMonitor` callback on a utility queue
+    /// and read from whichever thread flushes the archive. A `String` holding
+    /// more than 15 UTF-8 bytes -- which every value here does -- is a
+    /// refcounted heap buffer, so an unsynchronised read can load a pointer
+    /// the writer then releases, and retain freed memory. That is a crash, not
+    /// a stale line, and the two race windows are *correlated*: backgrounding
+    /// is both when iOS re-evaluates the network path and when
+    /// `archiveCurrentSession()` runs. Diagnostics code crashing the app it is
+    /// supposed to explain is the worst possible failure here.
+    private static let lock = NSLock()
+
     /// Last network path seen by `MeshController`'s monitor. Set from its
     /// existing `pathUpdateHandler` rather than by starting a second
     /// `NWPathMonitor` here, which would duplicate a system resource just to
     /// print one line.
-    ///
-    /// `nonisolated(unsafe)` because the path handler runs on a utility queue
-    /// and the banner reads from whichever thread is archiving; a torn read of
-    /// a `String?` is not a risk worth a lock in diagnostics code.
-    nonisolated(unsafe) static var networkSummary: String?
+    nonisolated(unsafe) private static var networkSummary: String?
 
     static func record(path: NWPath) {
-        networkSummary = describe(path)
+        let summary = describe(path)
+        lock.lock()
+        networkSummary = summary
+        lock.unlock()
     }
 
     /// Last Background App Refresh status, sampled on the main actor.
@@ -56,22 +69,32 @@ enum EnvironmentSnapshot {
 
     @MainActor
     private static func sampleBackgroundRefresh() {
+        let status: String
         switch UIApplication.shared.backgroundRefreshStatus {
-        case .available: backgroundRefresh = "available"
-        case .denied: backgroundRefresh = "DENIED"
-        case .restricted: backgroundRefresh = "restricted"
-        @unknown default: backgroundRefresh = "unknown"
+        case .available: status = "available"
+        case .denied: status = "DENIED"
+        case .restricted: status = "restricted"
+        @unknown default: status = "unknown"
         }
+        lock.lock()
+        backgroundRefresh = status
+        lock.unlock()
     }
 
     /// One line for the launch banner. Deliberately terse and greppable.
     static func line() -> String {
+        // Copy both cached strings under one lock, then format outside it.
+        lock.lock()
+        let refresh = backgroundRefresh
+        let network = networkSummary ?? "unknown"
+        lock.unlock()
+
         var parts: [String] = []
-        parts.append("backgroundRefresh=\(backgroundRefresh)")
+        parts.append("backgroundRefresh=\(refresh)")
         parts.append("lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled)")
         parts.append("thermal=\(thermal())")
         parts.append("bluetooth=\(bluetoothAuthorization())")
-        parts.append("network=\(networkSummary ?? "unknown")")
+        parts.append("network=\(network)")
         if let free = freeDiskBytes() {
             parts.append("freeDisk=\(free / 1_048_576)MB")
         }
