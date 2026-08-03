@@ -239,6 +239,14 @@
     <string name="ui_this_removes_the_contact_and_deletes_your_chat">This removes the contact and deletes your chat history with them.</string>
     <string name="ui_this_removes_the_contact_and_deletes_your_chat_f3fb0a50">This removes the contact and deletes your chat history with them. It can\'t be undone.</string>
     <string name="ui_this_backup_file_is_too_large">This backup file is too large.</string>
+    <string name="ui_that_passphrase_didn_t_work">That passphrase didn\'t work, or the file is damaged. Check the passphrase and try again.</string>
+    <string name="ui_that_file_isn_t_a_cruisemesh_backup">That file isn\'t a CruiseMesh backup. Pick the file you saved from CruiseMesh.</string>
+    <string name="ui_that_backup_file_is_incomplete">That backup file is incomplete. It may not have finished copying — try the original file again.</string>
+    <string name="ui_this_backup_was_made_by_a_newer_version">This backup was made by a newer version of CruiseMesh. Update the app, then try again.</string>
+    <string name="ui_that_backup_couldn_t_be_read">That backup couldn\'t be read. The file may be damaged.</string>
+    <string name="ui_couldn_t_save_the_backup">The backup couldn\'t be saved. Try again.</string>
+    <string name="ui_couldn_t_restore_that_backup">That backup couldn\'t be restored. Try again.</string>
+    <string name="ui_couldn_t_read_that_file">That file couldn\'t be read. Pick it again.</string>
     <string name="ui_unsupported_attachment">Unsupported attachment</string>
     <string name="ui_relay_token_rejected">The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.</string>
     <string name="ui_when_any_family_phone_has_internet_queued_messages">When any family phone has internet, queued messages flush through this mailbox.</string>

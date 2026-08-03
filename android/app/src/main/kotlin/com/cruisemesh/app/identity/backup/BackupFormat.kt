@@ -47,3 +47,18 @@ sealed class BackupException(message: String) : Exception(message) {
             "This backup is from a newer app version ($srcVersionCode > $appVersionCode); update CruiseMesh first",
         )
 }
+
+/**
+ * Should a restore be refused because the backup came from a newer build?
+ *
+ * A shipped build's version code comes from the release tag, so on a release
+ * build this is a real signal: the file may contain a payload this app cannot
+ * understand. A debuggable build has no such number — it carries one frozen
+ * constant that is older than every release, so a locally built app would
+ * refuse every backup made by the shipped app, on the very device the developer
+ * is using to reproduce a restore bug. The refusal is therefore release-only;
+ * the frozen debug version code stays put so debug-made backups still restore
+ * onto release builds.
+ */
+fun refuseNewerBackup(srcVersionCode: Int, appVersionCode: Int, debuggableBuild: Boolean): Boolean =
+    srcVersionCode > appVersionCode && !debuggableBuild

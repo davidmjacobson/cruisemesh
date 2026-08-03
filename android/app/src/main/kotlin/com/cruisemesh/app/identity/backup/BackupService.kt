@@ -1,7 +1,10 @@
 package com.cruisemesh.app.identity.backup
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.net.Uri
+import android.provider.OpenableColumns
+import android.util.Log
 import com.cruisemesh.app.R
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.OnboardingStore
@@ -30,6 +33,7 @@ import uniffi.cruisemesh_core.backupMaxFileBytes
 object BackupService {
 
     private const val STORE_FILENAME = "cruisemesh.sqlite"
+    private const val TAG = "BackupService"
 
     /** Build the encrypted `.cmbak` bytes from the current on-device identity and message store. */
     fun buildBackup(context: Context, passphrase: CharArray): ByteArray {
@@ -72,8 +76,16 @@ object BackupService {
         val payload = BackupCrypto.open(passphrase, fileBytes)
 
         val appVersion = appVersionCode(context)
-        if (payload.srcVersionCode > appVersion) {
+        if (refuseNewerBackup(payload.srcVersionCode, appVersion, isDebuggableBuild(context))) {
             throw BackupException.NewerBackup(payload.srcVersionCode, appVersion)
+        }
+        if (payload.srcVersionCode > appVersion) {
+            Log.w(
+                TAG,
+                "Restoring a backup made by version ${payload.srcVersionCode} onto $appVersion; " +
+                    "this build is debuggable and its version code is a frozen constant, so the " +
+                    "newer-backup refusal does not apply.",
+            )
         }
 
         val identity = decodeIdentity(payload.identity)
@@ -122,6 +134,25 @@ object BackupService {
         } ?: throw IllegalStateException("Could not open backup file")
     }
 
+    /**
+     * The name to show for a picked document. A SAF uri's last path segment is
+     * a provider document id, which for a file the app itself wrote is often
+     * just a number ("152"); the provider's display-name column is the actual
+     * filename. Falls back to the path segment when no provider answers.
+     */
+    fun displayName(context: Context, uri: Uri): String? {
+        val fromProvider = runCatching {
+            context.contentResolver
+                .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    val column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (column >= 0 && cursor.moveToFirst()) cursor.getString(column) else null
+                }
+        }.getOrNull()
+        return fromProvider?.takeIf { it.isNotBlank() }
+            ?: uri.lastPathSegment?.substringAfterLast('/')
+    }
+
     /** Write bytes to a SAF document (the destination the user chose to save the backup). */
     fun writeBytes(context: Context, uri: Uri, bytes: ByteArray) {
         // "wt" = write + truncate, so re-saving over an existing file replaces it cleanly.
@@ -141,6 +172,13 @@ object BackupService {
         // minSdk is 31, so longVersionCode (added in API 28) is always available.
         return info.longVersionCode.toInt()
     }
+
+    /**
+     * True for a locally built app. Read from the installed package rather than
+     * `BuildConfig`, which this module does not generate.
+     */
+    private fun isDebuggableBuild(context: Context): Boolean =
+        (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
     private fun readBackupBytes(context: Context, input: InputStream): ByteArray = try {
         input.readBackupBytes(backupReadLimit())
