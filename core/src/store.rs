@@ -1567,6 +1567,27 @@ impl MessageStore {
         Ok(out)
     }
 
+    /// Erases every V2 field-metrics row.
+    ///
+    /// The counterpart to [`Self::export_delivery_metrics_csv`]. These rows
+    /// used to leave the device only when someone deliberately tapped a
+    /// separate "Export field metrics" button, so having no way to erase them
+    /// was defensible. Now that they ride along with every "Share
+    /// diagnostics", the tester-facing delete has to reach them too --
+    /// otherwise "delete captured diagnostics" leaves behind the one captured
+    /// thing it did not name.
+    ///
+    /// Deliberately does not touch `messages`: the `arrival_transport` and
+    /// `hops_taken` columns there are per-message delivery facts the chat UI
+    /// renders, not captured diagnostics, and clearing them would silently
+    /// change what the app says about existing conversations.
+    pub fn clear_delivery_metrics(&self) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute("DELETE FROM delivery_metrics", [])
+            .map_err(store_err)?;
+        Ok(())
+    }
+
     /// First-arrival diagnostics for one message, or `None` for locally
     /// authored/legacy rows that predate diagnostics.
     pub fn message_arrival(
@@ -9474,6 +9495,53 @@ mod tests {
         let csv = store.export_delivery_metrics_csv().unwrap();
         assert_eq!(csv.lines().count(), 1);
         assert!(csv.starts_with("direction,chat,lamport,"));
+    }
+
+    #[test]
+    fn clearing_metrics_leaves_the_export_empty() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .record_sent_metric(b"chat".to_vec(), 1, 1_000)
+            .unwrap();
+        store
+            .record_sent_metric(b"chat".to_vec(), 2, 1_100)
+            .unwrap();
+        assert!(store.export_delivery_metrics_csv().unwrap().lines().count() > 1);
+
+        store.clear_delivery_metrics().unwrap();
+
+        let csv = store.export_delivery_metrics_csv().unwrap();
+        assert_eq!(csv.lines().count(), 1, "only the header should remain");
+        assert!(csv.starts_with("direction,chat,lamport,"));
+    }
+
+    #[test]
+    fn clearing_metrics_is_safe_when_nothing_was_captured() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.clear_delivery_metrics().unwrap();
+        assert_eq!(
+            store.export_delivery_metrics_csv().unwrap().lines().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn clearing_metrics_keeps_recording_afterwards() {
+        // The delete must not leave the table unusable: a tester who erases
+        // diagnostics mid-cruise still needs the next messages measured.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .record_sent_metric(b"chat".to_vec(), 1, 1_000)
+            .unwrap();
+        store.clear_delivery_metrics().unwrap();
+        store
+            .record_sent_metric(b"chat".to_vec(), 2, 1_200)
+            .unwrap();
+        assert_eq!(
+            store.export_delivery_metrics_csv().unwrap().lines().count(),
+            2,
+            "the post-clear row should be the only one"
+        );
     }
 
     #[test]

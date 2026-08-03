@@ -22,6 +22,13 @@ enum FieldMetricsExport {
         }
         return url
     }
+
+    /// Whether any metrics rows exist, without writing a file. Drives whether
+    /// "Delete captured diagnostics" has anything to act on.
+    static func hasCapturedMetrics() -> Bool {
+        guard let csv = try? AppStore.get().exportDeliveryMetricsCsv() else { return false }
+        return csv.split(separator: "\n", omittingEmptySubsequences: true).count > 1
+    }
 }
 
 /// Identifiable wrapper so a freshly written set of export files can drive

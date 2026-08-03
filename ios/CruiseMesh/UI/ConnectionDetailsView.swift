@@ -81,50 +81,33 @@ struct ConnectionDetailsView: View {
                                 ? String(localized: "Diagnostic logging is on. Reproduce the problem, then return here to share it.")
                                 : String(localized: "Diagnostic logging is off. What was already captured is kept until you delete it.")
                         }
-                    Text("Turn this on before testing to keep connection and delivery diagnostics across app restarts. Message content is never recorded.")
+                    Text("Turn this on before testing to keep the connection log across app restarts. Delivery timings are kept either way. Message content is never recorded.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Button {
-                        // Bundles any MetricKit payloads in alongside the log
-                        // file, riding this existing flow with zero new UI.
-                        var urls: [URL] = []
-                        if let url = DiagnosticLogExport.writeLogFile() {
-                            urls.append(url)
-                            hasDiagnosticArchive = true
-                        }
-                        urls.append(contentsOf: DiagnosticLogExport.metricKitFileURLs())
-                        if urls.isEmpty {
-                            supportMessage = String(localized: "No diagnostics captured this session yet.")
-                        } else {
-                            shareFile = ShareableFile(urls: urls)
-                        }
+                        // One button, everything captured. Asking a family
+                        // member to send "diagnostics" and having them come
+                        // back with only half of what is needed costs a round
+                        // trip that, on a ship, can take a day -- so the log,
+                        // any crash reports, and the delivery timings all ride
+                        // the same share sheet.
+                        shareEverything()
                     } label: {
                         Label("Share diagnostics", systemImage: "ladybug")
                     }
                     Button(role: .destructive) {
                         DiagnosticLogExport.deleteArchive()
+                        try? AppStore.get().clearDeliveryMetrics()
                         hasDiagnosticArchive = false
                         supportMessage = String(localized: "Captured diagnostics deleted.")
                     } label: {
                         Label("Delete captured diagnostics", systemImage: "trash")
                     }
                     .disabled(!hasDiagnosticArchive)
-                    Button {
-                        if let url = FieldMetricsExport.writeCSVFile() {
-                            shareFile = ShareableFile(url: url)
-                        } else {
-                            supportMessage = "No field metrics captured yet."
-                        }
-                    } label: {
-                        Label("Export field metrics", systemImage: "square.and.arrow.up")
-                    }
                     Button("Clear connection history", role: .destructive) {
                         showClear = true
                     }
-                    Text("History contains only friend identity, path type, event type, and time. It never stores message content, relay tokens, IP addresses, or Wi-Fi names.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("Field metrics contain hashed chat tags, route types, and delivery timings—never message content or contact names.")
+                    Text("Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     if let supportMessage {
@@ -199,6 +182,37 @@ struct ConnectionDetailsView: View {
         contacts = (try? store.listContacts()) ?? []
         summaries = (try? store.peerConnectionSummaries()) ?? []
         events = (try? store.peerConnectionEvents(userId: nil, limit: 50)) ?? []
+        hasDiagnosticArchive = hasAnythingCaptured()
+    }
+
+    /// Everything captured, in one share sheet: the connection log, any crash
+    /// reports MetricKit delivered for previous launches, and the delivery
+    /// timings CSV.
+    ///
+    /// The three answer different questions -- what the radios did, why a
+    /// launch died, and whether messages actually arrived -- and none is
+    /// derivable from the others, so splitting them across buttons only meant
+    /// getting a partial answer from whoever tapped the obvious one.
+    private func shareEverything() {
+        var urls: [URL] = []
+        if let url = DiagnosticLogExport.writeLogFile() { urls.append(url) }
+        urls.append(contentsOf: DiagnosticLogExport.metricKitFileURLs())
+        if let url = FieldMetricsExport.writeCSVFile() { urls.append(url) }
+        hasDiagnosticArchive = !urls.isEmpty
+        if urls.isEmpty {
+            supportMessage = String(localized: "No diagnostics captured yet.")
+        } else {
+            shareFile = ShareableFile(urls: urls)
+        }
+    }
+
+    /// Whether the delete button has anything to act on. Counts the delivery
+    /// metrics too: they are captured unconditionally, so a tester who never
+    /// turned diagnostic logging on can still have rows worth erasing, and a
+    /// delete button greyed out over them would be wrong.
+    private func hasAnythingCaptured() -> Bool {
+        if DiagnosticLogExport.hasArchive() { return true }
+        return FieldMetricsExport.hasCapturedMetrics()
     }
 
     private func personStatus(_ contact: Contact) -> String {

@@ -41,6 +41,7 @@ import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
+import com.cruisemesh.app.debug.DiagnosticsShare
 import com.cruisemesh.app.debug.FieldMetricsExport
 import com.cruisemesh.app.mesh.DirectPath
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
@@ -64,7 +65,12 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
     var showClear by remember { mutableStateOf(false) }
     var showAllActivity by remember { mutableStateOf(false) }
     var diagnosticLogging by remember { mutableStateOf(DebugFileLog.isEnabled(context)) }
-    var hasCapturedDiagnostics by remember { mutableStateOf(DebugFileLog.hasCapturedLogs(context)) }
+    // Counts the delivery metrics too: they are captured whether or not
+    // diagnostic logging is on, so a tester who never touched the switch can
+    // still have rows worth erasing, and a greyed-out delete would be wrong.
+    var hasCapturedDiagnostics by remember {
+        mutableStateOf(DiagnosticsShare.hasAnythingCaptured(context))
+    }
     var supportMessage by remember { mutableStateOf<String?>(null) }
     val contacts = remember(revision) { store.listContacts() }
     val summaries = remember(revision) { store.peerConnectionSummaries() }
@@ -240,15 +246,26 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                 }
                 Button(
                     onClick = {
-                        DebugFileLog.shareIntent(context)?.let {
-                            context.startActivity(Intent.createChooser(it, "Share CruiseMesh diagnostics"))
-                        } ?: run { supportMessage = "No diagnostics captured this session yet." }
+                        // One button, everything captured -- see DiagnosticsShare.
+                        DiagnosticsShare.shareIntent(context)?.let {
+                            context.startActivity(
+                                Intent.createChooser(it, context.getString(R.string.ui_share_diagnostics)),
+                            )
+                            hasCapturedDiagnostics = true
+                        } ?: run {
+                            supportMessage = context.getString(R.string.ui_no_diagnostics_captured_yet)
+                        }
                     },
                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
                 ) { Text(stringResource(R.string.ui_share_diagnostics)) }
                 OutlinedButton(
                     onClick = {
                         DebugFileLog.deleteCapturedLogs(context)
+                        // The metrics are captured whether or not diagnostic
+                        // logging is on, so a delete that skipped them would
+                        // leave behind the one captured thing it did not name.
+                        runCatching { AppStore.get(context).clearDeliveryMetrics() }
+                        FieldMetricsExport.deleteCsvFile(context)
                         hasCapturedDiagnostics = false
                         supportMessage = context.getString(R.string.ui_diagnostics_deleted)
                     },
@@ -256,28 +273,14 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 ) { Text(stringResource(R.string.ui_delete_captured_diagnostics)) }
                 OutlinedButton(
-                    onClick = {
-                        FieldMetricsExport.shareIntent(context)?.let {
-                            context.startActivity(Intent.createChooser(it, "Export CruiseMesh field metrics"))
-                        } ?: run { supportMessage = "No field metrics captured yet." }
-                    },
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                ) { Text(stringResource(R.string.ui_export_field_metrics)) }
-                OutlinedButton(
                     onClick = { showClear = true },
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 ) { Text(stringResource(R.string.ui_clear_connection_history)) }
                 Text(
-                    stringResource(R.string.ui_history_contains_only_friend_identity_path_type_event),
+                    stringResource(R.string.ui_diagnostics_contain_identity_paths_and_timings),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 8.dp),
-                )
-                Text(
-                    stringResource(R.string.ui_field_metrics_contain_hashed_chat_tags_route_types),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 6.dp),
                 )
                 supportMessage?.let {
                     Text(

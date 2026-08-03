@@ -731,6 +731,16 @@
         }
       }
     },
+    "Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names."
+          }
+        }
+      }
+    },
     "Dismiss": {
       "localizations": {
         "en": {
@@ -871,16 +881,6 @@
         }
       }
     },
-    "Field metrics contain hashed chat tags, route types, and delivery timings—never message content or contact names.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Field metrics contain hashed chat tags, route types, and delivery timings—never message content or contact names."
-          }
-        }
-      }
-    },
     "For self-hosted relays and development.": {
       "localizations": {
         "en": {
@@ -1007,16 +1007,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Help & support"
-          }
-        }
-      }
-    },
-    "History contains only friend identity, path type, event type, and time. It never stores message content, relay tokens, IP addresses, or Wi-Fi names.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "History contains only friend identity, path type, event type, and time. It never stores message content, relay tokens, IP addresses, or Wi-Fi names."
           }
         }
       }
@@ -1357,6 +1347,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "No chats yet"
+          }
+        }
+      }
+    },
+    "No diagnostics captured yet.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No diagnostics captured yet."
           }
         }
       }
@@ -2561,12 +2561,12 @@
         }
       }
     },
-    "Turn this on before testing to keep connection and delivery diagnostics across app restarts. Message content is never recorded.": {
+    "Turn this on before testing to keep the connection log across app restarts. Delivery timings are kept either way. Message content is never recorded.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Turn this on before testing to keep connection and delivery diagnostics across app restarts. Message content is never recorded."
+            "value": "Turn this on before testing to keep the connection log across app restarts. Delivery timings are kept either way. Message content is never recorded."
           }
         }
       }

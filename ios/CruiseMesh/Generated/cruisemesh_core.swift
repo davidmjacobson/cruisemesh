@@ -1855,6 +1855,24 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func clearContactRelayRejection(userId: Data) throws 
     
+    /**
+     * Erases every V2 field-metrics row.
+     *
+     * The counterpart to [`Self::export_delivery_metrics_csv`]. These rows
+     * used to leave the device only when someone deliberately tapped a
+     * separate "Export field metrics" button, so having no way to erase them
+     * was defensible. Now that they ride along with every "Share
+     * diagnostics", the tester-facing delete has to reach them too --
+     * otherwise "delete captured diagnostics" leaves behind the one captured
+     * thing it did not name.
+     *
+     * Deliberately does not touch `messages`: the `arrival_transport` and
+     * `hops_taken` columns there are per-message delivery facts the chat UI
+     * renders, not captured diagnostics, and clearing them would silently
+     * change what the app says about existing conversations.
+     */
+    func clearDeliveryMetrics() throws 
+    
     func clearFriendSuggestions() throws 
     
     func clearPeerConnectionHistory() throws 
@@ -3401,6 +3419,28 @@ open func clearCarriedRelayUploadMarkers()throws  -> UInt64 {
 open func clearContactRelayRejection(userId: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_clear_contact_relay_rejection(self.uniffiClonePointer(),
         FfiConverterData.lower(userId),$0
+    )
+}
+}
+    
+    /**
+     * Erases every V2 field-metrics row.
+     *
+     * The counterpart to [`Self::export_delivery_metrics_csv`]. These rows
+     * used to leave the device only when someone deliberately tapped a
+     * separate "Export field metrics" button, so having no way to erase them
+     * was defensible. Now that they ride along with every "Share
+     * diagnostics", the tester-facing delete has to reach them too --
+     * otherwise "delete captured diagnostics" leaves behind the one captured
+     * thing it did not name.
+     *
+     * Deliberately does not touch `messages`: the `arrival_transport` and
+     * `hops_taken` columns there are per-message delivery facts the chat UI
+     * renders, not captured diagnostics, and clearing them would silently
+     * change what the app says about existing conversations.
+     */
+open func clearDeliveryMetrics()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_delivery_metrics(self.uniffiClonePointer(),$0
     )
 }
 }
@@ -17464,6 +17504,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_contact_relay_rejection() != 26476) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_delivery_metrics() != 11431) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_friend_suggestions() != 35411) {
