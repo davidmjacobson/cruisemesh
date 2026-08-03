@@ -49,15 +49,6 @@ object FriendDirectorySender {
         // phone already holding suggestions we should never have sent drops
         // them on the next pass instead of keeping them until the tickets
         // expire a month later.
-        // Cached: with no pass on either side, eligibility turns on whether we
-        // actually met, and the same contacts are re-checked once per
-        // recipient across the whole fan-out.
-        val nearbyCache = HashMap<String, Boolean>()
-        val addedNearby: (ByteArray) -> Boolean = { userId ->
-            nearbyCache.getOrPut(UserIdHex.encode(userId)) {
-                store.getContactProvenance(userId)?.addedNearby ?: false
-            }
-        }
         for (recipient in recipients) {
             val entries = if (enabled) {
                 FriendDirectoryScope.candidatesFor(
@@ -65,7 +56,6 @@ object FriendDirectorySender {
                     contacts = recipients,
                     ownRelayUrl = ownRelay?.relayUrl,
                     ownRelayToken = ownRelay?.relayToken,
-                    addedNearby = addedNearby,
                 ).asSequence()
                     .mapNotNull { candidate ->
                         val policy = store.getContactDiscoveryPolicy(candidate.userId)

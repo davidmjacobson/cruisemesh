@@ -407,9 +407,15 @@ not close it: the motivating case is a *direct* scan, recorded as
 `source = 0`, indistinguishable from scanning a relative.
 
 Resolved in `specs/friends-of-friends.md` decision 7 and already implemented:
-with a pass, only contacts on it are eligible; with no pass on either side,
-`added_nearby` decides. This spec assumes that behavior — without it, Share
-contact would make an open leak easier to reach.
+introductions require a shared Cruise Pass, with no in-person fallback for
+passless phones. An interim version did allow one, and it left this leak half
+open — a passless family who met another family face to face still propagated
+into each other's suggestion lists.
+
+Closing it completely is what makes this spec's premise true: introductions
+never cross a household, so crossing one is always a deliberate act. It also
+raises the stakes on the deliberate act being well designed, since it is now
+the *only* way across.
 
 ## Open questions
 

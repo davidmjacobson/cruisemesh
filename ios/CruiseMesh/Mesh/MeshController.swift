@@ -1928,13 +1928,7 @@ final class MeshController: ObservableObject {
             // its own next pass instead of waiting for every other phone in
             // the graph to update. Mirrors InboundEnvelopeProcessor.kt.
             var scoped = content
-            let introducerNearby = ((try? store.getContactProvenance(userId: senderUserId)) ?? nil)?
-                .addedNearby ?? false
-            if !FriendDirectoryScope.introducible(
-                contact,
-                ownRelay: RelayConfigStore.load(),
-                addedNearby: introducerNearby
-            ) {
+            if !FriendDirectoryScope.introducible(contact, ownRelay: RelayConfigStore.load()) {
                 log.info("Scoping out friend directory: introducer is on another pass")
                 scoped = FriendDirectoryContent(
                     version: content.version,

@@ -1,9 +1,9 @@
 import Foundation
 
 /// Which contacts friends-of-friends introductions may involve: the ones on
-/// our own Cruise Pass. Mirrors Android's `FriendDirectoryScope.kt`; the rule
-/// itself lives in the core (`relay_wire.rs::friend_introduction_eligible`),
-/// including what an *absent* pass means on either side.
+/// our own Cruise Pass, and nobody else. Mirrors Android's
+/// `FriendDirectoryScope.kt`; the comparison itself lives in the core
+/// (`relay_wire.rs::relay_contact_shares_own_family`).
 ///
 /// Introductions spread along the contact graph, and the graph does not stop
 /// at a household. One person who has scanned somebody outside the family is
@@ -11,24 +11,20 @@ import Foundation
 /// lists — which is how a shared tester pass ends up offering strangers to a
 /// child's phone. Nothing about it was a protocol failure; the pass simply
 /// was never consulted.
+///
+/// A contact with no pass is not introducible either, and there is no
+/// in-person fallback — the core function's doc explains why the signal was
+/// too weak to keep. Without a pass, people add each other by scanning a code
+/// or sharing their own friend link.
 enum FriendDirectoryScope {
 
     /// Whether `contact` may be introduced with us at all.
-    ///
-    /// `addedNearby` is `ContactProvenance.addedNearby` for this contact — it
-    /// only decides anything when neither side has a pass, where "did we
-    /// actually meet" is the only boundary left.
-    static func introducible(
-        _ contact: Contact,
-        ownRelay: RelayConfig?,
-        addedNearby: Bool
-    ) -> Bool {
-        friendIntroductionEligible(
+    static func introducible(_ contact: Contact, ownRelay: RelayConfig?) -> Bool {
+        relayContactSharesOwnFamily(
             contactRelayUrl: contact.relayUrl,
             contactRelayToken: contact.relayToken,
             ownRelayUrl: ownRelay?.relayUrl,
-            ownRelayToken: ownRelay?.relayToken,
-            contactAddedNearby: addedNearby
+            ownRelayToken: ownRelay?.relayToken
         )
     }
 
@@ -40,18 +36,11 @@ enum FriendDirectoryScope {
     static func candidatesFor(
         recipient: Contact,
         contacts: [Contact],
-        ownRelay: RelayConfig?,
-        addedNearby: (Data) -> Bool
+        ownRelay: RelayConfig?
     ) -> [Contact] {
-        guard introducible(recipient, ownRelay: ownRelay, addedNearby: addedNearby(recipient.userId))
-        else { return [] }
+        guard introducible(recipient, ownRelay: ownRelay) else { return [] }
         return contacts.filter { candidate in
-            candidate.userId != recipient.userId
-                && introducible(
-                    candidate,
-                    ownRelay: ownRelay,
-                    addedNearby: addedNearby(candidate.userId)
-                )
+            candidate.userId != recipient.userId && introducible(candidate, ownRelay: ownRelay)
         }
     }
 }

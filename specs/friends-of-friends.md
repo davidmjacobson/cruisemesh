@@ -58,30 +58,34 @@ all** before their phone requests the suggested connections.
    tester pass reached a child's phone exactly this way. The pass is the
    boundary the product already draws around a family, so introductions use it.
 
-   An **absent** pass is where this gets decided rather than assumed, because
-   a relative who has not finished onboarding and a family met on holiday who
-   never bought a pass look identical from the card alone. The rule:
+   No pass on either side means no introductions — there is no fallback, and
+   that is the whole rule. `relay_contact_shares_own_family` in the core is
+   the single comparison both shells use.
 
-   - **We have a pass.** Eligible only if the contact is on it. A contact with
-     no pass is *not yet* in the family rather than outside it, and becomes
-     eligible the moment they enter the pass we gave them — the pass-change
-     re-fan below replays that with no user action. Meeting them in person
-     buys no exception; that is exactly what the holiday case looks like.
-   - **Neither side has a pass.** No family boundary is drawn yet, so fall
-     back to the only one that exists: whether we actually met.
-     `ContactProvenance::added_nearby` is that stored fact, and a remote
-     re-add never unmakes it.
-   - **They have a pass and we do not.** Not eligible — they belong to a
-     family whose boundary we cannot see.
+   **This makes friends-of-friends part of a Cruise Pass. Say so plainly
+   rather than letting people discover it.** An earlier version let two
+   passless phones introduce contacts they had added in person, to avoid
+   gating the feature on payment. It was dropped for two reasons. The signal
+   could not separate the cases that matter — a relative who has not finished
+   onboarding and a family met on holiday look identical when both were
+   scanned face to face — so the holiday case kept propagating, which is the
+   leak this decision exists to close. And "you met them in person and neither
+   of you has a pass" is not a reason anyone seeing a suggestion could predict
+   or understand; a rule nobody can explain is one nobody can trust.
 
-   The cost is deliberate: a family that never buys a pass gets introductions
-   only among people they met face to face. The alternative was letting every
-   passless contact count as family, which is precisely the leak.
+   What a passless family loses is the transitive step, not the ability to
+   connect: they add each other by scanning a code, or by sharing their own
+   friend link out of band. That is how everyone starts regardless, and
+   sharing your *own* link is the one form of card-passing that needs no
+   safeguards. What they gain is that nobody outside their household can be
+   suggested to their children.
+
+   A contact with no pass is *not yet* in the family rather than outside it,
+   and becomes eligible the moment they enter the pass you gave them — the
+   pass-change re-fan below replays that with no user action.
 
    This is scoping, not access control: reading another family's mailbox is
-   prevented by the token class itself (CP4). `friend_introduction_eligible`
-   in the core is the single rule both shells use, over the pure comparison
-   `relay_contact_shares_own_family`.
+   prevented by the token class itself (CP4).
 
    Enforced on both sides. A sender never puts an off-pass candidate in a
    snapshot; a receiver applies an off-pass introducer's snapshot as an *empty*
