@@ -1873,6 +1873,12 @@ public protocol MessageStoreProtocol : AnyObject {
     func clearRelayFetchCursors() throws 
     
     /**
+     * Directly scanning the person's own QR code is the escape hatch that
+     * clears both a suppression and any dismissal history.
+     */
+    func clearSharedRequestDismissal(requesterUserId: Data) throws 
+    
+    /**
      * Rows currently in the consumed-hidden-kind set, expired ones included
      * (diagnostics/tests).
      */
@@ -2134,6 +2140,10 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func deleteGroup(groupId: Data) throws  -> Bool
     
+    func deleteOutgoingSharedRequest(candidateUserId: Data) throws 
+    
+    func deletePendingSharedRequest(requesterUserId: Data) throws 
+    
     /**
      * `recipient_hint`s the peer can open: their own userId over recent
      * days, plus every imported group they belong to (DESIGN.md §6.5:
@@ -2231,6 +2241,10 @@ public protocol MessageStoreProtocol : AnyObject {
      * Look up one imported group by id, including its current member list.
      */
     func getGroup(groupId: Data) throws  -> Group?
+    
+    func getPendingSharedRequest(requesterUserId: Data) throws  -> PendingSharedRequest?
+    
+    func getSharedRequestDismissal(requesterUserId: Data) throws  -> SharedRequestDismissal?
     
     /**
      * The imported group whose recent-day hints include `hint`, if any --
@@ -2393,6 +2407,20 @@ public protocol MessageStoreProtocol : AnyObject {
      * All imported groups, alphabetical by name then id for stable ordering.
      */
     func listGroups() throws  -> [Group]
+    
+    /**
+     * All outgoing shared-card requests, including expired ones — expiry is
+     * exactly the state the UI must surface as "didn't respond", so the rows
+     * outlive it until the connection completes or the user clears them.
+     */
+    func listOutgoingSharedRequests() throws  -> [OutgoingSharedRequest]
+    
+    /**
+     * All pending shared-card requests, oldest first. Rows past expiry are
+     * swept here rather than by a background job — read is the only moment
+     * staleness matters.
+     */
+    func listPendingSharedRequests(nowMs: Int64) throws  -> [PendingSharedRequest]
     
     /**
      * Record that `relay_url` is confirmed to hold this carried envelope --
@@ -2572,6 +2600,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * tries again instead of believing a partial re-walk was a full one.
      */
     func noteRelaySweepCompleted(configKey: String, nowMs: Int64) throws 
+    
+    /**
+     * Should this requester's pending request raise a prompt right now, and
+     * if so, stamp it as prompted. One atomic decision so at most one prompt
+     * per requester per day survives concurrent deliveries: `false` for a
+     * suppressed requester, a missing row, or a prompt within the last day.
+     */
+    func noteSharedRequestPrompt(requesterUserId: Data, nowMs: Int64) throws  -> Bool
     
     /**
      * Exact sealed envelopes for this device's authored messages in
@@ -2779,6 +2815,12 @@ public protocol MessageStoreProtocol : AnyObject {
     func recordSentMetric(chatId: Data, lamport: UInt64, sentAtMs: Int64) throws 
     
     /**
+     * Record a **Not now** and return the new dismissal count, so the shell
+     * knows when to start offering "Don't ask again" (from the second one).
+     */
+    func recordSharedRequestDismissal(requesterUserId: Data) throws  -> UInt32
+    
+    /**
      * Where the walk of one relay mailbox got to (see
      * [`crate::relay_cursor`]). An unknown or empty `config_key` reads as
      * "nothing remembered": start at 0, sweep is due.
@@ -2887,6 +2929,11 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func setFriendSuggestionState(candidateUserId: Data, state: UInt8) throws 
     
+    /**
+     * "Don't ask again": a quiet local tombstone, no notification to anyone.
+     */
+    func suppressSharedRequests(requesterUserId: Data) throws 
+    
     func unblockUser(userId: Data) throws  -> Bool
     
     /**
@@ -2923,6 +2970,20 @@ public protocol MessageStoreProtocol : AnyObject {
      * and clear `relay_posted_at`; lower watermark -> ignored as stale.
      */
     func upsertOutgoingReceiptEnvelope(envelope: OutgoingReceiptEnvelope, queuedAtMs: Int64) throws  -> Bool
+    
+    /**
+     * Record (or refresh, on a re-send) the requester-side "waiting" state
+     * for one shared-card connection.
+     */
+    func upsertOutgoingSharedRequest(request: OutgoingSharedRequest) throws 
+    
+    /**
+     * Record or refresh an inbound shared-card request. A duplicate delivery
+     * updates the row rather than stacking prompts: `first_seen_ms` and
+     * `last_prompted_ms` are preserved so redelivery neither resets the
+     * prompt-rate clock nor re-raises the sheet.
+     */
+    func upsertPendingSharedRequest(request: PendingSharedRequest) throws 
     
 }
 
@@ -3374,6 +3435,17 @@ open func clearRelayFetchCursors()throws  {try rustCallWithError(FfiConverterTyp
 }
     
     /**
+     * Directly scanning the person's own QR code is the escape hatch that
+     * clears both a suppression and any dismissal history.
+     */
+open func clearSharedRequestDismissal(requesterUserId: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_shared_request_dismissal(self.uniffiClonePointer(),
+        FfiConverterData.lower(requesterUserId),$0
+    )
+}
+}
+    
+    /**
      * Rows currently in the consumed-hidden-kind set, expired ones included
      * (diagnostics/tests).
      */
@@ -3731,6 +3803,20 @@ open func deleteGroup(groupId: Data)throws  -> Bool {
 })
 }
     
+open func deleteOutgoingSharedRequest(candidateUserId: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_delete_outgoing_shared_request(self.uniffiClonePointer(),
+        FfiConverterData.lower(candidateUserId),$0
+    )
+}
+}
+    
+open func deletePendingSharedRequest(requesterUserId: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_delete_pending_shared_request(self.uniffiClonePointer(),
+        FfiConverterData.lower(requesterUserId),$0
+    )
+}
+}
+    
     /**
      * `recipient_hint`s the peer can open: their own userId over recent
      * days, plus every imported group they belong to (DESIGN.md §6.5:
@@ -3895,6 +3981,22 @@ open func getGroup(groupId: Data)throws  -> Group? {
     return try  FfiConverterOptionTypeGroup.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_get_group(self.uniffiClonePointer(),
         FfiConverterData.lower(groupId),$0
+    )
+})
+}
+    
+open func getPendingSharedRequest(requesterUserId: Data)throws  -> PendingSharedRequest? {
+    return try  FfiConverterOptionTypePendingSharedRequest.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_get_pending_shared_request(self.uniffiClonePointer(),
+        FfiConverterData.lower(requesterUserId),$0
+    )
+})
+}
+    
+open func getSharedRequestDismissal(requesterUserId: Data)throws  -> SharedRequestDismissal? {
+    return try  FfiConverterOptionTypeSharedRequestDismissal.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_get_shared_request_dismissal(self.uniffiClonePointer(),
+        FfiConverterData.lower(requesterUserId),$0
     )
 })
 }
@@ -4168,6 +4270,31 @@ open func listGroups()throws  -> [Group] {
 }
     
     /**
+     * All outgoing shared-card requests, including expired ones — expiry is
+     * exactly the state the UI must surface as "didn't respond", so the rows
+     * outlive it until the connection completes or the user clears them.
+     */
+open func listOutgoingSharedRequests()throws  -> [OutgoingSharedRequest] {
+    return try  FfiConverterSequenceTypeOutgoingSharedRequest.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_list_outgoing_shared_requests(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * All pending shared-card requests, oldest first. Rows past expiry are
+     * swept here rather than by a background job — read is the only moment
+     * staleness matters.
+     */
+open func listPendingSharedRequests(nowMs: Int64)throws  -> [PendingSharedRequest] {
+    return try  FfiConverterSequenceTypePendingSharedRequest.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_list_pending_shared_requests(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * Record that `relay_url` is confirmed to hold this carried envelope --
      * either because this device just uploaded it there (2xx) or because it
      * just fetched the same `msg_id` off that relay's mailbox. From then on
@@ -4427,6 +4554,21 @@ open func noteRelaySweepCompleted(configKey: String, nowMs: Int64)throws  {try r
         FfiConverterInt64.lower(nowMs),$0
     )
 }
+}
+    
+    /**
+     * Should this requester's pending request raise a prompt right now, and
+     * if so, stamp it as prompted. One atomic decision so at most one prompt
+     * per requester per day survives concurrent deliveries: `false` for a
+     * suppressed requester, a missing row, or a prompt within the last day.
+     */
+open func noteSharedRequestPrompt(requesterUserId: Data, nowMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_note_shared_request_prompt(self.uniffiClonePointer(),
+        FfiConverterData.lower(requesterUserId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
 }
     
     /**
@@ -4797,6 +4939,18 @@ open func recordSentMetric(chatId: Data, lamport: UInt64, sentAtMs: Int64)throws
 }
     
     /**
+     * Record a **Not now** and return the new dismissal count, so the shell
+     * knows when to start offering "Don't ask again" (from the second one).
+     */
+open func recordSharedRequestDismissal(requesterUserId: Data)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_record_shared_request_dismissal(self.uniffiClonePointer(),
+        FfiConverterData.lower(requesterUserId),$0
+    )
+})
+}
+    
+    /**
      * Where the walk of one relay mailbox got to (see
      * [`crate::relay_cursor`]). An unknown or empty `config_key` reads as
      * "nothing remembered": start at 0, sweep is due.
@@ -4991,6 +5145,16 @@ open func setFriendSuggestionState(candidateUserId: Data, state: UInt8)throws  {
 }
 }
     
+    /**
+     * "Don't ask again": a quiet local tombstone, no notification to anyone.
+     */
+open func suppressSharedRequests(requesterUserId: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_suppress_shared_requests(self.uniffiClonePointer(),
+        FfiConverterData.lower(requesterUserId),$0
+    )
+}
+}
+    
 open func unblockUser(userId: Data)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_unblock_user(self.uniffiClonePointer(),
@@ -5066,6 +5230,30 @@ open func upsertOutgoingReceiptEnvelope(envelope: OutgoingReceiptEnvelope, queue
         FfiConverterInt64.lower(queuedAtMs),$0
     )
 })
+}
+    
+    /**
+     * Record (or refresh, on a re-send) the requester-side "waiting" state
+     * for one shared-card connection.
+     */
+open func upsertOutgoingSharedRequest(request: OutgoingSharedRequest)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_upsert_outgoing_shared_request(self.uniffiClonePointer(),
+        FfiConverterTypeOutgoingSharedRequest.lower(request),$0
+    )
+}
+}
+    
+    /**
+     * Record or refresh an inbound shared-card request. A duplicate delivery
+     * updates the row rather than stacking prompts: `first_seen_ms` and
+     * `last_prompted_ms` are preserved so redelivery neither resets the
+     * prompt-rate clock nor re-raises the sheet.
+     */
+open func upsertPendingSharedRequest(request: PendingSharedRequest)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_upsert_pending_shared_request(self.uniffiClonePointer(),
+        FfiConverterTypePendingSharedRequest.lower(request),$0
+    )
+}
 }
     
 
@@ -5922,7 +6110,8 @@ public func FfiConverterTypeContactDiscoveryPolicy_lower(_ value: ContactDiscove
 public struct ContactProvenance {
     public var userId: Data
     /**
-     * 0 = direct QR/link, 1 = introduced by another accepted contact.
+     * 0 = direct QR/link, 1 = introduced by another accepted contact,
+     * 2 = added from a shared contact card (specs/share-contact.md).
      */
     public var source: UInt8
     public var introducerUserId: Data?
@@ -5945,7 +6134,8 @@ public struct ContactProvenance {
     // declare one manually.
     public init(userId: Data, 
         /**
-         * 0 = direct QR/link, 1 = introduced by another accepted contact.
+         * 0 = direct QR/link, 1 = introduced by another accepted contact,
+         * 2 = added from a shared contact card (specs/share-contact.md).
          */source: UInt8, introducerUserId: Data?, introducedAtMs: Int64, 
         /**
          * Were we standing next to this person when we accepted them? True for a
@@ -8125,6 +8315,78 @@ public func FfiConverterTypeFriendDirectoryEntry_lower(_ value: FriendDirectoryE
 
 
 /**
+ * A decoded `kind=3` friend-request payload: the requester's own card, plus
+ * the shared card they imported from, when the request originated from one.
+ * The tail rides as an extra JSON field old clients ignore, so a tailless
+ * request keeps meaning "this person physically scanned your code".
+ */
+public struct FriendRequestContent {
+    public var card: FriendCard
+    public var shared: SharedFriendCard?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(card: FriendCard, shared: SharedFriendCard?) {
+        self.card = card
+        self.shared = shared
+    }
+}
+
+
+
+extension FriendRequestContent: Equatable, Hashable {
+    public static func ==(lhs: FriendRequestContent, rhs: FriendRequestContent) -> Bool {
+        if lhs.card != rhs.card {
+            return false
+        }
+        if lhs.shared != rhs.shared {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(card)
+        hasher.combine(shared)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFriendRequestContent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendRequestContent {
+        return
+            try FriendRequestContent(
+                card: FfiConverterTypeFriendCard.read(from: &buf), 
+                shared: FfiConverterOptionTypeSharedFriendCard.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FriendRequestContent, into buf: inout [UInt8]) {
+        FfiConverterTypeFriendCard.write(value.card, into: &buf)
+        FfiConverterOptionTypeSharedFriendCard.write(value.shared, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendRequestContent_lift(_ buf: RustBuffer) throws -> FriendRequestContent {
+    return try FfiConverterTypeFriendRequestContent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendRequestContent_lower(_ value: FriendRequestContent) -> RustBuffer {
+    return FfiConverterTypeFriendRequestContent.lower(value)
+}
+
+
+/**
  * One candidate/source pair. Callers group rows with the same candidate
  * UserID to present all known mutual friends.
  */
@@ -9587,6 +9849,84 @@ public func FfiConverterTypeOutgoingReceiptEnvelope_lower(_ value: OutgoingRecei
 }
 
 
+/**
+ * The requester's record of a shared-card request it sent, so the UI can
+ * honestly distinguish "waiting" from "didn't respond" (past expiry).
+ */
+public struct OutgoingSharedRequest {
+    public var candidateUserId: Data
+    public var expiresAtMs: Int64
+    public var sentAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(candidateUserId: Data, expiresAtMs: Int64, sentAtMs: Int64) {
+        self.candidateUserId = candidateUserId
+        self.expiresAtMs = expiresAtMs
+        self.sentAtMs = sentAtMs
+    }
+}
+
+
+
+extension OutgoingSharedRequest: Equatable, Hashable {
+    public static func ==(lhs: OutgoingSharedRequest, rhs: OutgoingSharedRequest) -> Bool {
+        if lhs.candidateUserId != rhs.candidateUserId {
+            return false
+        }
+        if lhs.expiresAtMs != rhs.expiresAtMs {
+            return false
+        }
+        if lhs.sentAtMs != rhs.sentAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(candidateUserId)
+        hasher.combine(expiresAtMs)
+        hasher.combine(sentAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutgoingSharedRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutgoingSharedRequest {
+        return
+            try OutgoingSharedRequest(
+                candidateUserId: FfiConverterData.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf), 
+                sentAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutgoingSharedRequest, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.candidateUserId, into: &buf)
+        FfiConverterInt64.write(value.expiresAtMs, into: &buf)
+        FfiConverterInt64.write(value.sentAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutgoingSharedRequest_lift(_ buf: RustBuffer) throws -> OutgoingSharedRequest {
+    return try FfiConverterTypeOutgoingSharedRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutgoingSharedRequest_lower(_ value: OutgoingSharedRequest) -> RustBuffer {
+    return FfiConverterTypeOutgoingSharedRequest.lower(value)
+}
+
+
 public struct PeerConnectionEvent {
     public var userId: Data
     public var transport: PeerConnectionTransport
@@ -9778,6 +10118,150 @@ public func FfiConverterTypePeerConnectionSummary_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypePeerConnectionSummary_lower(_ value: PeerConnectionSummary) -> RustBuffer {
     return FfiConverterTypePeerConnectionSummary.lower(value)
+}
+
+
+/**
+ * An inbound friend request that originated from a shared contact card and
+ * is waiting for this user's explicit decision (specs/share-contact.md).
+ * Everything needed to build the Contact on accept, held outside `contacts`
+ * until then.
+ */
+public struct PendingSharedRequest {
+    public var requesterUserId: Data
+    public var name: String
+    public var signPk: Data
+    public var agreePk: Data
+    public var relayUrl: String?
+    public var relayToken: String?
+    public var sharerUserId: Data
+    public var expiresAtMs: Int64
+    public var firstSeenMs: Int64
+    /**
+     * When this request last raised a prompt; 0 = never. Gates the
+     * one-prompt-per-requester-per-day rule.
+     */
+    public var lastPromptedMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(requesterUserId: Data, name: String, signPk: Data, agreePk: Data, relayUrl: String?, relayToken: String?, sharerUserId: Data, expiresAtMs: Int64, firstSeenMs: Int64, 
+        /**
+         * When this request last raised a prompt; 0 = never. Gates the
+         * one-prompt-per-requester-per-day rule.
+         */lastPromptedMs: Int64) {
+        self.requesterUserId = requesterUserId
+        self.name = name
+        self.signPk = signPk
+        self.agreePk = agreePk
+        self.relayUrl = relayUrl
+        self.relayToken = relayToken
+        self.sharerUserId = sharerUserId
+        self.expiresAtMs = expiresAtMs
+        self.firstSeenMs = firstSeenMs
+        self.lastPromptedMs = lastPromptedMs
+    }
+}
+
+
+
+extension PendingSharedRequest: Equatable, Hashable {
+    public static func ==(lhs: PendingSharedRequest, rhs: PendingSharedRequest) -> Bool {
+        if lhs.requesterUserId != rhs.requesterUserId {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.signPk != rhs.signPk {
+            return false
+        }
+        if lhs.agreePk != rhs.agreePk {
+            return false
+        }
+        if lhs.relayUrl != rhs.relayUrl {
+            return false
+        }
+        if lhs.relayToken != rhs.relayToken {
+            return false
+        }
+        if lhs.sharerUserId != rhs.sharerUserId {
+            return false
+        }
+        if lhs.expiresAtMs != rhs.expiresAtMs {
+            return false
+        }
+        if lhs.firstSeenMs != rhs.firstSeenMs {
+            return false
+        }
+        if lhs.lastPromptedMs != rhs.lastPromptedMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(requesterUserId)
+        hasher.combine(name)
+        hasher.combine(signPk)
+        hasher.combine(agreePk)
+        hasher.combine(relayUrl)
+        hasher.combine(relayToken)
+        hasher.combine(sharerUserId)
+        hasher.combine(expiresAtMs)
+        hasher.combine(firstSeenMs)
+        hasher.combine(lastPromptedMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePendingSharedRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PendingSharedRequest {
+        return
+            try PendingSharedRequest(
+                requesterUserId: FfiConverterData.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                signPk: FfiConverterData.read(from: &buf), 
+                agreePk: FfiConverterData.read(from: &buf), 
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
+                relayToken: FfiConverterOptionString.read(from: &buf), 
+                sharerUserId: FfiConverterData.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf), 
+                firstSeenMs: FfiConverterInt64.read(from: &buf), 
+                lastPromptedMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PendingSharedRequest, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.requesterUserId, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterData.write(value.signPk, into: &buf)
+        FfiConverterData.write(value.agreePk, into: &buf)
+        FfiConverterOptionString.write(value.relayUrl, into: &buf)
+        FfiConverterOptionString.write(value.relayToken, into: &buf)
+        FfiConverterData.write(value.sharerUserId, into: &buf)
+        FfiConverterInt64.write(value.expiresAtMs, into: &buf)
+        FfiConverterInt64.write(value.firstSeenMs, into: &buf)
+        FfiConverterInt64.write(value.lastPromptedMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingSharedRequest_lift(_ buf: RustBuffer) throws -> PendingSharedRequest {
+    return try FfiConverterTypePendingSharedRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingSharedRequest_lower(_ value: PendingSharedRequest) -> RustBuffer {
+    return FfiConverterTypePendingSharedRequest.lower(value)
 }
 
 
@@ -10297,6 +10781,217 @@ public func FfiConverterTypeRelayUpdateContent_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeRelayUpdateContent_lower(_ value: RelayUpdateContent) -> RustBuffer {
     return FfiConverterTypeRelayUpdateContent.lower(value)
+}
+
+
+/**
+ * One contact's friend card, deliberately handed to somebody else by a mutual
+ * acquaintance (specs/share-contact.md). Carries the stored card
+ * byte-identical (decision 8: never substitute the sharer's own credentials),
+ * plus who shared it, a validity window, and the sharer's Ed25519 signature
+ * over all of it. The signature is what lets the shared person's phone verify
+ * the request came from a card one of their own accepted contacts actually
+ * issued, rather than from anyone who once saw their link.
+ */
+public struct SharedFriendCard {
+    public var version: UInt8
+    public var card: FriendCard
+    public var sharerUserId: Data
+    /**
+     * The shared person's discovery-policy revision at issue time. Checked
+     * for equality on their phone (decision 10) so an off-then-on cycle
+     * kills every card issued before it.
+     */
+    public var sharedPolicyRevision: UInt64
+    public var issuedAtMs: Int64
+    public var expiresAtMs: Int64
+    public var signature: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(version: UInt8, card: FriendCard, sharerUserId: Data, 
+        /**
+         * The shared person's discovery-policy revision at issue time. Checked
+         * for equality on their phone (decision 10) so an off-then-on cycle
+         * kills every card issued before it.
+         */sharedPolicyRevision: UInt64, issuedAtMs: Int64, expiresAtMs: Int64, signature: Data) {
+        self.version = version
+        self.card = card
+        self.sharerUserId = sharerUserId
+        self.sharedPolicyRevision = sharedPolicyRevision
+        self.issuedAtMs = issuedAtMs
+        self.expiresAtMs = expiresAtMs
+        self.signature = signature
+    }
+}
+
+
+
+extension SharedFriendCard: Equatable, Hashable {
+    public static func ==(lhs: SharedFriendCard, rhs: SharedFriendCard) -> Bool {
+        if lhs.version != rhs.version {
+            return false
+        }
+        if lhs.card != rhs.card {
+            return false
+        }
+        if lhs.sharerUserId != rhs.sharerUserId {
+            return false
+        }
+        if lhs.sharedPolicyRevision != rhs.sharedPolicyRevision {
+            return false
+        }
+        if lhs.issuedAtMs != rhs.issuedAtMs {
+            return false
+        }
+        if lhs.expiresAtMs != rhs.expiresAtMs {
+            return false
+        }
+        if lhs.signature != rhs.signature {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(version)
+        hasher.combine(card)
+        hasher.combine(sharerUserId)
+        hasher.combine(sharedPolicyRevision)
+        hasher.combine(issuedAtMs)
+        hasher.combine(expiresAtMs)
+        hasher.combine(signature)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSharedFriendCard: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SharedFriendCard {
+        return
+            try SharedFriendCard(
+                version: FfiConverterUInt8.read(from: &buf), 
+                card: FfiConverterTypeFriendCard.read(from: &buf), 
+                sharerUserId: FfiConverterData.read(from: &buf), 
+                sharedPolicyRevision: FfiConverterUInt64.read(from: &buf), 
+                issuedAtMs: FfiConverterInt64.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf), 
+                signature: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SharedFriendCard, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.version, into: &buf)
+        FfiConverterTypeFriendCard.write(value.card, into: &buf)
+        FfiConverterData.write(value.sharerUserId, into: &buf)
+        FfiConverterUInt64.write(value.sharedPolicyRevision, into: &buf)
+        FfiConverterInt64.write(value.issuedAtMs, into: &buf)
+        FfiConverterInt64.write(value.expiresAtMs, into: &buf)
+        FfiConverterData.write(value.signature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSharedFriendCard_lift(_ buf: RustBuffer) throws -> SharedFriendCard {
+    return try FfiConverterTypeSharedFriendCard.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSharedFriendCard_lower(_ value: SharedFriendCard) -> RustBuffer {
+    return FfiConverterTypeSharedFriendCard.lower(value)
+}
+
+
+/**
+ * Dismissal state for one requester's shared-card prompts. Survives the
+ * pending row it came from.
+ */
+public struct SharedRequestDismissal {
+    public var requesterUserId: Data
+    public var count: UInt32
+    /**
+     * Once true ("Don't ask again"), matching requests are dropped before
+     * any prompt. Cleared only by directly scanning that person's own code.
+     */
+    public var suppressed: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(requesterUserId: Data, count: UInt32, 
+        /**
+         * Once true ("Don't ask again"), matching requests are dropped before
+         * any prompt. Cleared only by directly scanning that person's own code.
+         */suppressed: Bool) {
+        self.requesterUserId = requesterUserId
+        self.count = count
+        self.suppressed = suppressed
+    }
+}
+
+
+
+extension SharedRequestDismissal: Equatable, Hashable {
+    public static func ==(lhs: SharedRequestDismissal, rhs: SharedRequestDismissal) -> Bool {
+        if lhs.requesterUserId != rhs.requesterUserId {
+            return false
+        }
+        if lhs.count != rhs.count {
+            return false
+        }
+        if lhs.suppressed != rhs.suppressed {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(requesterUserId)
+        hasher.combine(count)
+        hasher.combine(suppressed)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSharedRequestDismissal: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SharedRequestDismissal {
+        return
+            try SharedRequestDismissal(
+                requesterUserId: FfiConverterData.read(from: &buf), 
+                count: FfiConverterUInt32.read(from: &buf), 
+                suppressed: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SharedRequestDismissal, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.requesterUserId, into: &buf)
+        FfiConverterUInt32.write(value.count, into: &buf)
+        FfiConverterBool.write(value.suppressed, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSharedRequestDismissal_lift(_ buf: RustBuffer) throws -> SharedRequestDismissal {
+    return try FfiConverterTypeSharedRequestDismissal.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSharedRequestDismissal_lower(_ value: SharedRequestDismissal) -> RustBuffer {
+    return FfiConverterTypeSharedRequestDismissal.lower(value)
 }
 
 
@@ -11969,6 +12664,81 @@ extension FriendCardMatch: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What a scanned/pasted friend text turned out to be. Shells route
+ * `Direct` through the existing confirmation flow and `Shared` through the
+ * shared-card flow (expiry message, "Shared by …" line, tailed request).
+ */
+
+public enum FriendImport {
+    
+    case direct(card: FriendCard
+    )
+    case shared(shared: SharedFriendCard
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFriendImport: FfiConverterRustBuffer {
+    typealias SwiftType = FriendImport
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendImport {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .direct(card: try FfiConverterTypeFriendCard.read(from: &buf)
+        )
+        
+        case 2: return .shared(shared: try FfiConverterTypeSharedFriendCard.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FriendImport, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .direct(card):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeFriendCard.write(card, into: &buf)
+            
+        
+        case let .shared(shared):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypeSharedFriendCard.write(shared, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendImport_lift(_ buf: RustBuffer) throws -> FriendImport {
+    return try FfiConverterTypeFriendImport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFriendImport_lower(_ value: FriendImport) -> RustBuffer {
+    return FfiConverterTypeFriendImport.lower(value)
+}
+
+
+
+extension FriendImport: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * A metadata-only connection event. No addresses, network names, tokens, or
  * message content are retained.
  *
@@ -12620,6 +13390,30 @@ fileprivate struct FfiConverterOptionTypeOutgoingReceiptEnvelope: FfiConverterRu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypePendingSharedRequest: FfiConverterRustBuffer {
+    typealias SwiftType = PendingSharedRequest?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePendingSharedRequest.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePendingSharedRequest.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeRelayEndpoint: FfiConverterRustBuffer {
     typealias SwiftType = RelayEndpoint?
 
@@ -12636,6 +13430,54 @@ fileprivate struct FfiConverterOptionTypeRelayEndpoint: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeRelayEndpoint.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSharedFriendCard: FfiConverterRustBuffer {
+    typealias SwiftType = SharedFriendCard?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSharedFriendCard.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSharedFriendCard.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSharedRequestDismissal: FfiConverterRustBuffer {
+    typealias SwiftType = SharedRequestDismissal?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSharedRequestDismissal.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSharedRequestDismissal.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -13389,6 +14231,31 @@ fileprivate struct FfiConverterSequenceTypeOutgoingReceiptEnvelope: FfiConverter
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeOutgoingSharedRequest: FfiConverterRustBuffer {
+    typealias SwiftType = [OutgoingSharedRequest]
+
+    public static func write(_ value: [OutgoingSharedRequest], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeOutgoingSharedRequest.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [OutgoingSharedRequest] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [OutgoingSharedRequest]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeOutgoingSharedRequest.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypePeerConnectionEvent: FfiConverterRustBuffer {
     typealias SwiftType = [PeerConnectionEvent]
 
@@ -13431,6 +14298,31 @@ fileprivate struct FfiConverterSequenceTypePeerConnectionSummary: FfiConverterRu
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypePeerConnectionSummary.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePendingSharedRequest: FfiConverterRustBuffer {
+    typealias SwiftType = [PendingSharedRequest]
+
+    public static func write(_ value: [PendingSharedRequest], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePendingSharedRequest.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PendingSharedRequest] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PendingSharedRequest]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePendingSharedRequest.read(from: &buf))
         }
         return seq
     }
@@ -14359,6 +15251,20 @@ public func createIntroductionTicket(introducer: Identity, candidateUserId: Data
     )
 })
 }
+/**
+ * Issue a shared card for `card` (a contact's stored friend card), signed by
+ * the sharer. Expiry is fixed at seven days from `now_ms`.
+ */
+public func createSharedFriendCard(sharer: Identity, card: FriendCard, sharedPolicyRevision: UInt64, nowMs: Int64)throws  -> SharedFriendCard {
+    return try  FfiConverterTypeSharedFriendCard.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_create_shared_friend_card(
+        FfiConverterTypeIdentity.lower(sharer),
+        FfiConverterTypeFriendCard.lower(card),
+        FfiConverterUInt64.lower(sharedPolicyRevision),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
 public func decodeAttachmentPayload(bytes: Data) -> CoreAttachmentPayload? {
     return try!  FfiConverterOptionTypeCoreAttachmentPayload.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_decode_attachment_payload(
@@ -15010,6 +15916,31 @@ public func makeRelaySetupCard(relayUrl: String, relayToken: String)throws  -> S
 })
 }
 /**
+ * The scannable text form of a shared card, for QR rendering only.
+ */
+public func makeSharedContactCode(shared: SharedFriendCard)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_make_shared_contact_code(
+        FfiConverterTypeSharedFriendCard.lower(shared),$0
+    )
+})
+}
+/**
+ * Build the `kind=3` payload for a request that originated from a shared
+ * card: the requester's ordinary card JSON with the shared card appended as
+ * an extra `shared` field. Old clients deserialize the same JSON into a
+ * plain FriendCard, ignore the unknown field, and auto-import exactly as
+ * today — the confirmation step is a property of updated recipients.
+ */
+public func makeSharedFriendRequestPayload(cardJson: String, shared: SharedFriendCard)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_make_shared_friend_request_payload(
+        FfiConverterString.lower(cardJson),
+        FfiConverterTypeSharedFriendCard.lower(shared),$0
+    )
+})
+}
+/**
  * Canonicalize a relay base URL, **rejecting anything that would put the
  * family's relay token on an unencrypted connection**.
  *
@@ -15102,6 +16033,30 @@ public func parseFrame(bytes: Data)throws  -> Frame {
 public func parseFriendCard(json: String)throws  -> FriendCard {
     return try  FfiConverterTypeFriendCard.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_parse_friend_card(
+        FfiConverterString.lower(json),$0
+    )
+})
+}
+/**
+ * Parse anything a scan or paste can produce: a shared-contact code, or any
+ * of the direct friend-card forms `parse_friend_text` accepts.
+ */
+public func parseFriendImport(text: String)throws  -> FriendImport {
+    return try  FfiConverterTypeFriendImport.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_parse_friend_import(
+        FfiConverterString.lower(text),$0
+    )
+})
+}
+/**
+ * Decode an inbound `kind=3` payload: the requester's card plus the shared
+ * tail when present. A malformed tail is an error, not a silent downgrade to
+ * the auto-import path — dropping a bad request outright is the fail-closed
+ * direction here.
+ */
+public func parseFriendRequestContent(json: String)throws  -> FriendRequestContent {
+    return try  FfiConverterTypeFriendRequestContent.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_parse_friend_request_content(
         FfiConverterString.lower(json),$0
     )
 })
@@ -15795,6 +16750,19 @@ public func sealMessage(sender: Identity, recipientAgreePk: Data, payload: Data)
 })
 }
 /**
+ * Scanner-side expiry check, for the specific "This code has expired. Ask
+ * for a new one." message rather than a generic parse failure. The shared
+ * person's own verification applies clock skew; the scanner does not need to.
+ */
+public func sharedCardExpired(shared: SharedFriendCard, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_shared_card_expired(
+        FfiConverterTypeSharedFriendCard.lower(shared),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
  * Whether a long-lived link is due to re-run its digest exchange (D8).
  *
  * The interval is jittered per link across `[REDIGEST_MIN_INTERVAL_MS,
@@ -15837,6 +16805,26 @@ public func verifyIntroductionTicket(ticket: IntroductionTicket, introducerSignP
         FfiConverterData.lower(expectedCandidateUserId),
         FfiConverterData.lower(expectedInviteeUserId),
         FfiConverterUInt64.lower(expectedCandidatePolicyRevision),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * Every check the *shared person's* phone can run from the card alone:
+ * the card really is mine, the named sharer signed exactly this card and
+ * window, it is unexpired within a day of clock skew, and it was issued
+ * under my current discovery-policy revision. The caller supplies the
+ * relationship checks (sharer is an accepted, non-blocked contact; my
+ * discovery switch is on) because they live in the store, not the card.
+ * Any `false` here means: drop the request without a prompt.
+ */
+public func verifySharedFriendCard(shared: SharedFriendCard, sharerSignPk: Data, expectedCardUserId: Data, expectedPolicyRevision: UInt64, nowMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_verify_shared_friend_card(
+        FfiConverterTypeSharedFriendCard.lower(shared),
+        FfiConverterData.lower(sharerSignPk),
+        FfiConverterData.lower(expectedCardUserId),
+        FfiConverterUInt64.lower(expectedPolicyRevision),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -16019,6 +17007,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_create_introduction_ticket() != 2547) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_create_shared_friend_card() != 10531) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_decode_attachment_payload() != 15495) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16181,6 +17172,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_make_relay_setup_card() != 25797) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_make_shared_contact_code() != 29140) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_make_shared_friend_request_payload() != 31913) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 19541) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16197,6 +17194,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_parse_friend_card() != 1373) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_parse_friend_import() != 5666) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_parse_friend_request_content() != 35709) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_parse_friend_text() != 63241) {
@@ -16313,6 +17316,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_seal_message() != 58379) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_shared_card_expired() != 2993) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_should_redigest() != 43848) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16320,6 +17326,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_verify_introduction_ticket() != 3092) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_verify_shared_friend_card() != 27605) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_bleframereassembler_accept() != 35445) {
@@ -16493,6 +17502,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_relay_fetch_cursors() != 5399) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_shared_request_dismissal() != 60027) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_consumed_hidden_msg_id_count() != 12326) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16532,6 +17544,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_group() != 30648) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_outgoing_shared_request() != 63800) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_pending_shared_request() != 25502) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delivery_hints_for_peer() != 55681) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16560,6 +17578,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_get_group() != 20599) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_get_pending_shared_request() != 44091) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_get_shared_request_dismissal() != 30817) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_group_matching_hint() != 19074) {
@@ -16610,6 +17634,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_list_groups() != 47601) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_list_outgoing_shared_requests() != 51614) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_list_pending_shared_requests() != 18456) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_carried_envelope_relay_uploaded() != 31075) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16644,6 +17674,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_sweep_completed() != 49168) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_shared_request_prompt() != 16956) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_outbound_envelopes_after() != 35551) {
@@ -16712,6 +17745,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_sent_metric() != 27687) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_shared_request_dismissal() != 11001) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_cursor() != 29554) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16751,6 +17787,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_set_friend_suggestion_state() != 34158) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_suppress_shared_requests() != 62070) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_unblock_user() != 18388) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16770,6 +17809,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_outgoing_receipt_envelope() != 65307) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_outgoing_shared_request() != 43501) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_upsert_pending_shared_request() != 3883) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_seenids_check_and_record() != 58281) {
