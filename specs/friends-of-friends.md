@@ -50,6 +50,31 @@ all** before their phone requests the suggested connections.
    The request uses the recipient's current relay or BLE muling. Ordinary
    friend-card/profile exchange reconciles relay details after the introduction
    completes.
+7. **Introductions stay inside one Cruise Pass.** A contact is offered as a
+   candidate, and sent a snapshot at all, only when they are on the sharer's
+   own pass. The contact graph does not stop at a household: one person who has
+   scanned somebody outside the family is enough for that outside circle to
+   start propagating into family suggestion lists. In a field test a shared
+   tester pass reached a child's phone exactly this way. The pass is the
+   boundary the product already draws around a family, so introductions use it.
+
+   A contact with **no** pass of their own stays eligible — their pass is
+   unknown, not foreign, and sends to them already fall back to the sharer's
+   own mailbox. So does everyone when the sharer has no pass, since no
+   classification is possible. This is scoping, not access control: reading
+   another family's mailbox is prevented by the token class itself (CP4).
+   `relay_contact_shares_own_family` in the core is the single comparison both
+   shells use.
+
+   Enforced on both sides. A sender never puts an off-pass candidate in a
+   snapshot; a receiver applies an off-pass introducer's snapshot as an *empty*
+   one, which retracts anything that introducer supplied before the rule
+   existed, so a phone heals on its own next pass rather than waiting for every
+   other phone in the graph to update.
+
+   Deliberately meeting somebody outside your pass is a separate, explicit act
+   (sharing a specific contact's card), not something suggestions should do on
+   your behalf.
 
 The default-on choice deserves clear disclosure. New installs should explain it
 in onboarding, and upgraded installs should show a one-time informational card
@@ -366,6 +391,9 @@ Queue a new directory revision, debounced into one update, when:
 - a contact is added, updated, deleted, blocked, or unblocked;
 - a contact's discovery policy changes;
 - the local friends-of-friends setting changes;
+- the local Cruise Pass changes, since it decides who is eligible at all
+  (decision 7) — driven from the same endpoint-change announcement that already
+  fans a new endpoint out to contacts;
 - an app upgrade first advertises v1 support; or
 - periodic repair detects that a current contact has never received a snapshot.
 

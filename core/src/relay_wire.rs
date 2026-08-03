@@ -233,6 +233,46 @@ pub fn resolved_contact_relay(
     }
 }
 
+/// Does this contact's card credential belong to the *same* Cruise Pass as
+/// ours? Both classes of card count: a post-CP4 card carries our family's
+/// deposit token (the attenuation of our member token), a pre-CP4 one carries
+/// the member token itself.
+///
+/// Two cases deliberately answer `true` without matching anything:
+///
+/// - **The contact's card carries no relay fields.** Their pass is unknown,
+///   not foreign — this is a family member who has not set a pass up yet, and
+///   sends to them already fall back to our own mailbox
+///   ([`resolved_contact_relay`]). Treating unknown as foreign would make the
+///   feature that most helps a half-onboarded family the one thing they
+///   cannot use.
+/// - **We have no pass of our own.** Nothing to compare against, so no
+///   classification is possible; answering `false` for everyone would
+///   silently switch off any caller that gates on this.
+///
+/// Callers therefore get "not known to be somebody else's pass" rather than a
+/// cryptographic guarantee. That is the right strength for a *scoping*
+/// decision (whom to volunteer an introduction to). It would be the wrong
+/// strength for an access-control decision, and it is not used as one:
+/// reading another family's mailbox is prevented by the token class itself
+/// (see [`resolved_contact_poll_relay`]).
+#[uniffi::export]
+pub fn relay_contact_shares_own_family(
+    contact_relay_url: Option<String>,
+    contact_relay_token: Option<String>,
+    own_relay_url: Option<String>,
+    own_relay_token: Option<String>,
+) -> bool {
+    let Some(contact) = relay_endpoint_from(contact_relay_url, contact_relay_token) else {
+        return true;
+    };
+    let Some(own) = relay_endpoint_from(own_relay_url, own_relay_token) else {
+        return true;
+    };
+    contact.url == own.url
+        && (contact.token == own.token || contact.token == relay_deposit_token_for(own.token))
+}
+
 /// Poll-path routing (CP4): which mailbox, if any, may be *read*
 /// (fetch/ack/presence) on this contact's behalf. Deposit tokens cannot
 /// read, so a resolved endpoint that would carry one is dropped rather than
@@ -910,6 +950,80 @@ fn relay_host_only(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // OWN_URL / OWN_TOKEN are defined with the contact_delivery tests below.
+    const OTHER_TOKEN: &str = "other-family-member-token";
+
+    fn shares(contact_url: Option<&str>, contact_token: Option<&str>) -> bool {
+        relay_contact_shares_own_family(
+            contact_url.map(str::to_string),
+            contact_token.map(str::to_string),
+            Some(OWN_URL.to_string()),
+            Some(OWN_TOKEN.to_string()),
+        )
+    }
+
+    #[test]
+    fn own_family_cards_of_both_token_classes_are_recognized() {
+        // Post-CP4 card: our family's deposit token.
+        assert!(shares(
+            Some(OWN_URL),
+            Some(&relay_deposit_token_for(OWN_TOKEN.into()))
+        ));
+        // Pre-CP4 card: the member token itself.
+        assert!(shares(Some(OWN_URL), Some(OWN_TOKEN)));
+    }
+
+    #[test]
+    fn another_familys_card_is_foreign_in_both_classes() {
+        // The tester-pass case this scoping exists for: a real, working card
+        // on the same relay host, but a different family's mailbox.
+        assert!(!shares(
+            Some(OWN_URL),
+            Some(&relay_deposit_token_for(OTHER_TOKEN.into()))
+        ));
+        assert!(!shares(Some(OWN_URL), Some(OTHER_TOKEN)));
+    }
+
+    #[test]
+    fn our_own_token_on_a_different_relay_host_is_foreign() {
+        assert!(!shares(Some("https://other.example"), Some(OWN_TOKEN)));
+    }
+
+    #[test]
+    fn an_unknown_pass_counts_as_ours_but_a_known_foreign_one_never_does() {
+        // A family member who has not set a pass up yet: no card fields, so
+        // sends to them already land in our own mailbox. They stay eligible.
+        assert!(shares(None, None));
+        assert!(shares(Some(OWN_URL), None));
+        assert!(shares(None, Some(OWN_TOKEN)));
+        // Blank-but-present fields are the same "no endpoint" state.
+        assert!(shares(Some("   "), Some("   ")));
+
+        // With no pass of our own we cannot classify anyone, so nobody is
+        // excluded -- including a contact who plainly has one.
+        assert!(relay_contact_shares_own_family(
+            Some(OWN_URL.into()),
+            Some(OTHER_TOKEN.into()),
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn a_deposit_token_is_never_mistaken_for_the_member_token_it_came_from() {
+        // Guards the direction of the attenuation: holding our deposit token
+        // means same family, but our deposit token must not match somebody
+        // else's member token by accident.
+        let ours = relay_deposit_token_for(OWN_TOKEN.into());
+        assert_ne!(ours, OWN_TOKEN);
+        assert!(!relay_contact_shares_own_family(
+            Some(OWN_URL.into()),
+            Some(OWN_TOKEN.into()),
+            Some(OWN_URL.into()),
+            Some(ours),
+        ));
+    }
 
     #[test]
     fn normalizes_urls() {

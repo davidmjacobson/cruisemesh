@@ -3,6 +3,7 @@ package com.cruisemesh.app.relay
 import android.content.Context
 import android.util.Log
 import com.cruisemesh.app.chat.UserIdHex
+import com.cruisemesh.app.friending.FriendDirectorySender
 import com.cruisemesh.app.mesh.GossipState
 import com.cruisemesh.app.mesh.MeshRouter
 import com.cruisemesh.app.mesh.RelaySyncEvents
@@ -57,6 +58,12 @@ object RelayUpdateSender {
             Log.w(TAG, "Failed to clear carried-upload markers on endpoint change: ${e.message}")
         }
         queueToAllContacts(context, store, identity, epoch)
+        // Which contacts may be introduced to each other is scoped by our own
+        // pass (FriendDirectoryScope), so the pass moving changes every
+        // snapshot we have ever sent. Re-fan here -- the one place that knows
+        // our mailbox changed -- or the old scoping stands until some
+        // unrelated contact edit happens to trigger a rebuild.
+        FriendDirectorySender.queueToAllContacts(context, store, identity)
         RelayConfigStore.markRelayEpochAnnounced(context, epoch)
     }
 

@@ -41,11 +41,22 @@ object FriendDirectorySender {
             .filterNot { contact -> blocked.any { it.contentEquals(contact.userId) } }
         val revision = FriendsOfFriendsStore.nextDirectoryRevision(context)
         val enabled = FriendsOfFriendsStore.isEnabled(context)
+        val ownRelay = RelayConfigStore.load(context)
         val now = System.currentTimeMillis()
+        // Off-pass recipients stay in this loop deliberately, receiving an
+        // empty snapshot rather than being skipped. A newer empty revision is
+        // the protocol's own retraction (specs/friends-of-friends.md), so a
+        // phone already holding suggestions we should never have sent drops
+        // them on the next pass instead of keeping them until the tickets
+        // expire a month later.
         for (recipient in recipients) {
             val entries = if (enabled) {
-                recipients.asSequence()
-                    .filterNot { it.userId.contentEquals(recipient.userId) }
+                FriendDirectoryScope.candidatesFor(
+                    recipient = recipient,
+                    contacts = recipients,
+                    ownRelayUrl = ownRelay?.relayUrl,
+                    ownRelayToken = ownRelay?.relayToken,
+                ).asSequence()
                     .mapNotNull { candidate ->
                         val policy = store.getContactDiscoveryPolicy(candidate.userId)
                             ?: return@mapNotNull null

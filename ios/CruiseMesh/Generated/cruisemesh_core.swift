@@ -15139,6 +15139,41 @@ public func relayClassifyHttpError(httpStatus: UInt16, relayCode: String?) -> Co
 })
 }
 /**
+ * Does this contact's card credential belong to the *same* Cruise Pass as
+ * ours? Both classes of card count: a post-CP4 card carries our family's
+ * deposit token (the attenuation of our member token), a pre-CP4 one carries
+ * the member token itself.
+ *
+ * Two cases deliberately answer `true` without matching anything:
+ *
+ * - **The contact's card carries no relay fields.** Their pass is unknown,
+ * not foreign — this is a family member who has not set a pass up yet, and
+ * sends to them already fall back to our own mailbox
+ * ([`resolved_contact_relay`]). Treating unknown as foreign would make the
+ * feature that most helps a half-onboarded family the one thing they
+ * cannot use.
+ * - **We have no pass of our own.** Nothing to compare against, so no
+ * classification is possible; answering `false` for everyone would
+ * silently switch off any caller that gates on this.
+ *
+ * Callers therefore get "not known to be somebody else's pass" rather than a
+ * cryptographic guarantee. That is the right strength for a *scoping*
+ * decision (whom to volunteer an introduction to). It would be the wrong
+ * strength for an access-control decision, and it is not used as one:
+ * reading another family's mailbox is prevented by the token class itself
+ * (see [`resolved_contact_poll_relay`]).
+ */
+public func relayContactSharesOwnFamily(contactRelayUrl: String?, contactRelayToken: String?, ownRelayUrl: String?, ownRelayToken: String?) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_contact_shares_own_family(
+        FfiConverterOptionString.lower(contactRelayUrl),
+        FfiConverterOptionString.lower(contactRelayToken),
+        FfiConverterOptionString.lower(ownRelayUrl),
+        FfiConverterOptionString.lower(ownRelayToken),$0
+    )
+})
+}
+/**
  * The frontier to persist after one page, given what was already persisted.
  *
  * This is the mirror of the DTN ack-safety invariant, applied to *skipping*
@@ -16150,6 +16185,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_classify_http_error() != 51460) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_contact_shares_own_family() != 53464) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_cursor_advance() != 64540) {

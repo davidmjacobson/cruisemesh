@@ -7,6 +7,7 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.friending.FriendDirectorySender
 import com.cruisemesh.app.friending.FriendImportEvents
 import com.cruisemesh.app.friending.FriendRequestSender
+import com.cruisemesh.app.friending.FriendDirectoryScope
 import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.friending.ProfileSyncSender
 import com.cruisemesh.app.identity.ProfileStore
@@ -17,6 +18,7 @@ import com.cruisemesh.app.media.isVisibleChatKind
 import com.cruisemesh.app.notify.ChatVisibility
 import com.cruisemesh.app.notify.IncomingMessageAnnouncer
 import com.cruisemesh.app.notify.NotificationAnnouncer
+import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.relay.RelayFetchedEnvelope
 import com.cruisemesh.app.relay.RelayImport
 import uniffi.cruisemesh_core.CarriedEnvelope
@@ -1368,8 +1370,24 @@ internal class InboundEnvelopeProcessor(
         )
         if (!inserted) return
         if (FriendsOfFriendsStore.isEnabled(context)) {
+            // Introductions stay inside one Cruise Pass. A directory from an
+            // introducer on somebody else's pass is applied as an *empty*
+            // snapshot rather than ignored: the revision bookkeeping stays
+            // identical, and it additionally clears whatever that introducer
+            // supplied before this rule existed. A phone therefore heals on
+            // its own next pass instead of waiting for every other phone in
+            // the graph to update.
+            val ownRelay = RelayConfigStore.load(context)
+            val scoped = if (
+                FriendDirectoryScope.sharesOwnPass(contact, ownRelay?.relayUrl, ownRelay?.relayToken)
+            ) {
+                content
+            } else {
+                Log.i(TAG, "Scoping out friend directory from $address: introducer is on another pass")
+                content.copy(entries = emptyList())
+            }
             try {
-                if (store.applyFriendDirectory(senderUserId, identity.userId, content, System.currentTimeMillis())) {
+                if (store.applyFriendDirectory(senderUserId, identity.userId, scoped, System.currentTimeMillis())) {
                     ChatEvents.notifyChatChanged(senderUserId)
                 }
             } catch (e: CoreException) {

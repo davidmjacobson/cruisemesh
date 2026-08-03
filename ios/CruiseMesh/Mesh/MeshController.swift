@@ -1920,10 +1920,26 @@ final class MeshController: ObservableObject {
         ))
         guard inserted else { return }
         if FriendsOfFriendsStore.isEnabled() {
+            // Introductions stay inside one Cruise Pass. A directory from an
+            // introducer on somebody else's pass is applied as an *empty*
+            // snapshot rather than ignored: the revision bookkeeping stays
+            // identical, and it additionally clears whatever that introducer
+            // supplied before this rule existed. A phone therefore heals on
+            // its own next pass instead of waiting for every other phone in
+            // the graph to update. Mirrors InboundEnvelopeProcessor.kt.
+            var scoped = content
+            if !FriendDirectoryScope.sharesOwnPass(contact, ownRelay: RelayConfigStore.load()) {
+                log.info("Scoping out friend directory: introducer is on another pass")
+                scoped = FriendDirectoryContent(
+                    version: content.version,
+                    revision: content.revision,
+                    entries: []
+                )
+            }
             guard (try? store.applyFriendDirectory(
                 introducerUserId: senderUserId,
                 recipientUserId: identity.userId,
-                content: content,
+                content: scoped,
                 nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
             )) != nil else { return }
             ChatEvents.notifyChatChanged(senderUserId)
