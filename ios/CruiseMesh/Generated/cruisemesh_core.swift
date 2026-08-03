@@ -1830,6 +1830,21 @@ public protocol MessageStoreProtocol : AnyObject {
     func chatDigest(chatId: Data) throws  -> [DigestEntry]
     
     /**
+     * Forget every carried-upload marker, so the next sync pass offers the
+     * whole (family, non-relay-sourced) carry queue for upload once more.
+     * Called when a relay endpoint changes -- ours (a new Cruise Pass, a
+     * manual edit, a restore onto a different config) or a contact's (a
+     * T23 relay-change notice, applied inside
+     * [`MessageStore::apply_contact_relay_update`]) -- because "already on
+     * the old mailbox" says nothing about the new one. Endpoint changes are
+     * rare and the relay dedupes re-posts, so one wholesale re-offer is the
+     * simple safe answer; scoping the clear to one contact's envelopes is
+     * not possible anyway (recipient hints rotate daily and are not
+     * reversible to a contact). Returns how many rows were cleared.
+     */
+    func clearCarriedRelayUploadMarkers() throws  -> UInt64
+    
+    /**
      * Forget any recorded rejection for a contact — called on every
      * successful post to their endpoint.
      *
@@ -2192,7 +2207,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * proxy-polling in the first place (see
      * [`MessageStore::enqueue_relay_carried_envelope`]), so re-uploading them
      * here would be pointless churn (and could resurrect an envelope the
-     * real recipient already acked).
+     * real recipient already acked). Also excludes rows whose
+     * `relay_uploaded_to` marker is set (see
+     * [`MessageStore::mark_carried_envelope_relay_uploaded`]): a relay that
+     * already holds an envelope dedupes a re-post but still charges the
+     * family's shared request budget for it, so before the marker existed a
+     * phone with a deep carry queue re-posted its oldest `limit` rows on
+     * every single sync pass -- rate-limiting the whole family -- while
+     * rows behind the batch head never got their first upload at all.
      */
     func familyCarriedEnvelopes(limit: UInt64, nowMs: Int64) throws  -> [CarriedEnvelope]
     
@@ -2371,6 +2393,26 @@ public protocol MessageStoreProtocol : AnyObject {
      * All imported groups, alphabetical by name then id for stable ordering.
      */
     func listGroups() throws  -> [Group]
+    
+    /**
+     * Record that `relay_url` is confirmed to hold this carried envelope --
+     * either because this device just uploaded it there (2xx) or because it
+     * just fetched the same `msg_id` off that relay's mailbox. From then on
+     * [`MessageStore::family_carried_envelopes`] stops offering the row for
+     * upload, which is the whole fix for the re-post-every-pass storm: an
+     * upload becomes once per envelope per mailbox instead of once per
+     * envelope per pass. First writer wins (`relay_uploaded_to IS NULL`
+     * guard), so a marker never silently moves between relays -- an
+     * endpoint change instead clears markers wholesale
+     * ([`MessageStore::clear_carried_relay_upload_markers`]) and the next
+     * pass re-posts once to the new mailbox.
+     *
+     * This gates re-upload ONLY. It must never feed a removal decision: a
+     * carried envelope still leaves the queue only on digest-proof of
+     * receipt, eviction, or expiry (DTN ack-safety rule in CLAUDE.md).
+     * Returns whether a row was newly marked.
+     */
+    func markCarriedEnvelopeRelayUploaded(msgId: Data, relayUrl: String) throws  -> Bool
     
     /**
      * Mark one outbound envelope as successfully posted to a relay. Returns
@@ -3267,6 +3309,26 @@ open func chatDigest(chatId: Data)throws  -> [DigestEntry] {
 }
     
     /**
+     * Forget every carried-upload marker, so the next sync pass offers the
+     * whole (family, non-relay-sourced) carry queue for upload once more.
+     * Called when a relay endpoint changes -- ours (a new Cruise Pass, a
+     * manual edit, a restore onto a different config) or a contact's (a
+     * T23 relay-change notice, applied inside
+     * [`MessageStore::apply_contact_relay_update`]) -- because "already on
+     * the old mailbox" says nothing about the new one. Endpoint changes are
+     * rare and the relay dedupes re-posts, so one wholesale re-offer is the
+     * simple safe answer; scoping the clear to one contact's envelopes is
+     * not possible anyway (recipient hints rotate daily and are not
+     * reversible to a contact). Returns how many rows were cleared.
+     */
+open func clearCarriedRelayUploadMarkers()throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_carried_relay_upload_markers(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Forget any recorded rejection for a contact — called on every
      * successful post to their endpoint.
      *
@@ -3781,7 +3843,14 @@ open func exportDeliveryMetricsCsv()throws  -> String {
      * proxy-polling in the first place (see
      * [`MessageStore::enqueue_relay_carried_envelope`]), so re-uploading them
      * here would be pointless churn (and could resurrect an envelope the
-     * real recipient already acked).
+     * real recipient already acked). Also excludes rows whose
+     * `relay_uploaded_to` marker is set (see
+     * [`MessageStore::mark_carried_envelope_relay_uploaded`]): a relay that
+     * already holds an envelope dedupes a re-post but still charges the
+     * family's shared request budget for it, so before the marker existed a
+     * phone with a deep carry queue re-posted its oldest `limit` rows on
+     * every single sync pass -- rate-limiting the whole family -- while
+     * rows behind the batch head never got their first upload at all.
      */
 open func familyCarriedEnvelopes(limit: UInt64, nowMs: Int64)throws  -> [CarriedEnvelope] {
     return try  FfiConverterSequenceTypeCarriedEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -4094,6 +4163,33 @@ open func listFriendSuggestions(nowMs: Int64)throws  -> [FriendSuggestion] {
 open func listGroups()throws  -> [Group] {
     return try  FfiConverterSequenceTypeGroup.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_list_groups(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Record that `relay_url` is confirmed to hold this carried envelope --
+     * either because this device just uploaded it there (2xx) or because it
+     * just fetched the same `msg_id` off that relay's mailbox. From then on
+     * [`MessageStore::family_carried_envelopes`] stops offering the row for
+     * upload, which is the whole fix for the re-post-every-pass storm: an
+     * upload becomes once per envelope per mailbox instead of once per
+     * envelope per pass. First writer wins (`relay_uploaded_to IS NULL`
+     * guard), so a marker never silently moves between relays -- an
+     * endpoint change instead clears markers wholesale
+     * ([`MessageStore::clear_carried_relay_upload_markers`]) and the next
+     * pass re-posts once to the new mailbox.
+     *
+     * This gates re-upload ONLY. It must never feed a removal decision: a
+     * carried envelope still leaves the queue only on digest-proof of
+     * receipt, eviction, or expiry (DTN ack-safety rule in CLAUDE.md).
+     * Returns whether a row was newly marked.
+     */
+open func markCarriedEnvelopeRelayUploaded(msgId: Data, relayUrl: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_mark_carried_envelope_relay_uploaded(self.uniffiClonePointer(),
+        FfiConverterData.lower(msgId),
+        FfiConverterString.lower(relayUrl),$0
     )
 })
 }
@@ -16219,6 +16315,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_chat_digest() != 38268) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_carried_relay_upload_markers() != 51623) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_contact_relay_rejection() != 26476) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16285,7 +16384,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_export_delivery_metrics_csv() != 57937) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_family_carried_envelopes() != 49773) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_family_carried_envelopes() != 51761) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_get_contact() != 44297) {
@@ -16346,6 +16445,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_list_groups() != 47601) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_carried_envelope_relay_uploaded() != 31075) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_outbound_envelope_relay_posted() != 18680) {

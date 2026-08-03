@@ -27,6 +27,14 @@ enum RelayUpdateSender {
     static func announceIfChanged(store: MessageStore, identity: Identity) {
         let epoch = RelayConfigStore.relayEpoch()
         guard epoch > RelayConfigStore.announcedRelayEpoch() else { return }
+        // Our own mailbox moved (new pass, manual edit, restore): everything
+        // "already uploaded" was confirmed against the OLD config, so
+        // re-offer the whole carry queue once against the new one -- the
+        // same wholesale clear core performs when a CONTACT's endpoint
+        // moves (apply_contact_relay_update). Runs before this pass's
+        // uploads, so the re-offer rides the very sync that detected the
+        // change. Mirrors RelayUpdateSender.kt.
+        _ = try? store.clearCarriedRelayUploadMarkers()
         queueToAllContacts(store: store, identity: identity, epoch: epoch)
         RelayConfigStore.markRelayEpochAnnounced(epoch)
     }
