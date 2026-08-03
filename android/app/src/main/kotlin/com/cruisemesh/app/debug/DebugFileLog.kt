@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Process
 import android.util.Log
 import androidx.core.content.FileProvider
+import androidx.core.content.pm.PackageInfoCompat
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -147,10 +148,20 @@ object DebugFileLog {
         if (file.exists() && file.length() >= MAX_BYTES) rotate(context, file)
 
         val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        val version = try {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            "${info.versionName} (${PackageInfoCompat.getLongVersionCode(info)})"
+        } catch (e: Exception) {
+            "unknown version"
+        }
         file.appendText(
             "\n===== capture start $stamp pid=${Process.myPid()} " +
+                "CruiseMesh $version " +
                 "${Build.MANUFACTURER} ${Build.MODEL} Android ${Build.VERSION.RELEASE} =====\n",
         )
+        // Why the last process died -- see ProcessExitHistory for why logcat
+        // alone cannot answer that.
+        file.appendText(ProcessExitHistory.format(ProcessExitHistory.recentExits(context)))
 
         // -v threadtime keeps timestamps + tid; --pid restricts to us even on
         // the off chance the platform would hand back more.
