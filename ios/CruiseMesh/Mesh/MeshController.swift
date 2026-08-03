@@ -251,8 +251,24 @@ final class MeshController: ObservableObject {
     }
 
     func setAppForeground(_ foreground: Bool) {
+        let changed = appForeground != foreground
         appForeground = foreground
         lanTransport?.setForegroundActive(foreground)
+        // Battery, 2026-07-21: lanHealthTimer and digestMaintenanceTimer are
+        // foreground-only (see their docs) -- background execution windows
+        // are kept alive by CoreBluetooth activity alone, and neither tick
+        // does anything BLE frame relay needs while backgrounded. Re-running
+        // both start*Loop functions on any foreground/background flip stops
+        // them immediately on backgrounding and, on returning to foreground,
+        // fires an immediate catch-up tick (via their own guard) before
+        // resuming the normal interval -- see startLanHealthLoop /
+        // startDigestMaintenanceLoop. relayTimer is deliberately left alone
+        // here -- it's the one timer that must keep running in the
+        // background (see RelayPushClient's class doc).
+        if changed, isRunning {
+            startLanHealthLoop()
+            startDigestMaintenanceLoop()
+        }
     }
 
     // MARK: - Bluetooth audio coexistence
@@ -536,8 +552,20 @@ final class MeshController: ObservableObject {
         }
     }
 
+    /// Battery, 2026-07-21: foreground-only (see `setAppForeground`). This
+    /// only probes LAN links -- `probeLanLinks` filters
+    /// `MeshRouter.identifiedRoutes()` down to `.lan` transport, and
+    /// `LanTransport` itself already suspends its automatic-scan/discovery
+    /// activity while backgrounded (`setForegroundActive`), so there is
+    /// nothing background-live for this to usefully probe. Invalidates and
+    /// returns (no timer) when backgrounded; fires an immediate catch-up
+    /// probe before arming the repeating timer whenever this runs while
+    /// foregrounded, so a foreground return doesn't wait out a stale 30s.
     private func startLanHealthLoop() {
         lanHealthTimer?.invalidate()
+        lanHealthTimer = nil
+        guard appForeground else { return }
+        _ = probeLanLinks(manual: false)
         lanHealthTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshLanCapableContacts()
@@ -627,8 +655,31 @@ final class MeshController: ObservableObject {
         lastDigestAtByAddress[address] = Int64(Date().timeIntervalSince1970 * 1_000)
     }
 
+    /// Battery, 2026-07-21: foreground-only (see `setAppForeground`). This
+    /// tick only *re-sends* our own digest on links idle past their jittered
+    /// re-digest window (`checkDigestMaintenance` -> `sendDigest`) -- a
+    /// convergence nudge for messages/receipts that arrived after the
+    /// connect-time digest, not the delivery path itself. Actual envelope
+    /// delivery over BLE (and LAN) is driven directly by received
+    /// `.envelope` frames in `onFrameReceived` -> `processInboundEnvelope`,
+    /// which fires from CoreBluetooth/Network.framework callbacks
+    /// independent of this timer -- see that function. `handleHello` also
+    /// already sends a fresh digest on every (re)connect, so a background
+    /// BLE link that drops and reconnects still gets one on the reconnect;
+    /// only an already-long-lived link's periodic *re*-digest is deferred
+    /// until the app returns to foreground. Nothing correctness-critical for
+    /// background BLE frame relay depends on this tick.
+    ///
+    /// Invalidates and returns (no timer) when backgrounded; fires an
+    /// immediate catch-up check before arming the repeating timer whenever
+    /// this runs while foregrounded, so a foreground return doesn't wait out
+    /// a stale 60s -- semantics on links that are actually due are otherwise
+    /// unchanged from before this gating.
     private func startDigestMaintenanceLoop() {
         digestMaintenanceTimer?.invalidate()
+        digestMaintenanceTimer = nil
+        guard appForeground else { return }
+        checkDigestMaintenance()
         digestMaintenanceTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.checkDigestMaintenance()
