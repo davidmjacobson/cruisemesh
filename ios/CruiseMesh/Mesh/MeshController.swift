@@ -30,13 +30,27 @@ final class MeshController: ObservableObject {
     /// envelope content itself -- see `RelayPushClient`'s class doc. Mirrors
     /// Android's `relayPushClient` / `updateRelayPushSubscription`
     /// (`MeshService.kt`).
-    private lazy var relayPushClient = RelayPushClient { [weak self] in
-        Task { @MainActor in self?.runRelaySync() }
-    }
+    ///
+    /// Battery, 2026-07-21: also reports its connection health via
+    /// `onRelayPushHealthChanged`, which `reschedulePoll` (through
+    /// `RelayPollPolicy.relayPollIntervalMs`) uses to slow `relayTimer` down
+    /// to a safety net while push is healthy and the app is foregrounded.
+    private lazy var relayPushClient = RelayPushClient(
+        onPush: { [weak self] in
+            Task { @MainActor in self?.runRelaySync() }
+        },
+        onHealthChanged: { [weak self] healthy in
+            Task { @MainActor in self?.onRelayPushHealthChanged(healthy) }
+        }
+    )
     private var isRunning = false
     private var meshRolesRunning = false
     private var bluetoothAudioConnected = false
     private var relayCancellable: AnyCancellable?
+    /// Health `relayPushClient` reported at the last poll-interval decision;
+    /// `nil` before the first one. See `onRelayPushHealthChanged`/
+    /// `reschedulePoll`. Mirrors Android's `MeshService.lastKnownPushHealthy`.
+    private var lastKnownPushHealthy: Bool?
     private var lanHealthTimer: Timer?
     // D8: periodic re-digest bookkeeping.
     private var digestMaintenanceTimer: Timer?
@@ -240,6 +254,7 @@ final class MeshController: ObservableObject {
         relayTimer?.invalidate()
         relayTimer = nil
         relayRateLimitedUntilMs = 0
+        lastKnownPushHealthy = nil
         pathMonitor?.cancel()
         pathMonitor = nil
         relayPushClient.stop()
@@ -262,12 +277,17 @@ final class MeshController: ObservableObject {
         // them immediately on backgrounding and, on returning to foreground,
         // fires an immediate catch-up tick (via their own guard) before
         // resuming the normal interval -- see startLanHealthLoop /
-        // startDigestMaintenanceLoop. relayTimer is deliberately left alone
-        // here -- it's the one timer that must keep running in the
-        // background (see RelayPushClient's class doc).
+        // startDigestMaintenanceLoop. relayTimer is different: it must keep
+        // running in the background (see RelayPushClient's class doc), but
+        // RelayPollPolicy's backoff only ever applies while foregrounded
+        // (see its doc), so a flip reschedules it immediately rather than
+        // waiting out whatever long interval is already pending --
+        // backgrounding hands the poll sole responsibility for relay
+        // delivery.
         if changed, isRunning {
             startLanHealthLoop()
             startDigestMaintenanceLoop()
+            reschedulePoll(currentlyHealthy: relayPushClient.isHealthy())
         }
     }
 
@@ -2408,9 +2428,17 @@ final class MeshController: ObservableObject {
     // MARK: - Relay
 
     private func startRelayLoop() {
+        // Push health is unknown at this point (relayPushClient hasn't been
+        // (re)started for this session yet) -- start at the
+        // unhealthy/background cadence; the first real health report
+        // reschedules from there via onRelayPushHealthChanged.
+        lastKnownPushHealthy = nil
         relayTimer?.invalidate()
-        relayTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.runRelaySync() }
+        relayTimer = Timer.scheduledTimer(
+            withTimeInterval: TimeInterval(RelayPollPolicy.unhealthyOrBackgroundMs) / 1_000,
+            repeats: false
+        ) { [weak self] _ in
+            Task { @MainActor in self?.relayPollTick() }
         }
         pathMonitor = NWPathMonitor()
         pathMonitor?.pathUpdateHandler = { [weak self] path in
@@ -2432,6 +2460,58 @@ final class MeshController: ObservableObject {
             Task { @MainActor in self?.runRelaySync() }
         }
         updateRelayPushSubscription()
+    }
+
+    /// `relayTimer`'s tick: runs the authoritative poll, then reschedules
+    /// itself at whatever interval `RelayPollPolicy` currently calls for.
+    /// Battery, 2026-07-21: replaces the old fixed-60s repeating timer with a
+    /// self-rescheduling one-shot timer (mirrors Android's
+    /// `relayPollRunnable` `Runnable.postDelayed` self-repost) so the cadence
+    /// can change on every tick. The poll call itself (`runRelaySync`) is
+    /// unchanged and stays correctness-authoritative; only its cadence
+    /// changes.
+    private func relayPollTick() {
+        runRelaySync()
+        reschedulePoll(currentlyHealthy: relayPushClient.isHealthy())
+    }
+
+    /// Recomputes the relay-poll interval from
+    /// `RelayPollPolicy.relayPollIntervalMs` given `currentlyHealthy` and the
+    /// current `appForeground` state, and re-arms `relayTimer` with it,
+    /// cancelling whatever was previously scheduled. Called from
+    /// `relayPollTick` itself (every tick decides its own next interval),
+    /// from `onRelayPushHealthChanged` (so a health transition reschedules
+    /// immediately rather than waiting out whatever long interval is already
+    /// pending), and from `setAppForeground` (so a foreground/background flip
+    /// reschedules immediately too). Mirrors Android's
+    /// `MeshService.reschedulePoll`.
+    private func reschedulePoll(currentlyHealthy: Bool) {
+        let interval = RelayPollPolicy.relayPollIntervalMs(
+            previouslyHealthy: lastKnownPushHealthy,
+            currentlyHealthy: currentlyHealthy,
+            foreground: appForeground
+        )
+        lastKnownPushHealthy = currentlyHealthy
+        relayTimer?.invalidate()
+        relayTimer = Timer.scheduledTimer(
+            withTimeInterval: TimeInterval(interval) / 1_000,
+            repeats: false
+        ) { [weak self] _ in
+            Task { @MainActor in self?.relayPollTick() }
+        }
+    }
+
+    /// `relayPushClient`'s health-change callback -- see `relayPushClient`'s
+    /// doc and `RelayPollPolicy`'s type doc. Also mirrors the signal into
+    /// `MeshConnectivityStatus.pushHealthy` for `level(for:)`'s relay-health
+    /// freshness check: without this, "Online via relay" would falsely
+    /// degrade after ~120-150s of push-healthy-but-quiet, since the poll
+    /// (which used to be the only thing refreshing `RelayHealth.ok`'s
+    /// `lastSyncMs`) now backs off to 900s while foregrounded with push up.
+    private func onRelayPushHealthChanged(_ healthy: Bool) {
+        log.info("Relay push health -> \(healthy)")
+        reschedulePoll(currentlyHealthy: healthy)
+        MeshConnectivityStatus.shared.setPushHealthy(healthy)
     }
 
     /// Starts `relayPushClient` against the user's relay config once the mesh
