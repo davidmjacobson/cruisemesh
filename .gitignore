@@ -36,8 +36,11 @@ android/app/src/main/jniLibs/
 /logs/
 /tmp/
 
-# Icon source assets (rendered launcher icons live in android res/)
+# Icon source assets (rendered launcher icons live in android res/).
+# Exception: the hand-built vector master of the app icon is real source —
+# version it so the mark is never again something only Google has a copy of.
 /art/
+!/art/cruisemesh-icon.svg
 
 # Editor swap files
 *.swp
