@@ -117,7 +117,14 @@ enum RelayConfigStore {
     /// credential, so the full value must never reach a share sheet.
     static func logSummary() {
         guard let config = load() else {
-            log.info("Relay not configured on this device (no Cruise Pass)")
+            // Deliberately hedged. This also runs on a background Bluetooth
+            // relaunch, which after a reboot can happen before first unlock,
+            // when the UserDefaults plist may not be readable yet -- `load()`
+            // returns nil for a perfectly configured phone. Stating "no Cruise
+            // Pass" there would answer the exact triage question this line
+            // exists for, wrongly, and send someone chasing a missing pass
+            // that is not missing.
+            log.info("No relay configuration readable at launch (unset, or device not yet unlocked)")
             return
         }
         let host = URL(string: config.relayUrl)?.host ?? "unparseable"
