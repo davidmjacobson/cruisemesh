@@ -1,7 +1,7 @@
 package com.cruisemesh.app.friending
 
 import uniffi.cruisemesh_core.Contact
-import uniffi.cruisemesh_core.relayContactSharesOwnFamily
+import uniffi.cruisemesh_core.friendIntroductionEligible
 
 /**
  * Which contacts friends-of-friends introductions may involve: the ones on
@@ -16,45 +16,59 @@ import uniffi.cruisemesh_core.relayContactSharesOwnFamily
  *
  * Scoping to the pass matches what a Cruise Pass already means everywhere
  * else in the app: the people you share a mailbox with are your family, and
- * everyone else is somebody you happen to know. Suggesting within that
- * boundary is the behavior the feature was pitched as.
+ * everyone else is somebody you happen to know.
  *
  * Kept free of Android imports so the policy is unit-testable on its own; the
- * pass comparison itself lives in the core
- * (`relay_wire.rs::relay_contact_shares_own_family`) and is shared with iOS.
+ * rule itself lives in the core
+ * (`relay_wire.rs::friend_introduction_eligible`) and is shared with iOS,
+ * including what an *absent* pass means on either side.
  */
 object FriendDirectoryScope {
 
     /**
-     * Whether `contact` is on our pass. A contact with no pass of their own
-     * counts as ours — see the core function's doc for why unknown is not
-     * treated as foreign.
+     * Whether `contact` may be introduced with us at all.
+     *
+     * [addedNearby] is `ContactProvenance.addedNearby` for this contact — it
+     * only decides anything when neither side has a pass, where "did we
+     * actually meet" is the only boundary left.
      */
-    fun sharesOwnPass(contact: Contact, ownRelayUrl: String?, ownRelayToken: String?): Boolean =
-        relayContactSharesOwnFamily(
+    fun introducible(
+        contact: Contact,
+        ownRelayUrl: String?,
+        ownRelayToken: String?,
+        addedNearby: Boolean,
+    ): Boolean =
+        friendIntroductionEligible(
             contact.relayUrl,
             contact.relayToken,
             ownRelayUrl,
             ownRelayToken,
+            addedNearby,
         )
 
     /**
      * The candidates we may offer to `recipient`, given every contact we hold.
      *
-     * Empty whenever the recipient is not on our pass: a snapshot is a list of
-     * the people we know, so sending one off-pass would hand a family's names
-     * to an outside circle — the same leak in the opposite direction.
+     * Empty whenever the recipient is not introducible: a snapshot is a list
+     * of the people we know, so sending one to an outsider would hand a
+     * family's names outward — the same leak in the opposite direction.
+     *
+     * [addedNearby] is looked up per contact rather than passed in bulk so
+     * callers can back it with the provenance store directly.
      */
     fun candidatesFor(
         recipient: Contact,
         contacts: List<Contact>,
         ownRelayUrl: String?,
         ownRelayToken: String?,
+        addedNearby: (ByteArray) -> Boolean,
     ): List<Contact> {
-        if (!sharesOwnPass(recipient, ownRelayUrl, ownRelayToken)) return emptyList()
+        if (!introducible(recipient, ownRelayUrl, ownRelayToken, addedNearby(recipient.userId))) {
+            return emptyList()
+        }
         return contacts.filter { candidate ->
             !candidate.userId.contentEquals(recipient.userId) &&
-                sharesOwnPass(candidate, ownRelayUrl, ownRelayToken)
+                introducible(candidate, ownRelayUrl, ownRelayToken, addedNearby(candidate.userId))
         }
     }
 }

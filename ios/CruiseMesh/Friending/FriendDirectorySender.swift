@@ -22,13 +22,24 @@ enum FriendDirectorySender {
         // phone already holding suggestions we should never have sent drops
         // them on the next pass instead of keeping them until the tickets
         // expire a month later. Mirrors FriendDirectorySender.kt.
+        // Cached: with no pass on either side, eligibility turns on whether we
+        // actually met, and the same contacts are re-checked once per
+        // recipient across the whole fan-out.
+        var nearbyCache: [Data: Bool] = [:]
+        let addedNearby: (Data) -> Bool = { userId in
+            if let known = nearbyCache[userId] { return known }
+            let nearby = ((try? store.getContactProvenance(userId: userId)) ?? nil)?.addedNearby ?? false
+            nearbyCache[userId] = nearby
+            return nearby
+        }
         for recipient in contacts {
             var entries: [FriendDirectoryEntry] = []
             if enabled {
                 let eligible = FriendDirectoryScope.candidatesFor(
                     recipient: recipient,
                     contacts: contacts,
-                    ownRelay: ownRelay
+                    ownRelay: ownRelay,
+                    addedNearby: addedNearby
                 )
                 for candidate in eligible {
                     guard entries.count < 64,

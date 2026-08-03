@@ -1379,7 +1379,12 @@ internal class InboundEnvelopeProcessor(
             // the graph to update.
             val ownRelay = RelayConfigStore.load(context)
             val scoped = if (
-                FriendDirectoryScope.sharesOwnPass(contact, ownRelay?.relayUrl, ownRelay?.relayToken)
+                FriendDirectoryScope.introducible(
+                    contact,
+                    ownRelay?.relayUrl,
+                    ownRelay?.relayToken,
+                    store.getContactProvenance(senderUserId)?.addedNearby ?: false,
+                )
             ) {
                 content
             } else {

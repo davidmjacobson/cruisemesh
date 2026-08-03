@@ -28,11 +28,17 @@ final class FriendDirectoryScopeTests: XCTestCase {
         contact(name, relayUrl: relayUrl, relayToken: relayDepositTokenFor(memberToken: memberToken))
     }
 
-    private func candidates(recipient: Contact, contacts: [Contact]) -> [String] {
+    private func candidates(
+        recipient: Contact,
+        contacts: [Contact],
+        ownRelay: RelayConfig?,
+        addedNearby: @escaping (Data) -> Bool = { _ in true }
+    ) -> [String] {
         FriendDirectoryScope.candidatesFor(
             recipient: recipient,
             contacts: contacts,
-            ownRelay: ownRelay
+            ownRelay: ownRelay,
+            addedNearby: addedNearby
         ).map(\.name)
     }
 
@@ -41,14 +47,15 @@ final class FriendDirectoryScopeTests: XCTestCase {
         let tester = cardFor("Tester", memberToken: testerToken)
         let contacts = [family, tester]
 
-        // The reported symptom: a tester-pass person offered inside a family.
         XCTAssertEqual(
-            candidates(recipient: cardFor("Kid", memberToken: ownToken), contacts: contacts),
+            candidates(
+                recipient: cardFor("Kid", memberToken: ownToken),
+                contacts: contacts,
+                ownRelay: ownRelay
+            ),
             ["Sibling"]
         )
-        // ...and the same leak outbound, which would hand a family's names to
-        // the tester fleet.
-        XCTAssertEqual(candidates(recipient: tester, contacts: contacts), [])
+        XCTAssertEqual(candidates(recipient: tester, contacts: contacts, ownRelay: ownRelay), [])
     }
 
     func testFamilyIntroductionsStillWork() {
@@ -58,48 +65,75 @@ final class FriendDirectoryScopeTests: XCTestCase {
             cardFor("Kid2", memberToken: ownToken),
         ]
         XCTAssertEqual(
-            candidates(recipient: contacts[1], contacts: contacts),
+            candidates(recipient: contacts[1], contacts: contacts, ownRelay: ownRelay),
             ["Parent", "Kid2"]
         )
     }
 
-    func testFamilyMemberWithoutAPassYetStaysEligible() {
-        // Their card carries no relay fields, so our sends to them already
-        // land in our own mailbox. Excluding them would break introductions
-        // for exactly the half-onboarded family the feature helps most.
-        let noPass = contact("NotSetUpYet")
+    func testHolidayAcquaintanceWithoutAPassIsNotFamilyEvenMetInPerson() {
+        // The cruise case: another family's kid, scanned face to face, no pass
+        // of their own. Being nearby must not buy an exception -- that is
+        // exactly how a relative mid-onboarding looks.
+        let outsider = contact("CruiseKid")
         let parent = cardFor("Parent", memberToken: ownToken)
-        XCTAssertTrue(FriendDirectoryScope.sharesOwnPass(noPass, ownRelay: ownRelay))
-        XCTAssertEqual(candidates(recipient: parent, contacts: [noPass, parent]), ["NotSetUpYet"])
+        XCTAssertFalse(
+            FriendDirectoryScope.introducible(outsider, ownRelay: ownRelay, addedNearby: true)
+        )
+        XCTAssertEqual(
+            candidates(recipient: parent, contacts: [outsider, parent], ownRelay: ownRelay),
+            []
+        )
+    }
+
+    func testFamilyMemberJoiningOurPassBecomesEligibleAtThatMoment() {
+        let before = contact("NotSetUpYet")
+        let after = cardFor("NotSetUpYet", memberToken: ownToken)
+        XCTAssertFalse(FriendDirectoryScope.introducible(before, ownRelay: ownRelay, addedNearby: true))
+        XCTAssertTrue(FriendDirectoryScope.introducible(after, ownRelay: ownRelay, addedNearby: false))
+    }
+
+    func testWithNoPassAtAllMeetingInPersonIsTheOnlyBoundaryLeft() {
+        let met = contact("Met")
+        let neverMet = contact("NeverMet")
+        XCTAssertEqual(
+            candidates(recipient: met, contacts: [met, neverMet], ownRelay: nil),
+            ["NeverMet"]
+        )
+        XCTAssertEqual(
+            candidates(
+                recipient: met,
+                contacts: [met, neverMet],
+                ownRelay: nil,
+                addedNearby: { _ in false }
+            ),
+            []
+        )
+    }
+
+    func testWithoutAPassAContactWhoHasOneBelongsToAFamilyWeCannotSee() {
+        let passHolder = cardFor("HasPass", memberToken: testerToken)
+        XCTAssertFalse(
+            FriendDirectoryScope.introducible(passHolder, ownRelay: nil, addedNearby: true)
+        )
     }
 
     func testPreCp4CardCarryingTheMemberTokenIsStillOurFamily() {
         let legacy = contact("Legacy", relayUrl: relayUrl, relayToken: ownToken)
-        XCTAssertTrue(FriendDirectoryScope.sharesOwnPass(legacy, ownRelay: ownRelay))
+        XCTAssertTrue(FriendDirectoryScope.introducible(legacy, ownRelay: ownRelay, addedNearby: false))
     }
 
     func testSameFamilyTokenOnADifferentRelayHostIsNotOurPass() {
         let elsewhere = contact("Elsewhere", relayUrl: "https://other.example", relayToken: ownToken)
-        XCTAssertFalse(FriendDirectoryScope.sharesOwnPass(elsewhere, ownRelay: ownRelay))
+        XCTAssertFalse(
+            FriendDirectoryScope.introducible(elsewhere, ownRelay: ownRelay, addedNearby: true)
+        )
     }
 
     func testRecipientIsNeverOfferedThemselves() {
         let selfContact = cardFor("Kid", memberToken: ownToken)
-        XCTAssertEqual(candidates(recipient: selfContact, contacts: [selfContact]), [])
-    }
-
-    func testWithNoPassOfOurOwnNobodyIsExcluded() {
-        // Nothing to compare against; silently emptying every snapshot would
-        // switch the feature off for anyone who has not bought a pass.
-        let tester = cardFor("Tester", memberToken: testerToken)
-        let other = cardFor("Other", memberToken: testerToken)
         XCTAssertEqual(
-            FriendDirectoryScope.candidatesFor(
-                recipient: tester,
-                contacts: [tester, other],
-                ownRelay: nil
-            ).map(\.name),
-            ["Other"]
+            candidates(recipient: selfContact, contacts: [selfContact], ownRelay: ownRelay),
+            []
         )
     }
 }

@@ -238,24 +238,11 @@ pub fn resolved_contact_relay(
 /// deposit token (the attenuation of our member token), a pre-CP4 one carries
 /// the member token itself.
 ///
-/// Two cases deliberately answer `true` without matching anything:
-///
-/// - **The contact's card carries no relay fields.** Their pass is unknown,
-///   not foreign — this is a family member who has not set a pass up yet, and
-///   sends to them already fall back to our own mailbox
-///   ([`resolved_contact_relay`]). Treating unknown as foreign would make the
-///   feature that most helps a half-onboarded family the one thing they
-///   cannot use.
-/// - **We have no pass of our own.** Nothing to compare against, so no
-///   classification is possible; answering `false` for everyone would
-///   silently switch off any caller that gates on this.
-///
-/// Callers therefore get "not known to be somebody else's pass" rather than a
-/// cryptographic guarantee. That is the right strength for a *scoping*
-/// decision (whom to volunteer an introduction to). It would be the wrong
-/// strength for an access-control decision, and it is not used as one:
-/// reading another family's mailbox is prevented by the token class itself
-/// (see [`resolved_contact_poll_relay`]).
+/// A pure comparison, and `false` whenever either side has no pass — "not
+/// known to be the same family" rather than "known to be a different one".
+/// Deciding what an *absent* pass should mean is a policy question with a
+/// different answer per caller, so it lives in
+/// [`friend_introduction_eligible`] rather than here.
 #[uniffi::export]
 pub fn relay_contact_shares_own_family(
     contact_relay_url: Option<String>,
@@ -263,14 +250,63 @@ pub fn relay_contact_shares_own_family(
     own_relay_url: Option<String>,
     own_relay_token: Option<String>,
 ) -> bool {
-    let Some(contact) = relay_endpoint_from(contact_relay_url, contact_relay_token) else {
-        return true;
-    };
-    let Some(own) = relay_endpoint_from(own_relay_url, own_relay_token) else {
-        return true;
+    let (Some(contact), Some(own)) = (
+        relay_endpoint_from(contact_relay_url, contact_relay_token),
+        relay_endpoint_from(own_relay_url, own_relay_token),
+    ) else {
+        return false;
     };
     contact.url == own.url
         && (contact.token == own.token || contact.token == relay_deposit_token_for(own.token))
+}
+
+/// May this contact take part in friends-of-friends introductions with us —
+/// as a candidate we offer, or as a recipient we send a directory to?
+///
+/// Introductions are scoped to one Cruise Pass (specs/friends-of-friends.md
+/// decision 7), because the contact graph does not stop at a household: one
+/// person who has scanned somebody outside the family is otherwise enough for
+/// that outside circle to propagate into family suggestion lists.
+///
+/// The rule, and why an absent pass is not simply "ours":
+///
+/// - **We have a pass.** Eligible only if the contact is on it. A contact with
+///   no pass is *not yet* in the family rather than outside it, and becomes
+///   eligible the moment they enter the pass we gave them — the pass-change
+///   re-fan handles that automatically. Counting them in meanwhile is what
+///   reopened the leak: a family met on holiday who never bought a pass looks
+///   identical to a relative who has not finished onboarding.
+/// - **Neither of us has a pass.** There is no family boundary drawn yet, so
+///   fall back to the only boundary that exists — whether we actually met.
+///   `contact_added_nearby` is the stored fact that this contact was added
+///   over a nearby transport (`ContactProvenance::added_nearby`), which a
+///   remote re-add never unmakes.
+/// - **They have a pass and we do not.** Not eligible: they belong to a family
+///   whose boundary we cannot see, and we are in no position to introduce
+///   across it.
+///
+/// Still scoping, not access control. Reading another family's mailbox is
+/// prevented by the token class itself (see [`resolved_contact_poll_relay`]).
+#[uniffi::export]
+pub fn friend_introduction_eligible(
+    contact_relay_url: Option<String>,
+    contact_relay_token: Option<String>,
+    own_relay_url: Option<String>,
+    own_relay_token: Option<String>,
+    contact_added_nearby: bool,
+) -> bool {
+    let contact = relay_endpoint_from(contact_relay_url.clone(), contact_relay_token.clone());
+    let own = relay_endpoint_from(own_relay_url.clone(), own_relay_token.clone());
+    match (contact, own) {
+        (Some(_), Some(_)) => relay_contact_shares_own_family(
+            contact_relay_url,
+            contact_relay_token,
+            own_relay_url,
+            own_relay_token,
+        ),
+        (None, None) => contact_added_nearby,
+        _ => false,
+    }
 }
 
 /// Poll-path routing (CP4): which mailbox, if any, may be *read*
@@ -991,23 +1027,68 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_pass_counts_as_ours_but_a_known_foreign_one_never_does() {
-        // A family member who has not set a pass up yet: no card fields, so
-        // sends to them already land in our own mailbox. They stay eligible.
-        assert!(shares(None, None));
-        assert!(shares(Some(OWN_URL), None));
-        assert!(shares(None, Some(OWN_TOKEN)));
+    fn the_pass_comparison_itself_is_false_whenever_either_side_has_none() {
+        // Pure comparison: absent is not "same". What absence *means* is
+        // decided by friend_introduction_eligible, tested below.
+        assert!(!shares(None, None));
+        assert!(!shares(Some(OWN_URL), None));
+        assert!(!shares(None, Some(OWN_TOKEN)));
         // Blank-but-present fields are the same "no endpoint" state.
-        assert!(shares(Some("   "), Some("   ")));
-
-        // With no pass of our own we cannot classify anyone, so nobody is
-        // excluded -- including a contact who plainly has one.
-        assert!(relay_contact_shares_own_family(
+        assert!(!shares(Some("   "), Some("   ")));
+        assert!(!relay_contact_shares_own_family(
             Some(OWN_URL.into()),
             Some(OTHER_TOKEN.into()),
             None,
             None,
         ));
+    }
+
+    fn eligible(
+        contact: Option<(&str, &str)>,
+        own: Option<(&str, &str)>,
+        added_nearby: bool,
+    ) -> bool {
+        friend_introduction_eligible(
+            contact.map(|c| c.0.to_string()),
+            contact.map(|c| c.1.to_string()),
+            own.map(|o| o.0.to_string()),
+            own.map(|o| o.1.to_string()),
+            added_nearby,
+        )
+    }
+
+    #[test]
+    fn with_a_pass_only_contacts_on_it_may_be_introduced() {
+        let ours = (OWN_URL, OWN_TOKEN);
+        let own_card = relay_deposit_token_for(OWN_TOKEN.into());
+        assert!(eligible(Some((OWN_URL, &own_card)), Some(ours), false));
+        // Another family's card, however real: never.
+        let their_card = relay_deposit_token_for(OTHER_TOKEN.into());
+        assert!(!eligible(Some((OWN_URL, &their_card)), Some(ours), true));
+    }
+
+    #[test]
+    fn with_a_pass_a_contact_without_one_waits_until_they_join_it() {
+        // The holiday-acquaintance case: meeting them in person is not enough
+        // to make them family, and being nearby-scanned must not buy an
+        // exception -- that is exactly how a relative mid-onboarding looks.
+        let ours = (OWN_URL, OWN_TOKEN);
+        assert!(!eligible(None, Some(ours), true));
+        assert!(!eligible(None, Some(ours), false));
+    }
+
+    #[test]
+    fn without_a_pass_meeting_in_person_is_the_only_boundary_left() {
+        // No family boundary is drawn yet, so fall back to whether we
+        // actually met. A remotely-added stranger stays out.
+        assert!(eligible(None, None, true));
+        assert!(!eligible(None, None, false));
+    }
+
+    #[test]
+    fn without_a_pass_a_contact_who_has_one_belongs_to_a_family_we_cannot_see() {
+        let theirs = relay_deposit_token_for(OTHER_TOKEN.into());
+        assert!(!eligible(Some((OWN_URL, &theirs)), None, true));
     }
 
     #[test]

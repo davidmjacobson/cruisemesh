@@ -7,8 +7,8 @@
 ## Outcome
 
 A person can deliberately hand one specific contact's friend card to someone
-else, as a QR code or a copyable link, and have that connection complete
-safely — without any mechanism that spreads contacts on its own.
+in front of them, as a QR code, and have that connection complete safely —
+without any mechanism that spreads contacts on its own.
 
 Introductions are now scoped to a single Cruise Pass, which is the right
 default and the wrong absolute. You meet another family on a cruise. Your kid
@@ -68,37 +68,47 @@ stops working on its own.
    contact and taps **Share contact**. Nothing shares automatically, on a
    schedule, in bulk, or as a side effect of any other action. There is no
    "share all", by design.
-2. **Only accepted contacts.** You can share a card only for somebody already
+2. **A displayed code, never a copyable link.** Sharing shows a QR code on
+   screen and offers no **Copy link**. Sharing your *own* link is your call;
+   putting somebody else's name, keys, and their family's mailbox deposit
+   token into SMS or a group chat — logged by infrastructure neither of you
+   controls, with no notification to them — is a different act wearing the
+   same button. A displayed code is bounded by being in the room, which is
+   also the only situation this feature is for. It keeps the durable-artifact
+   and group-chat-blast problems from existing rather than mitigating them
+   afterwards.
+3. **Only accepted contacts.** You can share a card only for somebody already
    in your Friends list. A pending suggestion, a blocked identity, or a
    candidate from someone else's directory cannot be shared. This is the same
    bound as friends-of-friends decision 5, and it keeps every share one hop
    from a real relationship.
-3. **The shared person's switch governs.** **Share contact** is unavailable
+4. **The shared person's switch governs.** **Share contact** is unavailable
    for a contact whose discovery policy is off or absent. Turning off
    **Friends of friends** already means "do not hand me around"; it would be
    incoherent for that to stop automatic introductions but permit manual ones.
    One switch, one meaning. The setting's copy is updated to say so.
-4. **The shared person confirms.** A friend request that originated from a
+5. **The shared person confirms.** A friend request that originated from a
    shared card does **not** auto-import. The receiving phone shows a
    confirmation naming both the requester and the sharer, and nothing is
    written to `contacts` until it is accepted. This is the one place this spec
    deliberately behaves differently from a QR scan, and the reason is that a
    QR scan is self-evidencing — the person was standing there — while a shared
    card is not.
-5. **Shared cards expire.** A shared card carries an expiry, default seven
-   days. A link pasted into a chat is durable in a way a displayed QR code is
-   not; without an expiry, a card shared on a cruise still works a year later
-   from a message history nobody remembers. Seven days covers "we'll add each
-   other tomorrow" and little else.
-6. **Honest provenance, never a verified badge.** A contact added this way is
+6. **Shared cards expire.** A shared card carries an expiry, default seven
+   days. A displayed code is already bounded by being in the room, so the
+   expiry is defence in depth rather than the main control — it covers a
+   screenshotted code, and it bounds how long a card lives on the phone that
+   scanned it before being used. Seven days covers "we'll add each other
+   tomorrow" and little else.
+7. **Honest provenance, never a verified badge.** A contact added this way is
    recorded as **shared** and displayed as "Shared by Mom". It is not
    described as QR-verified. Scanning that person's own code later upgrades
    the stored provenance to direct, exactly as an introduced contact does.
-7. **Never share a credential you hold and they don't.** The card ships with
+8. **Never share a credential you hold and they don't.** The card ships with
    the relay fields exactly as stored for that contact — a deposit-class
    token. The sharer's own member token is never substituted, and the sharer's
    own relay config is never used to fill in a contact's missing fields.
-8. **Blocking stops your own participation; it cannot recall a card.** A
+9. **Blocking stops your own participation; it cannot recall a card.** A
    shared card is a bearer artifact already in someone else's hands, and every
    validity check runs on the *shared person's* phone — is the sharer my
    accepted contact, does their signature verify, is my switch on. Nothing in
@@ -111,8 +121,9 @@ stops working on its own.
    State that plainly in the UI rather than implying recall. Adding a
    revocation channel for a bearer credential is precisely the complexity
    bearer credentials exist to avoid, and it is the strongest argument for
-   preferring targeted shares (open question 3).
-9. **A policy change kills cards issued before it.** The card carries the
+   preferring targeted shares (open question 3), which is why decision 2 removes
+   the copyable form outright.
+10. **A policy change kills cards issued before it.** The card carries the
    shared person's discovery-policy revision, and the recipient checks it
    against their current one — the same mechanism `IntroductionTicket` uses.
    Without it, someone who turns discovery off and later on again silently
@@ -128,7 +139,6 @@ Long-press a contact in Friends (or use the overflow in their detail sheet) →
 
 - the contact's display name and formatted UserID;
 - a QR code;
-- **Copy link**;
 - one line of plain copy: "Anyone with this code can ask to connect with
   Avery. Avery chooses whether to accept. The code stops working in 7 days."
 
@@ -142,8 +152,7 @@ approve it.
 
 ### Receiving
 
-Opening a shared link or scanning a shared code lands on the existing friend
-confirmation screen, with the introducer line reading "Shared by Mom" and the
+Scanning a shared code lands on the existing friend confirmation screen, with the introducer line reading "Shared by Mom" and the
 same four fingerprint words and same-name/different-key warning as any other
 import. The primary action stays **Add friend**.
 
@@ -342,9 +351,9 @@ permanent hang.
 - Ship both shells together, as with friends-of-friends.
 
 Suggested slices: (1) core codec, signing, verification, expiry, and the
-provenance widening; (2) the share sheet and QR/link generation; (3) the
-pending-request store and confirmation screen on both platforms; (4) blocking
-retraction and the settings copy change.
+provenance widening; (2) the share sheet and QR generation; (3) the
+pending-request store and confirmation screen on both platforms; (4) the
+dismissal cap, suppression, and the settings copy change.
 
 ## Acceptance tests
 
@@ -383,36 +392,24 @@ retraction and the settings copy change.
   `specs/friends-of-friends.md` decision 7 still holds either side of the new
   edge.
 - The same flow relay-only with BLE off, then BLE/mule-only with internet off.
-- A shared link opened after seven days is refused with the expiry message.
+- A shared code scanned after seven days is refused with the expiry message.
+- No surface anywhere produces a shared card as copyable text.
 
-## Dependency: passless outsiders reopen the pass scoping
+## Dependency: passless outsiders (resolved, already fixed)
 
-Friends-of-friends decision 7 treats a contact with **no** Cruise Pass as
-being on ours, on the reasoning that unknown is not foreign and that a
-half-onboarded family member should stay eligible. A family met on a cruise
-who never bought a pass lands in that same bucket. Connect to their kid — by
-a shared card *or* by a plain QR scan, which is how the scenario actually
-starts — and that kid becomes friends-of-friends eligible inside your family,
-propagating exactly as the tester pass did.
+The first draft of the pass scoping treated a contact with **no** Cruise Pass
+as being on ours, reasoning that unknown is not foreign. A family met on a
+cruise who never bought a pass landed in that same bucket, so connecting to
+their kid — by a shared card *or* by a plain QR scan, which is how the
+scenario actually starts — made that kid friends-of-friends eligible inside
+your family, propagating exactly as the tester pass did. Provenance alone does
+not close it: the motivating case is a *direct* scan, recorded as
+`source = 0`, indistinguishable from scanning a relative.
 
-This is a hole in the scoping change as shipped, not one this feature
-introduces, and it must close before Share contact makes the situation easier
-to reach. Provenance alone does not close it: the motivating case is a
-*direct* scan, which records `source = 0` and looks identical to scanning a
-relative.
-
-The honest fork is what "no pass" should mean, and it is a product decision
-rather than a technical one:
-
-- **Passless stays eligible** (today): free-tier families keep introductions;
-  cruise outsiders keep propagating.
-- **Passless is not eligible as a candidate**: the leak closes completely, a
-  family member becomes eligible the moment they enter the pass you gave them
-  (the pass-change re-fan already handles this), and friends-of-friends
-  becomes, in effect, a paid feature for families who never buy one.
-
-Resolve this before implementing, and record the answer in
-`specs/friends-of-friends.md` decision 7 rather than here.
+Resolved in `specs/friends-of-friends.md` decision 7 and already implemented:
+with a pass, only contacts on it are eligible; with no pass on either side,
+`added_nearby` decides. This spec assumes that behavior — without it, Share
+contact would make an open leak easier to reach.
 
 ## Open questions
 
@@ -421,30 +418,19 @@ Resolve this before implementing, and record the answer in
 2. **Should the sharer learn the outcome?** Currently they see nothing. A
    quiet "Riley accepted" would be friendly and is also a small disclosure
    about someone else's decision. Left out of v1.
-3. **Targeted shares — and whether they should be v1 instead.** When the
-   person you are sharing *with* is already a contact, the share can be sealed
-   to them and bound to their UserID, reusing the friends-of-friends ticket
-   machinery. That form has no expiry ambiguity, no durable artifact, no
-   group-chat blast radius, and no revocation hole — blocking becomes
-   trivially effective because delivery simply stops.
+3. **Targeted shares.** When the person you are sharing *with* is already a
+   contact, the share could instead be sealed to them and bound to their
+   UserID, reusing the friends-of-friends ticket machinery — no expiry
+   ambiguity, no scannable artifact at all, and blocking becomes trivially
+   effective because delivery simply stops. There is a real argument that this
+   should have been v1: in the motivating scenario the person you share with
+   is your own second kid, already your contact, on your pass, standing next
+   to you.
 
-   The case for making it v1 is stronger than this spec's original framing
-   admitted: in the motivating scenario the person you are sharing with is
-   *your own second kid*, who is already your contact, on your pass, standing
-   next to you. That is the targeted case exactly. The untargeted bearer form
-   is only required for handing a card to someone who is **not** yet your
-   contact — and on a cruise that person is in front of you, where scanning
-   the original phone directly already works.
-
-   Against: the untargeted form is what was actually asked for, and it handles
-   the case where the second phone is not yet connected to anything at all.
-
-   This is unresolved and worth settling before implementation, because it
-   decides whether the riskiest artifact in this spec — an unrevocable bearer
-   credential for a third party, handed to children — exists at all.
-4. **Copy link, specifically.** Even keeping the bearer form, the paste path
-   is separable from the QR path. A copied link puts another person's name,
-   keys, and their family's mailbox deposit token into SMS or a group chat,
-   logged by someone else's infrastructure, with no notification to them. QR
-   alone covers the in-person scenario. Shipping QR-only first costs little
-   and can be revisited.
+   Deferred rather than dismissed. The displayed-code form covers the case
+   where the second phone is not yet connected to anything, which the targeted
+   form structurally cannot, and dropping **Copy link** (decision 2) removes
+   most of what made the bearer form risky — what remains is a code on a
+   screen, in a room, for seven days. Revisit if field use shows the in-family
+   share is the dominant one; the two can coexist, with targeted preferred
+   automatically whenever the recipient is already a contact.

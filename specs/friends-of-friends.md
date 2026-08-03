@@ -58,13 +58,30 @@ all** before their phone requests the suggested connections.
    tester pass reached a child's phone exactly this way. The pass is the
    boundary the product already draws around a family, so introductions use it.
 
-   A contact with **no** pass of their own stays eligible — their pass is
-   unknown, not foreign, and sends to them already fall back to the sharer's
-   own mailbox. So does everyone when the sharer has no pass, since no
-   classification is possible. This is scoping, not access control: reading
-   another family's mailbox is prevented by the token class itself (CP4).
-   `relay_contact_shares_own_family` in the core is the single comparison both
-   shells use.
+   An **absent** pass is where this gets decided rather than assumed, because
+   a relative who has not finished onboarding and a family met on holiday who
+   never bought a pass look identical from the card alone. The rule:
+
+   - **We have a pass.** Eligible only if the contact is on it. A contact with
+     no pass is *not yet* in the family rather than outside it, and becomes
+     eligible the moment they enter the pass we gave them — the pass-change
+     re-fan below replays that with no user action. Meeting them in person
+     buys no exception; that is exactly what the holiday case looks like.
+   - **Neither side has a pass.** No family boundary is drawn yet, so fall
+     back to the only one that exists: whether we actually met.
+     `ContactProvenance::added_nearby` is that stored fact, and a remote
+     re-add never unmakes it.
+   - **They have a pass and we do not.** Not eligible — they belong to a
+     family whose boundary we cannot see.
+
+   The cost is deliberate: a family that never buys a pass gets introductions
+   only among people they met face to face. The alternative was letting every
+   passless contact count as family, which is precisely the leak.
+
+   This is scoping, not access control: reading another family's mailbox is
+   prevented by the token class itself (CP4). `friend_introduction_eligible`
+   in the core is the single rule both shells use, over the pure comparison
+   `relay_contact_shares_own_family`.
 
    Enforced on both sides. A sender never puts an off-pass candidate in a
    snapshot; a receiver applies an off-pass introducer's snapshot as an *empty*

@@ -28,9 +28,22 @@ class FriendDirectoryScopeTest {
     private fun cardFor(name: String, memberToken: String) =
         contact(name, RELAY_URL, relayDepositTokenFor(memberToken))
 
-    private fun candidates(recipient: Contact, contacts: List<Contact>) =
-        FriendDirectoryScope.candidatesFor(recipient, contacts, RELAY_URL, OWN_TOKEN)
-            .map { it.name }
+    /** Default: everyone was met in person, so the pass is what decides. */
+    private val allNearby: (ByteArray) -> Boolean = { true }
+    private val noneNearby: (ByteArray) -> Boolean = { false }
+
+    private fun candidates(
+        recipient: Contact,
+        contacts: List<Contact>,
+        ownToken: String? = OWN_TOKEN,
+        addedNearby: (ByteArray) -> Boolean = allNearby,
+    ) = FriendDirectoryScope.candidatesFor(
+        recipient = recipient,
+        contacts = contacts,
+        ownRelayUrl = ownToken?.let { RELAY_URL },
+        ownRelayToken = ownToken,
+        addedNearby = addedNearby,
+    ).map { it.name }
 
     @Test
     fun `a contact on another pass is never offered and never receives`() {
@@ -39,10 +52,10 @@ class FriendDirectoryScopeTest {
         val contacts = listOf(family, tester)
 
         // The reported symptom: a tester-pass person offered inside a family.
-        assertEquals(listOf("Sibling"), candidates(recipient = cardFor("Kid", OWN_TOKEN), contacts))
+        assertEquals(listOf("Sibling"), candidates(cardFor("Kid", OWN_TOKEN), contacts))
         // ...and the same leak outbound, which would hand a family's names to
         // the tester fleet.
-        assertEquals(emptyList<String>(), candidates(recipient = tester, contacts))
+        assertEquals(emptyList<String>(), candidates(tester, contacts))
     }
 
     @Test
@@ -52,51 +65,76 @@ class FriendDirectoryScopeTest {
             cardFor("Kid1", OWN_TOKEN),
             cardFor("Kid2", OWN_TOKEN),
         )
+        assertEquals(listOf("Parent", "Kid2"), candidates(contacts[1], contacts))
+    }
+
+    @Test
+    fun `a holiday acquaintance without a pass is not family, even met in person`() {
+        // The cruise case: another family's kid, scanned face to face, no pass
+        // of their own. Being nearby must not buy an exception -- that is
+        // exactly how a relative mid-onboarding looks, and letting either one
+        // through reopens the propagation the scoping exists to stop.
+        val outsider = contact("CruiseKid")
+        val parent = cardFor("Parent", OWN_TOKEN)
+        assertFalse(
+            FriendDirectoryScope.introducible(outsider, RELAY_URL, OWN_TOKEN, addedNearby = true),
+        )
+        assertEquals(emptyList<String>(), candidates(parent, listOf(outsider, parent)))
+    }
+
+    @Test
+    fun `a family member joining our pass becomes eligible at that moment`() {
+        // Before: no pass, not offered. After: on ours, offered. The
+        // pass-change re-fan is what replays this without user action.
+        val before = contact("NotSetUpYet")
+        val after = cardFor("NotSetUpYet", OWN_TOKEN)
+        assertFalse(FriendDirectoryScope.introducible(before, RELAY_URL, OWN_TOKEN, true))
+        assertTrue(FriendDirectoryScope.introducible(after, RELAY_URL, OWN_TOKEN, false))
+    }
+
+    @Test
+    fun `with no pass at all, meeting in person is the only boundary left`() {
+        val met = contact("Met")
+        val neverMet = contact("NeverMet")
         assertEquals(
-            listOf("Parent", "Kid2"),
-            candidates(recipient = contacts[1], contacts = contacts),
+            listOf("NeverMet"),
+            candidates(
+                recipient = met,
+                contacts = listOf(met, neverMet),
+                ownToken = null,
+                addedNearby = allNearby,
+            ),
+        )
+        // A contact added remotely, by somebody else's introduction, stays out.
+        assertEquals(
+            emptyList<String>(),
+            candidates(met, listOf(met, neverMet), ownToken = null, addedNearby = noneNearby),
         )
     }
 
     @Test
-    fun `a family member who has not set a pass up yet stays eligible`() {
-        // Their card carries no relay fields, so our sends to them already
-        // land in our own mailbox. Excluding them would break introductions
-        // for exactly the half-onboarded family the feature helps most.
-        val noPass = contact("NotSetUpYet")
-        val contacts = listOf(noPass, cardFor("Parent", OWN_TOKEN))
-        assertTrue(FriendDirectoryScope.sharesOwnPass(noPass, RELAY_URL, OWN_TOKEN))
-        assertEquals(listOf("NotSetUpYet"), candidates(recipient = contacts[1], contacts))
+    fun `without a pass, a contact who has one belongs to a family we cannot see`() {
+        val passHolder = cardFor("HasPass", TESTER_TOKEN)
+        assertFalse(
+            FriendDirectoryScope.introducible(passHolder, null, null, addedNearby = true),
+        )
     }
 
     @Test
     fun `a pre-CP4 card carrying the member token itself is still our family`() {
         val legacy = contact("Legacy", RELAY_URL, OWN_TOKEN)
-        assertTrue(FriendDirectoryScope.sharesOwnPass(legacy, RELAY_URL, OWN_TOKEN))
+        assertTrue(FriendDirectoryScope.introducible(legacy, RELAY_URL, OWN_TOKEN, false))
     }
 
     @Test
     fun `the same family token on a different relay host is not our pass`() {
         val elsewhere = contact("Elsewhere", "https://other.example", OWN_TOKEN)
-        assertFalse(FriendDirectoryScope.sharesOwnPass(elsewhere, RELAY_URL, OWN_TOKEN))
+        assertFalse(FriendDirectoryScope.introducible(elsewhere, RELAY_URL, OWN_TOKEN, true))
     }
 
     @Test
     fun `a recipient is never offered themselves`() {
         val self = cardFor("Kid", OWN_TOKEN)
-        assertEquals(emptyList<String>(), candidates(recipient = self, contacts = listOf(self)))
-    }
-
-    @Test
-    fun `with no pass of our own nobody is excluded`() {
-        // Nothing to compare against; silently emptying every snapshot would
-        // switch the feature off for anyone who has not bought a pass.
-        val tester = cardFor("Tester", TESTER_TOKEN)
-        val other = cardFor("Other", TESTER_TOKEN)
-        assertEquals(
-            listOf("Other"),
-            FriendDirectoryScope.candidatesFor(tester, listOf(tester, other), null, null)
-                .map { it.name },
-        )
+        assertEquals(emptyList<String>(), candidates(self, listOf(self)))
     }
 }
