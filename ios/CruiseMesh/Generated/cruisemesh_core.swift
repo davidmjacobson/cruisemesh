@@ -1855,6 +1855,24 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func clearContactRelayRejection(userId: Data) throws 
     
+    /**
+     * Erases every V2 field-metrics row.
+     *
+     * The counterpart to [`Self::export_delivery_metrics_csv`]. These rows
+     * used to leave the device only when someone deliberately tapped a
+     * separate "Export field metrics" button, so having no way to erase them
+     * was defensible. Now that they ride along with every "Share
+     * diagnostics", the tester-facing delete has to reach them too --
+     * otherwise "delete captured diagnostics" leaves behind the one captured
+     * thing it did not name.
+     *
+     * Deliberately does not touch `messages`: the `arrival_transport` and
+     * `hops_taken` columns there are per-message delivery facts the chat UI
+     * renders, not captured diagnostics, and clearing them would silently
+     * change what the app says about existing conversations.
+     */
+    func clearDeliveryMetrics() throws 
+    
     func clearFriendSuggestions() throws 
     
     func clearPeerConnectionHistory() throws 
@@ -2274,6 +2292,19 @@ public protocol MessageStoreProtocol : AnyObject {
      * groups is unlikely but not impossible, so callers try each).
      */
     func groupsMatchingHint(hint: Data, nowMs: Int64) throws  -> [Group]
+    
+    /**
+     * Whether any field-metrics rows exist.
+     *
+     * The cheap question the UI actually wants when deciding whether the
+     * delete button has anything to act on. Asking
+     * [`Self::export_delivery_metrics_csv`] instead means serialising every
+     * row -- thousands of them after a week aboard -- and, on Android, the
+     * caller then had to write that CSV to disk just to count its lines,
+     * during Compose composition. `EXISTS` stops at the first row and touches
+     * no files.
+     */
+    func hasDeliveryMetrics() throws  -> Bool
     
     /**
      * The highest lamport value N such that every message `1..=N` from this
@@ -3405,6 +3436,28 @@ open func clearContactRelayRejection(userId: Data)throws  {try rustCallWithError
 }
 }
     
+    /**
+     * Erases every V2 field-metrics row.
+     *
+     * The counterpart to [`Self::export_delivery_metrics_csv`]. These rows
+     * used to leave the device only when someone deliberately tapped a
+     * separate "Export field metrics" button, so having no way to erase them
+     * was defensible. Now that they ride along with every "Share
+     * diagnostics", the tester-facing delete has to reach them too --
+     * otherwise "delete captured diagnostics" leaves behind the one captured
+     * thing it did not name.
+     *
+     * Deliberately does not touch `messages`: the `arrival_transport` and
+     * `hops_taken` columns there are per-message delivery facts the chat UI
+     * renders, not captured diagnostics, and clearing them would silently
+     * change what the app says about existing conversations.
+     */
+open func clearDeliveryMetrics()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_delivery_metrics(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
 open func clearFriendSuggestions()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_clear_friend_suggestions(self.uniffiClonePointer(),$0
     )
@@ -4048,6 +4101,24 @@ open func groupsMatchingHint(hint: Data, nowMs: Int64)throws  -> [Group] {
     uniffi_cruisemesh_core_fn_method_messagestore_groups_matching_hint(self.uniffiClonePointer(),
         FfiConverterData.lower(hint),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Whether any field-metrics rows exist.
+     *
+     * The cheap question the UI actually wants when deciding whether the
+     * delete button has anything to act on. Asking
+     * [`Self::export_delivery_metrics_csv`] instead means serialising every
+     * row -- thousands of them after a week aboard -- and, on Android, the
+     * caller then had to write that CSV to disk just to count its lines,
+     * during Compose composition. `EXISTS` stops at the first row and touches
+     * no files.
+     */
+open func hasDeliveryMetrics()throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_has_delivery_metrics(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -17466,6 +17537,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_contact_relay_rejection() != 26476) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_delivery_metrics() != 11431) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_friend_suggestions() != 35411) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -17566,6 +17640,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_groups_matching_hint() != 61300) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_has_delivery_metrics() != 11580) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 43009) {

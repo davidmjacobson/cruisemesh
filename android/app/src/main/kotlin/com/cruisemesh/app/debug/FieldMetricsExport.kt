@@ -21,6 +21,23 @@ object FieldMetricsExport {
      * [Intent], or `null` when nothing has been captured yet (header only).
      */
     fun shareIntent(context: Context): Intent? {
+        val file = writeCsvFile(context) ?: return null
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        return Intent(Intent.ACTION_SEND).apply {
+            type = "text/csv"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, "CruiseMesh field metrics")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
+
+    /**
+     * Writes the current metrics to a shareable file and returns it, or `null`
+     * when nothing has been captured yet (header row only). Split out from
+     * [shareIntent] so [DiagnosticsShare] can bundle the CSV alongside the log
+     * in a single share sheet.
+     */
+    fun writeCsvFile(context: Context): File? {
         val csv = runCatching { AppStore.get(context).exportDeliveryMetricsCsv() }.getOrNull()
             ?: return null
         // A header line with no data rows means there's nothing to share.
@@ -29,13 +46,11 @@ object FieldMetricsExport {
         val dir = File(context.getExternalFilesDir(null), METRICS_DIR).apply { mkdirs() }
         val file = File(dir, FILE_NAME)
         file.writeText(csv)
+        return file
+    }
 
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-        return Intent(Intent.ACTION_SEND).apply {
-            type = "text/csv"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            putExtra(Intent.EXTRA_SUBJECT, "CruiseMesh field metrics")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
+    /** Erases the exported CSV, if one was written. */
+    fun deleteCsvFile(context: Context) {
+        File(File(context.getExternalFilesDir(null), METRICS_DIR), FILE_NAME).delete()
     }
 }
