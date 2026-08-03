@@ -5,7 +5,13 @@ import os.log
 /// is an instance property of a `@MainActor` type; the fetch walk runs
 /// `nonisolated`, so it needs a logger it can reach without hopping to the
 /// main actor just to say something went wrong.
-let relaySyncLog = Logger(subsystem: "com.cruisemesh", category: "MeshController")
+///
+/// Categorised `RelaySync`, not `MeshController`. It carried the latter for no
+/// reason beyond where the code was lifted from, which meant relay sync lines
+/// were indistinguishable from mesh lines in a shared archive -- so a log from
+/// a tester whose relay was failing read as though the relay was never
+/// consulted at all.
+let relaySyncLog = Logger(subsystem: "com.cruisemesh", category: "RelaySync")
 
 /// What a `/ws` subscribe needs: which recipient hints to watch, and where in
 /// the mailbox to start from. Mirrors Android's `RelayPushSubscription`.

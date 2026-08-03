@@ -120,6 +120,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // actor, and a headless relaunch is exactly the case where knowing it
         // is denied matters most.
         EnvironmentSnapshot.start()
+        // Which Cruise Pass this device is on, before anything tries to use it.
+        RelayConfigStore.logSummary()
         let isBluetoothRelaunch = launchOptions?[.bluetoothCentrals] != nil
             || launchOptions?[.bluetoothPeripherals] != nil
         // Onboarding gates mesh startup deliberately (permissions are

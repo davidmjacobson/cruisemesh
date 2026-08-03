@@ -35,6 +35,7 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.TermsAcceptanceStore
+import com.cruisemesh.app.relay.RelayConfigStore
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.DigestEntry
@@ -479,6 +480,10 @@ class MeshService : Service() {
         // revived straight into the service without the UI (no-op in release
         // and idempotent with MainActivity's call).
         DebugFileLog.start(this)
+        // Same reason: a process revived straight into the service does relay
+        // work with no UI, and without this its log would carry relay traffic
+        // and never say which pass produced it -- the gap this line closes.
+        RelayConfigStore.logSummary(this)
         MeshRuntimeStatus.markStarting()
 
         if (running) {

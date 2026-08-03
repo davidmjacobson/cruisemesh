@@ -1,6 +1,7 @@
 package com.cruisemesh.app.relay
 
 import android.net.Network
+import android.util.Log
 import com.google.gson.JsonParser
 import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.CoreGroupFanoutRow
@@ -125,6 +126,17 @@ data class RelayPresencePage(
  * never crosses this boundary.
  */
 object RelayClient {
+    /**
+     * Every relay call lands here, and until now none of them left a trace.
+     *
+     * That is the single biggest hole in a shared diagnostics log: the relay is
+     * where this app's hardest bugs have lived -- 401s against a stale contact
+     * endpoint, 429 storms, silent-host demotion, a re-upload loop that
+     * bypassed Retry-After -- and every one had to be reproduced locally
+     * because the tester's log said nothing about the relay at all.
+     */
+    const val TAG = "RelayClient"
+
     fun postOutboundEnvelope(config: RelayConfig, envelope: OutboundEnvelope, network: Network? = null): Long =
         postEnvelope(
             config,
@@ -318,7 +330,24 @@ object RelayClient {
         outputStream.use { it.write(body.toByteArray(StandardCharsets.UTF_8)) }
     }
 
+    /**
+     * One line per relay call.
+     *
+     * Only the URL *path* is logged, never the query: the fetch path carries
+     * recipient hints, and this log gets shared with whoever is helping.
+     */
+    fun logOutcome(method: String, path: String, code: Int, ms: Long, bytes: Int) {
+        Log.i(TAG, "$method $path -> $code in ${ms}ms, ${bytes}B")
+    }
+
+    fun logFailure(method: String, path: String, ms: Long, detail: String) {
+        Log.e(TAG, "$method $path failed after ${ms}ms: $detail")
+    }
+
     private inline fun <T> HttpURLConnection.useJsonResponse(block: (ByteArray) -> T): T {
+        val started = System.currentTimeMillis()
+        val method = requestMethod ?: "?"
+        val path = runCatching { url.path }.getOrNull() ?: "?"
         return try {
             val code = responseCode
             val maxBytes = relayMaxResponseBytes().toInt()
@@ -339,17 +368,39 @@ object RelayClient {
                     JsonParser.parseString(preview).asJsonObject.get("code")?.asString
                 }.getOrNull()
                 val semantic = relayCode?.let { " [$it]" }.orEmpty()
+                val retryAfter = getHeaderField("Retry-After")
+                // The fields that explain a stuck relay: relayd's own
+                // machine-readable reason, and the header the carry re-upload
+                // storm ignored. The body preview is deliberately not logged --
+                // it is the one part of a relay response not under our control.
+                Log.e(
+                    TAG,
+                    "$method $path -> $code${semantic.ifEmpty { " [-]" }} " +
+                        "in ${System.currentTimeMillis() - started}ms " +
+                        "retryAfter=${retryAfter ?: "-"}",
+                )
                 throw RelayHttpException(
                     code,
                     relayCode,
                     "Relay request failed ($code)$semantic: $preview",
-                    retryAfter = getHeaderField("Retry-After"),
+                    retryAfter = retryAfter,
                 )
             }
             if (contentLengthLong > maxBytes) {
                 throw RelayResponseTooLargeException(maxBytes)
             }
-            block(inputStream?.use { it.readBounded(maxBytes) } ?: ByteArray(0))
+            val body = inputStream?.use { it.readBounded(maxBytes) } ?: ByteArray(0)
+            logOutcome(method, path, code, System.currentTimeMillis() - started, body.size)
+            block(body)
+        } catch (e: RelayHttpException) {
+            // Already logged above with its status and Retry-After; re-logging
+            // here would double every relay failure in the shared archive.
+            throw e
+        } catch (e: Exception) {
+            // Transport and decode failures never reach the branch above, so
+            // this is their only chance to be recorded.
+            logFailure(method, path, System.currentTimeMillis() - started, "${e.javaClass.simpleName}: ${e.message}")
+            throw e
         } finally {
             disconnect()
         }
