@@ -1,4 +1,5 @@
 import Foundation
+import os.log
 
 struct RelayConfig: Codable, Equatable {
     var relayUrl: String
@@ -98,5 +99,36 @@ enum RelayConfigStore {
 
     static func setShareOnline(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: shareOnlineKey)
+    }
+
+    private static let log = Logger(subsystem: "com.cruisemesh", category: "RelayClient")
+
+    /// Records the Cruise Pass this device is actually using, once per launch.
+    ///
+    /// Without it a shared archive cannot answer the first question anyone
+    /// asks about a relay problem -- is this phone even configured, and with
+    /// which pass? A log full of relay silence looks identical whether the
+    /// pass is missing, pointed at a dead host, or working perfectly with
+    /// nothing to carry.
+    ///
+    /// The token is reduced to its first eight characters. That is enough to
+    /// tell one family's pass from another's, and from the shared tester pass,
+    /// while staying useless to anyone who reads the file: it is a bearer
+    /// credential, so the full value must never reach a share sheet.
+    static func logSummary() {
+        guard let config = load() else {
+            log.info("Relay not configured on this device (no Cruise Pass)")
+            return
+        }
+        let host = URL(string: config.relayUrl)?.host ?? "unparseable"
+        let tokenPrefix = String(config.relayToken.prefix(8))
+        log.info(
+            """
+            Relay configured: host=\(host, privacy: .public) \
+            token=\(tokenPrefix, privacy: .public)… \
+            epoch=\(relayEpoch(), privacy: .public) \
+            shareOnline=\(shareOnline(), privacy: .public)
+            """
+        )
     }
 }

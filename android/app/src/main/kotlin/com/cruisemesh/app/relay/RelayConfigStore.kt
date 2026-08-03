@@ -1,6 +1,7 @@
 package com.cruisemesh.app.relay
 
 import android.content.Context
+import android.util.Log
 import com.cruisemesh.app.persist
 
 private const val PREFS_NAME = "cruisemesh_relay"
@@ -107,4 +108,38 @@ object RelayConfigStore {
             .putBoolean(PREF_SHARE_ONLINE, enabled)
             .persist(durable)
     }
+
+    /**
+     * Records the Cruise Pass this device is actually using, once per launch.
+     *
+     * Without it a shared log cannot answer the first question anyone asks
+     * about a relay problem -- is this phone even configured, and with which
+     * pass? A log full of relay silence looks identical whether the pass is
+     * missing, pointed at a dead host, or working perfectly with nothing to
+     * carry.
+     */
+    fun logSummary(context: Context) {
+        val config = load(context)
+        if (config == null) {
+            Log.i(RelayClient.TAG, "Relay not configured on this device (no Cruise Pass)")
+            return
+        }
+        Log.i(
+            RelayClient.TAG,
+            "Relay configured: host=${hostOf(config.relayUrl)} " +
+                "token=${tokenPrefix(config.relayToken)}… " +
+                "epoch=${relayEpoch(context)} shareOnline=${shareOnline(context)}",
+        )
+    }
+
+    private fun hostOf(url: String): String =
+        runCatching { java.net.URL(url).host }.getOrNull() ?: "unparseable"
+
+    /**
+     * The first eight characters only. Enough to tell one family's pass from
+     * another's, and from the shared tester pass, while staying useless to
+     * anyone who reads the file: it is a bearer credential, so the full value
+     * must never reach a share sheet.
+     */
+    internal fun tokenPrefix(token: String): String = token.take(8)
 }

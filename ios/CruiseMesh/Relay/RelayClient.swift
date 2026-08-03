@@ -1,4 +1,5 @@
 import Foundation
+import os.log
 
 /// Accumulates one bounded relay response and decides what its failures mean.
 ///
@@ -259,6 +260,16 @@ enum RelayClient {
     private static let errorBodyPreviewBytes = 2_048
     private static let userAgent = "CruiseMeshRelayClient-iOS/0.1"
 
+    /// Every relay call lands here, and until now none of them left a trace.
+    ///
+    /// That is the single biggest hole in a shared diagnostics archive: the
+    /// relay is where this app's hardest bugs have lived -- 401s against a
+    /// stale contact endpoint, 429 storms, silent-host demotion, a re-upload
+    /// loop that bypassed `Retry-After` -- and every one of them had to be
+    /// reproduced locally because the tester's log said nothing at all about
+    /// the relay. One line per call fixes that.
+    private static let log = Logger(subsystem: "com.cruisemesh", category: "RelayClient")
+
     /// Overridable for unit tests (URLProtocol / mock sessions).
     static var urlSession: URLSession = .shared
 
@@ -454,6 +465,77 @@ enum RelayClient {
     }
 
     private static func syncRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
+        let started = Date()
+        do {
+            let (data, response) = try performRequest(request)
+            logOutcome(request, response: response, data: data, started: started)
+            return (data, response)
+        } catch {
+            // Transport failures never reach `ensureOK`, so this is their only
+            // chance to be recorded. `localizedDescription` on a URLError is
+            // OS-authored text like "The request timed out" -- no URL, no
+            // token, nothing from the body.
+            log.error(
+                """
+                \(label(request), privacy: .public) failed after \
+                \(elapsedMs(started), privacy: .public)ms: \
+                \(error.localizedDescription, privacy: .public)
+                """
+            )
+            throw error
+        }
+    }
+
+    /// One line per relay call.
+    ///
+    /// Only the URL *path* is logged, never the query: the fetch path carries
+    /// recipient hints, and this file gets emailed to whoever is helping.
+    private static func logOutcome(
+        _ request: URLRequest,
+        response: URLResponse,
+        data: Data,
+        started: Date
+    ) {
+        guard let http = response as? HTTPURLResponse else {
+            log.error("\(label(request), privacy: .public) -> non-HTTP response")
+            return
+        }
+        let ms = elapsedMs(started)
+        guard !(200..<300).contains(http.statusCode) else {
+            log.info(
+                """
+                \(label(request), privacy: .public) -> \(http.statusCode, privacy: .public) \
+                in \(ms, privacy: .public)ms, \(data.count, privacy: .public)B
+                """
+            )
+            return
+        }
+        // Non-2xx: the fields that explain a stuck relay. `code` is relayd's
+        // own machine-readable reason (an enum it defines, not user data), and
+        // Retry-After is the header the carry re-upload storm ignored.
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let code = (json?["code"] as? String) ?? "-"
+        let retryAfter = http.value(forHTTPHeaderField: "Retry-After") ?? "-"
+        log.error(
+            """
+            \(label(request), privacy: .public) -> \(http.statusCode, privacy: .public) \
+            [\(code, privacy: .public)] in \(ms, privacy: .public)ms \
+            retryAfter=\(retryAfter, privacy: .public)
+            """
+        )
+    }
+
+    private static func label(_ request: URLRequest) -> String {
+        let method = request.httpMethod ?? "?"
+        let path = request.url?.path ?? "?"
+        return "\(method) \(path)"
+    }
+
+    private static func elapsedMs(_ started: Date) -> Int {
+        Int(Date().timeIntervalSince(started) * 1000)
+    }
+
+    private static func performRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
         let sem = DispatchSemaphore(value: 0)
         let delegate = BoundedRelayResponseDelegate(
             maxBytes: Int(relayMaxResponseBytes()),
