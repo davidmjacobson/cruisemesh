@@ -85,7 +85,8 @@ all** before their phone requests the suggested connections.
    pass-change re-fan below replays that with no user action.
 
    This is scoping, not access control: reading another family's mailbox is
-   prevented by the token class itself (CP4).
+   prevented by the token class itself: a friend card carries a post-only
+   deposit token, which cannot fetch.
 
    Enforced on both sides. A sender never puts an off-pass candidate in a
    snapshot; a receiver applies an off-pass introducer's snapshot as an *empty*

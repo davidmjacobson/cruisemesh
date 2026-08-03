@@ -21,7 +21,11 @@ Especially interesting:
   state — the design intends them to learn none of these
   ([SECURITY-DESIGN.md](SECURITY-DESIGN.md)).
 - Envelope forgery, receipt forgery, or group-key exposure.
-- relayd authentication bypass or cross-family data access.
+- relayd authentication bypass or cross-family data access, including a
+  post-only deposit token that gets fetch, ack, or WebSocket access.
+- Anything on the same-LAN transport: impersonating a contact through the
+  Noise XX handshake, or getting a phone to accept or forward an endpoint it
+  wasn't told about by its owner.
 - Key material leaving the device (it never should).
 
 Out of scope: denial of service via radio jamming or BLE flooding (physical
@@ -40,5 +44,6 @@ beyond family logistics.
 
 ## Supported versions
 
-Pre-1.0: only the latest commit on `master` is supported. There are no
-backported fixes.
+Only the current release (1.0.7 on both platforms) and the latest commit on
+`master` are supported. Fixes ship forward in the next release; there are no
+backports to older builds.

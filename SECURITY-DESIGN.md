@@ -19,10 +19,11 @@ beyond its stated threat model.
 CruiseMesh's adversary is **"no internet," not a nation-state.**
 
 It is a delay-tolerant family messenger: messages travel over Bluetooth LE
-between phones, get physically carried ("muled") by other phones, and
-optionally sync through a self-hostable relay server when any phone finds
-internet. Because ciphertext rides on strangers' phones and third-party
-servers, everything is end-to-end encrypted — but the design does **not**
+between phones, over a shared local network such as a ship's Wi-Fi, get
+physically carried ("muled") by other phones, and optionally sync through a
+self-hostable relay server when any phone finds internet. Because ciphertext
+rides on shared networks, strangers' phones, and third-party servers,
+everything is end-to-end encrypted — but the design does **not**
 attempt anonymity, censorship resistance, metadata-free operation, or
 resistance to a global passive observer. If your threat model includes state
 actors, use something built for that (e.g. Briar) and accept its platform
@@ -64,9 +65,9 @@ limits.
   PBKDF2-HMAC-SHA256 (600,000 iterations by default; the format enforces
   100,000–1,200,000) from a user passphrase (minimum 10 characters,
   strength-rated before export), with a random 16-byte salt and 12-byte
-  nonce per file. This is a deliberate, user-driven trade-off — see
-  [LOCAL_BACKUP_RESTORE.md](LOCAL_BACKUP_RESTORE.md) — not an automatic or
-  cloud-synced export; the file is only as strong as its passphrase.
+  nonce per file. This is a deliberate, user-driven trade-off — not an
+  automatic or cloud-synced export; the file is only as strong as its
+  passphrase.
 - **UserID** = first 16 bytes of BLAKE2b(Ed25519 public key), shown base32
   for out-of-band sharing.
 - **Friending** exchanges names and both public keys via QR code or pasted
@@ -127,6 +128,54 @@ bucketed sizes, daily-rotating hints, and rough social-graph scale. What it
 does not learn: contents, senders, recipients' stable identities, read
 state, or group membership.
 
+## Same-LAN links (ship Wi-Fi)
+
+When phones share a network — most often a ship's Wi-Fi, joined without buying
+an internet package — they talk directly over TCP. Everyone else associated to
+that network is a potential observer, so the link carries its own layer:
+
+- Every connection completes a **`Noise_XX_25519_ChaChaPoly_BLAKE2s`**
+  handshake using the X25519 key already in the device's identity. Both static
+  public keys are encrypted during the handshake, and the result is mutually
+  authenticated with forward secrecy and replay resistance.
+- The remote static key must **exactly match an accepted contact's** agreement
+  key. An initiator won't send message 3 to an unknown device; a responder
+  closes an unknown connection before accepting any CruiseMesh frame. Version 1
+  exchanges nothing at all with strangers.
+- TCP reachability and DNS-SD advertisements are treated as **routing data, not
+  authentication**. Anything can advertise anything on a shared network; only
+  the handshake decides who you're talking to.
+- Sealed envelopes are still the authoritative layer. What Noise adds is
+  protection for **link metadata** — HELLO and digest inventories — from the
+  rest of the network.
+- **Endpoint privacy invariant:** a phone advertises only *its own* address,
+  and shares it with a contact sealed pairwise. Addresses it discovers for
+  third parties are never forwarded to anyone. A contact learns where to reach
+  you because you told them, not because someone else did.
+
+What a fellow passenger on the same Wi-Fi can still see: that a device is
+running something advertising `_cruisemesh._tcp`, and the timing and size of
+its connections. Contents, identities, and who is talking to whom stay sealed.
+
+## Relay credentials (why a leaked friend card isn't a breach)
+
+Each family's mailbox has **two credential classes**, split the way email
+splits SMTP from IMAP:
+
+- The **member token** authorizes everything — post, fetch, ack, WebSocket —
+  and travels only on the family's own setup card, between the family's own
+  phones.
+- The **deposit token** is post-only into that family's mailbox, under a
+  tighter rate limit. This is what friend cards carry, so that people outside
+  the family can deliver mail to you.
+
+relayd enforces the split at its auth layer: a deposit token presented to
+fetch, ack, or the WebSocket gets a structured 403. So a friend card that leaks
+is a nuisance — someone can stuff your mail slot, rate-limited — rather than a
+compromise, because nobody holding it can drain the mailbox. Everything in the
+mailbox is sealed regardless; this bounds *availability* and traffic-analysis
+exposure, not confidentiality.
+
 ## Why no Double Ratchet (the biggest deliberate trade-off)
 
 Ratchets assume ordered-ish, online-ish delivery. Delay-tolerant networking
@@ -145,11 +194,17 @@ post-quantum upgrade can ship later without a flag day.
 This is a considered position, not an oversight — but it is exactly the kind
 of judgment an independent review should probe.
 
-## Broadcast mode
+## Broadcast mode (not shipped, not planned)
 
-The public "shout" channel is signed but encrypted to a fixed, well-known
-key — i.e., **readable by anyone with the app, by design**. The UI labels it
-as public. Do not put anything private in broadcast.
+The design called for a public "shout" channel signed but encrypted to a
+fixed, well-known key — readable by anyone with the app, by design. **It was
+never built, and it is no longer planned** (DESIGN.md §6.6). Nothing in the
+app today is readable by anyone other than its intended recipients.
+
+If a broadcast channel ever ships it will be scoped to a single Cruise Pass
+rather than open to anyone with the app, and this section gets rewritten
+before that happens. The rule for any such channel stands: anything encrypted
+to a key many people hold is not private, and the UI has to say so.
 
 ## Design principles (and their origin story)
 

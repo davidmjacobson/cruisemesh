@@ -1,4 +1,4 @@
-# T3 — Google Nearby Connections evaluation
+# Google Nearby Connections evaluation
 
 Status: spike (spec-only, no product code). Timeboxed deliverable. Recommendation
 up front, evidence below.
@@ -86,6 +86,6 @@ for media.
 
 ## Disposition
 
-- T3: **closed as won't-adopt**, cite this doc.
+- **Closed as won't-adopt**; cite this doc.
 - Follow-up (optional, data-driven): "BLE-negotiated Wi-Fi bulk path" spike,
   gated on L3 media-throughput findings.

@@ -1,11 +1,17 @@
 # Group relay durability
 
-Status: **approved 2026-07-17** (DTN_TODOS.md D6 / finding N1). Option (d)
+Status: **approved 2026-07-17**, implemented. Option (d)
 per-member fan-out, with the §7 questions resolved in the future-proof
 direction: fan-out includes a self-addressed row (multi-device readiness),
 the attachment storage multiplier is accepted (kind=17 external chunks
 remain the eventual scaling path), and the legacy never-ack transition rule
 is unconditional.
+
+Reference note: the D-numbers below (D1, D4, D7, D9) are delay-tolerant
+delivery work items from an internal backlog that has since been retired.
+They are kept because the rules they name are cited by comments in the core.
+D1 is the consumed-SEEN ack rule, D4 the seen-set, D7 the per-family quota,
+D9 group receipt aggregation.
 
 ## 1. Problem
 
