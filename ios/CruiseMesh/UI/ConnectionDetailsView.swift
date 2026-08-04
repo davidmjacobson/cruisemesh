@@ -191,6 +191,9 @@ struct ConnectionDetailsView: View {
     /// launch died, and whether messages actually arrived -- and none is
     /// derivable from the others, so splitting them across buttons only meant
     /// getting a partial answer from whoever tapped the obvious one.
+    ///
+    /// They go as a single zip rather than as several attachments -- see
+    /// `DiagnosticsArchive` for how a list of files loses some of them.
     private func shareEverything() {
         var urls: [URL] = []
         if let url = DiagnosticLogExport.writeLogFile() { urls.append(url) }
@@ -199,9 +202,13 @@ struct ConnectionDetailsView: View {
         hasDiagnosticArchive = !urls.isEmpty
         if urls.isEmpty {
             supportMessage = String(localized: "No diagnostics captured yet.")
-        } else {
-            shareFile = ShareableFile(urls: urls)
+            return
         }
+        // Zipping is a disk write and can fail -- a full device, most likely.
+        // Sending the loose files then beats telling someone who has captured
+        // diagnostics that they have none.
+        let archive = DiagnosticsArchive.write(files: urls, name: DiagnosticsArchive.todaysName())
+        shareFile = ShareableFile(urls: archive.map { [$0] } ?? urls)
     }
 
     /// Whether the delete button has anything to act on.
@@ -227,6 +234,8 @@ struct ConnectionDetailsView: View {
         }
         try? AppStore.get().clearDeliveryMetrics()
         FieldMetricsExport.deleteExportedCSV()
+        // The last share left a zip holding copies of all of the above.
+        DiagnosticsArchive.deleteArchives()
         hasDiagnosticArchive = false
     }
 

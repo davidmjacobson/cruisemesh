@@ -6,6 +6,9 @@ import android.net.Uri
 import androidx.core.content.FileProvider
 import com.cruisemesh.app.AppStore
 import java.io.File
+import java.time.LocalDate
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 /**
  * Everything captured, in one share sheet.
@@ -21,27 +24,36 @@ import java.io.File
  * the point is analysis rather than a support hand-off.
  */
 object DiagnosticsShare {
+    private const val ARCHIVE_DIR = "diagnostics"
+
     /**
-     * A share [Intent] carrying every captured artifact, or `null` when there
-     * is nothing to send. Uses `ACTION_SEND_MULTIPLE` whenever more than one
-     * file exists; a lone file still goes as a plain `ACTION_SEND`, which more
-     * targets accept.
+     * A share [Intent] carrying every captured artifact as one zip, or `null`
+     * when there is nothing to send.
+     *
+     * One file, deliberately, even though `ACTION_SEND_MULTIPLE` is the
+     * documented way to attach several. Sending both files that way is correct
+     * on our side and the sheet even counts them ("Sharing 2 files"), but plenty
+     * of receiving apps take the first attachment and silently drop the rest --
+     * Files by Google saves only the log. The failure is invisible: the tester
+     * believes they sent diagnostics, support gets half of them, and neither
+     * side can tell. A zip cannot be half-consumed, and "send me the one file"
+     * is a simpler thing to ask a family member for anyway.
      */
     fun shareIntent(context: Context): Intent? {
         val files = capturedFiles(context)
         if (files.isEmpty()) return null
-        val uris = files.map { uriFor(context, it) }
-        val intent = if (uris.size == 1) {
-            Intent(Intent.ACTION_SEND).apply { putExtra(Intent.EXTRA_STREAM, uris.first()) }
-        } else {
-            Intent(Intent.ACTION_SEND_MULTIPLE).apply {
-                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+        val archive = writeArchive(files, archiveFile(context))
+        return Intent(Intent.ACTION_SEND).apply {
+            if (archive != null) {
+                type = "application/zip"
+                putExtra(Intent.EXTRA_STREAM, uriFor(context, archive))
+            } else {
+                // Zipping is a disk write and can fail -- a full device, most
+                // likely. Sending the log alone beats telling someone who has
+                // captured diagnostics that they have none.
+                type = mimeFor(files.first())
+                putExtra(Intent.EXTRA_STREAM, uriFor(context, files.first()))
             }
-        }
-        return intent.apply {
-            // Mixed text/csv: the only honest common ancestor is */*. Naming
-            // text/plain here would hide the CSV from targets that filter on it.
-            type = if (files.size == 1) mimeFor(files.first()) else "*/*"
             putExtra(Intent.EXTRA_SUBJECT, "CruiseMesh diagnostics")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
@@ -63,6 +75,17 @@ object DiagnosticsShare {
     }
 
     /**
+     * Erases the zip written by the last share.
+     *
+     * The archive is a full second copy of the log and the metrics, so a
+     * "delete captured diagnostics" that left it sitting in external files
+     * would be untrue. Mirrors [FieldMetricsExport.deleteCsvFile].
+     */
+    fun deleteArchive(context: Context) {
+        archiveDir(context).listFiles()?.forEach { it.delete() }
+    }
+
+    /**
      * The captured files, in the order a reader wants them: the log first,
      * since it is the narrative, then the metrics CSV.
      *
@@ -76,6 +99,46 @@ object DiagnosticsShare {
         FieldMetricsExport.writeCsvFile(context)?.let(files::add)
         return files
     }
+
+    /**
+     * Zips [files] into [dest], returning it, or `null` if the write failed.
+     *
+     * Entry names are the plain file names: a zip whose entries carry the
+     * device's directory layout is harder to read and leaks paths for no gain.
+     * Context-free so it can be unit-tested against a temp directory.
+     */
+    internal fun writeArchive(files: List<File>, dest: File): File? = runCatching {
+        dest.parentFile?.mkdirs()
+        ZipOutputStream(dest.outputStream().buffered()).use { zip ->
+            for (file in files) {
+                zip.putNextEntry(ZipEntry(file.name))
+                file.inputStream().buffered().use { it.copyTo(zip) }
+                zip.closeEntry()
+            }
+        }
+        dest
+    }.getOrElse {
+        // A half-written zip is worse than none: it would share as a plausible
+        // attachment and fail to open on the far side.
+        dest.delete()
+        null
+    }
+
+    /**
+     * Where this share's zip goes. Dated, because the first thing anyone asks
+     * of a diagnostics file is when it was taken, and the file name is the only
+     * part of it that survives being forwarded through three apps.
+     *
+     * The directory is cleared first so a week of shares does not accumulate
+     * copies of the log next to the log.
+     */
+    private fun archiveFile(context: Context): File {
+        deleteArchive(context)
+        return File(archiveDir(context), "cruisemesh-diagnostics-${LocalDate.now()}.zip")
+    }
+
+    private fun archiveDir(context: Context): File =
+        File(context.getExternalFilesDir(null), ARCHIVE_DIR).apply { mkdirs() }
 
     private fun uriFor(context: Context, file: File): Uri =
         FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
