@@ -1,7 +1,7 @@
 import Foundation
 
 /// Which contacts friends-of-friends introductions may involve: the ones on
-/// our own Cruise Pass, and nobody else. Mirrors Android's
+/// our own Shore Pass, and nobody else. Mirrors Android's
 /// `FriendDirectoryScope.kt`; the comparison itself lives in the core
 /// (`relay_wire.rs::relay_contact_shares_own_family`).
 ///

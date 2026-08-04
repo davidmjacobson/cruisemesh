@@ -169,7 +169,7 @@ class MainActivity : ComponentActivity() {
         // Debug builds: start capturing this process's log to a file so it can
         // be shared without adb (no-op in release). Idempotent with MeshService.
         DebugFileLog.start(this)
-        // Which Cruise Pass this device is on, recorded right after capture
+        // Which Shore Pass this device is on, recorded right after capture
         // starts so it is the first thing in every shared log.
         RelayConfigStore.logSummary(this)
         pendingDeepLink.value = deepLinkFromIntent(intent)

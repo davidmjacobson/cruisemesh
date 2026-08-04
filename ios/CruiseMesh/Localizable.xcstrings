@@ -351,12 +351,12 @@
         }
       }
     },
-    "Checking your Cruise Pass": {
+    "Checking your Shore Pass": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Checking your Cruise Pass"
+            "value": "Checking your Shore Pass"
           }
         }
       }
@@ -411,12 +411,12 @@
         }
       }
     },
-    "Confirm Cruise Pass change": {
+    "Confirm Shore Pass change": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Confirm Cruise Pass change"
+            "value": "Confirm Shore Pass change"
           }
         }
       }
@@ -541,62 +541,62 @@
         }
       }
     },
-    "Cruise Pass": {
+    "Shore Pass": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Cruise Pass"
+            "value": "Shore Pass"
           }
         }
       }
     },
-    "Cruise Pass is catching up": {
+    "Shore Pass is catching up": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Cruise Pass is catching up"
+            "value": "Shore Pass is catching up"
           }
         }
       }
     },
-    "Cruise Pass is configured": {
+    "Shore Pass is configured": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Cruise Pass is configured"
+            "value": "Shore Pass is configured"
           }
         }
       }
     },
-    "Cruise Pass is ready on this phone.": {
+    "Shore Pass is ready on this phone.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Cruise Pass is ready on this phone."
+            "value": "Shore Pass is ready on this phone."
           }
         }
       }
     },
-    "Cruise Pass is set up": {
+    "Shore Pass is set up": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Cruise Pass is set up"
+            "value": "Shore Pass is set up"
           }
         }
       }
     },
-    "Cruise Pass wasn’t set up": {
+    "Shore Pass wasn’t set up": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Cruise Pass wasn’t set up"
+            "value": "Shore Pass wasn’t set up"
           }
         }
       }
@@ -611,12 +611,12 @@
         }
       }
     },
-    "CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Cruise Pass.": {
+    "CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Shore Pass.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Cruise Pass."
+            "value": "CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Shore Pass."
           }
         }
       }
@@ -1031,12 +1031,12 @@
         }
       }
     },
-    "If the link does not open, copy the setup card, then go to Settings → Cruise Pass and choose Paste and set up.": {
+    "If the link does not open, copy the setup card, then go to Settings → Shore Pass and choose Paste and set up.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "If the link does not open, copy the setup card, then go to Settings → Cruise Pass and choose Paste and set up."
+            "value": "If the link does not open, copy the setup card, then go to Settings → Shore Pass and choose Paste and set up."
           }
         }
       }
@@ -1301,12 +1301,12 @@
         }
       }
     },
-    "Never post a Cruise Pass setup card or relay token publicly.": {
+    "Never post a Shore Pass setup card or relay token publicly.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Never post a Cruise Pass setup card or relay token publicly."
+            "value": "Never post a Shore Pass setup card or relay token publicly."
           }
         }
       }
@@ -1661,12 +1661,12 @@
         }
       }
     },
-    "Queued internet delivery will stop until another Cruise Pass or custom relay is set up. Nearby delivery still works.": {
+    "Queued internet delivery will stop until another Shore Pass or custom relay is set up. Nearby delivery still works.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Queued internet delivery will stop until another Cruise Pass or custom relay is set up. Nearby delivery still works."
+            "value": "Queued internet delivery will stop until another Shore Pass or custom relay is set up. Nearby delivery still works."
           }
         }
       }
@@ -1761,12 +1761,12 @@
         }
       }
     },
-    "Remove Cruise Pass setup": {
+    "Remove Shore Pass setup": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Remove Cruise Pass setup"
+            "value": "Remove Shore Pass setup"
           }
         }
       }
@@ -1841,12 +1841,12 @@
         }
       }
     },
-    "Replace Cruise Pass?": {
+    "Replace Shore Pass?": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Replace Cruise Pass?"
+            "value": "Replace Shore Pass?"
           }
         }
       }
@@ -2041,12 +2041,12 @@
         }
       }
     },
-    "Set up or fix Cruise Pass": {
+    "Set up or fix Shore Pass": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Set up or fix Cruise Pass"
+            "value": "Set up or fix Shore Pass"
           }
         }
       }
@@ -2061,12 +2061,12 @@
         }
       }
     },
-    "Set up your Cruise Pass": {
+    "Set up your Shore Pass": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Set up your Cruise Pass"
+            "value": "Set up your Shore Pass"
           }
         }
       }
@@ -2411,12 +2411,12 @@
         }
       }
     },
-    "The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Cruise Pass is set up, then share their friend card again. Messages still deliver when you are near each other.": {
+    "The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Shore Pass is set up, then share their friend card again. Messages still deliver when you are near each other.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Cruise Pass is set up, then share their friend card again. Messages still deliver when you are near each other."
+            "value": "The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Shore Pass is set up, then share their friend card again. Messages still deliver when you are near each other."
           }
         }
       }
@@ -2511,12 +2511,12 @@
         }
       }
     },
-    "This link is for a different Cruise Pass.": {
+    "This link is for a different Shore Pass.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "This link is for a different Cruise Pass."
+            "value": "This link is for a different Shore Pass."
           }
         }
       }
@@ -2621,12 +2621,12 @@
         }
       }
     },
-    "Use a different Cruise Pass": {
+    "Use a different Shore Pass": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Use a different Cruise Pass"
+            "value": "Use a different Shore Pass"
           }
         }
       }

@@ -32,8 +32,8 @@ struct ConnectionDetailsView: View {
                             ? "No active links"
                             : "\(localWifiCount) active"
                     )
-                    LabeledContent("Cruise Pass", value: relayLabel)
-                    Text("CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Cruise Pass.")
+                    LabeledContent("Shore Pass", value: relayLabel)
+                    Text("CruiseMesh chooses the best available path automatically. A message may arrive by Bluetooth, local Wi-Fi, or Shore Pass.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -336,7 +336,7 @@ struct ConnectionDetailsView: View {
         switch transport {
         case .bluetooth: return String(localized: "Bluetooth")
         case .localWifi: return String(localized: "local Wi-Fi")
-        case .cruisePass: return String(localized: "Cruise Pass")
+        case .cruisePass: return String(localized: "Shore Pass")
         case .carried: return nil
         }
     }

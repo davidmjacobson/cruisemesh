@@ -21,7 +21,7 @@ private const val KIND_RELAY_UPDATE: UByte = 9u
  * [com.cruisemesh.app.friending.ProfileSyncSender].
  *
  * A friend card is a *snapshot* of the sharer's relay config at the moment it
- * was shared. Buy a Cruise Pass, rotate a token, or migrate servers, and every
+ * was shared. Buy a Shore Pass, rotate a token, or migrate servers, and every
  * contact keeps posting to the endpoint they were handed — in the field that
  * looked like a contact's phone posting to a long-retired host and collecting
  * `401 unknown family token` roughly ten times a minute, forever, while the

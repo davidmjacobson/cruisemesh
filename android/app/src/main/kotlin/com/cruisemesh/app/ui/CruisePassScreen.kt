@@ -600,7 +600,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Image(
                         bitmap = qr,
-                        contentDescription = "Cruise Pass setup QR code",
+                        contentDescription = "Shore Pass setup QR code",
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Text(

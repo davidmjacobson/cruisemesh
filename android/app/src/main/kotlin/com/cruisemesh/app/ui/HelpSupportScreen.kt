@@ -54,7 +54,7 @@ fun HelpSupportScreen(
                 .padding(20.dp),
         ) {
             HelpItem(
-                "Set up or fix Cruise Pass",
+                "Set up or fix Shore Pass",
                 "Open the setup link from your purchase email. CruiseMesh checks and saves it automatically.",
                 onCruisePass,
             )
@@ -65,7 +65,7 @@ fun HelpSupportScreen(
             )
             HelpItem(
                 "Setup link did not open",
-                "Copy the setup card, then open Settings → Cruise Pass and choose Paste and set up.",
+                "Copy the setup card, then open Settings → Shore Pass and choose Paste and set up.",
                 onCruisePass,
             )
             Text(

@@ -2180,7 +2180,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         ))
         guard inserted else { return }
         if FriendsOfFriendsStore.isEnabled() {
-            // Introductions stay inside one Cruise Pass. A directory from an
+            // Introductions stay inside one Shore Pass. A directory from an
             // introducer on somebody else's pass is applied as an *empty*
             // snapshot rather than ignored: the revision bookkeeping stays
             // identical, and it additionally clears whatever that introducer
@@ -2856,7 +2856,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // T23: if our own endpoint changed since the last announcement, queue
         // the notice to every contact *before* this pass uploads, so it rides
         // out in the same sync. This is the single trigger for every way the
-        // config can change (Cruise Pass setup and removal, manual entry in
+        // config can change (Shore Pass setup and removal, manual entry in
         // Advanced, a scanned setup card, a backup restore) because they all
         // already end in `RelaySyncEvents.requestSync()` — no save site has to
         // remember to announce, and none can be missed. Mirrors Android's

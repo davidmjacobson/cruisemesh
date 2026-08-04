@@ -477,7 +477,7 @@ struct FriendsView: View {
             // fine for the contact record (sends resolve through it), never
             // for this phone's OWN config: adopting it would leave the phone
             // unable to fetch its own mail (403 deposit_only on every poll).
-            // Own config comes from the member-scoped Cruise Pass setup card.
+            // Own config comes from the member-scoped Shore Pass setup card.
             if RelayConfigStore.load() == nil,
                let url = contact.relayUrl,
                let token = contact.relayToken,

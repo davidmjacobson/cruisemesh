@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Severity of the Cruise Pass status shown in Settings, derived from
+/// Severity of the Shore Pass status shown in Settings, derived from
 /// `RelayHealth` plus whether a setup card is saved at all.
 ///
 /// Mirrors Android's `PassIndicator.kt` -- keep the two mappings in step.
@@ -85,10 +85,10 @@ enum PassIndicator {
     var accessibilityLabel: LocalizedStringKey? {
         switch self {
         case .none: return nil
-        case .ready: return "Cruise Pass ready"
-        case .waiting: return "Cruise Pass waiting for internet"
-        case .attention: return "Cruise Pass needs attention"
-        case .actionRequired: return "Cruise Pass needs action"
+        case .ready: return "Shore Pass ready"
+        case .waiting: return "Shore Pass waiting for internet"
+        case .attention: return "Shore Pass needs attention"
+        case .actionRequired: return "Shore Pass needs action"
         }
     }
 }
@@ -106,7 +106,7 @@ extension RelayHealth {
     }
 }
 
-/// Heading shown at the top of the Cruise Pass screen.
+/// Heading shown at the top of the Shore Pass screen.
 ///
 /// Mirrors Android's `PassIndicator.kt` -- keep the two mappings in step.
 enum CruisePassHeading {
@@ -127,8 +127,8 @@ enum CruisePassHeading {
     ///
     /// Re-checks are not demotions. A background sync pass, or a service
     /// restart, drops health to `.checking`/`.noConfig` for a second or two;
-    /// without `lastVerdict` the heading would fall from "Cruise Pass is set
-    /// up" with its green check to "Cruise Pass is configured" and back, which
+    /// without `lastVerdict` the heading would fall from "Shore Pass is set
+    /// up" with its green check to "Shore Pass is configured" and back, which
     /// reads to the person holding the phone as the pass breaking and healing.
     /// This is the same reasoning that maps those two states to
     /// `PassIndicator.none` rather than to a symbol that would only flicker.

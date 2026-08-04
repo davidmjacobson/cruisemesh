@@ -103,7 +103,7 @@ enum RelayConfigStore {
 
     private static let log = Logger(subsystem: "com.cruisemesh", category: "RelayClient")
 
-    /// Records the Cruise Pass this device is actually using, once per launch.
+    /// Records the Shore Pass this device is actually using, once per launch.
     ///
     /// Without it a shared archive cannot answer the first question anyone
     /// asks about a relay problem -- is this phone even configured, and with

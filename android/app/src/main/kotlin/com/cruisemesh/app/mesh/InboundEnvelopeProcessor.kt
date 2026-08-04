@@ -1503,7 +1503,7 @@ internal class InboundEnvelopeProcessor(
         )
         if (!inserted) return
         if (FriendsOfFriendsStore.isEnabled(context)) {
-            // Introductions stay inside one Cruise Pass. A directory from an
+            // Introductions stay inside one Shore Pass. A directory from an
             // introducer on somebody else's pass is applied as an *empty*
             // snapshot rather than ignored: the revision bookkeeping stays
             // identical, and it additionally clears whatever that introducer

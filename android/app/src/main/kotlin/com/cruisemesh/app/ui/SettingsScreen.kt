@@ -96,7 +96,7 @@ fun SettingsScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(20.dp),
         ) {
-            SettingsGroup("Cruise Pass") {
+            SettingsGroup("Shore Pass") {
                 SettingsLink(
                     title = relayTitle(relayHealth, relayConfigured),
                     detail = relayDetail(relayHealth, relayConfigured),
@@ -231,16 +231,16 @@ private fun appVersionLabel(context: Context): String {
 
 @Composable
 private fun relayTitle(health: RelayHealth, configured: Boolean): String {
-    if (!configured) return "Set up Cruise Pass"
+    if (!configured) return "Set up Shore Pass"
     return when (health) {
         RelayHealth.NoConfig,
-        RelayHealth.Checking -> "Checking Cruise Pass setup…"
-        is RelayHealth.Ok -> "Cruise Pass is working"
-        RelayHealth.NoInternet -> "Cruise Pass is waiting for internet"
-        is RelayHealth.Failing -> "Cruise Pass needs attention"
-        is RelayHealth.Expired -> "Cruise Pass expired"
-        is RelayHealth.Suspended -> "Cruise Pass suspended"
-        is RelayHealth.TokenRejected -> "Cruise Pass setup was rejected"
+        RelayHealth.Checking -> "Checking Shore Pass setup…"
+        is RelayHealth.Ok -> "Shore Pass is working"
+        RelayHealth.NoInternet -> "Shore Pass is waiting for internet"
+        is RelayHealth.Failing -> "Shore Pass needs attention"
+        is RelayHealth.Expired -> "Shore Pass expired"
+        is RelayHealth.Suspended -> "Shore Pass suspended"
+        is RelayHealth.TokenRejected -> "Shore Pass setup was rejected"
         is RelayHealth.QuotaFull -> stringResource(R.string.ui_cruise_pass_storage_full_title)
         is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_cruise_pass_message_too_large_title)
         is RelayHealth.RateLimited -> stringResource(R.string.ui_cruise_pass_slowed_title)
@@ -258,7 +258,7 @@ private fun relayDetail(health: RelayHealth, configured: Boolean): String {
         is RelayHealth.Failing -> "The relay could not be reached."
         is RelayHealth.Expired -> "Renew your pass to resume internet delivery."
         is RelayHealth.Suspended -> "Contact support for help with this pass."
-        is RelayHealth.TokenRejected -> "Paste the setup card again, or use a different Cruise Pass."
+        is RelayHealth.TokenRejected -> "Paste the setup card again, or use a different Shore Pass."
         is RelayHealth.QuotaFull -> stringResource(R.string.ui_cruise_pass_storage_full_detail)
         is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_cruise_pass_message_too_large_detail)
         is RelayHealth.RateLimited -> stringResource(R.string.ui_cruise_pass_slowed_detail)

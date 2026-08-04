@@ -255,7 +255,7 @@ class ContactReachabilityTest {
     @Test
     fun `contactDetailsCopy includes relay path detail when presence is known`() {
         assertEquals(
-            "Online via Cruise Pass · Last seen 2m ago",
+            "Online via Shore Pass · Last seen 2m ago",
             ContactReachability.contactDetailsCopy(
                 ReachabilityLevel.ONLINE_RELAY,
                 peerLastSeenMs = 60_000L,
@@ -326,7 +326,7 @@ class ContactReachabilityTest {
     @Test
     fun `no user-facing copy calls the mailbox a relay`() {
         // CP3 vocabulary: consumer surfaces say "internet delivery" or
-        // "Cruise Pass", never protocol words.
+        // "Shore Pass", never protocol words.
         for (level in ReachabilityLevel.entries) {
             for (hasDelivery in listOf(true, false)) {
                 val copy = ContactReachability.chatHeaderCopy(level, 0L, 60_000L, null, hasDelivery)

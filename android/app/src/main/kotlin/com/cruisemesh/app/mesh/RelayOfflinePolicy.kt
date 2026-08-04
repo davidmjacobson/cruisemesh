@@ -8,7 +8,7 @@ package com.cruisemesh.app.mesh
  * there is no internet delivery to have lost: nearby delivery is the whole
  * arrangement, it is working, and reporting "offline" would dress the free
  * default up as a fault -- the same mistake the pill made by reporting an
- * absent Cruise Pass as amber.
+ * absent Shore Pass as amber.
  *
  * This matters more at sea than at a desk. [RelaySyncEngine.requestRelaySync]
  * runs on every queue change, so a phone with no pass and no internet -- the

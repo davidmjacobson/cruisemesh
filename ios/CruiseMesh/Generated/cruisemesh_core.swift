@@ -1941,7 +1941,7 @@ public protocol MessageStoreProtocol : AnyObject {
     /**
      * Forget every carried-upload marker, so the next sync pass offers the
      * whole (family, non-relay-sourced) carry queue for upload once more.
-     * Called when a relay endpoint changes -- ours (a new Cruise Pass, a
+     * Called when a relay endpoint changes -- ours (a new Shore Pass, a
      * manual edit, a restore onto a different config) or a contact's (a
      * T23 relay-change notice, applied inside
      * [`MessageStore::apply_contact_relay_update`]) -- because "already on
@@ -3567,7 +3567,7 @@ open func chatDigest(chatId: Data)throws  -> [DigestEntry] {
     /**
      * Forget every carried-upload marker, so the next sync pass offers the
      * whole (family, non-relay-sourced) carry queue for upload once more.
-     * Called when a relay endpoint changes -- ours (a new Cruise Pass, a
+     * Called when a relay endpoint changes -- ours (a new Shore Pass, a
      * manual edit, a restore onto a different config) or a contact's (a
      * T23 relay-change notice, applied inside
      * [`MessageStore::apply_contact_relay_update`]) -- because "already on
@@ -12013,7 +12013,7 @@ public enum ContactDelivery {
     
     /**
      * The contact rides the same mailbox this phone fetches from: our own
-     * family's Cruise Pass. Internet delivery works in both directions and
+     * family's Shore Pass. Internet delivery works in both directions and
      * their presence is observable, because we hold the member credential.
      */
     case sharedMailbox
@@ -12910,7 +12910,7 @@ public enum DeepLinkRoute {
      */
     case friend
     /**
-     * A Cruise Pass setup card (`/r`) — internet delivery setup.
+     * A Shore Pass setup card (`/r`) — internet delivery setup.
      */
     case relaySetup
     /**
@@ -13120,7 +13120,7 @@ extension Frame: Equatable, Hashable {}
  *
  * Identity beats name, always. A UserID is derived from the signing key, so a
  * card whose UserID is already on file is the same person re-sharing (new
- * relay details after a Cruise Pass, a fresh card over the air) even when some
+ * relay details after a Shore Pass, a fresh card over the air) even when some
  * *other* contact happens to share their display name. Deciding by name first
  * points a key-change warning at the wrong person and teaches a family to tap
  * through the one warning that would ever have mattered.
@@ -16499,7 +16499,7 @@ public func makeSharedFriendRequestPayload(cardJson: String, shared: SharedFrien
  * use, from three sources with very different trust: a URL the user typed, a
  * URL inside a scanned friend card, and a URL inside a kind-9 relay-change
  * notice sealed by a contact. `validate_setup` has always required HTTPS for
- * Cruise Pass setup cards; the other two paths reached
+ * Shore Pass setup cards; the other two paths reached
  * [`RelayConfig`](crate::relay_setup) with whatever scheme they carried. Message
  * bodies are sealed either way, so this is not about message secrecy — it is
  * the relay token, the recipient hints, and the envelope sizes, which an
@@ -16680,7 +16680,7 @@ public func relayClassifyHttpError(httpStatus: UInt16, relayCode: String?) -> Co
 })
 }
 /**
- * Does this contact's card credential belong to the *same* Cruise Pass as
+ * Does this contact's card credential belong to the *same* Shore Pass as
  * ours? Both classes of card count: a post-CP4 card carries our family's
  * deposit token (the attenuation of our member token), a pre-CP4 one carries
  * the member token itself.
@@ -16796,7 +16796,7 @@ public func relayDecodePresencePage(body: Data)throws  -> CoreRelayPresencePage 
  * Derivation (a one-way hash), not random minting, on purpose: the phone
  * can stamp a deposit token onto a friend card entirely offline, knowing
  * only its own member token, with no new relay endpoint, no extra stored
- * credential, and no change to the Cruise Pass setup card. The relay
+ * credential, and no change to the Shore Pass setup card. The relay
  * derives and stores the identical value at provisioning/startup, so both
  * sides agree without ever exchanging it. Preimage resistance means a
  * deposit token (semi-public: it rides QR friend cards) reveals nothing
@@ -16841,7 +16841,7 @@ public func relayEncodePresenceRequest(announce: [Data], query: [Data])throws  -
 }
 /**
  * True for conditions that clear on their own with no action from the
- * person holding the phone ("?" on the Cruise Pass indicator); false for
+ * person holding the phone ("?" on the Shore Pass indicator); false for
  * conditions that persist until someone acts ("!"). Support guidance
  * belongs only on the persistent side.
  */
@@ -17029,7 +17029,7 @@ public func relayRetryAfterMs(retryAfterHeader: String?) -> UInt64 {
 })
 }
 /**
- * True when a setup card points at the hosted Cruise Pass service.
+ * True when a setup card points at the hosted Shore Pass service.
  *
  * URL fragments are unsigned, so anyone can mint a `cruisemesh.app/r#…`
  * link naming their own relay. The shells auto-accept first-time setup only
@@ -17138,7 +17138,7 @@ public func relaySweepIntervalMs() -> Int64 {
 /**
  * True when `token` is a deposit-class relay credential (CP4): valid only
  * for posting envelopes into its family's mailbox, never for fetch/ack/
- * presence/WebSocket. Friend cards carry this class; the Cruise Pass setup
+ * presence/WebSocket. Friend cards carry this class; the Shore Pass setup
  * card carries the full member class.
  */
 public func relayTokenIsDeposit(token: String) -> Bool {
@@ -17196,7 +17196,7 @@ public func resolvedContactDeliveryPollRelay(contactRelayUrl: String?, contactRe
  * Falling back is not a new capability: a card with no relay fields already
  * resolves to our own endpoint today. It is also the routing that actually
  * delivers whenever the contact is in our own family (they poll the mailbox
- * we are posting to) — the common case for somebody we handed a Cruise Pass
+ * we are posting to) — the common case for somebody we handed a Shore Pass
  * to. For a cross-family contact it delivers nothing, but neither did the
  * dead endpoint, and unlike the dead endpoint this state is surfaced, so a
  * person can repair the card.
@@ -17733,7 +17733,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_make_shared_friend_request_payload() != 31913) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 19541) {
+    if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 20691) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_open_backup() != 7338) {
@@ -17775,7 +17775,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_classify_http_error() != 51460) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_contact_shares_own_family() != 45033) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_contact_shares_own_family() != 37254) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_cursor_advance() != 64540) {
@@ -17793,7 +17793,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_decode_presence_page() != 6708) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_deposit_token_for() != 9229) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_deposit_token_for() != 59157) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_encode_ack_request() != 23747) {
@@ -17805,7 +17805,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_encode_presence_request() != 64701) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_fault_is_transient() != 24298) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_fault_is_transient() != 24532) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_fault_rank() != 19318) {
@@ -17832,7 +17832,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_retry_after_ms() != 10198) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 55007) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 11572) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 13229) {
@@ -17841,7 +17841,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_interval_ms() != 37428) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_token_is_deposit() != 47848) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_token_is_deposit() != 58985) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_url_is_insecure() != 16245) {
@@ -17850,7 +17850,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_poll_relay() != 54665) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_relay() != 21664) {
+    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_relay() != 7224) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_resolved_contact_poll_relay() != 62901) {
@@ -18048,7 +18048,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_chat_digest() != 38268) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_carried_relay_upload_markers() != 51623) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_carried_relay_upload_markers() != 51382) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_contact_relay_rejection() != 26476) {

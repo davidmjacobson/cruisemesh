@@ -765,11 +765,11 @@ struct ComposerReachNotice: View {
         case .fine:
             return nil
         case .repliesCannotReachMe:
-            return "Your messages will reach \(contactName), but their replies only arrive when you're near each other. Set up a Cruise Pass to get replies anywhere."
+            return "Your messages will reach \(contactName), but their replies only arrive when you're near each other. Set up a Shore Pass to get replies anywhere."
         case .theyCannotBeReached:
-            return "\(contactName) hasn't set up a Cruise Pass, so your messages only arrive when you're near each other. They need their own pass to be reached from further away."
+            return "\(contactName) hasn't set up a Shore Pass, so your messages only arrive when you're near each other. They need their own pass to be reached from further away."
         case .neitherDirectionWorks:
-            return String(localized: "Neither phone has a Cruise Pass, so messages only cross when you're near each other. Either of you can set one up.")
+            return String(localized: "Neither phone has a Shore Pass, so messages only cross when you're near each other. Either of you can set one up.")
         }
     }
 

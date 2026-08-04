@@ -32,7 +32,7 @@ Every family has **two** credentials:
 
 | Class | Token | Can do | Rides on |
 |---|---|---|---|
-| **member** | the token you provision (env var or admin API) | post, fetch, ack, presence, WebSocket | Cruise Pass setup card (`CMRELAY1`), each family phone's own config |
+| **member** | the token you provision (env var or admin API) | post, fetch, ack, presence, WebSocket | Shore Pass setup card (`CMRELAY1`), each family phone's own config |
 | **deposit** | `cmdep1-` + base64url(BLAKE2b-256(context ‖ member token)), derived automatically | `POST /envelopes` only | friend cards (`CMFRIEND…`) |
 
 You never provision or distribute the deposit token yourself: relayd derives
@@ -97,7 +97,7 @@ the usual cause).
 
 ## 4. Point phones at the relay
 
-On each phone, the saved relay config (Cruise Pass screen / internal tools)
+On each phone, the saved relay config (Shore Pass screen / internal tools)
 should be:
 
 | Field | Value |
@@ -404,7 +404,7 @@ failing once a family's mailbox is merely full.
 
 **Client-side handling has shipped**: both apps classify these
 bodies in the core (`core/src/relay_status.rs`, keyed on the `code` field)
-and surface them through the Cruise Pass status indicator — 507 as a
+and surface them through the Shore Pass status indicator — 507 as a
 persistent "storage full" state, 413 as a persistent "message too large"
 state, 429 as a transient self-healing state that also honors
 `Retry-After`. The upload loop itself still logs-and-continues per
@@ -560,7 +560,7 @@ one-time longer startup on the first upgrade.
 
 Off by default. Setting `CRUISEMESH_RELAY_ADMIN_TOKEN` (generate like a family
 token: `openssl rand -hex 32`) enables a small provisioning API used by the
-cruisemesh.app purchase flow ("Cruise Pass"); self-hosted deploys can ignore
+cruisemesh.app purchase flow ("Shore Pass"); self-hosted deploys can ignore
 this section entirely — with the variable unset the routes answer 404 and
 behavior is identical to before.
 
@@ -637,4 +637,4 @@ output somewhere you would put a password.
   `GET /ws` is a client change, not a server gap.
 - ~~Client-side handling of the 413/507 error bodies (see §10)~~ —
   shipped: both apps now surface distinct storage-full /
-  too-large / rate-limited states through the Cruise Pass indicator.
+  too-large / rate-limited states through the Shore Pass indicator.

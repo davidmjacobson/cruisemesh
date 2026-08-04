@@ -1,7 +1,7 @@
 import XCTest
 @testable import CruiseMesh
 
-/// CP2b: pins the Cruise Pass indicator mapping and the sync-pass fold to
+/// CP2b: pins the Shore Pass indicator mapping and the sync-pass fold to
 /// the core's transient/persistent classification, mirroring Android's
 /// PassIndicatorTest + RelayFaultPolicyTest.
 final class PassIndicatorTests: XCTestCase {
@@ -71,7 +71,7 @@ final class PassIndicatorTests: XCTestCase {
         // (FAMILY_EXPIRY_GRACE_MS) in which fetch and ack still succeed and
         // only POST takes the 403 -- so this exact combination is what a
         // paying family sees for a week after their pass lapses. Folding it
-        // to .ok told them the Cruise Pass was working while nothing they
+        // to .ok told them the Shore Pass was working while nothing they
         // wrote left the phone.
         XCTAssertEqual(
             RelayHealth.afterSyncPass(
@@ -163,8 +163,8 @@ final class PassIndicatorTests: XCTestCase {
     }
 
     func testARecheckDoesNotDemoteAPassThatJustVerified() {
-        // Aunt Joan's report: pasting a card showed "Cruise Pass is set up"
-        // with its green check, then flipped to "Cruise Pass is configured"
+        // Aunt Joan's report: pasting a card showed "Shore Pass is set up"
+        // with its green check, then flipped to "Shore Pass is configured"
         // and back as the first background sync -- and the service restart
         // that clears health to .noConfig -- passed through. A check in
         // flight is not evidence against the pass, so the heading must hold.

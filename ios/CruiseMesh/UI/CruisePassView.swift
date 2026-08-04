@@ -42,7 +42,7 @@ struct CruisePassView: View {
             if isLinkSetup {
                 Section {
                     if isTesting || (resultMessage == nil && pending == nil && pendingUntrusted == nil) {
-                        Text("Checking your Cruise Pass")
+                        Text("Checking your Shore Pass")
                             .font(.title2.weight(.semibold))
                         HStack {
                             ProgressView()
@@ -52,7 +52,7 @@ struct CruisePassView: View {
                         readyHeading {
                             Text("You’re all set")
                         }
-                        Text("Cruise Pass is ready on this phone.")
+                        Text("Shore Pass is ready on this phone.")
                         Button("Done") { dismiss() }
                             .buttonStyle(.borderedProminent)
                     } else if savedForLater {
@@ -62,17 +62,17 @@ struct CruisePassView: View {
                         Button("Done") { dismiss() }
                             .buttonStyle(.borderedProminent)
                     } else if pending != nil {
-                        Text("Confirm Cruise Pass change")
+                        Text("Confirm Shore Pass change")
                             .font(.title2.weight(.semibold))
-                        Text("This link is for a different Cruise Pass.")
+                        Text("This link is for a different Shore Pass.")
                             .foregroundStyle(.secondary)
                     } else if pendingUntrusted != nil {
-                        Text("Confirm Cruise Pass change")
+                        Text("Confirm Shore Pass change")
                             .font(.title2.weight(.semibold))
                         Text("This link is for a custom relay.")
                             .foregroundStyle(.secondary)
                     } else if let resultMessage {
-                        Text("Cruise Pass wasn’t set up")
+                        Text("Shore Pass wasn’t set up")
                             .font(.title2.weight(.semibold))
                         Text(resultMessage)
                             .foregroundStyle(.red)
@@ -94,16 +94,16 @@ struct CruisePassView: View {
                     switch heading {
                     case .ready:
                         readyHeading {
-                            Text("Cruise Pass is set up")
+                            Text("Shore Pass is set up")
                         }
                     case .notSetUp:
-                        Text("Set up your Cruise Pass")
+                        Text("Set up your Shore Pass")
                             .font(.title2.weight(.semibold))
                     case .checking:
-                        Text("Checking your Cruise Pass")
+                        Text("Checking your Shore Pass")
                             .font(.title2.weight(.semibold))
                     case .configured:
-                        Text("Cruise Pass is configured")
+                        Text("Shore Pass is configured")
                             .font(.title2.weight(.semibold))
                     }
                     if configured == nil {
@@ -161,7 +161,7 @@ struct CruisePassView: View {
                     }
                 } else {
                     Section {
-                        Button("Use a different Cruise Pass") {
+                        Button("Use a different Shore Pass") {
                             resultMessage = nil
                             resultIsError = false
                             showManualEntry = true
@@ -188,7 +188,7 @@ struct CruisePassView: View {
                         Text("Share this only with your family’s phones.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Button("Remove Cruise Pass setup", role: .destructive) {
+                        Button("Remove Shore Pass setup", role: .destructive) {
                             showRemoveConfirmation = true
                         }
                     }
@@ -220,7 +220,7 @@ struct CruisePassView: View {
                 }
             }
         }
-        .navigationTitle(isLinkSetup ? "Setting up Cruise Pass" : "Cruise Pass")
+        .navigationTitle(isLinkSetup ? "Setting up Shore Pass" : "Shore Pass")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
@@ -282,7 +282,7 @@ struct CruisePassView: View {
             if health.isPassVerdict { lastVerdict = health }
         }
         .confirmationDialog(
-            "Remove Cruise Pass setup?",
+            "Remove Shore Pass setup?",
             isPresented: $showRemoveConfirmation,
             titleVisibility: .visible
         ) {
@@ -298,9 +298,9 @@ struct CruisePassView: View {
                 savedForLater = false
             }
         } message: {
-            Text("Queued internet delivery will stop until another Cruise Pass or custom relay is set up. Nearby delivery still works.")
+            Text("Queued internet delivery will stop until another Shore Pass or custom relay is set up. Nearby delivery still works.")
         }
-        .alert("Replace Cruise Pass?", isPresented: Binding(
+        .alert("Replace Shore Pass?", isPresented: Binding(
             get: { pending != nil },
             set: { if !$0 { pending = nil } }
         )) {
@@ -333,7 +333,7 @@ struct CruisePassView: View {
             }
         } message: {
             if let setup = pendingUntrusted {
-                Text("Host: \(relayHost(setup.relayUrl))\n\nThis setup card isn’t for the official Cruise Pass service. Only continue if you set this relay up yourself.")
+                Text("Host: \(relayHost(setup.relayUrl))\n\nThis setup card isn’t for the official Shore Pass service. Only continue if you set this relay up yourself.")
             }
         }
     }
@@ -457,15 +457,15 @@ struct CruisePassView: View {
                     )
                     appModel.startMesh()
                     resultIsError = false
-                    resultMessage = "Cruise Pass is ready on this phone."
+                    resultMessage = "Shore Pass is ready on this phone."
                     setupCompleted = true
                 case .failure(let error):
                     resultIsError = true
                     setupCompleted = false
                     if let relay = error as? RelayHTTPError, relay.relayCode == "family_expired" {
-                        resultMessage = "This Cruise Pass has expired. Renew it, then open the new setup link."
+                        resultMessage = "This Shore Pass has expired. Renew it, then open the new setup link."
                     } else if let relay = error as? RelayHTTPError, relay.relayCode == "family_suspended" {
-                        resultMessage = "This Cruise Pass is suspended. Contact support for help."
+                        resultMessage = "This Shore Pass is suspended. Contact support for help."
                     } else if error is RelayHTTPError {
                         resultMessage = "This setup card was rejected. Check the card, or contact support."
                     } else {
@@ -479,20 +479,20 @@ struct CruisePassView: View {
 
     private func setupFailureMessage(_ error: Error) -> String {
         guard let urlError = error as? URLError else {
-            return "CruiseMesh couldn’t reach Cruise Pass. Try again. If it keeps happening, check your VPN or security app."
+            return "CruiseMesh couldn’t reach Shore Pass. Try again. If it keeps happening, check your VPN or security app."
         }
         switch urlError.code {
         case .timedOut:
-            return "Cruise Pass took too long to respond. Try again."
+            return "Shore Pass took too long to respond. Try again."
         case .cannotFindHost, .dnsLookupFailed:
-            return "CruiseMesh couldn’t find the Cruise Pass service. Check Private DNS or VPN settings, then try again."
+            return "CruiseMesh couldn’t find the Shore Pass service. Check Private DNS or VPN settings, then try again."
         case .secureConnectionFailed, .serverCertificateUntrusted,
              .serverCertificateHasBadDate, .serverCertificateNotYetValid:
-            return "CruiseMesh couldn’t make a secure connection to Cruise Pass. Check the phone’s date, VPN, or security app, then try again."
+            return "CruiseMesh couldn’t make a secure connection to Shore Pass. Check the phone’s date, VPN, or security app, then try again."
         case .notConnectedToInternet, .networkConnectionLost:
-            return "CruiseMesh couldn’t reach Cruise Pass. Check the connection or VPN, then try again."
+            return "CruiseMesh couldn’t reach Shore Pass. Check the connection or VPN, then try again."
         default:
-            return "CruiseMesh couldn’t reach Cruise Pass. Try again. If it keeps happening, check your VPN or security app."
+            return "CruiseMesh couldn’t reach Shore Pass. Try again. If it keeps happening, check your VPN or security app."
         }
     }
 

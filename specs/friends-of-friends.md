@@ -50,7 +50,7 @@ all** before their phone requests the suggested connections.
    The request uses the recipient's current relay or BLE muling. Ordinary
    friend-card/profile exchange reconciles relay details after the introduction
    completes.
-7. **Introductions stay inside one Cruise Pass.** A contact is offered as a
+7. **Introductions stay inside one Shore Pass.** A contact is offered as a
    candidate, and sent a snapshot at all, only when they are on the sharer's
    own pass. The contact graph does not stop at a household: one person who has
    scanned somebody outside the family is enough for that outside circle to
@@ -62,7 +62,7 @@ all** before their phone requests the suggested connections.
    that is the whole rule. `relay_contact_shares_own_family` in the core is
    the single comparison both shells use.
 
-   **This makes friends-of-friends part of a Cruise Pass. Say so plainly
+   **This makes friends-of-friends part of a Shore Pass. Say so plainly
    rather than letting people discover it.** An earlier version let two
    passless phones introduce contacts they had added in person, to avoid
    gating the feature on payment. It was dropped for two reasons. The signal
@@ -413,7 +413,7 @@ Queue a new directory revision, debounced into one update, when:
 - a contact is added, updated, deleted, blocked, or unblocked;
 - a contact's discovery policy changes;
 - the local friends-of-friends setting changes;
-- the local Cruise Pass changes, since it decides who is eligible at all
+- the local Shore Pass changes, since it decides who is eligible at all
   (decision 7) — driven from the same endpoint-change announcement that already
   fans a new endpoint out to contacts;
 - an app upgrade first advertises v1 support; or
