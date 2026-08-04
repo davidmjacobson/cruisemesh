@@ -33,6 +33,15 @@ enum MeshDefaults {
     static let relayStoreBatchLimit: UInt64 = 128
     static let ownOutboundSprayBudgetBytes: UInt64 = 256 * 1024
     static let ownReceiptSprayBudgetBytes: UInt64 = 64 * 1024
+    // Per-encounter budget for spraying *foreign* carried envelopes onward,
+    // the same size as ownOutboundSprayBudgetBytes. A phone that has been
+    // muling for a busy fleet can be holding the whole
+    // foreignCarryBudgetBytes of third-party traffic; offering all of it on
+    // one encounter fills a BLE link's single FIFO for minutes, with live
+    // replies to real contacts stuck behind it. Nothing is dropped by the
+    // cut: the carry queue is untouched and the periodic re-digest re-offers
+    // the remainder, oldest first.
+    static let carriedSprayBudgetBytes: UInt64 = 256 * 1024
 }
 
 func isVisibleChatKind(_ kind: UInt8) -> Bool {

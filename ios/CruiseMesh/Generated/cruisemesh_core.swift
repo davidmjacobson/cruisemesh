@@ -1803,8 +1803,18 @@ public protocol MessageStoreProtocol : AnyObject {
      * fetch-everything-then-filter shape meant every one of those ticks
      * paid to materialize up to the full 64 MiB carry budget regardless of
      * how little of it was actually new to the peer.
+     *
+     * `budget_bytes` bounds one encounter's worth of foreign-carry offering
+     * by summed sealed-byte size: rows are taken oldest first until the next
+     * one would not fit, and then iteration stops (so the rest never has its
+     * ciphertext decoded either). A single envelope larger than the whole
+     * budget yields nothing rather than a partial frame -- frames are
+     * all-or-nothing on the wire. Nothing is dropped by this cut: the carry
+     * queue is untouched, and D8's periodic re-digest re-offers whatever did
+     * not fit on the next round, so a big backlog is *paced* across rounds
+     * instead of monopolizing a slow link's single FIFO in one burst.
      */
-    func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64) throws  -> [CarriedEnvelope]
+    func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, budgetBytes: UInt64) throws  -> [CarriedEnvelope]
     
     /**
      * Number of envelopes currently in the carry queue (diagnostics/tests).
@@ -1999,8 +2009,19 @@ public protocol MessageStoreProtocol : AnyObject {
      * This deliberately includes all three canonical classes: foreign
      * carried traffic, this device's pending pairwise traffic to other
      * contacts, and pending receipts owed to other contacts.
+     *
+     * Every class is budgeted per encounter, foreign carry included
+     * (`carried_budget_bytes`). A phone that has been muling for a busy fleet
+     * can be holding megabytes for third parties; offering all of it at once
+     * down a BLE link's single FIFO queues everything behind it for minutes,
+     * live replies to real contacts included. The cut bounds only what is
+     * OFFERED this round -- the carry queue itself is untouched, and D8's
+     * 3-5 minute re-digest re-offers the remainder (still oldest first) on
+     * the next round, so a backlog is paced rather than dropped. Removal of
+     * a carried copy remains gated on digest-proof of receipt
+     * ([`Self::core_confirm_carried_deliveries`]); nothing here acks.
      */
-    func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data]) throws  -> CoreDigestSprayPlan
+    func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data]) throws  -> CoreDigestSprayPlan
     
     /**
      * Record that this device consumed `msg_id` as the envelope's SOLE true
@@ -3349,13 +3370,24 @@ open func carriedEnvelopesForHints(hints: [Data], nowMs: Int64)throws  -> [Carri
      * fetch-everything-then-filter shape meant every one of those ticks
      * paid to materialize up to the full 64 MiB carry budget regardless of
      * how little of it was actually new to the peer.
+     *
+     * `budget_bytes` bounds one encounter's worth of foreign-carry offering
+     * by summed sealed-byte size: rows are taken oldest first until the next
+     * one would not fit, and then iteration stops (so the rest never has its
+     * ciphertext decoded either). A single envelope larger than the whole
+     * budget yields nothing rather than a partial frame -- frames are
+     * all-or-nothing on the wire. Nothing is dropped by this cut: the carry
+     * queue is untouched, and D8's periodic re-digest re-offers whatever did
+     * not fit on the next round, so a big backlog is *paced* across rounds
+     * instead of monopolizing a slow link's single FIFO in one burst.
      */
-open func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64)throws  -> [CarriedEnvelope] {
+open func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, budgetBytes: UInt64)throws  -> [CarriedEnvelope] {
     return try  FfiConverterSequenceTypeCarriedEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_carried_envelopes_for_peer_sync(self.uniffiClonePointer(),
         FfiConverterSequenceData.lower(peerHints),
         FfiConverterSequenceData.lower(peerKnownMsgIds),
-        FfiConverterInt64.lower(nowMs),$0
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterUInt64.lower(budgetBytes),$0
     )
 })
 }
@@ -3651,8 +3683,19 @@ open func coreDigestAdvertisedMsgIds()throws  -> [Data] {
      * This deliberately includes all three canonical classes: foreign
      * carried traffic, this device's pending pairwise traffic to other
      * contacts, and pending receipts owed to other contacts.
+     *
+     * Every class is budgeted per encounter, foreign carry included
+     * (`carried_budget_bytes`). A phone that has been muling for a busy fleet
+     * can be holding megabytes for third parties; offering all of it at once
+     * down a BLE link's single FIFO queues everything behind it for minutes,
+     * live replies to real contacts included. The cut bounds only what is
+     * OFFERED this round -- the carry queue itself is untouched, and D8's
+     * 3-5 minute re-digest re-offers the remainder (still oldest first) on
+     * the next round, so a backlog is paced rather than dropped. Removal of
+     * a carried copy remains gated on digest-proof of receipt
+     * ([`Self::core_confirm_carried_deliveries`]); nothing here acks.
      */
-open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data])throws  -> CoreDigestSprayPlan {
+open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data])throws  -> CoreDigestSprayPlan {
     return try  FfiConverterTypeCoreDigestSprayPlan.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_core_digest_spray_plan(self.uniffiClonePointer(),
         FfiConverterData.lower(ownUserId),
@@ -3660,6 +3703,7 @@ open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Dat
         FfiConverterSequenceData.lower(peerHints),
         FfiConverterSequenceData.lower(peerKnownMsgIds),
         FfiConverterInt64.lower(nowMs),
+        FfiConverterUInt64.lower(carriedBudgetBytes),
         FfiConverterUInt64.lower(ownOutboundBudgetBytes),
         FfiConverterUInt64.lower(ownReceiptBudgetBytes),
         FfiConverterUInt64.lower(receiptQueryLimit),
@@ -17519,7 +17563,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints() != 43270) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_peer_sync() != 29079) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_peer_sync() != 64076) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_len() != 13406) {
@@ -17576,7 +17620,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 37419) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 37814) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 29904) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_record_consumed_hidden_msg_id() != 37215) {

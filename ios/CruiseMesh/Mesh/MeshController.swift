@@ -2496,6 +2496,7 @@ final class MeshController: ObservableObject {
             peerHints: recentHintsFor(userId: peerUserId, nowMs: now),
             peerKnownMsgIds: peerKnownIds,
             nowMs: now,
+            carriedBudgetBytes: MeshDefaults.carriedSprayBudgetBytes,
             ownOutboundBudgetBytes: MeshDefaults.ownOutboundSprayBudgetBytes,
             ownReceiptBudgetBytes: MeshDefaults.ownReceiptSprayBudgetBytes,
             receiptQueryLimit: MeshDefaults.relayStoreBatchLimit,
@@ -2505,7 +2506,13 @@ final class MeshController: ObservableObject {
             log.warning("Failed to build digest spray plan for \(address, privacy: .public)")
             return
         }
-        let frames = plan.carriedFrames + plan.ownOutboundFrames + plan.ownReceiptFrames
+        // Own lanes first, foreign carry last. On a slow link every frame here
+        // lands in one FIFO, so whatever goes first delays everything after
+        // it: live mail and receipts to real contacts must beat third-party
+        // courier traffic. Nothing is lost by deferring the carried lane --
+        // the periodic re-digest re-offers it, and its own per-encounter
+        // budget already bounds this round's share.
+        let frames = plan.ownOutboundFrames + plan.ownReceiptFrames + plan.carriedFrames
         for frame in frames {
             _ = MeshRouter.sendToAddress(address: address, frame: frame)
         }

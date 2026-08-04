@@ -3776,11 +3776,22 @@ impl MessageStore {
     /// fetch-everything-then-filter shape meant every one of those ticks
     /// paid to materialize up to the full 64 MiB carry budget regardless of
     /// how little of it was actually new to the peer.
+    ///
+    /// `budget_bytes` bounds one encounter's worth of foreign-carry offering
+    /// by summed sealed-byte size: rows are taken oldest first until the next
+    /// one would not fit, and then iteration stops (so the rest never has its
+    /// ciphertext decoded either). A single envelope larger than the whole
+    /// budget yields nothing rather than a partial frame -- frames are
+    /// all-or-nothing on the wire. Nothing is dropped by this cut: the carry
+    /// queue is untouched, and D8's periodic re-digest re-offers whatever did
+    /// not fit on the next round, so a big backlog is *paced* across rounds
+    /// instead of monopolizing a slow link's single FIFO in one burst.
     pub fn carried_envelopes_for_peer_sync(
         &self,
         peer_hints: Vec<Vec<u8>>,
         peer_known_msg_ids: Vec<Vec<u8>>,
         now_ms: i64,
+        budget_bytes: u64,
     ) -> Result<Vec<CarriedEnvelope>, CoreError> {
         let conn = lock_conn(&self.conn);
         let mut sql = String::from(
@@ -3796,10 +3807,23 @@ impl MessageStore {
         let rows = stmt
             .query_map(params_from_iter(bind.iter()), row_to_carried)
             .map_err(store_err)?;
-        let selected = rows.collect::<Result<Vec<_>, _>>().map_err(store_err)?;
-        #[cfg(test)]
-        self.sealed_reads
-            .fetch_add(selected.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let mut selected: Vec<CarriedEnvelope> = Vec::new();
+        let mut used = 0_u64;
+        for row in rows {
+            let envelope = row.map_err(store_err)?;
+            // Counted here, not over `selected`: this row's ciphertext has now
+            // been decoded whether or not the budget lets us keep it, and the
+            // FC2 counter measures exactly that cost.
+            #[cfg(test)]
+            self.sealed_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let size = envelope.sealed.len() as u64;
+            if used.saturating_add(size) > budget_bytes {
+                break;
+            }
+            used += size;
+            selected.push(envelope);
+        }
         Ok(selected)
     }
 
@@ -10188,6 +10212,7 @@ mod tests {
                 vec![b"day-b".to_vec()],
                 vec![b"known".to_vec()],
                 5_000,
+                u64::MAX,
             )
             .unwrap();
         let ids: Vec<Vec<u8>> = found.into_iter().map(|e| e.msg_id).collect();
@@ -10211,7 +10236,7 @@ mod tests {
 
         let known_ids = vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()];
         let found = store
-            .carried_envelopes_for_peer_sync(vec![], known_ids, 5_000)
+            .carried_envelopes_for_peer_sync(vec![], known_ids, 5_000, u64::MAX)
             .unwrap();
 
         assert!(found.is_empty());
