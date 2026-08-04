@@ -1,5 +1,5 @@
 //! CP2b: classification of relayd's structured HTTP rejections into the
-//! semantic Cruise Pass states both shells render.
+//! semantic Shore Pass states both shells render.
 //!
 //! relayd answers every rejection with a status code and, for the conditions
 //! a client can act on, a stable JSON `code` field (relayd/DEPLOY.md §10):
@@ -61,7 +61,7 @@ pub fn relay_classify_http_error(http_status: u16, relay_code: Option<String>) -
 }
 
 /// True for conditions that clear on their own with no action from the
-/// person holding the phone ("?" on the Cruise Pass indicator); false for
+/// person holding the phone ("?" on the Shore Pass indicator); false for
 /// conditions that persist until someone acts ("!"). Support guidance
 /// belongs only on the persistent side.
 #[uniffi::export]

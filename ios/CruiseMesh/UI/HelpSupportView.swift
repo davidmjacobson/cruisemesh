@@ -7,18 +7,18 @@ struct HelpSupportView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Cruise Pass") {
+                Section("Shore Pass") {
                     NavigationLink {
                         CruisePassView(initialCard: nil, appModel: appModel)
                     } label: {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("Set up or fix Cruise Pass")
+                            Text("Set up or fix Shore Pass")
                             Text("Open the setup link from your purchase email. CruiseMesh checks and saves it automatically.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    Text("If the link does not open, copy the setup card, then go to Settings → Cruise Pass and choose Paste and set up.")
+                    Text("If the link does not open, copy the setup card, then go to Settings → Shore Pass and choose Paste and set up.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -38,7 +38,7 @@ struct HelpSupportView: View {
 
                 Section("More help") {
                     Link("Open CruiseMesh support", destination: URL(string: "https://cruisemesh.app/support/")!)
-                    Text("Never post a Cruise Pass setup card or relay token publicly.")
+                    Text("Never post a Shore Pass setup card or relay token publicly.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

@@ -10,7 +10,7 @@ A person can deliberately hand one specific contact's friend card to someone
 in front of them, as a QR code, and have that connection complete safely —
 without any mechanism that spreads contacts on its own.
 
-Introductions are now scoped to a single Cruise Pass, which is the right
+Introductions are now scoped to a single Shore Pass, which is the right
 default and the wrong absolute. You meet another family on a cruise. Your kid
 friends one of their kids. Nothing should start propagating between the two
 families — but your second kid should be able to connect to that same kid
@@ -397,7 +397,7 @@ dismissal cap, suppression, and the settings copy change.
 
 ## Dependency: passless outsiders (resolved, already fixed)
 
-The first draft of the pass scoping treated a contact with **no** Cruise Pass
+The first draft of the pass scoping treated a contact with **no** Shore Pass
 as being on ours, reasoning that unknown is not foreign. A family met on a
 cruise who never bought a pass landed in that same bucket, so connecting to
 their kid — by a shared card *or* by a plain QR scan, which is how the
@@ -407,7 +407,7 @@ not close it: the motivating case is a *direct* scan, recorded as
 `source = 0`, indistinguishable from scanning a relative.
 
 Resolved in `specs/friends-of-friends.md` decision 7 and already implemented:
-introductions require a shared Cruise Pass, with no in-person fallback for
+introductions require a shared Shore Pass, with no in-person fallback for
 passless phones. An interim version did allow one, and it left this leak half
 open — a passless family who met another family face to face still propagated
 into each other's suggestion lists.

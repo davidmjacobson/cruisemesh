@@ -8,7 +8,7 @@ import java.net.UnknownHostException
 import javax.net.ssl.SSLException
 
 /**
- * Pure policy for the Cruise Pass first-check flow, kept out of the
+ * Pure policy for the Shore Pass first-check flow, kept out of the
  * composable so it stays unit-testable. Mirrored by the private helpers in
  * iOS CruisePassView.
  */

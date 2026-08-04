@@ -23,7 +23,7 @@
 pub enum DeepLinkRoute {
     /// A friend card (`/f`) — add-a-friend.
     Friend,
-    /// A Cruise Pass setup card (`/r`) — internet delivery setup.
+    /// A Shore Pass setup card (`/r`) — internet delivery setup.
     RelaySetup,
     /// A LAN endpoint (`/lan`) — diagnostics-only manual connect.
     Lan,

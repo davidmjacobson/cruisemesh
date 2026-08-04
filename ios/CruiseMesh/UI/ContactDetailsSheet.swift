@@ -40,7 +40,7 @@ struct ContactDetailsSheet: View {
 
     private var deliveryLabel: String {
         switch delivery {
-        case .sharedMailbox: return String(localized: "Uses your Cruise Pass")
+        case .sharedMailbox: return String(localized: "Uses your Shore Pass")
         case .ownMailbox: return String(localized: "Uses their own service")
         case .nearbyOnly: return String(localized: "Not shared — nearby delivery only")
         }
@@ -120,7 +120,7 @@ struct ContactDetailsSheet: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(.red)
                                     .padding(.top, 12)
-                                Text("The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Cruise Pass is set up, then share their friend card again. Messages still deliver when you are near each other.")
+                                Text("The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Shore Pass is set up, then share their friend card again. Messages still deliver when you are near each other.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }

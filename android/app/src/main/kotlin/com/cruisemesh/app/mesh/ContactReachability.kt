@@ -109,7 +109,7 @@ object ContactReachability {
         contactHasInternetDelivery: Boolean = true,
     ): String = when (level) {
         ReachabilityLevel.NEARBY -> nearbyViaCopy(transport)
-        ReachabilityLevel.ONLINE_RELAY -> "Online via Cruise Pass"
+        ReachabilityLevel.ONLINE_RELAY -> "Online via Shore Pass"
         ReachabilityLevel.RECENT -> {
             val minutes = peerLastSeenMs?.let { ((nowMs - it) / 60_000L).coerceAtLeast(0L) } ?: 0L
             if (minutes >= 60) "Active ${minutes / 60}h ago" else "Active ${minutes}m ago"
@@ -131,7 +131,7 @@ object ContactReachability {
      */
     fun contentDescriptionSuffix(level: ReachabilityLevel, transport: MeshRouterState.Transport? = null): String? = when (level) {
         ReachabilityLevel.NEARBY -> nearbyViaCopy(transport)
-        ReachabilityLevel.ONLINE_RELAY -> "Online via Cruise Pass"
+        ReachabilityLevel.ONLINE_RELAY -> "Online via Shore Pass"
         ReachabilityLevel.RECENT -> "Recently active"
         ReachabilityLevel.MESH_CARRY -> "Reachable through nearby phones"
         ReachabilityLevel.OFFLINE -> null

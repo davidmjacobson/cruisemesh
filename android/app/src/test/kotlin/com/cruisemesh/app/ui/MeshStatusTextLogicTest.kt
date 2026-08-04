@@ -11,26 +11,26 @@ import org.junit.Test
 class MeshStatusTextLogicTest {
 
     @Test
-    fun `active with nearby peers and healthy Cruise Pass`() {
+    fun `active with nearby peers and healthy Shore Pass`() {
         val status = MeshStatusTextLogic.build(
             MeshRuntimeState.ACTIVE,
             3,
             RelayHealth.Ok(0L),
             InternetDeliveryService.CRUISE_PASS,
         )
-        assertEquals("Mesh on · 3 nearby · Cruise Pass ✓", status.text)
+        assertEquals("Mesh on · 3 nearby · Shore Pass ✓", status.text)
         assertEquals(MeshStatusDotColor.GREEN, status.dot)
     }
 
     @Test
-    fun `active with no peers and healthy Cruise Pass`() {
+    fun `active with no peers and healthy Shore Pass`() {
         val status = MeshStatusTextLogic.build(
             MeshRuntimeState.ACTIVE,
             0,
             RelayHealth.Ok(0L),
             InternetDeliveryService.CRUISE_PASS,
         )
-        assertEquals("Mesh on · Cruise Pass ✓", status.text)
+        assertEquals("Mesh on · Shore Pass ✓", status.text)
         assertEquals(MeshStatusDotColor.BLUE, status.dot)
     }
 
@@ -59,14 +59,14 @@ class MeshStatusTextLogicTest {
     }
 
     @Test
-    fun `active with Cruise Pass failing`() {
+    fun `active with Shore Pass failing`() {
         val status = MeshStatusTextLogic.build(
             MeshRuntimeState.ACTIVE,
             0,
             RelayHealth.Failing(0L),
             InternetDeliveryService.CRUISE_PASS,
         )
-        assertEquals("Mesh on · Cruise Pass unreachable", status.text)
+        assertEquals("Mesh on · Shore Pass unreachable", status.text)
         assertEquals(MeshStatusDotColor.AMBER, status.dot)
     }
 
@@ -78,7 +78,7 @@ class MeshStatusTextLogicTest {
             RelayHealth.TokenRejected(0L),
             InternetDeliveryService.CRUISE_PASS,
         )
-        assertEquals("Mesh on · Cruise Pass token rejected", status.text)
+        assertEquals("Mesh on · Shore Pass token rejected", status.text)
         assertEquals(MeshStatusDotColor.AMBER, status.dot)
     }
 
@@ -117,7 +117,7 @@ class MeshStatusTextLogicTest {
             )
             assertFalse(status.text.contains("set up", ignoreCase = true))
             assertFalse(status.text.contains("relay", ignoreCase = true))
-            assertFalse(status.text.contains("Cruise Pass", ignoreCase = true))
+            assertFalse(status.text.contains("Shore Pass", ignoreCase = true))
             assertNotEquals(MeshStatusDotColor.AMBER, status.dot)
         }
     }
@@ -142,7 +142,7 @@ class MeshStatusTextLogicTest {
     }
 
     @Test
-    fun `official service status copy uses Cruise Pass branding`() {
+    fun `official service status copy uses Shore Pass branding`() {
         val healthStates = listOf(
             RelayHealth.Ok(0L),
             RelayHealth.Checking,
@@ -176,7 +176,7 @@ class MeshStatusTextLogicTest {
                 InternetDeliveryService.CUSTOM_RELAY,
             ).text
             assertTrue(copy.contains("relay", ignoreCase = true))
-            assertFalse(copy.contains("Cruise Pass", ignoreCase = true))
+            assertFalse(copy.contains("Shore Pass", ignoreCase = true))
         }
     }
 

@@ -9,7 +9,7 @@ enum InternetDeliveryService: Equatable {
 
     var displayName: String {
         switch self {
-        case .cruisePass: return String(localized: "Cruise Pass")
+        case .cruisePass: return String(localized: "Shore Pass")
         case .customRelay: return String(localized: "Internet delivery")
         }
     }
@@ -32,7 +32,7 @@ enum InternetDeliveryService: Equatable {
 /// ## Why this says so much less than Android's pill
 ///
 /// Android appends a relay-health suffix for *every* health: "internet
-/// delivery ✓", "checking Cruise Pass", "no internet", and so on. This speaks
+/// delivery ✓", "checking Shore Pass", "no internet", and so on. This speaks
 /// only when internet delivery has stopped in a way the person has to do
 /// something about, and otherwise leaves the pill exactly as it was.
 ///

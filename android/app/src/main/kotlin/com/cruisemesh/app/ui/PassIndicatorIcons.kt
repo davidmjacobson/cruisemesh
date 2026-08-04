@@ -7,7 +7,7 @@ import androidx.compose.ui.graphics.vector.addPathNodes
 import androidx.compose.ui.unit.dp
 
 /**
- * CP2b: the "?" and "!" glyphs for the Cruise Pass status indicator --
+ * CP2b: the "?" and "!" glyphs for the Shore Pass status indicator --
  * David's UX spec gives the transient/self-healing states a question mark
  * and the persistent/actionable states an exclamation mark (iOS uses
  * `questionmark.circle.fill` / `exclamationmark.circle.fill`).

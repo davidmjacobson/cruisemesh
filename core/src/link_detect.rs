@@ -11,7 +11,7 @@
 //!
 //! Exactly two schemes, spelled with `://`:
 //!
-//! * `https://` — the web, including the Cruise Pass and friend-card links
+//! * `https://` — the web, including the Shore Pass and friend-card links
 //!   the product itself tells people to send each other.
 //! * `cruisemesh://` — the in-app deep link ([`crate::DeepLinkRoute`]).
 //!

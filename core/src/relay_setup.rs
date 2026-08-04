@@ -1,4 +1,4 @@
-//! Portable Cruise Pass setup cards shared by the purchase site and both apps.
+//! Portable Shore Pass setup cards shared by the purchase site and both apps.
 //!
 //! The card is intentionally carried in a URL fragment. Browsers do not send
 //! fragments to the server, which keeps the household relay token out of
@@ -97,7 +97,7 @@ pub fn parse_relay_setup_text(text: String) -> Result<RelaySetup, CoreError> {
     validate_setup(wire.relay_url, wire.relay_token)
 }
 
-/// True when a setup card points at the hosted Cruise Pass service.
+/// True when a setup card points at the hosted Shore Pass service.
 ///
 /// URL fragments are unsigned, so anyone can mint a `cruisemesh.app/r#…`
 /// link naming their own relay. The shells auto-accept first-time setup only

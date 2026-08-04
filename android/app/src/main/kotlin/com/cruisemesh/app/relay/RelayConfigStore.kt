@@ -110,7 +110,7 @@ object RelayConfigStore {
     }
 
     /**
-     * Records the Cruise Pass this device is actually using, once per launch.
+     * Records the Shore Pass this device is actually using, once per launch.
      *
      * Without it a shared log cannot answer the first question anyone asks
      * about a relay problem -- is this phone even configured, and with which
@@ -121,7 +121,7 @@ object RelayConfigStore {
     fun logSummary(context: Context) {
         val config = load(context)
         if (config == null) {
-            Log.i(RelayClient.TAG, "Relay not configured on this device (no Cruise Pass)")
+            Log.i(RelayClient.TAG, "Relay not configured on this device (no Shore Pass)")
             return
         }
         Log.i(

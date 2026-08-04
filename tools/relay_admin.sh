@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# relay_admin.sh -- operator CLI for a hosted CruiseMesh relay ("Cruise Pass").
+# relay_admin.sh -- operator CLI for a hosted CruiseMesh relay ("Shore Pass").
 #
 # Everything here goes through the admin HTTP API documented in
 # relayd/DEPLOY.md §12. Nothing touches SQLite: an earlier version of this
@@ -290,7 +290,7 @@ cmd_provision() {
   echo "family token:"
   echo "  $token"
   echo
-  echo "setup link (paste into Cruise Pass on the first phone; it QRs to the second):"
+  echo "setup link (paste into Shore Pass on the first phone; it QRs to the second):"
   echo "  $(setup_link "$token")"
 }
 
@@ -378,7 +378,7 @@ usage() {
   # Delimiter is deliberately not "USAGE": the text below has a section
   # header on its own line at column 0, which would end the heredoc there.
   cat <<'__HELP__'
-relay_admin.sh -- operator CLI for a hosted CruiseMesh relay ("Cruise Pass").
+relay_admin.sh -- operator CLI for a hosted CruiseMesh relay ("Shore Pass").
 
 USAGE
   relay_admin.sh <command> [args]

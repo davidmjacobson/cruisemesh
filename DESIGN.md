@@ -329,7 +329,7 @@ UI as public-to-anyone-with-the-app.
 moderation surface that a family messenger with one maintainer should not
 grow, and it buys nothing for the use case the product is actually for. The
 one variant still under consideration is a broadcast **scoped to a single
-Cruise Pass** — everyone on one pass can post to a shared channel, nobody
+Shore Pass** — everyone on one pass can post to a shared channel, nobody
 outside it can — which inherits the boundary the product already draws around
 a family and is not open to strangers at all. That variant isn't specified
 yet; if it happens it gets its own spec.
@@ -456,7 +456,7 @@ A deliberately dumb mailbox:
   Pass to strangers: a families table with per-family quota (256 MiB default),
   plan expiry and suspension with a 7-day grace window, per-token
   request/byte rate limits plus a global backstop, a per-token WebSocket cap,
-  and an admin API that Cruise Pass provisioning drives. Self-hosting stays
+  and an admin API that Shore Pass provisioning drives. Self-hosting stays
   free and runs the identical binary.
 - Sees only sealed envelopes and hints (§6.4). A compromised relay learns traffic
   timing and approximate social graph size — not contents, senders, or read state.
@@ -640,7 +640,7 @@ designed around (iOS background BLE) before any real investment.
 - Message history sync for a group member who joins late.
 - Ratchet / post-quantum upgrade timing (envelope `version` byte reserves the path).
 - Relay federation.
-- A broadcast channel scoped to one Cruise Pass (§6.6). The public,
+- A broadcast channel scoped to one Shore Pass (§6.6). The public,
   anyone-with-the-app version is not deferred, it is dropped.
 
 ---
@@ -707,7 +707,7 @@ sit down" expectations get set.
 
 Absorbs the old identity screen: editable display name, local/shared profile
 photo picker, my QR friend card, UserID + fingerprint words (with the "read
-these aloud to verify" hint), mesh on/off, the Cruise Pass status indicator
+these aloud to verify" hint), mesh on/off, the Shore Pass status indicator
 (quiet glyph states; tap for plain-language detail), backup/restore, and the
 build version. Nothing here is daily-use, which is exactly why it lives
 behind the avatar.

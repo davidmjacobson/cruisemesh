@@ -1,7 +1,7 @@
 package com.cruisemesh.app.mesh
 
 /**
- * Severity of the Cruise Pass status shown in Settings, derived from
+ * Severity of the Shore Pass status shown in Settings, derived from
  * [RelayHealth] plus whether a setup card is saved at all.
  *
  * Deliberately coarser than [RelayHealth]: the row needs one glanceable
@@ -62,7 +62,7 @@ fun RelayHealth.isPassVerdict(): Boolean =
     this !is RelayHealth.Checking && this !is RelayHealth.NoConfig
 
 /**
- * Heading shown at the top of the Cruise Pass screen.
+ * Heading shown at the top of the Shore Pass screen.
  *
  * Pure so the flicker rules below are unit-testable; the copy lives in
  * `strings.xml` and iOS mirrors this in `PassIndicator.swift`.
@@ -87,8 +87,8 @@ enum class CruisePassHeading {
  *
  * Re-checks are not demotions. A background sync pass, or a service restart,
  * drops health to [RelayHealth.Checking]/[RelayHealth.NoConfig] for a second
- * or two; without [lastVerdict] the heading would fall from "Cruise Pass is
- * set up" with its green check to "Cruise Pass is configured" and back, which
+ * or two; without [lastVerdict] the heading would fall from "Shore Pass is
+ * set up" with its green check to "Shore Pass is configured" and back, which
  * reads to the person holding the phone as the pass breaking and healing.
  * This is the same reasoning that maps those two states to
  * [PassIndicator.NONE] rather than to a symbol that would only flicker.

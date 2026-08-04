@@ -5,7 +5,7 @@ import uniffi.cruisemesh_core.relayFaultRank
 
 /**
  * CP2b: pure policy for folding the structured relay faults one sync pass
- * observed into the single [RelayHealth] the Cruise Pass indicator renders.
+ * observed into the single [RelayHealth] the Shore Pass indicator renders.
  * The classification itself (HTTP status/`code` -> [CoreRelayFault], and
  * which faults self-heal) lives in the core (`core/src/relay_status.rs`);
  * this file only decides which fault wins the pass and how it lands in the
@@ -38,7 +38,7 @@ fun worseRelayFault(current: CoreRelayFault?, observed: CoreRelayFault): CoreRel
  * pass keeps fetching and acking so nobody's last messages are stranded
  * mid-cruise, and only POSTs take the 403. So the pass's success flags say
  * "reachable" for a week while every new message is rejected, and folding
- * expiry below them told a paying family their Cruise Pass was working
+ * expiry below them told a paying family their Shore Pass was working
  * when nothing they wrote was leaving the phone.
  *
  * The other two credential faults keep the pre-CP2b precedence, and that is

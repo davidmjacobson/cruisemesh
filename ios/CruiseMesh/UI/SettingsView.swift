@@ -13,7 +13,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Cruise Pass") {
+                Section("Shore Pass") {
                     NavigationLink {
                         CruisePassView(initialCard: nil, appModel: appModel)
                     } label: {
@@ -142,19 +142,19 @@ struct SettingsView: View {
     }
 
     private var relayTitle: String {
-        guard RelayConfigStore.load() != nil else { return "Set up Cruise Pass" }
+        guard RelayConfigStore.load() != nil else { return "Set up Shore Pass" }
         switch connectivity.relay {
-        case .noConfig: return "Checking Cruise Pass setup…"
-        case .checking: return "Checking Cruise Pass setup…"
-        case .ok: return "Cruise Pass is working"
-        case .noInternet: return "Cruise Pass is waiting for internet"
-        case .failing: return "Cruise Pass needs attention"
-        case .expired: return "Cruise Pass expired"
-        case .suspended: return "Cruise Pass suspended"
-        case .tokenRejected: return "Cruise Pass setup was rejected"
-        case .quotaFull: return String(localized: "Cruise Pass storage is full")
+        case .noConfig: return "Checking Shore Pass setup…"
+        case .checking: return "Checking Shore Pass setup…"
+        case .ok: return "Shore Pass is working"
+        case .noInternet: return "Shore Pass is waiting for internet"
+        case .failing: return "Shore Pass needs attention"
+        case .expired: return "Shore Pass expired"
+        case .suspended: return "Shore Pass suspended"
+        case .tokenRejected: return "Shore Pass setup was rejected"
+        case .quotaFull: return String(localized: "Shore Pass storage is full")
         case .messageTooLarge: return String(localized: "A message is too large to send")
-        case .rateLimited: return String(localized: "Cruise Pass is catching up")
+        case .rateLimited: return String(localized: "Shore Pass is catching up")
         }
     }
 
@@ -170,7 +170,7 @@ struct SettingsView: View {
         case .failing: return "The relay could not be reached."
         case .expired: return "Renew your pass to resume internet delivery."
         case .suspended: return "Contact support for help with this pass."
-        case .tokenRejected: return "Paste the setup card again, or use a different Cruise Pass."
+        case .tokenRejected: return "Paste the setup card again, or use a different Shore Pass."
         case .quotaFull:
             return String(localized: "Internet delivery is paused until your family collects waiting messages.")
         case .messageTooLarge:

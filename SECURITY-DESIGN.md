@@ -201,7 +201,7 @@ fixed, well-known key — readable by anyone with the app, by design. **It was
 never built, and it is no longer planned** (DESIGN.md §6.6). Nothing in the
 app today is readable by anyone other than its intended recipients.
 
-If a broadcast channel ever ships it will be scoped to a single Cruise Pass
+If a broadcast channel ever ships it will be scoped to a single Shore Pass
 rather than open to anyone with the app, and this section gets rewritten
 before that happens. The rule for any such channel stands: anything encrypted
 to a key many people hold is not private, and the UI has to say so.

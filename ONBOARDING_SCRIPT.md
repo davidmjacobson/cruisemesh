@@ -24,7 +24,7 @@ connection your phone has — Bluetooth, local Wi‑Fi, and even handing them
 phone to phone when there's no signal at all.
 
 > The draft listed "the internet" here. Removed: internet delivery needs a
-> Cruise Pass or a self-hosted relay, so listing it among the connections
+> Shore Pass or a self-hosted relay, so listing it among the connections
 > CruiseMesh "has" would promise the paid feature on slide 1 of a fresh
 > install. It is named honestly on Slide 2 instead.
 
@@ -41,7 +41,7 @@ Title: **It uses whatever's around**
 Body:
 Nearby, CruiseMesh talks phone‑to‑phone over Bluetooth and local Wi‑Fi. Farther
 away, your message hops between other phones running CruiseMesh until it reaches
-your friend — and, with a Cruise Pass or your own server, over the internet
+your friend — and, with a Shore Pass or your own server, over the internet
 whenever any of those phones has a connection.
 
 > The draft ended "And when the internet is available on any of them, it uses

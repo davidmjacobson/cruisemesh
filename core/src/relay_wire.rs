@@ -148,7 +148,7 @@ const RELAY_DEPOSIT_TOKEN_CONTEXT: &[u8] = b"cruisemesh relay deposit token v1";
 
 /// True when `token` is a deposit-class relay credential (CP4): valid only
 /// for posting envelopes into its family's mailbox, never for fetch/ack/
-/// presence/WebSocket. Friend cards carry this class; the Cruise Pass setup
+/// presence/WebSocket. Friend cards carry this class; the Shore Pass setup
 /// card carries the full member class.
 #[uniffi::export]
 pub fn relay_token_is_deposit(token: String) -> bool {
@@ -161,7 +161,7 @@ pub fn relay_token_is_deposit(token: String) -> bool {
 /// Derivation (a one-way hash), not random minting, on purpose: the phone
 /// can stamp a deposit token onto a friend card entirely offline, knowing
 /// only its own member token, with no new relay endpoint, no extra stored
-/// credential, and no change to the Cruise Pass setup card. The relay
+/// credential, and no change to the Shore Pass setup card. The relay
 /// derives and stores the identical value at provisioning/startup, so both
 /// sides agree without ever exchanging it. Preimage resistance means a
 /// deposit token (semi-public: it rides QR friend cards) reveals nothing
@@ -233,7 +233,7 @@ pub fn resolved_contact_relay(
     }
 }
 
-/// Does this contact's card credential belong to the *same* Cruise Pass as
+/// Does this contact's card credential belong to the *same* Shore Pass as
 /// ours? Both classes of card count: a post-CP4 card carries our family's
 /// deposit token (the attenuation of our member token), a pre-CP4 one carries
 /// the member token itself.
@@ -314,7 +314,7 @@ pub fn resolved_contact_poll_relay(
 /// Falling back is not a new capability: a card with no relay fields already
 /// resolves to our own endpoint today. It is also the routing that actually
 /// delivers whenever the contact is in our own family (they poll the mailbox
-/// we are posting to) — the common case for somebody we handed a Cruise Pass
+/// we are posting to) — the common case for somebody we handed a Shore Pass
 /// to. For a cross-family contact it delivers nothing, but neither did the
 /// dead endpoint, and unlike the dead endpoint this state is surfaced, so a
 /// person can repair the card.
@@ -463,7 +463,7 @@ fn relay_endpoint_from(url: Option<String>, token: Option<String>) -> Option<Rel
 /// use, from three sources with very different trust: a URL the user typed, a
 /// URL inside a scanned friend card, and a URL inside a kind-9 relay-change
 /// notice sealed by a contact. `validate_setup` has always required HTTPS for
-/// Cruise Pass setup cards; the other two paths reached
+/// Shore Pass setup cards; the other two paths reached
 /// [`RelayConfig`](crate::relay_setup) with whatever scheme they carried. Message
 /// bodies are sealed either way, so this is not about message secrecy — it is
 /// the relay token, the recipient hints, and the envelope sizes, which an
@@ -838,7 +838,7 @@ fn malformed(message: &str) -> CoreError {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ContactDelivery {
     /// The contact rides the same mailbox this phone fetches from: our own
-    /// family's Cruise Pass. Internet delivery works in both directions and
+    /// family's Shore Pass. Internet delivery works in both directions and
     /// their presence is observable, because we hold the member credential.
     SharedMailbox,
     /// The contact shared internet delivery of their own (another family's

@@ -163,7 +163,7 @@ pub fn friend_card_user_id(card: FriendCard) -> Vec<u8> {
 ///
 /// Identity beats name, always. A UserID is derived from the signing key, so a
 /// card whose UserID is already on file is the same person re-sharing (new
-/// relay details after a Cruise Pass, a fresh card over the air) even when some
+/// relay details after a Shore Pass, a fresh card over the air) even when some
 /// *other* contact happens to share their display name. Deciding by name first
 /// points a key-change warning at the wrong person and teaches a family to tap
 /// through the one warning that would ever have mattered.
@@ -1922,7 +1922,7 @@ mod tests {
     }
 
     /// The bug this exists to stop: Aunt Joan (already saved as "iPhone")
-    /// re-sends her card after setting up a Cruise Pass, and Dad — a different
+    /// re-sends her card after setting up a Shore Pass, and Dad — a different
     /// person who also shows up as "iPhone" — makes it look like her keys
     /// changed. Her UserID is on file, so this is a refresh, not a stranger.
     #[test]

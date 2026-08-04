@@ -108,7 +108,7 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                 }
                 DetailLine("Bluetooth", if (bluetoothCount == 0) "Listening" else "$bluetoothCount active")
                 DetailLine("Local Wi-Fi", if (localWifiCount == 0) "No active links" else "$localWifiCount active")
-                DetailLine("Cruise Pass", relayLabel(relay, relayConfigured))
+                DetailLine("Shore Pass", relayLabel(relay, relayConfigured))
                 Text(
                     stringResource(R.string.ui_cruisemesh_chooses_the_best_available_path_automatically_a),
                     style = MaterialTheme.typography.bodySmall,

@@ -207,7 +207,7 @@ fun FriendPreviewSheet(
 /**
  * What this card means next to the contacts already saved. A card whose UserID
  * is already on file is the same person re-sharing (new relay details after a
- * Cruise Pass, say) — never a key change, even when a *different* contact
+ * Shore Pass, say) — never a key change, even when a *different* contact
  * happens to share their display name.
  */
 @Composable

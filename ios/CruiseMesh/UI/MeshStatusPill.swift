@@ -57,7 +57,7 @@ struct MeshStatusPill: View {
 
     private var dotColor: Color {
         // A fault the person must act on outranks the runtime colour: green
-        // beside "Cruise Pass expired" would undercut the words next to it.
+        // beside "Shore Pass expired" would undercut the words next to it.
         // Red matches `PassIndicator.actionRequired`'s tint in Settings.
         if faultSuffix != nil { return .red }
         switch runtime.state {

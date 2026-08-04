@@ -110,8 +110,8 @@ class PassIndicatorTest {
 
     @Test
     fun `a re-check does not demote a pass that just verified`() {
-        // Aunt Joan's report: pasting a card showed "Cruise Pass is set up"
-        // with its green check, then flipped to "Cruise Pass is configured"
+        // Aunt Joan's report: pasting a card showed "Shore Pass is set up"
+        // with its green check, then flipped to "Shore Pass is configured"
         // and back as the first background sync -- and the service restart
         // that clears health to NoConfig -- passed through. A check in flight
         // is not evidence against the pass, so the heading must hold.

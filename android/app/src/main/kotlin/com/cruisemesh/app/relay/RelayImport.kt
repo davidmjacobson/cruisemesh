@@ -14,7 +14,7 @@ object RelayImport {
         // is a fine credential for the contact record (sends resolve through
         // it), but never for this phone's OWN config — adopting it would
         // leave the phone unable to fetch its own mail (403 deposit_only on
-        // every poll). Own config comes from the Cruise Pass setup card,
+        // every poll). Own config comes from the Shore Pass setup card,
         // which stays member-scoped.
         if (RelayConfigStore.load(context) == null &&
             !relayUrl.isNullOrEmpty() &&

@@ -46,7 +46,7 @@ backup and restore.
 
 Multi-device identity, message-history sync for late group joiners,
 ratchet/post-quantum upgrades (the envelope `version` byte reserves the
-path), relay federation, and a broadcast channel scoped to one Cruise Pass.
+path), relay federation, and a broadcast channel scoped to one Shore Pass.
 See DESIGN.md §13.
 
 ## Non-goals

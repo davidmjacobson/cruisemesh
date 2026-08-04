@@ -3969,7 +3969,7 @@ impl MessageStore {
 
     /// Forget every carried-upload marker, so the next sync pass offers the
     /// whole (family, non-relay-sourced) carry queue for upload once more.
-    /// Called when a relay endpoint changes -- ours (a new Cruise Pass, a
+    /// Called when a relay endpoint changes -- ours (a new Shore Pass, a
     /// manual edit, a restore onto a different config) or a contact's (a
     /// T23 relay-change notice, applied inside
     /// [`MessageStore::apply_contact_relay_update`]) -- because "already on

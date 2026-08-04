@@ -127,7 +127,7 @@ enum ContactReachability {
     ) -> String {
         switch level {
         case .nearby: return "Nearby via Bluetooth"
-        case .onlineRelay: return "Online via Cruise Pass"
+        case .onlineRelay: return "Online via Shore Pass"
         case .recent:
             let minutes = max(0, (nowMs - (peerLastSeenMs ?? nowMs)) / 60_000)
             return minutes >= 60 ? "Active \(minutes / 60)h ago" : "Active \(minutes)m ago"
@@ -148,7 +148,7 @@ enum ContactReachability {
     static func contentDescriptionSuffix(_ level: ReachabilityLevel) -> String? {
         switch level {
         case .nearby: return "Nearby via Bluetooth"
-        case .onlineRelay: return "Online via Cruise Pass"
+        case .onlineRelay: return "Online via Shore Pass"
         case .recent: return "Recently active"
         case .meshCarry: return "Reachable through nearby phones"
         case .offline: return nil
@@ -201,7 +201,7 @@ final class MeshConnectivityStatus: ObservableObject {
     /// Contacts whose friend-card relay endpoint has been written off after
     /// authoritatively rejecting us (core `contact_relay_health`).
     ///
-    /// Distinct from `relay`, which is our OWN Cruise Pass's health -- both
+    /// Distinct from `relay`, which is our OWN Shore Pass's health -- both
     /// can be true at once ("my pass is fine, but their card points at a host
     /// that no longer knows them"). Published so the contact sheet can say it
     /// live, instead of a person discovering it from device logs as happened

@@ -13,19 +13,19 @@ final class MeshStatusPillLogicTests: XCTestCase {
     // MARK: - The states that need a person
 
     func testExpiredPassIsNamed() {
-        XCTAssertEqual(suffix(.expired(lastAttemptMs: 1)), "Cruise Pass expired")
+        XCTAssertEqual(suffix(.expired(lastAttemptMs: 1)), "Shore Pass expired")
     }
 
     func testSuspendedPassIsNamed() {
-        XCTAssertEqual(suffix(.suspended(lastAttemptMs: 1)), "Cruise Pass suspended")
+        XCTAssertEqual(suffix(.suspended(lastAttemptMs: 1)), "Shore Pass suspended")
     }
 
     func testRejectedSetupIsNamedWithoutJargon() {
-        XCTAssertEqual(suffix(.tokenRejected(lastAttemptMs: 1)), "Cruise Pass setup was not accepted")
+        XCTAssertEqual(suffix(.tokenRejected(lastAttemptMs: 1)), "Shore Pass setup was not accepted")
     }
 
     func testFullMailboxIsNamed() {
-        XCTAssertEqual(suffix(.quotaFull(lastAttemptMs: 1)), "Cruise Pass storage is full")
+        XCTAssertEqual(suffix(.quotaFull(lastAttemptMs: 1)), "Shore Pass storage is full")
     }
 
     func testMessageTooLargeIsNamed() {
@@ -84,7 +84,7 @@ final class MeshStatusPillLogicTests: XCTestCase {
     func testQuietWithNoPeersNearbyToo() {
         XCTAssertEqual(
             suffix(.expired(lastAttemptMs: 1), state: .meshing(nearby: 0)),
-            "Cruise Pass expired"
+            "Shore Pass expired"
         )
     }
 

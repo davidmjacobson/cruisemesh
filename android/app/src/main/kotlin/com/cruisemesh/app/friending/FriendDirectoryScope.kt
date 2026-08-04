@@ -5,7 +5,7 @@ import uniffi.cruisemesh_core.relayContactSharesOwnFamily
 
 /**
  * Which contacts friends-of-friends introductions may involve: the ones on
- * our own Cruise Pass, and nobody else.
+ * our own Shore Pass, and nobody else.
  *
  * Introductions spread along the contact graph, and the graph does not stop
  * at a household. One person who has scanned somebody outside the family is

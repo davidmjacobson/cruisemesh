@@ -91,7 +91,7 @@ object MeshConnectivityStatus {
      * hex userIds whose friend-card relay endpoint has been written off after
      * authoritatively rejecting us (core `contact_relay_health`).
      *
-     * Distinct from [relay], which is our OWN Cruise Pass's health -- both can
+     * Distinct from [relay], which is our OWN Shore Pass's health -- both can
      * be true at once ("my pass is fine, but their card points at a host that
      * no longer knows them"). Observable so a chat's route row can say it
      * live, instead of a person discovering it from logcat as happened in the

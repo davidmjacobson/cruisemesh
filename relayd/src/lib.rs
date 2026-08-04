@@ -384,7 +384,7 @@ pub fn is_deposit_token(token: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenClass {
     /// Full family credential (post + fetch + ack + presence + WS). Rides
-    /// the Cruise Pass setup card; every pre-CP4 token is this class.
+    /// the Shore Pass setup card; every pre-CP4 token is this class.
     Member,
     /// Post-only into the family's mailbox. Rides friend cards.
     Deposit,
@@ -411,7 +411,7 @@ const RATE_BUCKET_IDLE_EVICT_AFTER: Duration = Duration::from_secs(5 * 60);
 /// bucket could not satisfy at all.
 const RATE_LIMIT_MAX_RETRY_AFTER_SECS: u64 = 60;
 
-/// Hosted-relay (Cruise Pass) expiry grace: after a provisioned family's
+/// Hosted-relay (Shore Pass) expiry grace: after a provisioned family's
 /// `expires_ms` passes, the family may still FETCH and ACK queued envelopes
 /// for this window (so nobody's last messages are stranded mid-cruise), but
 /// may no longer POST new ones. Past the grace window every request is
@@ -1020,7 +1020,7 @@ pub enum QuotaInsertResult {
     QuotaExceeded { usage_bytes: u64 },
 }
 
-/// A provisioned (hosted / Cruise Pass) family, stored in the `families`
+/// A provisioned (hosted / Shore Pass) family, stored in the `families`
 /// table. Static env-var tokens (`CRUISEMESH_RELAY_TOKENS`) never appear
 /// here — they behave as implicit always-active families.
 #[derive(Clone, Debug, PartialEq)]
@@ -2430,7 +2430,7 @@ fn decode_presence_hints(values: &[String], field: &str) -> Result<Vec<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
-// Admin API — hosted-relay ("Cruise Pass") provisioning. Every route requires
+// Admin API — hosted-relay ("Shore Pass") provisioning. Every route requires
 // `Authorization: Bearer <CRUISEMESH_RELAY_ADMIN_TOKEN>` and answers 404 when
 // no admin token is configured (the self-hosted default). The caller is the
 // cruisemesh.app purchase Worker; all operations are idempotent because
@@ -2458,7 +2458,7 @@ struct PatchFamilyRequest {
 struct FamilyResponse {
     token: String,
     /// CP4: the family's post-only credential, minted alongside `token` at
-    /// provisioning. The purchase flow puts `token` on the Cruise Pass setup
+    /// provisioning. The purchase flow puts `token` on the Shore Pass setup
     /// card; `deposit_token` is what friend cards carry (phones derive the
     /// same value locally, so nothing needs to distribute it — it is
     /// returned here so the operator can see/verify it).
@@ -3347,7 +3347,7 @@ impl ApiError {
     /// posting an envelope. 403 (not 401): the credential is real and
     /// recognized — the operation is simply outside its class. The stable
     /// `deposit_only` code lets a client distinguish "you scanned a friend
-    /// card into the Cruise Pass slot" from a revoked or mistyped token.
+    /// card into the Shore Pass slot" from a revoked or mistyped token.
     fn deposit_only(token: &str) -> Self {
         warn!(
             family = %token_prefix(token),

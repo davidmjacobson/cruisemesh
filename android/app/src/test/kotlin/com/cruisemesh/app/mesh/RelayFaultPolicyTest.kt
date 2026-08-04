@@ -82,7 +82,7 @@ class RelayFaultPolicyTest {
         // So this exact combination -- PASS_EXPIRED noted by the uploads,
         // both success flags true from the polls -- is what a paying family
         // sees for a week after their pass lapses. Folding it to Ok told
-        // them the Cruise Pass was working while nothing they wrote left
+        // them the Shore Pass was working while nothing they wrote left
         // the phone. If this assertion ever reads Ok again, that lie is
         // back.
         assertEquals(

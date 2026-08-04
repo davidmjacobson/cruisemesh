@@ -45,12 +45,12 @@ struct OnboardingView: View {
                 .tag(0)
 
                 // The internet clause is deliberately qualified: internet
-                // delivery needs a Cruise Pass or a self-hosted relay, and
+                // delivery needs a Shore Pass or a self-hosted relay, and
                 // onboarding must not imply the free tier includes it.
                 OnboardingSlide(
                     systemImage: "point.3.connected.trianglepath.dotted",
                     title: "It uses whatever's around",
-                    bodyText: "Nearby, CruiseMesh talks phone-to-phone over Bluetooth and local Wi-Fi. Farther away, your message hops between other phones running CruiseMesh until it reaches your friend — and, with a Cruise Pass or your own server, over the internet whenever any of those phones has a connection.",
+                    bodyText: "Nearby, CruiseMesh talks phone-to-phone over Bluetooth and local Wi-Fi. Farther away, your message hops between other phones running CruiseMesh until it reaches your friend — and, with a Shore Pass or your own server, over the internet whenever any of those phones has a connection.",
                     supportText: "Every message is encrypted end to end, so the phones and networks that help carry it can never read it."
                 )
                 .tag(1)
