@@ -1555,7 +1555,7 @@ class MeshService : Service() {
         val resolvedPeerUserId = peerUserId!!
         val contact = store.getContact(resolvedPeerUserId)
         if (contact != null) {
-            envelopeProcessor?.syncReceiptsFirst(identity, contact, address, entries)
+            envelopeProcessor?.syncReceiptsFirst(identity, contact, address)
             val peerHasThrough = DigestSync.throughLamportForSelf(entries, identity.userId)
             val queuedByLamport = store
                 .outboundEnvelopesAfter(contact.userId, identity.userId, peerHasThrough)

@@ -889,7 +889,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             return
         }
         if let contact = try? store.getContact(userId: peerUserId) {
-            syncReceiptsFirst(identity: identity, contact: contact, address: address, entries: entries)
+            syncReceiptsFirst(identity: identity, contact: contact, address: address)
             let peerHasThrough = DigestSync.throughLamportForSelf(entries: entries, ownUserId: identity.userId)
             let queued = (try? store.outboundEnvelopesAfter(
                 chatId: contact.userId,
@@ -1335,6 +1335,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         case ProtocolKind.groupInvite:
             try handleIncomingGroupInvite(
                 sourceLabel: sourceLabel,
+                sourceAddress: sourceAddress,
                 senderUserId: opened.senderUserId,
                 body: body,
                 identity: identity
@@ -1532,6 +1533,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// under `chat_id = group.id`.
     private func handleIncomingGroupInvite(
         sourceLabel: String,
+        sourceAddress: String?,
         senderUserId: Data,
         body: MessageBody,
         identity: Identity
@@ -1569,6 +1571,24 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         guard inserted else { return }
         ChatEvents.notifyChatChanged(group.id)
         log.info("Imported group \(group.name, privacy: .public) from invite on \(sourceLabel, privacy: .public)")
+
+        // The invite rides the 1:1 pairwise lamport stream, so it must be
+        // acknowledged on that stream like any other pairwise kind -- even
+        // though its row lives under the group chat. Skipping the ack (as this
+        // did) strands the peer's delivered watermark below the invite's
+        // lamport for as long as the invite is the newest thing they sent us,
+        // and the repair lane can never lift it, so they replay their backlog
+        // on every send. DELIVERED only, like every other row that never
+        // appears in the 1:1 chat.
+        if let contact = try? store.getContact(userId: senderUserId) {
+            acknowledgeHiddenMessage(
+                sourceAddress: sourceAddress,
+                senderUserId: senderUserId,
+                identity: identity,
+                contact: contact,
+                atLeastLamport: body.lamport
+            )
+        }
 
         if !ChatVisibility.isVisible(group.id) {
             let senderName = (try? store.getContact(userId: senderUserId))
@@ -2278,16 +2298,21 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Hidden-kind rows (endpoint hints, directories, introductions, group
+    /// invites) are never on screen in the 1:1 chat, so they ack DELIVERED
+    /// only -- never READ. See `PeerStreamWatermark` for `atLeastLamport`.
     private func acknowledgeHiddenMessage(
         sourceAddress: String?,
         senderUserId: Data,
         identity: Identity,
-        contact: Contact
+        contact: Contact,
+        atLeastLamport: UInt64 = 0
     ) {
         let through = PeerStreamWatermark.through(
             store: store,
             chatId: senderUserId,
-            senderUserId: senderUserId
+            senderUserId: senderUserId,
+            atLeastLamport: atLeastLamport
         )
         try? store.recordOutgoingReceipt(
             chatId: senderUserId,
@@ -2376,48 +2401,27 @@ final class MeshController: ObservableObject, @unchecked Sendable {
 
     // MARK: - Receipts / carry / relay
 
+    /// DESIGN.md §7.3: receipts go first on peer sync because they're the
+    /// smallest frames and unblock the most UI. The store persists the latest
+    /// cumulative delivered/read watermarks we owe `contact`, so a receipt that
+    /// couldn't be sent when it was first observed heals on this reconnect.
+    ///
+    /// The peer's digest is deliberately not consulted -- see
+    /// `ReceiptRepair.owedTo` for why capping these watermarks against it
+    /// self-locked the pairing.
     private func syncReceiptsFirst(
         identity: Identity,
         contact: Contact,
-        address: String,
-        entries: [DigestEntry]
+        address: String
     ) {
-        let peerAuthoredThrough = DigestSync.throughLamportForSender(entries: entries, senderUserId: contact.userId)
-        guard peerAuthoredThrough > 0 else { return }
-        let deliveredThrough = min(
-            (try? store.outgoingReceiptThrough(
-                chatId: contact.userId,
-                senderUserId: contact.userId,
-                receiptType: ReceiptType.delivered
-            )) ?? 0,
-            peerAuthoredThrough
-        )
-        if deliveredThrough > 0 {
+        for owed in ReceiptRepair.owedTo(store: store, peerUserId: contact.userId) {
             sendReceiptOnAddress(
                 identity: identity,
                 contact: contact,
                 address: address,
-                receiptType: ReceiptType.delivered,
+                receiptType: owed.receiptType,
                 ackedSenderUserId: contact.userId,
-                throughLamport: deliveredThrough
-            )
-        }
-        let readThrough = min(
-            (try? store.outgoingReceiptThrough(
-                chatId: contact.userId,
-                senderUserId: contact.userId,
-                receiptType: ReceiptType.read
-            )) ?? 0,
-            peerAuthoredThrough
-        )
-        if readThrough > 0 {
-            sendReceiptOnAddress(
-                identity: identity,
-                contact: contact,
-                address: address,
-                receiptType: ReceiptType.read,
-                ackedSenderUserId: contact.userId,
-                throughLamport: readThrough
+                throughLamport: owed.throughLamport
             )
         }
     }

@@ -28,7 +28,6 @@ import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.CoreInboundDisposition
 import uniffi.cruisemesh_core.CoreInboundGate
-import uniffi.cruisemesh_core.DigestEntry
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
@@ -190,35 +189,24 @@ internal class InboundEnvelopeProcessor(
      * cumulative delivered/read watermarks we owe [contact], so a receipt that
      * couldn't be sent when it was first observed heals on this reconnect.
      *
-     * The digest entry for [contact.userId] is "how far the peer says its own
-     * authored stream exists contiguously"; receipts acknowledging beyond that
-     * point are capped away as nonsensical. In the ordinary case the cap is a
-     * no-op, but it makes the foreign digest entry actively meaningful rather
-     * than ignored.
+     * The peer's digest is deliberately not consulted -- see
+     * [ReceiptRepair.owedTo] for why capping these watermarks against it
+     * self-locked the pairing.
      */
     fun syncReceiptsFirst(
         identity: Identity,
         contact: Contact,
         address: String,
-        entries: List<DigestEntry>,
     ) {
-        val peerAuthoredThrough = DigestSync.throughLamportForSender(entries, contact.userId)
-        if (peerAuthoredThrough == 0uL) return
-
-        val deliveredThrough = minOf(
-            store.outgoingReceiptThrough(contact.userId, contact.userId, RECEIPT_TYPE_DELIVERED),
-            peerAuthoredThrough,
-        )
-        if (deliveredThrough > 0uL) {
-            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, contact.userId, deliveredThrough)
-        }
-
-        val readThrough = minOf(
-            store.outgoingReceiptThrough(contact.userId, contact.userId, RECEIPT_TYPE_READ),
-            peerAuthoredThrough,
-        )
-        if (readThrough > 0uL) {
-            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, contact.userId, readThrough)
+        for (owed in ReceiptRepair.owedTo(store, contact.userId)) {
+            sendReceiptOnAddress(
+                identity,
+                contact,
+                address,
+                owed.receiptType,
+                contact.userId,
+                owed.throughLamport,
+            )
         }
     }
 
@@ -1069,12 +1057,9 @@ internal class InboundEnvelopeProcessor(
         recordInboundChatArrival(senderUserId, body.kind, arrival)
         ChatEvents.notifyChatChanged(group.id)
 
-        // Local read watermark only (group wire receipts are deferred). Uses
-        // highestLamport (plain MAX), not highestContiguousLamport: the
-        // latter stalls at 0 once the sender's stream legitimately starts
-        // above lamport 1 (post chat-history-wipe ratchet), which would
-        // leave this watermark -- and the unread badge -- stuck forever.
-        val throughLamport = store.highestLamport(group.id, senderUserId)
+        // Local read watermark only (group wire receipts are deferred).
+        // See [PeerStreamWatermark] for why this is a plain MAX.
+        val throughLamport = PeerStreamWatermark.through(store, group.id, senderUserId)
         store.recordOutgoingReceipt(group.id, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
         val isVisible = ChatVisibility.isVisible(group.id)
         if (isVisible) {
@@ -1142,10 +1127,22 @@ internal class InboundEnvelopeProcessor(
 
         val contact = store.getContact(senderUserId)
         if (contact != null) {
-            // 1:1 delivered/read receipts still apply to the pairwise invite
-            // envelope's sender stream — but the invite row lives under the
-            // group chat, so we only ack if we also store something under the
-            // 1:1 chat. Skip wire receipts for invites; the group is what matters.
+            // The invite rides the 1:1 pairwise lamport stream, so it must be
+            // acknowledged on that stream like any other pairwise kind -- even
+            // though its row lives under the group chat. Skipping the ack (as
+            // this did) strands the peer's delivered watermark below the
+            // invite's lamport for as long as the invite is the newest thing
+            // they sent us, and the repair lane can never lift it, so they
+            // replay their backlog on every send. DELIVERED only, like every
+            // other row that never appears in the 1:1 chat.
+            acknowledgePeerStream(
+                identity,
+                contact,
+                address,
+                senderUserId,
+                markRead = false,
+                atLeastLamport = body.lamport,
+            )
         }
         if (!ChatVisibility.isVisible(group.id)) {
             // FA8: a typed entry point, not a literal string sniffed by
@@ -1652,10 +1649,9 @@ internal class InboundEnvelopeProcessor(
      * relay sync if a watermark advanced, and send the receipt(s) back on the
      * link the message arrived on.
      *
-     * `highestLamport` (plain MAX), not `highestContiguousLamport`: this is
-     * a watermark over the peer's stream, and after the lamport ratchet that
-     * stream can legitimately start above 1, where the contiguous count
-     * would stall at 0 forever.
+     * See [PeerStreamWatermark] for why the watermark is a plain MAX and what
+     * [atLeastLamport] is for (the group invite, whose row lives under the
+     * group chat but whose lamport belongs to this 1:1 stream).
      */
     private fun acknowledgePeerStream(
         identity: Identity,
@@ -1663,8 +1659,9 @@ internal class InboundEnvelopeProcessor(
         address: String,
         senderUserId: ByteArray,
         markRead: Boolean,
+        atLeastLamport: ULong = 0uL,
     ) {
-        val throughLamport = store.highestLamport(senderUserId, senderUserId)
+        val throughLamport = PeerStreamWatermark.through(store, senderUserId, senderUserId, atLeastLamport)
         store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
         var relayQueueChanged = queueOutgoingReceiptForRelay(
             identity = identity,
@@ -1755,11 +1752,9 @@ internal class InboundEnvelopeProcessor(
         MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(senderUserId), System.currentTimeMillis())
         ChatEvents.notifyChatChanged(senderUserId)
 
-        // highestLamport (plain MAX), not highestContiguousLamport: same
-        // peer-stream-watermark reasoning as above -- a contiguous-from-1
-        // count stalls at 0 once the sender's stream starts above 1 (post
-        // ratchet), stranding the delivered/read receipt and unread badge.
-        val throughLamport = store.highestLamport(senderUserId, senderUserId)
+        // See [PeerStreamWatermark] for why this is a plain MAX and not the
+        // contiguous count.
+        val throughLamport = PeerStreamWatermark.through(store, senderUserId, senderUserId)
         store.recordOutgoingReceipt(senderUserId, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
         var relayQueueChanged = false
         val isVisible = ChatVisibility.isVisible(senderUserId)
@@ -2019,7 +2014,7 @@ internal class InboundEnvelopeProcessor(
         // hold. The `== 0` guard below still means "nothing received yet,"
         // since MAX is 0 only when the store truly has no message from
         // this peer.
-        val throughLamport = store.highestLamport(peerUserId, peerUserId)
+        val throughLamport = PeerStreamWatermark.through(store, peerUserId, peerUserId)
         if (throughLamport == 0uL) return // nothing received from this peer yet to ack as read
         store.recordOutgoingReceipt(peerUserId, peerUserId, RECEIPT_TYPE_READ, throughLamport)
         if (

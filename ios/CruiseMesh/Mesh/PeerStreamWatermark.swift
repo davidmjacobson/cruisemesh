@@ -20,6 +20,10 @@ import Foundation
 ///   a `messages` row, so that lamport is missing here forever even though the
 ///   peer sent it and every later message arrives fine. Kind 8
 ///   (`LAN_ENDPOINT_HINT`) already has this shape and kind 9 adds another.
+/// - **A lamport whose row we filed somewhere else.** A group invite is
+///   authored into the 1:1 pairwise stream but stored under the group's chat
+///   id, so the 1:1 chat never gains a row at that lamport -- see
+///   `atLeastLamport`.
 ///
 /// Only the *receipt* watermark widens. Gap detection still belongs to
 /// `chat_digest`, which keeps using `highestContiguousLamport` so digest sync
@@ -30,7 +34,21 @@ enum PeerStreamWatermark {
     /// The cumulative lamport a receipt for `senderUserId`'s messages in
     /// `chatId` should report. 0 when we hold nothing from them (or the store
     /// read fails), which every caller treats as "nothing to acknowledge yet".
-    static func through(store: MessageStore, chatId: Data, senderUserId: Data) -> UInt64 {
-        (try? store.highestLamport(chatId: chatId, senderUserId: senderUserId)) ?? 0
+    ///
+    /// `atLeastLamport` raises the floor for a message we genuinely consumed
+    /// but did not file under `chatId` -- the group invite case. The invite
+    /// rides the 1:1 pairwise lamport stream (so the sender's next authored
+    /// lamport is above it) but its row lives under the group's chat id, so a
+    /// pure MAX over the 1:1 chat sits below it. Left at 0 the invite would
+    /// strand the peer's delivered watermark under its own lamport for as long
+    /// as it stayed at the tail of the stream, and the sender would replay its
+    /// backlog forever.
+    static func through(
+        store: MessageStore,
+        chatId: Data,
+        senderUserId: Data,
+        atLeastLamport: UInt64 = 0
+    ) -> UInt64 {
+        max((try? store.highestLamport(chatId: chatId, senderUserId: senderUserId)) ?? 0, atLeastLamport)
     }
 }
