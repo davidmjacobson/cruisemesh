@@ -89,6 +89,108 @@ final class ContactRelaySilenceTests: XCTestCase {
         XCTAssertTrue(ContactRelaySilence.shared.endpointAnswering(userId: alice, endpointKey: dead, nowMs: now))
     }
 
+    // MARK: - the pass-local skip
+
+    func testAnAddressThatJustFailedIsNotDialledAgainForTheRestOfThePass() {
+        // The whole point of the pass-local arm. A rest needs two passes, so
+        // before this the first failure taught the pass nothing and a backlog
+        // of queued envelopes re-dialled the same dead host once each -- 352
+        // TLS handshakes in 27 seconds in the field report this came from.
+        let silence = ContactRelaySilence.shared
+        silence.beginPass()
+        XCTAssertTrue(silence.endpointAnswering(userId: alice, endpointKey: dead, nowMs: now), "never tried yet")
+        XCTAssertTrue(
+            silence.noteUnreachableThisPass(userId: alice, endpointKey: dead),
+            "first failure is news"
+        )
+        XCTAssertFalse(
+            silence.endpointAnswering(userId: alice, endpointKey: dead, nowMs: now),
+            "every later envelope this pass skips it"
+        )
+    }
+
+    func testOnlyTheFirstFailurePerAddressInAPassIsWorthLogging() {
+        let silence = ContactRelaySilence.shared
+        silence.beginPass()
+        XCTAssertTrue(silence.noteUnreachableThisPass(userId: alice, endpointKey: dead))
+        XCTAssertFalse(
+            silence.noteUnreachableThisPass(userId: alice, endpointKey: dead),
+            "same address again says nothing new"
+        )
+        XCTAssertTrue(
+            silence.noteUnreachableThisPass(userId: alice, endpointKey: live),
+            "a different address is its own news"
+        )
+    }
+
+    func testACardThatMovesTheContactMidPassIsTriedImmediately() {
+        // Same rule as the rest window: a host that has never been dialled
+        // cannot have been silent, so a T23 notice or a fresh card arriving
+        // between two envelopes must not serve out the old address's skip.
+        let silence = ContactRelaySilence.shared
+        silence.beginPass()
+        silence.noteUnreachableThisPass(userId: alice, endpointKey: dead)
+        XCTAssertTrue(silence.endpointAnswering(userId: alice, endpointKey: live, nowMs: now))
+    }
+
+    func testThePassLocalSkipDoesNotSurviveIntoTheNextPass() {
+        // It is not a rest and must not act like one: one failed pass is
+        // explicitly not enough to write an endpoint off, so the next pass
+        // owes it a fresh probe.
+        let silence = ContactRelaySilence.shared
+        silence.beginPass()
+        silence.noteUnreachableThisPass(userId: alice, endpointKey: dead)
+        let rested = silence.commitPass(otherRelayAnswered: true, nowMs: now)
+        XCTAssertEqual(rested.count, 1)
+        XCTAssertEqual(rested.first?.streak, 1)
+        silence.beginPass()
+        XCTAssertTrue(
+            silence.endpointAnswering(userId: alice, endpointKey: dead, nowMs: now),
+            "one silent pass is still not enough"
+        )
+    }
+
+    func testTwoSilentPassesStillRestTheEndpoint() {
+        // The pass-local arm must not change what the streak means: this is
+        // the pre-existing two-pass behaviour, now driven through commitPass.
+        let silence = ContactRelaySilence.shared
+        for expected in Int64(1)...2 {
+            silence.beginPass()
+            silence.noteUnreachableThisPass(userId: alice, endpointKey: dead)
+            XCTAssertEqual(silence.commitPass(otherRelayAnswered: true, nowMs: now).first?.streak, expected)
+        }
+        silence.beginPass()
+        XCTAssertFalse(silence.endpointAnswering(userId: alice, endpointKey: dead, nowMs: now))
+    }
+
+    func testSilenceCommittedWithoutProofOfWorkingInternetRestsNobody() {
+        // A phone in a tunnel fails every endpoint at once. The pass-local
+        // skip still saves the redundant dials inside that pass, but it must
+        // not harden into a rest that takes the relay path away from the whole
+        // contact list once connectivity returns.
+        let silence = ContactRelaySilence.shared
+        silence.beginPass()
+        silence.noteUnreachableThisPass(userId: alice, endpointKey: dead)
+        XCTAssertTrue(silence.commitPass(otherRelayAnswered: false, nowMs: now).isEmpty)
+        silence.beginPass()
+        XCTAssertTrue(silence.endpointAnswering(userId: alice, endpointKey: dead, nowMs: now))
+    }
+
+    func testAnEndpointThatAnswersLaterInThePassIsDialledAgain() {
+        // Recorded silence is provisional until the pass ends, so a success
+        // against the same address -- a host that was mid-reboot -- has to
+        // clear it outright rather than leave the rest of the pass skipping.
+        let silence = ContactRelaySilence.shared
+        silence.beginPass()
+        silence.noteUnreachableThisPass(userId: alice, endpointKey: dead)
+        silence.noteAnswered(userId: alice)
+        XCTAssertTrue(silence.endpointAnswering(userId: alice, endpointKey: dead, nowMs: now))
+        XCTAssertTrue(
+            silence.commitPass(otherRelayAnswered: true, nowMs: now).isEmpty,
+            "and nothing is left to commit"
+        )
+    }
+
     // MARK: - the group fan-out's choice of mailbox
 
     private func member(_ url: String?, usable: Bool, answering: Bool) -> GroupRelayMember {

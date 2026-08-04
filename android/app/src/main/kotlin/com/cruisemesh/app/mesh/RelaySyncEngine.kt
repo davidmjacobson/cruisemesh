@@ -478,7 +478,7 @@ internal class RelaySyncEngine(
         contactRelayRejections = store.listContactRelayRejections()
             .associateByTo(mutableMapOf()) { UserIdHex.encode(it.userId) }
         contactRelayCountedThisPass.clear()
-        contactRelayUnreachableThisPass.clear()
+        contactRelaySilence.beginPass()
         publishStaleContactRelays()
         backfillOutgoingReceipts(identity, now)
         // T23: if our own endpoint changed since the last announcement, queue
@@ -1078,7 +1078,9 @@ internal class RelaySyncEngine(
      * no HTTP answer to classify: a host that was retired rather than a token
      * that was revoked. False rests the endpoint until the core's probe window
      * opens, which is what stops an address that will never respond from being
-     * dialled on every pass forever.
+     * dialled on every pass forever -- and, since this pass's own provisional
+     * observations count too, from being dialled once per queued envelope
+     * inside a single pass. See [ContactRelaySilence.endpointAnswering].
      */
     private fun contactEndpointAnswering(contact: Contact): Boolean =
         contactRelaySilence.endpointAnswering(
@@ -1142,18 +1144,9 @@ internal class RelaySyncEngine(
     private val contactRelayCountedThisPass: MutableSet<String> = mutableSetOf()
 
     /**
-     * Contacts whose card endpoint failed this pass without answering at all.
-     *
-     * Held until the end of the pass because the observation is only
-     * meaningful next to proof that this device's internet works — see
-     * [commitUnreachableContactRelays], which is where they are either
-     * counted or discarded.
-     */
-    private val contactRelayUnreachableThisPass: MutableMap<String, String> = mutableMapOf()
-
-    /**
      * Per-process streaks of passes in which a contact's endpoint said
-     * nothing. See [ContactRelaySilence] for why this is not persisted.
+     * nothing, plus the pass now running's provisional observations. See
+     * [ContactRelaySilence] for why neither is persisted.
      */
     private val contactRelaySilence = ContactRelaySilence()
 
@@ -1215,8 +1208,15 @@ internal class RelaySyncEngine(
             // evidence about the card on its own, so it is only remembered
             // here; commitUnreachableContactRelays decides at the end of the
             // pass whether this device had any business believing it.
-            contactRelayUnreachableThisPass[UserIdHex.encode(contact.userId)] =
-                contactEndpointKey(contact)
+            val key = UserIdHex.encode(contact.userId)
+            // Log on the transition only. The per-envelope upload warnings name
+            // the host but not whose card carries it, which left a field report
+            // of hundreds of failures against one URL with no way to tell which
+            // contact to ask for a fresh card. Once per contact per pass answers
+            // that without restoring the volume the short-circuit just removed.
+            if (contactRelaySilence.noteUnreachableThisPass(key, contactEndpointKey(contact))) {
+                Log.w(TAG, "Contact $key relay ${config.relayUrl} did not answer: ${error.message}")
+            }
             return
         }
         val fault = relayClassifyHttpError(http.code.toUShort(), http.relayCode)
@@ -1253,7 +1253,6 @@ internal class RelaySyncEngine(
     private fun noteContactRelaySuccess(contact: Contact, config: RelayConfig, fallbackConfig: RelayConfig?) {
         if (config == fallbackConfig) return
         val key = UserIdHex.encode(contact.userId)
-        contactRelayUnreachableThisPass.remove(key)
         contactRelaySilence.noteAnswered(key)
         if (!contactRelayRejections.containsKey(key)) return
         store.clearContactRelayRejection(contact.userId)
@@ -1275,20 +1274,13 @@ internal class RelaySyncEngine(
      * came back.
      */
     private fun commitUnreachableContactRelays(ownRelayAnswered: Boolean) {
-        for ((key, endpointKey) in contactRelayUnreachableThisPass) {
-            val streak = contactRelaySilence.noteSilentPass(
-                key,
-                endpointKey,
-                ownRelayAnswered,
-                passNowMs,
-            ) ?: continue
+        for ((key, streak) in contactRelaySilence.commitPass(ownRelayAnswered, passNowMs)) {
             Log.w(
                 TAG,
                 "Contact $key relay endpoint did not answer while our own relay did " +
                     "(silent passes=$streak); resting it rather than retrying every pass",
             )
         }
-        contactRelayUnreachableThisPass.clear()
     }
 
     private fun syncRelayPresence(
