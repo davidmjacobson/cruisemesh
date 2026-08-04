@@ -4,10 +4,72 @@ import Foundation
 import Network
 import os.log
 
-/// Owns BLE dual-role + frame handling + relay sync (Android `MeshService` parity).
-@MainActor
-final class MeshController: ObservableObject {
+/**
+ Owns BLE dual-role + frame handling + relay sync (Android `MeshService` parity).
+
+ # Threading
+
+ Every mesh event -- BLE and LAN frames, connects, disconnects, HELLO, the
+ digest-maintenance and LAN-health ticks, the relay poll's bookkeeping, and
+ the app's own start/stop/foreground calls -- runs on `meshQueue`, one private
+ **serial** `DispatchQueue`. Nothing in this class runs on the main thread any
+ more, and every stored property below is owned by that queue.
+
+ This used to be a `@MainActor` type, so the whole inbound pipeline ran on the
+ main thread: per frame, a failed pairwise unseal (X25519 + AEAD over payloads
+ up to ~200 KiB), group-key open attempts, and a SQLite carry insert with
+ budget enforcement. A field report has a phone on a BLE-only link taking a
+ sustained multi-megabyte mule spray from a loaded courier: the UI stopped
+ responding for as long as the spray lasted, and the app was then killed on a
+ scene transition with the main thread still pegged. Android has always run
+ the equivalent work on binder/store threads; this is the iOS half of that.
+
+ ## Why a serial queue, and not an actor
+
+ Two documented invariants need the mesh's events to be processed strictly one
+ at a time, in arrival order:
+
+ - **FI6**: a connect and a disconnect for the same address must be handled in
+   the order the transport reported them, or a fast connect->disconnect can
+   re-register a dead route.
+ - **DTN D4** (see `processInboundEnvelope`): the seen-set is checked with a
+   non-mutating `contains` and recorded only at a terminal handled state, and
+   `relayForeign` re-floods before that record happens. Both are safe only
+   because one envelope is processed to completion before the next one starts.
+
+ A serial `DispatchQueue` gives exactly that and nothing subtler: `async`
+ enqueues FIFO from any thread, and a block runs to completion before the next
+ one starts -- there is no suspension point at which a second block could
+ interleave. A Swift `actor` would not: every `await` inside an actor method
+ is a re-entrancy point, so a single stray `await` added to the pipeline later
+ would silently break both invariants with no compiler complaint. Nothing on
+ the inbound path awaits today, and the queue means nothing can.
+
+ ## What still runs on the main actor
+
+ UI-facing state only, handed over with `onMain` (which is
+ `DispatchQueue.main.async`, so it preserves the order the pipeline produced
+ it in): `MeshConnectivityStatus`, `MeshRuntimeStatus`, and the Combine
+ subjects in `ChatEvents.swift`, which hop themselves. Everything else the
+ pipeline touches is safe off the main thread on its own terms -- the Rust
+ core's store/seen-set/trackers are `Mutex`-backed, `MeshRouter`,
+ `ChatVisibility`, `ContactRelaySilence` and `RelaySweepSession` are
+ `NSLock`-backed, `LanCapabilityStore`/`LanEndpointCache`/`ProfileStore` are
+ `UserDefaults`, `LanTransportDiagnostics` publishes on main internally, and
+ `BleTransport`/`LanTransport` each own a private queue.
+
+ The relay sync *pass* itself is unchanged: it still runs in a detached task
+ off any queue, still serialises through `relaySyncInFlight`, and still owns
+ `ContactRelaySilence` alone -- the inbound pipeline never touches it, so the
+ pass's assumption that its silence bookkeeping sees non-overlapping passes
+ still holds.
+ */
+final class MeshController: ObservableObject, @unchecked Sendable {
     static let shared = MeshController()
+
+    /// The single serial context every mesh event runs on. See the class doc
+    /// for why it is a queue rather than an actor.
+    private let meshQueue = DispatchQueue(label: "com.cruisemesh.mesh", qos: .userInitiated)
 
     private let log = Logger(subsystem: "com.cruisemesh", category: "MeshController")
     private let transport = BleTransport()
@@ -16,7 +78,7 @@ final class MeshController: ObservableObject {
     private let store = AppStore.get()
     private let bluetoothAudioBackoff = BluetoothAudioBackoff()
     private var identity: Identity!
-    private var relayTimer: Timer?
+    private var relayTimer: DispatchSourceTimer?
     /// CP2b: epoch ms until which relayd asked us not to sync again
     /// (`Retry-After` on a 429); 0 = no backoff. `runRelaySync` drops nudges
     /// inside the window; the 60 s poll tick retries once it has passed.
@@ -37,10 +99,12 @@ final class MeshController: ObservableObject {
     /// to a safety net while push is healthy and the app is foregrounded.
     private lazy var relayPushClient = RelayPushClient(
         onPush: { [weak self] in
-            Task { @MainActor in self?.runRelaySync() }
+            guard let self else { return }
+            self.meshQueue.async { self.runRelaySync() }
         },
         onHealthChanged: { [weak self] healthy in
-            Task { @MainActor in self?.onRelayPushHealthChanged(healthy) }
+            guard let self else { return }
+            self.meshQueue.async { self.onRelayPushHealthChanged(healthy) }
         }
     )
     private var isRunning = false
@@ -51,9 +115,9 @@ final class MeshController: ObservableObject {
     /// `nil` before the first one. See `onRelayPushHealthChanged`/
     /// `reschedulePoll`. Mirrors Android's `MeshService.lastKnownPushHealthy`.
     private var lastKnownPushHealthy: Bool?
-    private var lanHealthTimer: Timer?
+    private var lanHealthTimer: DispatchSourceTimer?
     // D8: periodic re-digest bookkeeping.
-    private var digestMaintenanceTimer: Timer?
+    private var digestMaintenanceTimer: DispatchSourceTimer?
     private var lastDigestAtByAddress: [String: Int64] = [:]
     private var audioRouteObserver: NSObjectProtocol?
     private var relaySyncInFlight = false
@@ -65,18 +129,89 @@ final class MeshController: ObservableObject {
 
     private init() {}
 
+    // MARK: - Threading helpers
+
+    /// Hands a closure to the main actor for UI-facing state.
+    ///
+    /// `DispatchQueue.main.async` rather than `Task { @MainActor in }`: the
+    /// mesh queue emits these in a meaningful order (a disconnect's nearby
+    /// refresh must not land before the connect's), and queue `async` is FIFO
+    /// where task enqueueing carries no such promise.
+    private func onMain(_ body: @escaping @MainActor @Sendable () -> Void) {
+        DispatchQueue.main.async { MainActor.assumeIsolated(body) }
+    }
+
+    /// Runs `body` on `meshQueue` and returns its result, for the one caller
+    /// that needs a value back: the relay sync pass's per-envelope
+    /// `processInboundEnvelope`. Suspends rather than blocking, so a pass
+    /// waiting behind a burst of BLE frames never occupies a pool thread.
+    ///
+    /// Each envelope is still handled start-to-finish inside one queue block,
+    /// which is all DTN D4 requires; interleaving *between* envelopes with
+    /// BLE/LAN frames is exactly what the previous `MainActor.run` per
+    /// envelope did too.
+    private func onMeshQueue<T>(_ body: @escaping () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            meshQueue.async { continuation.resume(returning: body()) }
+        }
+    }
+
+    /// A timer that fires on `meshQueue`, replacing `Timer.scheduledTimer`
+    /// (which needs a run loop, and so pinned all three of this class's timers
+    /// to the main thread). `cancel()` is the `invalidate()` twin.
+    private func meshTimer(
+        intervalSeconds: TimeInterval,
+        repeats: Bool,
+        _ body: @escaping @Sendable () -> Void
+    ) -> DispatchSourceTimer {
+        let timer = DispatchSource.makeTimerSource(queue: meshQueue)
+        if repeats {
+            timer.schedule(deadline: .now() + intervalSeconds, repeating: intervalSeconds)
+        } else {
+            timer.schedule(deadline: .now() + intervalSeconds)
+        }
+        timer.setEventHandler(handler: body)
+        timer.resume()
+        return timer
+    }
+
+    // MARK: - Lifecycle
+
     func configure(identity: Identity) {
-        self.identity = identity
+        meshQueue.async { self.identity = identity }
     }
 
     func start() {
+        meshQueue.async { self.startOnMeshQueue() }
+    }
+
+    func stop() {
+        meshQueue.async { self.stopOnMeshQueue() }
+    }
+
+    func setAppForeground(_ foreground: Bool) {
+        meshQueue.async { self.setAppForegroundOnMeshQueue(foreground) }
+    }
+
+    /// The contact list changed (a contact was deleted, blocked, or
+    /// unblocked), so anything derived from it needs rebuilding.
+    func contactListChanged() {
+        meshQueue.async { self.refreshLanCapableContacts() }
+    }
+
+    func notifyChatViewed(chatId: Data) {
+        meshQueue.async { self.notifyChatViewedOnMeshQueue(chatId: chatId) }
+    }
+
+    private func startOnMeshQueue() {
         if isRunning {
             // Repeat start while already running: refresh status only.
-            MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
+            let nearby = MeshRouter.connectedUserCount()
+            onMain { MeshRuntimeStatus.shared.markMeshing(nearby: nearby) }
             return
         }
         isRunning = true
-        MeshRuntimeStatus.shared.markStarting()
+        onMain { MeshRuntimeStatus.shared.markStarting() }
 
         MeshRouter.registerCentral { [weak self] address, frame in
             self?.transport.sendAsCentral(address: address, frame: frame)
@@ -109,7 +244,7 @@ final class MeshController: ObservableObject {
             lan?.sendFrame(address: address, frame: frame)
         }
         lan.onNetworkReady = { [weak self, weak lan] endpoint, instanceToken, networkId in
-            Task { @MainActor in
+            self?.meshQueue.async {
                 guard let self, let lan, self.isRunning else { return }
                 self.currentLanEndpoint = endpoint
                 self.currentLanInstanceToken = instanceToken
@@ -132,14 +267,14 @@ final class MeshController: ObservableObject {
             }
         }
         lan.onAuthenticated = { [weak self] address, userId in
-            Task { @MainActor in
+            self?.meshQueue.async {
                 guard let self, self.isRunning else { return }
                 MeshRouter.onConnected(address: address, transport: .lan)
                 guard MeshRouter.onHello(address: address, userId: userId) else { return }
-                MeshConnectivityStatus.shared.mergeLastSeen(
-                    userId: userId,
-                    seenAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
-                )
+                let seenAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
+                self.onMain {
+                    MeshConnectivityStatus.shared.mergeLastSeen(userId: userId, seenAtMs: seenAtMs)
+                }
                 let name = (try? self.store.getContact(userId: userId))?.name
                     ?? String(UserIdHex.encode(userId).prefix(8))
                 if (try? self.store.getContact(userId: userId)) != nil {
@@ -163,7 +298,7 @@ final class MeshController: ObservableObject {
             }
         }
         lan.onDisconnected = { [weak self] address in
-            Task { @MainActor in
+            self?.meshQueue.async {
                 guard let self, self.isRunning else { return }
                 self.recordPeerDisconnected(address: address)
                 self.lanHealth.remove(address: address)
@@ -173,7 +308,7 @@ final class MeshController: ObservableObject {
             }
         }
         lan.onFrame = { [weak self] address, frame in
-            Task { @MainActor in
+            self?.meshQueue.async {
                 guard let self, self.isRunning else { return }
                 self.onFrameReceived(address: address, frame: frame)
             }
@@ -184,35 +319,39 @@ final class MeshController: ObservableObject {
         startDigestMaintenanceLoop()
 
         transport.onFrame = { [weak self] address, frame in
-            Task { @MainActor in self?.onFrameReceived(address: address, frame: frame) }
+            self?.meshQueue.async { self?.onFrameReceived(address: address, frame: frame) }
         }
         transport.onCentralConnected = { [weak self] address in
-            Task { @MainActor in
+            self?.meshQueue.async {
                 MeshRouter.onConnected(address: address, transport: .central)
                 self?.sendHello(address: address)
                 self?.refreshNearby()
             }
         }
-        transport.onCentralDisconnected = { address in
-            // Hop via the same Task { @MainActor } pattern as the connect
-            // callbacks above (FI6): task-enqueue order preserves the BLE
-            // queue's event order, so a fast connect->disconnect can't have
-            // its disconnect processed first and re-register a dead route.
-            Task { @MainActor in
+        transport.onCentralDisconnected = { [weak self] address in
+            // FI6: hopped onto `meshQueue` exactly like the connect callbacks
+            // above, and for the same reason. Both callbacks arrive on
+            // `BleTransport`'s own serial queue, and `DispatchQueue.async`
+            // enqueues FIFO, so a fast connect->disconnect cannot have its
+            // disconnect processed first and re-register a dead route. The
+            // queue makes this stronger than the `Task { @MainActor }` hop it
+            // replaces: frames land in the same queue as connection events, so
+            // the whole mesh event stream keeps one order.
+            self?.meshQueue.async {
                 MeshController.shared.recordPeerDisconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 MeshController.shared.refreshNearby()
             }
         }
         transport.onPeripheralSubscribed = { [weak self] address in
-            Task { @MainActor in
+            self?.meshQueue.async {
                 MeshRouter.onConnected(address: address, transport: .peripheral)
                 self?.sendHello(address: address)
                 self?.refreshNearby()
             }
         }
-        transport.onPeripheralUnsubscribed = { address in
-            Task { @MainActor in
+        transport.onPeripheralUnsubscribed = { [weak self] address in
+            self?.meshQueue.async {
                 MeshController.shared.recordPeerDisconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 MeshController.shared.refreshNearby()
@@ -223,11 +362,12 @@ final class MeshController: ObservableObject {
         startRelayLoop()
         startMeshRoles()
         refreshBluetoothAudioState(reason: "mesh start")
-        MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
+        let nearby = MeshRouter.connectedUserCount()
+        onMain { MeshRuntimeStatus.shared.markMeshing(nearby: nearby) }
         log.info("Mesh started")
     }
 
-    func stop() {
+    private func stopOnMeshQueue() {
         guard isRunning else { return }
         isRunning = false
         bluetoothAudioConnected = false
@@ -236,10 +376,10 @@ final class MeshController: ObservableObject {
         lanTransport?.stop()
         lanTransport = nil
         LanTransportDiagnostics.shared.unregister()
-        lanHealthTimer?.invalidate()
+        lanHealthTimer?.cancel()
         lanHealthTimer = nil
         lanHealth.clear()
-        digestMaintenanceTimer?.invalidate()
+        digestMaintenanceTimer?.cancel()
         digestMaintenanceTimer = nil
         lastDigestAtByAddress.removeAll()
         currentLanEndpoint = nil
@@ -250,8 +390,8 @@ final class MeshController: ObservableObject {
         MeshRouter.unregisterPeripheral()
         MeshRouter.unregisterLan()
         MeshRouter.reset()
-        MeshConnectivityStatus.shared.clear()
-        relayTimer?.invalidate()
+        onMain { MeshConnectivityStatus.shared.clear() }
+        relayTimer?.cancel()
         relayTimer = nil
         relayRateLimitedUntilMs = 0
         lastKnownPushHealthy = nil
@@ -261,11 +401,11 @@ final class MeshController: ObservableObject {
         relayCancellable?.cancel()
         relayCancellable = nil
         relaySyncPending = false
-        MeshRuntimeStatus.shared.markStopped()
+        onMain { MeshRuntimeStatus.shared.markStopped() }
         log.info("Mesh stopped")
     }
 
-    func setAppForeground(_ foreground: Bool) {
+    private func setAppForegroundOnMeshQueue(_ foreground: Bool) {
         let changed = appForeground != foreground
         appForeground = foreground
         lanTransport?.setForegroundActive(foreground)
@@ -300,7 +440,7 @@ final class MeshController: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in
+            self?.meshQueue.async {
                 self?.refreshBluetoothAudioState(reason: "route change")
             }
         }
@@ -332,7 +472,8 @@ final class MeshController: ObservableObject {
         case nil:
             return
         }
-        MeshRuntimeStatus.shared.setBluetoothAudioConnected(bluetoothAudioConnected)
+        let connected = bluetoothAudioConnected
+        onMain { MeshRuntimeStatus.shared.setBluetoothAudioConnected(connected) }
     }
 
     /// Active Bluetooth audio route (A2DP / HFP / LE audio). See `BluetoothAudioBackoff`.
@@ -361,7 +502,7 @@ final class MeshController: ObservableObject {
         MeshRouter.resetBle()
     }
 
-    func notifyChatViewed(chatId: Data) {
+    private func notifyChatViewedOnMeshQueue(chatId: Data) {
         guard let identity else { return }
         guard let contact = try? store.getContact(userId: chatId) else {
             notifyGroupViewed(groupId: chatId)
@@ -392,7 +533,7 @@ final class MeshController: ObservableObject {
         RelaySyncEvents.requestSync()
     }
 
-    func notifyGroupViewed(groupId: Data) {
+    private func notifyGroupViewed(groupId: Data) {
         guard let identity,
               let group = try? store.getGroup(groupId: groupId),
               group.memberUserIds.contains(identity.userId) else { return }
@@ -526,19 +667,22 @@ final class MeshController: ObservableObject {
     /// makes that true without every screen having to say so.
     ///
     /// The reading itself is a contact-list query plus a stored value per
-    /// contact, so it runs off the main actor (same pattern as the relay
-    /// sync pass, and matching Android's move of this work onto its store
-    /// executor). The transport's setter is queue-hopping and safe to call
-    /// from there.
+    /// contact, and it stays on its own utility task rather than occupying
+    /// `meshQueue` for the length of a whole-contact-list sweep -- inbound
+    /// frames queued behind it would wait for no reason, since nothing about
+    /// this reading is ordered against them. The result is applied back on
+    /// `meshQueue` because `lanTransport` belongs to it; the transport's own
+    /// setter is queue-hopping and safe to call from there.
     private func refreshLanCapableContacts() {
         guard lanTransport != nil else { return }
         Task.detached(priority: .utility) { [weak self] in
             let capable = MeshController.lanCapableContacts()
-            await MainActor.run { self?.lanTransport?.updateLanCapableContacts(capable) }
+            guard let self else { return }
+            self.meshQueue.async { self.lanTransport?.updateLanCapableContacts(capable) }
         }
     }
 
-    private nonisolated static func lanCapableContacts() -> [Data: Int64] {
+    private static func lanCapableContacts() -> [Data: Int64] {
         let store = AppStore.get()
         let contacts = (try? store.listContacts()) ?? []
         let blocked = Set((try? store.listBlockedUsers()) ?? [])
@@ -549,12 +693,6 @@ final class MeshController: ObservableObject {
             }
         }
         return capable
-    }
-
-    /// The contact list changed (a contact was deleted, blocked, or
-    /// unblocked), so anything derived from it needs rebuilding.
-    func contactListChanged() {
-        refreshLanCapableContacts()
     }
 
     private func handleTransportProbe(address: String, nonce: UInt64, response: Bool) {
@@ -582,25 +720,37 @@ final class MeshController: ObservableObject {
     /// probe before arming the repeating timer whenever this runs while
     /// foregrounded, so a foreground return doesn't wait out a stale 30s.
     private func startLanHealthLoop() {
-        lanHealthTimer?.invalidate()
+        lanHealthTimer?.cancel()
         lanHealthTimer = nil
         guard appForeground else { return }
-        _ = probeLanLinks(manual: false)
-        lanHealthTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.refreshLanCapableContacts()
-                _ = self?.probeLanLinks(manual: false)
-            }
+        probeLanLinks(manual: false)
+        lanHealthTimer = meshTimer(intervalSeconds: 30, repeats: true) { [weak self] in
+            self?.refreshLanCapableContacts()
+            self?.probeLanLinks(manual: false)
         }
     }
 
+    /// The Advanced screen's "test the local Wi-Fi link" button, called
+    /// straight from the UI thread and answering synchronously.
+    ///
+    /// Deliberately does NOT hop onto `meshQueue` and wait: that would put the
+    /// main thread behind whatever inbound work the queue is doing, which is
+    /// the freeze this whole change exists to remove. The one thing it needs
+    /// to answer -- is there a LAN link at all -- comes from `MeshRouter`,
+    /// which is lock-protected and readable from any thread; the probe itself
+    /// is fire-and-forget and reports through `LanTransportDiagnostics` as it
+    /// always did.
     private func requestLanProbe() -> String? {
-        probeLanLinks(manual: true)
+        guard MeshRouter.identifiedRoutes().contains(where: { $0.transport == .lan }) else {
+            return "No secure local Wi-Fi link is active yet"
+        }
+        meshQueue.async { self.probeLanLinks(manual: true) }
+        return nil
     }
 
-    private func probeLanLinks(manual: Bool) -> String? {
+    private func probeLanLinks(manual: Bool) {
         let routes = MeshRouter.identifiedRoutes().filter { $0.transport == .lan }
-        guard !routes.isEmpty else { return "No secure local Wi-Fi link is active yet" }
+        guard !routes.isEmpty else { return }
         if manual { LanTransportDiagnostics.shared.probeStarted() }
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
         for route in routes {
@@ -623,7 +773,6 @@ final class MeshController: ObservableObject {
                 )
             }
         }
-        return nil
     }
 
     private func handleHello(address: String, userId: Data, identity: Identity) {
@@ -631,10 +780,8 @@ final class MeshController: ObservableObject {
             log.warning("Dropping HELLO that conflicts with the authenticated link identity")
             return
         }
-        MeshConnectivityStatus.shared.mergeLastSeen(
-            userId: userId,
-            seenAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
-        )
+        let seenAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        onMain { MeshConnectivityStatus.shared.mergeLastSeen(userId: userId, seenAtMs: seenAtMs) }
         if (try? store.getContact(userId: userId)) != nil,
            let transport = MeshRouter.transportFor(address: address) {
             recordPeerConnection(userId: userId, transport: transport, kind: .connected)
@@ -695,15 +842,17 @@ final class MeshController: ObservableObject {
     /// this runs while foregrounded, so a foreground return doesn't wait out
     /// a stale 60s -- semantics on links that are actually due are otherwise
     /// unchanged from before this gating.
+    ///
+    /// The tick fires on `meshQueue`, so its digest sends are ordered against
+    /// received frames exactly like every other mesh event -- a re-digest can
+    /// never land halfway through an envelope being processed.
     private func startDigestMaintenanceLoop() {
-        digestMaintenanceTimer?.invalidate()
+        digestMaintenanceTimer?.cancel()
         digestMaintenanceTimer = nil
         guard appForeground else { return }
         checkDigestMaintenance()
-        digestMaintenanceTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.checkDigestMaintenance()
-            }
+        digestMaintenanceTimer = meshTimer(intervalSeconds: 60, repeats: true) { [weak self] in
+            self?.checkDigestMaintenance()
         }
     }
 
@@ -801,7 +950,15 @@ final class MeshController: ObservableObject {
     /// relay fanout and this function runs synchronously per received frame,
     /// so this node cannot re-ingest the frame it just relayed before the
     /// `record` call below completes.
-    func processInboundEnvelope(
+    ///
+    /// "Synchronously per received frame" is now enforced by `meshQueue`, the
+    /// controller's serial queue (see the class doc): every frame, connect,
+    /// disconnect and timer tick runs in one queue block, and this function
+    /// contains no suspension point, so no second envelope's processing can
+    /// begin between the gate above and the `record` at the end. The relay
+    /// pass calls in through `onMeshQueue`, so its envelopes serialise here
+    /// with BLE/LAN frames rather than racing them.
+    private func processInboundEnvelope(
         sourceAddress: String?,
         msgId: Data,
         hopTtl: UInt8,
@@ -1609,8 +1766,15 @@ final class MeshController: ObservableObject {
     /// `ContactProvenance.addedNearby` so the composer can stay quiet about
     /// nearby-only delivery for people we actually met, and say it plainly for
     /// people who only ever arrived over the internet.
+    ///
+    /// Read from `MeshRouter` rather than from `MeshConnectivityStatus`, which
+    /// is main-actor state this pipeline can no longer read synchronously.
+    /// Not a change of answer: `MeshConnectivityStatus.nearbyPeerIds` is
+    /// derived from exactly this list by `refreshNearbyRoutes`, and asking the
+    /// router directly is if anything the fresher of the two, since the
+    /// published copy trails by one hop to the main actor.
     private func peerIsNearby(_ userId: Data) -> Bool {
-        MeshConnectivityStatus.shared.nearbyPeerIds.contains(userId)
+        MeshRouter.identifiedRoutes().contains { $0.userId == userId }
     }
 
     private func handleIncomingFriendRequest(
@@ -1705,7 +1869,7 @@ final class MeshController: ObservableObject {
         }
         if !wasKnown {
             FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
-            FriendImportEvents.subject.send(FriendImportEvent(contact: contact, directBluetooth: sourceAddress != nil))
+            FriendImportEvents.notify(FriendImportEvent(contact: contact, directBluetooth: sourceAddress != nil))
             MessageNotifier.notifyFriendAdded(contact: contact)
         }
         log.info("Imported contact \(contact.name, privacy: .public) from friend request")
@@ -2106,7 +2270,7 @@ final class MeshController: ObservableObject {
         FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
         ChatEvents.notifyChatChanged(senderUserId)
         if !wasKnown {
-            FriendImportEvents.subject.send(FriendImportEvent(
+            FriendImportEvents.notify(FriendImportEvent(
                 contact: contact,
                 directBluetooth: sourceAddress != nil
             ))
@@ -2525,34 +2689,37 @@ final class MeshController: ObservableObject {
         // unhealthy/background cadence; the first real health report
         // reschedules from there via onRelayPushHealthChanged.
         lastKnownPushHealthy = nil
-        relayTimer?.invalidate()
-        relayTimer = Timer.scheduledTimer(
-            withTimeInterval: TimeInterval(RelayPollPolicy.unhealthyOrBackgroundMs) / 1_000,
+        relayTimer?.cancel()
+        relayTimer = meshTimer(
+            intervalSeconds: TimeInterval(RelayPollPolicy.unhealthyOrBackgroundMs) / 1_000,
             repeats: false
-        ) { [weak self] _ in
-            Task { @MainActor in self?.relayPollTick() }
+        ) { [weak self] in
+            self?.relayPollTick()
         }
         pathMonitor = NWPathMonitor()
         pathMonitor?.pathUpdateHandler = { [weak self] path in
             // Keep the diagnostics banner's view of the network current
             // without standing up a second NWPathMonitor just to print it.
             EnvironmentSnapshot.record(path: path)
-            if path.status == .satisfied {
-                Task { @MainActor in self?.runRelaySync() }
+            self?.meshQueue.async {
+                guard let self else { return }
+                if path.status == .satisfied {
+                    self.runRelaySync()
+                }
+                // Recheck the push subscription on every path change, mirroring
+                // Android's relayNetworkCallback calling updateRelayPushSubscription
+                // from both onCapabilitiesChanged and onLost -- the push socket
+                // should be up in exactly the situations runRelaySync would
+                // already succeed in, and torn down the moment that stops being
+                // true.
+                self.updateRelayPushSubscription()
             }
-            // Recheck the push subscription on every path change, mirroring
-            // Android's relayNetworkCallback calling updateRelayPushSubscription
-            // from both onCapabilitiesChanged and onLost -- the push socket
-            // should be up in exactly the situations runRelaySync would
-            // already succeed in, and torn down the moment that stops being
-            // true.
-            Task { @MainActor in self?.updateRelayPushSubscription() }
         }
         pathMonitor?.start(queue: .global(qos: .utility))
 
         // Immediate kick on send
         relayCancellable = RelaySyncEvents.subject.sink { [weak self] in
-            Task { @MainActor in self?.runRelaySync() }
+            self?.meshQueue.async { self?.runRelaySync() }
         }
         updateRelayPushSubscription()
     }
@@ -2587,12 +2754,12 @@ final class MeshController: ObservableObject {
             foreground: appForeground
         )
         lastKnownPushHealthy = currentlyHealthy
-        relayTimer?.invalidate()
-        relayTimer = Timer.scheduledTimer(
-            withTimeInterval: TimeInterval(interval) / 1_000,
+        relayTimer?.cancel()
+        relayTimer = meshTimer(
+            intervalSeconds: TimeInterval(interval) / 1_000,
             repeats: false
-        ) { [weak self] _ in
-            Task { @MainActor in self?.relayPollTick() }
+        ) { [weak self] in
+            self?.relayPollTick()
         }
     }
 
@@ -2606,7 +2773,7 @@ final class MeshController: ObservableObject {
     private func onRelayPushHealthChanged(_ healthy: Bool) {
         log.info("Relay push health -> \(healthy)")
         reschedulePoll(currentlyHealthy: healthy)
-        MeshConnectivityStatus.shared.setPushHealthy(healthy)
+        onMain { MeshConnectivityStatus.shared.setPushHealthy(healthy) }
     }
 
     /// Starts `relayPushClient` against the user's relay config once the mesh
@@ -2644,7 +2811,7 @@ final class MeshController: ObservableObject {
         // reports .noConfig when there is truly nowhere to sync.
         let config = RelayConfigStore.load()
         guard pathMonitor?.currentPath.status == .satisfied else {
-            MeshConnectivityStatus.shared.setRelayHealth(.noInternet)
+            onMain { MeshConnectivityStatus.shared.setRelayHealth(.noInternet) }
             return
         }
         // CP2b: honor relayd's Retry-After. Nudges inside the advertised
@@ -2669,11 +2836,11 @@ final class MeshController: ObservableObject {
         // remember to announce, and none can be missed. Mirrors Android's
         // `RelaySyncEngine.performRelaySyncPass`.
         RelayUpdateSender.announceIfChanged(store: store, identity: identity)
-        MeshRuntimeStatus.shared.markSyncingViaRelay()
+        onMain { MeshRuntimeStatus.shared.markSyncingViaRelay() }
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             await self.relaySyncBlocking(identity: identity, config: config)
-            await self.finishRelaySync()
+            self.meshQueue.async { self.finishRelaySync() }
         }
     }
 
@@ -2714,7 +2881,7 @@ final class MeshController: ObservableObject {
     /// resolution skips it exactly as though the card carried no relay
     /// fields — otherwise one dead field beats a working alternative forever.
     /// Mirrors RelaySyncEngine.kt's resolvedRelayConfig.
-    nonisolated static func resolvedRelayConfig(
+    static func resolvedRelayConfig(
         contact: Contact?,
         fallback: RelayConfig?,
         endpointUsable: Bool = true
@@ -2735,7 +2902,7 @@ final class MeshController: ObservableObject {
     /// `deposit_only` on every pass). Legacy member-token cards keep
     /// proxy-polling exactly as before. Sends stay on `resolvedRelayConfig`.
     /// Mirrors RelaySyncEngine.kt's resolvedPollRelayConfig.
-    nonisolated static func resolvedPollRelayConfig(
+    static func resolvedPollRelayConfig(
         contact: Contact?,
         fallback: RelayConfig?,
         endpointUsable: Bool = true
@@ -2752,7 +2919,7 @@ final class MeshController: ObservableObject {
     /// Whether a contact's card endpoint has earned another attempt, given
     /// the rejection streaks read once at the start of this pass. Mirrors
     /// RelaySyncEngine.kt's contactEndpointUsable.
-    nonisolated static func contactEndpointUsable(
+    static func contactEndpointUsable(
         contact: Contact,
         rejections: [Data: ContactRelayRejection],
         nowMs: Int64
@@ -2768,7 +2935,7 @@ final class MeshController: ObservableObject {
     /// Every distinct mailbox this device should poll: its own saved config
     /// first, then each contact's resolved card relay (mirrors
     /// RelaySyncEngine.kt's distinctRelayConfigs).
-    nonisolated static func distinctRelayConfigs(
+    static func distinctRelayConfigs(
         contacts: [Contact],
         fallback: RelayConfig?,
         rejections: [Data: ContactRelayRejection] = [:],
@@ -2796,7 +2963,18 @@ final class MeshController: ObservableObject {
         return result
     }
 
-    private nonisolated func relaySyncBlocking(identity: Identity, config: RelayConfig?) async {
+    /// The relay sync pass. Runs on a detached task, off `meshQueue` and off
+    /// the main thread: it is a long sequence of blocking HTTP calls, and it
+    /// serialises against itself through `relaySyncInFlight` rather than
+    /// through any queue. Deliberately unchanged by the move of the inbound
+    /// pipeline off the main thread -- including `ContactRelaySilence`, whose
+    /// per-pass bookkeeping is touched here and nowhere else, so it still only
+    /// ever sees one pass at a time.
+    ///
+    /// The one point where it meets the mesh pipeline is per-envelope
+    /// delivery, which goes through `onMeshQueue` so a relay-fetched envelope
+    /// is processed under the same serial guarantee a BLE frame gets.
+    private func relaySyncBlocking(identity: Identity, config: RelayConfig?) async {
         let store = AppStore.get()
         // T11 + CP2b: structured rejections of our OWN saved config -- a
         // contact's stale card relay failing is not our pass's fault. The
@@ -3186,20 +3364,31 @@ final class MeshController: ObservableObject {
                                 query: query
                             )
                             let localNow = Int64(Date().timeIntervalSince1970 * 1_000)
-                            await MainActor.run {
-                                for item in page.presence {
-                                    guard let userId = contactByHint[item.hint] else { continue }
-                                    let localSeenAt = localNow - max(0, page.nowMs - item.lastSeenMs)
-                                    MeshConnectivityStatus.shared.mergePresenceLastSeen(
-                                        userId: userId,
-                                        seenAtMs: localSeenAt
-                                    )
-                                    try? store.recordPeerConnectionEvent(
-                                        userId: userId,
-                                        transport: .cruisePass,
-                                        kind: .presenceSeen,
-                                        occurredAtMs: localSeenAt
-                                    )
+                            // The store write stays off the main actor (it was
+                            // only ever inside the hop because the published
+                            // merge next to it needed one); only the published
+                            // merge itself is handed over.
+                            var seen: [(Data, Int64)] = []
+                            for item in page.presence {
+                                guard let userId = contactByHint[item.hint] else { continue }
+                                let localSeenAt = localNow - max(0, page.nowMs - item.lastSeenMs)
+                                seen.append((userId, localSeenAt))
+                                try? store.recordPeerConnectionEvent(
+                                    userId: userId,
+                                    transport: .cruisePass,
+                                    kind: .presenceSeen,
+                                    occurredAtMs: localSeenAt
+                                )
+                            }
+                            if !seen.isEmpty {
+                                let merged = seen
+                                await MainActor.run {
+                                    for (userId, seenAtMs) in merged {
+                                        MeshConnectivityStatus.shared.mergePresenceLastSeen(
+                                            userId: userId,
+                                            seenAtMs: seenAtMs
+                                        )
+                                    }
                                 }
                             }
                         } catch { noteFailure(error, usedConfig: cfg) }
@@ -3302,7 +3491,7 @@ final class MeshController: ObservableObject {
                         var pageFullyProcessed = true
                         var dispositions: [CoreRelayEnvelopeDisposition] = []
                         for env in page.envelopes {
-                            let disposition = await MainActor.run {
+                            let disposition = await onMeshQueue {
                                 MeshController.shared.processInboundEnvelope(
                                     sourceAddress: nil,
                                     msgId: env.msgId,
@@ -3451,6 +3640,10 @@ final class MeshController: ObservableObject {
                     nowMs: syncedAtMs
                 ))
                 MeshConnectivityStatus.shared.setStaleRelayContacts(stale)
+            }
+            // `relayRateLimitedUntilMs` is the controller's own state, read by
+            // `runRelaySync` on `meshQueue`, so it is written there too.
+            meshQueue.async {
                 self.noteRelayRateLimit(fault: fault, retryAfterMs: retryAfterMs)
             }
         } catch {
@@ -3466,9 +3659,11 @@ final class MeshController: ObservableObject {
                     anyRelaySucceeded: false,
                     nowMs: nowMs
                 ))
-                self.noteRelayRateLimit(fault: fault, retryAfterMs: retryAfterMs)
-                log.warning("Relay sync failed: \(message, privacy: .public)")
             }
+            meshQueue.async {
+                self.noteRelayRateLimit(fault: fault, retryAfterMs: retryAfterMs)
+            }
+            relaySyncLog.warning("Relay sync failed: \(message, privacy: .public)")
         }
     }
 
@@ -3531,21 +3726,29 @@ final class MeshController: ObservableObject {
         )
     }
 
+    /// Both stores are main-actor `ObservableObject`s driving the UI, so this
+    /// is the pipeline's one purely-UI hop. `MeshRouter` is the source of
+    /// truth for both values and is readable from the main actor, so the route
+    /// snapshot is deliberately taken there rather than passed across: taking
+    /// it here and handing it over would let a later mesh event's hop overtake
+    /// an earlier one's data. `DispatchQueue.main.async` preserves the order
+    /// these are emitted in.
     private func refreshNearby() {
         guard isRunning else { return }
-        MeshConnectivityStatus.shared.refreshNearbyRoutes()
-        MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
+        onMain {
+            MeshConnectivityStatus.shared.refreshNearbyRoutes()
+            MeshRuntimeStatus.shared.markMeshing(nearby: MeshRouter.connectedUserCount())
+        }
     }
 }
 
 /// Self + owned-group recipient hints for the current moment -- the same hint
 /// set `MeshController.relaySyncBlocking` computes inline for its own relay
-/// fetch. A free function (not a `MeshController` method) so it carries no
-/// main-actor isolation: `RelayPushClient` (DTN_TODOS.md D3) invokes its
-/// `hintsProvider` closure from its own private queue, off the main actor,
-/// the same reason `relaySyncBlocking` itself is `nonisolated` and
-/// calls the store (safe off-actor) rather than any `@MainActor`-isolated
-/// controller member.
+/// fetch. A free function (not a `MeshController` method) because
+/// `RelayPushClient` (DTN_TODOS.md D3) invokes its `hintsProvider` closure
+/// from its own private queue -- neither the main thread nor the controller's
+/// mesh queue -- so it must reach nothing but the store, which is safe from
+/// any thread.
 /// FI2: unlike this function, `relaySyncBlocking`'s own fetch ALSO includes
 /// `relayProxyHints` below (mail addressed to a contact, fetched on their
 /// behalf) -- deliberately not mirrored here. This hint set only decides

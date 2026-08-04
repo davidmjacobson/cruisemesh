@@ -75,10 +75,10 @@ import os.log
 /// Mirrors Android's `RelayPushClient.kt` exactly (same class-doc section,
 /// same rationale).
 ///
-/// `isHealthy()` is read synchronously from `MeshController`'s main-actor
-/// relay-poll tick, unlike the rest of this class's state which is confined
-/// to `queue` -- so it's backed by its own lock rather than round-tripping
-/// through `queue.async`.
+/// `isHealthy()` is read synchronously from `MeshController`'s relay-poll
+/// tick, on that controller's own serial mesh queue, unlike the rest of this
+/// class's state which is confined to `queue` -- so it's backed by its own
+/// lock rather than round-tripping through `queue.async`.
 final class RelayPushClient: NSObject {
     private static let connectTimeout: TimeInterval = 10
     private static let log = Logger(subsystem: "com.cruisemesh", category: "RelayPushClient")
