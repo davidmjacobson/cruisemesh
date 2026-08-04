@@ -1,10 +1,7 @@
 import Foundation
 import os.log
 
-/// Logger for the relay sync pass's off-main-actor work. `MeshController.log`
-/// is an instance property of a `@MainActor` type; the fetch walk runs
-/// `nonisolated`, so it needs a logger it can reach without hopping to the
-/// main actor just to say something went wrong.
+/// Logger for the relay sync pass's own work.
 ///
 /// Categorised `RelaySync`, not `MeshController`. It carried the latter for no
 /// reason beyond where the code was lifted from, which meant relay sync lines
