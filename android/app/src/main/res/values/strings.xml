@@ -30,6 +30,7 @@
     <string name="ui_another_friend_also_shows_as">Another friend also shows as %1$s. This card belongs to the one with these safety words:</string>
     <string name="ui_ask_them_to_check_these_words_match_their">Ask them to check these words match their card.</string>
     <string name="ui_ask_them_to_read_their_safety_words_aloud">Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them.</string>
+    <string name="ui_arrived_at">Arrived %1$s</string>
     <string name="ui_back">Back</string>
     <string name="ui_back_up_account">Back up account</string>
     <string name="ui_block">Block</string>

@@ -171,6 +171,16 @@
         }
       }
     },
+    "Arrived %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Arrived %@"
+          }
+        }
+      }
+    },
     "Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them.": {
       "localizations": {
         "en": {

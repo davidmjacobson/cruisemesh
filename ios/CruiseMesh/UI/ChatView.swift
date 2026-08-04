@@ -141,6 +141,7 @@ struct ChatView: View {
                                     reactions: row.reactions,
                                     grouping: row.grouping,
                                     timeLabel: row.timeLabel,
+                                    arrivalLabel: row.arrivalLabel,
                                     onStatus: { statusMessage = $0 },
                                     onReact: { emoji in
                                         sendReaction(to: message, emoji: emoji)
@@ -387,7 +388,16 @@ struct ChatView: View {
     private func reload() {
         let loadedMessages = (try? store.messagesForChat(chatId: contact.userId)) ?? []
         messages = loadedMessages
-        rows = ChatRowModel.build(from: loadedMessages, ownUserId: identity.userId)
+        rows = ChatRowModel.build(
+            from: loadedMessages,
+            ownUserId: identity.userId,
+            lateArrivalMs: loadLateArrivalTimes(
+                store: store,
+                chatId: contact.userId,
+                visibleMessages: loadedMessages.filter { isVisibleChatKind($0.kind) },
+                ownUserId: identity.userId
+            )
+        )
         replyMetadata = loadMessageReplyMetadata(
             store: store,
             messages: loadedMessages.filter { isVisibleChatKind($0.kind) },
@@ -485,6 +495,9 @@ struct ChatRowModel: Equatable {
     let grouping: MessageGrouping
     let timeLabel: String
     let reactions: [ReactionSummary]
+    /// "Arrived 5:14 PM", set only for a message spliced in above content that
+    /// was already here -- see `core/src/late_arrival.rs`.
+    let arrivalLabel: String?
 
     private static let dayFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -500,7 +513,11 @@ struct ChatRowModel: Equatable {
         return f
     }()
 
-    static func build(from messages: [StoredMessage], ownUserId: Data) -> [ChatRowModel] {
+    static func build(
+        from messages: [StoredMessage],
+        ownUserId: Data,
+        lateArrivalMs: [String: Int64] = [:]
+    ) -> [ChatRowModel] {
         let visible = messages.filter { isVisibleChatKind($0.kind) }
         let reactionsByTarget = reactionSummariesByTarget(messages: messages, ownUserId: ownUserId)
         let cal = Calendar.current
@@ -525,7 +542,13 @@ struct ChatRowModel: Equatable {
                 dayLabel: showDayBreak ? dayFormatter.string(from: date) : "",
                 grouping: MessageGrouping(joinsPrevious: joinsPrevious, joinsNext: joinsNext),
                 timeLabel: timeFormatter.string(from: date),
-                reactions: reactionsByTarget[target.stableKey] ?? []
+                reactions: reactionsByTarget[target.stableKey] ?? [],
+                arrivalLabel: lateArrivalMs[lateArrivalRowKey(message)].map { arrival in
+                    String(
+                        format: String(localized: "Arrived %@"),
+                        timeFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(arrival) / 1000))
+                    )
+                }
             ))
         }
         return rows
@@ -579,6 +602,7 @@ private struct MessageBubbleView: View {
     let reactions: [ReactionSummary]
     let grouping: MessageGrouping
     let timeLabel: String
+    var arrivalLabel: String? = nil
     var onStatus: (String) -> Void = { _ in }
     var onReact: (String) -> Void = { _ in }
     var onReply: () -> Void = {}
@@ -663,6 +687,15 @@ private struct MessageBubbleView: View {
 
                 if grouping.showTimestamp {
                     Text(timeLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                // Set only for a message spliced in above content already
+                // here (core/src/late_arrival.rs). The bubble keeps the
+                // sender's time; this says when it reached us.
+                if let arrivalLabel {
+                    Text(arrivalLabel)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }

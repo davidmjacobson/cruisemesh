@@ -160,6 +160,16 @@ pub struct MessageArrival {
     pub received_at: i64,
 }
 
+/// When one message in a chat first reached this device, keyed by the
+/// (sender, lamport) pair that identifies it within that chat. Returned in
+/// bulk by [`MessageStore::chat_received_times`].
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct CoreMessageReceivedAt {
+    pub sender_user_id: Vec<u8>,
+    pub lamport: u64,
+    pub received_at_ms: i64,
+}
+
 /// A privacy-preserving path by which the device has reached a friend.
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerConnectionTransport {
@@ -1696,6 +1706,42 @@ impl MessageStore {
         )
         .optional()
         .map_err(store_err)
+    }
+
+    /// Arrival times for every message in `chat_id` that has one, for
+    /// [`crate::late_arrival`]'s displacement test.
+    ///
+    /// One query rather than a [`Self::message_arrival`] call per row: the
+    /// shells recompute this on every conversation reload, and a per-bubble
+    /// round trip across the FFI would put a store read back on the render
+    /// path that FA4 moved off it.
+    ///
+    /// Rows we authored locally and rows stored before arrival diagnostics
+    /// existed have no `received_at` and are simply absent -- callers treat a
+    /// missing entry as "no recorded arrival", which is what
+    /// [`crate::late_arrival::LateArrivalInput::arrival_ts_ms`] wants.
+    pub fn chat_received_times(
+        &self,
+        chat_id: Vec<u8>,
+    ) -> Result<Vec<CoreMessageReceivedAt>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT sender_user_id, lamport, received_at
+                 FROM messages
+                 WHERE chat_id = ?1 AND received_at IS NOT NULL",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![chat_id], |row| {
+                Ok(CoreMessageReceivedAt {
+                    sender_user_id: row.get(0)?,
+                    lamport: row.get::<_, i64>(1)? as u64,
+                    received_at_ms: row.get(2)?,
+                })
+            })
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
 
     /// The highest lamport value N such that every message `1..=N` from this
@@ -6011,6 +6057,46 @@ mod tests {
             store.messages_for_chat(message.chat_id.clone()).unwrap(),
             vec![message],
         );
+    }
+
+    #[test]
+    fn chat_received_times_covers_arrived_rows_and_skips_legacy_and_own_rows() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let arrived = msg(b"chat-a", b"alice", 1, "carried");
+        // No arrival ever recorded: a locally authored row, or one stored
+        // before diagnostics existed. Both must stay absent rather than
+        // reporting a made-up arrival time.
+        let legacy = msg(b"chat-a", b"alice", 2, "legacy");
+        let own = msg(b"chat-a", b"me", 1, "mine");
+        store.insert_message(arrived.clone()).unwrap();
+        store.insert_message(legacy).unwrap();
+        store.insert_message(own).unwrap();
+        store
+            .record_message_arrival(
+                arrived.chat_id.clone(),
+                arrived.sender_user_id.clone(),
+                arrived.lamport,
+                MessageArrival {
+                    transport: 2,
+                    hops_taken: 1,
+                    received_at: 1_700_000_600_000,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.chat_received_times(arrived.chat_id.clone()).unwrap(),
+            vec![CoreMessageReceivedAt {
+                sender_user_id: arrived.sender_user_id.clone(),
+                lamport: arrived.lamport,
+                received_at_ms: 1_700_000_600_000,
+            }],
+        );
+        // Another chat's arrivals never leak into this one.
+        assert!(store
+            .chat_received_times(b"chat-b".to_vec())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -61,6 +61,8 @@ fun messageStableKey(message: StoredMessage): String =
 data class ChatExtras(
     val replyMetadata: Map<String, MessageReplyMetadata> = emptyMap(),
     val outboundExpiryMs: Map<String, Long?> = emptyMap(),
+    /** Arrival times for messages spliced above content already here; see [lateArrivalTimesByKey]. */
+    val lateArrivalMs: Map<String, Long> = emptyMap(),
 )
 
 /**
@@ -79,7 +81,12 @@ fun loadChatExtras(
     val outboundExpiryMs = messages
         .filter { it.senderUserId.contentEquals(ownUserId) }
         .associate { messageStableKey(it) to store.outboundMessageExpiry(it.chatId, it.senderUserId, it.lamport) }
-    return ChatExtras(replyMetadata, outboundExpiryMs)
+    // One query for the whole chat rather than a lookup per bubble -- the
+    // displacement test needs every row's arrival time anyway.
+    val lateArrivalMs = messages.firstOrNull()?.let { first ->
+        lateArrivalTimesByKey(messages, store.chatReceivedTimes(first.chatId), ownUserId)
+    }.orEmpty()
+    return ChatExtras(replyMetadata, outboundExpiryMs, lateArrivalMs)
 }
 
 /**

@@ -561,7 +561,7 @@ private fun ConversationScreen(
 
     fun closeOverlay() = host.closeOverlay()
 
-    ConversationHostEffects(host, visibleMessages, ownUserId)
+    ConversationHostEffects(host, visibleMessages, ownUserId, chatExtras.lateArrivalMs.keys)
 
     ConversationScaffold(
         host = host,
@@ -614,6 +614,7 @@ private fun ConversationScreen(
                         },
                         onPhotoClick = { viewerPhoto = it },
                         outboundExpiryMs = if (isOwn) chatExtras.outboundExpiryMs[messageStableKey(message)] else null,
+                        lateArrivalMs = chatExtras.lateArrivalMs[messageStableKey(message)],
                         onLongPress = { target, bounds -> openOverlay(target, bounds) },
                         onSwipeReply = { startReply(message) },
                         onLinkClick = { link -> linkHandler.open(link) },
@@ -1229,6 +1230,8 @@ private fun MessageBubble(
     onReact: (String) -> Unit = {},
     onPhotoClick: (ByteArray) -> Unit = {},
     outboundExpiryMs: Long? = null,
+    /** When this message reached this device, if its place in the thread needs explaining. */
+    lateArrivalMs: Long? = null,
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
     onSwipeReply: () -> Unit = {},
     onLinkClick: (MessageLink) -> Unit = {},
@@ -1342,6 +1345,18 @@ private fun MessageBubble(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                )
+            }
+            // Only set when this message was spliced in above content that was
+            // already here (core/src/late_arrival.rs), which is the one case
+            // where its position needs explaining. The bubble keeps the
+            // sender's time; this says when it reached us.
+            if (lateArrivalMs != null) {
+                Text(
+                    text = stringResource(R.string.ui_arrived_at, formatConversationTimestamp(lateArrivalMs)),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 12.dp),
                 )
             }
             if (isOwn && tick == TickStatus.SENT && outboundExpiryMs != null &&

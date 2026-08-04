@@ -71,6 +71,16 @@ class ConversationHost internal constructor(
 
     private var newestMessageKey: String? = null
 
+    /** Keys of the previous visible list, for spotting messages spliced in above the tail. */
+    private var previousKeys: Set<String> = emptySet()
+
+    /**
+     * Oldest-first index the chip should jump to, or null to jump to the
+     * bottom. Set when a delayed message lands above the tail, where the
+     * newest message is not the one the reader is being told about.
+     */
+    private var insertedJumpIndex: Int? = null
+
     val overlayOpen: Boolean get() = focused != null
 
     /**
@@ -104,10 +114,17 @@ class ConversationHost internal constructor(
         scrollScope.launch { listState.animateScrollToItem(displayIndex) }
     }
 
-    /** [NewMessagesChip]'s onClick: jump to the newest message and dismiss the chip. */
+    /**
+     * [NewMessagesChip]'s onClick: jump to what the chip is announcing and
+     * dismiss it. Usually that is the newest message at the bottom; when a
+     * delayed message was spliced into history it is that message instead,
+     * which is the only way the reader would ever find it.
+     */
     fun scrollToBottomAndClearChip() {
-        scrollScope.launch { listState.animateScrollToItem(0) }
+        val target = insertedJumpIndex
+        scrollScope.launch { listState.animateScrollToItem(target ?: 0) }
         newMessagesAvailable = false
+        insertedJumpIndex = null
     }
 
     /**
@@ -117,32 +134,53 @@ class ConversationHost internal constructor(
      * view. See [ChatScrollLogic] for the pure decision. Run from a
      * `LaunchedEffect(visibleMessages)` -- see [ConversationHostEffects].
      */
-    suspend fun onVisibleMessagesChanged(visibleMessages: List<StoredMessage>, ownUserId: ByteArray) {
+    suspend fun onVisibleMessagesChanged(
+        visibleMessages: List<StoredMessage>,
+        ownUserId: ByteArray,
+        lateArrivalKeys: Set<String> = emptySet(),
+    ) {
         val currentNewestKey = visibleMessages.lastOrNull()?.let(::messageStableKey)
         val isNewestOwn = visibleMessages.lastOrNull()?.senderUserId?.contentEquals(ownUserId) == true
+        val currentKeys = visibleMessages.map(::messageStableKey)
+        val insertedIndex = ChatScrollLogic.oldestInsertedIndex(previousKeys, currentKeys, lateArrivalKeys)
         when (
             ChatScrollLogic.decide(
                 previousNewestKey = newestMessageKey,
                 currentNewestKey = currentNewestKey,
                 firstVisibleItemIndex = listState.firstVisibleItemIndex,
                 isNewestOwnMessage = isNewestOwn,
+                insertedAboveTail = insertedIndex != null,
             )
         ) {
             ChatScrollLogic.Decision.AUTO_SCROLL -> {
                 // reverseLayout start is the bottom; pin the newest message there.
                 listState.scrollToItem(0)
                 newMessagesAvailable = false
+                insertedJumpIndex = null
             }
             ChatScrollLogic.Decision.SHOW_NEW_MESSAGES_CHIP -> newMessagesAvailable = true
+            ChatScrollLogic.Decision.SHOW_INSERTED_ABOVE_CHIP -> {
+                newMessagesAvailable = true
+                // Oldest-first index -> reverseLayout display index.
+                insertedJumpIndex = insertedIndex?.let { visibleMessages.lastIndex - it }
+            }
             ChatScrollLogic.Decision.NONE -> {}
         }
         newestMessageKey = currentNewestKey ?: newestMessageKey
+        previousKeys = currentKeys.toSet()
     }
 
-    /** Clears the chip once the reader scrolls back to the bottom themselves. Run from a `LaunchedEffect(listState)`. */
+    /**
+     * Clears the chip once the reader scrolls back to the bottom themselves.
+     * Run from a `LaunchedEffect(listState)`.
+     *
+     * Reaching the bottom does not clear a chip pointing at a message spliced
+     * into history: that message is above the reader, so scrolling down is
+     * not them having seen it.
+     */
     suspend fun watchScrollForChipClear() {
         snapshotFlow { listState.firstVisibleItemIndex }.collect { index ->
-            if (index <= 1) newMessagesAvailable = false
+            if (index <= 1 && insertedJumpIndex == null) newMessagesAvailable = false
         }
     }
 }
@@ -177,14 +215,15 @@ fun ConversationHostEffects(
     host: ConversationHost,
     visibleMessages: List<StoredMessage>,
     ownUserId: ByteArray,
+    lateArrivalKeys: Set<String> = emptySet(),
 ) {
     LaunchedEffect(host.overlayOpen) {
         if (!host.overlayOpen) {
             host.keyboardFreeze.releaseWhenKeyboardReturns()
         }
     }
-    LaunchedEffect(visibleMessages) {
-        host.onVisibleMessagesChanged(visibleMessages, ownUserId)
+    LaunchedEffect(visibleMessages, lateArrivalKeys) {
+        host.onVisibleMessagesChanged(visibleMessages, ownUserId, lateArrivalKeys)
     }
     LaunchedEffect(host.listState) {
         host.watchScrollForChipClear()
