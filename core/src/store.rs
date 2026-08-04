@@ -3780,9 +3780,19 @@ impl MessageStore {
     /// `budget_bytes` bounds one encounter's worth of foreign-carry offering
     /// by summed sealed-byte size: rows are taken oldest first until the next
     /// one would not fit, and then iteration stops (so the rest never has its
-    /// ciphertext decoded either). A single envelope larger than the whole
-    /// budget yields nothing rather than a partial frame -- frames are
-    /// all-or-nothing on the wire. Nothing is dropped by this cut: the carry
+    /// ciphertext decoded either). Frames are all-or-nothing on the wire, so a
+    /// row is never truncated to fit. The one exception is the head of the
+    /// list: if the oldest eligible envelope is by itself bigger than the whole
+    /// budget, it is offered anyway and the round stops there. Skipping it
+    /// instead would block the lane forever -- selection is always oldest
+    /// first, so that same row would be reconsidered and rejected on every
+    /// future round until it expired, and nothing behind it would ever be
+    /// offered. One oversized frame per encounter keeps the lane live while
+    /// still bounding the round to about a single envelope. Any *later* row
+    /// that does not fit the remaining budget still just ends the round, and
+    /// a `budget_bytes` of zero still offers nothing at all -- that is the
+    /// lane's off switch rather than a small allowance.
+    /// Nothing is dropped by this cut: the carry
     /// queue is untouched, and D8's periodic re-digest re-offers whatever did
     /// not fit on the next round, so a big backlog is *paced* across rounds
     /// instead of monopolizing a slow link's single FIFO in one burst.
@@ -3819,6 +3829,15 @@ impl MessageStore {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let size = envelope.sealed.len() as u64;
             if used.saturating_add(size) > budget_bytes {
+                // Head-of-line liveness: an oldest row that alone exceeds the
+                // budget is taken anyway, then the round stops. Rejecting it
+                // would wedge the lane -- oldest-first means it would be the
+                // first row considered every round until expiry. A budget of
+                // zero is the one exception: that is the explicit off switch
+                // for the lane, not a small allowance.
+                if selected.is_empty() && budget_bytes > 0 {
+                    selected.push(envelope);
+                }
                 break;
             }
             used += size;
@@ -10245,6 +10264,52 @@ mod tests {
             0,
             "a row already known to the peer must never have its sealed ciphertext decoded"
         );
+    }
+
+    #[test]
+    fn peer_sync_offers_an_oversized_oldest_envelope_alone_rather_than_wedging_the_lane() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"huge", b"day-a", 9_000, 300),
+                false,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"small-1", b"day-b", 9_000, 100),
+                false,
+                2_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"small-2", b"day-c", 9_000, 100),
+                false,
+                3_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+
+        // The oldest row alone busts the 250-byte budget. Skipping it would
+        // park it at the head of every future round until it expired, and
+        // nothing behind it would ever be offered, so it goes out by itself.
+        let round_one = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250)
+            .unwrap();
+        let ids: Vec<Vec<u8>> = round_one.into_iter().map(|e| e.msg_id).collect();
+        assert_eq!(ids, vec![b"huge".to_vec()]);
+
+        // Once the peer advertises it in a digest, the lane moves on and the
+        // two small ones fit the same budget together.
+        let round_two = store
+            .carried_envelopes_for_peer_sync(vec![], vec![b"huge".to_vec()], 5_000, 250)
+            .unwrap();
+        let ids: Vec<Vec<u8>> = round_two.into_iter().map(|e| e.msg_id).collect();
+        assert_eq!(ids, vec![b"small-1".to_vec(), b"small-2".to_vec()]);
     }
 
     #[test]
