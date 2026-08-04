@@ -17222,7 +17222,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_make_shared_friend_request_payload() != 31913) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 19541) {
+    if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 20691) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_open_backup() != 7338) {
@@ -17264,7 +17264,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_classify_http_error() != 51460) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_contact_shares_own_family() != 45033) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_contact_shares_own_family() != 37254) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_cursor_advance() != 64540) {
@@ -17282,7 +17282,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_decode_presence_page() != 6708) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_deposit_token_for() != 9229) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_deposit_token_for() != 59157) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_encode_ack_request() != 23747) {
@@ -17294,7 +17294,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_encode_presence_request() != 64701) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_fault_is_transient() != 24298) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_fault_is_transient() != 24532) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_fault_rank() != 19318) {
@@ -17321,7 +17321,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_retry_after_ms() != 10198) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 55007) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 11572) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 13229) {
@@ -17330,7 +17330,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_interval_ms() != 37428) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_token_is_deposit() != 47848) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_token_is_deposit() != 58985) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_url_is_insecure() != 16245) {
@@ -17339,7 +17339,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_poll_relay() != 54665) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_relay() != 21664) {
+    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_relay() != 7224) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_resolved_contact_poll_relay() != 62901) {
@@ -17531,7 +17531,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_chat_digest() != 38268) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_carried_relay_upload_markers() != 51623) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_carried_relay_upload_markers() != 51382) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_contact_relay_rejection() != 26476) {
