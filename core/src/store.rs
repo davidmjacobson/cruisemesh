@@ -3879,6 +3879,17 @@ impl MessageStore {
         budget_bytes: u64,
         after: Option<CoreCarriedCursor>,
     ) -> Result<CoreCarriedSyncPage, CoreError> {
+        if budget_bytes == 0 {
+            // The lane's off switch. Returning here rather than letting the
+            // loop below break on its first row keeps the query -- and one
+            // row's ciphertext decode -- off a link that is parked. Not
+            // `exhausted`: nothing was examined, so nothing was ruled out.
+            return Ok(CoreCarriedSyncPage {
+                rows: Vec::new(),
+                next: None,
+                exhausted: false,
+            });
+        }
         let conn = lock_conn(&self.conn);
         let mut sql = String::from(
             "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed, received_at
@@ -10552,6 +10563,33 @@ mod tests {
     }
 
     // --- per-link-session carried cursor -----------------------------------
+
+    #[test]
+    fn a_zero_budget_reads_nothing_at_all() {
+        // The lane's off switch, used by the shells while a completed walk is
+        // parked. It must not cost a query or a ciphertext decode per
+        // re-digest, and it must not claim the queue was exhausted.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"one", b"hint", 9_000, 10),
+                false,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+
+        let page = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 0, None)
+            .unwrap();
+        assert!(page.rows.is_empty());
+        assert!(page.next.is_none());
+        assert!(
+            !page.exhausted,
+            "nothing was examined, so nothing was ruled out"
+        );
+        assert_eq!(store.test_sealed_reads(), 0);
+    }
 
     #[test]
     fn peer_sync_pages_forward_from_the_cursor_and_is_exhausted_only_at_the_tail() {

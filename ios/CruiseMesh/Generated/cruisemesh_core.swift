@@ -2087,18 +2087,26 @@ public protocol MessageStoreProtocol : AnyObject {
     /**
      * Build the exact `recent_msg_id` list this device advertises in its
      * outgoing DIGEST (DESIGN.md §7.3; DTN_TODOS.md §3.2, D2
-     * mule-drain-confirm): carried entries first (mirrors the pre-existing
-     * carried-only budget), then recently *held* message-stream ids
-     * ([`MessageStore::recent_consumed_msg_ids`] -- both consumed incoming
-     * AND our own authored messages) filling whatever room remains, bounded
-     * to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format change:
-     * the DIGEST frame's `recent_msg_id` list already carries arbitrary
-     * content (`protocol.rs`'s DIGEST frame docs).
+     * mule-drain-confirm): carried entries first, capped at
+     * [`DIGEST_ADVERTISED_CARRIED_SHARE`], then recently *held*
+     * message-stream ids ([`MessageStore::recent_consumed_msg_ids`] -- both
+     * consumed incoming AND our own authored messages) filling the rest,
+     * bounded to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format
+     * change: the DIGEST frame's `recent_msg_id` list already carries
+     * arbitrary content (`protocol.rs`'s DIGEST frame docs), and both
+     * consumers treat it as a plain known-set.
      *
      * This is also the proof-of-receipt half of D2: a mule still holding
      * our envelope in its carry queue learns, on our next digest, that we
      * already have it -- see [`Self::core_confirm_carried_deliveries`] for
      * the other half, which acts on this same list from the peer's side.
+     *
+     * The two limits exist because a heavily loaded phone used to advertise
+     * nothing useful: the carried half filled the whole list with a frozen
+     * window over its *oldest* rows (which its own eviction may already have
+     * deleted) and starved out the consumed ids that are the only proof of
+     * receipt. Hence the reserved share here plus
+     * [`MessageStore::carried_msg_ids_desc`]'s newest-first order.
      */
     func coreDigestAdvertisedMsgIds() throws  -> [Data]
     
@@ -3781,18 +3789,26 @@ open func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data]
     /**
      * Build the exact `recent_msg_id` list this device advertises in its
      * outgoing DIGEST (DESIGN.md §7.3; DTN_TODOS.md §3.2, D2
-     * mule-drain-confirm): carried entries first (mirrors the pre-existing
-     * carried-only budget), then recently *held* message-stream ids
-     * ([`MessageStore::recent_consumed_msg_ids`] -- both consumed incoming
-     * AND our own authored messages) filling whatever room remains, bounded
-     * to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format change:
-     * the DIGEST frame's `recent_msg_id` list already carries arbitrary
-     * content (`protocol.rs`'s DIGEST frame docs).
+     * mule-drain-confirm): carried entries first, capped at
+     * [`DIGEST_ADVERTISED_CARRIED_SHARE`], then recently *held*
+     * message-stream ids ([`MessageStore::recent_consumed_msg_ids`] -- both
+     * consumed incoming AND our own authored messages) filling the rest,
+     * bounded to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format
+     * change: the DIGEST frame's `recent_msg_id` list already carries
+     * arbitrary content (`protocol.rs`'s DIGEST frame docs), and both
+     * consumers treat it as a plain known-set.
      *
      * This is also the proof-of-receipt half of D2: a mule still holding
      * our envelope in its carry queue learns, on our next digest, that we
      * already have it -- see [`Self::core_confirm_carried_deliveries`] for
      * the other half, which acts on this same list from the peer's side.
+     *
+     * The two limits exist because a heavily loaded phone used to advertise
+     * nothing useful: the carried half filled the whole list with a frozen
+     * window over its *oldest* rows (which its own eviction may already have
+     * deleted) and starved out the consumed ids that are the only proof of
+     * receipt. Hence the reserved share here plus
+     * [`MessageStore::carried_msg_ids_desc`]'s newest-first order.
      */
 open func coreDigestAdvertisedMsgIds()throws  -> [Data] {
     return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -18074,7 +18090,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 38296) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 37419) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 45681) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 15577) {
