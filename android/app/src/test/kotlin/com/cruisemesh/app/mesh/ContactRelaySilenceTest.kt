@@ -95,4 +95,91 @@ class ContactRelaySilenceTest {
         silence.noteAnswered(alice)
         assertTrue(silence.endpointAnswering(alice, dead, now))
     }
+
+    @Test
+    fun `an address that just failed is not dialled again for the rest of the pass`() {
+        // The whole point of the pass-local arm. A rest needs two passes, so
+        // before this the first failure taught the pass nothing and a backlog
+        // of queued envelopes re-dialled the same dead host once each -- 352
+        // TLS handshakes in 27 seconds in the field report this came from.
+        val silence = ContactRelaySilence()
+        silence.beginPass()
+        assertTrue("never tried yet", silence.endpointAnswering(alice, dead, now))
+        assertTrue("first failure is news", silence.noteUnreachableThisPass(alice, dead))
+        assertFalse("every later envelope this pass skips it", silence.endpointAnswering(alice, dead, now))
+    }
+
+    @Test
+    fun `only the first failure per address in a pass is worth logging`() {
+        val silence = ContactRelaySilence()
+        silence.beginPass()
+        assertTrue(silence.noteUnreachableThisPass(alice, dead))
+        assertFalse("same address again says nothing new", silence.noteUnreachableThisPass(alice, dead))
+        assertTrue("a different address is its own news", silence.noteUnreachableThisPass(alice, live))
+    }
+
+    @Test
+    fun `a card that moves the contact mid-pass is tried immediately`() {
+        // Same rule as the rest window: a host that has never been dialled
+        // cannot have been silent, so a T23 notice or a fresh card arriving
+        // between two envelopes must not serve out the old address's skip.
+        val silence = ContactRelaySilence()
+        silence.beginPass()
+        silence.noteUnreachableThisPass(alice, dead)
+        assertTrue(silence.endpointAnswering(alice, live, now))
+    }
+
+    @Test
+    fun `the pass-local skip does not survive into the next pass`() {
+        // It is not a rest and must not act like one: one failed pass is
+        // explicitly not enough to write an endpoint off, so the next pass
+        // owes it a fresh probe.
+        val silence = ContactRelaySilence()
+        silence.beginPass()
+        silence.noteUnreachableThisPass(alice, dead)
+        assertEquals(listOf(alice to 1L), silence.commitPass(true, now))
+        silence.beginPass()
+        assertTrue("one silent pass is still not enough", silence.endpointAnswering(alice, dead, now))
+    }
+
+    @Test
+    fun `two silent passes still rest the endpoint`() {
+        // The pass-local arm must not change what the streak means: this is
+        // the pre-existing two-pass behaviour, now driven through commitPass.
+        val silence = ContactRelaySilence()
+        for (expected in listOf(1L, 2L)) {
+            silence.beginPass()
+            silence.noteUnreachableThisPass(alice, dead)
+            assertEquals(listOf(alice to expected), silence.commitPass(true, now))
+        }
+        silence.beginPass()
+        assertFalse(silence.endpointAnswering(alice, dead, now))
+    }
+
+    @Test
+    fun `silence committed without proof of working internet rests nobody`() {
+        // A phone in a tunnel fails every endpoint at once. The pass-local
+        // skip still saves the redundant dials inside that pass, but it must
+        // not harden into a rest that takes the relay path away from the whole
+        // contact list once connectivity returns.
+        val silence = ContactRelaySilence()
+        silence.beginPass()
+        silence.noteUnreachableThisPass(alice, dead)
+        assertEquals(emptyList<Pair<String, Long>>(), silence.commitPass(false, now))
+        silence.beginPass()
+        assertTrue(silence.endpointAnswering(alice, dead, now))
+    }
+
+    @Test
+    fun `an endpoint that answers later in the pass is dialled again`() {
+        // Recorded silence is provisional until the pass ends, so a success
+        // against the same address -- a host that was mid-reboot -- has to
+        // clear it outright rather than leave the rest of the pass skipping.
+        val silence = ContactRelaySilence()
+        silence.beginPass()
+        silence.noteUnreachableThisPass(alice, dead)
+        silence.noteAnswered(alice)
+        assertTrue(silence.endpointAnswering(alice, dead, now))
+        assertEquals("and nothing is left to commit", emptyList<Pair<String, Long>>(), silence.commitPass(true, now))
+    }
 }

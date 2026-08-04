@@ -2861,10 +2861,12 @@ final class MeshController: ObservableObject {
             /// a single pass, the exact false positive the second pass exists
             /// to prevent. Mirrors RelaySyncEngine.kt.
             var countedThisPass: Set<Data> = []
-            /// Contacts whose endpoint failed this pass without answering at
-            /// all. Held to the end of the pass because the observation only
-            /// means anything next to proof that this device's internet works.
-            var silentThisPass: [Data: String] = [:]
+            // Contacts whose endpoint fails this pass without answering are
+            // held by ContactRelaySilence until the end of the pass, because
+            // the observation only means anything next to proof that this
+            // device's internet works -- and, from this pass forward, so the
+            // rest of the pass stops dialling an address that just refused.
+            ContactRelaySilence.shared.beginPass()
             /// A rest belongs to an *address*, not to a person: `relayCursorKey`
             /// hashes the contact's current endpoint so a card or a T23 notice
             /// that moves them to a different host is tried again immediately
@@ -2920,7 +2922,20 @@ final class MeshController: ObservableObject {
                     // own, so it is only remembered here; the end of the pass
                     // decides whether this device had any business believing
                     // it.
-                    silentThisPass[contact.userId] = endpointKey(contact)
+                    //
+                    // Logged on the transition only. The per-envelope upload
+                    // warnings name the host but not whose card carries it,
+                    // which left a field report of hundreds of failures
+                    // against one URL with no way to tell which contact to ask
+                    // for a fresh card.
+                    if ContactRelaySilence.shared.noteUnreachableThisPass(
+                        userId: contact.userId,
+                        endpointKey: endpointKey(contact)
+                    ) {
+                        relaySyncLog.warning(
+                            "Contact \(UserIdHex.encode(contact.userId), privacy: .public) relay \(usedConfig.relayUrl, privacy: .public) did not answer: \(error.localizedDescription, privacy: .public)"
+                        )
+                    }
                     return
                 }
                 let fault = relayClassifyHttpError(
@@ -2946,7 +2961,6 @@ final class MeshController: ObservableObject {
                    usedConfig.relayToken == own.relayToken { return }
                 // The endpoint answering settles the silence question outright,
                 // whatever this pass had provisionally observed.
-                silentThisPass[contact.userId] = nil
                 ContactRelaySilence.shared.noteAnswered(userId: contact.userId)
                 guard rejections[contact.userId] != nil else { return }
                 try? store.clearContactRelayRejection(userId: contact.userId)
@@ -3417,18 +3431,14 @@ final class MeshController: ObservableObject {
             // and resting them all would take the relay path away from every
             // contact for the whole rest window. Mirrors RelaySyncEngine.kt's
             // commitUnreachableContactRelays.
-            for (userId, key) in silentThisPass {
-                guard let streak = ContactRelaySilence.shared.noteSilentPass(
-                    userId: userId,
-                    endpointKey: key,
-                    otherRelayAnswered: ownRelayAnswered,
-                    nowMs: now
-                ) else { continue }
+            for rested in ContactRelaySilence.shared.commitPass(
+                otherRelayAnswered: ownRelayAnswered,
+                nowMs: now
+            ) {
                 relaySyncLog.warning(
-                    "A contact's relay endpoint did not answer while our own did (silent passes=\(streak, privacy: .public)); resting it rather than retrying every pass"
+                    "Contact \(UserIdHex.encode(rested.userId), privacy: .public) relay endpoint did not answer while our own did (silent passes=\(rested.streak, privacy: .public)); resting it rather than retrying every pass"
                 )
             }
-            silentThisPass.removeAll()
             let syncedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
             let fault = ownRelayFault
             let retryAfterMs = ownRetryAfterMs

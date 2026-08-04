@@ -100,6 +100,38 @@ final class ContactRelaySilence: @unchecked Sendable {
     private let lock = NSLock()
     private var silent: [Data: State] = [:]
 
+    /// Endpoints that gave no answer during the pass now running, before that
+    /// observation has been judged. Keyed like `silent` and holding the same
+    /// address hash, so both arms agree about what a moved card means.
+    ///
+    /// Safe on the shared instance because `relaySyncInFlight` serialises
+    /// passes -- a second sync is refused, never overlapped.
+    private var silentThisPass: [Data: String] = [:]
+
+    /// Forgets the previous pass's provisional observations.
+    func beginPass() {
+        lock.lock()
+        defer { lock.unlock() }
+        silentThisPass.removeAll()
+    }
+
+    /// Records that this endpoint gave no answer at all during the pass now
+    /// running -- a retired host, dead DNS, a refused connection, a TLS
+    /// certificate that does not cover the name. Returns true the first time
+    /// in a pass, so the caller can log the transition rather than every
+    /// envelope.
+    ///
+    /// Provisional by design: `commitPass` decides at the end of the pass
+    /// whether this device had any business believing it.
+    @discardableResult
+    func noteUnreachableThisPass(userId: Data, endpointKey: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let fresh = silentThisPass[userId] != endpointKey
+        silentThisPass[userId] = endpointKey
+        return fresh
+    }
+
     /// Whether this contact's endpoint has answered recently enough to be
     /// worth spending a request on. True below the core's streak, and true
     /// again once the rest window is up so a recovered host is picked back up
@@ -113,9 +145,25 @@ final class ContactRelaySilence: @unchecked Sendable {
     /// keep being skipped for the rest of the half-hour window. Re-importing a
     /// card that re-states the *same* endpoint changes nothing, exactly as it
     /// does not launder a rejection streak.
+    ///
+    /// The `silentThisPass` arm covers the *inside* of one pass, which the
+    /// rest window alone cannot: a rest is only awarded by `commitPass` once
+    /// the pass is over, so without this arm the first failure taught the pass
+    /// nothing and every remaining queued envelope re-dialled the same dead
+    /// address. Observed in the field -- a friend card naming a host whose
+    /// certificate no longer covered it drew 352 handshakes in 27 seconds
+    /// while an update-restart backlog drained.
+    ///
+    /// That arm is deliberately not a rest and touches no streak. Whether the
+    /// silence counts at all still belongs to `commitPass`, where the core can
+    /// weigh it against proof that this device's own internet works -- a phone
+    /// in a tunnel fails every endpoint at once and must write off nobody. All
+    /// this arm claims is that an address which failed to answer milliseconds
+    /// ago will not answer the next envelope either.
     func endpointAnswering(userId: Data, endpointKey: String, nowMs: Int64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        if silentThisPass[userId] == endpointKey { return false }
         guard let state = silent[userId] else { return true }
         guard state.endpointKey == endpointKey else {
             silent[userId] = nil
@@ -158,11 +206,36 @@ final class ContactRelaySilence: @unchecked Sendable {
         return streak
     }
 
+    /// Turns this pass's provisional observations into streaks and clears
+    /// them, returning the endpoints that earned a rest so the caller can say
+    /// so.
+    ///
+    /// `otherRelayAnswered` is passed straight through to `noteSilentPass` --
+    /// see its doc for why the shell must not answer that question itself.
+    func commitPass(otherRelayAnswered: Bool, nowMs: Int64) -> [(userId: Data, streak: Int64)] {
+        // Snapshot and clear under the lock, then score outside it:
+        // `noteSilentPass` takes the same non-recursive lock.
+        lock.lock()
+        let pending = silentThisPass
+        silentThisPass.removeAll()
+        lock.unlock()
+        return pending.compactMap { userId, endpointKey in
+            guard let streak = noteSilentPass(
+                userId: userId,
+                endpointKey: endpointKey,
+                otherRelayAnswered: otherRelayAnswered,
+                nowMs: nowMs
+            ) else { return nil }
+            return (userId, streak)
+        }
+    }
+
     /// The endpoint answered: whatever we thought about its silence is settled.
     func noteAnswered(userId: Data) {
         lock.lock()
         defer { lock.unlock() }
         silent[userId] = nil
+        silentThisPass[userId] = nil
     }
 
     /// Test seam: forget everything, as though the process had just started.
@@ -170,5 +243,6 @@ final class ContactRelaySilence: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         silent.removeAll()
+        silentThisPass.removeAll()
     }
 }

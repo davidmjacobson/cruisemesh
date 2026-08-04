@@ -37,6 +37,30 @@ internal class ContactRelaySilence {
     private val rests = ConcurrentHashMap<String, Rest>()
 
     /**
+     * Endpoints that gave no answer during the pass now running, before that
+     * observation has been judged. Keyed like [rests] and holding the same
+     * address hash, so both arms agree about what a moved card means.
+     */
+    private val silentThisPass = ConcurrentHashMap<String, String>()
+
+    /** Forgets the previous pass's provisional observations. */
+    fun beginPass() {
+        silentThisPass.clear()
+    }
+
+    /**
+     * Records that this endpoint gave no answer at all during the pass now
+     * running — a retired host, dead DNS, a refused connection, a TLS
+     * certificate that does not cover the name. Returns true the first time in
+     * a pass, so the caller can log the transition rather than every envelope.
+     *
+     * Provisional by design: [commitPass] decides at the end of the pass
+     * whether this device had any business believing it.
+     */
+    fun noteUnreachableThisPass(userIdKey: String, endpointKey: String): Boolean =
+        silentThisPass.put(userIdKey, endpointKey) != endpointKey
+
+    /**
      * Whether this contact's endpoint has answered recently enough to be worth
      * spending a request on. True below the core's streak, and true again once
      * the rest window is up so a recovered host is picked back up with nobody
@@ -50,8 +74,24 @@ internal class ContactRelaySilence {
      * skipped for the rest of the half-hour window. Re-importing a card that
      * re-states the *same* endpoint changes nothing, exactly as it does not
      * launder a rejection streak.
+     *
+     * The [silentThisPass] arm covers the *inside* of one pass, which the rest
+     * window alone cannot: a rest is only awarded by [commitPass] once the pass
+     * is over, so without this arm the first failure taught the pass nothing
+     * and every remaining queued envelope re-dialled the same dead address.
+     * Observed in the field — a friend card naming a host whose certificate no
+     * longer covered it drew 352 handshakes in 27 seconds while an
+     * update-restart backlog drained.
+     *
+     * That arm is deliberately not a rest and touches no streak. Whether the
+     * silence counts at all still belongs to [commitPass], where the core can
+     * weigh it against proof that this device's own internet works — a phone in
+     * a tunnel fails every endpoint at once and must write off nobody. All this
+     * arm claims is that an address which failed to answer milliseconds ago
+     * will not answer the next envelope either.
      */
     fun endpointAnswering(userIdKey: String, endpointKey: String, nowMs: Long): Boolean {
+        if (silentThisPass[userIdKey] == endpointKey) return false
         val rest = rests[userIdKey] ?: return true
         if (rest.endpointKey != endpointKey) {
             rests.remove(userIdKey)
@@ -86,8 +126,24 @@ internal class ContactRelaySilence {
         return streak
     }
 
+    /**
+     * Turns this pass's provisional observations into streaks and clears them,
+     * returning the endpoints that earned a rest so the caller can say so.
+     *
+     * [otherRelayAnswered] is passed straight through to [noteSilentPass] —
+     * see its doc for why the shell must not answer that question itself.
+     */
+    fun commitPass(otherRelayAnswered: Boolean, nowMs: Long): List<Pair<String, Long>> {
+        val rested = silentThisPass.mapNotNull { (key, endpointKey) ->
+            noteSilentPass(key, endpointKey, otherRelayAnswered, nowMs)?.let { key to it }
+        }
+        silentThisPass.clear()
+        return rested
+    }
+
     /** The endpoint answered: whatever we thought about its silence is settled. */
     fun noteAnswered(userIdKey: String) {
         rests.remove(userIdKey)
+        silentThisPass.remove(userIdKey)
     }
 }
