@@ -24,6 +24,19 @@ use crate::{
 /// sync over fragmented BLE.
 const DIGEST_ADVERTISED_MSG_IDS_LIMIT: u64 = 512;
 
+/// Most of [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] one device's *carried* ids may
+/// occupy, leaving the rest for recently-held ones.
+///
+/// Without a cap the two halves compete and the carry queue always wins: a
+/// phone acting as courier for the fleet carries more than the whole limit, so
+/// it advertised carried ids only and *zero* consumed ids. Consumed ids are
+/// the sole signal driving [`MessageStore::core_confirm_carried_deliveries`],
+/// so the busiest phones — the ones whose mail is muled the most — never
+/// proved receipt, and their couriers redelivered their 1:1 mail on every
+/// HELLO until the envelopes aged out a week later. Reserving room means proof
+/// of receipt can never be crowded out, however loaded the carry queue is.
+const DIGEST_ADVERTISED_CARRIED_SHARE: u64 = 256;
+
 /// How many recent day-numbers to hash a peer's UserID against when scoping
 /// carried envelopes to them for D2's confirm-before-delete check
 /// (DTN_TODOS.md §3.2; DESIGN.md §5.3 carry queue, §6.4 `recipient_hint`).
@@ -694,20 +707,28 @@ impl MessageStore {
 
     /// Build the exact `recent_msg_id` list this device advertises in its
     /// outgoing DIGEST (DESIGN.md §7.3; DTN_TODOS.md §3.2, D2
-    /// mule-drain-confirm): carried entries first (mirrors the pre-existing
-    /// carried-only budget), then recently *held* message-stream ids
-    /// ([`MessageStore::recent_consumed_msg_ids`] -- both consumed incoming
-    /// AND our own authored messages) filling whatever room remains, bounded
-    /// to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format change:
-    /// the DIGEST frame's `recent_msg_id` list already carries arbitrary
-    /// content (`protocol.rs`'s DIGEST frame docs).
+    /// mule-drain-confirm): carried entries first, capped at
+    /// [`DIGEST_ADVERTISED_CARRIED_SHARE`], then recently *held*
+    /// message-stream ids ([`MessageStore::recent_consumed_msg_ids`] -- both
+    /// consumed incoming AND our own authored messages) filling the rest,
+    /// bounded to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format
+    /// change: the DIGEST frame's `recent_msg_id` list already carries
+    /// arbitrary content (`protocol.rs`'s DIGEST frame docs), and both
+    /// consumers treat it as a plain known-set.
     ///
     /// This is also the proof-of-receipt half of D2: a mule still holding
     /// our envelope in its carry queue learns, on our next digest, that we
     /// already have it -- see [`Self::core_confirm_carried_deliveries`] for
     /// the other half, which acts on this same list from the peer's side.
+    ///
+    /// The two limits exist because a heavily loaded phone used to advertise
+    /// nothing useful: the carried half filled the whole list with a frozen
+    /// window over its *oldest* rows (which its own eviction may already have
+    /// deleted) and starved out the consumed ids that are the only proof of
+    /// receipt. Hence the reserved share here plus
+    /// [`MessageStore::carried_msg_ids_desc`]'s newest-first order.
     pub fn core_digest_advertised_msg_ids(&self) -> Result<Vec<Vec<u8>>, CoreError> {
-        let carried = self.carried_msg_ids(DIGEST_ADVERTISED_MSG_IDS_LIMIT)?;
+        let carried = self.carried_msg_ids_desc(DIGEST_ADVERTISED_CARRIED_SHARE)?;
         let remaining = DIGEST_ADVERTISED_MSG_IDS_LIMIT.saturating_sub(carried.len() as u64);
         if remaining == 0 {
             return Ok(carried);
@@ -2469,42 +2490,117 @@ mod tests {
         assert_eq!(ids, vec![vec![1; 16], vec![2; 16]]);
     }
 
-    #[test]
-    fn digest_advertised_msg_ids_stops_at_the_cap_before_appending_consumed_ids() {
-        let store = MessageStore::open(":memory:".to_string()).unwrap();
-        for i in 0..DIGEST_ADVERTISED_MSG_IDS_LIMIT {
-            let mut msg_id = vec![0_u8; 16];
-            msg_id[0..8].copy_from_slice(&i.to_be_bytes());
+    fn seq_msg_id(i: u64) -> Vec<u8> {
+        let mut msg_id = vec![0_u8; 16];
+        msg_id[0..8].copy_from_slice(&i.to_be_bytes());
+        msg_id
+    }
+
+    fn seed_advertised_carried(store: &MessageStore, count: u64) {
+        for i in 0..count {
             store
                 .enqueue_carried_envelope(
-                    carried_envelope(&msg_id, b"hint".to_vec(), 9_000),
+                    carried_envelope(&seq_msg_id(i), b"hint".to_vec(), 9_000_000),
                     false,
                     1_000 + i as i64,
                     BIG_BUDGET,
                 )
                 .unwrap();
         }
+    }
+
+    fn seed_consumed(store: &MessageStore, count: u64) {
+        for i in 0..count {
+            let mut msg_id = vec![0xEE_u8; 16];
+            msg_id[8..16].copy_from_slice(&i.to_be_bytes());
+            store
+                .insert_incoming_message(
+                    crate::StoredMessage {
+                        chat_id: vec![9; 16],
+                        sender_user_id: vec![9; 16],
+                        lamport: 1 + i,
+                        timestamp: 1 + i as i64,
+                        kind: 1,
+                        payload: b"hi".to_vec(),
+                    },
+                    msg_id,
+                    None,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn digest_advertised_msg_ids_reserves_room_for_consumed_proof_under_a_heavy_carry() {
+        // A courier-scale carry queue must not crowd out proof of receipt:
+        // carried is capped at its share and every consumed id still lands.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        seed_advertised_carried(&store, 600);
+        seed_consumed(&store, 50);
+
+        let ids = store.core_digest_advertised_msg_ids().unwrap();
+        assert_eq!(
+            ids.len(),
+            DIGEST_ADVERTISED_CARRIED_SHARE as usize + 50,
+            "carried share plus every consumed id"
+        );
+
+        // The carried half is the NEWEST 256 (msg_ids 344..=599), not the
+        // oldest window that eviction deletes first.
+        let carried_part = &ids[..DIGEST_ADVERTISED_CARRIED_SHARE as usize];
+        let expected_newest: Vec<Vec<u8>> = (600 - DIGEST_ADVERTISED_CARRIED_SHARE..600)
+            .map(seq_msg_id)
+            .collect();
+        let mut got = carried_part.to_vec();
+        got.sort();
+        let mut want = expected_newest;
+        want.sort();
+        assert_eq!(got, want, "advertisement covers the newest carried rows");
+
+        for i in 0..50_u64 {
+            let mut msg_id = vec![0xEE_u8; 16];
+            msg_id[8..16].copy_from_slice(&i.to_be_bytes());
+            assert!(ids.contains(&msg_id), "consumed id {i} must be advertised");
+        }
+    }
+
+    #[test]
+    fn digest_advertised_msg_ids_lets_consumed_ids_use_the_unused_carried_share() {
+        // The reservation is a ceiling on carried, not a floor: a light
+        // carrier still fills the whole list with consumed proof.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        seed_advertised_carried(&store, 10);
+        seed_consumed(&store, 600);
+
+        let ids = store.core_digest_advertised_msg_ids().unwrap();
+        assert_eq!(ids.len(), DIGEST_ADVERTISED_MSG_IDS_LIMIT as usize);
+        let carried_count = ids.iter().filter(|id| id[0] != 0xEE).count();
+        assert_eq!(carried_count, 10);
+        assert_eq!(
+            ids.len() - carried_count,
+            DIGEST_ADVERTISED_MSG_IDS_LIMIT as usize - 10
+        );
+    }
+
+    #[test]
+    fn digest_advertised_msg_ids_covers_a_just_accepted_carry() {
+        // Anti-live-lock: on an over-full queue the id we accepted a moment
+        // ago must be in the next advertisement, or the peer re-offers it
+        // forever while our oldest-first eviction throws it away again.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        seed_advertised_carried(&store, 600);
+        let fresh = vec![0x7B_u8; 16];
         store
-            .insert_incoming_message(
-                crate::StoredMessage {
-                    chat_id: vec![9; 16],
-                    sender_user_id: vec![9; 16],
-                    lamport: 1,
-                    timestamp: 1,
-                    kind: 1,
-                    payload: b"hi".to_vec(),
-                },
-                vec![0xFF; 16],
-                None,
+            .enqueue_carried_envelope(
+                carried_envelope(&fresh, b"hint".to_vec(), 9_000_000),
+                false,
+                9_999,
+                BIG_BUDGET,
             )
             .unwrap();
 
-        // Carried alone already fills the cap, so the consumed id must be
-        // left off entirely -- confirms the builder actually enforces the
-        // bound rather than merely defaulting to a generous query limit.
         let ids = store.core_digest_advertised_msg_ids().unwrap();
-        assert_eq!(ids.len(), DIGEST_ADVERTISED_MSG_IDS_LIMIT as usize);
-        assert!(!ids.contains(&vec![0xFF; 16]));
+        assert!(ids.contains(&fresh));
     }
 
     #[test]

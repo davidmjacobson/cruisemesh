@@ -1807,9 +1807,19 @@ public protocol MessageStoreProtocol : AnyObject {
      * `budget_bytes` bounds one encounter's worth of foreign-carry offering
      * by summed sealed-byte size: rows are taken oldest first until the next
      * one would not fit, and then iteration stops (so the rest never has its
-     * ciphertext decoded either). A single envelope larger than the whole
-     * budget yields nothing rather than a partial frame -- frames are
-     * all-or-nothing on the wire. Nothing is dropped by this cut: the carry
+     * ciphertext decoded either). Frames are all-or-nothing on the wire, so a
+     * row is never truncated to fit. The one exception is the head of the
+     * list: if the oldest eligible envelope is by itself bigger than the whole
+     * budget, it is offered anyway and the round stops there. Skipping it
+     * instead would block the lane forever -- selection is always oldest
+     * first, so that same row would be reconsidered and rejected on every
+     * future round until it expired, and nothing behind it would ever be
+     * offered. One oversized frame per encounter keeps the lane live while
+     * still bounding the round to about a single envelope. Any *later* row
+     * that does not fit the remaining budget still just ends the round, and
+     * a `budget_bytes` of zero still offers nothing at all -- that is the
+     * lane's off switch rather than a small allowance.
+     * Nothing is dropped by this cut: the carry
      * queue is untouched, and D8's periodic re-digest re-offers whatever did
      * not fit on the next round, so a big backlog is *paced* across rounds
      * instead of monopolizing a slow link's single FIFO in one burst.
@@ -1988,18 +1998,26 @@ public protocol MessageStoreProtocol : AnyObject {
     /**
      * Build the exact `recent_msg_id` list this device advertises in its
      * outgoing DIGEST (DESIGN.md §7.3; DTN_TODOS.md §3.2, D2
-     * mule-drain-confirm): carried entries first (mirrors the pre-existing
-     * carried-only budget), then recently *held* message-stream ids
-     * ([`MessageStore::recent_consumed_msg_ids`] -- both consumed incoming
-     * AND our own authored messages) filling whatever room remains, bounded
-     * to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format change:
-     * the DIGEST frame's `recent_msg_id` list already carries arbitrary
-     * content (`protocol.rs`'s DIGEST frame docs).
+     * mule-drain-confirm): carried entries first, capped at
+     * [`DIGEST_ADVERTISED_CARRIED_SHARE`], then recently *held*
+     * message-stream ids ([`MessageStore::recent_consumed_msg_ids`] -- both
+     * consumed incoming AND our own authored messages) filling the rest,
+     * bounded to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format
+     * change: the DIGEST frame's `recent_msg_id` list already carries
+     * arbitrary content (`protocol.rs`'s DIGEST frame docs), and both
+     * consumers treat it as a plain known-set.
      *
      * This is also the proof-of-receipt half of D2: a mule still holding
      * our envelope in its carry queue learns, on our next digest, that we
      * already have it -- see [`Self::core_confirm_carried_deliveries`] for
      * the other half, which acts on this same list from the peer's side.
+     *
+     * The two limits exist because a heavily loaded phone used to advertise
+     * nothing useful: the carried half filled the whole list with a frozen
+     * window over its *oldest* rows (which its own eviction may already have
+     * deleted) and starved out the consumed ids that are the only proof of
+     * receipt. Hence the reserved share here plus
+     * [`MessageStore::carried_msg_ids_desc`]'s newest-first order.
      */
     func coreDigestAdvertisedMsgIds() throws  -> [Data]
     
@@ -3374,9 +3392,19 @@ open func carriedEnvelopesForHints(hints: [Data], nowMs: Int64)throws  -> [Carri
      * `budget_bytes` bounds one encounter's worth of foreign-carry offering
      * by summed sealed-byte size: rows are taken oldest first until the next
      * one would not fit, and then iteration stops (so the rest never has its
-     * ciphertext decoded either). A single envelope larger than the whole
-     * budget yields nothing rather than a partial frame -- frames are
-     * all-or-nothing on the wire. Nothing is dropped by this cut: the carry
+     * ciphertext decoded either). Frames are all-or-nothing on the wire, so a
+     * row is never truncated to fit. The one exception is the head of the
+     * list: if the oldest eligible envelope is by itself bigger than the whole
+     * budget, it is offered anyway and the round stops there. Skipping it
+     * instead would block the lane forever -- selection is always oldest
+     * first, so that same row would be reconsidered and rejected on every
+     * future round until it expired, and nothing behind it would ever be
+     * offered. One oversized frame per encounter keeps the lane live while
+     * still bounding the round to about a single envelope. Any *later* row
+     * that does not fit the remaining budget still just ends the round, and
+     * a `budget_bytes` of zero still offers nothing at all -- that is the
+     * lane's off switch rather than a small allowance.
+     * Nothing is dropped by this cut: the carry
      * queue is untouched, and D8's periodic re-digest re-offers whatever did
      * not fit on the next round, so a big backlog is *paced* across rounds
      * instead of monopolizing a slow link's single FIFO in one burst.
@@ -3657,18 +3685,26 @@ open func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data]
     /**
      * Build the exact `recent_msg_id` list this device advertises in its
      * outgoing DIGEST (DESIGN.md §7.3; DTN_TODOS.md §3.2, D2
-     * mule-drain-confirm): carried entries first (mirrors the pre-existing
-     * carried-only budget), then recently *held* message-stream ids
-     * ([`MessageStore::recent_consumed_msg_ids`] -- both consumed incoming
-     * AND our own authored messages) filling whatever room remains, bounded
-     * to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format change:
-     * the DIGEST frame's `recent_msg_id` list already carries arbitrary
-     * content (`protocol.rs`'s DIGEST frame docs).
+     * mule-drain-confirm): carried entries first, capped at
+     * [`DIGEST_ADVERTISED_CARRIED_SHARE`], then recently *held*
+     * message-stream ids ([`MessageStore::recent_consumed_msg_ids`] -- both
+     * consumed incoming AND our own authored messages) filling the rest,
+     * bounded to [`DIGEST_ADVERTISED_MSG_IDS_LIMIT`] total. No wire-format
+     * change: the DIGEST frame's `recent_msg_id` list already carries
+     * arbitrary content (`protocol.rs`'s DIGEST frame docs), and both
+     * consumers treat it as a plain known-set.
      *
      * This is also the proof-of-receipt half of D2: a mule still holding
      * our envelope in its carry queue learns, on our next digest, that we
      * already have it -- see [`Self::core_confirm_carried_deliveries`] for
      * the other half, which acts on this same list from the peer's side.
+     *
+     * The two limits exist because a heavily loaded phone used to advertise
+     * nothing useful: the carried half filled the whole list with a frozen
+     * window over its *oldest* rows (which its own eviction may already have
+     * deleted) and starved out the consumed ids that are the only proof of
+     * receipt. Hence the reserved share here plus
+     * [`MessageStore::carried_msg_ids_desc`]'s newest-first order.
      */
 open func coreDigestAdvertisedMsgIds()throws  -> [Data] {
     return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -17563,7 +17599,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints() != 43270) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_peer_sync() != 64076) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_peer_sync() != 7168) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_len() != 13406) {
@@ -17617,7 +17653,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 38296) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 37419) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 45681) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 29904) {
