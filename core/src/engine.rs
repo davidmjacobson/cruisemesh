@@ -8,11 +8,11 @@
 use std::collections::HashSet;
 
 use crate::{
-    compute_recipient_hint, encode_envelope_frame, fanout_msg_id, CarriedEnvelope, CoreError,
-    MessageOrigin, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
-    KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
-    KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION,
-    KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+    compute_recipient_hint, encode_envelope_frame, fanout_msg_id, CarriedEnvelope,
+    CoreCarriedCursor, CoreError, MessageOrigin, MessageStore, OutboundEnvelope,
+    OutgoingReceiptEnvelope, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST,
+    KIND_GROUP_INVITE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC,
+    KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
 };
 
 /// Exact carried+recently-held `msg_id` count advertised in one outgoing
@@ -159,6 +159,15 @@ pub struct CoreDigestSprayPlan {
     /// session excludes them — the once-per-session re-spray bound. Empty
     /// when the peer advertised CAP_ACKS_HIDDEN_KINDS.
     pub offered_hidden_msg_ids: Vec<Vec<u8>>,
+    /// Resume point for this link session's next carried-lane round: the last
+    /// carried row this plan offered, or `None` if it offered none. The shell
+    /// hands it straight back via `record_carried_progress`. It is offering
+    /// bookkeeping only, never a delete signal.
+    pub next_carried_cursor: Option<CoreCarriedCursor>,
+    /// Whether the carried lane reached the tail of the queue this round --
+    /// i.e. this peer has now been offered everything it is eligible for, so
+    /// the lane can park until the re-walk cooldown elapses.
+    pub carried_exhausted: bool,
 }
 
 /// One relay-post row of a group message's per-member fan-out
@@ -587,10 +596,14 @@ impl MessageStore {
     /// down a BLE link's single FIFO queues everything behind it for minutes,
     /// live replies to real contacts included. The cut bounds only what is
     /// OFFERED this round -- the carry queue itself is untouched, and D8's
-    /// 3-5 minute re-digest re-offers the remainder (still oldest first) on
-    /// the next round, so a backlog is paced rather than dropped. Removal of
-    /// a carried copy remains gated on digest-proof of receipt
-    /// ([`Self::core_confirm_carried_deliveries`]); nothing here acks.
+    /// 3-5 minute re-digest offers the *next* page on the next round, so a
+    /// backlog is walked rather than dropped -- `carried_cursor` /
+    /// `next_carried_cursor` carry the resume point between rounds of one
+    /// link session. Before it existed each round re-read from the oldest row,
+    /// so a store larger than one round's budget re-offered its head forever
+    /// and its young tail starved. Removal of a carried copy remains gated on
+    /// digest-proof of receipt ([`Self::core_confirm_carried_deliveries`]);
+    /// nothing here acks.
     pub fn core_digest_spray_plan(
         &self,
         own_user_id: Vec<u8>,
@@ -604,6 +617,7 @@ impl MessageStore {
         receipt_query_limit: u64,
         peer_acks_hidden_kinds: bool,
         hidden_already_offered: Vec<Vec<u8>>,
+        carried_cursor: Option<CoreCarriedCursor>,
     ) -> Result<CoreDigestSprayPlan, CoreError> {
         self.prune_expired_carried(now_ms)?;
         let carried = self.carried_envelopes_for_peer_sync(
@@ -611,6 +625,7 @@ impl MessageStore {
             peer_known_msg_ids.clone(),
             now_ms,
             carried_budget_bytes,
+            carried_cursor,
         )?;
         let known: HashSet<Vec<u8>> = peer_known_msg_ids.into_iter().collect();
         // Hidden kinds never advance a non-capable peer's DELIVERED
@@ -698,10 +713,12 @@ impl MessageStore {
         let selected_ids: HashSet<&Vec<u8>> = own_outbound.iter().map(|e| &e.msg_id).collect();
         offered_hidden_msg_ids.retain(|id| selected_ids.contains(id));
         Ok(CoreDigestSprayPlan {
-            carried_frames: carried.into_iter().map(frame_carried).collect(),
+            carried_frames: carried.rows.into_iter().map(frame_carried).collect(),
             own_outbound_frames: own_outbound.into_iter().map(frame_outbound).collect(),
             own_receipt_frames: own_receipts.into_iter().map(frame_receipt).collect(),
             offered_hidden_msg_ids,
+            next_carried_cursor: carried.next,
+            carried_exhausted: carried.exhausted,
         })
     }
 
@@ -2112,6 +2129,7 @@ mod tests {
                 0,
                 true,
                 vec![],
+                None,
             )
             .unwrap();
 
@@ -2197,6 +2215,7 @@ mod tests {
                     0,
                     acks,
                     offered,
+                    None,
                 )
                 .unwrap()
         };
@@ -2276,6 +2295,7 @@ mod tests {
                 0,
                 true,
                 vec![],
+                None,
             )
             .unwrap();
 
@@ -2370,6 +2390,7 @@ mod tests {
                 128,
                 true,
                 vec![],
+                None,
             )
             .unwrap();
 
@@ -2401,6 +2422,7 @@ mod tests {
                     0,
                     true,
                     vec![],
+                    None,
                 )
                 .unwrap()
         };
@@ -2432,10 +2454,88 @@ mod tests {
         // is carried.
         assert_eq!(
             store
-                .carried_envelopes_for_peer_sync(vec![], vec![], now_ms, u64::MAX)
+                .carried_envelopes_for_peer_sync(vec![], vec![], now_ms, u64::MAX, None)
                 .unwrap()
+                .rows
                 .len(),
             6
+        );
+    }
+
+    #[test]
+    fn carried_backlog_walks_forward_even_when_the_peers_digest_never_grows() {
+        // The case the byte budget alone could not handle. A peer's digest
+        // advertises a bounded, FIXED id set that never includes what it just
+        // received -- a courier whose store is larger than that cap, or a peer
+        // whose advertised list is already full of other traffic. Re-reading
+        // from the oldest row every round then re-offers the same head
+        // forever and the young tail is never reached at all. With the cursor
+        // the same three rounds walk the whole backlog and then go quiet.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let now_ms = 1_700_000_000_000_i64;
+        seed_carried(&store, 6, 100, now_ms);
+
+        let round = |cursor: Option<CoreCarriedCursor>| {
+            store
+                .core_digest_spray_plan(
+                    vec![1_u8; 16],
+                    vec![9_u8; 16],
+                    vec![],
+                    // Fixed and unhelpful: nothing this peer says it holds
+                    // overlaps our carry queue, on any round.
+                    vec![vec![0xFF; 16]],
+                    now_ms,
+                    200,
+                    0,
+                    0,
+                    0,
+                    true,
+                    vec![],
+                    cursor,
+                )
+                .unwrap()
+        };
+
+        let mut cursor = None;
+        let mut offered: Vec<Vec<u8>> = Vec::new();
+        for expected in [2_usize, 2, 2] {
+            let plan = round(cursor.clone());
+            assert_eq!(
+                plan.carried_frames.len(),
+                expected,
+                "each round offers the next page, not the same head again"
+            );
+            offered.extend(plan.carried_frames.iter().map(|f| frame_msg_id(f)));
+            cursor = plan.next_carried_cursor;
+        }
+
+        let mut unique = offered.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            6,
+            "three rounds of two walk all six distinct envelopes -- no row is \
+             offered twice and none is skipped"
+        );
+
+        let quiet = round(cursor);
+        assert!(
+            quiet.carried_frames.is_empty(),
+            "the walk has reached the tail, so the lane falls silent"
+        );
+        assert!(quiet.carried_exhausted);
+
+        // And the whole point: nothing was acked or deleted along the way.
+        // Removal still waits on digest-proof of receipt.
+        assert_eq!(
+            store
+                .carried_envelopes_for_peer_sync(vec![], vec![], now_ms, u64::MAX, None)
+                .unwrap()
+                .rows
+                .len(),
+            6,
+            "a full walk offers; it never drops a carried copy"
         );
     }
 

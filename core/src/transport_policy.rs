@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
 
-use crate::DigestEntry;
+use crate::{CoreCarriedCursor, DigestEntry};
 
 /// FC6: recover from mutex poisoning instead of propagating it as a panic.
 /// `Mutex::lock` returns `Err` if some earlier locker panicked while
@@ -42,6 +42,20 @@ pub fn digest_is_expected_chat_id(digest_chat_id: Vec<u8>, hello_user_id: Option
 /// digest still converges without waiting for a reconnect.
 pub const REDIGEST_MIN_INTERVAL_MS: i64 = 3 * 60_000;
 pub const REDIGEST_MAX_INTERVAL_MS: i64 = 5 * 60_000;
+
+/// How long the foreign-carry lane of the digest spray stays parked on a link
+/// after it has walked this device's whole carry queue once.
+///
+/// The walk itself is paced by a per-round byte budget and resumed by a
+/// cursor, so a courier converges: each re-digest offers the next page, and
+/// eventually a page reaches the tail with nothing new in it. Re-walking from
+/// the top immediately after that would put the link straight back to
+/// re-offering rows the peer has already refused, which is the churn the
+/// cursor exists to end. A long-lived link does eventually re-walk, because a
+/// frame can be lost in the link's FIFO on a disconnect mid-write and only a
+/// fresh pass would find it again; half an hour is far longer than the 3-5
+/// minute re-digest, so the steady state of a converged pair is quiet.
+pub const CARRIED_REWALK_MIN_INTERVAL_MS: i64 = 30 * 60_000;
 
 /// Whether a long-lived link is due to re-run its digest exchange (D8).
 ///
@@ -113,6 +127,25 @@ struct Peer {
     /// hidden kinds. Cleared on a fresh legacy HELLO (new handshake) and
     /// dropped with the peer on disconnect.
     hidden_offered: std::collections::HashSet<Vec<u8>>,
+    /// How far the foreign-carry lane has walked this device's carry queue
+    /// toward this peer during this link session, and when (if ever) that walk
+    /// last reached the tail. Same lifecycle as `hidden_offered`: fresh on
+    /// connect, reset by a fresh legacy HELLO, dropped with the peer on
+    /// disconnect -- a new session re-offers from the top, because there is no
+    /// evidence the previous session's frames survived the link.
+    carried_cursor: Option<CoreCarriedCursor>,
+    carried_walk_done_at_ms: Option<i64>,
+}
+
+/// What the foreign-carry lane should do on this link right now
+/// ([`CoreMeshRouterState::carried_lane_for`]).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CoreCarriedLane {
+    /// Offer no carried frames at all this round: the walk is complete and
+    /// still inside its re-walk cooldown.
+    pub skip: bool,
+    /// Resume point to hand to the spray plan. `None` is a fresh full pass.
+    pub after: Option<CoreCarriedCursor>,
 }
 
 #[derive(uniffi::Object)]
@@ -137,6 +170,8 @@ impl CoreMeshRouterState {
                 user_id: None,
                 capabilities: None,
                 hidden_offered: std::collections::HashSet::new(),
+                carried_cursor: None,
+                carried_walk_done_at_ms: None,
             },
         );
     }
@@ -155,8 +190,11 @@ impl CoreMeshRouterState {
         }
         peer.user_id = Some(user_id);
         // A fresh legacy HELLO is a new handshake: the once-per-session
-        // hidden-kind spray bound resets so this session gets one new offer.
+        // hidden-kind spray bound resets so this session gets one new offer,
+        // and the carry walk restarts from the top for the same reason.
         peer.hidden_offered.clear();
+        peer.carried_cursor = None;
+        peer.carried_walk_done_at_ms = None;
         true
     }
 
@@ -215,6 +253,80 @@ impl CoreMeshRouterState {
         let mut peers = self.peers.lock_recoverable();
         if let Some(peer) = peers.get_mut(&address) {
             peer.hidden_offered.extend(msg_ids);
+        }
+    }
+
+    /// Where this link's foreign-carry lane should resume, or whether to sit
+    /// this round out entirely.
+    ///
+    /// Three states, in order:
+    /// * mid-walk -- resume after the last row offered;
+    /// * walked, still in cooldown -- skip, the peer has already been offered
+    ///   everything and re-walking would just re-offer refused rows;
+    /// * walked, cooldown elapsed -- a fresh *full* pass (`after: None`),
+    ///   deliberately not a resume. A write accepted by the transport is not a
+    ///   frame the peer received; a link that dropped mid-write lost whatever
+    ///   was still queued behind it, and only a pass from the top finds those
+    ///   rows again. Anything the peer really does hold it advertises in its
+    ///   digest, so the re-walk excludes it in SQL and costs nothing.
+    ///
+    /// An unknown address reads as a fresh pass: the caller is about to spray
+    /// down a link this state has no record of, and offering is always safe.
+    pub fn carried_lane_for(&self, address: String, now_ms: i64) -> CoreCarriedLane {
+        let peers = self.peers.lock_recoverable();
+        let Some(peer) = peers.get(&address) else {
+            return CoreCarriedLane {
+                skip: false,
+                after: None,
+            };
+        };
+        match peer.carried_walk_done_at_ms {
+            // A `done_at` in the future (clock skew) reads as not-yet-due,
+            // the same direction `should_redigest` errs in: worst case the
+            // lane stays quiet a while longer on a link that already has
+            // nothing new to offer.
+            Some(done_at) if now_ms.saturating_sub(done_at) < CARRIED_REWALK_MIN_INTERVAL_MS => {
+                CoreCarriedLane {
+                    skip: true,
+                    after: None,
+                }
+            }
+            Some(_) => CoreCarriedLane {
+                skip: false,
+                after: None,
+            },
+            None => CoreCarriedLane {
+                skip: false,
+                after: peer.carried_cursor.clone(),
+            },
+        }
+    }
+
+    /// Record what the carried lane just offered down this link: `next` is the
+    /// plan's `next_carried_cursor` and `exhausted` its `carried_exhausted`.
+    ///
+    /// Reaching the tail parks the lane (and drops the cursor, so the eventual
+    /// re-walk starts from the top). A page that stopped on the budget just
+    /// advances the cursor. A round that offered nothing without reaching the
+    /// tail -- the lane's zero-budget off switch -- changes nothing, so the
+    /// next round reconsiders exactly the same page.
+    pub fn record_carried_progress(
+        &self,
+        address: String,
+        next: Option<CoreCarriedCursor>,
+        exhausted: bool,
+        now_ms: i64,
+    ) {
+        let mut peers = self.peers.lock_recoverable();
+        let Some(peer) = peers.get_mut(&address) else {
+            return;
+        };
+        if exhausted {
+            peer.carried_cursor = None;
+            peer.carried_walk_done_at_ms = Some(now_ms);
+        } else if next.is_some() {
+            peer.carried_cursor = next;
+            peer.carried_walk_done_at_ms = None;
         }
     }
 
@@ -614,6 +726,114 @@ mod tests {
         router.on_disconnected("ble".into());
         assert!(router.hidden_offered_for("ble".into()).is_empty());
         assert!(!router.peer_acks_hidden_kinds("ble".into()));
+    }
+
+    #[test]
+    fn the_carried_lane_resumes_mid_walk_and_parks_once_it_reaches_the_tail() {
+        let router = CoreMeshRouterState::new();
+        let cursor = |n: u8| CoreCarriedCursor {
+            received_at: n as i64 * 1_000,
+            msg_id: vec![n; 16],
+        };
+        let now = 1_700_000_000_000_i64;
+
+        // A link this state has never seen: offer, from the top.
+        assert_eq!(
+            router.carried_lane_for("ble".into(), now),
+            CoreCarriedLane {
+                skip: false,
+                after: None
+            }
+        );
+
+        router.on_connected("ble".into(), CoreTransport::Central);
+        assert!(router.on_hello("ble".into(), vec![1; 16]));
+        assert_eq!(
+            router.carried_lane_for("ble".into(), now),
+            CoreCarriedLane {
+                skip: false,
+                after: None
+            },
+            "a fresh session starts its walk at the top"
+        );
+
+        // Mid-walk: each round resumes where the last one stopped.
+        router.record_carried_progress("ble".into(), Some(cursor(1)), false, now);
+        assert_eq!(
+            router.carried_lane_for("ble".into(), now + 1),
+            CoreCarriedLane {
+                skip: false,
+                after: Some(cursor(1))
+            }
+        );
+        router.record_carried_progress("ble".into(), Some(cursor(2)), false, now + 1);
+        assert_eq!(
+            router.carried_lane_for("ble".into(), now + 2),
+            CoreCarriedLane {
+                skip: false,
+                after: Some(cursor(2))
+            }
+        );
+
+        // A round that offered nothing without reaching the tail (the
+        // zero-budget off switch) leaves the walk exactly where it was.
+        router.record_carried_progress("ble".into(), None, false, now + 3);
+        assert_eq!(
+            router.carried_lane_for("ble".into(), now + 4),
+            CoreCarriedLane {
+                skip: false,
+                after: Some(cursor(2))
+            }
+        );
+
+        // Tail reached: the lane parks for the cooldown.
+        router.record_carried_progress("ble".into(), Some(cursor(3)), true, now + 5);
+        let done_at = now + 5;
+        assert_eq!(
+            router.carried_lane_for("ble".into(), done_at + CARRIED_REWALK_MIN_INTERVAL_MS - 1),
+            CoreCarriedLane {
+                skip: true,
+                after: None
+            },
+            "still inside the cooldown: offer nothing at all"
+        );
+
+        // Cooldown elapsed: a fresh FULL pass, not a resume -- frames lost in
+        // a link's FIFO are only found again from the top.
+        assert_eq!(
+            router.carried_lane_for("ble".into(), done_at + CARRIED_REWALK_MIN_INTERVAL_MS),
+            CoreCarriedLane {
+                skip: false,
+                after: None
+            }
+        );
+
+        // A fresh handshake resets the walk even mid-cooldown.
+        router.record_carried_progress("ble".into(), Some(cursor(4)), true, done_at);
+        assert!(router.on_hello("ble".into(), vec![1; 16]));
+        assert_eq!(
+            router.carried_lane_for("ble".into(), done_at + 1),
+            CoreCarriedLane {
+                skip: false,
+                after: None
+            },
+            "a new handshake is a new session: walk from the top again"
+        );
+
+        // And disconnect drops the cursor with the rest of the peer record.
+        router.record_carried_progress("ble".into(), Some(cursor(5)), false, done_at);
+        router.on_disconnected("ble".into());
+        assert_eq!(
+            router.carried_lane_for("ble".into(), done_at),
+            CoreCarriedLane {
+                skip: false,
+                after: None
+            }
+        );
+        // A progress report for a link that is already gone is a no-op, not a
+        // resurrected peer entry.
+        router.record_carried_progress("ble".into(), Some(cursor(6)), false, done_at);
+        assert_eq!(router.connected_user_count(), 0);
     }
 
     #[test]

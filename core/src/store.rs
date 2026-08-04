@@ -456,6 +456,38 @@ pub struct CarriedEnvelope {
     pub sealed: Vec<u8>,
 }
 
+/// A resume point in the carry queue's `(received_at, msg_id)` order --
+/// "everything at or before this row has already been offered to this peer
+/// during this link session".
+///
+/// Both fields together, because `received_at` alone is not unique: two
+/// envelopes accepted in the same millisecond would otherwise let a cursor
+/// either skip one or re-offer one forever. `msg_id` is the table's primary
+/// key, so the pair is a total order over the queue and matches the
+/// `ORDER BY received_at ASC, msg_id ASC` every carried query already uses.
+///
+/// This is offering bookkeeping only. It never removes anything: a carried
+/// copy is still dropped only on digest-proof of receipt
+/// ([`MessageStore::core_confirm_carried_deliveries`]), eviction, or expiry.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct CoreCarriedCursor {
+    pub received_at: i64,
+    pub msg_id: Vec<u8>,
+}
+
+/// One page of [`MessageStore::carried_envelopes_for_peer_sync`].
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct CoreCarriedSyncPage {
+    pub rows: Vec<CarriedEnvelope>,
+    /// Resume point for the next page: the last row on this one, or `None`
+    /// if the page is empty (nothing to resume past).
+    pub next: Option<CoreCarriedCursor>,
+    /// Whether the scan reached the tail of the queue rather than stopping on
+    /// the byte budget. `true` means the walk is complete: everything this
+    /// peer is eligible to be offered has now been offered.
+    pub exhausted: bool,
+}
+
 /// One locally authored sealed envelope persisted for resend over BLE and
 /// relay. This is the exact §6.4 public header plus sealed bytes, alongside
 /// the local message metadata needed to query the queue by chat/sender/lamport
@@ -3810,6 +3842,16 @@ impl MessageStore {
     /// paid to materialize up to the full 64 MiB carry budget regardless of
     /// how little of it was actually new to the peer.
     ///
+    /// `after` resumes the walk: rows are restricted to those strictly after
+    /// that `(received_at, msg_id)` point. Without it a courier whose backlog
+    /// exceeds one round's budget re-read from the oldest row on every
+    /// re-digest and re-offered the same head forever, so a peer whose digest
+    /// cannot advertise the whole store (the advertised-id list is capped)
+    /// never saw the young tail at all. The caller (the per-link-session
+    /// policy in `transport_policy.rs`) hands back [`CoreCarriedSyncPage::next`]
+    /// on the following round, so successive rounds walk the queue instead of
+    /// re-treading its head. `None` starts a fresh full pass.
+    ///
     /// `budget_bytes` bounds one encounter's worth of foreign-carry offering
     /// by summed sealed-byte size: rows are taken oldest first until the next
     /// one would not fit, and then iteration stops (so the rest never has its
@@ -3835,25 +3877,65 @@ impl MessageStore {
         peer_known_msg_ids: Vec<Vec<u8>>,
         now_ms: i64,
         budget_bytes: u64,
-    ) -> Result<Vec<CarriedEnvelope>, CoreError> {
+        after: Option<CoreCarriedCursor>,
+    ) -> Result<CoreCarriedSyncPage, CoreError> {
+        if budget_bytes == 0 {
+            // The lane's off switch. Returning here rather than letting the
+            // loop below break on its first row keeps the query -- and one
+            // row's ciphertext decode -- off a link that is parked. Not
+            // `exhausted`: nothing was examined, so nothing was ruled out.
+            return Ok(CoreCarriedSyncPage {
+                rows: Vec::new(),
+                next: None,
+                exhausted: false,
+            });
+        }
         let conn = lock_conn(&self.conn);
         let mut sql = String::from(
-            "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
+            "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed, received_at
              FROM carried_envelopes
              WHERE expiry > ?1",
         );
         let mut bind: Vec<Value> = vec![Value::Integer(now_ms)];
         push_not_in(&mut sql, &mut bind, "msg_id", &peer_known_msg_ids);
         push_not_in(&mut sql, &mut bind, "recipient_hint", &peer_hints);
+        // Keyset, not OFFSET: the queue is written to while a walk is in
+        // progress, so a row count would skip rows that shifted under it. The
+        // predicate is expressed in exactly the ORDER BY's terms, so
+        // `idx_carried_received_at` can seek straight to the resume point.
+        //
+        // Numbered placeholders, because `received_at` is compared twice and
+        // must not consume two binds. They are appended after `push_not_in`'s
+        // anonymous `?`s, which SQLite numbers sequentially from the largest
+        // index used so far -- so `bind.len()` right after a push is exactly
+        // that parameter's index.
+        if let Some(cursor) = &after {
+            sql.push_str(" AND (received_at > ?");
+            bind.push(Value::Integer(cursor.received_at));
+            let received_at_param = bind.len();
+            sql.push_str(&received_at_param.to_string());
+            sql.push_str(" OR (received_at = ?");
+            sql.push_str(&received_at_param.to_string());
+            sql.push_str(" AND msg_id > ?");
+            bind.push(Value::Blob(cursor.msg_id.clone()));
+            sql.push_str(&bind.len().to_string());
+            sql.push_str("))");
+        }
         sql.push_str(" ORDER BY received_at ASC, msg_id ASC");
         let mut stmt = conn.prepare(&sql).map_err(store_err)?;
         let rows = stmt
-            .query_map(params_from_iter(bind.iter()), row_to_carried)
+            .query_map(params_from_iter(bind.iter()), |row| {
+                Ok((row_to_carried(row)?, row.get::<_, i64>(5)?))
+            })
             .map_err(store_err)?;
         let mut selected: Vec<CarriedEnvelope> = Vec::new();
+        let mut next: Option<CoreCarriedCursor> = None;
         let mut used = 0_u64;
+        // Only a `break` below leaves this false: falling off the end of the
+        // result set means the walk reached the tail of the queue.
+        let mut exhausted = true;
         for row in rows {
-            let envelope = row.map_err(store_err)?;
+            let (envelope, received_at) = row.map_err(store_err)?;
             // Counted here, not over `selected`: this row's ciphertext has now
             // been decoded whether or not the budget lets us keep it, and the
             // FC2 counter measures exactly that cost.
@@ -3861,22 +3943,35 @@ impl MessageStore {
             self.sealed_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let size = envelope.sealed.len() as u64;
+            let cursor = CoreCarriedCursor {
+                received_at,
+                msg_id: envelope.msg_id.clone(),
+            };
             if used.saturating_add(size) > budget_bytes {
                 // Head-of-line liveness: an oldest row that alone exceeds the
                 // budget is taken anyway, then the round stops. Rejecting it
                 // would wedge the lane -- oldest-first means it would be the
                 // first row considered every round until expiry. A budget of
                 // zero is the one exception: that is the explicit off switch
-                // for the lane, not a small allowance.
+                // for the lane, not a small allowance. Taking it still
+                // advances the cursor past it, so the next round resumes
+                // behind it rather than re-deciding the same row.
                 if selected.is_empty() && budget_bytes > 0 {
                     selected.push(envelope);
+                    next = Some(cursor);
                 }
+                exhausted = false;
                 break;
             }
             used += size;
             selected.push(envelope);
+            next = Some(cursor);
         }
-        Ok(selected)
+        Ok(CoreCarriedSyncPage {
+            rows: selected,
+            next,
+            exhausted,
+        })
     }
 
     /// Drop a carried envelope by `msg_id` -- called once it's been handed to
@@ -5178,6 +5273,15 @@ CREATE TABLE IF NOT EXISTS carried_envelopes (
 );
 CREATE INDEX IF NOT EXISTS idx_carried_hint ON carried_envelopes(recipient_hint);
 CREATE INDEX IF NOT EXISTS idx_carried_expiry ON carried_envelopes(expiry);
+-- Covers both the ORDER BY and the keyset resume predicate of
+-- `carried_envelopes_for_peer_sync`: the per-link-session cursor seeks
+-- straight to `(received_at, msg_id) > (?, ?)` instead of re-walking the head
+-- of a courier's whole backlog on every re-digest. Both columns have been in
+-- the table since its first version, so unlike `idx_carried_family_upload`
+-- (which needs the later-added `from_relay`) this can live in SCHEMA, which
+-- `open` replays on every store, new or existing.
+CREATE INDEX IF NOT EXISTS idx_carried_received_at
+    ON carried_envelopes(received_at, msg_id);
 
 CREATE TABLE IF NOT EXISTS peer_connection_events (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -10373,9 +10477,10 @@ mod tests {
                 vec![b"known".to_vec()],
                 5_000,
                 u64::MAX,
+                None,
             )
             .unwrap();
-        let ids: Vec<Vec<u8>> = found.into_iter().map(|e| e.msg_id).collect();
+        let ids: Vec<Vec<u8>> = found.rows.into_iter().map(|e| e.msg_id).collect();
         assert_eq!(ids, vec![b"spray".to_vec()]);
     }
 
@@ -10396,10 +10501,14 @@ mod tests {
 
         let known_ids = vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()];
         let found = store
-            .carried_envelopes_for_peer_sync(vec![], known_ids, 5_000, u64::MAX)
+            .carried_envelopes_for_peer_sync(vec![], known_ids, 5_000, u64::MAX, None)
             .unwrap();
 
-        assert!(found.is_empty());
+        assert!(found.rows.is_empty());
+        assert!(
+            found.exhausted,
+            "a scan that reaches the tail is exhausted even when it selects nothing"
+        );
         assert_eq!(
             store.test_sealed_reads(),
             0,
@@ -10439,18 +10548,180 @@ mod tests {
         // park it at the head of every future round until it expired, and
         // nothing behind it would ever be offered, so it goes out by itself.
         let round_one = store
-            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250)
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250, None)
             .unwrap();
-        let ids: Vec<Vec<u8>> = round_one.into_iter().map(|e| e.msg_id).collect();
+        let ids: Vec<Vec<u8>> = round_one.rows.into_iter().map(|e| e.msg_id).collect();
         assert_eq!(ids, vec![b"huge".to_vec()]);
 
         // Once the peer advertises it in a digest, the lane moves on and the
         // two small ones fit the same budget together.
         let round_two = store
-            .carried_envelopes_for_peer_sync(vec![], vec![b"huge".to_vec()], 5_000, 250)
+            .carried_envelopes_for_peer_sync(vec![], vec![b"huge".to_vec()], 5_000, 250, None)
             .unwrap();
-        let ids: Vec<Vec<u8>> = round_two.into_iter().map(|e| e.msg_id).collect();
+        let ids: Vec<Vec<u8>> = round_two.rows.into_iter().map(|e| e.msg_id).collect();
         assert_eq!(ids, vec![b"small-1".to_vec(), b"small-2".to_vec()]);
+    }
+
+    // --- per-link-session carried cursor -----------------------------------
+
+    #[test]
+    fn a_zero_budget_reads_nothing_at_all() {
+        // The lane's off switch, used by the shells while a completed walk is
+        // parked. It must not cost a query or a ciphertext decode per
+        // re-digest, and it must not claim the queue was exhausted.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"one", b"hint", 9_000, 10),
+                false,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+
+        let page = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 0, None)
+            .unwrap();
+        assert!(page.rows.is_empty());
+        assert!(page.next.is_none());
+        assert!(
+            !page.exhausted,
+            "nothing was examined, so nothing was ruled out"
+        );
+        assert_eq!(store.test_sealed_reads(), 0);
+    }
+
+    #[test]
+    fn peer_sync_pages_forward_from_the_cursor_and_is_exhausted_only_at_the_tail() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // Two rows share a millisecond, so the walk also has to order on
+        // msg_id -- a received_at-only cursor would skip one of them.
+        for (id, received_at) in [
+            (b"e1" as &[u8], 1_000_i64),
+            (b"e2", 1_000),
+            (b"e3", 2_000),
+            (b"e4", 3_000),
+        ] {
+            store
+                .enqueue_carried_envelope(
+                    carried(id, b"hint", 9_000, 100),
+                    false,
+                    received_at,
+                    BIG_BUDGET,
+                )
+                .unwrap();
+        }
+
+        // 250 bytes fits two 100-byte rows, not three.
+        let page_one = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250, None)
+            .unwrap();
+        let ids: Vec<Vec<u8>> = page_one.rows.iter().map(|e| e.msg_id.clone()).collect();
+        assert_eq!(ids, vec![b"e1".to_vec(), b"e2".to_vec()]);
+        assert!(!page_one.exhausted, "two of four rows is not the tail");
+        assert_eq!(
+            page_one.next,
+            Some(CoreCarriedCursor {
+                received_at: 1_000,
+                msg_id: b"e2".to_vec(),
+            })
+        );
+
+        let page_two = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250, page_one.next.clone())
+            .unwrap();
+        let ids: Vec<Vec<u8>> = page_two.rows.iter().map(|e| e.msg_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![b"e3".to_vec(), b"e4".to_vec()],
+            "the second page starts strictly after the cursor"
+        );
+        assert!(
+            page_two.exhausted,
+            "the second page consumed the rest of the queue"
+        );
+
+        let page_three = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250, page_two.next)
+            .unwrap();
+        assert!(page_three.rows.is_empty());
+        assert!(page_three.exhausted);
+        assert_eq!(page_three.next, None);
+    }
+
+    #[test]
+    fn a_row_that_arrives_after_the_cursor_was_set_is_still_offered() {
+        // The young tail must never starve: a cursor is a resume point in the
+        // queue's order, not a snapshot of what existed when it was taken.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"old", b"hint", 9_000, 10),
+                false,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+
+        let first = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 10, None)
+            .unwrap();
+        assert_eq!(first.rows.len(), 1);
+
+        store
+            .enqueue_carried_envelope(
+                carried(b"young", b"hint", 9_000, 10),
+                false,
+                2_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+
+        let second = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 10, first.next)
+            .unwrap();
+        let ids: Vec<Vec<u8>> = second.rows.into_iter().map(|e| e.msg_id).collect();
+        assert_eq!(ids, vec![b"young".to_vec()]);
+    }
+
+    #[test]
+    fn peer_sync_never_decodes_sealed_ciphertext_for_rows_behind_the_cursor() {
+        // The whole point of a keyset cursor over a re-read from the top: the
+        // rows a previous round already offered are excluded by the index
+        // seek, so their ciphertext is never materialized again.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for (id, received_at) in [
+            (b"c1" as &[u8], 1_000_i64),
+            (b"c2", 2_000),
+            (b"c3", 3_000),
+            (b"c4", 4_000),
+        ] {
+            store
+                .enqueue_carried_envelope(
+                    carried(id, b"hint", 9_000, 4_096),
+                    false,
+                    received_at,
+                    BIG_BUDGET,
+                )
+                .unwrap();
+        }
+
+        let after = Some(CoreCarriedCursor {
+            received_at: 3_000,
+            msg_id: b"c3".to_vec(),
+        });
+        let page = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, u64::MAX, after)
+            .unwrap();
+
+        let ids: Vec<Vec<u8>> = page.rows.into_iter().map(|e| e.msg_id).collect();
+        assert_eq!(ids, vec![b"c4".to_vec()]);
+        assert_eq!(
+            store.test_sealed_reads(),
+            1,
+            "only the one row past the cursor may have its sealed ciphertext \
+             decoded; the three behind it must never be read"
+        );
     }
 
     #[test]

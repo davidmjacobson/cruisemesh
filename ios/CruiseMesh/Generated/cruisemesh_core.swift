@@ -883,6 +883,26 @@ public func FfiConverterTypeCoreLanHealthTracker_lower(_ value: CoreLanHealthTra
 
 public protocol CoreMeshRouterStateProtocol : AnyObject {
     
+    /**
+     * Where this link's foreign-carry lane should resume, or whether to sit
+     * this round out entirely.
+     *
+     * Three states, in order:
+     * * mid-walk -- resume after the last row offered;
+     * * walked, still in cooldown -- skip, the peer has already been offered
+     * everything and re-walking would just re-offer refused rows;
+     * * walked, cooldown elapsed -- a fresh *full* pass (`after: None`),
+     * deliberately not a resume. A write accepted by the transport is not a
+     * frame the peer received; a link that dropped mid-write lost whatever
+     * was still queued behind it, and only a pass from the top finds those
+     * rows again. Anything the peer really does hold it advertises in its
+     * digest, so the re-walk excludes it in SQL and costs nothing.
+     *
+     * An unknown address reads as a fresh pass: the caller is about to spray
+     * down a link this state has no record of, and offering is always safe.
+     */
+    func carriedLaneFor(address: String, nowMs: Int64)  -> CoreCarriedLane
+    
     func clear() 
     
     func clearTransports(transports: [CoreTransport]) 
@@ -928,6 +948,18 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
      * direct and relay paths are untouched.
      */
     func peerAcksHiddenKinds(address: String)  -> Bool
+    
+    /**
+     * Record what the carried lane just offered down this link: `next` is the
+     * plan's `next_carried_cursor` and `exhausted` its `carried_exhausted`.
+     *
+     * Reaching the tail parks the lane (and drops the cursor, so the eventual
+     * re-walk starts from the top). A page that stopped on the budget just
+     * advances the cursor. A round that offered nothing without reaching the
+     * tail -- the lane's zero-budget off switch -- changes nothing, so the
+     * next round reconsiders exactly the same page.
+     */
+    func recordCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64) 
     
     func recordHiddenOffered(address: String, msgIds: [Data]) 
     
@@ -997,6 +1029,33 @@ public convenience init() {
 
     
 
+    
+    /**
+     * Where this link's foreign-carry lane should resume, or whether to sit
+     * this round out entirely.
+     *
+     * Three states, in order:
+     * * mid-walk -- resume after the last row offered;
+     * * walked, still in cooldown -- skip, the peer has already been offered
+     * everything and re-walking would just re-offer refused rows;
+     * * walked, cooldown elapsed -- a fresh *full* pass (`after: None`),
+     * deliberately not a resume. A write accepted by the transport is not a
+     * frame the peer received; a link that dropped mid-write lost whatever
+     * was still queued behind it, and only a pass from the top finds those
+     * rows again. Anything the peer really does hold it advertises in its
+     * digest, so the re-walk excludes it in SQL and costs nothing.
+     *
+     * An unknown address reads as a fresh pass: the caller is about to spray
+     * down a link this state has no record of, and offering is always safe.
+     */
+open func carriedLaneFor(address: String, nowMs: Int64) -> CoreCarriedLane {
+    return try!  FfiConverterTypeCoreCarriedLane.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_carried_lane_for(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
     
 open func clear() {try! rustCall() {
     uniffi_cruisemesh_core_fn_method_coremeshrouterstate_clear(self.uniffiClonePointer(),$0
@@ -1109,6 +1168,26 @@ open func peerAcksHiddenKinds(address: String) -> Bool {
         FfiConverterString.lower(address),$0
     )
 })
+}
+    
+    /**
+     * Record what the carried lane just offered down this link: `next` is the
+     * plan's `next_carried_cursor` and `exhausted` its `carried_exhausted`.
+     *
+     * Reaching the tail parks the lane (and drops the cursor, so the eventual
+     * re-walk starts from the top). A page that stopped on the budget just
+     * advances the cursor. A round that offered nothing without reaching the
+     * tail -- the lane's zero-budget off switch -- changes nothing, so the
+     * next round reconsiders exactly the same page.
+     */
+open func recordCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_record_carried_progress(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterOptionTypeCoreCarriedCursor.lower(next),
+        FfiConverterBool.lower(exhausted),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
 }
     
 open func recordHiddenOffered(address: String, msgIds: [Data]) {try! rustCall() {
@@ -1804,6 +1883,16 @@ public protocol MessageStoreProtocol : AnyObject {
      * paid to materialize up to the full 64 MiB carry budget regardless of
      * how little of it was actually new to the peer.
      *
+     * `after` resumes the walk: rows are restricted to those strictly after
+     * that `(received_at, msg_id)` point. Without it a courier whose backlog
+     * exceeds one round's budget re-read from the oldest row on every
+     * re-digest and re-offered the same head forever, so a peer whose digest
+     * cannot advertise the whole store (the advertised-id list is capped)
+     * never saw the young tail at all. The caller (the per-link-session
+     * policy in `transport_policy.rs`) hands back [`CoreCarriedSyncPage::next`]
+     * on the following round, so successive rounds walk the queue instead of
+     * re-treading its head. `None` starts a fresh full pass.
+     *
      * `budget_bytes` bounds one encounter's worth of foreign-carry offering
      * by summed sealed-byte size: rows are taken oldest first until the next
      * one would not fit, and then iteration stops (so the rest never has its
@@ -1824,7 +1913,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * not fit on the next round, so a big backlog is *paced* across rounds
      * instead of monopolizing a slow link's single FIFO in one burst.
      */
-    func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, budgetBytes: UInt64) throws  -> [CarriedEnvelope]
+    func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, budgetBytes: UInt64, after: CoreCarriedCursor?) throws  -> CoreCarriedSyncPage
     
     /**
      * Number of envelopes currently in the carry queue (diagnostics/tests).
@@ -2034,12 +2123,16 @@ public protocol MessageStoreProtocol : AnyObject {
      * down a BLE link's single FIFO queues everything behind it for minutes,
      * live replies to real contacts included. The cut bounds only what is
      * OFFERED this round -- the carry queue itself is untouched, and D8's
-     * 3-5 minute re-digest re-offers the remainder (still oldest first) on
-     * the next round, so a backlog is paced rather than dropped. Removal of
-     * a carried copy remains gated on digest-proof of receipt
-     * ([`Self::core_confirm_carried_deliveries`]); nothing here acks.
+     * 3-5 minute re-digest offers the *next* page on the next round, so a
+     * backlog is walked rather than dropped -- `carried_cursor` /
+     * `next_carried_cursor` carry the resume point between rounds of one
+     * link session. Before it existed each round re-read from the oldest row,
+     * so a store larger than one round's budget re-offered its head forever
+     * and its young tail starved. Removal of a carried copy remains gated on
+     * digest-proof of receipt ([`Self::core_confirm_carried_deliveries`]);
+     * nothing here acks.
      */
-    func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data]) throws  -> CoreDigestSprayPlan
+    func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data], carriedCursor: CoreCarriedCursor?) throws  -> CoreDigestSprayPlan
     
     /**
      * Record that this device consumed `msg_id` as the envelope's SOLE true
@@ -3389,6 +3482,16 @@ open func carriedEnvelopesForHints(hints: [Data], nowMs: Int64)throws  -> [Carri
      * paid to materialize up to the full 64 MiB carry budget regardless of
      * how little of it was actually new to the peer.
      *
+     * `after` resumes the walk: rows are restricted to those strictly after
+     * that `(received_at, msg_id)` point. Without it a courier whose backlog
+     * exceeds one round's budget re-read from the oldest row on every
+     * re-digest and re-offered the same head forever, so a peer whose digest
+     * cannot advertise the whole store (the advertised-id list is capped)
+     * never saw the young tail at all. The caller (the per-link-session
+     * policy in `transport_policy.rs`) hands back [`CoreCarriedSyncPage::next`]
+     * on the following round, so successive rounds walk the queue instead of
+     * re-treading its head. `None` starts a fresh full pass.
+     *
      * `budget_bytes` bounds one encounter's worth of foreign-carry offering
      * by summed sealed-byte size: rows are taken oldest first until the next
      * one would not fit, and then iteration stops (so the rest never has its
@@ -3409,13 +3512,14 @@ open func carriedEnvelopesForHints(hints: [Data], nowMs: Int64)throws  -> [Carri
      * not fit on the next round, so a big backlog is *paced* across rounds
      * instead of monopolizing a slow link's single FIFO in one burst.
      */
-open func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, budgetBytes: UInt64)throws  -> [CarriedEnvelope] {
-    return try  FfiConverterSequenceTypeCarriedEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+open func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, budgetBytes: UInt64, after: CoreCarriedCursor?)throws  -> CoreCarriedSyncPage {
+    return try  FfiConverterTypeCoreCarriedSyncPage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_carried_envelopes_for_peer_sync(self.uniffiClonePointer(),
         FfiConverterSequenceData.lower(peerHints),
         FfiConverterSequenceData.lower(peerKnownMsgIds),
         FfiConverterInt64.lower(nowMs),
-        FfiConverterUInt64.lower(budgetBytes),$0
+        FfiConverterUInt64.lower(budgetBytes),
+        FfiConverterOptionTypeCoreCarriedCursor.lower(after),$0
     )
 })
 }
@@ -3726,12 +3830,16 @@ open func coreDigestAdvertisedMsgIds()throws  -> [Data] {
      * down a BLE link's single FIFO queues everything behind it for minutes,
      * live replies to real contacts included. The cut bounds only what is
      * OFFERED this round -- the carry queue itself is untouched, and D8's
-     * 3-5 minute re-digest re-offers the remainder (still oldest first) on
-     * the next round, so a backlog is paced rather than dropped. Removal of
-     * a carried copy remains gated on digest-proof of receipt
-     * ([`Self::core_confirm_carried_deliveries`]); nothing here acks.
+     * 3-5 minute re-digest offers the *next* page on the next round, so a
+     * backlog is walked rather than dropped -- `carried_cursor` /
+     * `next_carried_cursor` carry the resume point between rounds of one
+     * link session. Before it existed each round re-read from the oldest row,
+     * so a store larger than one round's budget re-offered its head forever
+     * and its young tail starved. Removal of a carried copy remains gated on
+     * digest-proof of receipt ([`Self::core_confirm_carried_deliveries`]);
+     * nothing here acks.
      */
-open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data])throws  -> CoreDigestSprayPlan {
+open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data], carriedCursor: CoreCarriedCursor?)throws  -> CoreDigestSprayPlan {
     return try  FfiConverterTypeCoreDigestSprayPlan.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_core_digest_spray_plan(self.uniffiClonePointer(),
         FfiConverterData.lower(ownUserId),
@@ -3744,7 +3852,8 @@ open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Dat
         FfiConverterUInt64.lower(ownReceiptBudgetBytes),
         FfiConverterUInt64.lower(receiptQueryLimit),
         FfiConverterBool.lower(peerAcksHiddenKinds),
-        FfiConverterSequenceData.lower(hiddenAlreadyOffered),$0
+        FfiConverterSequenceData.lower(hiddenAlreadyOffered),
+        FfiConverterOptionTypeCoreCarriedCursor.lower(carriedCursor),$0
     )
 })
 }
@@ -6684,6 +6793,266 @@ public func FfiConverterTypeCoreBackupPayload_lower(_ value: CoreBackupPayload) 
 
 
 /**
+ * A resume point in the carry queue's `(received_at, msg_id)` order --
+ * "everything at or before this row has already been offered to this peer
+ * during this link session".
+ *
+ * Both fields together, because `received_at` alone is not unique: two
+ * envelopes accepted in the same millisecond would otherwise let a cursor
+ * either skip one or re-offer one forever. `msg_id` is the table's primary
+ * key, so the pair is a total order over the queue and matches the
+ * `ORDER BY received_at ASC, msg_id ASC` every carried query already uses.
+ *
+ * This is offering bookkeeping only. It never removes anything: a carried
+ * copy is still dropped only on digest-proof of receipt
+ * ([`MessageStore::core_confirm_carried_deliveries`]), eviction, or expiry.
+ */
+public struct CoreCarriedCursor {
+    public var receivedAt: Int64
+    public var msgId: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(receivedAt: Int64, msgId: Data) {
+        self.receivedAt = receivedAt
+        self.msgId = msgId
+    }
+}
+
+
+
+extension CoreCarriedCursor: Equatable, Hashable {
+    public static func ==(lhs: CoreCarriedCursor, rhs: CoreCarriedCursor) -> Bool {
+        if lhs.receivedAt != rhs.receivedAt {
+            return false
+        }
+        if lhs.msgId != rhs.msgId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(receivedAt)
+        hasher.combine(msgId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreCarriedCursor: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreCarriedCursor {
+        return
+            try CoreCarriedCursor(
+                receivedAt: FfiConverterInt64.read(from: &buf), 
+                msgId: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreCarriedCursor, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.receivedAt, into: &buf)
+        FfiConverterData.write(value.msgId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreCarriedCursor_lift(_ buf: RustBuffer) throws -> CoreCarriedCursor {
+    return try FfiConverterTypeCoreCarriedCursor.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreCarriedCursor_lower(_ value: CoreCarriedCursor) -> RustBuffer {
+    return FfiConverterTypeCoreCarriedCursor.lower(value)
+}
+
+
+/**
+ * What the foreign-carry lane should do on this link right now
+ * ([`CoreMeshRouterState::carried_lane_for`]).
+ */
+public struct CoreCarriedLane {
+    /**
+     * Offer no carried frames at all this round: the walk is complete and
+     * still inside its re-walk cooldown.
+     */
+    public var skip: Bool
+    /**
+     * Resume point to hand to the spray plan. `None` is a fresh full pass.
+     */
+    public var after: CoreCarriedCursor?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Offer no carried frames at all this round: the walk is complete and
+         * still inside its re-walk cooldown.
+         */skip: Bool, 
+        /**
+         * Resume point to hand to the spray plan. `None` is a fresh full pass.
+         */after: CoreCarriedCursor?) {
+        self.skip = skip
+        self.after = after
+    }
+}
+
+
+
+extension CoreCarriedLane: Equatable, Hashable {
+    public static func ==(lhs: CoreCarriedLane, rhs: CoreCarriedLane) -> Bool {
+        if lhs.skip != rhs.skip {
+            return false
+        }
+        if lhs.after != rhs.after {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(skip)
+        hasher.combine(after)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreCarriedLane: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreCarriedLane {
+        return
+            try CoreCarriedLane(
+                skip: FfiConverterBool.read(from: &buf), 
+                after: FfiConverterOptionTypeCoreCarriedCursor.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreCarriedLane, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.skip, into: &buf)
+        FfiConverterOptionTypeCoreCarriedCursor.write(value.after, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreCarriedLane_lift(_ buf: RustBuffer) throws -> CoreCarriedLane {
+    return try FfiConverterTypeCoreCarriedLane.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreCarriedLane_lower(_ value: CoreCarriedLane) -> RustBuffer {
+    return FfiConverterTypeCoreCarriedLane.lower(value)
+}
+
+
+/**
+ * One page of [`MessageStore::carried_envelopes_for_peer_sync`].
+ */
+public struct CoreCarriedSyncPage {
+    public var rows: [CarriedEnvelope]
+    /**
+     * Resume point for the next page: the last row on this one, or `None`
+     * if the page is empty (nothing to resume past).
+     */
+    public var next: CoreCarriedCursor?
+    /**
+     * Whether the scan reached the tail of the queue rather than stopping on
+     * the byte budget. `true` means the walk is complete: everything this
+     * peer is eligible to be offered has now been offered.
+     */
+    public var exhausted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(rows: [CarriedEnvelope], 
+        /**
+         * Resume point for the next page: the last row on this one, or `None`
+         * if the page is empty (nothing to resume past).
+         */next: CoreCarriedCursor?, 
+        /**
+         * Whether the scan reached the tail of the queue rather than stopping on
+         * the byte budget. `true` means the walk is complete: everything this
+         * peer is eligible to be offered has now been offered.
+         */exhausted: Bool) {
+        self.rows = rows
+        self.next = next
+        self.exhausted = exhausted
+    }
+}
+
+
+
+extension CoreCarriedSyncPage: Equatable, Hashable {
+    public static func ==(lhs: CoreCarriedSyncPage, rhs: CoreCarriedSyncPage) -> Bool {
+        if lhs.rows != rhs.rows {
+            return false
+        }
+        if lhs.next != rhs.next {
+            return false
+        }
+        if lhs.exhausted != rhs.exhausted {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(rows)
+        hasher.combine(next)
+        hasher.combine(exhausted)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreCarriedSyncPage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreCarriedSyncPage {
+        return
+            try CoreCarriedSyncPage(
+                rows: FfiConverterSequenceTypeCarriedEnvelope.read(from: &buf), 
+                next: FfiConverterOptionTypeCoreCarriedCursor.read(from: &buf), 
+                exhausted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreCarriedSyncPage, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeCarriedEnvelope.write(value.rows, into: &buf)
+        FfiConverterOptionTypeCoreCarriedCursor.write(value.next, into: &buf)
+        FfiConverterBool.write(value.exhausted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreCarriedSyncPage_lift(_ buf: RustBuffer) throws -> CoreCarriedSyncPage {
+    return try FfiConverterTypeCoreCarriedSyncPage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreCarriedSyncPage_lower(_ value: CoreCarriedSyncPage) -> RustBuffer {
+    return FfiConverterTypeCoreCarriedSyncPage.lower(value)
+}
+
+
+/**
  * One link found in a message body.
  *
  * The range is half-open in **UTF-16 code units** over the body that was
@@ -6816,6 +7185,19 @@ public struct CoreDigestSprayPlan {
      * when the peer advertised CAP_ACKS_HIDDEN_KINDS.
      */
     public var offeredHiddenMsgIds: [Data]
+    /**
+     * Resume point for this link session's next carried-lane round: the last
+     * carried row this plan offered, or `None` if it offered none. The shell
+     * hands it straight back via `record_carried_progress`. It is offering
+     * bookkeeping only, never a delete signal.
+     */
+    public var nextCarriedCursor: CoreCarriedCursor?
+    /**
+     * Whether the carried lane reached the tail of the queue this round --
+     * i.e. this peer has now been offered everything it is eligible for, so
+     * the lane can park until the re-walk cooldown elapses.
+     */
+    public var carriedExhausted: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -6826,11 +7208,24 @@ public struct CoreDigestSprayPlan {
          * (`record_hidden_offered`) after sending, so the next plan for this
          * session excludes them — the once-per-session re-spray bound. Empty
          * when the peer advertised CAP_ACKS_HIDDEN_KINDS.
-         */offeredHiddenMsgIds: [Data]) {
+         */offeredHiddenMsgIds: [Data], 
+        /**
+         * Resume point for this link session's next carried-lane round: the last
+         * carried row this plan offered, or `None` if it offered none. The shell
+         * hands it straight back via `record_carried_progress`. It is offering
+         * bookkeeping only, never a delete signal.
+         */nextCarriedCursor: CoreCarriedCursor?, 
+        /**
+         * Whether the carried lane reached the tail of the queue this round --
+         * i.e. this peer has now been offered everything it is eligible for, so
+         * the lane can park until the re-walk cooldown elapses.
+         */carriedExhausted: Bool) {
         self.carriedFrames = carriedFrames
         self.ownOutboundFrames = ownOutboundFrames
         self.ownReceiptFrames = ownReceiptFrames
         self.offeredHiddenMsgIds = offeredHiddenMsgIds
+        self.nextCarriedCursor = nextCarriedCursor
+        self.carriedExhausted = carriedExhausted
     }
 }
 
@@ -6850,6 +7245,12 @@ extension CoreDigestSprayPlan: Equatable, Hashable {
         if lhs.offeredHiddenMsgIds != rhs.offeredHiddenMsgIds {
             return false
         }
+        if lhs.nextCarriedCursor != rhs.nextCarriedCursor {
+            return false
+        }
+        if lhs.carriedExhausted != rhs.carriedExhausted {
+            return false
+        }
         return true
     }
 
@@ -6858,6 +7259,8 @@ extension CoreDigestSprayPlan: Equatable, Hashable {
         hasher.combine(ownOutboundFrames)
         hasher.combine(ownReceiptFrames)
         hasher.combine(offeredHiddenMsgIds)
+        hasher.combine(nextCarriedCursor)
+        hasher.combine(carriedExhausted)
     }
 }
 
@@ -6872,7 +7275,9 @@ public struct FfiConverterTypeCoreDigestSprayPlan: FfiConverterRustBuffer {
                 carriedFrames: FfiConverterSequenceData.read(from: &buf), 
                 ownOutboundFrames: FfiConverterSequenceData.read(from: &buf), 
                 ownReceiptFrames: FfiConverterSequenceData.read(from: &buf), 
-                offeredHiddenMsgIds: FfiConverterSequenceData.read(from: &buf)
+                offeredHiddenMsgIds: FfiConverterSequenceData.read(from: &buf), 
+                nextCarriedCursor: FfiConverterOptionTypeCoreCarriedCursor.read(from: &buf), 
+                carriedExhausted: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -6881,6 +7286,8 @@ public struct FfiConverterTypeCoreDigestSprayPlan: FfiConverterRustBuffer {
         FfiConverterSequenceData.write(value.ownOutboundFrames, into: &buf)
         FfiConverterSequenceData.write(value.ownReceiptFrames, into: &buf)
         FfiConverterSequenceData.write(value.offeredHiddenMsgIds, into: &buf)
+        FfiConverterOptionTypeCoreCarriedCursor.write(value.nextCarriedCursor, into: &buf)
+        FfiConverterBool.write(value.carriedExhausted, into: &buf)
     }
 }
 
@@ -13349,6 +13756,30 @@ fileprivate struct FfiConverterOptionTypeCoreAttachmentPayload: FfiConverterRust
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreCarriedCursor: FfiConverterRustBuffer {
+    typealias SwiftType = CoreCarriedCursor?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreCarriedCursor.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreCarriedCursor.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreLanEndpoint: FfiConverterRustBuffer {
     typealias SwiftType = CoreLanEndpoint?
 
@@ -17470,6 +17901,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corelanhealthtracker_response() != 52501) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_carried_lane_for() != 48707) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_clear() != 9925) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -17504,6 +17938,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_peer_acks_hidden_kinds() != 45296) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_record_carried_progress() != 6116) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_record_hidden_offered() != 41551) {
@@ -17599,7 +18036,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints() != 43270) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_peer_sync() != 7168) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_peer_sync() != 48539) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_len() != 13406) {
@@ -17656,7 +18093,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 45681) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 29904) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 15577) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_record_consumed_hidden_msg_id() != 37215) {
