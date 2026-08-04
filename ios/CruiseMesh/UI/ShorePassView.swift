@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-struct CruisePassView: View {
+struct ShorePassView: View {
     let initialCard: String?
     @ObservedObject var appModel: AppModel
     @ObservedObject private var connectivity = MeshConnectivityStatus.shared
@@ -343,10 +343,10 @@ struct CruisePassView: View {
     }
 
     // Verdict-driven, not health-driven: an in-flight re-check must not demote
-    // the heading (see CruisePassHeading.of), but any real answer other than
+    // the heading (see ShorePassHeading.of), but any real answer other than
     // OK takes the green check away at once.
-    private var heading: CruisePassHeading {
-        CruisePassHeading.of(
+    private var heading: ShorePassHeading {
+        ShorePassHeading.of(
             connectivity.relay,
             configured: configured != nil,
             lastVerdict: lastVerdict

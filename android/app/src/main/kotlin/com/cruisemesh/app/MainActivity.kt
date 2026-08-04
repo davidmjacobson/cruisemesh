@@ -112,7 +112,7 @@ import com.cruisemesh.app.ui.OnboardingScreen
 import com.cruisemesh.app.ui.ProfileScreen
 import com.cruisemesh.app.ui.TermsAcceptanceScreen
 import com.cruisemesh.app.ui.ConnectionDetailsScreen
-import com.cruisemesh.app.ui.CruisePassScreen
+import com.cruisemesh.app.ui.ShorePassScreen
 import com.cruisemesh.app.ui.HelpSupportScreen
 import com.cruisemesh.app.ui.InternalToolsScreen
 import com.cruisemesh.app.ui.SettingsScreen
@@ -292,13 +292,13 @@ fun CruiseMeshApp(
         }
         composable("help") {
             HelpSupportScreen(
-                onCruisePass = { navController.navigate("cruisePass") },
+                onShorePass = { navController.navigate("shorePass") },
                 onConnectionDetails = { navController.navigate("connectionDetails") },
                 onBack = { navController.popBackStack() },
             )
         }
         composable(
-            "cruisePass?card={card}",
+            "shorePass?card={card}",
             arguments = listOf(
                 navArgument("card") {
                     type = NavType.StringType
@@ -307,7 +307,7 @@ fun CruiseMeshApp(
                 },
             ),
         ) { entry ->
-            CruisePassScreen(
+            ShorePassScreen(
                 initialCard = entry.arguments?.getString("card"),
                 onBack = { navController.popBackStack() },
             )
@@ -350,7 +350,7 @@ fun CruiseMeshApp(
         val link = pendingDeepLink ?: return@LaunchedEffect
         if (!onboardingCompleted) return@LaunchedEffect
         link.relayCard?.let { relayCard ->
-            navController.navigate("cruisePass?card=${Uri.encode(relayCard)}") {
+            navController.navigate("shorePass?card=${Uri.encode(relayCard)}") {
                 launchSingleTop = true
             }
             onPendingDeepLinkConsumed()
@@ -627,7 +627,7 @@ private fun freshRelayHealthForDisplay(relayHealth: RelayHealth, nowMs: Long, pu
 private fun configuredInternetDeliveryService(context: Context): InternetDeliveryService? =
     RelayConfigStore.load(context)?.let { config ->
         if (relaySetupIsOfficial(config.relayUrl)) {
-            InternetDeliveryService.CRUISE_PASS
+            InternetDeliveryService.SHORE_PASS
         } else {
             InternetDeliveryService.CUSTOM_RELAY
         }
@@ -977,7 +977,7 @@ private fun SettingsRoute(identity: Identity, navController: NavHostController) 
     SettingsScreen(
         meshStatus = runtimeStatus.label,
         relayHealth = relayHealth,
-        onCruisePass = { navController.navigate("cruisePass") },
+        onShorePass = { navController.navigate("shorePass") },
         onConnectionDetails = { navController.navigate("connectionDetails") },
         onInternalTools = { navController.navigate("internalTools") },
         onBackUp = { navController.navigate("backup") },

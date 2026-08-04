@@ -1324,7 +1324,7 @@ internal class RelaySyncEngine(
                 runCatching {
                     store.recordPeerConnectionEvent(
                         contact.userId,
-                        PeerConnectionTransport.CRUISE_PASS,
+                        PeerConnectionTransport.SHORE_PASS,
                         PeerConnectionEventKind.PRESENCE_SEEN,
                         localSeenAt,
                     )

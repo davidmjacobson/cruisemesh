@@ -10,7 +10,7 @@ import javax.net.ssl.SSLException
 /**
  * Pure policy for the Shore Pass first-check flow, kept out of the
  * composable so it stays unit-testable. Mirrored by the private helpers in
- * iOS CruisePassView.
+ * iOS ShorePassView.
  */
 
 /**
@@ -25,19 +25,19 @@ fun shouldRetryFirstRelayCheck(error: Throwable): Boolean =
 /** Maps a failed relay check to the user-facing explanation. */
 fun relayCheckFailureRes(error: Throwable, hasValidatedInternet: Boolean): Int = when {
     (error as? RelayHttpException)?.relayCode == "family_expired" ->
-        R.string.ui_this_cruise_pass_has_expired
+        R.string.ui_this_shore_pass_has_expired
     (error as? RelayHttpException)?.relayCode == "family_suspended" ->
-        R.string.ui_this_cruise_pass_is_suspended
+        R.string.ui_this_shore_pass_is_suspended
     error is RelayHttpException ->
         R.string.ui_this_setup_card_was_rejected
     error is SocketTimeoutException ->
-        R.string.ui_cruise_pass_check_timed_out
+        R.string.ui_shore_pass_check_timed_out
     error is UnknownHostException ->
-        R.string.ui_cruise_pass_service_not_found
+        R.string.ui_shore_pass_service_not_found
     error is SSLException ->
-        R.string.ui_cruise_pass_secure_connection_failed
+        R.string.ui_shore_pass_secure_connection_failed
     !hasValidatedInternet ->
         R.string.ui_android_has_not_verified_internet
     else ->
-        R.string.ui_cruise_pass_check_failed_network
+        R.string.ui_shore_pass_check_failed_network
 }

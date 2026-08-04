@@ -16,7 +16,7 @@ class MeshStatusTextLogicTest {
             MeshRuntimeState.ACTIVE,
             3,
             RelayHealth.Ok(0L),
-            InternetDeliveryService.CRUISE_PASS,
+            InternetDeliveryService.SHORE_PASS,
         )
         assertEquals("Mesh on · 3 nearby · Shore Pass ✓", status.text)
         assertEquals(MeshStatusDotColor.GREEN, status.dot)
@@ -28,7 +28,7 @@ class MeshStatusTextLogicTest {
             MeshRuntimeState.ACTIVE,
             0,
             RelayHealth.Ok(0L),
-            InternetDeliveryService.CRUISE_PASS,
+            InternetDeliveryService.SHORE_PASS,
         )
         assertEquals("Mesh on · Shore Pass ✓", status.text)
         assertEquals(MeshStatusDotColor.BLUE, status.dot)
@@ -40,7 +40,7 @@ class MeshStatusTextLogicTest {
             MeshRuntimeState.ACTIVE,
             2,
             RelayHealth.NoInternet,
-            InternetDeliveryService.CRUISE_PASS,
+            InternetDeliveryService.SHORE_PASS,
         )
         assertEquals("Mesh on · 2 nearby · no internet", status.text)
         assertEquals(MeshStatusDotColor.GREEN, status.dot)
@@ -52,7 +52,7 @@ class MeshStatusTextLogicTest {
             MeshRuntimeState.ACTIVE,
             0,
             RelayHealth.NoInternet,
-            InternetDeliveryService.CRUISE_PASS,
+            InternetDeliveryService.SHORE_PASS,
         )
         assertEquals("Mesh on · offline", status.text)
         assertEquals(MeshStatusDotColor.AMBER, status.dot)
@@ -64,7 +64,7 @@ class MeshStatusTextLogicTest {
             MeshRuntimeState.ACTIVE,
             0,
             RelayHealth.Failing(0L),
-            InternetDeliveryService.CRUISE_PASS,
+            InternetDeliveryService.SHORE_PASS,
         )
         assertEquals("Mesh on · Shore Pass unreachable", status.text)
         assertEquals(MeshStatusDotColor.AMBER, status.dot)
@@ -76,7 +76,7 @@ class MeshStatusTextLogicTest {
             MeshRuntimeState.ACTIVE,
             0,
             RelayHealth.TokenRejected(0L),
-            InternetDeliveryService.CRUISE_PASS,
+            InternetDeliveryService.SHORE_PASS,
         )
         assertEquals("Mesh on · Shore Pass token rejected", status.text)
         assertEquals(MeshStatusDotColor.AMBER, status.dot)
@@ -160,7 +160,7 @@ class MeshStatusTextLogicTest {
                 MeshRuntimeState.ACTIVE,
                 0,
                 health,
-                InternetDeliveryService.CRUISE_PASS,
+                InternetDeliveryService.SHORE_PASS,
             ).text
             assertFalse(copy.contains("relay", ignoreCase = true))
         }
@@ -187,7 +187,7 @@ class MeshStatusTextLogicTest {
                 state,
                 5,
                 RelayHealth.Ok(0L),
-                InternetDeliveryService.CRUISE_PASS,
+                InternetDeliveryService.SHORE_PASS,
             )
             assertEquals(state.label, status.text)
             assertEquals(MeshStatusDotColor.NEUTRAL, status.dot)

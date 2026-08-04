@@ -40,7 +40,7 @@ struct ChatListView: View {
     @State private var showMeshHelp = false
     @State private var showSettings = false
     @State private var showConnectionDetails = false
-    @State private var showCruisePass = false
+    @State private var showShorePass = false
     @State private var showHelp = false
     @State private var cancellable: AnyCancellable?
     @State private var bluetoothAudioWarningDismissed = false
@@ -266,11 +266,11 @@ struct ChatListView: View {
             .sheet(isPresented: $showConnectionDetails) {
                 ConnectionDetailsView()
             }
-            .sheet(isPresented: $showCruisePass, onDismiss: {
+            .sheet(isPresented: $showShorePass, onDismiss: {
                 appModel.pendingRelayCard = nil
             }) {
                 NavigationStack {
-                    CruisePassView(initialCard: appModel.pendingRelayCard, appModel: appModel)
+                    ShorePassView(initialCard: appModel.pendingRelayCard, appModel: appModel)
                 }
             }
             .sheet(isPresented: $showHelp) {
@@ -292,7 +292,7 @@ struct ChatListView: View {
                     FriendDirectorySender.queueToAllContacts(store: AppStore.get(), identity: identity)
                 }
                 if appModel.pendingFriendToken != nil { showFriends = true }
-                if appModel.pendingRelayCard != nil { showCruisePass = true }
+                if appModel.pendingRelayCard != nil { showShorePass = true }
             }
             .onChange(of: runtime.bluetoothAudioConnected) { connected in
                 if connected { return }
@@ -302,7 +302,7 @@ struct ChatListView: View {
                 if token != nil { showFriends = true }
             }
             .onChange(of: appModel.pendingRelayCard) { card in
-                if card != nil { showCruisePass = true }
+                if card != nil { showShorePass = true }
             }
             .onReceive(NotificationOpenEvents.subject) { event in
                 let (chatId, isGroup) = event

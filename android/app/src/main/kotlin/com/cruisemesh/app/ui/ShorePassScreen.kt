@@ -53,11 +53,11 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.R
-import com.cruisemesh.app.mesh.CruisePassHeading
+import com.cruisemesh.app.mesh.ShorePassHeading
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.mesh.RelaySyncEvents
-import com.cruisemesh.app.mesh.cruisePassHeading
+import com.cruisemesh.app.mesh.shorePassHeading
 import com.cruisemesh.app.mesh.isPassVerdict
 import com.cruisemesh.app.mesh.relayCheckFailureRes
 import com.cruisemesh.app.mesh.shouldRetryFirstRelayCheck
@@ -86,7 +86,7 @@ private sealed class PassSetupState {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
+fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val relayHealth by MeshConnectivityStatus.relay.collectAsState()
@@ -131,7 +131,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
             val firstError = result.exceptionOrNull()
             if (firstError != null && shouldRetryFirstRelayCheck(firstError)) {
                 Log.i(
-                    "CruisePassSetup",
+                    "ShorePassSetup",
                     "Retrying initial check after ${firstError.javaClass.simpleName}",
                 )
                 delay(750)
@@ -151,7 +151,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                     unverifiedSetup = setup
                 }
                 Log.w(
-                    "CruisePassSetup",
+                    "ShorePassSetup",
                     "Check failed for ${relayHost(setup.relayUrl)}: ${error.javaClass.simpleName}",
                     error,
                 )
@@ -204,9 +204,9 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                     Text(
                         stringResource(
                             if (initialCard.isNullOrBlank()) {
-                                R.string.ui_cruise_pass
+                                R.string.ui_shore_pass
                             } else {
-                                R.string.ui_setting_up_cruise_pass
+                                R.string.ui_setting_up_shore_pass
                             },
                         ),
                     )
@@ -230,7 +230,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                 when (val state = setupState) {
                     PassSetupState.Idle, PassSetupState.Testing -> {
                         Text(
-                            stringResource(R.string.ui_checking_your_cruise_pass),
+                            stringResource(R.string.ui_checking_your_shore_pass),
                             style = MaterialTheme.typography.headlineSmall,
                         )
                         Row(
@@ -242,11 +242,11 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                         }
                     }
                     is PassSetupState.Saved -> {
-                        CruisePassReadyHeading(
+                        ShorePassReadyHeading(
                             text = stringResource(R.string.ui_you_are_all_set),
                         )
                         Text(
-                            stringResource(R.string.ui_cruise_pass_is_ready_on_this_phone),
+                            stringResource(R.string.ui_shore_pass_is_ready_on_this_phone),
                             modifier = Modifier.padding(top = 8.dp),
                         )
                         Button(
@@ -270,7 +270,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                     }
                     is PassSetupState.Failed -> {
                         Text(
-                            stringResource(R.string.ui_cruise_pass_wasnt_set_up),
+                            stringResource(R.string.ui_shore_pass_wasnt_set_up),
                             style = MaterialTheme.typography.headlineSmall,
                         )
                         Text(
@@ -305,22 +305,22 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                 }
             } else {
                 // Verdict-driven, not health-driven: an in-flight re-check must
-                // not demote the heading (see cruisePassHeading), but any real
+                // not demote the heading (see shorePassHeading), but any real
                 // answer other than OK takes the green check away at once.
-                when (cruisePassHeading(relayHealth, configured != null, lastVerdict)) {
-                    CruisePassHeading.READY -> CruisePassReadyHeading(
-                        text = stringResource(R.string.ui_cruise_pass_is_set_up),
+                when (shorePassHeading(relayHealth, configured != null, lastVerdict)) {
+                    ShorePassHeading.READY -> ShorePassReadyHeading(
+                        text = stringResource(R.string.ui_shore_pass_is_set_up),
                     )
-                    CruisePassHeading.NOT_SET_UP -> Text(
-                        stringResource(R.string.ui_set_up_your_cruise_pass),
+                    ShorePassHeading.NOT_SET_UP -> Text(
+                        stringResource(R.string.ui_set_up_your_shore_pass),
                         style = MaterialTheme.typography.headlineSmall,
                     )
-                    CruisePassHeading.CHECKING -> Text(
-                        stringResource(R.string.ui_checking_your_cruise_pass),
+                    ShorePassHeading.CHECKING -> Text(
+                        stringResource(R.string.ui_checking_your_shore_pass),
                         style = MaterialTheme.typography.headlineSmall,
                     )
-                    CruisePassHeading.CONFIGURED -> Text(
-                        stringResource(R.string.ui_cruise_pass_is_configured),
+                    ShorePassHeading.CONFIGURED -> Text(
+                        stringResource(R.string.ui_shore_pass_is_configured),
                         style = MaterialTheme.typography.headlineSmall,
                     )
                 }
@@ -393,7 +393,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                             showManualEntry = true
                         },
                         modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
-                    ) { Text(stringResource(R.string.ui_use_a_different_cruise_pass)) }
+                    ) { Text(stringResource(R.string.ui_use_a_different_shore_pass)) }
                 }
 
                 when (val state = setupState) {
@@ -461,7 +461,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                     TextButton(
                         onClick = { showRemoveConfirmation = true },
                         modifier = Modifier.fillMaxWidth(),
-                    ) { Text(stringResource(R.string.ui_remove_cruise_pass_setup)) }
+                    ) { Text(stringResource(R.string.ui_remove_shore_pass_setup)) }
                 }
 
                 Spacer(modifier = Modifier.height(20.dp))
@@ -522,7 +522,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
                 pending = null
                 if (!initialCard.isNullOrBlank()) onBack()
             },
-            title = { Text(stringResource(R.string.ui_replace_cruise_pass)) },
+            title = { Text(stringResource(R.string.ui_replace_shore_pass)) },
             text = {
                 Column {
                     val current = configured
@@ -619,7 +619,7 @@ fun CruisePassScreen(initialCard: String?, onBack: () -> Unit) {
     if (showRemoveConfirmation) {
         AlertDialog(
             onDismissRequest = { showRemoveConfirmation = false },
-            title = { Text(stringResource(R.string.ui_remove_cruise_pass_setup_confirm)) },
+            title = { Text(stringResource(R.string.ui_remove_shore_pass_setup_confirm)) },
             text = { Text(stringResource(R.string.ui_queued_internet_delivery_will_stop_until_another_cruise)) },
             confirmButton = {
                 TextButton(
@@ -655,11 +655,11 @@ private fun hasValidatedInternet(context: Context): Boolean {
 }
 
 @Composable
-private fun CruisePassReadyHeading(text: String) {
+private fun ShorePassReadyHeading(text: String) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Icon(
             Icons.Filled.CheckCircle,
-            contentDescription = stringResource(R.string.ui_cruise_pass_ready),
+            contentDescription = stringResource(R.string.ui_shore_pass_ready),
             tint = LocalReachabilityPalette.current.nearby,
             modifier = Modifier.padding(end = 10.dp).size(28.dp),
         )
@@ -684,9 +684,9 @@ private fun passStatus(health: RelayHealth, setupState: PassSetupState): String 
         is RelayHealth.Expired -> "Pass expired · renewal required"
         is RelayHealth.Suspended -> "Pass suspended · contact support"
         is RelayHealth.TokenRejected -> "Setup card rejected"
-        is RelayHealth.QuotaFull -> stringResource(R.string.ui_cruise_pass_storage_full_status)
-        is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_cruise_pass_message_too_large_status)
-        is RelayHealth.RateLimited -> stringResource(R.string.ui_cruise_pass_slowed_status)
+        is RelayHealth.QuotaFull -> stringResource(R.string.ui_shore_pass_storage_full_status)
+        is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_shore_pass_message_too_large_status)
+        is RelayHealth.RateLimited -> stringResource(R.string.ui_shore_pass_slowed_status)
     }
 }
 
@@ -697,9 +697,9 @@ private fun passStatus(health: RelayHealth, setupState: PassSetupState): String 
  */
 @Composable
 private fun passStatusExplanation(health: RelayHealth): String? = when (health) {
-    is RelayHealth.QuotaFull -> stringResource(R.string.ui_cruise_pass_storage_full_explanation)
-    is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_cruise_pass_message_too_large_explanation)
-    is RelayHealth.RateLimited -> stringResource(R.string.ui_cruise_pass_slowed_explanation)
+    is RelayHealth.QuotaFull -> stringResource(R.string.ui_shore_pass_storage_full_explanation)
+    is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_shore_pass_message_too_large_explanation)
+    is RelayHealth.RateLimited -> stringResource(R.string.ui_shore_pass_slowed_explanation)
     else -> null
 }
 

@@ -109,7 +109,7 @@ extension RelayHealth {
 /// Heading shown at the top of the Shore Pass screen.
 ///
 /// Mirrors Android's `PassIndicator.kt` -- keep the two mappings in step.
-enum CruisePassHeading {
+enum ShorePassHeading {
     /// No setup card saved: invite them to add one.
     case notSetUp
 
@@ -141,7 +141,7 @@ enum CruisePassHeading {
         _ health: RelayHealth,
         configured: Bool,
         lastVerdict: RelayHealth?
-    ) -> CruisePassHeading {
+    ) -> ShorePassHeading {
         guard configured else { return .notSetUp }
         guard let settled = health.isPassVerdict ? health : lastVerdict else { return .checking }
         if case .ok = settled { return .ready }

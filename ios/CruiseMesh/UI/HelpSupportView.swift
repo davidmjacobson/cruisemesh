@@ -9,7 +9,7 @@ struct HelpSupportView: View {
             List {
                 Section("Shore Pass") {
                     NavigationLink {
-                        CruisePassView(initialCard: nil, appModel: appModel)
+                        ShorePassView(initialCard: nil, appModel: appModel)
                     } label: {
                         VStack(alignment: .leading, spacing: 3) {
                             Text("Set up or fix Shore Pass")

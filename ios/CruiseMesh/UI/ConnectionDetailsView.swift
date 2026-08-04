@@ -336,7 +336,7 @@ struct ConnectionDetailsView: View {
         switch transport {
         case .bluetooth: return String(localized: "Bluetooth")
         case .localWifi: return String(localized: "local Wi-Fi")
-        case .cruisePass: return String(localized: "Shore Pass")
+        case .shorePass: return String(localized: "Shore Pass")
         case .carried: return nil
         }
     }

@@ -150,14 +150,14 @@ final class PassIndicatorTests: XCTestCase {
 
     func testHeadingInvitesSetupWhateverTheStaleHealthSays() {
         XCTAssertEqual(
-            CruisePassHeading.of(.ok(lastSyncMs: now), configured: false, lastVerdict: .ok(lastSyncMs: now)),
+            ShorePassHeading.of(.ok(lastSyncMs: now), configured: false, lastVerdict: .ok(lastSyncMs: now)),
             .notSetUp
         )
     }
 
     func testHeadingReadsAsSetUpWhenTheRelayAnswersOk() {
         XCTAssertEqual(
-            CruisePassHeading.of(.ok(lastSyncMs: now), configured: true, lastVerdict: nil),
+            ShorePassHeading.of(.ok(lastSyncMs: now), configured: true, lastVerdict: nil),
             .ready
         )
     }
@@ -170,7 +170,7 @@ final class PassIndicatorTests: XCTestCase {
         // flight is not evidence against the pass, so the heading must hold.
         for health in [RelayHealth.checking, .noConfig] {
             XCTAssertEqual(
-                CruisePassHeading.of(health, configured: true, lastVerdict: .ok(lastSyncMs: now)),
+                ShorePassHeading.of(health, configured: true, lastVerdict: .ok(lastSyncMs: now)),
                 .ready,
                 "\(health) is an absent answer, not a failing one"
             )
@@ -180,7 +180,7 @@ final class PassIndicatorTests: XCTestCase {
     func testASavedPassWithNoAnswerYetSaysItIsBeingChecked() {
         for health in [RelayHealth.checking, .noConfig] {
             XCTAssertEqual(
-                CruisePassHeading.of(health, configured: true, lastVerdict: nil),
+                ShorePassHeading.of(health, configured: true, lastVerdict: nil),
                 .checking,
                 "\(health)"
             )
@@ -203,7 +203,7 @@ final class PassIndicatorTests: XCTestCase {
         ]
         for health in healths {
             XCTAssertEqual(
-                CruisePassHeading.of(health, configured: true, lastVerdict: .ok(lastSyncMs: now)),
+                ShorePassHeading.of(health, configured: true, lastVerdict: .ok(lastSyncMs: now)),
                 .configured,
                 "\(health) is an answer and must beat the previous OK"
             )
@@ -212,7 +212,7 @@ final class PassIndicatorTests: XCTestCase {
 
     func testACheckInFlightHoldsAFailingVerdictToo() {
         XCTAssertEqual(
-            CruisePassHeading.of(.checking, configured: true, lastVerdict: .tokenRejected(lastAttemptMs: now)),
+            ShorePassHeading.of(.checking, configured: true, lastVerdict: .tokenRejected(lastAttemptMs: now)),
             .configured
         )
     }

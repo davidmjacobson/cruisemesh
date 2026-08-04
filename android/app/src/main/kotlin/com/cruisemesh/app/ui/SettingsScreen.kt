@@ -58,7 +58,7 @@ const val SUPPORT_URL = "https://cruisemesh.app/support/"
 fun SettingsScreen(
     meshStatus: String,
     relayHealth: RelayHealth,
-    onCruisePass: () -> Unit,
+    onShorePass: () -> Unit,
     onConnectionDetails: () -> Unit,
     onInternalTools: () -> Unit,
     onBackUp: () -> Unit,
@@ -101,7 +101,7 @@ fun SettingsScreen(
                     title = relayTitle(relayHealth, relayConfigured),
                     detail = relayDetail(relayHealth, relayConfigured),
                     indicator = passIndicator(relayHealth, relayConfigured),
-                    onClick = onCruisePass,
+                    onClick = onShorePass,
                 )
             }
 
@@ -241,9 +241,9 @@ private fun relayTitle(health: RelayHealth, configured: Boolean): String {
         is RelayHealth.Expired -> "Shore Pass expired"
         is RelayHealth.Suspended -> "Shore Pass suspended"
         is RelayHealth.TokenRejected -> "Shore Pass setup was rejected"
-        is RelayHealth.QuotaFull -> stringResource(R.string.ui_cruise_pass_storage_full_title)
-        is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_cruise_pass_message_too_large_title)
-        is RelayHealth.RateLimited -> stringResource(R.string.ui_cruise_pass_slowed_title)
+        is RelayHealth.QuotaFull -> stringResource(R.string.ui_shore_pass_storage_full_title)
+        is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_shore_pass_message_too_large_title)
+        is RelayHealth.RateLimited -> stringResource(R.string.ui_shore_pass_slowed_title)
     }
 }
 
@@ -259,9 +259,9 @@ private fun relayDetail(health: RelayHealth, configured: Boolean): String {
         is RelayHealth.Expired -> "Renew your pass to resume internet delivery."
         is RelayHealth.Suspended -> "Contact support for help with this pass."
         is RelayHealth.TokenRejected -> "Paste the setup card again, or use a different Shore Pass."
-        is RelayHealth.QuotaFull -> stringResource(R.string.ui_cruise_pass_storage_full_detail)
-        is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_cruise_pass_message_too_large_detail)
-        is RelayHealth.RateLimited -> stringResource(R.string.ui_cruise_pass_slowed_detail)
+        is RelayHealth.QuotaFull -> stringResource(R.string.ui_shore_pass_storage_full_detail)
+        is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_shore_pass_message_too_large_detail)
+        is RelayHealth.RateLimited -> stringResource(R.string.ui_shore_pass_slowed_detail)
     }
 }
 
@@ -316,22 +316,22 @@ private fun passIndicatorIcon(
         PassIndicator.READY -> Triple(
             Icons.Filled.CheckCircle,
             palette.nearby,
-            stringResource(R.string.ui_cruise_pass_ready),
+            stringResource(R.string.ui_shore_pass_ready),
         )
         PassIndicator.WAITING -> Triple(
             Icons.Filled.Info,
             palette.neutral,
-            stringResource(R.string.ui_cruise_pass_waiting_for_internet),
+            stringResource(R.string.ui_shore_pass_waiting_for_internet),
         )
         PassIndicator.ATTENTION -> Triple(
             PassQuestionIcon,
             palette.recent,
-            stringResource(R.string.ui_cruise_pass_needs_attention),
+            stringResource(R.string.ui_shore_pass_needs_attention),
         )
         PassIndicator.ACTION_REQUIRED -> Triple(
             PassExclamationIcon,
             MaterialTheme.colorScheme.error,
-            stringResource(R.string.ui_cruise_pass_needs_action),
+            stringResource(R.string.ui_shore_pass_needs_action),
         )
     }
 }

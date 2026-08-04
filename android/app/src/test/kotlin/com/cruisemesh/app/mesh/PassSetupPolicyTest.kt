@@ -39,11 +39,11 @@ class PassSetupPolicyTest {
     @Test
     fun `relay verdicts map to their specific explanations`() {
         assertEquals(
-            R.string.ui_this_cruise_pass_has_expired,
+            R.string.ui_this_shore_pass_has_expired,
             relayCheckFailureRes(RelayHttpException(403, "family_expired", "x"), true),
         )
         assertEquals(
-            R.string.ui_this_cruise_pass_is_suspended,
+            R.string.ui_this_shore_pass_is_suspended,
             relayCheckFailureRes(RelayHttpException(403, "family_suspended", "x"), true),
         )
         assertEquals(
@@ -57,15 +57,15 @@ class PassSetupPolicyTest {
         // A timeout with validated internet is still reported as a timeout;
         // the connectivity hint is only for the otherwise-unexplained case.
         assertEquals(
-            R.string.ui_cruise_pass_check_timed_out,
+            R.string.ui_shore_pass_check_timed_out,
             relayCheckFailureRes(SocketTimeoutException("t"), false),
         )
         assertEquals(
-            R.string.ui_cruise_pass_service_not_found,
+            R.string.ui_shore_pass_service_not_found,
             relayCheckFailureRes(UnknownHostException("h"), false),
         )
         assertEquals(
-            R.string.ui_cruise_pass_secure_connection_failed,
+            R.string.ui_shore_pass_secure_connection_failed,
             relayCheckFailureRes(SSLException("s"), false),
         )
     }
@@ -77,7 +77,7 @@ class PassSetupPolicyTest {
             relayCheckFailureRes(IOException("reset"), false),
         )
         assertEquals(
-            R.string.ui_cruise_pass_check_failed_network,
+            R.string.ui_shore_pass_check_failed_network,
             relayCheckFailureRes(IOException("reset"), true),
         )
     }
