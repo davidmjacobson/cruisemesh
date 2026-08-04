@@ -1939,6 +1939,22 @@ public protocol MessageStoreProtocol : AnyObject {
     func chatDigest(chatId: Data) throws  -> [DigestEntry]
     
     /**
+     * Arrival times for every message in `chat_id` that has one, for
+     * [`crate::late_arrival`]'s displacement test.
+     *
+     * One query rather than a [`Self::message_arrival`] call per row: the
+     * shells recompute this on every conversation reload, and a per-bubble
+     * round trip across the FFI would put a store read back on the render
+     * path that FA4 moved off it.
+     *
+     * Rows we authored locally and rows stored before arrival diagnostics
+     * existed have no `received_at` and are simply absent -- callers treat a
+     * missing entry as "no recorded arrival", which is what
+     * [`crate::late_arrival::LateArrivalInput::arrival_ts_ms`] wants.
+     */
+    func chatReceivedTimes(chatId: Data) throws  -> [CoreMessageReceivedAt]
+    
+    /**
      * Forget every carried-upload marker, so the next sync pass offers the
      * whole (family, non-relay-sourced) carry queue for upload once more.
      * Called when a relay endpoint changes -- ours (a new Shore Pass, a
@@ -3559,6 +3575,28 @@ open func carriedMsgIds(limit: UInt64)throws  -> [Data] {
 open func chatDigest(chatId: Data)throws  -> [DigestEntry] {
     return try  FfiConverterSequenceTypeDigestEntry.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_chat_digest(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),$0
+    )
+})
+}
+    
+    /**
+     * Arrival times for every message in `chat_id` that has one, for
+     * [`crate::late_arrival`]'s displacement test.
+     *
+     * One query rather than a [`Self::message_arrival`] call per row: the
+     * shells recompute this on every conversation reload, and a per-bubble
+     * round trip across the FFI would put a store read back on the render
+     * path that FA4 moved off it.
+     *
+     * Rows we authored locally and rows stored before arrival diagnostics
+     * existed have no `received_at` and are simply absent -- callers treat a
+     * missing entry as "no recorded arrival", which is what
+     * [`crate::late_arrival::LateArrivalInput::arrival_ts_ms`] wants.
+     */
+open func chatReceivedTimes(chatId: Data)throws  -> [CoreMessageReceivedAt] {
+    return try  FfiConverterSequenceTypeCoreMessageReceivedAt.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_chat_received_times(self.uniffiClonePointer(),
         FfiConverterData.lower(chatId),$0
     )
 })
@@ -7612,6 +7650,85 @@ public func FfiConverterTypeCoreLanHealthDecision_lower(_ value: CoreLanHealthDe
 }
 
 
+/**
+ * When one message in a chat first reached this device, keyed by the
+ * (sender, lamport) pair that identifies it within that chat. Returned in
+ * bulk by [`MessageStore::chat_received_times`].
+ */
+public struct CoreMessageReceivedAt {
+    public var senderUserId: Data
+    public var lamport: UInt64
+    public var receivedAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(senderUserId: Data, lamport: UInt64, receivedAtMs: Int64) {
+        self.senderUserId = senderUserId
+        self.lamport = lamport
+        self.receivedAtMs = receivedAtMs
+    }
+}
+
+
+
+extension CoreMessageReceivedAt: Equatable, Hashable {
+    public static func ==(lhs: CoreMessageReceivedAt, rhs: CoreMessageReceivedAt) -> Bool {
+        if lhs.senderUserId != rhs.senderUserId {
+            return false
+        }
+        if lhs.lamport != rhs.lamport {
+            return false
+        }
+        if lhs.receivedAtMs != rhs.receivedAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(senderUserId)
+        hasher.combine(lamport)
+        hasher.combine(receivedAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreMessageReceivedAt: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreMessageReceivedAt {
+        return
+            try CoreMessageReceivedAt(
+                senderUserId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
+                receivedAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreMessageReceivedAt, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.senderUserId, into: &buf)
+        FfiConverterUInt64.write(value.lamport, into: &buf)
+        FfiConverterInt64.write(value.receivedAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMessageReceivedAt_lift(_ buf: RustBuffer) throws -> CoreMessageReceivedAt {
+    return try FfiConverterTypeCoreMessageReceivedAt.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMessageReceivedAt_lower(_ value: CoreMessageReceivedAt) -> RustBuffer {
+    return FfiConverterTypeCoreMessageReceivedAt.lower(value)
+}
+
+
 public struct CoreMessageTarget {
     public var senderUserId: Data
     public var lamport: UInt64
@@ -9726,6 +9843,115 @@ public func FfiConverterTypeLanEndpointContent_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeLanEndpointContent_lower(_ value: LanEndpointContent) -> RustBuffer {
     return FfiConverterTypeLanEndpointContent.lower(value)
+}
+
+
+/**
+ * One row of the conversation as displayed, oldest first.
+ */
+public struct LateArrivalInput {
+    /**
+     * The author-clock timestamp this row renders with
+     * (`StoredMessage::timestamp`).
+     */
+    public var displayTsMs: Int64
+    /**
+     * When this device first received the row (`messages.received_at`).
+     *
+     * `None` for a locally authored message, and for any message stored
+     * before arrival diagnostics were recorded. Legacy rows are never
+     * annotated -- we cannot claim an arrival time we never wrote down --
+     * but they still take part in the ordering below, standing in with
+     * their display timestamp.
+     */
+    public var arrivalTsMs: Int64?
+    /**
+     * Whether this device authored the row.
+     */
+    public var isOwn: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The author-clock timestamp this row renders with
+         * (`StoredMessage::timestamp`).
+         */displayTsMs: Int64, 
+        /**
+         * When this device first received the row (`messages.received_at`).
+         *
+         * `None` for a locally authored message, and for any message stored
+         * before arrival diagnostics were recorded. Legacy rows are never
+         * annotated -- we cannot claim an arrival time we never wrote down --
+         * but they still take part in the ordering below, standing in with
+         * their display timestamp.
+         */arrivalTsMs: Int64?, 
+        /**
+         * Whether this device authored the row.
+         */isOwn: Bool) {
+        self.displayTsMs = displayTsMs
+        self.arrivalTsMs = arrivalTsMs
+        self.isOwn = isOwn
+    }
+}
+
+
+
+extension LateArrivalInput: Equatable, Hashable {
+    public static func ==(lhs: LateArrivalInput, rhs: LateArrivalInput) -> Bool {
+        if lhs.displayTsMs != rhs.displayTsMs {
+            return false
+        }
+        if lhs.arrivalTsMs != rhs.arrivalTsMs {
+            return false
+        }
+        if lhs.isOwn != rhs.isOwn {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(displayTsMs)
+        hasher.combine(arrivalTsMs)
+        hasher.combine(isOwn)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLateArrivalInput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LateArrivalInput {
+        return
+            try LateArrivalInput(
+                displayTsMs: FfiConverterInt64.read(from: &buf), 
+                arrivalTsMs: FfiConverterOptionInt64.read(from: &buf), 
+                isOwn: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LateArrivalInput, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.displayTsMs, into: &buf)
+        FfiConverterOptionInt64.write(value.arrivalTsMs, into: &buf)
+        FfiConverterBool.write(value.isOwn, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLateArrivalInput_lift(_ buf: RustBuffer) throws -> LateArrivalInput {
+    return try FfiConverterTypeLateArrivalInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLateArrivalInput_lower(_ value: LateArrivalInput) -> RustBuffer {
+    return FfiConverterTypeLateArrivalInput.lower(value)
 }
 
 
@@ -14238,6 +14464,31 @@ fileprivate struct FfiConverterSequenceInt64: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceBool: FfiConverterRustBuffer {
+    typealias SwiftType = [Bool]
+
+    public static func write(_ value: [Bool], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterBool.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Bool] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Bool]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterBool.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -14455,6 +14706,31 @@ fileprivate struct FfiConverterSequenceTypeCoreIdentifiedRoute: FfiConverterRust
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeCoreIdentifiedRoute.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreMessageReceivedAt: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreMessageReceivedAt]
+
+    public static func write(_ value: [CoreMessageReceivedAt], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreMessageReceivedAt.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreMessageReceivedAt] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreMessageReceivedAt]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreMessageReceivedAt.read(from: &buf))
         }
         return seq
     }
@@ -14755,6 +15031,31 @@ fileprivate struct FfiConverterSequenceTypeGroupRelayMember: FfiConverterRustBuf
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeGroupRelayMember.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLateArrivalInput: FfiConverterRustBuffer {
+    typealias SwiftType = [LateArrivalInput]
+
+    public static func write(_ value: [LateArrivalInput], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLateArrivalInput.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LateArrivalInput] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LateArrivalInput]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLateArrivalInput.read(from: &buf))
         }
         return seq
     }
@@ -15556,6 +15857,17 @@ public func coreLastVisibleMessage(messages: [StoredMessage]) -> StoredMessage? 
     return try!  FfiConverterOptionTypeStoredMessage.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_last_visible_message(
         FfiConverterSequenceTypeStoredMessage.lower(messages),$0
+    )
+})
+}
+/**
+ * FFI wrapper for [`late_arrival_flags`]; both shells call this once per
+ * conversation reload, over the same list they are about to render.
+ */
+public func coreLateArrivalFlags(rows: [LateArrivalInput]) -> [Bool] {
+    return try!  FfiConverterSequenceBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_late_arrival_flags(
+        FfiConverterSequenceTypeLateArrivalInput.lower(rows),$0
     )
 })
 }
@@ -17505,6 +17817,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_last_visible_message() != 29515) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_late_arrival_flags() != 29354) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_link_openable_scheme() != 40398) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -18046,6 +18361,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_chat_digest() != 38268) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_chat_received_times() != 4891) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_carried_relay_upload_markers() != 51382) {

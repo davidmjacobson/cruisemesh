@@ -251,7 +251,7 @@ fun GroupChatScreen(
 
     fun closeOverlay() = host.closeOverlay()
 
-    ConversationHostEffects(host, visibleMessages, ownUserId)
+    ConversationHostEffects(host, visibleMessages, ownUserId, chatExtras.lateArrivalMs.keys)
 
     ConversationScaffold(
         host = host,
@@ -288,6 +288,7 @@ fun GroupChatScreen(
                     onReact = { emoji ->
                         toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
                     },
+                    lateArrivalMs = chatExtras.lateArrivalMs[messageStableKey(message)],
                     onLongPress = { target, bounds -> openOverlay(target, bounds) },
                     onLinkClick = { link -> linkHandler.open(link) },
                 )
@@ -778,6 +779,8 @@ private fun GroupMessageBubble(
     onQuotedClick: (StoredMessage) -> Unit = {},
     reactions: List<ReactionSummary> = emptyList(),
     onReact: (String) -> Unit = {},
+    /** When this message reached this device, if its place in the thread needs explaining. */
+    lateArrivalMs: Long? = null,
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
     onLinkClick: (MessageLink) -> Unit = {},
 ) {
@@ -805,10 +808,14 @@ private fun GroupMessageBubble(
         MessageTarget(message.senderUserId, message.lamport, message.kind)
     }
 
-    Row(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(top = topPadding, bottom = bottomPadding),
+        horizontalAlignment = if (isOwn) Alignment.End else Alignment.Start,
+    ) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isOwn) Arrangement.End else Arrangement.Start,
     ) {
         GroupMessageBubbleVisual(
@@ -835,6 +842,17 @@ private fun GroupMessageBubble(
                     onLongClick = { onLongPress(target, boundsInRoot) },
                 ),
         )
+    }
+        // Set only for a message spliced in above content already here --
+        // see core/src/late_arrival.rs. The bubble keeps the sender's time.
+        if (lateArrivalMs != null) {
+            Text(
+                text = stringResource(R.string.ui_arrived_at, formatConversationTimestamp(lateArrivalMs)),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 12.dp),
+            )
+        }
     }
 }
 

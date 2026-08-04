@@ -17,6 +17,7 @@ mod groups;
 mod identity;
 mod lan_session;
 mod lan_util;
+mod late_arrival;
 mod limits;
 mod link_detect;
 mod protocol;
@@ -82,6 +83,9 @@ pub use lan_util::{
     core_subnet_24_hosts, lan_endpoint_cache_is_fresh, lan_endpoint_host_is_local,
     should_resend_lan_endpoint, CoreLanEndpoint,
 };
+pub use late_arrival::{
+    core_late_arrival_flags, late_arrival_flags, LateArrivalInput, LATE_ARRIVAL_MIN_DELAY_MS,
+};
 pub use limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 pub use link_detect::{
     core_detect_links, core_link_openable_scheme, CoreDetectedLink, CoreLinkScheme,
@@ -136,10 +140,10 @@ pub use semantic::{
 pub use store::{
     core_peer_transport_for_arrival, core_peer_transport_is_observed, CarriedEnvelope, Contact,
     ContactDiscoveryPolicy, ContactProvenance, ContactRelayRejection, CoreCarriedCursor,
-    CoreCarriedSyncPage, DigestEntry, FriendSuggestion, MessageArrival, MessageOrigin,
-    MessageReference, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, PeerConnectionEvent,
-    PeerConnectionEventKind, PeerConnectionSummary, PeerConnectionTransport, RelayFetchCursor,
-    StoredMessage,
+    CoreCarriedSyncPage, CoreMessageReceivedAt, DigestEntry, FriendSuggestion, MessageArrival,
+    MessageOrigin, MessageReference, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
+    PeerConnectionEvent, PeerConnectionEventKind, PeerConnectionSummary, PeerConnectionTransport,
+    RelayFetchCursor, StoredMessage,
 };
 pub use transport_policy::{
     core_transport_send_plan, digest_is_expected_chat_id, digest_through_lamport_for_sender,

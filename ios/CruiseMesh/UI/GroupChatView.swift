@@ -85,6 +85,7 @@ struct GroupChatView: View {
                                     canReply: replyMetadata[replyKey]?.msgId != nil,
                                     reactions: row.reactions,
                                     timeLabel: row.timeLabel,
+                                    arrivalLabel: row.arrivalLabel,
                                     onReact: { emoji in
                                         sendReaction(to: message, emoji: emoji)
                                     },
@@ -334,7 +335,17 @@ struct GroupChatView: View {
     private func reload() {
         let loadedMessages = (try? store.messagesForChat(chatId: activeGroup.id)) ?? []
         messages = loadedMessages
-        rows = GroupChatRowModel.build(from: loadedMessages, ownUserId: identity.userId, senderLabel: senderName)
+        rows = GroupChatRowModel.build(
+            from: loadedMessages,
+            ownUserId: identity.userId,
+            senderLabel: senderName,
+            lateArrivalMs: loadLateArrivalTimes(
+                store: store,
+                chatId: activeGroup.id,
+                visibleMessages: loadedMessages.filter { isVisibleChatKind($0.kind) },
+                ownUserId: identity.userId
+            )
+        )
         replyMetadata = loadMessageReplyMetadata(
             store: store,
             messages: loadedMessages.filter { isVisibleChatKind($0.kind) }
@@ -374,6 +385,9 @@ struct GroupChatRowModel: Equatable {
     let senderLabel: String?
     let timeLabel: String
     let reactions: [ReactionSummary]
+    /// "Arrived 5:14 PM", set only for a message spliced in above content that
+    /// was already here -- see `core/src/late_arrival.rs`.
+    let arrivalLabel: String?
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -385,7 +399,8 @@ struct GroupChatRowModel: Equatable {
     static func build(
         from messages: [StoredMessage],
         ownUserId: Data,
-        senderLabel: (Data) -> String
+        senderLabel: (Data) -> String,
+        lateArrivalMs: [String: Int64] = [:]
     ) -> [GroupChatRowModel] {
         let visible = messages.filter { isVisibleChatKind($0.kind) }
         let reactionsByTarget = reactionSummariesByTarget(messages: messages, ownUserId: ownUserId)
@@ -407,7 +422,13 @@ struct GroupChatRowModel: Equatable {
                 rowId: message.stableGroupRowId,
                 senderLabel: label,
                 timeLabel: timeFormatter.string(from: date),
-                reactions: reactionsByTarget[target.stableKey] ?? []
+                reactions: reactionsByTarget[target.stableKey] ?? [],
+                arrivalLabel: lateArrivalMs[lateArrivalRowKey(message)].map { arrival in
+                    String(
+                        format: String(localized: "Arrived %@"),
+                        timeFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(arrival) / 1000))
+                    )
+                }
             ))
         }
         return rows
@@ -424,6 +445,7 @@ private struct GroupMessageRow: View {
     let canReply: Bool
     let reactions: [ReactionSummary]
     let timeLabel: String
+    var arrivalLabel: String? = nil
     let onReact: (String) -> Void
     let onReply: () -> Void
     let onPhotoTap: (Data) -> Void
@@ -539,6 +561,15 @@ private struct GroupMessageRow: View {
                     Text(timeLabel)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+
+                    // Set only for a message spliced in above content already
+                    // here (core/src/late_arrival.rs). The bubble keeps the
+                    // sender's time; this says when it reached us.
+                    if let arrivalLabel {
+                        Text(arrivalLabel)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 if !isOwn { Spacer(minLength: 40) }
             }
