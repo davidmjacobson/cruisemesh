@@ -2658,18 +2658,25 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         ), confirmed > 0 {
             log.info("Confirmed delivery of \(confirmed) carried envelope(s) to \(UserIdHex.encode(peerUserId), privacy: .public); dropped our copy")
         }
+        // How far this link session's walk through our carry queue has got. A
+        // courier's store can be many times one round's budget, so each
+        // re-digest offers the NEXT page instead of re-reading the oldest
+        // rows; once the walk reaches the tail the lane parks until its
+        // cooldown elapses. A zero budget is the lane's own off switch.
+        let lane = MeshRouter.carriedLaneFor(address: address, nowMs: now)
         guard let plan = try? store.coreDigestSprayPlan(
             ownUserId: identity.userId,
             peerUserId: peerUserId,
             peerHints: recentHintsFor(userId: peerUserId, nowMs: now),
             peerKnownMsgIds: peerKnownIds,
             nowMs: now,
-            carriedBudgetBytes: MeshDefaults.carriedSprayBudgetBytes,
+            carriedBudgetBytes: lane.skip ? 0 : MeshDefaults.carriedSprayBudgetBytes,
             ownOutboundBudgetBytes: MeshDefaults.ownOutboundSprayBudgetBytes,
             ownReceiptBudgetBytes: MeshDefaults.ownReceiptSprayBudgetBytes,
             receiptQueryLimit: MeshDefaults.relayStoreBatchLimit,
             peerAcksHiddenKinds: MeshRouter.peerAcksHiddenKinds(address: address),
-            hiddenAlreadyOffered: MeshRouter.hiddenOfferedFor(address: address)
+            hiddenAlreadyOffered: MeshRouter.hiddenOfferedFor(address: address),
+            carriedCursor: lane.after
         ) else {
             log.warning("Failed to build digest spray plan for \(address, privacy: .public)")
             return
@@ -2678,13 +2685,21 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // lands in one FIFO, so whatever goes first delays everything after
         // it: live mail and receipts to real contacts must beat third-party
         // courier traffic. Nothing is lost by deferring the carried lane --
-        // the periodic re-digest re-offers it, and its own per-encounter
-        // budget already bounds this round's share.
+        // the periodic re-digest offers the next page, and its own
+        // per-encounter budget already bounds this round's share.
         let frames = plan.ownOutboundFrames + plan.ownReceiptFrames + plan.carriedFrames
         for frame in frames {
             _ = MeshRouter.sendToAddress(address: address, frame: frame)
         }
         MeshRouter.recordHiddenOffered(address: address, msgIds: plan.offeredHiddenMsgIds)
+        if !lane.skip {
+            MeshRouter.recordCarriedProgress(
+                address: address,
+                next: plan.nextCarriedCursor,
+                exhausted: plan.carriedExhausted,
+                nowMs: now
+            )
+        }
     }
 
     // Hint aggregation (recent/delivery/known-target/group matching) moved

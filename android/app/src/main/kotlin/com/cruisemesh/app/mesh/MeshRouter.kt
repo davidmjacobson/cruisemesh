@@ -1,6 +1,8 @@
 package com.cruisemesh.app.mesh
 
 import android.util.Log
+import uniffi.cruisemesh_core.CoreCarriedCursor
+import uniffi.cruisemesh_core.CoreCarriedLane
 
 private const val TAG = "MeshRouter"
 
@@ -98,6 +100,17 @@ object MeshRouter {
 
     fun recordHiddenOffered(address: String, msgIds: List<ByteArray>) =
         state.recordHiddenOffered(address, msgIds)
+
+    /**
+     * Where this link's foreign-carry lane should resume, or whether to sit
+     * this re-digest out because the walk is done and still cooling down.
+     */
+    fun carriedLaneFor(address: String, nowMs: Long): CoreCarriedLane =
+        state.carriedLaneFor(address, nowMs)
+
+    /** Record how far the carried lane just walked down [address]. */
+    fun recordCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Boolean, nowMs: Long) =
+        state.recordCarriedProgress(address, next, exhausted, nowMs)
 
     /** The userId [address] identified as, if known. */
     fun userIdFor(address: String): ByteArray? = state.userIdFor(address)

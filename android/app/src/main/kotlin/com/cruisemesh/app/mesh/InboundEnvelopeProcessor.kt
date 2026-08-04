@@ -2092,28 +2092,38 @@ internal class InboundEnvelopeProcessor(
             if (confirmed > 0uL) {
                 Log.i(TAG, "Confirmed delivery of $confirmed carried envelope(s) to ${UserIdHex.encode(peerUserId)}; dropped our copy")
             }
+            // How far this link session's walk through our carry queue has
+            // got. A courier's store can be many times one round's budget, so
+            // each re-digest offers the NEXT page instead of re-reading the
+            // oldest rows; once the walk reaches the tail the lane parks until
+            // its cooldown elapses. A zero budget is the lane's own off switch.
+            val lane = MeshRouter.carriedLaneFor(address, now)
             val plan = store.coreDigestSprayPlan(
                 ownUserId = identity.userId,
                 peerUserId = peerUserId,
                 peerHints = recentHintsFor(peerUserId, now),
                 peerKnownMsgIds = peerKnownMsgIds,
                 nowMs = now,
-                carriedBudgetBytes = CARRIED_SPRAY_BUDGET_BYTES.toULong(),
+                carriedBudgetBytes = if (lane.skip) 0uL else CARRIED_SPRAY_BUDGET_BYTES.toULong(),
                 ownOutboundBudgetBytes = OWN_OUTBOUND_SPRAY_BUDGET_BYTES.toULong(),
                 ownReceiptBudgetBytes = OWN_RECEIPT_SPRAY_BUDGET_BYTES.toULong(),
                 receiptQueryLimit = RELAY_STORE_BATCH_LIMIT,
                 peerAcksHiddenKinds = MeshRouter.peerAcksHiddenKinds(address),
                 hiddenAlreadyOffered = MeshRouter.hiddenOfferedFor(address),
+                carriedCursor = lane.after,
             )
             // Own lanes first, foreign carry last. On a slow link every frame
             // here lands in one FIFO, so whatever goes first delays everything
             // after it: live mail and receipts to real contacts must beat
             // third-party courier traffic. Nothing is lost by deferring the
-            // carried lane -- the periodic re-digest re-offers it, and its own
-            // per-encounter budget already bounds this round's share.
+            // carried lane -- the periodic re-digest offers the next page, and
+            // its own per-encounter budget already bounds this round's share.
             val frames = plan.ownOutboundFrames + plan.ownReceiptFrames + plan.carriedFrames
             val sprayed = frames.count { MeshRouter.sendToAddress(address, it) }
             MeshRouter.recordHiddenOffered(address, plan.offeredHiddenMsgIds)
+            if (!lane.skip) {
+                MeshRouter.recordCarriedProgress(address, plan.nextCarriedCursor, plan.carriedExhausted, now)
+            }
             Log.i(
                 TAG,
                 "Digest spray to $address sent $sprayed/${frames.size} frame(s) " +

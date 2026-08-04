@@ -76,6 +76,17 @@ enum MeshRouter {
         state.recordHiddenOffered(address: address, msgIds: msgIds)
     }
 
+    /// Where this link's foreign-carry lane should resume, or whether to sit
+    /// this re-digest out because the walk is done and still cooling down.
+    static func carriedLaneFor(address: String, nowMs: Int64) -> CoreCarriedLane {
+        state.carriedLaneFor(address: address, nowMs: nowMs)
+    }
+
+    /// Record how far the carried lane just walked down `address`.
+    static func recordCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64) {
+        state.recordCarriedProgress(address: address, next: next, exhausted: exhausted, nowMs: nowMs)
+    }
+
     static func userIdFor(address: String) -> Data? {
         state.userIdFor(address: address)
     }

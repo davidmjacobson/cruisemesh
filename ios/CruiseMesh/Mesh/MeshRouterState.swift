@@ -40,6 +40,14 @@ final class MeshRouterState {
         core.recordHiddenOffered(address: address, msgIds: msgIds)
     }
 
+    func carriedLaneFor(address: String, nowMs: Int64) -> CoreCarriedLane {
+        core.carriedLaneFor(address: address, nowMs: nowMs)
+    }
+
+    func recordCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64) {
+        core.recordCarriedProgress(address: address, next: next, exhausted: exhausted, nowMs: nowMs)
+    }
+
     func userIdFor(address: String) -> Data? { core.userIdFor(address: address) }
     func transportFor(address: String) -> Transport? { core.transportFor(address: address)?.platform }
     func connectedRoutes() -> [(Transport, String)] { core.connectedRoutes().map { ($0.transport.platform, $0.address) } }

@@ -37,7 +37,8 @@ use cruisemesh_core::{
     compute_recipient_hint, core_group_fanout_rows, default_expiry, encode_envelope_frame,
     generate_identity, generate_msg_id, open_group_message, open_message, parse_frame,
     seal_group_message, seal_message, CarriedEnvelope, CoreGroupFanoutRow, CoreInboundDisposition,
-    CoreRelayEnvelopeDisposition, Frame, Group, Identity, MessageStore, SeenIds, DEFAULT_HOP_TTL,
+    CoreMeshRouterState, CoreRelayEnvelopeDisposition, CoreTransport, Frame, Group, Identity,
+    MessageStore, SeenIds, DEFAULT_HOP_TTL,
 };
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
@@ -580,9 +581,10 @@ impl Network {
                         peer_known_msg_ids,
                         now,
                         u64::MAX,
+                        None,
                     )
                     .expect("query spray candidates");
-                for env in spray {
+                for env in spray.rows {
                     let frame = encode_envelope_frame(
                         env.msg_id,
                         env.hop_ttl,
@@ -921,5 +923,152 @@ fn group_relay_fanout_opens_on_every_member_and_each_copy_is_acked() {
         relay.pending_len(),
         0,
         "each per-member row is removed only after its member consumes it"
+    );
+}
+
+/// D8 + the per-link-session carried cursor: a courier parked next to one peer
+/// for hours must hand over its whole backlog and then fall silent.
+///
+/// The re-digest fires every 3-5 minutes on a long-lived link, and each round
+/// offers at most a byte budget's worth of foreign carry. A backlog many times
+/// that budget therefore takes several rounds -- but it must take *several*,
+/// not forever: before the cursor, every round re-read the queue from its
+/// oldest row, so the only thing stopping a round from re-offering the same
+/// head was the peer's digest happening to name it. This walks the whole
+/// backlog once, delivers every envelope exactly once, and then goes quiet for
+/// the rest of the day, across several re-walk cooldowns.
+#[test]
+fn a_courier_walks_a_backlog_many_times_the_budget_once_and_then_stays_quiet() {
+    // The shipped shell values (android MeshDefaults / iOS MeshDefaults).
+    const CARRIED_BUDGET_BYTES: u64 = 256 * 1024;
+    const SEALED_LEN: usize = 4 * 1024;
+    const BACKLOG: usize = 300;
+    const ROUND_MS: i64 = 4 * 60_000;
+    const ROUNDS: usize = 40;
+    const ADDRESS: &str = "ble:courier-peer";
+
+    let courier = SimNode::new();
+    let mut peer = SimNode::new();
+    let stranger = generate_identity();
+
+    // Foreign traffic addressed to someone who is not here: the courier can't
+    // open it and the peer can't either, so it stays in both carry queues and
+    // the offering path is the only thing under test.
+    let hint = compute_recipient_hint(stranger.user_id.clone(), BASE_NOW);
+    for index in 0..BACKLOG {
+        // Distinct ciphertext per row: the carry queue dedupes on the
+        // (hint, sealed) content digest, so identical filler would collapse
+        // the backlog instead of building one.
+        let mut sealed = vec![0xAB; SEALED_LEN];
+        sealed[..2].copy_from_slice(&(index as u16).to_be_bytes());
+        courier
+            .store
+            .enqueue_carried_envelope(
+                CarriedEnvelope {
+                    msg_id: generate_msg_id(),
+                    hop_ttl: DEFAULT_HOP_TTL,
+                    expiry: BASE_NOW + 7 * MS_PER_DAY,
+                    recipient_hint: hint.clone(),
+                    sealed,
+                },
+                false,
+                BASE_NOW + index as i64,
+                FOREIGN_BUDGET,
+            )
+            .expect("enqueue backlog");
+    }
+    assert_eq!(
+        courier
+            .store
+            .carried_msg_ids(u64::MAX)
+            .expect("courier carried msg ids")
+            .len(),
+        BACKLOG
+    );
+
+    // One link session for the whole run -- the phones never move apart.
+    let router = CoreMeshRouterState::new();
+    router.on_connected(ADDRESS.to_string(), CoreTransport::Central);
+    assert!(router.on_hello(ADDRESS.to_string(), peer.user_id()));
+
+    let mut offers_per_round = Vec::new();
+    for round in 0..ROUNDS {
+        let now = BASE_NOW + (round as i64 + 1) * ROUND_MS;
+        // Exactly what `InboundEnvelopeProcessor.sprayDigestPlanTo` /
+        // `MeshController.sprayDigestPlanTo` do per re-digest.
+        let lane = router.carried_lane_for(ADDRESS.to_string(), now);
+        let plan = courier
+            .store
+            .core_digest_spray_plan(
+                courier.user_id(),
+                peer.user_id(),
+                peer.recent_delivery_hints(now),
+                peer.store
+                    .carried_msg_ids(DIGEST_CARRIED_MSG_IDS_LIMIT)
+                    .expect("peer carried msg ids"),
+                now,
+                if lane.skip { 0 } else { CARRIED_BUDGET_BYTES },
+                0,
+                0,
+                0,
+                true,
+                vec![],
+                lane.after,
+            )
+            .expect("digest spray plan");
+        for frame in &plan.carried_frames {
+            let _ = peer.receive(frame, now);
+        }
+        if !lane.skip {
+            router.record_carried_progress(
+                ADDRESS.to_string(),
+                plan.next_carried_cursor,
+                plan.carried_exhausted,
+                now,
+            );
+        }
+        offers_per_round.push(plan.carried_frames.len());
+    }
+
+    let total_offered: usize = offers_per_round.iter().sum();
+    assert_eq!(
+        total_offered, BACKLOG,
+        "every envelope is offered exactly once across the whole run: no row \
+         re-offered, none skipped ({offers_per_round:?})"
+    );
+    assert_eq!(
+        peer.store
+            .carried_msg_ids(DIGEST_CARRIED_MSG_IDS_LIMIT)
+            .expect("peer carried msg ids")
+            .len(),
+        BACKLOG,
+        "the peer ends up carrying the courier's whole backlog"
+    );
+
+    let walk_rounds = offers_per_round
+        .iter()
+        .position(|offers| *offers == 0)
+        .expect("the lane must fall silent");
+    assert!(
+        walk_rounds <= 8,
+        "1.2 MiB at 256 KiB a round should converge in a handful of rounds, took {walk_rounds}"
+    );
+    assert!(
+        offers_per_round[walk_rounds..].iter().all(|n| *n == 0),
+        "once converged the lane stays quiet -- including across the re-walk \
+         cooldowns this run spans ({offers_per_round:?})"
+    );
+
+    // DTN ack safety: offering is not delivery. The courier still holds every
+    // envelope; a carried copy is dropped only on digest-proof of receipt.
+    assert_eq!(
+        courier
+            .store
+            .carried_envelopes_for_peer_sync(vec![], vec![], BASE_NOW, u64::MAX, None)
+            .expect("courier carry queue")
+            .rows
+            .len(),
+        BACKLOG,
+        "a completed walk offers; it never acks or deletes"
     );
 }

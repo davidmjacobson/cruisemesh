@@ -135,15 +135,17 @@ pub use semantic::{
 };
 pub use store::{
     core_peer_transport_for_arrival, core_peer_transport_is_observed, CarriedEnvelope, Contact,
-    ContactDiscoveryPolicy, ContactProvenance, ContactRelayRejection, DigestEntry,
-    FriendSuggestion, MessageArrival, MessageOrigin, MessageReference, MessageStore,
-    OutboundEnvelope, OutgoingReceiptEnvelope, PeerConnectionEvent, PeerConnectionEventKind,
-    PeerConnectionSummary, PeerConnectionTransport, RelayFetchCursor, StoredMessage,
+    ContactDiscoveryPolicy, ContactProvenance, ContactRelayRejection, CoreCarriedCursor,
+    CoreCarriedSyncPage, DigestEntry, FriendSuggestion, MessageArrival, MessageOrigin,
+    MessageReference, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, PeerConnectionEvent,
+    PeerConnectionEventKind, PeerConnectionSummary, PeerConnectionTransport, RelayFetchCursor,
+    StoredMessage,
 };
 pub use transport_policy::{
     core_transport_send_plan, digest_is_expected_chat_id, digest_through_lamport_for_sender,
-    CoreIdentifiedRoute, CoreLanHealthAction, CoreLanHealthDecision, CoreLanHealthTracker,
-    CoreMeshRouterState, CoreReconnectBackoffTracker, CoreTransport, CoreTransportRoute,
-    DEFAULT_INITIAL_BACKOFF_MS, DEFAULT_LAN_HEALTH_MAX_TIMEOUTS, DEFAULT_LAN_HEALTH_TIMEOUT_MS,
-    DEFAULT_MAX_BACKOFF_MS, DEFAULT_MAX_CONSECUTIVE_FAILURES, SMALL_FRAME_RACE_MAX_BYTES,
+    CoreCarriedLane, CoreIdentifiedRoute, CoreLanHealthAction, CoreLanHealthDecision,
+    CoreLanHealthTracker, CoreMeshRouterState, CoreReconnectBackoffTracker, CoreTransport,
+    CoreTransportRoute, CARRIED_REWALK_MIN_INTERVAL_MS, DEFAULT_INITIAL_BACKOFF_MS,
+    DEFAULT_LAN_HEALTH_MAX_TIMEOUTS, DEFAULT_LAN_HEALTH_TIMEOUT_MS, DEFAULT_MAX_BACKOFF_MS,
+    DEFAULT_MAX_CONSECUTIVE_FAILURES, SMALL_FRAME_RACE_MAX_BYTES,
 };
