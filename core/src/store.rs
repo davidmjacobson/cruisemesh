@@ -982,6 +982,39 @@ impl MessageStore {
     pub(crate) fn test_sealed_reads(&self) -> u64 {
         self.sealed_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Up to `limit` carried-envelope `msg_id`s, **newest** first — the
+    /// digest-advertisement counterpart to
+    /// [`MessageStore::carried_msg_ids`]'s oldest-first order.
+    ///
+    /// At courier scale the two orders behave very differently. A phone
+    /// carrying more rows than the advertisement holds would, oldest-first,
+    /// advertise a frozen window over its *oldest* rows — exactly the rows
+    /// its own oldest-first carry eviction deletes next — so the
+    /// advertisement describes envelopes it no longer has while saying
+    /// nothing about the ones it just accepted. A courier peer then re-offers
+    /// everything newer on every reconnect, the loaded phone accepts and
+    /// evicts, and the pair live-locks on offer/accept/evict. Newest-first
+    /// advertises the half of the carry queue where suppression actually
+    /// matters, and moves with the queue instead of pinning to its tail.
+    ///
+    /// [`MessageStore::carried_msg_ids`] keeps its oldest-first order for its
+    /// other callers (seen-id seeding on the shells, the mesh simulator),
+    /// where the traversal order is the point.
+    pub(crate) fn carried_msg_ids_desc(&self, limit: u64) -> Result<Vec<Vec<u8>>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT msg_id FROM carried_envelopes
+                 ORDER BY received_at DESC, msg_id DESC
+                 LIMIT ?1",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
 }
 
 mod incoming_message_reference {
@@ -10092,6 +10125,23 @@ mod tests {
 
         let ids = store.carried_msg_ids(2).unwrap();
         assert_eq!(ids, vec![b"m1".to_vec(), b"m2".to_vec()]);
+    }
+
+    #[test]
+    fn carried_msg_ids_desc_are_returned_newest_first_and_limited() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"m1", b"h", 9_000, 10), false, 1_000, BIG_BUDGET)
+            .unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"m2", b"h", 9_000, 10), false, 2_000, BIG_BUDGET)
+            .unwrap();
+        store
+            .enqueue_carried_envelope(carried(b"m3", b"h", 9_000, 10), false, 3_000, BIG_BUDGET)
+            .unwrap();
+
+        let ids = store.carried_msg_ids_desc(2).unwrap();
+        assert_eq!(ids, vec![b"m3".to_vec(), b"m2".to_vec()]);
     }
 
     #[test]
