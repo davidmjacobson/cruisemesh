@@ -266,6 +266,8 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                         // leave behind the one captured thing it did not name.
                         runCatching { AppStore.get(context).clearDeliveryMetrics() }
                         FieldMetricsExport.deleteCsvFile(context)
+                        // The last share left a zip holding copies of both.
+                        DiagnosticsShare.deleteArchive(context)
                         hasCapturedDiagnostics = false
                         supportMessage = context.getString(R.string.ui_diagnostics_deleted)
                     },

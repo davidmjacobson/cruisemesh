@@ -6,4 +6,6 @@
     <external-files-path name="logs" path="logs/" />
     <!-- V2 field-metrics CSV export, retained for internal diagnostics. -->
     <external-files-path name="metrics" path="metrics/" />
+    <!-- The single zip "Share diagnostics" sends (DiagnosticsShare). -->
+    <external-files-path name="diagnostics" path="diagnostics/" />
 </paths>
