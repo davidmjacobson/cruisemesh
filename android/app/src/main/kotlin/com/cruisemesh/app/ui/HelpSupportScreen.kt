@@ -29,7 +29,7 @@ import com.cruisemesh.app.R
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HelpSupportScreen(
-    onCruisePass: () -> Unit,
+    onShorePass: () -> Unit,
     onConnectionDetails: () -> Unit,
     onBack: () -> Unit,
 ) {
@@ -56,7 +56,7 @@ fun HelpSupportScreen(
             HelpItem(
                 "Set up or fix Shore Pass",
                 "Open the setup link from your purchase email. CruiseMesh checks and saves it automatically.",
-                onCruisePass,
+                onShorePass,
             )
             HelpItem(
                 "Understand delivery",
@@ -66,10 +66,10 @@ fun HelpSupportScreen(
             HelpItem(
                 "Setup link did not open",
                 "Copy the setup card, then open Settings → Shore Pass and choose Paste and set up.",
-                onCruisePass,
+                onShorePass,
             )
             Text(
-                stringResource(R.string.ui_never_post_a_cruise_pass_setup_card_or),
+                stringResource(R.string.ui_never_post_a_shore_pass_setup_card_or),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(vertical = 16.dp),

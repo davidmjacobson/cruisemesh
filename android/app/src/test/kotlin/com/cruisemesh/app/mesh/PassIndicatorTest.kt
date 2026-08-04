@@ -95,16 +95,16 @@ class PassIndicatorTest {
     @Test
     fun `no saved pass invites setup whatever the stale health says`() {
         assertEquals(
-            CruisePassHeading.NOT_SET_UP,
-            cruisePassHeading(RelayHealth.Ok(now), configured = false, lastVerdict = RelayHealth.Ok(now)),
+            ShorePassHeading.NOT_SET_UP,
+            shorePassHeading(RelayHealth.Ok(now), configured = false, lastVerdict = RelayHealth.Ok(now)),
         )
     }
 
     @Test
     fun `a working pass reads as set up`() {
         assertEquals(
-            CruisePassHeading.READY,
-            cruisePassHeading(RelayHealth.Ok(now), configured = true, lastVerdict = null),
+            ShorePassHeading.READY,
+            shorePassHeading(RelayHealth.Ok(now), configured = true, lastVerdict = null),
         )
     }
 
@@ -118,8 +118,8 @@ class PassIndicatorTest {
         for (health in listOf(RelayHealth.Checking, RelayHealth.NoConfig)) {
             assertEquals(
                 "$health is an absent answer, not a failing one",
-                CruisePassHeading.READY,
-                cruisePassHeading(health, configured = true, lastVerdict = RelayHealth.Ok(now)),
+                ShorePassHeading.READY,
+                shorePassHeading(health, configured = true, lastVerdict = RelayHealth.Ok(now)),
             )
         }
     }
@@ -128,8 +128,8 @@ class PassIndicatorTest {
     fun `a saved pass with no answer yet says it is being checked`() {
         for (health in listOf(RelayHealth.Checking, RelayHealth.NoConfig)) {
             assertEquals(
-                CruisePassHeading.CHECKING,
-                cruisePassHeading(health, configured = true, lastVerdict = null),
+                ShorePassHeading.CHECKING,
+                shorePassHeading(health, configured = true, lastVerdict = null),
             )
         }
     }
@@ -151,8 +151,8 @@ class PassIndicatorTest {
         )) {
             assertEquals(
                 "$health is an answer and must beat the previous OK",
-                CruisePassHeading.CONFIGURED,
-                cruisePassHeading(health, configured = true, lastVerdict = RelayHealth.Ok(now)),
+                ShorePassHeading.CONFIGURED,
+                shorePassHeading(health, configured = true, lastVerdict = RelayHealth.Ok(now)),
             )
         }
     }
@@ -160,8 +160,8 @@ class PassIndicatorTest {
     @Test
     fun `a check in flight holds a failing verdict too`() {
         assertEquals(
-            CruisePassHeading.CONFIGURED,
-            cruisePassHeading(
+            ShorePassHeading.CONFIGURED,
+            shorePassHeading(
                 RelayHealth.Checking,
                 configured = true,
                 lastVerdict = RelayHealth.TokenRejected(now),

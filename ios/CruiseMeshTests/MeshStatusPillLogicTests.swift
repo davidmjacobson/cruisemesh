@@ -5,7 +5,7 @@ final class MeshStatusPillLogicTests: XCTestCase {
     private func suffix(
         _ health: RelayHealth,
         state: MeshRuntimeState = .meshing(nearby: 2),
-        service: InternetDeliveryService? = .cruisePass
+        service: InternetDeliveryService? = .shorePass
     ) -> String? {
         MeshStatusPillLogic.faultSuffix(runtimeState: state, relayHealth: health, service: service)
     }
@@ -32,7 +32,7 @@ final class MeshStatusPillLogicTests: XCTestCase {
         XCTAssertEqual(suffix(.messageTooLarge(lastAttemptMs: 1)), "A message was too large to send")
     }
 
-    func testACustomRelayIsNotCalledACruisePass() {
+    func testACustomRelayIsNotCalledAShorePass() {
         XCTAssertEqual(
             suffix(.expired(lastAttemptMs: 1), service: .customRelay),
             "Internet delivery expired"

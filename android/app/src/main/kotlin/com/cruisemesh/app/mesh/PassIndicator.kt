@@ -67,7 +67,7 @@ fun RelayHealth.isPassVerdict(): Boolean =
  * Pure so the flicker rules below are unit-testable; the copy lives in
  * `strings.xml` and iOS mirrors this in `PassIndicator.swift`.
  */
-enum class CruisePassHeading {
+enum class ShorePassHeading {
     /** No setup card saved: invite them to add one. */
     NOT_SET_UP,
 
@@ -97,14 +97,14 @@ enum class CruisePassHeading {
  * with anything but OK -- rejected token, expired, no internet -- the green
  * check goes, because [lastVerdict] is then that answer and not the stale OK.
  */
-fun cruisePassHeading(
+fun shorePassHeading(
     health: RelayHealth,
     configured: Boolean,
     lastVerdict: RelayHealth?,
-): CruisePassHeading {
-    if (!configured) return CruisePassHeading.NOT_SET_UP
-    val settled = if (health.isPassVerdict()) health else lastVerdict ?: return CruisePassHeading.CHECKING
-    return if (settled is RelayHealth.Ok) CruisePassHeading.READY else CruisePassHeading.CONFIGURED
+): ShorePassHeading {
+    if (!configured) return ShorePassHeading.NOT_SET_UP
+    val settled = if (health.isPassVerdict()) health else lastVerdict ?: return ShorePassHeading.CHECKING
+    return if (settled is RelayHealth.Ok) ShorePassHeading.READY else ShorePassHeading.CONFIGURED
 }
 
 /**

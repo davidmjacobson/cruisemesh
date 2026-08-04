@@ -4,12 +4,12 @@ import Foundation
 /// names it the way the person set it up. Mirrors Android's
 /// `InternetDeliveryService`.
 enum InternetDeliveryService: Equatable {
-    case cruisePass
+    case shorePass
     case customRelay
 
     var displayName: String {
         switch self {
-        case .cruisePass: return String(localized: "Shore Pass")
+        case .shorePass: return String(localized: "Shore Pass")
         case .customRelay: return String(localized: "Internet delivery")
         }
     }
@@ -19,7 +19,7 @@ enum InternetDeliveryService: Equatable {
     /// what counts as the official service.
     static func of(_ config: RelayConfig?) -> InternetDeliveryService? {
         guard let config else { return nil }
-        return relaySetupIsOfficial(relayUrl: config.relayUrl) ? .cruisePass : .customRelay
+        return relaySetupIsOfficial(relayUrl: config.relayUrl) ? .shorePass : .customRelay
     }
 }
 

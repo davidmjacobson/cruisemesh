@@ -45,12 +45,12 @@ class ConnectionActivityLogicTest {
     @Test
     fun `outbound delivery and inbound arrival are distinct evidence`() {
         val delivered = latestPeerStatus(
-            listOf(summary(PeerConnectionTransport.CRUISE_PASS, delivered = 500L)),
+            listOf(summary(PeerConnectionTransport.SHORE_PASS, delivered = 500L)),
         )
         assertEquals(PeerEvidence.MESSAGE_DELIVERED, delivered?.evidence)
 
         val received = latestPeerStatus(
-            listOf(summary(PeerConnectionTransport.CRUISE_PASS, received = 500L)),
+            listOf(summary(PeerConnectionTransport.SHORE_PASS, received = 500L)),
         )
         assertEquals(PeerEvidence.MESSAGE_RECEIVED, received?.evidence)
     }
@@ -83,7 +83,7 @@ class ConnectionActivityLogicTest {
     fun `the newest moment wins across paths, not the first field on a row`() {
         val status = latestPeerStatus(
             listOf(
-                summary(PeerConnectionTransport.CRUISE_PASS, delivered = 1_000L, seen = 2_000L),
+                summary(PeerConnectionTransport.SHORE_PASS, delivered = 1_000L, seen = 2_000L),
                 summary(PeerConnectionTransport.BLUETOOTH, received = 5_000L),
             ),
         )

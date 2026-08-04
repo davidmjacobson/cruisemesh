@@ -165,7 +165,7 @@ pub struct MessageArrival {
 pub enum PeerConnectionTransport {
     Bluetooth,
     LocalWifi,
-    CruisePass,
+    ShorePass,
     /// Another device carried this the last hop, so no path to the friend was
     /// observed at all.
     ///
@@ -255,7 +255,7 @@ pub fn core_peer_transport_for_arrival(transport: u8) -> PeerConnectionTransport
         0 => PeerConnectionTransport::Bluetooth,
         3 => PeerConnectionTransport::LocalWifi,
         1 | 4 => PeerConnectionTransport::Carried,
-        _ => PeerConnectionTransport::CruisePass,
+        _ => PeerConnectionTransport::ShorePass,
     }
 }
 
@@ -4802,7 +4802,7 @@ fn peer_transport_value(transport: PeerConnectionTransport) -> i64 {
     match transport {
         PeerConnectionTransport::Bluetooth => 0,
         PeerConnectionTransport::LocalWifi => 1,
-        PeerConnectionTransport::CruisePass => 2,
+        PeerConnectionTransport::ShorePass => 2,
         PeerConnectionTransport::Carried => 3,
     }
 }
@@ -4811,7 +4811,7 @@ fn peer_transport_from_value(value: i64) -> rusqlite::Result<PeerConnectionTrans
     match value {
         0 => Ok(PeerConnectionTransport::Bluetooth),
         1 => Ok(PeerConnectionTransport::LocalWifi),
-        2 => Ok(PeerConnectionTransport::CruisePass),
+        2 => Ok(PeerConnectionTransport::ShorePass),
         3 => Ok(PeerConnectionTransport::Carried),
         _ => Err(rusqlite::Error::IntegralValueOutOfRange(1, value)),
     }
@@ -5473,7 +5473,7 @@ mod tests {
         store
             .record_peer_connection_event(
                 alice.clone(),
-                PeerConnectionTransport::CruisePass,
+                PeerConnectionTransport::ShorePass,
                 PeerConnectionEventKind::PresenceSeen,
                 1_700_000_002_000,
             )
@@ -5629,7 +5629,7 @@ mod tests {
         );
         assert_eq!(
             core_peer_transport_for_arrival(2),
-            PeerConnectionTransport::CruisePass
+            PeerConnectionTransport::ShorePass
         );
         assert_eq!(
             core_peer_transport_for_arrival(3),
@@ -5659,7 +5659,7 @@ mod tests {
         for observed in [
             PeerConnectionTransport::Bluetooth,
             PeerConnectionTransport::LocalWifi,
-            PeerConnectionTransport::CruisePass,
+            PeerConnectionTransport::ShorePass,
         ] {
             assert!(core_peer_transport_is_observed(observed));
         }

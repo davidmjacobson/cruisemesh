@@ -31,11 +31,11 @@ final class ConnectionActivityLogicTests: XCTestCase {
     /// arrival is the defect this whole change exists to remove.
     func testOutboundDeliveryAndInboundArrivalAreDistinct() {
         XCTAssertEqual(
-            ConnectionActivityLogic.latestPeerStatus([summary(.cruisePass, delivered: 500)])?.evidence,
+            ConnectionActivityLogic.latestPeerStatus([summary(.shorePass, delivered: 500)])?.evidence,
             .messageDelivered
         )
         XCTAssertEqual(
-            ConnectionActivityLogic.latestPeerStatus([summary(.cruisePass, received: 500)])?.evidence,
+            ConnectionActivityLogic.latestPeerStatus([summary(.shorePass, received: 500)])?.evidence,
             .messageReceived
         )
     }
@@ -54,7 +54,7 @@ final class ConnectionActivityLogicTests: XCTestCase {
     /// news while a fresher arrival on another path was dropped.
     func testNewestMomentWinsAcrossPaths() {
         let status = ConnectionActivityLogic.latestPeerStatus([
-            summary(.cruisePass, seen: 2_000, delivered: 1_000),
+            summary(.shorePass, seen: 2_000, delivered: 1_000),
             summary(.bluetooth, received: 5_000),
         ])
         XCTAssertEqual(status?.evidence, .messageReceived)
@@ -92,7 +92,7 @@ final class ConnectionActivityLogicTests: XCTestCase {
     /// one surface names a path the other says was never seen. Every case is
     /// checked, so a transport added later cannot silently pick a default.
     func testAPathIsNamedExactlyWhenCoreSaysItWasObserved() {
-        let all: [PeerConnectionTransport] = [.bluetooth, .localWifi, .cruisePass, .carried]
+        let all: [PeerConnectionTransport] = [.bluetooth, .localWifi, .shorePass, .carried]
         for transport in all {
             XCTAssertEqual(
                 corePeerTransportIsObserved(transport: transport),

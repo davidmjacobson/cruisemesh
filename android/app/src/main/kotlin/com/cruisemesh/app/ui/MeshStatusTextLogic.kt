@@ -9,7 +9,7 @@ enum class MeshStatusDotColor { GREEN, BLUE, AMBER, NEUTRAL }
 data class MeshStatusPillStatus(val text: String, val dot: MeshStatusDotColor?)
 
 enum class InternetDeliveryService(val displayName: String) {
-    CRUISE_PASS("Shore Pass"),
+    SHORE_PASS("Shore Pass"),
     CUSTOM_RELAY("relay"),
 }
 
@@ -59,13 +59,13 @@ object MeshStatusTextLogic {
             RelayHealth.NoConfig -> "no internet delivery set up"
             is RelayHealth.Failing -> "$serviceName unreachable"
             is RelayHealth.Expired ->
-                if (internetDeliveryService == InternetDeliveryService.CRUISE_PASS) {
+                if (internetDeliveryService == InternetDeliveryService.SHORE_PASS) {
                     "Shore Pass expired"
                 } else {
                     "$serviceName pass expired"
                 }
             is RelayHealth.Suspended ->
-                if (internetDeliveryService == InternetDeliveryService.CRUISE_PASS) {
+                if (internetDeliveryService == InternetDeliveryService.SHORE_PASS) {
                     "Shore Pass suspended"
                 } else {
                     "$serviceName pass suspended"

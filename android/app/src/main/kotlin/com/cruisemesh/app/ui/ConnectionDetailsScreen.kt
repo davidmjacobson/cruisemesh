@@ -413,7 +413,7 @@ private fun activityTextNoPathId(evidence: PeerEvidence): Int = when (evidence) 
 internal fun transportLabelId(transport: PeerConnectionTransport): Int? = when (transport) {
     PeerConnectionTransport.BLUETOOTH -> R.string.ui_path_bluetooth
     PeerConnectionTransport.LOCAL_WIFI -> R.string.ui_path_local_wifi
-    PeerConnectionTransport.CRUISE_PASS -> R.string.ui_path_cruise_pass
+    PeerConnectionTransport.SHORE_PASS -> R.string.ui_path_shore_pass
     PeerConnectionTransport.CARRIED -> null
 }
 

@@ -3415,7 +3415,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                                 seen.append((userId, localSeenAt))
                                 try? store.recordPeerConnectionEvent(
                                     userId: userId,
-                                    transport: .cruisePass,
+                                    transport: .shorePass,
                                     kind: .presenceSeen,
                                     occurredAtMs: localSeenAt
                                 )

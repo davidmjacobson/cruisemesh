@@ -13403,7 +13403,7 @@ public enum PeerConnectionTransport {
     
     case bluetooth
     case localWifi
-    case cruisePass
+    case shorePass
     /**
      * Another device carried this the last hop, so no path to the friend was
      * observed at all.
@@ -13437,7 +13437,7 @@ public struct FfiConverterTypePeerConnectionTransport: FfiConverterRustBuffer {
         
         case 2: return .localWifi
         
-        case 3: return .cruisePass
+        case 3: return .shorePass
         
         case 4: return .carried
         
@@ -13457,7 +13457,7 @@ public struct FfiConverterTypePeerConnectionTransport: FfiConverterRustBuffer {
             writeInt(&buf, Int32(2))
         
         
-        case .cruisePass:
+        case .shorePass:
             writeInt(&buf, Int32(3))
         
         

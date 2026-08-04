@@ -15,7 +15,7 @@ struct SettingsView: View {
             Form {
                 Section("Shore Pass") {
                     NavigationLink {
-                        CruisePassView(initialCard: nil, appModel: appModel)
+                        ShorePassView(initialCard: nil, appModel: appModel)
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {
