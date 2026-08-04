@@ -9040,6 +9040,97 @@ mod tests {
         assert_eq!(through, 9);
     }
 
+    /// The receipt-repair lane reports an *uncapped* peer-stream watermark:
+    /// MAX semantics, so it can legitimately sit above the highest lamport the
+    /// acknowledging side holds a row for (a front gap from the lamport
+    /// ratchet, or a kind -- like a group invite -- filed under another chat).
+    /// The receiving side must absorb that harmlessly: monotonic as always,
+    /// and above all it must not drop anything it still owes. Only expiry and
+    /// chat-delete prune `outbound_envelopes`; a receipt never does.
+    #[test]
+    fn record_receipt_absorbs_an_over_reported_watermark_without_dropping_outbound_work() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let alice = crate::generate_identity();
+        let bob = crate::generate_identity();
+        let bob_contact = Contact {
+            user_id: bob.user_id.clone(),
+            name: "Bob".to_string(),
+            sign_pk: bob.sign_pk.clone(),
+            agree_pk: bob.agree_pk.clone(),
+            relay_url: None,
+            relay_token: None,
+            nickname: None,
+        };
+        store
+            .author_pairwise_message(
+                alice.clone(),
+                bob_contact.clone(),
+                crate::KIND_TEXT,
+                b"hello".to_vec(),
+                None,
+                1_700_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .outbound_envelopes_after(bob.user_id.clone(), alice.user_id.clone(), 0)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Bob acks far beyond anything Alice authored.
+        store
+            .record_receipt(
+                bob.user_id.clone(),
+                alice.user_id.clone(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9_999,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .receipt_through(
+                    bob.user_id.clone(),
+                    alice.user_id.clone(),
+                    crate::RECEIPT_TYPE_DELIVERED,
+                )
+                .unwrap(),
+            9_999
+        );
+        // The queued envelope is still there to send/resend.
+        assert_eq!(
+            store
+                .outbound_envelopes_after(bob.user_id.clone(), alice.user_id.clone(), 0)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // And an ordinary, correctly-sized receipt arriving afterwards still
+        // cannot regress the watermark.
+        store
+            .record_receipt(
+                bob.user_id.clone(),
+                alice.user_id.clone(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                1,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .receipt_through(
+                    bob.user_id.clone(),
+                    alice.user_id.clone(),
+                    crate::RECEIPT_TYPE_DELIVERED,
+                )
+                .unwrap(),
+            9_999
+        );
+    }
+
     #[test]
     fn record_receipt_records_and_advances_via_transport() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
