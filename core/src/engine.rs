@@ -567,6 +567,17 @@ impl MessageStore {
     /// This deliberately includes all three canonical classes: foreign
     /// carried traffic, this device's pending pairwise traffic to other
     /// contacts, and pending receipts owed to other contacts.
+    ///
+    /// Every class is budgeted per encounter, foreign carry included
+    /// (`carried_budget_bytes`). A phone that has been muling for a busy fleet
+    /// can be holding megabytes for third parties; offering all of it at once
+    /// down a BLE link's single FIFO queues everything behind it for minutes,
+    /// live replies to real contacts included. The cut bounds only what is
+    /// OFFERED this round -- the carry queue itself is untouched, and D8's
+    /// 3-5 minute re-digest re-offers the remainder (still oldest first) on
+    /// the next round, so a backlog is paced rather than dropped. Removal of
+    /// a carried copy remains gated on digest-proof of receipt
+    /// ([`Self::core_confirm_carried_deliveries`]); nothing here acks.
     pub fn core_digest_spray_plan(
         &self,
         own_user_id: Vec<u8>,
@@ -574,6 +585,7 @@ impl MessageStore {
         peer_hints: Vec<Vec<u8>>,
         peer_known_msg_ids: Vec<Vec<u8>>,
         now_ms: i64,
+        carried_budget_bytes: u64,
         own_outbound_budget_bytes: u64,
         own_receipt_budget_bytes: u64,
         receipt_query_limit: u64,
@@ -581,8 +593,12 @@ impl MessageStore {
         hidden_already_offered: Vec<Vec<u8>>,
     ) -> Result<CoreDigestSprayPlan, CoreError> {
         self.prune_expired_carried(now_ms)?;
-        let carried =
-            self.carried_envelopes_for_peer_sync(peer_hints, peer_known_msg_ids.clone(), now_ms)?;
+        let carried = self.carried_envelopes_for_peer_sync(
+            peer_hints,
+            peer_known_msg_ids.clone(),
+            now_ms,
+            carried_budget_bytes,
+        )?;
         let known: HashSet<Vec<u8>> = peer_known_msg_ids.into_iter().collect();
         // Hidden kinds never advance a non-capable peer's DELIVERED
         // watermark, so `lamport > delivered_through` re-selects them on
@@ -2069,6 +2085,7 @@ mod tests {
                 vec![],
                 vec![],
                 now_ms,
+                u64::MAX,
                 15,
                 0,
                 0,
@@ -2153,6 +2170,7 @@ mod tests {
                     vec![],
                     vec![],
                     now_ms,
+                    u64::MAX,
                     1024 * 1024,
                     0,
                     0,
@@ -2178,6 +2196,226 @@ mod tests {
         let capable = plan(true, vec![]);
         assert_eq!(capable.own_outbound_frames.len(), 2);
         assert!(capable.offered_hidden_msg_ids.is_empty());
+    }
+
+    // --- per-encounter foreign-carry budget --------------------------------
+
+    /// The `msg_id` an envelope frame carries, read straight back out of the
+    /// header (`encode_envelope_frame`: type byte, then the 16-byte id).
+    fn frame_msg_id(frame: &[u8]) -> Vec<u8> {
+        frame[1..17].to_vec()
+    }
+
+    /// Seed a carry queue with `count` foreign envelopes of `sealed_len`
+    /// bytes each, received oldest-first in id order (`carried-000` first).
+    fn seed_carried(store: &MessageStore, count: usize, sealed_len: usize, now_ms: i64) {
+        for index in 0..count {
+            let mut msg_id = vec![0_u8; 16];
+            msg_id[0] = 0xC0;
+            msg_id[1] = index as u8;
+            store
+                .enqueue_carried_envelope(
+                    crate::CarriedEnvelope {
+                        msg_id,
+                        hop_ttl: 7,
+                        expiry: now_ms + 600_000,
+                        recipient_hint: vec![0xE0, index as u8],
+                        sealed: vec![0xAB; sealed_len],
+                    },
+                    false,
+                    // Distinct, increasing received_at so the oldest-first
+                    // ordering under test is unambiguous.
+                    now_ms - 100_000 + index as i64,
+                    5 * 1024 * 1024,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn carried_spray_stops_at_the_encounter_budget_oldest_first() {
+        // A courier phone holding a big foreign backlog must offer only a
+        // bounded slice of it per encounter, taken oldest first, and must
+        // never emit a partial envelope to make the last few bytes fit.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let now_ms = 1_700_000_000_000_i64;
+        seed_carried(&store, 5, 100, now_ms);
+
+        // 250 bytes fits two 100-byte envelopes; the third would overflow.
+        let plan = store
+            .core_digest_spray_plan(
+                vec![1_u8; 16],
+                vec![9_u8; 16],
+                vec![],
+                vec![],
+                now_ms,
+                250,
+                0,
+                0,
+                0,
+                true,
+                vec![],
+            )
+            .unwrap();
+
+        let ids: Vec<Vec<u8>> = plan
+            .carried_frames
+            .iter()
+            .map(|f| frame_msg_id(f))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                {
+                    let mut id = vec![0_u8; 16];
+                    id[0] = 0xC0;
+                    id
+                },
+                {
+                    let mut id = vec![0_u8; 16];
+                    id[0] = 0xC0;
+                    id[1] = 1;
+                    id
+                },
+            ],
+            "the two oldest carried envelopes, in received order"
+        );
+        for frame in &plan.carried_frames {
+            assert_eq!(
+                frame.len(),
+                1 + 16 + 1 + 8 + 2 + 100,
+                "every offered frame is whole -- the budget never truncates one"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_carried_budget_silences_the_foreign_lane_only() {
+        // The fairness knob must be able to stand the foreign lane down
+        // entirely without touching this device's own mail or receipts.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let own_user_id = vec![1_u8; 16];
+        let bob = vec![2_u8; 16];
+        let now_ms = 1_700_000_000_000_i64;
+        seed_carried(&store, 3, 100, now_ms);
+        store
+            .upsert_contact(crate::Contact {
+                user_id: bob.clone(),
+                name: "Bob".to_string(),
+                sign_pk: vec![0; 32],
+                agree_pk: vec![0; 32],
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            })
+            .unwrap();
+        store
+            .insert_outgoing_message(
+                crate::StoredMessage {
+                    chat_id: bob.clone(),
+                    sender_user_id: own_user_id.clone(),
+                    lamport: 1,
+                    timestamp: now_ms,
+                    kind: 1,
+                    payload: b"hi".to_vec(),
+                },
+                OutboundEnvelope {
+                    msg_id: vec![7_u8; 16],
+                    recipient_user_id: bob.clone(),
+                    chat_id: bob.clone(),
+                    sender_user_id: own_user_id.clone(),
+                    kind: 1,
+                    lamport: 1,
+                    timestamp: now_ms,
+                    hop_ttl: 7,
+                    expiry: now_ms + 60_000,
+                    recipient_hint: b"hint".to_vec(),
+                    sealed: vec![0xAB; 10],
+                },
+                now_ms,
+            )
+            .unwrap();
+
+        let plan = store
+            .core_digest_spray_plan(
+                own_user_id,
+                vec![9_u8; 16],
+                vec![],
+                vec![],
+                now_ms,
+                0,
+                1024 * 1024,
+                1024,
+                128,
+                true,
+                vec![],
+            )
+            .unwrap();
+
+        assert!(plan.carried_frames.is_empty());
+        assert_eq!(plan.own_outbound_frames.len(), 1);
+    }
+
+    #[test]
+    fn carried_backlog_is_paced_across_re_digests_not_dropped() {
+        // Nothing the budget excludes is lost: the next re-digest, with the
+        // peer now advertising the first round's msg_ids as known, offers the
+        // next tranche -- and the carry queue itself is untouched throughout
+        // (removal still waits on digest-proof of receipt).
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let now_ms = 1_700_000_000_000_i64;
+        seed_carried(&store, 6, 100, now_ms);
+
+        let round = |known: Vec<Vec<u8>>| {
+            store
+                .core_digest_spray_plan(
+                    vec![1_u8; 16],
+                    vec![9_u8; 16],
+                    vec![],
+                    known,
+                    now_ms,
+                    200,
+                    0,
+                    0,
+                    0,
+                    true,
+                    vec![],
+                )
+                .unwrap()
+        };
+
+        let first = round(vec![]);
+        let first_ids: Vec<Vec<u8>> = first
+            .carried_frames
+            .iter()
+            .map(|f| frame_msg_id(f))
+            .collect();
+        assert_eq!(first_ids.len(), 2);
+
+        let second = round(first_ids.clone());
+        let second_ids: Vec<Vec<u8>> = second
+            .carried_frames
+            .iter()
+            .map(|f| frame_msg_id(f))
+            .collect();
+        assert_eq!(second_ids.len(), 2);
+        assert!(
+            second_ids.iter().all(|id| !first_ids.contains(id)),
+            "the second round advances to the next tranche"
+        );
+
+        let third = round([first_ids, second_ids].concat());
+        assert_eq!(third.carried_frames.len(), 2, "and the last two follow");
+
+        // All six are still held: pacing changes what is offered, never what
+        // is carried.
+        assert_eq!(
+            store
+                .carried_envelopes_for_peer_sync(vec![], vec![], now_ms, u64::MAX)
+                .unwrap()
+                .len(),
+            6
+        );
     }
 
     #[test]

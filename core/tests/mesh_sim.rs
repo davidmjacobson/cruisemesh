@@ -579,6 +579,7 @@ impl Network {
                         self.nodes[b].recent_delivery_hints(now),
                         peer_known_msg_ids,
                         now,
+                        u64::MAX,
                     )
                     .expect("query spray candidates");
                 for env in spray {

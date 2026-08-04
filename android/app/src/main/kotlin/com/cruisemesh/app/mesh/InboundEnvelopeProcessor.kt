@@ -94,6 +94,19 @@ private const val OWN_OUTBOUND_SPRAY_BUDGET_BYTES: Long = 256L * 1024
 private const val OWN_RECEIPT_SPRAY_BUDGET_BYTES: Long = 64L * 1024
 
 /**
+ * Bounded per-digest-exchange budget (sealed-byte size) for spraying *foreign*
+ * carried envelopes onward. Same size as [OWN_OUTBOUND_SPRAY_BUDGET_BYTES]: a
+ * phone that has been muling for a busy fleet can be holding the whole
+ * [FOREIGN_CARRY_BUDGET_BYTES] of third-party traffic, and offering all of it
+ * on one encounter fills a BLE link's single FIFO for minutes, with live
+ * replies to real contacts stuck behind it. Nothing is dropped by the cut: the
+ * carry queue is untouched and the periodic re-digest re-offers the remainder,
+ * oldest first, so a big backlog drains over several rounds instead of one
+ * burst.
+ */
+private const val CARRIED_SPRAY_BUDGET_BYTES: Long = 256L * 1024
+
+/**
  * FA15: the envelope half of what used to be MeshService — everything that
  * happens to a §6.4 envelope after a transport hands it over: the FA5
  * admission claim, the §5.3 gossip gate (dedupe/expiry), open-vs-relay, local
@@ -2090,13 +2103,20 @@ internal class InboundEnvelopeProcessor(
                 peerHints = recentHintsFor(peerUserId, now),
                 peerKnownMsgIds = peerKnownMsgIds,
                 nowMs = now,
+                carriedBudgetBytes = CARRIED_SPRAY_BUDGET_BYTES.toULong(),
                 ownOutboundBudgetBytes = OWN_OUTBOUND_SPRAY_BUDGET_BYTES.toULong(),
                 ownReceiptBudgetBytes = OWN_RECEIPT_SPRAY_BUDGET_BYTES.toULong(),
                 receiptQueryLimit = RELAY_STORE_BATCH_LIMIT,
                 peerAcksHiddenKinds = MeshRouter.peerAcksHiddenKinds(address),
                 hiddenAlreadyOffered = MeshRouter.hiddenOfferedFor(address),
             )
-            val frames = plan.carriedFrames + plan.ownOutboundFrames + plan.ownReceiptFrames
+            // Own lanes first, foreign carry last. On a slow link every frame
+            // here lands in one FIFO, so whatever goes first delays everything
+            // after it: live mail and receipts to real contacts must beat
+            // third-party courier traffic. Nothing is lost by deferring the
+            // carried lane -- the periodic re-digest re-offers it, and its own
+            // per-encounter budget already bounds this round's share.
+            val frames = plan.ownOutboundFrames + plan.ownReceiptFrames + plan.carriedFrames
             val sprayed = frames.count { MeshRouter.sendToAddress(address, it) }
             MeshRouter.recordHiddenOffered(address, plan.offeredHiddenMsgIds)
             Log.i(
