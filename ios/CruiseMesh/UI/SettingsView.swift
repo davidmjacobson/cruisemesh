@@ -123,6 +123,7 @@ struct SettingsView: View {
                     Button("Close") { dismiss() }
                 }
             }
+            .accessibilityIdentifier("screen.settings")
         }
     }
 

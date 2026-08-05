@@ -122,14 +122,29 @@ targets:
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/CruiseMesh.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/CruiseMesh"
         BUNDLE_LOADER: "$(TEST_HOST)"
 
+  CruiseMeshUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: CruiseMeshUITests
+    dependencies:
+      - target: CruiseMesh
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cruisemesh.app.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: CruiseMesh
+
 schemes:
   CruiseMesh:
     build:
       targets:
         CruiseMesh: all
         CruiseMeshTests: [test]
+        CruiseMeshUITests: [test]
     test:
       targets:
         - CruiseMeshTests
+        - CruiseMeshUITests
     run:
       config: Debug

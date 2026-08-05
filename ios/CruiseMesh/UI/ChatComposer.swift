@@ -49,6 +49,7 @@ struct ChatComposerBar: View {
                 .accessibilityLabel("Attach")
 
                 TextField("Message", text: $draft, axis: .vertical)
+                    .accessibilityIdentifier("chat.composer.text")
                     .lineLimit(1...4)
                     .focused(composerFocused)
                     .padding(.horizontal, 14)
@@ -64,6 +65,7 @@ struct ChatComposerBar: View {
                             .font(.system(size: 32, weight: .semibold))
                     }
                     .accessibilityLabel("Send")
+                    .accessibilityIdentifier("chat.composer.send")
                 } else {
                     HoldToRecordButton(
                         recorder: voiceRecorder,
@@ -76,6 +78,7 @@ struct ChatComposerBar: View {
         }
         .padding(12)
         .background(.bar)
+        .accessibilityIdentifier("chat.composer")
     }
 }
 

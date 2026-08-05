@@ -222,6 +222,7 @@ struct ChatView: View {
                     }
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("chat.contact-details")
             }
         }
         .onAppear {
@@ -229,7 +230,9 @@ struct ChatView: View {
             isMuted = ChatMuteStore.isMuted(contact.userId)
             isBlocked = (try? store.isUserBlocked(userId: contact.userId)) ?? false
             ChatVisibility.setVisible(contact.userId)
-            MeshController.shared.notifyChatViewed(chatId: contact.userId)
+            if !UITestConfiguration.isEnabled {
+                MeshController.shared.notifyChatViewed(chatId: contact.userId)
+            }
             reload()
             cancellable = ChatEvents.subject.sink { chatId in
                 if chatId == contact.userId { reload() }
@@ -248,7 +251,9 @@ struct ChatView: View {
                 ChatVisibility.clearVisible(contact.userId)
             } else if phase == .active {
                 ChatVisibility.setVisible(contact.userId)
-                MeshController.shared.notifyChatViewed(chatId: contact.userId)
+                if !UITestConfiguration.isEnabled {
+                    MeshController.shared.notifyChatViewed(chatId: contact.userId)
+                }
             }
         }
         .onChange(of: draft) { DraftStore.save(chatId: contact.userId, text: $0) }
@@ -349,6 +354,7 @@ struct ChatView: View {
         } message: {
             Text(statusMessage ?? "")
         }
+        .accessibilityIdentifier("screen.chat")
     }
 
     private var canSend: Bool {

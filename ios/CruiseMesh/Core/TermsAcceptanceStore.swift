@@ -7,11 +7,11 @@ enum TermsAcceptanceStore {
 
     private static let acceptedVersionKey = "cruisemesh.terms.acceptedVersion"
 
-    static func isCurrentVersionAccepted(defaults: UserDefaults = .standard) -> Bool {
+    static func isCurrentVersionAccepted(defaults: UserDefaults = AppDefaults.current) -> Bool {
         defaults.string(forKey: acceptedVersionKey) == currentVersion
     }
 
-    static func acceptCurrentVersion(defaults: UserDefaults = .standard) {
+    static func acceptCurrentVersion(defaults: UserDefaults = AppDefaults.current) {
         defaults.set(currentVersion, forKey: acceptedVersionKey)
     }
 }

@@ -136,6 +136,7 @@ struct OnboardingView: View {
                 OnboardingStore.markCompleted()
             }
         }
+        .accessibilityIdentifier("screen.onboarding")
     }
 
     private func complete() {
@@ -244,8 +245,10 @@ private struct PermissionsSlide: View {
     // Read statically rather than through `BluetoothAccess.shared`: this slide
     // only needs the recorded decision, and touching that singleton would spin
     // up a `CBCentralManager` before the user has agreed to anything.
-    @State private var bluetooth: CBManagerAuthorization = CBCentralManager.authorization
-    @State private var notifications: UNAuthorizationStatus = .notDetermined
+    @State private var bluetooth: CBManagerAuthorization = UITestConfiguration.isEnabled
+        ? .allowedAlways : CBCentralManager.authorization
+    @State private var notifications: UNAuthorizationStatus = UITestConfiguration.isEnabled
+        ? .authorized : .notDetermined
 
     private var action: OnboardingPermissionAction {
         OnboardingPermissions.action(bluetooth: bluetooth, notifications: notifications)
@@ -319,6 +322,11 @@ private struct PermissionsSlide: View {
     }
 
     private func refreshPermissions() {
+        guard !UITestConfiguration.isEnabled else {
+            bluetooth = .allowedAlways
+            notifications = .authorized
+            return
+        }
         let bluetoothNow = CBCentralManager.authorization
         UNUserNotificationCenter.current().getNotificationSettings { settings in
             let status = settings.authorizationStatus

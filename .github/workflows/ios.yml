@@ -11,12 +11,23 @@ name: iOS
 # the Swift bindings the app links against), plus this workflow itself.
 
 on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Tests to run on the macOS host
+        required: true
+        default: ui
+        type: choice
+        options:
+          - ui
+          - all
   pull_request:
     paths:
       - "ios/**"
       - "core/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "tools/run-ios-ui-tests.ps1"
       - ".github/workflows/ios.yml"
   push:
     branches: [master]
@@ -25,6 +36,7 @@ on:
       - "core/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "tools/run-ios-ui-tests.ps1"
       - ".github/workflows/ios.yml"
 
 jobs:
@@ -92,9 +104,29 @@ jobs:
         working-directory: ios
         run: |
           set -o pipefail
+          mkdir -p build
+          ONLY_TESTING=()
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.suite }}" == "ui" ]]; then
+            ONLY_TESTING=(-only-testing:CruiseMeshUITests)
+          fi
           xcodebuild test \
             -project CruiseMesh.xcodeproj \
             -scheme CruiseMesh \
             -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
             -derivedDataPath build/dd \
-            CODE_SIGNING_ALLOWED=NO
+            -resultBundlePath build/TestResults.xcresult \
+            -parallel-testing-enabled NO \
+            "${ONLY_TESTING[@]}" \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee build/xcodebuild.log
+
+      - name: Upload iOS test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-results
+          path: |
+            ios/build/TestResults.xcresult
+            ios/build/xcodebuild.log
+          if-no-files-found: warn
+          retention-days: 14

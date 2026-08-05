@@ -11,9 +11,20 @@ struct CruiseMeshApp: App {
     // early.
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var appModel = AppModel()
-    @State private var termsAccepted = TermsAcceptanceStore.isCurrentVersionAccepted()
-    @State private var onboardingCompleted = OnboardingStore.isCompleted()
+    @StateObject private var appModel: AppModel
+    @State private var termsAccepted: Bool
+    @State private var onboardingCompleted: Bool
+
+    init() {
+        _appModel = StateObject(wrappedValue: AppModel())
+        if let scenario = UITestConfiguration.scenario {
+            _termsAccepted = State(initialValue: scenario.termsAccepted)
+            _onboardingCompleted = State(initialValue: scenario.onboardingCompleted)
+        } else {
+            _termsAccepted = State(initialValue: TermsAcceptanceStore.isCurrentVersionAccepted())
+            _onboardingCompleted = State(initialValue: OnboardingStore.isCompleted())
+        }
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -32,7 +43,9 @@ struct CruiseMeshApp: App {
                 }
             }
             .environmentObject(appModel)
+            .defaultAppStorage(AppDefaults.current)
             .onAppear {
+                guard !UITestConfiguration.isEnabled else { return }
                 UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
                 MessageNotifier.configureCategories()
             }
@@ -65,6 +78,7 @@ struct CruiseMeshApp: App {
             }
             .onChange(of: scenePhase) { phase in
                 appModel.setAppForeground(phase == .active)
+                guard !UITestConfiguration.isEnabled else { return }
                 // Flush both when leaving and when returning: mesh work can
                 // continue while backgrounded, and those entries should reach
                 // the persistent tester archive before a later termination.
@@ -101,6 +115,7 @@ struct CruiseMeshApp: App {
 /// this provides for the background-relaunch case specifically.
 final class AppDelegate: NSObject, UIApplicationDelegate {
     func applicationWillTerminate(_ application: UIApplication) {
+        guard !UITestConfiguration.isEnabled else { return }
         DiagnosticLogExport.archiveCurrentSession()
     }
 
@@ -109,6 +124,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        if UITestConfiguration.isEnabled {
+            UIView.setAnimationsEnabled(false)
+            return true
+        }
         // Battery audit, 2026-07-21: registered unconditionally, here rather
         // than in the SwiftUI `onAppear` below, for the same reason this
         // method exists at all -- a background BLE relaunch may never show
@@ -134,8 +153,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
               OnboardingStore.isCompleted() else { return true }
         let identity = IdentityStore.loadOrCreate()
         MeshController.shared.configure(identity: identity)
-        let meshEnabled = UserDefaults.standard.object(forKey: AppModel.meshEnabledKey) == nil
-            || UserDefaults.standard.bool(forKey: AppModel.meshEnabledKey)
+        let meshEnabled = AppDefaults.current.object(forKey: AppModel.meshEnabledKey) == nil
+            || AppDefaults.current.bool(forKey: AppModel.meshEnabledKey)
         if meshEnabled {
             MeshController.shared.start()
         }

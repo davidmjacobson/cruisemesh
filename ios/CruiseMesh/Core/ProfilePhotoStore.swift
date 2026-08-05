@@ -7,6 +7,7 @@ enum ProfilePhotoStore {
     private static let wireMaxBytes = 24 * 1024
 
     private static var avatarURL: URL {
+        if let testURL = UITestConfiguration.avatarURL { return testURL }
         let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("profile", isDirectory: true)
         return dir.appendingPathComponent("avatar.jpg")

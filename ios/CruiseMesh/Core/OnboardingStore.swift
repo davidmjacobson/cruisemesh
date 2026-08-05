@@ -4,10 +4,10 @@ enum OnboardingStore {
     private static let completedKey = "cruisemesh.onboarding.completed"
 
     static func isCompleted() -> Bool {
-        UserDefaults.standard.bool(forKey: completedKey)
+        AppDefaults.current.bool(forKey: completedKey)
     }
 
     static func markCompleted() {
-        UserDefaults.standard.set(true, forKey: completedKey)
+        AppDefaults.current.set(true, forKey: completedKey)
     }
 }
