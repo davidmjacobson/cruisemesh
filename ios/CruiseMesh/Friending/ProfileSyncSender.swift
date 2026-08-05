@@ -72,7 +72,7 @@ enum ProfileSyncSender {
         GossipState.seenIds.record(msgId: authored.envelope.msgId)
         RelaySyncEvents.requestSync()
         if !MeshRouter.sendToUserId(userId: contact.userId, frame: authored.frame) {
-            log.info("Profile sync queued for later delivery to \(contact.name, privacy: .public)")
+            log.info("Profile sync queued for later delivery to \(UserIdHex.encode(contact.userId), privacy: .public)")
         }
     }
 }

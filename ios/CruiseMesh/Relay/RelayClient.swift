@@ -527,8 +527,9 @@ enum RelayClient {
 
     private static func label(_ request: URLRequest) -> String {
         let method = request.httpMethod ?? "?"
+        let host = request.url?.host ?? "?"
         let path = request.url?.path ?? "?"
-        return "\(method) \(path)"
+        return "\(method) \(host)\(path)"
     }
 
     private static func elapsedMs(_ started: Date) -> Int {

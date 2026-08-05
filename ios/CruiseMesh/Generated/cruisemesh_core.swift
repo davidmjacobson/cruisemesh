@@ -1985,8 +1985,8 @@ public protocol MessageStoreProtocol : AnyObject {
      * answer. A 401 may advance the separate rejection streak, but it proves
      * the host is reachable and must settle the silence verdict.
      */
-    func clearContactRelayUnreachable(userId: Data) throws
-
+    func clearContactRelayUnreachable(userId: Data) throws 
+    
     /**
      * Erases every V2 field-metrics row.
      *
@@ -2033,7 +2033,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * sender stream the visible-gap policy compares independently.
      */
     func consumedHiddenLamports(chatId: Data) throws  -> [ConsumedHiddenLamport]
-
+    
     /**
      * Rows currently in the consumed-hidden-kind set, expired ones included
      * (diagnostics/tests).
@@ -2643,7 +2643,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * restarts without a query per contact.
      */
     func listContactRelayUnreachable() throws  -> [ContactRelayUnreachable]
-
+    
     /**
      * All contacts, alphabetical by name.
      */
@@ -2792,7 +2792,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * observation is strong enough to call this method.
      */
     func noteContactRelayUnreachable(userId: Data, endpointKey: String, nowMs: Int64) throws  -> Int64
-
+    
     /**
      * Notice that the set of ids our relay fetch hints derive from has
      * changed, and invalidate every remembered frontier if it has. Returns
@@ -3060,7 +3060,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * second copy here would obscure the ownership boundary.
      */
     func recordConsumedHiddenLamport(chatId: Data, senderUserId: Data, lamport: UInt64, kind: UInt8) throws  -> Bool
-
+    
     /**
      * V2 field metric: stamp the delivery time and return route (T6
      * `via_transport`) onto every outbound metric row in `chat_id` at or below
@@ -3070,14 +3070,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * stamps the messages it newly covers). Metadata only.
      */
     func recordDeliveredMetric(chatId: Data, throughLamport: UInt64, deliveredAtMs: Int64, viaTransport: UInt8?) throws 
-
+    
     /**
      * Attach first-arrival diagnostics to an already inserted incoming
      * message. A redundant mesh/relay copy never overwrites the original
      * route, hop count, or receive time.
      */
     func recordMessageArrival(chatId: Data, senderUserId: Data, lamport: UInt64, arrival: MessageArrival) throws  -> Bool
-
+    
     /**
      * Record that *this device* has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` -- the
@@ -3087,14 +3087,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * stale retries must never regress it.
      */
     func recordOutgoingReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64) throws 
-
+    
     /**
      * Record a bounded, metadata-only connection event for an accepted peer.
      * Identical high-frequency signals are coalesced for 30 seconds; detailed
      * events are retained for 30 days and capped at 1,000 rows.
      */
     func recordPeerConnectionEvent(userId: Data, transport: PeerConnectionTransport, kind: PeerConnectionEventKind, occurredAtMs: Int64) throws 
-
+    
     /**
      * Record that a peer has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` (DESIGN.md
@@ -3118,7 +3118,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * route isn't known.
      */
     func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws 
-
+    
     /**
      * V2 field metric: record that this device authored an outbound message
      * at `lamport` in `chat_id` at `sent_at_ms`, so the cruise-test export can
@@ -3784,7 +3784,7 @@ open func clearContactRelayUnreachable(userId: Data)throws  {try rustCallWithErr
     )
 }
 }
-
+    
     /**
      * Erases every V2 field-metrics row.
      *
@@ -3858,7 +3858,7 @@ open func consumedHiddenLamports(chatId: Data)throws  -> [ConsumedHiddenLamport]
     )
 })
 }
-
+    
     /**
      * Rows currently in the consumed-hidden-kind set, expired ones included
      * (diagnostics/tests).
@@ -4759,7 +4759,7 @@ open func listContactRelayUnreachable()throws  -> [ContactRelayUnreachable] {
     )
 })
 }
-
+    
     /**
      * All contacts, alphabetical by name.
      */
@@ -5014,7 +5014,7 @@ open func noteContactRelayUnreachable(userId: Data, endpointKey: String, nowMs: 
     )
 })
 }
-
+    
     /**
      * Notice that the set of ids our relay fetch hints derive from has
      * changed, and invalidate every remembered frontier if it has. Returns
@@ -5431,7 +5431,7 @@ open func recordConsumedHiddenLamport(chatId: Data, senderUserId: Data, lamport:
     )
 })
 }
-
+    
     /**
      * V2 field metric: stamp the delivery time and return route (T6
      * `via_transport`) onto every outbound metric row in `chat_id` at or below
@@ -6554,7 +6554,7 @@ public struct FfiConverterTypeConsumedHiddenLamport: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsumedHiddenLamport {
         return
             try ConsumedHiddenLamport(
-                senderUserId: FfiConverterData.read(from: &buf),
+                senderUserId: FfiConverterData.read(from: &buf), 
                 lamport: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -7058,9 +7058,9 @@ public struct FfiConverterTypeContactRelayUnreachable: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactRelayUnreachable {
         return
             try ContactRelayUnreachable(
-                userId: FfiConverterData.read(from: &buf),
-                endpointKey: FfiConverterString.read(from: &buf),
-                unreachableStreak: FfiConverterInt64.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                endpointKey: FfiConverterString.read(from: &buf), 
+                unreachableStreak: FfiConverterInt64.read(from: &buf), 
                 unreachableAtMs: FfiConverterInt64.read(from: &buf)
         )
     }

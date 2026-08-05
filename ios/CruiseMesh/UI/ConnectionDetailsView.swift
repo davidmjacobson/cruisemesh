@@ -8,6 +8,7 @@ struct ConnectionDetailsView: View {
     @State private var contacts: [Contact] = []
     @State private var summaries: [PeerConnectionSummary] = []
     @State private var events: [PeerConnectionEvent] = []
+    @State private var queueDepths: [Data: UInt64] = [:]
     @State private var showClear = false
     @State private var showAllActivity = false
     @State private var diagnosticLogging = DiagnosticLogExport.isEnabled
@@ -48,6 +49,11 @@ struct ConnectionDetailsView: View {
                                 Text(personStatus(contact))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                if let queued = queueDepths[contact.userId], queued > 0 {
+                                    Text("Pending relay upload: \(queued)")
+                                        .font(.caption)
+                                        .foregroundStyle(.red)
+                                }
                             }
                         }
                     }
@@ -180,6 +186,15 @@ struct ConnectionDetailsView: View {
         contacts = (try? store.listContacts()) ?? []
         summaries = (try? store.peerConnectionSummaries()) ?? []
         events = (try? store.peerConnectionEvents(userId: nil, limit: 50)) ?? []
+        
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let depthList = (try? store.pendingRelayOutboundDepthByRecipient(nowMs: nowMs)) ?? []
+        var depths: [Data: UInt64] = [:]
+        for d in depthList {
+            depths[d.recipientUserId] = d.queued
+        }
+        queueDepths = depths
+        
         hasDiagnosticArchive = hasAnythingCaptured()
     }
 

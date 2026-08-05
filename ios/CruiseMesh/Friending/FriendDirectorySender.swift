@@ -129,7 +129,7 @@ enum FriendDirectorySender {
         let frame = authored.frame
         if !MeshRouter.sendToUserId(userId: recipient.userId, frame: frame) {
             let muled = MeshRouter.relayToAll(frame: frame)
-            log.info("Queued hidden friend data for \(recipient.name, privacy: .public); sprayed to \(muled) mule link(s)")
+            log.info("Queued hidden friend data for \(UserIdHex.encode(recipient.userId), privacy: .public); sprayed to \(muled) mule link(s)")
         }
         return true
     }

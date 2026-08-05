@@ -1939,7 +1939,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             FriendImportEvents.notify(FriendImportEvent(contact: contact, directBluetooth: sourceAddress != nil))
             MessageNotifier.notifyFriendAdded(contact: contact)
         }
-        log.info("Imported contact \(contact.name, privacy: .public) from friend request")
+        log.info("Imported contact \(UserIdHex.encode(contact.userId), privacy: .public) from friend request")
     }
 
     /// A `kind=3` that came out of somebody's **Share contact** code
@@ -1999,7 +1999,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         if (try? store.noteSharedRequestPrompt(requesterUserId: senderUserId, nowMs: now)) == true {
             MessageNotifier.notifySharedRequest(name: card.name, userId: senderUserId)
         }
-        log.info("Holding a shared-card friend request for confirmation from \(sharer.name, privacy: .public)")
+        log.info("Holding a shared-card friend request for confirmation from \(UserIdHex.encode(sharer.userId), privacy: .public)")
     }
 
     // FI5: throws now -- see handleIncomingFriendRequest's doc for the
@@ -2094,7 +2094,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             content: content
         )) ?? false
         if applied {
-            log.info("Applied a relay update from \(contact.name, privacy: .public)")
+            log.info("Applied a relay update from \(UserIdHex.encode(contact.userId), privacy: .public)")
             // Anything queued for them was addressed to the old endpoint's
             // mailbox; a sync pass re-resolves and re-posts to the new one.
             RelaySyncEvents.requestSync()

@@ -92,7 +92,7 @@ enum RelayUpdateSender {
         GossipState.seenIds.record(msgId: authored.envelope.msgId)
         RelaySyncEvents.requestSync()
         if !MeshRouter.sendToUserId(userId: contact.userId, frame: authored.frame) {
-            log.info("Relay update queued for later delivery to \(contact.name, privacy: .public)")
+            log.info("Relay update queued for later delivery to \(UserIdHex.encode(contact.userId), privacy: .public)")
         }
     }
 }
