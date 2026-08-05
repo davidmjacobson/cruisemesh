@@ -11,7 +11,7 @@ final class CruiseMeshUITests: XCTestCase {
     }
 
     override func tearDown() {
-        if let app, testRun?.hasSucceeded == false {
+        if let app, (testRun?.failureCount ?? 0) > 0 {
             let screenshot = XCTAttachment(screenshot: app.screenshot())
             screenshot.name = "Failure-\(scenario)"
             screenshot.lifetime = .keepAlways
@@ -100,7 +100,7 @@ final class CruiseMeshUITests: XCTestCase {
         card.tap()
         card.typeText("not-a-real-card")
 
-        let keyboardAction = app.keyboards.buttons["Preview friend"].firstMatch
+        let keyboardAction = element("friends.preview-keyboard")
         XCTAssertTrue(keyboardAction.waitForExistence(timeout: 3))
         XCTAssertTrue(keyboardAction.isHittable)
     }
@@ -157,7 +157,8 @@ final class CruiseMeshUITests: XCTestCase {
         delete.tap()
         XCTAssertTrue(app.alerts["Delete contact?"].waitForExistence(timeout: 3))
         app.alerts["Delete contact?"].buttons["Cancel"].tap()
-        XCTAssertTrue(element("screen.contact-details").exists)
+        XCTAssertTrue(element("screen.chat").waitForExistence(timeout: 3))
+        XCTAssertFalse(app.alerts["Delete contact?"].exists)
     }
 
     private func launch(scenario: String) {

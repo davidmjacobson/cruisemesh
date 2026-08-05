@@ -78,7 +78,6 @@ struct ChatComposerBar: View {
         }
         .padding(12)
         .background(.bar)
-        .accessibilityIdentifier("chat.composer")
     }
 }
 

@@ -182,6 +182,7 @@ struct FriendsView: View {
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button("Preview friend") { submitPaste() }
+                        .accessibilityIdentifier("friends.preview-keyboard")
                         .disabled(pasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
