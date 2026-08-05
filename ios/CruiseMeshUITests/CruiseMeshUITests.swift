@@ -130,12 +130,7 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(message.waitForExistence(timeout: 10))
         XCTAssertFalse(element("chat.composer.send").exists)
 
-        // Tap navigation title to dismiss keyboard before long-pressing
-        if app.navigationBars.firstMatch.exists {
-            app.navigationBars.firstMatch.tap()
-        }
-
-        message.press(forDuration: 2)
+        message.press(forDuration: 1.5)
         let copyButton = app.buttons["Copy"]
         XCTAssertTrue(copyButton.waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["Info"].exists)
