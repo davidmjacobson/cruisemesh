@@ -2391,8 +2391,42 @@ public protocol MessageStoreProtocol : AnyObject {
      * phone with a deep carry queue re-posted its oldest `limit` rows on
      * every single sync pass -- rate-limiting the whole family -- while
      * rows behind the batch head never got their first upload at all.
+     * ## Fairness across recipients
+     *
+     * Rows are drawn round-robin across the recipient each envelope is bound
+     * for, and recipients in `skip_recipient_user_ids` are excluded outright
+     * -- the same policy, for the same reason, as
+     * [`MessageStore::pending_relay_outbound_envelopes`]. A failed upload
+     * leaves `relay_uploaded_to` unset, so under flat `received_at` order one
+     * unreachable destination refills the whole window on every pass and
+     * nothing else in the carry queue is ever offered. In the field capture
+     * that accounted for 236 of 758 upload failures, alongside the outbound
+     * and receipt queues doing the same thing.
+     *
+     * This queue could not reuse that fix directly: `carried_envelopes` is
+     * other people's mail being muled, addressed by a day-bucketed
+     * `recipient_hint` that rotates, so there is no recipient column to
+     * partition on and "skip these ids" cannot be expressed against the
+     * stored rows. Resolving the hint is what makes it possible -- and it
+     * belongs here rather than in the shells, because a row the caller
+     * fetches and then skips has still consumed one of `limit` slots.
+     *
+     * The resolution is small and bounded (contacts and groups, each over a
+     * [`CARRY_HINT_DAY_WINDOW_DAYS`] window), so it is materialised into a
+     * temp table and joined, rather than scanning a capped page of rows in
+     * Rust -- a capped scan would quietly reintroduce the starvation it is
+     * meant to remove as soon as one recipient's backlog exceeded the cap.
+     *
+     * Rows whose hint resolves to nothing are still returned, in a partition
+     * of their own. Dropping them was the first instinct -- an unresolvable
+     * hint is one the caller skips anyway -- but it silently changes what
+     * this function promises, and it would strand a legitimate case: a group
+     * carry none of whose members is a contact yet resolves to no recipient
+     * here, while the caller can still upload it via the group path. Giving
+     * them one shared bucket bounds how much of a batch they can take without
+     * removing anything that used to be offered.
      */
-    func familyCarriedEnvelopes(limit: UInt64, nowMs: Int64) throws  -> [CarriedEnvelope]
+    func familyCarriedEnvelopes(limit: UInt64, nowMs: Int64, skipRecipientUserIds: [Data]) throws  -> [CarriedEnvelope]
     
     /**
      * Look up a single contact by UserID, or `None` if not a contact.
@@ -4260,12 +4294,47 @@ open func exportDeliveryMetricsCsv()throws  -> String {
      * phone with a deep carry queue re-posted its oldest `limit` rows on
      * every single sync pass -- rate-limiting the whole family -- while
      * rows behind the batch head never got their first upload at all.
+     * ## Fairness across recipients
+     *
+     * Rows are drawn round-robin across the recipient each envelope is bound
+     * for, and recipients in `skip_recipient_user_ids` are excluded outright
+     * -- the same policy, for the same reason, as
+     * [`MessageStore::pending_relay_outbound_envelopes`]. A failed upload
+     * leaves `relay_uploaded_to` unset, so under flat `received_at` order one
+     * unreachable destination refills the whole window on every pass and
+     * nothing else in the carry queue is ever offered. In the field capture
+     * that accounted for 236 of 758 upload failures, alongside the outbound
+     * and receipt queues doing the same thing.
+     *
+     * This queue could not reuse that fix directly: `carried_envelopes` is
+     * other people's mail being muled, addressed by a day-bucketed
+     * `recipient_hint` that rotates, so there is no recipient column to
+     * partition on and "skip these ids" cannot be expressed against the
+     * stored rows. Resolving the hint is what makes it possible -- and it
+     * belongs here rather than in the shells, because a row the caller
+     * fetches and then skips has still consumed one of `limit` slots.
+     *
+     * The resolution is small and bounded (contacts and groups, each over a
+     * [`CARRY_HINT_DAY_WINDOW_DAYS`] window), so it is materialised into a
+     * temp table and joined, rather than scanning a capped page of rows in
+     * Rust -- a capped scan would quietly reintroduce the starvation it is
+     * meant to remove as soon as one recipient's backlog exceeded the cap.
+     *
+     * Rows whose hint resolves to nothing are still returned, in a partition
+     * of their own. Dropping them was the first instinct -- an unresolvable
+     * hint is one the caller skips anyway -- but it silently changes what
+     * this function promises, and it would strand a legitimate case: a group
+     * carry none of whose members is a contact yet resolves to no recipient
+     * here, while the caller can still upload it via the group path. Giving
+     * them one shared bucket bounds how much of a batch they can take without
+     * removing anything that used to be offered.
      */
-open func familyCarriedEnvelopes(limit: UInt64, nowMs: Int64)throws  -> [CarriedEnvelope] {
+open func familyCarriedEnvelopes(limit: UInt64, nowMs: Int64, skipRecipientUserIds: [Data])throws  -> [CarriedEnvelope] {
     return try  FfiConverterSequenceTypeCarriedEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_family_carried_envelopes(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(limit),
-        FfiConverterInt64.lower(nowMs),$0
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterSequenceData.lower(skipRecipientUserIds),$0
     )
 })
 }
@@ -18638,7 +18707,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_export_delivery_metrics_csv() != 57937) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_family_carried_envelopes() != 51761) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_family_carried_envelopes() != 13806) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_get_contact() != 44297) {

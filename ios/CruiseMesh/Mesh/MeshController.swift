@@ -3309,9 +3309,15 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     noteContactFailure(error, contact: contact, usedConfig: cfg)
                 }
             }
+            // Carried mail starves like the outbound and receipt queues: a
+            // failed upload leaves the row unmarked, so under flat order one
+            // unreachable destination refills the batch every pass. Core
+            // resolves each row's rotating recipient hint to a contact so it
+            // can partition and skip. Mirrors RelaySyncEngine.kt.
             let family = try store.familyCarriedEnvelopes(
                 limit: MeshDefaults.relayStoreBatchLimit,
-                nowMs: now
+                nowMs: now,
+                skipRecipientUserIds: skipRecipients
             )
             for env in family {
                 // Carried mail goes to the mailbox its recipient actually

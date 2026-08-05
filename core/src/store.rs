@@ -1029,6 +1029,36 @@ impl MessageStore {
 /// digest spray plan (FC2) rather than API the platform shells call
 /// directly.
 impl MessageStore {
+    /// `(hint, recipient_user_id)` for every hint a carried envelope could
+    /// currently be addressed by, resolved exactly the way
+    /// [`MessageStore::contact_matching_hint`] resolves one: a contact's own
+    /// recent-day hints first, then a group's hints attributed to the first
+    /// member who is a contact (a group carry uploads via any member's relay
+    /// config). Earlier entries win on collision, matching that function's
+    /// first-match-wins iteration.
+    fn carried_hint_recipients(&self, now_ms: i64) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CoreError> {
+        let contacts = self.list_contacts()?;
+        let mut map: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for contact in &contacts {
+            for hint in crate::recipient_hints::recent_hints_for(contact.user_id.clone(), now_ms) {
+                map.push((hint, contact.user_id.clone()));
+            }
+        }
+        for group in self.list_groups()? {
+            let Some(member) = group
+                .member_user_ids
+                .iter()
+                .find(|id| contacts.iter().any(|c| c.user_id == **id))
+            else {
+                continue;
+            };
+            for hint in crate::recipient_hints::recent_hints_for(group.id.clone(), now_ms) {
+                map.push((hint, member.clone()));
+            }
+        }
+        Ok(map)
+    }
+
     /// FC2 test-only accessor for [`MessageStore::sealed_reads`].
     #[cfg(test)]
     pub(crate) fn test_sealed_reads(&self) -> u64 {
@@ -4234,24 +4264,89 @@ impl MessageStore {
     /// phone with a deep carry queue re-posted its oldest `limit` rows on
     /// every single sync pass -- rate-limiting the whole family -- while
     /// rows behind the batch head never got their first upload at all.
+    /// ## Fairness across recipients
+    ///
+    /// Rows are drawn round-robin across the recipient each envelope is bound
+    /// for, and recipients in `skip_recipient_user_ids` are excluded outright
+    /// -- the same policy, for the same reason, as
+    /// [`MessageStore::pending_relay_outbound_envelopes`]. A failed upload
+    /// leaves `relay_uploaded_to` unset, so under flat `received_at` order one
+    /// unreachable destination refills the whole window on every pass and
+    /// nothing else in the carry queue is ever offered. In the field capture
+    /// that accounted for 236 of 758 upload failures, alongside the outbound
+    /// and receipt queues doing the same thing.
+    ///
+    /// This queue could not reuse that fix directly: `carried_envelopes` is
+    /// other people's mail being muled, addressed by a day-bucketed
+    /// `recipient_hint` that rotates, so there is no recipient column to
+    /// partition on and "skip these ids" cannot be expressed against the
+    /// stored rows. Resolving the hint is what makes it possible -- and it
+    /// belongs here rather than in the shells, because a row the caller
+    /// fetches and then skips has still consumed one of `limit` slots.
+    ///
+    /// The resolution is small and bounded (contacts and groups, each over a
+    /// [`CARRY_HINT_DAY_WINDOW_DAYS`] window), so it is materialised into a
+    /// temp table and joined, rather than scanning a capped page of rows in
+    /// Rust -- a capped scan would quietly reintroduce the starvation it is
+    /// meant to remove as soon as one recipient's backlog exceeded the cap.
+    ///
+    /// Rows whose hint resolves to nothing are still returned, in a partition
+    /// of their own. Dropping them was the first instinct -- an unresolvable
+    /// hint is one the caller skips anyway -- but it silently changes what
+    /// this function promises, and it would strand a legitimate case: a group
+    /// carry none of whose members is a contact yet resolves to no recipient
+    /// here, while the caller can still upload it via the group path. Giving
+    /// them one shared bucket bounds how much of a batch they can take without
+    /// removing anything that used to be offered.
     pub fn family_carried_envelopes(
         &self,
         limit: u64,
         now_ms: i64,
+        skip_recipient_user_ids: Vec<Vec<u8>>,
     ) -> Result<Vec<CarriedEnvelope>, CoreError> {
+        let hint_map = self.carried_hint_recipients(now_ms)?;
         let conn = lock_conn(&self.conn);
-        let mut stmt = conn
-            .prepare(
-                "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
-                 FROM carried_envelopes
-                 WHERE is_family = 1 AND from_relay = 0
-                   AND relay_uploaded_to IS NULL AND expiry > ?1
-                 ORDER BY received_at ASC, msg_id ASC
-                 LIMIT ?2",
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS carried_hint_map (
+                 hint              BLOB PRIMARY KEY,
+                 recipient_user_id BLOB NOT NULL
+             );
+             DELETE FROM carried_hint_map;",
+        )
+        .map_err(store_err)?;
+        {
+            let mut insert = conn
+                .prepare(
+                    "INSERT OR IGNORE INTO carried_hint_map (hint, recipient_user_id)
+                     VALUES (?1, ?2)",
+                )
+                .map_err(store_err)?;
+            for (hint, recipient) in &hint_map {
+                insert
+                    .execute(params![hint, recipient])
+                    .map_err(store_err)?;
+            }
+        }
+
+        let mut args: Vec<Value> = vec![Value::Integer(now_ms)];
+        let skip_clause = if skip_recipient_user_ids.is_empty() {
+            String::new()
+        } else {
+            let placeholders = vec!["?"; skip_recipient_user_ids.len()].join(", ");
+            args.extend(skip_recipient_user_ids.into_iter().map(Value::Blob));
+            // An unresolved hint has a NULL recipient, and `NULL NOT IN (...)`
+            // is NULL rather than true, so those rows need saying explicitly
+            // or the skip set would silently drop every one of them.
+            format!(
+                " AND (m.recipient_user_id IS NULL
+                       OR m.recipient_user_id NOT IN ({placeholders}))"
             )
-            .map_err(store_err)?;
+        };
+        args.push(Value::Integer(limit as i64));
+        let sql = family_carried_upload_sql(&skip_clause);
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
         let rows = stmt
-            .query_map(params![now_ms, limit as i64], row_to_carried)
+            .query_map(params_from_iter(args.iter()), row_to_carried)
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
@@ -5196,6 +5291,30 @@ fn ensure_column(
     )
     .map_err(store_err)?;
     Ok(())
+}
+
+/// The relay-upload query for [`MessageStore::family_carried_envelopes`],
+/// built in one place so the query-plan test can explain the query the code
+/// actually runs. It used to keep its own copy of this SQL, which meant it
+/// went on passing against a query that no longer existed.
+fn family_carried_upload_sql(skip_clause: &str) -> String {
+    format!(
+        "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
+         FROM (
+             SELECT c.msg_id, c.hop_ttl, c.expiry, c.recipient_hint, c.sealed,
+                    c.received_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(m.recipient_user_id, x'')
+                        ORDER BY c.received_at ASC, c.msg_id ASC
+                    ) AS recipient_rank
+             FROM carried_envelopes c
+             LEFT JOIN carried_hint_map m ON m.hint = c.recipient_hint
+             WHERE c.is_family = 1 AND c.from_relay = 0
+               AND c.relay_uploaded_to IS NULL AND c.expiry > ?{skip_clause}
+         )
+         ORDER BY recipient_rank ASC, received_at ASC, msg_id ASC
+         LIMIT ?"
+    )
 }
 
 const SCHEMA: &str = "
@@ -7298,42 +7417,136 @@ mod tests {
             )
             .unwrap();
 
-        let rows = store.family_carried_envelopes(10, 2_000).unwrap();
+        let rows = store.family_carried_envelopes(10, 2_000, vec![]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].msg_id, b"fam".to_vec());
     }
 
     #[test]
-    fn family_carried_envelopes_query_uses_the_supporting_index_with_no_temp_sort() {
+    /// The mule queue starves like the outbound and receipt queues did: one
+    /// unreachable destination's rows never clear, so under flat `received_at`
+    /// order they refill the batch every pass. 236 of the 758 upload failures
+    /// in the field capture came from this queue.
+    #[test]
+    fn one_destinations_carry_backlog_cannot_consume_the_whole_upload_batch() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let now = 2_000i64;
+        let stuck = contact(b"stuck-contact-id", "Stuck");
+        let healthy = contact(b"healthy-contact", "Healthy");
+        store.upsert_contact(stuck.clone()).unwrap();
+        store.upsert_contact(healthy.clone()).unwrap();
+        let stuck_hint = crate::recipient_hints::recent_hints_for(stuck.user_id.clone(), now)
+            .into_iter()
+            .next()
+            .unwrap();
+        let healthy_hint = crate::recipient_hints::recent_hints_for(healthy.user_id.clone(), now)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        // The jammed destination queued first and holds a deep backlog.
+        for i in 0..40u8 {
+            store
+                .enqueue_carried_envelope(
+                    carried(&[b'S', i], &stuck_hint, 900_000, 10),
+                    true,
+                    1_000 + i as i64,
+                    BIG_BUDGET,
+                )
+                .unwrap();
+        }
+        for i in 0..3u8 {
+            store
+                .enqueue_carried_envelope(
+                    carried(&[b'H', i], &healthy_hint, 900_000, 10),
+                    true,
+                    800_000 + i as i64,
+                    BIG_BUDGET,
+                )
+                .unwrap();
+        }
+
+        let batch = store.family_carried_envelopes(8, now, vec![]).unwrap();
+        assert_eq!(batch.len(), 8);
+        assert_eq!(
+            batch
+                .iter()
+                .filter(|e| e.recipient_hint == healthy_hint)
+                .count(),
+            3,
+            "the reachable destination's carry must still be offered",
+        );
+
+        // And a destination known to be unpostable consumes no slots at all.
+        let skipped = store
+            .family_carried_envelopes(128, now, vec![stuck.user_id.clone()])
+            .unwrap();
+        assert_eq!(skipped.len(), 3);
+        assert!(skipped.iter().all(|e| e.recipient_hint == healthy_hint));
+    }
+
+    /// A carry whose hint resolves to nobody must still be offered: a group
+    /// carry with no contact member among its recipients resolves to no
+    /// recipient here, but the caller can still upload it via the group path.
+    #[test]
+    fn carried_rows_with_an_unresolvable_hint_are_still_offered() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .enqueue_carried_envelope(
+                carried(b"orphan", b"no-such-hint", 900_000, 10),
+                true,
+                1_000,
+                BIG_BUDGET,
+            )
+            .unwrap();
+        let rows = store.family_carried_envelopes(10, 2_000, vec![]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].msg_id, b"orphan".to_vec());
+    }
+
+    #[test]
+    fn family_carried_envelopes_query_still_uses_the_supporting_index() {
         // FC7: the relay-upload query filters on (is_family, from_relay,
-        // expiry) and orders by received_at; without a supporting index
-        // SQLite falls back to a full scan plus a temp b-tree for the ORDER
-        // BY. `idx_carried_family_upload` covers both.
+        // expiry); without a supporting index SQLite falls back to a full
+        // scan. `idx_carried_family_upload` covers that filter.
+        //
+        // This explains the query the code actually runs. It previously kept
+        // its own copy of the SQL, so it went on passing against a query that
+        // no longer existed -- which is why the builder is shared now.
+        //
+        // The original also asserted no temp b-tree. That no longer holds and
+        // should not: ordering round-robin across recipients cannot be served
+        // by an index whose order is `received_at`, so the fairness sort is a
+        // real and accepted cost. It sorts only rows the WHERE clause already
+        // selected -- family mail, not yet uploaded, unexpired -- and the
+        // alternative is the starvation this ordering exists to prevent.
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let conn = lock_conn(&store.conn);
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS carried_hint_map (
+                 hint              BLOB PRIMARY KEY,
+                 recipient_user_id BLOB NOT NULL
+             );",
+        )
+        .unwrap();
         let plan: Vec<String> = conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
-                 FROM carried_envelopes
-                 WHERE is_family = 1 AND from_relay = 0
-                   AND relay_uploaded_to IS NULL AND expiry > ?1
-                 ORDER BY received_at ASC, msg_id ASC
-                 LIMIT ?2",
-            )
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                family_carried_upload_sql("")
+            ))
             .unwrap()
             .query_map(params![2_000i64, 10i64], |row| row.get::<_, String>(3))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let plan_text = plan.join("\n");
-        assert!(
-            plan_text.contains("idx_carried_family_upload"),
-            "plan did not use the index:\n{plan_text}"
+        let plan_text = plan.join(
+            "
+",
         );
         assert!(
-            !plan_text.to_uppercase().contains("TEMP B-TREE"),
-            "plan required a temp sort:\n{plan_text}"
+            plan_text.contains("idx_carried_family_upload"),
+            "plan did not use the index:
+{plan_text}"
         );
     }
 
@@ -11406,7 +11619,7 @@ mod tests {
         assert_eq!(found, vec![env]);
 
         // ...but never re-uploaded to the relay it came from.
-        let uploadable = store.family_carried_envelopes(10, 2_000).unwrap();
+        let uploadable = store.family_carried_envelopes(10, 2_000, vec![]).unwrap();
         assert!(uploadable.is_empty());
     }
 
@@ -11420,7 +11633,7 @@ mod tests {
             .enqueue_carried_envelope(env.clone(), true, 1_000, BIG_BUDGET)
             .unwrap());
 
-        let uploadable = store.family_carried_envelopes(10, 2_000).unwrap();
+        let uploadable = store.family_carried_envelopes(10, 2_000, vec![]).unwrap();
         assert_eq!(uploadable, vec![env]);
     }
 
@@ -11437,7 +11650,13 @@ mod tests {
         assert!(store
             .enqueue_carried_envelope(env.clone(), true, 1_000, BIG_BUDGET)
             .unwrap());
-        assert_eq!(store.family_carried_envelopes(10, 2_000).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .family_carried_envelopes(10, 2_000, vec![])
+                .unwrap()
+                .len(),
+            1
+        );
 
         assert!(store
             .mark_carried_envelope_relay_uploaded(
@@ -11446,7 +11665,7 @@ mod tests {
             )
             .unwrap());
         assert!(store
-            .family_carried_envelopes(10, 2_000)
+            .family_carried_envelopes(10, 2_000, vec![])
             .unwrap()
             .is_empty());
         assert_eq!(
@@ -11503,13 +11722,13 @@ mod tests {
             )
             .unwrap());
         assert!(store
-            .family_carried_envelopes(10, 2_000)
+            .family_carried_envelopes(10, 2_000, vec![])
             .unwrap()
             .is_empty());
 
         assert_eq!(store.clear_carried_relay_upload_markers().unwrap(), 1);
         assert_eq!(
-            store.family_carried_envelopes(10, 2_000).unwrap(),
+            store.family_carried_envelopes(10, 2_000, vec![]).unwrap(),
             vec![env],
         );
         // Idempotent: nothing left to clear.
@@ -11540,7 +11759,7 @@ mod tests {
             .apply_contact_relay_update(b"alice-id".to_vec(), notice.clone())
             .unwrap());
         assert_eq!(
-            store.family_carried_envelopes(10, 2_000).unwrap(),
+            store.family_carried_envelopes(10, 2_000, vec![]).unwrap(),
             vec![env],
         );
 
@@ -11556,7 +11775,7 @@ mod tests {
             .apply_contact_relay_update(b"alice-id".to_vec(), notice)
             .unwrap());
         assert!(store
-            .family_carried_envelopes(10, 2_000)
+            .family_carried_envelopes(10, 2_000, vec![])
             .unwrap()
             .is_empty());
     }
