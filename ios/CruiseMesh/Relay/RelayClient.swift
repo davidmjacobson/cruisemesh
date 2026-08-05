@@ -477,7 +477,7 @@ enum RelayClient {
             // token, nothing from the body.
             log.error(
                 """
-                \(label(request), privacy: .public) failed after \
+                \(relayDiagnosticRequestLabel(request), privacy: .public) failed after \
                 \(elapsedMs(started), privacy: .public)ms: \
                 \(error.localizedDescription, privacy: .public)
                 """
@@ -488,8 +488,9 @@ enum RelayClient {
 
     /// One line per relay call.
     ///
-    /// Only the URL *path* is logged, never the query: the fetch path carries
-    /// recipient hints, and this file gets emailed to whoever is helping.
+    /// Only the URL host and path are logged, never the query: the fetch path
+    /// carries recipient hints, and this file gets emailed to whoever is
+    /// helping.
     private static func logOutcome(
         _ request: URLRequest,
         response: URLResponse,
@@ -497,14 +498,14 @@ enum RelayClient {
         started: Date
     ) {
         guard let http = response as? HTTPURLResponse else {
-            log.error("\(label(request), privacy: .public) -> non-HTTP response")
+            log.error("\(relayDiagnosticRequestLabel(request), privacy: .public) -> non-HTTP response")
             return
         }
         let ms = elapsedMs(started)
         guard !(200..<300).contains(http.statusCode) else {
             log.info(
                 """
-                \(label(request), privacy: .public) -> \(http.statusCode, privacy: .public) \
+                \(relayDiagnosticRequestLabel(request), privacy: .public) -> \(http.statusCode, privacy: .public) \
                 in \(ms, privacy: .public)ms, \(data.count, privacy: .public)B
                 """
             )
@@ -518,21 +519,14 @@ enum RelayClient {
         let retryAfter = http.value(forHTTPHeaderField: "Retry-After") ?? "-"
         log.error(
             """
-            \(label(request), privacy: .public) -> \(http.statusCode, privacy: .public) \
+            \(relayDiagnosticRequestLabel(request), privacy: .public) -> \(http.statusCode, privacy: .public) \
             [\(code, privacy: .public)] in \(ms, privacy: .public)ms \
             retryAfter=\(retryAfter, privacy: .public)
             """
         )
     }
 
-    private static func label(_ request: URLRequest) -> String {
-        let method = request.httpMethod ?? "?"
-        let host = request.url?.host ?? "?"
-        let path = request.url?.path ?? "?"
-        return "\(method) \(host)\(path)"
-    }
-
-    private static func elapsedMs(_ started: Date) -> Int {
+      private static func elapsedMs(_ started: Date) -> Int {
         Int(Date().timeIntervalSince(started) * 1000)
     }
 
