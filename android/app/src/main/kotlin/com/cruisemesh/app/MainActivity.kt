@@ -2,8 +2,10 @@ package com.cruisemesh.app
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -212,7 +214,33 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Derive the pending deep link from [intent] and *consume* it.
+     *
+     * The consuming half matters as much as the deriving half. `onNewIntent`
+     * calls `setIntent`, so the link outlives the moment it was handled: every
+     * later Activity recreation -- a rotation, a theme change, the process
+     * coming back -- re-reads the same intent, re-derives the same link, and
+     * navigates to Add Friend again. From the user's side an already-handled
+     * friend card silently reopens, which reads as the app refusing to let go
+     * of a screen they already finished with.
+     *
+     * [onPendingDeepLinkConsumed] does not cover this: it clears the
+     * in-memory state for one Activity instance, and a recreation builds a new
+     * one from the intent that was never cleared.
+     *
+     * This mirrors [handleBluetoothEnableRequest] directly below, which nulls
+     * its trampoline action for exactly the same reason.
+     */
     private fun deepLinkFromIntent(intent: Intent?): PendingDeepLink? {
+        val link = derivePendingDeepLink(intent) ?: return null
+        intent?.removeExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)
+        intent?.removeExtra(MessageNotifier.EXTRA_CHAT_IS_GROUP)
+        intent?.data = null
+        return link
+    }
+
+    private fun derivePendingDeepLink(intent: Intent?): PendingDeepLink? {
         val hex = intent?.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)
         if (hex != null) {
             return PendingDeepLink(hex, intent.getBooleanExtra(MessageNotifier.EXTRA_CHAT_IS_GROUP, false))
@@ -285,16 +313,16 @@ fun CruiseMeshApp(
         composable("profile") { ProfileRoute(identity, navController) }
         composable("settings") { SettingsRoute(identity, navController) }
         composable("connectionDetails") {
-            ConnectionDetailsScreen(onBack = { navController.popBackStack() })
+            ConnectionDetailsScreen(onBack = { navController.popOrExit(context) })
         }
         composable("internalTools") {
-            InternalToolsScreen(onBack = { navController.popBackStack() })
+            InternalToolsScreen(onBack = { navController.popOrExit(context) })
         }
         composable("help") {
             HelpSupportScreen(
                 onShorePass = { navController.navigate("shorePass") },
                 onConnectionDetails = { navController.navigate("connectionDetails") },
-                onBack = { navController.popBackStack() },
+                onBack = { navController.popOrExit(context) },
             )
         }
         composable(
@@ -309,16 +337,16 @@ fun CruiseMeshApp(
         ) { entry ->
             ShorePassScreen(
                 initialCard = entry.arguments?.getString("card"),
-                onBack = { navController.popBackStack() },
+                onBack = { navController.popOrExit(context) },
             )
         }
-        composable("backup") { BackupExportScreen(onBack = { navController.popBackStack() }) }
-        composable("restore") { BackupRestoreScreen(onBack = { navController.popBackStack() }) }
+        composable("backup") { BackupExportScreen(onBack = { navController.popOrExit(context) }) }
+        composable("restore") { BackupRestoreScreen(onBack = { navController.popOrExit(context) }) }
         composable("myQr") {
             MyQrScreen(
                 identity,
                 onSayHi = { openFriendChat(navController, it) },
-                onBack = { navController.popBackStack() },
+                onBack = { navController.popOrExit(context) },
             )
         }
         composable(
@@ -623,6 +651,40 @@ private fun freshRelayHealthForDisplay(relayHealth: RelayHealth, nowMs: Long, pu
     } else {
         relayHealth
     }
+
+/**
+ * The [Activity] behind a composable's context, unwrapping the theme and
+ * configuration wrappers Compose layers on top of it.
+ */
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
+/**
+ * Go back one screen, or leave the app when this is the last screen.
+ *
+ * Always prefer this to a bare `popBackStack()` for a user-facing back
+ * action. `popBackStack()` will pop the *only* entry on the stack and report
+ * success: the `NavHost` is then left with no current destination, so it
+ * renders nothing at all. The Activity is still alive and responsive, but the
+ * user is looking at a blank screen with no way out except force-quitting the
+ * app -- which is what a family member hit going back from Settings.
+ *
+ * Checking `popBackStack()`'s return value does not catch this. It returns
+ * true precisely because the pop succeeded; the emptiness is the *result* of
+ * the successful pop, not a failure. So the guard has to be asked before the
+ * fact: is there anything underneath to go back *to*? If there isn't, "back"
+ * means "leave", which is what the system back button would have done.
+ */
+private fun NavController.popOrExit(context: Context) {
+    if (previousBackStackEntry != null) {
+        popBackStack()
+        return
+    }
+    context.findActivity()?.finish()
+}
 
 private fun configuredInternetDeliveryService(context: Context): InternetDeliveryService? =
     RelayConfigStore.load(context)?.let { config ->
@@ -992,7 +1054,7 @@ private fun SettingsRoute(identity: Identity, navController: NavHostController) 
             )
             FriendDirectorySender.queueToAllContacts(context, store, identity)
         },
-        onBack = { navController.popBackStack() },
+        onBack = { navController.popOrExit(context) },
     )
 }
 
@@ -1011,7 +1073,7 @@ private fun ProfileRoute(identity: Identity, navController: NavHostController) {
         onProfileChanged = { epoch ->
             ProfileSyncSender.queueToAllContacts(context, store, identity, epoch)
         },
-        onBack = { navController.popBackStack() }
+        onBack = { navController.popOrExit(context) }
     )
 }
 
@@ -1057,7 +1119,7 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
             },
             onSayHi = { openFriendChat(navController, it) },
             onDone = { returnToContacts(navController) },
-            onBack = { navController.popBackStack() },
+            onBack = { navController.popOrExit(context) },
         )
     } else {
         Scaffold { innerPadding ->
@@ -1067,7 +1129,7 @@ private fun ScanRoute(identity: Identity, navController: NavHostController) {
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Text(stringResource(R.string.ui_camera_permission_is_needed_to_scan_a_friend))
-                Button(onClick = { navController.popBackStack() }, modifier = Modifier.padding(top = 16.dp)) {
+                Button(onClick = { navController.popOrExit(context) }, modifier = Modifier.padding(top = 16.dp)) {
                     Text(stringResource(R.string.ui_back))
                 }
             }
@@ -1157,7 +1219,7 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
         initialText = initialToken.orEmpty(),
         onSayHi = { openFriendChat(navController, it) },
         onDone = { returnToContacts(navController) },
-        onBack = { navController.popBackStack() },
+        onBack = { navController.popOrExit(context) },
     )
 }
 
@@ -1236,7 +1298,7 @@ private fun WaitingToConnectRoute(identity: Identity, navController: NavHostCont
             store.deletePendingSharedRequest(request.requesterUserId)
             reload()
         },
-        onBack = { navController.popBackStack() },
+        onBack = { navController.popOrExit(context) },
     )
 }
 
@@ -1254,14 +1316,14 @@ private fun ShareContactRoute(identity: Identity, userIdHex: String, navControll
         ShareContactPolicy.availability(policy, store.isUserBlocked(contact.userId)) !=
         ShareContactAvailability.AVAILABLE
     ) {
-        LaunchedEffect(userIdHex) { navController.popBackStack() }
+        LaunchedEffect(userIdHex) { navController.popOrExit(context) }
         return
     }
     ShareContactScreen(
         identity = identity,
         contact = contact,
         sharedPolicyRevision = policy?.revision ?: 0uL,
-        onBack = { navController.popBackStack() },
+        onBack = { navController.popOrExit(context) },
     )
 }
 
@@ -1322,7 +1384,7 @@ private fun ContactsRoute(identity: Identity, navController: NavHostController) 
         onAddFriendClick = { navController.navigate("addFriend") },
         onMyCardClick = { navController.navigate("myQr") },
         onNewGroupClick = { navController.navigate("newGroup") },
-        onBack = { navController.popBackStack() },
+        onBack = { navController.popOrExit(context) },
     )
 }
 
@@ -1349,7 +1411,7 @@ private fun NewGroupRoute(identity: Identity, navController: NavHostController) 
                 }
             }
         },
-        onBack = { navController.popBackStack() },
+        onBack = { navController.popOrExit(context) },
     )
 }
 
@@ -1481,11 +1543,11 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             ownUserId = identity.userId,
             sender = sender,
             store = store,
-            onBack = { navController.popBackStack() },
+            onBack = { navController.popOrExit(context) },
             onDeleteContact = {
                 store.deleteContact(contact.userId)
                 FriendDirectorySender.queueToAllContacts(context, store, identity)
-                navController.popBackStack()
+                navController.popOrExit(context)
             },
             reachability = reachability,
             reachabilityStatusText = reachabilityStatusText,
@@ -1495,7 +1557,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             onShareContact = { navController.navigate("shareContact/${UserIdHex.encode(it.userId)}") },
         )
     } else {
-        LaunchedEffect(Unit) { navController.popBackStack() }
+        LaunchedEffect(Unit) { navController.popOrExit(context) }
     }
 }
 
@@ -1579,16 +1641,16 @@ private fun GroupChatRoute(identity: Identity, groupIdHex: String, navController
             contactsByUserId = contactsByUserId,
             sender = sender,
             store = store,
-            onBack = { navController.popBackStack() },
+            onBack = { navController.popOrExit(context) },
             onDeleteGroup = {
                 store.deleteGroup(group.id)
-                navController.popBackStack()
+                navController.popOrExit(context)
             },
             reachableMemberCount = reachableMemberCount,
             memberReachabilityByUserId = memberReachabilityByUserId,
         )
     } else {
-        LaunchedEffect(Unit) { navController.popBackStack() }
+        LaunchedEffect(Unit) { navController.popOrExit(context) }
     }
 }
 
