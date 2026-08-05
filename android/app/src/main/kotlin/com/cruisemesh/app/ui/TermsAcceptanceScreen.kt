@@ -26,6 +26,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.R
 import com.cruisemesh.app.identity.PRIVACY_POLICY_URL
@@ -44,6 +45,7 @@ fun TermsAcceptanceScreen(onAccept: () -> Unit) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .testTag(UiTestTags.TERMS_SCREEN)
                 .padding(innerPadding)
                 .verticalScroll(rememberScrollState())
                 .padding(24.dp),

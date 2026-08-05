@@ -36,6 +36,7 @@ import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.formatUserId
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.platform.testTag
 import com.cruisemesh.app.R
 
 /**
@@ -71,6 +72,7 @@ fun NewGroupScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .testTag(UiTestTags.NEW_GROUP_SCREEN)
                 .padding(innerPadding)
                 .padding(horizontal = 16.dp),
         ) {

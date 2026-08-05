@@ -77,6 +77,16 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew :app:testDebugUnitTest --rerun-tasks
+      - name: Validate critical-screen screenshots
+        working-directory: android
+        run: ./gradlew :app:validateDebugScreenshotTest
+      - name: Upload screenshot differences
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-screenshot-differences
+          path: android/app/build/reports/screenshotTest/
+          if-no-files-found: ignore
       - name: gradlew :app:lintRelease
         working-directory: android
         run: ./gradlew :app:lintRelease

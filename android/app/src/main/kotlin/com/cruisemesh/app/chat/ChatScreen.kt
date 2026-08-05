@@ -87,6 +87,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
@@ -961,14 +962,15 @@ internal fun MessageComposer(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
+            .testTag(com.cruisemesh.app.ui.UiTestTags.MESSAGE_COMPOSER)
             .padding(bottom = 16.dp),
     ) {
         Box(
             modifier = Modifier
-                // FA10: 44dp visually; minimumInteractiveComponentSize() pads
-                // the touch target up to the 48dp minimum.
-                .minimumInteractiveComponentSize()
-                .size(44.dp)
+                // Keep the semantic hit target at Android's 48dp minimum. A
+                // size modifier after minimumInteractiveComponentSize would
+                // constrain the node back down to the visual size.
+                .size(48.dp)
                 .clip(CircleShape)
                 .background(ownBubbleColor)
                 .clickable(onClick = onPickGallery)
@@ -1011,7 +1013,10 @@ internal fun MessageComposer(
                     Text(stringResource(if (hasPendingAttachment) R.string.ui_add_a_caption else R.string.ui_message))
                 },
                 trailingIcon = {
-                    IconButton(onClick = onPickCamera) {
+                    IconButton(
+                        onClick = onPickCamera,
+                        modifier = Modifier.size(48.dp),
+                    ) {
                         Icon(ComposerCameraIcon, contentDescription = "Take photo")
                     }
                 },
