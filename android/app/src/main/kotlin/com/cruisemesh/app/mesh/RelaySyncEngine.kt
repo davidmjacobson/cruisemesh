@@ -750,7 +750,12 @@ internal class RelaySyncEngine(
         now: Long,
         network: Network?,
     ) {
-        for (envelope in store.familyCarriedEnvelopes(RELAY_STORE_BATCH_LIMIT, now)) {
+        // Carried mail starves like the outbound and receipt queues: a failed
+        // upload leaves the row unmarked, so under flat order one unreachable
+        // destination refills the batch every pass. Core resolves each row's
+        // rotating recipient hint to a contact so it can partition and skip.
+        val skipRecipients = unpostableRecipients(contacts, fallbackConfig)
+        for (envelope in store.familyCarriedEnvelopes(RELAY_STORE_BATCH_LIMIT, now, skipRecipients)) {
             val contact = store.contactMatchingHint(envelope.recipientHint, now)
             if (contact == null) {
                 // Group-hinted carried envelope: previously skipped entirely

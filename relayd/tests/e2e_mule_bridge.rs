@@ -296,7 +296,7 @@ async fn no_internet_message_bridges_to_shore_and_receipt_returns_the_same_way()
     //    family traffic: it must land in his relay-upload selection
     //    (is_family=1, from_relay=0).
     assert!(bob.receive_over_mesh(&authored.frame, t0).is_none());
-    let upload_pass = bob.store.family_carried_envelopes(16, t0).unwrap();
+    let upload_pass = bob.store.family_carried_envelopes(16, t0, vec![]).unwrap();
     assert_eq!(
         upload_pass.len(),
         1,
@@ -430,7 +430,7 @@ async fn no_internet_message_bridges_to_shore_and_receipt_returns_the_same_way()
     // of receipt, and re-posting it is dedupe-safe.)
     assert!(!bob
         .store
-        .family_carried_envelopes(16, t0)
+        .family_carried_envelopes(16, t0, vec![])
         .unwrap()
         .iter()
         .any(|envelope| envelope.msg_id == receipt.envelope.msg_id));
@@ -522,7 +522,7 @@ async fn senders_late_self_upload_after_mule_upload_dedupes_and_skips_quota() {
 
     // Bob mules it and uploads first, filling the family mailbox exactly.
     assert!(bob.receive_over_mesh(&authored.frame, t0).is_none());
-    let carried = bob.store.family_carried_envelopes(16, t0).unwrap();
+    let carried = bob.store.family_carried_envelopes(16, t0, vec![]).unwrap();
     assert_eq!(carried.len(), 1);
     let bob_relay_id = http_post_envelope(
         &router,
@@ -638,7 +638,7 @@ async fn relay_fetched_copies_never_reenter_the_upload_selection() {
     );
     assert!(
         bob.store
-            .family_carried_envelopes(16, t0)
+            .family_carried_envelopes(16, t0, vec![])
             .unwrap()
             .is_empty(),
         "from_relay=1 copies must never enter the relay-upload selection"
@@ -667,7 +667,7 @@ async fn fetching_with_unrelated_hints_sees_nothing() {
         )
         .expect("author text");
     assert!(bob.receive_over_mesh(&authored.frame, t0).is_none());
-    let carried = bob.store.family_carried_envelopes(16, t0).unwrap();
+    let carried = bob.store.family_carried_envelopes(16, t0, vec![]).unwrap();
     http_post_envelope(
         &router,
         &carried[0].msg_id,
