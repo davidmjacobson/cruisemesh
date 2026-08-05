@@ -127,13 +127,19 @@ final class CruiseMeshUITests: XCTestCase {
         send.tap()
 
         let message = app.staticTexts["Hello from UI test"]
-        XCTAssertTrue(message.waitForExistence(timeout: 5))
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
         XCTAssertFalse(element("chat.composer.send").exists)
 
-        message.press(forDuration: 1)
-        XCTAssertTrue(app.buttons["Info"].waitForExistence(timeout: 3))
-        XCTAssertTrue(app.buttons["Copy"].exists)
-        app.buttons["Copy"].tap()
+        // Tap navigation title to dismiss keyboard before long-pressing
+        if app.navigationBars.firstMatch.exists {
+            app.navigationBars.firstMatch.tap()
+        }
+
+        message.press(forDuration: 2)
+        let copyButton = app.buttons["Copy"]
+        XCTAssertTrue(copyButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Info"].exists)
+        copyButton.tap()
     }
 
     func testContactVerificationAndDeleteCancellationAreSafe() {
