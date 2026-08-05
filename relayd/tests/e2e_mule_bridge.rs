@@ -285,7 +285,7 @@ async fn no_internet_message_bridges_to_shore_and_receipt_returns_the_same_way()
     assert_eq!(authored.message.lamport, 1);
     let alice_pending = alice
         .store
-        .pending_relay_outbound_envelopes(16, t0)
+        .pending_relay_outbound_envelopes(16, t0, vec![])
         .unwrap();
     assert_eq!(alice_pending.len(), 1);
     assert_eq!(alice_pending[0].msg_id, authored.envelope.msg_id);
@@ -540,7 +540,7 @@ async fn senders_late_self_upload_after_mule_upload_dedupes_and_skips_quota() {
     // quota-checked even though the mailbox is already full.
     let pending = alice
         .store
-        .pending_relay_outbound_envelopes(16, t0)
+        .pending_relay_outbound_envelopes(16, t0, vec![])
         .unwrap();
     assert_eq!(pending.len(), 1);
     let alice_relay_id = http_post_envelope(
@@ -566,7 +566,7 @@ async fn senders_late_self_upload_after_mule_upload_dedupes_and_skips_quota() {
         .unwrap());
     assert!(alice
         .store
-        .pending_relay_outbound_envelopes(16, t0)
+        .pending_relay_outbound_envelopes(16, t0, vec![])
         .unwrap()
         .is_empty());
 }

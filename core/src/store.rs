@@ -517,6 +517,16 @@ pub struct OutboundEnvelope {
     pub sealed: Vec<u8>,
 }
 
+/// How many relay uploads are still queued for one recipient. Reported by
+/// [`MessageStore::pending_relay_outbound_depth_by_recipient`] for diagnostics
+/// exports, where a lopsided backlog is the signature of one unreachable
+/// contact holding up the queue.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct RelayQueueDepth {
+    pub recipient_user_id: Vec<u8>,
+    pub queued: u64,
+}
+
 /// One persisted outgoing receipt envelope for relay upload and retry.
 /// Unlike [`OutboundEnvelope`], this queue is keyed by the cumulative receipt
 /// watermark rather than the chat lamport stream, so `through_lamport` is the
@@ -1898,25 +1908,94 @@ impl MessageStore {
     }
 
     /// Relay-upload candidates: locally authored envelopes not yet marked as
-    /// posted to a relay, unexpired as of `now_ms`, oldest first.
+    /// posted to a relay, unexpired as of `now_ms`.
+    ///
+    /// Rows are drawn **round-robin across recipients** rather than in flat
+    /// queue order: each recipient's oldest envelope is offered before any
+    /// recipient's second, and so on. A flat `ORDER BY queued_at LIMIT n` lets
+    /// one recipient own the entire window, and because a failed upload never
+    /// sets `relay_posted_at`, those same rows refill it on every pass --
+    /// forever. One contact with an unreachable relay then starves every other
+    /// conversation on the device indefinitely. Ranking first by position
+    /// *within* a recipient makes that impossible while costing nothing when
+    /// only one recipient has traffic: with a single recipient the ranks are
+    /// already `1, 2, 3, ...` in queue order, so the batch is byte-identical
+    /// to the flat query. Fairness binds only under contention.
+    ///
+    /// `skip_recipient_user_ids` drops recipients the caller already knows it
+    /// cannot post to on this pass (no resolvable relay config -- resting,
+    /// unconfigured, or written off). The exclusion has to happen *here*
+    /// rather than in the caller's loop: a row the caller fetches and then
+    /// skips has still consumed one of `limit` slots, so filtering downstream
+    /// leaves the starvation fully intact. Skipped rows keep their queued
+    /// state untouched and are offered again on a later pass, and to the
+    /// BLE/LAN paths meanwhile, exactly as before.
+    ///
+    /// Group-addressed envelopes carry `recipient_user_id = group_id`, so a
+    /// group ranks as its own recipient -- which is what fan-out wants.
     pub fn pending_relay_outbound_envelopes(
         &self,
         limit: u64,
         now_ms: i64,
+        skip_recipient_user_ids: Vec<Vec<u8>>,
     ) -> Result<Vec<OutboundEnvelope>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut args: Vec<Value> = vec![Value::Integer(now_ms)];
+        let skip_clause = if skip_recipient_user_ids.is_empty() {
+            String::new()
+        } else {
+            let placeholders = vec!["?"; skip_recipient_user_ids.len()].join(", ");
+            args.extend(skip_recipient_user_ids.into_iter().map(Value::Blob));
+            format!(" AND recipient_user_id NOT IN ({placeholders})")
+        };
+        args.push(Value::Integer(limit as i64));
+        let sql = format!(
+            "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, kind, lamport,
+                    timestamp, hop_ttl, expiry, recipient_hint, sealed
+             FROM (
+                 SELECT *, ROW_NUMBER() OVER (
+                            PARTITION BY recipient_user_id
+                            ORDER BY queued_at ASC, msg_id ASC
+                        ) AS recipient_rank
+                 FROM outbound_envelopes
+                 WHERE relay_posted_at IS NULL AND expiry > ?{skip_clause}
+             )
+             ORDER BY recipient_rank ASC, queued_at ASC, msg_id ASC
+             LIMIT ?"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let rows = stmt
+            .query_map(params_from_iter(args.iter()), row_to_outbound)
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// How many unposted, unexpired relay-upload candidates are queued per
+    /// recipient as of `now_ms`, largest backlog first. Diagnostics only: a
+    /// stranded outbound queue was previously invisible in a support export,
+    /// which made "nothing is being delivered" indistinguishable from
+    /// "nothing was sent" without a debugger.
+    pub fn pending_relay_outbound_depth_by_recipient(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<RelayQueueDepth>, CoreError> {
         let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
-                "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, kind, lamport,
-                        timestamp, hop_ttl, expiry, recipient_hint, sealed
+                "SELECT recipient_user_id, COUNT(*) AS queued
                  FROM outbound_envelopes
                  WHERE relay_posted_at IS NULL AND expiry > ?1
-                 ORDER BY queued_at ASC, msg_id ASC
-                 LIMIT ?2",
+                 GROUP BY recipient_user_id
+                 ORDER BY queued DESC, recipient_user_id ASC",
             )
             .map_err(store_err)?;
         let rows = stmt
-            .query_map(params![now_ms, limit as i64], row_to_outbound)
+            .query_map(params![now_ms], |row| {
+                Ok(RelayQueueDepth {
+                    recipient_user_id: row.get(0)?,
+                    queued: row.get::<_, i64>(1)? as u64,
+                })
+            })
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
@@ -6820,8 +6899,134 @@ mod tests {
             .unwrap());
 
         assert_eq!(
-            store.pending_relay_outbound_envelopes(10, 2_000).unwrap(),
+            store
+                .pending_relay_outbound_envelopes(10, 2_000, vec![])
+                .unwrap(),
             vec![live_env],
+        );
+    }
+
+    /// Queue `count` envelopes to `recipient`, all unexpired, queued in the
+    /// given `queued_at` order so the flat-order behaviour is unambiguous.
+    fn queue_outbound_for(
+        store: &MessageStore,
+        recipient: &[u8],
+        chat: &[u8],
+        count: u64,
+        first_queued_at: i64,
+    ) -> Vec<Vec<u8>> {
+        let mut ids = Vec::new();
+        for i in 0..count {
+            let message = msg(chat, b"alice", i + 1, "body");
+            let msg_id = format!("msg-{}-{:08}", String::from_utf8_lossy(recipient), i);
+            let mut envelope = outbound_for(&message, recipient, msg_id.as_bytes());
+            envelope.expiry = 10_000_000;
+            ids.push(envelope.msg_id.clone());
+            store
+                .insert_outgoing_message(message, envelope, first_queued_at + i as i64)
+                .unwrap();
+        }
+        ids
+    }
+
+    #[test]
+    fn one_recipients_backlog_cannot_consume_the_whole_relay_batch() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // Bob's relay is unreachable, so his rows never clear and they were
+        // queued first -- exactly the field case where every other
+        // conversation went dark for three days.
+        queue_outbound_for(&store, b"bob", b"chat-bob", 200, 1_000);
+        queue_outbound_for(&store, b"carol", b"chat-carol", 3, 900_000);
+
+        let batch = store
+            .pending_relay_outbound_envelopes(128, 2_000, vec![])
+            .unwrap();
+        assert_eq!(batch.len(), 128);
+        let carol_rows = batch
+            .iter()
+            .filter(|e| e.recipient_user_id == b"carol".to_vec())
+            .count();
+        // Flat queue order would have given Carol zero of the 128 slots even
+        // though her messages are newer: Bob's backlog fills the window.
+        assert_eq!(carol_rows, 3, "every newer recipient's row must get a slot");
+    }
+
+    #[test]
+    fn a_single_recipient_still_gets_the_whole_batch_in_queue_order() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let ids = queue_outbound_for(&store, b"bob", b"chat-bob", 200, 1_000);
+
+        let batch = store
+            .pending_relay_outbound_envelopes(128, 2_000, vec![])
+            .unwrap();
+        // Fairness must bind only under contention: uncontended throughput and
+        // ordering are unchanged from the flat query.
+        assert_eq!(batch.len(), 128);
+        assert_eq!(
+            batch.iter().map(|e| e.msg_id.clone()).collect::<Vec<_>>(),
+            ids[..128].to_vec(),
+        );
+    }
+
+    #[test]
+    fn skipped_recipients_do_not_consume_relay_batch_slots() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        queue_outbound_for(&store, b"bob", b"chat-bob", 200, 1_000);
+        queue_outbound_for(&store, b"carol", b"chat-carol", 40, 900_000);
+
+        let batch = store
+            .pending_relay_outbound_envelopes(128, 2_000, vec![b"bob".to_vec()])
+            .unwrap();
+        // Bob is known-unpostable this pass, so none of his rows are fetched
+        // at all -- Carol's whole backlog gets the window.
+        assert_eq!(batch.len(), 40);
+        assert!(batch
+            .iter()
+            .all(|e| e.recipient_user_id == b"carol".to_vec()));
+    }
+
+    #[test]
+    fn skipping_a_recipient_leaves_its_queue_intact_for_a_later_pass() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let bob_ids = queue_outbound_for(&store, b"bob", b"chat-bob", 5, 1_000);
+
+        assert!(store
+            .pending_relay_outbound_envelopes(128, 2_000, vec![b"bob".to_vec()])
+            .unwrap()
+            .is_empty());
+        // Skipping is not a terminal state: once his relay resolves again the
+        // same rows are offered, unchanged.
+        assert_eq!(
+            store
+                .pending_relay_outbound_envelopes(128, 2_000, vec![])
+                .unwrap()
+                .iter()
+                .map(|e| e.msg_id.clone())
+                .collect::<Vec<_>>(),
+            bob_ids,
+        );
+    }
+
+    #[test]
+    fn relay_queue_depth_reports_the_backlog_per_recipient() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        queue_outbound_for(&store, b"bob", b"chat-bob", 7, 1_000);
+        queue_outbound_for(&store, b"carol", b"chat-carol", 2, 900_000);
+
+        assert_eq!(
+            store
+                .pending_relay_outbound_depth_by_recipient(2_000)
+                .unwrap(),
+            vec![
+                RelayQueueDepth {
+                    recipient_user_id: b"bob".to_vec(),
+                    queued: 7,
+                },
+                RelayQueueDepth {
+                    recipient_user_id: b"carol".to_vec(),
+                    queued: 2,
+                },
+            ],
         );
     }
 

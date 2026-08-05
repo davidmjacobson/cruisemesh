@@ -600,7 +600,34 @@ internal class RelaySyncEngine(
         network: Network?,
     ) {
         val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
-        for (envelope in store.pendingRelayOutboundEnvelopes(RELAY_STORE_BATCH_LIMIT, now)) {
+        // Recipients we already know we cannot post to on this pass. Core
+        // excludes them in the query rather than the loop below: a row fetched
+        // and then skipped has still consumed one of RELAY_STORE_BATCH_LIMIT
+        // slots, so an unreachable contact with a deep backlog would keep
+        // refilling the whole window and starve every other conversation.
+        val skipRecipients = contacts
+            .filter { resolvedRelayConfig(it, fallbackConfig) == null }
+            .map { it.userId }
+        if (skipRecipients.isNotEmpty()) {
+            Log.i(
+                TAG,
+                "Skipping relay upload for ${skipRecipients.size} unreachable recipient(s) this pass: " +
+                    skipRecipients.joinToString { UserIdHex.encode(it) },
+            )
+        }
+        // A stranded outbound queue was previously invisible in a support
+        // archive: "nothing is arriving" read the same whether the queue was
+        // deep or empty. One lopsided recipient here is the signature of a
+        // contact whose relay is unreachable.
+        val queueDepth = store.pendingRelayOutboundDepthByRecipient(now)
+        if (queueDepth.isNotEmpty()) {
+            Log.i(
+                TAG,
+                "Outbound relay queue depth by recipient: " +
+                    queueDepth.joinToString { "${UserIdHex.encode(it.recipientUserId)}=${it.queued}" },
+            )
+        }
+        for (envelope in store.pendingRelayOutboundEnvelopes(RELAY_STORE_BATCH_LIMIT, now, skipRecipients)) {
             // 1:1 / invite envelopes are addressed to a contact userId; group
             // text uses recipientUserId = group.id and rides the family's
             // fallback (or any member's) relay config.
