@@ -78,6 +78,9 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
     val names = remember(contacts) {
         contacts.associate { UserIdHex.encode(it.userId) to coreContactDisplayName(it) }
     }
+    val queueDepths = remember(revision) {
+        store.pendingRelayOutboundDepthByRecipient(System.currentTimeMillis()).associateBy { UserIdHex.encode(it.recipientUserId) }
+    }
 
     Scaffold(
         topBar = {
@@ -155,6 +158,14 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
+                            val queueDepth = queueDepths[hex]?.queued ?: 0u
+                            if (queueDepth > 0u) {
+                                Text(
+                                    stringResource(R.string.ui_pending_relay_upload, queueDepth.toInt()),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
                         }
                     }
                 }

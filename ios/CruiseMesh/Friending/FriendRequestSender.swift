@@ -52,7 +52,7 @@ enum FriendRequestSender {
         let reachedDirectly = MeshRouter.sendToUserId(userId: contact.userId, frame: authored.frame)
         if !reachedDirectly {
             let muled = MeshRouter.relayToAll(frame: authored.frame)
-            log.info("Friend request queued for later delivery to \(contact.name, privacy: .public); sprayed to \(muled) mule link(s)")
+            log.info("Friend request queued for later delivery to \(UserIdHex.encode(contact.userId), privacy: .public); sprayed to \(muled) mule link(s)")
         }
         return FriendRequestDelivery(reachedDirectly: reachedDirectly, lamport: authored.message.lamport)
     }
