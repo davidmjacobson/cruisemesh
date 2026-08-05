@@ -149,10 +149,14 @@ final class CruiseMeshUITests: XCTestCase {
             app.staticTexts["Match these words with your friend's screen to confirm it's really them."].exists
         )
 
-        let delete = app.buttons["Delete contact"]
-        for _ in 0..<4 where !delete.isHittable {
+        // Expanding verification pushes the destructive action below the
+        // sheet's viewport. Scroll before asking XCTest for hittability: on
+        // an off-screen SwiftUI button that query itself can fail the test.
+        for _ in 0..<4 {
             app.swipeUp()
         }
+        let delete = app.buttons["Delete contact"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
         XCTAssertTrue(delete.isHittable)
         delete.tap()
         XCTAssertTrue(app.alerts["Delete contact?"].waitForExistence(timeout: 3))
