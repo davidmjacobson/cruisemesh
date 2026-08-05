@@ -24,7 +24,7 @@ enum RelayConfigStore {
     private static let announcedRelayEpochKey = "cruisemesh.relay.announcedEpoch"
 
     static func load() -> RelayConfig? {
-        if let data = UserDefaults.standard.data(forKey: configKey),
+        if let data = AppDefaults.current.data(forKey: configKey),
            let config = try? JSONDecoder().decode(RelayConfig.self, from: data) {
             let url = normalizeRelayUrl(config.relayUrl)
             let token = config.relayToken.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -33,14 +33,14 @@ enum RelayConfigStore {
             }
         }
         // One-time migration from the original two-key representation.
-        let url = normalizeRelayUrl(UserDefaults.standard.string(forKey: urlKey) ?? "")
-        let token = (UserDefaults.standard.string(forKey: tokenKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = normalizeRelayUrl(AppDefaults.current.string(forKey: urlKey) ?? "")
+        let token = (AppDefaults.current.string(forKey: tokenKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !url.isEmpty, !token.isEmpty else { return nil }
         let config = RelayConfig(relayUrl: url, relayToken: token)
         if let data = try? JSONEncoder().encode(config) {
-            UserDefaults.standard.set(data, forKey: configKey)
-            UserDefaults.standard.removeObject(forKey: urlKey)
-            UserDefaults.standard.removeObject(forKey: tokenKey)
+            AppDefaults.current.set(data, forKey: configKey)
+            AppDefaults.current.removeObject(forKey: urlKey)
+            AppDefaults.current.removeObject(forKey: tokenKey)
         }
         return config
     }
@@ -60,29 +60,29 @@ enum RelayConfigStore {
             guard let data = try? JSONEncoder().encode(next) else { return }
             // One value means a process interruption can never leave a URL
             // from one setup paired with a token from another.
-            UserDefaults.standard.set(data, forKey: configKey)
+            AppDefaults.current.set(data, forKey: configKey)
         } else {
-            UserDefaults.standard.removeObject(forKey: configKey)
+            AppDefaults.current.removeObject(forKey: configKey)
         }
-        UserDefaults.standard.removeObject(forKey: urlKey)
-        UserDefaults.standard.removeObject(forKey: tokenKey)
-        UserDefaults.standard.set(nextRelayEpoch(), forKey: relayEpochKey)
+        AppDefaults.current.removeObject(forKey: urlKey)
+        AppDefaults.current.removeObject(forKey: tokenKey)
+        AppDefaults.current.set(nextRelayEpoch(), forKey: relayEpochKey)
     }
 
     /// T23: the current epoch of this device's own relay endpoint. `0` means
     /// it has never changed since install, so there is nothing to announce.
     static func relayEpoch() -> Int64 {
-        Int64(UserDefaults.standard.integer(forKey: relayEpochKey))
+        Int64(AppDefaults.current.integer(forKey: relayEpochKey))
     }
 
     /// T23: the newest epoch already fanned out to contacts.
     static func announcedRelayEpoch() -> Int64 {
-        Int64(UserDefaults.standard.integer(forKey: announcedRelayEpochKey))
+        Int64(AppDefaults.current.integer(forKey: announcedRelayEpochKey))
     }
 
     /// T23: records that `epoch` has been queued to every contact.
     static func markRelayEpochAnnounced(_ epoch: Int64) {
-        UserDefaults.standard.set(Int(epoch), forKey: announcedRelayEpochKey)
+        AppDefaults.current.set(Int(epoch), forKey: announcedRelayEpochKey)
     }
 
     /// Wall clock, but never at or below the previous value: a backwards clock
@@ -93,12 +93,12 @@ enum RelayConfigStore {
     }
 
     static func shareOnline() -> Bool {
-        guard UserDefaults.standard.object(forKey: shareOnlineKey) != nil else { return true }
-        return UserDefaults.standard.bool(forKey: shareOnlineKey)
+        guard AppDefaults.current.object(forKey: shareOnlineKey) != nil else { return true }
+        return AppDefaults.current.bool(forKey: shareOnlineKey)
     }
 
     static func setShareOnline(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: shareOnlineKey)
+        AppDefaults.current.set(enabled, forKey: shareOnlineKey)
     }
 
     private static let log = Logger(subsystem: "com.cruisemesh", category: "RelayClient")

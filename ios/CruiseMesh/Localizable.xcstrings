@@ -1281,6 +1281,16 @@
         }
       }
     },
+    "More": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "More"
+          }
+        }
+      }
+    },
     "More help": {
       "localizations": {
         "en": {
@@ -1317,6 +1327,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Never post a Shore Pass setup card or relay token publicly."
+          }
+        }
+      }
+    },
+    "New chat": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "New chat"
           }
         }
       }

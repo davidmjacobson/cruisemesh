@@ -16,6 +16,11 @@ final class BluetoothAccess: NSObject, ObservableObject {
 
     private override init() {
         super.init()
+        if UITestConfiguration.isEnabled {
+            authorization = .allowedAlways
+            radioState = .poweredOn
+            return
+        }
         central = CBCentralManager(
             delegate: self,
             queue: nil,

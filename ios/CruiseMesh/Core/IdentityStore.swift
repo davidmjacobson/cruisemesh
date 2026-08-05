@@ -5,7 +5,9 @@ import Security
 /// Keychain is the platform secret store, DESIGN.md §6.2).
 enum IdentityStore {
     private static let service = "com.cruisemesh.app.identity"
-    private static let account = "device-identity"
+    private static var account: String {
+        "device-identity" + (UITestConfiguration.identityAccountSuffix ?? "")
+    }
 
     static func load() -> Identity? {
         let query: [String: Any] = [

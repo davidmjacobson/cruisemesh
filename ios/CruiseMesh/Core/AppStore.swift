@@ -13,7 +13,8 @@ enum AppStore {
     private static var recoveryNoticePending = false
 
     static var databaseURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        if let testURL = UITestConfiguration.databaseURL { return testURL }
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("CruiseMesh", isDirectory: true)
             .appendingPathComponent("messages.sqlite")
     }

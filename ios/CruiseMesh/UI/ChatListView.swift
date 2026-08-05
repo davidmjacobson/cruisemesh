@@ -177,6 +177,8 @@ struct ChatListView: View {
                     } label: {
                         Image(systemName: "plus.circle")
                     }
+                    .accessibilityLabel("New chat")
+                    .accessibilityIdentifier("home.new-chat-menu")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
@@ -187,6 +189,8 @@ struct ChatListView: View {
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
+                    .accessibilityLabel("More")
+                    .accessibilityIdentifier("home.more-menu")
                 }
             }
             .safeAreaInset(edge: .top) {
@@ -281,7 +285,7 @@ struct ChatListView: View {
                 cancellable = ChatEvents.subject.sink { _ in reload() }
                 appModel.startMeshIfEnabled()
                 if AppStore.consumeRecoveryNotice() { showStoreRecoveryNotice = true }
-                if !publishedFriendDirectory {
+                if !UITestConfiguration.isEnabled && !publishedFriendDirectory {
                     publishedFriendDirectory = true
                     ProfileSyncSender.queueToAllContacts(
                         store: AppStore.get(),
@@ -309,6 +313,7 @@ struct ChatListView: View {
                 path.append(isGroup ? ChatRoute.group(chatId) : ChatRoute.contact(chatId))
             }
         }
+        .accessibilityIdentifier("screen.chat-list")
     }
 
     private func route(for summary: ChatSummary) -> ChatRoute {

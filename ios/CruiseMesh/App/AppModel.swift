@@ -18,38 +18,48 @@ final class AppModel: ObservableObject {
     init() {
         try? BackupService.installPendingRestoreIfNeeded()
         let id = IdentityStore.loadOrCreate()
+        UITestConfiguration.prepareFixtures(identity: id)
         self.identity = id
         self.displayName = ProfileStore.loadDisplayName()
         self.pendingFriendToken = nil
         self.pendingRelayCard = nil
-        if UserDefaults.standard.object(forKey: Self.meshEnabledKey) == nil {
+        if UITestConfiguration.isEnabled {
+            self.meshEnabled = false
+        } else if AppDefaults.current.object(forKey: Self.meshEnabledKey) == nil {
             self.meshEnabled = true
         } else {
-            self.meshEnabled = UserDefaults.standard.bool(forKey: Self.meshEnabledKey)
+            self.meshEnabled = AppDefaults.current.bool(forKey: Self.meshEnabledKey)
         }
-        MeshController.shared.configure(identity: id)
+        if !UITestConfiguration.isEnabled {
+            MeshController.shared.configure(identity: id)
+        }
     }
 
     func startMesh() {
         guard TermsAcceptanceStore.isCurrentVersionAccepted() else { return }
         meshEnabled = true
-        UserDefaults.standard.set(true, forKey: Self.meshEnabledKey)
+        AppDefaults.current.set(true, forKey: Self.meshEnabledKey)
+        guard !UITestConfiguration.isEnabled else { return }
         MessageNotifier.requestPermission()
         MeshController.shared.start()
     }
 
     func startMeshIfEnabled() {
-        guard meshEnabled, TermsAcceptanceStore.isCurrentVersionAccepted() else { return }
+        guard !UITestConfiguration.isEnabled,
+              meshEnabled,
+              TermsAcceptanceStore.isCurrentVersionAccepted() else { return }
         MeshController.shared.start()
     }
 
     func stopMesh() {
         meshEnabled = false
-        UserDefaults.standard.set(false, forKey: Self.meshEnabledKey)
+        AppDefaults.current.set(false, forKey: Self.meshEnabledKey)
+        guard !UITestConfiguration.isEnabled else { return }
         MeshController.shared.stop()
     }
 
     func setAppForeground(_ foreground: Bool) {
+        guard !UITestConfiguration.isEnabled else { return }
         MeshController.shared.setAppForeground(foreground)
     }
 }

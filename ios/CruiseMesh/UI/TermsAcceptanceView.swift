@@ -38,5 +38,6 @@ struct TermsAcceptanceView: View {
             }
             .padding(28)
         }
+        .accessibilityIdentifier("screen.terms")
     }
 }

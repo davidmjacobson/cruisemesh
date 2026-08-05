@@ -78,6 +78,36 @@ xcodegen generate
 open CruiseMesh.xcodeproj
 ```
 
+## UI tests
+
+The XCUITest target launches deterministic, isolated scenarios: each test uses
+its own preferences suite, Keychain identity, and SQLite database, and live
+Bluetooth/network/notification services are disabled. On macOS, generate the
+project as above and run the full scheme, or only the UI target:
+
+```sh
+xcodebuild test \
+  -project CruiseMesh.xcodeproj \
+  -scheme CruiseMesh \
+  -destination "platform=iOS Simulator,id=<simulator-udid>" \
+  -only-testing:CruiseMeshUITests \
+  CODE_SIGNING_ALLOWED=NO
+```
+
+Windows cannot host Apple's iOS Simulator, but it can dispatch the exact same
+tests to the repository's standard macOS GitHub Actions runner and download the
+`.xcresult` and build log. Install and authenticate
+[GitHub CLI](https://cli.github.com/) first (`gh auth login`), then run:
+
+```powershell
+tools/run-ios-ui-tests.ps1 -Suite ui
+```
+
+The current commit must already be pushed to its branch. Pass `-Push` to push a
+clean worktree's `HEAD` first. Standard macOS runners are free for public
+repositories; private repositories consume the owner's included Actions
+minutes and then normal runner charges.
+
 **Simulator notes:** BLE dual-role mesh is limited on Simulator. UI, store, and
 relay paths work; peer discovery needs two physical phones (or one iPhone + one
 Android with the same service UUID).

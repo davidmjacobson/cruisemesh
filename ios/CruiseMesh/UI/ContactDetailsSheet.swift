@@ -253,6 +253,7 @@ struct ContactDetailsSheet: View {
             } message: {
                 Text("Only you see this. It replaces the name they shared, just on your phone.")
             }
+            .accessibilityIdentifier("screen.contact-details")
         }
     }
 }

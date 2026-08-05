@@ -111,6 +111,7 @@ struct FriendsView: View {
                 }
                 Section("Paste friend card") {
                     TextField("Friend card", text: $pasteText, axis: .vertical)
+                        .accessibilityIdentifier("friends.card-input")
                         .lineLimit(3...8)
                         .focused($pasteFocused)
                     HStack {
@@ -181,6 +182,7 @@ struct FriendsView: View {
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button("Preview friend") { submitPaste() }
+                        .accessibilityIdentifier("friends.preview-keyboard")
                         .disabled(pasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
@@ -260,6 +262,7 @@ struct FriendsView: View {
                     previewText(initialToken)
                 }
             }
+            .accessibilityIdentifier("screen.friends")
             .onReceive(ChatEvents.subject.receive(on: DispatchQueue.main)) { _ in reload() }
         }
     }

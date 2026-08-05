@@ -57,6 +57,7 @@ struct ChatComposerBar: View {
                         Capsule(style: .continuous)
                             .fill(Color(uiColor: .secondarySystemBackground))
                     )
+                    .accessibilityIdentifier("chat.composer.text")
 
                 if canSend {
                     Button(action: onSend) {
@@ -64,6 +65,7 @@ struct ChatComposerBar: View {
                             .font(.system(size: 32, weight: .semibold))
                     }
                     .accessibilityLabel("Send")
+                    .accessibilityIdentifier("chat.composer.send")
                 } else {
                     HoldToRecordButton(
                         recorder: voiceRecorder,
