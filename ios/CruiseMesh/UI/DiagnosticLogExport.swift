@@ -1,5 +1,99 @@
 import Foundation
 import OSLog
+import UIKit
+
+/// Cancellation shared between the UIKit background-task expiry handler and
+/// the diagnostics worker. `OSLogStore` iteration is lazy, so checking between
+/// entries lets an expired job stop without advancing its persisted cursor;
+/// the next lifecycle flush can safely retry the same entries.
+final class DiagnosticArchiveCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
+/// Coalesces lifecycle archive requests and guarantees that the expensive
+/// work runs on a utility queue rather than the caller's queue. Kept free of
+/// UIKit so unit tests can prove that a scene callback never waits for the
+/// worker and that expiry reaches it.
+final class DiagnosticArchiveLifecycleScheduler: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let lock = NSLock()
+    private var running = false
+
+    init(queue: DispatchQueue) {
+        self.queue = queue
+    }
+
+    @discardableResult
+    func schedule(
+        beginBackgroundTask: (@escaping () -> Void) -> () -> Void,
+        work: @escaping (DiagnosticArchiveCancellation) -> Void
+    ) -> Bool {
+        lock.lock()
+        guard !running else {
+            lock.unlock()
+            return false
+        }
+        running = true
+        lock.unlock()
+
+        let cancellation = DiagnosticArchiveCancellation()
+        let endBackgroundTask = beginBackgroundTask { cancellation.cancel() }
+        queue.async { [weak self] in
+            work(cancellation)
+            endBackgroundTask()
+            self?.finish()
+        }
+        return true
+    }
+
+    private func finish() {
+        lock.lock()
+        running = false
+        lock.unlock()
+    }
+}
+
+/// Owns one UIKit background-task identifier. Expiry and normal completion
+/// can race, so `end()` always hops to the main queue and is idempotent there.
+private final class DiagnosticArchiveBackgroundTask: @unchecked Sendable {
+    private var identifier = UIBackgroundTaskIdentifier.invalid
+
+    func begin(expiration: @escaping () -> Void) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        identifier = UIApplication.shared.beginBackgroundTask(
+            withName: "CruiseMesh diagnostics archive"
+        ) { [weak self] in
+            expiration()
+            self?.end()
+        }
+    }
+
+    func end() {
+        let endOnMain = { [weak self] in
+            guard let self, self.identifier != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(self.identifier)
+            self.identifier = .invalid
+        }
+        if Thread.isMainThread {
+            endOnMain()
+        } else {
+            DispatchQueue.main.async(execute: endOnMain)
+        }
+    }
+}
 
 /// T13: opt-in iOS diagnostic-log archive. The OS already retains this app's
 /// current-process Logger entries, so enabling capture has no continuous
@@ -18,6 +112,9 @@ enum DiagnosticLogExport {
     private static let directoryName = "Diagnostics"
     private static let fileName = "cruisemesh-diagnostics.txt"
     private static let lock = NSLock()
+    private static let lifecycleScheduler = DiagnosticArchiveLifecycleScheduler(
+        queue: DispatchQueue(label: "com.cruisemesh.diagnostics.archive", qos: .utility)
+    )
 
     /// Guarded by `lock`, like every other mutable state in here.
     private static var sessionBannerWritten = false
@@ -45,8 +142,31 @@ enum DiagnosticLogExport {
     }
 
     /// Called from the app lifecycle as the scene leaves the foreground.
+    ///
+    /// Never enumerate `OSLogStore` inline here. Apple treats a slow
+    /// scene-update callback as a watchdog violation, and a relay failure
+    /// storm can leave hundreds of entries for the lazy iterator to retrieve.
+    /// The UIKit background task gives the utility worker time to finish after
+    /// the scene backgrounds; its expiry handler asks the iterator to stop.
     static func archiveCurrentSession() {
-        archiveCurrentSession(force: false)
+        guard isEnabled else { return }
+        let schedule = {
+            _ = lifecycleScheduler.schedule(
+                beginBackgroundTask: { expiration in
+                    let task = DiagnosticArchiveBackgroundTask()
+                    task.begin(expiration: expiration)
+                    return { task.end() }
+                },
+                work: { cancellation in
+                    archiveCurrentSession(force: false, cancellation: cancellation)
+                }
+            )
+        }
+        if Thread.isMainThread {
+            schedule()
+        } else {
+            DispatchQueue.main.async(execute: schedule)
+        }
     }
 
     /// Flushes the current session and returns the persistent shareable archive,
@@ -62,11 +182,16 @@ enum DiagnosticLogExport {
         return url
     }
 
-    private static func archiveCurrentSession(force: Bool) {
+    private static func archiveCurrentSession(
+        force: Bool,
+        cancellation: DiagnosticArchiveCancellation? = nil
+    ) {
         guard force || isEnabled else { return }
+        guard cancellation?.isCancelled != true else { return }
         lock.lock()
         defer { lock.unlock() }
 
+        guard cancellation?.isCancelled != true else { return }
         guard let store = try? OSLogStore(scope: .currentProcessIdentifier) else { return }
         let defaults = UserDefaults.standard
         let lastArchivedAt = defaults.object(forKey: lastArchivedAtKey) as? Date
@@ -78,6 +203,7 @@ enum DiagnosticLogExport {
         let stamp = ISO8601DateFormatter()
         var records: [(date: Date, line: String)] = []
         for entry in entries {
+            guard cancellation?.isCancelled != true else { return }
             guard let log = entry as? OSLogEntryLog, log.subsystem == subsystem else {
                 continue
             }
@@ -89,6 +215,7 @@ enum DiagnosticLogExport {
                 )
             )
         }
+        guard cancellation?.isCancelled != true else { return }
         guard !records.isEmpty, let url = archiveURL() else { return }
         if records.count > maxEntries { records = Array(records.suffix(maxEntries)) }
 
