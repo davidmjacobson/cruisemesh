@@ -79,7 +79,7 @@ class ReceiptRelayRoundTripTest {
             1,
             bobStore.messagesForChat(alice.userId).size,
         )
-        val actualEnvelopes = bobStore.pendingRelayOutgoingReceiptEnvelopes(10uL, 1_700_000_000_300L)
+        val actualEnvelopes = bobStore.pendingRelayOutgoingReceiptEnvelopes(10uL, 1_700_000_000_300L, emptyList())
         assertEquals(2, actualEnvelopes.size)
         assertEquals(deliveredEnvelope.toString(), actualEnvelopes[0].toString())
         assertEquals(readEnvelope.toString(), actualEnvelopes[1].toString())

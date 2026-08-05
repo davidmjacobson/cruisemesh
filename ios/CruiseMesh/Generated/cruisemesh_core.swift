@@ -2823,16 +2823,59 @@ public protocol MessageStoreProtocol : AnyObject {
     func peerConnectionSummaries() throws  -> [PeerConnectionSummary]
     
     /**
-     * Relay-upload candidates: locally authored envelopes not yet marked as
-     * posted to a relay, unexpired as of `now_ms`, oldest first.
+     * How many unposted, unexpired relay-upload candidates are queued per
+     * recipient as of `now_ms`, largest backlog first. Diagnostics only: a
+     * stranded outbound queue was previously invisible in a support export,
+     * which made "nothing is being delivered" indistinguishable from
+     * "nothing was sent" without a debugger.
      */
-    func pendingRelayOutboundEnvelopes(limit: UInt64, nowMs: Int64) throws  -> [OutboundEnvelope]
+    func pendingRelayOutboundDepthByRecipient(nowMs: Int64) throws  -> [RelayQueueDepth]
+    
+    /**
+     * Relay-upload candidates: locally authored envelopes not yet marked as
+     * posted to a relay, unexpired as of `now_ms`.
+     *
+     * Rows are drawn **round-robin across recipients** rather than in flat
+     * queue order: each recipient's oldest envelope is offered before any
+     * recipient's second, and so on. A flat `ORDER BY queued_at LIMIT n` lets
+     * one recipient own the entire window, and because a failed upload never
+     * sets `relay_posted_at`, those same rows refill it on every pass --
+     * forever. One contact with an unreachable relay then starves every other
+     * conversation on the device indefinitely. Ranking first by position
+     * *within* a recipient makes that impossible while costing nothing when
+     * only one recipient has traffic: with a single recipient the ranks are
+     * already `1, 2, 3, ...` in queue order, so the batch is byte-identical
+     * to the flat query. Fairness binds only under contention.
+     *
+     * `skip_recipient_user_ids` drops recipients the caller already knows it
+     * cannot post to on this pass (no resolvable relay config -- resting,
+     * unconfigured, or written off). The exclusion has to happen *here*
+     * rather than in the caller's loop: a row the caller fetches and then
+     * skips has still consumed one of `limit` slots, so filtering downstream
+     * leaves the starvation fully intact. Skipped rows keep their queued
+     * state untouched and are offered again on a later pass, and to the
+     * BLE/LAN paths meanwhile, exactly as before.
+     *
+     * Group-addressed envelopes carry `recipient_user_id = group_id`, so a
+     * group ranks as its own recipient -- which is what fan-out wants.
+     */
+    func pendingRelayOutboundEnvelopes(limit: UInt64, nowMs: Int64, skipRecipientUserIds: [Data]) throws  -> [OutboundEnvelope]
     
     /**
      * Relay-upload candidates: persisted receipt envelopes not yet marked as
      * posted to a relay, unexpired as of `now_ms`, oldest first.
+     * Receipts are drawn round-robin across recipients and honour the same
+     * skip set as [`MessageStore::pending_relay_outbound_envelopes`], for the
+     * same reason and with the same guarantees -- see that function's doc
+     * comment for why flat queue order starves.
+     *
+     * This queue is not a lesser case of the problem: in the field capture it
+     * was the one visibly failing (`Failed to upload receipt envelope` against
+     * an unreachable host, over and over). Receipts are also the queue most
+     * likely to be jammed by one bad contact, because every message received
+     * from anyone generates one and they are re-queued until they post.
      */
-    func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64) throws  -> [OutgoingReceiptEnvelope]
+    func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64, skipRecipientUserIds: [Data]) throws  -> [OutgoingReceiptEnvelope]
     
     /**
      * Delete every carried envelope whose `expiry` is at or before `now_ms`
@@ -4948,14 +4991,54 @@ open func peerConnectionSummaries()throws  -> [PeerConnectionSummary] {
 }
     
     /**
-     * Relay-upload candidates: locally authored envelopes not yet marked as
-     * posted to a relay, unexpired as of `now_ms`, oldest first.
+     * How many unposted, unexpired relay-upload candidates are queued per
+     * recipient as of `now_ms`, largest backlog first. Diagnostics only: a
+     * stranded outbound queue was previously invisible in a support export,
+     * which made "nothing is being delivered" indistinguishable from
+     * "nothing was sent" without a debugger.
      */
-open func pendingRelayOutboundEnvelopes(limit: UInt64, nowMs: Int64)throws  -> [OutboundEnvelope] {
+open func pendingRelayOutboundDepthByRecipient(nowMs: Int64)throws  -> [RelayQueueDepth] {
+    return try  FfiConverterSequenceTypeRelayQueueDepth.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_pending_relay_outbound_depth_by_recipient(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Relay-upload candidates: locally authored envelopes not yet marked as
+     * posted to a relay, unexpired as of `now_ms`.
+     *
+     * Rows are drawn **round-robin across recipients** rather than in flat
+     * queue order: each recipient's oldest envelope is offered before any
+     * recipient's second, and so on. A flat `ORDER BY queued_at LIMIT n` lets
+     * one recipient own the entire window, and because a failed upload never
+     * sets `relay_posted_at`, those same rows refill it on every pass --
+     * forever. One contact with an unreachable relay then starves every other
+     * conversation on the device indefinitely. Ranking first by position
+     * *within* a recipient makes that impossible while costing nothing when
+     * only one recipient has traffic: with a single recipient the ranks are
+     * already `1, 2, 3, ...` in queue order, so the batch is byte-identical
+     * to the flat query. Fairness binds only under contention.
+     *
+     * `skip_recipient_user_ids` drops recipients the caller already knows it
+     * cannot post to on this pass (no resolvable relay config -- resting,
+     * unconfigured, or written off). The exclusion has to happen *here*
+     * rather than in the caller's loop: a row the caller fetches and then
+     * skips has still consumed one of `limit` slots, so filtering downstream
+     * leaves the starvation fully intact. Skipped rows keep their queued
+     * state untouched and are offered again on a later pass, and to the
+     * BLE/LAN paths meanwhile, exactly as before.
+     *
+     * Group-addressed envelopes carry `recipient_user_id = group_id`, so a
+     * group ranks as its own recipient -- which is what fan-out wants.
+     */
+open func pendingRelayOutboundEnvelopes(limit: UInt64, nowMs: Int64, skipRecipientUserIds: [Data])throws  -> [OutboundEnvelope] {
     return try  FfiConverterSequenceTypeOutboundEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_pending_relay_outbound_envelopes(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(limit),
-        FfiConverterInt64.lower(nowMs),$0
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterSequenceData.lower(skipRecipientUserIds),$0
     )
 })
 }
@@ -4963,12 +5046,23 @@ open func pendingRelayOutboundEnvelopes(limit: UInt64, nowMs: Int64)throws  -> [
     /**
      * Relay-upload candidates: persisted receipt envelopes not yet marked as
      * posted to a relay, unexpired as of `now_ms`, oldest first.
+     * Receipts are drawn round-robin across recipients and honour the same
+     * skip set as [`MessageStore::pending_relay_outbound_envelopes`], for the
+     * same reason and with the same guarantees -- see that function's doc
+     * comment for why flat queue order starves.
+     *
+     * This queue is not a lesser case of the problem: in the field capture it
+     * was the one visibly failing (`Failed to upload receipt envelope` against
+     * an unreachable host, over and over). Receipts are also the queue most
+     * likely to be jammed by one bad contact, because every message received
+     * from anyone generates one and they are re-queued until they post.
      */
-open func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64)throws  -> [OutgoingReceiptEnvelope] {
+open func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64, skipRecipientUserIds: [Data])throws  -> [OutgoingReceiptEnvelope] {
     return try  FfiConverterSequenceTypeOutgoingReceiptEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_pending_relay_outgoing_receipt_envelopes(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(limit),
-        FfiConverterInt64.lower(nowMs),$0
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterSequenceData.lower(skipRecipientUserIds),$0
     )
 })
 }
@@ -11403,6 +11497,78 @@ public func FfiConverterTypeRelayFetchCursor_lower(_ value: RelayFetchCursor) ->
 }
 
 
+/**
+ * How many relay uploads are still queued for one recipient. Reported by
+ * [`MessageStore::pending_relay_outbound_depth_by_recipient`] for diagnostics
+ * exports, where a lopsided backlog is the signature of one unreachable
+ * contact holding up the queue.
+ */
+public struct RelayQueueDepth {
+    public var recipientUserId: Data
+    public var queued: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(recipientUserId: Data, queued: UInt64) {
+        self.recipientUserId = recipientUserId
+        self.queued = queued
+    }
+}
+
+
+
+extension RelayQueueDepth: Equatable, Hashable {
+    public static func ==(lhs: RelayQueueDepth, rhs: RelayQueueDepth) -> Bool {
+        if lhs.recipientUserId != rhs.recipientUserId {
+            return false
+        }
+        if lhs.queued != rhs.queued {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(recipientUserId)
+        hasher.combine(queued)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRelayQueueDepth: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayQueueDepth {
+        return
+            try RelayQueueDepth(
+                recipientUserId: FfiConverterData.read(from: &buf), 
+                queued: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RelayQueueDepth, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.recipientUserId, into: &buf)
+        FfiConverterUInt64.write(value.queued, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayQueueDepth_lift(_ buf: RustBuffer) throws -> RelayQueueDepth {
+    return try FfiConverterTypeRelayQueueDepth.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayQueueDepth_lower(_ value: RelayQueueDepth) -> RustBuffer {
+    return FfiConverterTypeRelayQueueDepth.lower(value)
+}
+
+
 public struct RelaySetup {
     public var relayUrl: String
     public var relayToken: String
@@ -15214,6 +15380,31 @@ fileprivate struct FfiConverterSequenceTypePendingSharedRequest: FfiConverterRus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeRelayQueueDepth: FfiConverterRustBuffer {
+    typealias SwiftType = [RelayQueueDepth]
+
+    public static func write(_ value: [RelayQueueDepth], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeRelayQueueDepth.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [RelayQueueDepth] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [RelayQueueDepth]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeRelayQueueDepth.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeStoredMessage: FfiConverterRustBuffer {
     typealias SwiftType = [StoredMessage]
 
@@ -18582,10 +18773,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_peer_connection_summaries() != 62253) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outbound_envelopes() != 10485) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outbound_depth_by_recipient() != 58936) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outgoing_receipt_envelopes() != 55668) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outbound_envelopes() != 23243) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outgoing_receipt_envelopes() != 13280) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_carried() != 12206) {
