@@ -591,7 +591,25 @@ fn next_authored_lamport(
     };
     let delivered = receipt(RECEIPT_TYPE_DELIVERED)?;
     let read = receipt(RECEIPT_TYPE_READ)?;
-    let next = own.max(delivered).max(read).saturating_add(1) as u64;
+    // The persisted high-water mark is the only one of these four that
+    // survives `delete_contact`. Without it the counter restarts at 1 against
+    // a peer who still holds our old stream: they read the reused lamports as
+    // us having forked, and their fork recovery deletes their copy of the
+    // conversation to resynchronise. A one-sided delete would silently become
+    // a two-sided one.
+    let authored_high: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(high_lamport), 0) FROM authored_lamport_watermarks
+             WHERE chat_id = ?1 AND sender_user_id = ?2",
+            params![chat_id, sender_user_id],
+            |row| row.get(0),
+        )
+        .map_err(store_err)?;
+    let next = own
+        .max(delivered)
+        .max(read)
+        .max(authored_high)
+        .saturating_add(1) as u64;
     Ok((next, delivered as u64))
 }
 
@@ -669,6 +687,22 @@ fn insert_authored_rows(
     reply_to_msg_id: Option<&[u8]>,
     queued_at_ms: i64,
 ) -> Result<(), CoreError> {
+    // Record how far our counter has got before anything else, in the same
+    // transaction, so it holds even for kinds that are never stored as chat
+    // rows. `MAX` rather than plain assignment: the watermark only ever
+    // climbs, so an out-of-order or replayed author cannot walk it backwards.
+    tx.execute(
+        "INSERT INTO authored_lamport_watermarks (chat_id, sender_user_id, high_lamport)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(chat_id, sender_user_id) DO UPDATE SET
+             high_lamport = MAX(high_lamport, excluded.high_lamport)",
+        params![
+            message.chat_id,
+            message.sender_user_id,
+            message.lamport as i64
+        ],
+    )
+    .map_err(store_err)?;
     tx.execute(
         "INSERT OR IGNORE INTO messages
             (chat_id, sender_user_id, lamport, timestamp, kind, payload, msg_id, reply_to_msg_id)

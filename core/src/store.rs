@@ -2985,8 +2985,23 @@ impl MessageStore {
     /// delete must yield a genuinely blank slate, not a chat that looks
     /// empty locally but still remembers watermarks against history the
     /// user asked to erase. If the contact is re-added, the peer's replayed
-    /// receipts plus fork recovery re-establish consistency from scratch --
-    /// nothing here needs to survive a delete to make that work.
+    /// receipts plus fork recovery re-establish consistency from scratch.
+    ///
+    /// **One thing must survive: `authored_lamport_watermarks`.** This used to
+    /// say that nothing did, and that was wrong in a way that cost a peer
+    /// their history. Deletion is one-sided by design -- we drop our copy, the
+    /// peer keeps theirs -- but the lamport counter was derived purely from
+    /// rows this function deletes, so it restarted at 1 while the peer still
+    /// held our stream up into the hundreds. Re-authoring over lamports they
+    /// already have does not look like a restart to them; it looks like we
+    /// forked our stream, and [`insert_message`]'s fork recovery responds by
+    /// deleting their copy of the conversation from that lamport up. So a
+    /// local delete silently destroyed the *other* person's history too.
+    /// Keeping the watermark means our numbering continues where it left off
+    /// and no fork is ever detected. It stores no content -- only how far the
+    /// counter got -- but note it is keyed by the peer's UserID, so a bare
+    /// counter does outlive a delete; that is the deliberate cost of not
+    /// erasing someone else's chat from their phone.
     ///
     /// Atomic (single transaction) and idempotent: deleting an unknown
     /// contact is a no-op. Returns `true` if a contact row was removed.
@@ -5337,6 +5352,20 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat_lamport ON messages(chat_id, lamport);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp_id ON messages(chat_id, timestamp, id);
 
+-- The highest lamport this device has ever authored into a chat, kept
+-- separately from `messages` so it SURVIVES delete_contact. Deleting a
+-- contact clears our copy of a chat, but the peer keeps theirs; if our
+-- counter restarted from 1 we would author lamports the peer already holds,
+-- and their store would read that as us having forked our stream and delete
+-- their history to recover. This table is the one thing that must outlive a
+-- delete, and it holds no content -- only how far the counter got.
+CREATE TABLE IF NOT EXISTS authored_lamport_watermarks (
+    chat_id        BLOB NOT NULL,
+    sender_user_id BLOB NOT NULL,
+    high_lamport   INTEGER NOT NULL,
+    PRIMARY KEY(chat_id, sender_user_id)
+);
+
 CREATE TABLE IF NOT EXISTS contacts (
     user_id   BLOB PRIMARY KEY,
     name      TEXT NOT NULL,
@@ -7013,6 +7042,91 @@ mod tests {
             .collect();
         recipients.sort();
         assert_eq!(recipients, vec![b"bob".to_vec(), b"carol".to_vec()]);
+    }
+
+    /// The peer's side of the field failure: a sender whose lamport counter
+    /// restarted re-authors over lamports the peer already holds, and the
+    /// peer's fork recovery deletes their copy of the conversation. This test
+    /// documents the mechanism the fix exists to prevent -- it is about
+    /// `insert_message`, and it passes both before and after.
+    #[test]
+    fn a_sender_who_restarts_their_lamports_destroys_the_peers_history() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for i in 1..=5u64 {
+            let mut old = msg(b"david", b"david", i, "old");
+            old.payload = format!("old-{i}").into_bytes();
+            assert!(store.insert_message(old).unwrap());
+        }
+        assert_eq!(store.messages_for_chat(b"david".to_vec()).unwrap().len(), 5);
+
+        // Same lamport, different content: not a duplicate, so the peer reads
+        // it as a fork and drops everything from that lamport up.
+        let mut restarted = msg(b"david", b"david", 1, "after a delete");
+        restarted.timestamp += 999;
+        assert!(store.insert_message(restarted).unwrap());
+
+        let rows = store.messages_for_chat(b"david".to_vec()).unwrap();
+        assert_eq!(rows.len(), 1, "the peer's whole history was erased");
+        assert_eq!(rows[0].payload, b"after a delete".to_vec());
+    }
+
+    #[test]
+    fn deleting_a_contact_does_not_rewind_the_authored_lamport_counter() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let identity = crate::generate_identity();
+        let peer = crate::generate_identity();
+        let contact = Contact {
+            user_id: peer.user_id.clone(),
+            name: "Peer".to_string(),
+            sign_pk: peer.sign_pk.clone(),
+            agree_pk: peer.agree_pk.clone(),
+            relay_url: None,
+            relay_token: None,
+            nickname: None,
+        };
+
+        store.upsert_contact(contact.clone()).unwrap();
+        let mut last = 0;
+        for i in 0..3 {
+            let authored = store
+                .author_pairwise_message(
+                    identity.clone(),
+                    contact.clone(),
+                    1,
+                    format!("hello {i}").into_bytes(),
+                    None,
+                    1_700_000_000_000 + i,
+                )
+                .unwrap();
+            last = authored.envelope.lamport;
+        }
+        assert_eq!(last, 3);
+
+        assert!(store.delete_contact(contact.user_id.clone()).unwrap());
+        assert!(store
+            .messages_for_chat(contact.user_id.clone())
+            .unwrap()
+            .is_empty());
+
+        // Re-add and send again. The counter must continue past the peer's
+        // retained high-water mark, not restart at 1 -- restarting is what
+        // makes the peer delete their own history to "recover" from the
+        // apparent fork.
+        store.upsert_contact(contact.clone()).unwrap();
+        let after = store
+            .author_pairwise_message(
+                identity,
+                contact,
+                1,
+                b"after the delete".to_vec(),
+                None,
+                1_700_000_100_000,
+            )
+            .unwrap();
+        assert_eq!(
+            after.envelope.lamport, 4,
+            "the counter must not be reused against a peer that still holds the old stream",
+        );
     }
 
     #[test]
