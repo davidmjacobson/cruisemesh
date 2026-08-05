@@ -6,6 +6,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.screenshot)
 }
 
 // Release signing: populated from android/app/keystore.properties (gitignored,
@@ -75,6 +76,8 @@ android {
             // device splits that fail at startup.
             abiFilters += setOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunnerArguments["clearPackageData"] = "true"
     }
 
     signingConfigs {
@@ -147,14 +150,32 @@ android {
         getByName("main").kotlin.srcDirs("src/main/kotlin-gen")
     }
     testOptions {
+        animationsDisabled = true
+        execution = "ANDROID_TEST_ORCHESTRATOR"
         unitTests {
             // Production code logs routinely (android.util.Log) on paths unit
             // tests exercise directly (no Robolectric here); without this the
             // unmocked framework stub throws instead of no-op'ing, which has
             // nothing to do with what the test is actually asserting.
             isReturnDefaultValues = true
+            isIncludeAndroidResources = true
+        }
+        managedDevices {
+            localDevices {
+                create("pixel6Api36") {
+                    device = "Pixel 6"
+                    apiLevel = 36
+                    systemImageSource = "aosp"
+                }
+                create("pixel2Api31") {
+                    device = "Pixel 2"
+                    apiLevel = 31
+                    systemImageSource = "aosp"
+                }
+            }
         }
     }
+    experimentalProperties["android.experimental.enableScreenshotTest"] = true
 }
 
 dependencies {
@@ -182,9 +203,26 @@ dependencies {
     // it in transitively for tests); this just also exposes it to main code.
     implementation(libs.okhttp)
     debugImplementation(libs.compose.ui.tooling)
+    debugImplementation(libs.compose.ui.test.manifest)
     testImplementation(libs.junit)
     testImplementation(libs.mockwebserver)
     testImplementation(libs.jna)
+    testImplementation(platform(libs.compose.bom))
+    testImplementation(libs.compose.ui.test.junit4)
+    testImplementation(libs.androidx.test.core)
+    testImplementation(libs.androidx.test.junit)
+    testImplementation(libs.navigation.testing)
+    testImplementation(libs.robolectric)
+
+    androidTestImplementation(platform(libs.compose.bom))
+    androidTestImplementation(libs.compose.ui.test.junit4)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.junit)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.rules)
+    androidTestUtil(libs.androidx.test.orchestrator)
+
+    screenshotTestImplementation(libs.compose.ui.tooling)
 }
 
 // Pure JVM tests now exercise portable logic through UniFFI. Point JNA at the

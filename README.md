@@ -154,7 +154,9 @@ cd android && ./gradlew assembleDebug
 That script regenerates `android/app/src/main/kotlin-gen` and
 `android/app/src/main/jniLibs` together and stamps both, so Gradle can detect a
 stale or partial regeneration and refuse to build. For JVM unit tests alone
-there's a faster host-only path — see [AGENTS.md](AGENTS.md).
+there's a faster host-only path — see [AGENTS.md](AGENTS.md). The layered UI
+regression suite and screenshot-update workflow are documented in
+[`specs/android-ui-testing.md`](specs/android-ui-testing.md).
 
 **iOS** (macOS + Xcode):
 
@@ -192,6 +194,7 @@ the API and its ack rules are DESIGN.md §9.
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | DCO, CLA, and what makes a good PR here. |
 | [AGENTS.md](AGENTS.md) | Build and bindgen recipes, including the fast paths. |
+| [`specs/android-ui-testing.md`](specs/android-ui-testing.md) | Android host, screenshot, and managed-emulator UI gates. |
 | [`relayd/DEPLOY.md`](relayd/DEPLOY.md) | Running a relay in production. |
 | `specs/` | Per-feature protocol specs. |
 

@@ -233,36 +233,7 @@ class MainActivity : ComponentActivity() {
      * its trampoline action for exactly the same reason.
      */
     private fun deepLinkFromIntent(intent: Intent?): PendingDeepLink? {
-        val link = derivePendingDeepLink(intent) ?: return null
-        intent?.removeExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)
-        intent?.removeExtra(MessageNotifier.EXTRA_CHAT_IS_GROUP)
-        intent?.data = null
-        return link
-    }
-
-    private fun derivePendingDeepLink(intent: Intent?): PendingDeepLink? {
-        val hex = intent?.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)
-        if (hex != null) {
-            return PendingDeepLink(hex, intent.getBooleanExtra(MessageNotifier.EXTRA_CHAT_IS_GROUP, false))
-        }
-        val uri = intent?.data ?: return null
-        // T20: the core owns the routing table so both shells agree, and so
-        // the https link and the cruisemesh:// scheme resolve identically.
-        // The scheme exists because iOS will not fire a Universal Link for a
-        // same-domain navigation, which makes the website's "Open in
-        // CruiseMesh" button inert in Safari.
-        val route = deepLinkRoute(uri.scheme ?: "", uri.host ?: "", uri.path ?: "") ?: return null
-        val fragment = uri.fragment ?: return null
-        return when (route) {
-            DeepLinkRoute.FRIEND ->
-                fragment.takeIf { runCatching { parseFriendText(it) }.isSuccess }
-                    ?.let { PendingDeepLink(friendToken = it) }
-            DeepLinkRoute.RELAY_SETUP ->
-                fragment.takeIf { runCatching { parseRelaySetupText(it) }.isSuccess }
-                    ?.let { PendingDeepLink(relayCard = it) }
-            DeepLinkRoute.LAN ->
-                parseLanEndpointLink(fragment)?.let { PendingDeepLink(lanEndpoint = it.display) }
-        }
+        return consumePendingDeepLink(intent)
     }
 
     companion object {
@@ -652,11 +623,42 @@ private fun freshRelayHealthForDisplay(relayHealth: RelayHealth, nowMs: Long, pu
         relayHealth
     }
 
+/** Derive a pending route and remove the one-shot data from its source Intent. */
+internal fun consumePendingDeepLink(intent: Intent?): PendingDeepLink? {
+    val link = derivePendingDeepLink(intent) ?: return null
+    intent?.removeExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)
+    intent?.removeExtra(MessageNotifier.EXTRA_CHAT_IS_GROUP)
+    intent?.data = null
+    return link
+}
+
+internal fun derivePendingDeepLink(intent: Intent?): PendingDeepLink? {
+    val hex = intent?.getStringExtra(MessageNotifier.EXTRA_CHAT_USER_ID_HEX)
+    if (hex != null) {
+        return PendingDeepLink(hex, intent.getBooleanExtra(MessageNotifier.EXTRA_CHAT_IS_GROUP, false))
+    }
+    val uri = intent?.data ?: return null
+    // T20: the core owns the routing table so both shells agree, and so the
+    // https link and the cruisemesh:// scheme resolve identically.
+    val route = deepLinkRoute(uri.scheme ?: "", uri.host ?: "", uri.path ?: "") ?: return null
+    val fragment = uri.fragment ?: return null
+    return when (route) {
+        DeepLinkRoute.FRIEND ->
+            fragment.takeIf { runCatching { parseFriendText(it) }.isSuccess }
+                ?.let { PendingDeepLink(friendToken = it) }
+        DeepLinkRoute.RELAY_SETUP ->
+            fragment.takeIf { runCatching { parseRelaySetupText(it) }.isSuccess }
+                ?.let { PendingDeepLink(relayCard = it) }
+        DeepLinkRoute.LAN ->
+            parseLanEndpointLink(fragment)?.let { PendingDeepLink(lanEndpoint = it.display) }
+    }
+}
+
 /**
  * The [Activity] behind a composable's context, unwrapping the theme and
  * configuration wrappers Compose layers on top of it.
  */
-private tailrec fun Context.findActivity(): Activity? = when (this) {
+internal tailrec fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this
     is ContextWrapper -> baseContext.findActivity()
     else -> null
@@ -678,7 +680,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
  * fact: is there anything underneath to go back *to*? If there isn't, "back"
  * means "leave", which is what the system back button would have done.
  */
-private fun NavController.popOrExit(context: Context) {
+internal fun NavController.popOrExit(context: Context) {
     if (previousBackStackEntry != null) {
         popBackStack()
         return

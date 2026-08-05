@@ -23,6 +23,20 @@ cd android
 .\gradlew.bat testDebugUnitTest
 ```
 
+The same host setup runs the fast UI behavior tests and deterministic screenshot
+gate:
+
+```powershell
+cd android
+.\gradlew.bat :app:testDebugUnitTest :app:validateDebugScreenshotTest
+```
+
+For an intentional UI change, review regenerated references from
+`.\gradlew.bat :app:updateDebugScreenshotTest`. Managed-device UI tests require
+the full `core/build-android.sh` path described below; run API 36 with
+`.\gradlew.bat :app:pixel6Api36DebugAndroidTest` or minimum-SDK API 31 with
+`.\gradlew.bat :app:pixel2Api31DebugAndroidTest`.
+
 On macOS/Linux, replace the library path with the host artifact Cargo produced,
 usually `target/debug/libcruisemesh_core.dylib` or
 `target/debug/libcruisemesh_core.so`.
