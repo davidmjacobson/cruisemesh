@@ -65,8 +65,8 @@ final class RelaySweepSession: @unchecked Sendable {
     }
 }
 
-/// Contacts whose friend-card relay endpoint has stopped answering this
-/// process, and for how many consecutive sync passes.
+/// Contacts whose friend-card relay endpoint has stopped answering, and the
+/// current sync pass's provisional observations.
 ///
 /// The counterpart of the persisted rejection streaks in core
 /// `contact_relay_health`, for the half of the failure that produces no HTTP
@@ -74,12 +74,10 @@ final class RelaySweepSession: @unchecked Sendable {
 /// nothing at all, and that transport failure never reached the rejection
 /// streak, so the address was re-dialled on every pass indefinitely.
 ///
-/// In memory rather than in the store, on both shells, for two reasons. A host
-/// that is down is usually down for minutes, so re-learning it after a restart
-/// costs two passes and is cheaper than carrying a stale verdict across days.
-/// And it keeps "not answering right now" out of the persisted stale-card set
-/// the contact sheet reads, where the prompt is "ask them to share their card
-/// again" -- correct for a revoked token, wrong for a relay that is rebooting.
+/// The committed rest is persisted by core and restored at the start of every
+/// pass. Keeping only this pass's provisional set here preserves the immediate
+/// per-envelope breaker while ensuring an app restart cannot re-arm a dead
+/// endpoint from zero.
 ///
 /// Mirrors `RelaySyncEngine.contactRelayUnreachable` on Android.
 final class ContactRelaySilence: @unchecked Sendable {
@@ -104,6 +102,19 @@ final class ContactRelaySilence: @unchecked Sendable {
     /// Safe on the shared instance because `relaySyncInFlight` serialises
     /// passes -- a second sync is refused, never overlapped.
     private var silentThisPass: [Data: String] = [:]
+
+    /// Replace the committed rests with the store's authoritative snapshot.
+    func restore(_ states: [ContactRelayUnreachable]) {
+        lock.lock()
+        defer { lock.unlock() }
+        silent = Dictionary(uniqueKeysWithValues: states.map {
+            ($0.userId, State(
+                endpointKey: $0.endpointKey,
+                streak: $0.unreachableStreak,
+                restedAtMs: $0.unreachableAtMs
+            ))
+        })
+    }
 
     /// Forgets the previous pass's provisional observations.
     func beginPass() {

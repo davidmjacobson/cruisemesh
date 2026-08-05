@@ -3047,10 +3047,14 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             // rejections from the endpoint in a CONTACT's friend card. Those
             // were dropped entirely, so a card pointing at a retired host
             // produced an unbounded silent retry loop while the person's
-            // messages sat at one tick. Read once per pass; only contacts
-            // with a non-zero streak appear. Mirrors RelaySyncEngine.kt.
+            // messages sat at one tick. Read both health records once per
+            // pass; only contacts with a non-zero streak appear. Mirrors
+            // RelaySyncEngine.kt.
             var rejections = Dictionary(
                 uniqueKeysWithValues: (try store.listContactRelayRejections()).map { ($0.userId, $0) }
+            )
+            var unreachable = Dictionary(
+                uniqueKeysWithValues: (try store.listContactRelayUnreachable()).map { ($0.userId, $0) }
             )
             func endpointUsable(_ contact: Contact) -> Bool {
                 Self.contactEndpointUsable(contact: contact, rejections: rejections, nowMs: now)
@@ -3070,6 +3074,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             // the observation only means anything next to proof that this
             // device's internet works -- and, from this pass forward, so the
             // rest of the pass stops dialling an address that just refused.
+            ContactRelaySilence.shared.restore(Array(unreachable.values))
             ContactRelaySilence.shared.beginPass()
             /// A rest belongs to an *address*, not to a person: `relayCursorKey`
             /// hashes the contact's current endpoint so a card or a T23 notice
@@ -3113,6 +3118,13 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     endpointUsable: endpointUsable(contact)
                 )
             }
+            /// Any HTTP answer settles transport silence, including a non-2xx
+            /// response that may advance the separate rejection streak.
+            func noteContactAnswered(_ contact: Contact) {
+                ContactRelaySilence.shared.noteAnswered(userId: contact.userId)
+                try? store.clearContactRelayUnreachable(userId: contact.userId)
+                unreachable[contact.userId] = nil
+            }
             /// Only counts when `usedConfig` is genuinely the contact's own
             /// endpoint: once we have fallen back to our own relay, a failure
             /// there is our relay's health, not evidence about their card.
@@ -3142,6 +3154,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     }
                     return
                 }
+                noteContactAnswered(contact)
                 let fault = relayClassifyHttpError(
                     httpStatus: UInt16(clamping: relay.statusCode),
                     relayCode: relay.relayCode
@@ -3165,7 +3178,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                    usedConfig.relayToken == own.relayToken { return }
                 // The endpoint answering settles the silence question outright,
                 // whatever this pass had provisionally observed.
-                ContactRelaySilence.shared.noteAnswered(userId: contact.userId)
+                noteContactAnswered(contact)
                 guard rejections[contact.userId] != nil else { return }
                 try? store.clearContactRelayRejection(userId: contact.userId)
                 rejections[contact.userId] = nil
@@ -3689,8 +3702,21 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 otherRelayAnswered: ownRelayAnswered,
                 nowMs: now
             ) {
+                guard let contact = contactsById[rested.userId] else { continue }
+                let key = endpointKey(contact)
+                guard let streak = try? store.noteContactRelayUnreachable(
+                    userId: contact.userId,
+                    endpointKey: key,
+                    nowMs: now
+                ) else { continue }
+                unreachable[contact.userId] = ContactRelayUnreachable(
+                    userId: contact.userId,
+                    endpointKey: key,
+                    unreachableStreak: streak,
+                    unreachableAtMs: now
+                )
                 relaySyncLog.warning(
-                    "Contact \(UserIdHex.encode(rested.userId), privacy: .public) relay endpoint did not answer while our own did (silent passes=\(rested.streak, privacy: .public)); resting it rather than retrying every pass"
+                    "Contact \(UserIdHex.encode(rested.userId), privacy: .public) relay endpoint did not answer while our own did (silent passes=\(streak, privacy: .public)); resting it rather than retrying every pass"
                 )
             }
             let syncedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
@@ -3698,13 +3724,16 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             let retryAfterMs = ownRetryAfterMs
             let ownSucceeded = ownRelaySucceeded
             let anySucceeded = anyRelaySucceeded
-            // Reported from the streak alone, not from `endpointUsable`: a
-            // card stays reported stale through its six-hourly probe window,
-            // so the explanation in the contact sheet doesn't blink out and
-            // back while nothing about the person's situation changed.
+            // Reported from the streak alone, not from either current
+            // usability probe: a relay stays reported stale while a periodic
+            // probe is due, so the explanation does not blink out merely
+            // because one request is temporarily permitted.
             let stale = Set(
                 rejections.values
                     .filter { coreContactRelayIsStale(rejectStreak: $0.rejectStreak) }
+                    .map(\.userId)
+                + unreachable.values
+                    .filter { coreContactRelayUnreachableIsStale(unreachableStreak: $0.unreachableStreak) }
                     .map(\.userId)
             )
             await MainActor.run {

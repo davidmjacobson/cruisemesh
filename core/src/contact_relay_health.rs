@@ -163,10 +163,13 @@ pub fn core_contact_relay_streak_delta(fault: CoreRelayFault) -> i64 {
 //   endpoint, leave the envelope queued for a later pass and for the BLE/LAN
 //   paths, and probe again soon.
 //
-// This state is deliberately per-process and unpersisted, which also keeps it
-// out of the "their card is stale, ask them to re-share it" set the contact
-// sheet reports — the right prompt for a revoked token and the wrong one for
-// a host that is down this afternoon.
+// The short rest and the user-facing verdict deliberately have different
+// thresholds. Two silent passes are enough to stop hammering an address for
+// half an hour, but not enough to tell a person the card needs attention. A
+// persistent transport failure must eventually become visible, though: the
+// field TLS-hostname failure ran for three days and the only repair affordance
+// stayed silent. Persisting the streak also prevents every app restart from
+// re-arming the dead endpoint from zero.
 
 /// Consecutive passes an endpoint may fail to answer before we rest it.
 ///
@@ -174,6 +177,15 @@ pub fn core_contact_relay_streak_delta(fault: CoreRelayFault) -> i64 {
 /// silent pass is ordinary (a dropped packet, a host mid-restart) and the
 /// next pass agreeing costs one sync interval to rule that out.
 pub const CONTACT_RELAY_UNREACHABLE_STREAK: i64 = 2;
+
+/// Consecutive proven-silent passes before the UI reports that the contact's
+/// relay needs attention.
+///
+/// Four requires two probes beyond the initial two-pass rest. With the
+/// half-hour rest window this gives an ordinary reboot time to heal, while a
+/// dead DNS name, refused host, or invalid TLS certificate becomes actionable
+/// in roughly an hour instead of remaining invisible forever.
+pub const CONTACT_RELAY_UNREACHABLE_STALE_STREAK: i64 = 4;
 
 /// How long a rested endpoint is left alone before one probe.
 ///
@@ -229,6 +241,17 @@ pub fn core_contact_relay_unreachable_endpoint_usable(
         return true;
     }
     probe_due(rested_at_ms, now_ms, CONTACT_RELAY_UNREACHABLE_REST_MS)
+}
+
+/// Has a transport-level failure lasted long enough to surface in the same
+/// contact-health affordance as an authoritatively rejected card?
+///
+/// This does not change routing: a silent endpoint is still rested and never
+/// falls back to our own family mailbox. It only makes the prolonged failure
+/// visible to the person who can request a corrected friend card.
+#[uniffi::export]
+pub fn core_contact_relay_unreachable_is_stale(unreachable_streak: i64) -> bool {
+    unreachable_streak >= CONTACT_RELAY_UNREACHABLE_STALE_STREAK
 }
 
 #[cfg(test)]
@@ -338,6 +361,15 @@ mod tests {
         assert!(!core_contact_relay_unreachable_endpoint_usable(
             2, rested, rested
         ));
+    }
+
+    #[test]
+    fn prolonged_silence_eventually_becomes_actionable() {
+        assert!(!core_contact_relay_unreachable_is_stale(0));
+        assert!(!core_contact_relay_unreachable_is_stale(2));
+        assert!(!core_contact_relay_unreachable_is_stale(3));
+        assert!(core_contact_relay_unreachable_is_stale(4));
+        assert!(core_contact_relay_unreachable_is_stale(12));
     }
 
     #[test]

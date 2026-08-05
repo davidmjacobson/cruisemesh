@@ -1981,6 +1981,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func clearContactRelayRejection(userId: Data) throws 
     
     /**
+     * Clear the transport-level streak when the endpoint gives any HTTP
+     * answer. A 401 may advance the separate rejection streak, but it proves
+     * the host is reachable and must settle the silence verdict.
+     */
+    func clearContactRelayUnreachable(userId: Data) throws
+
+    /**
      * Erases every V2 field-metrics row.
      *
      * The counterpart to [`Self::export_delivery_metrics_csv`]. These rows
@@ -2286,8 +2293,23 @@ public protocol MessageStoreProtocol : AnyObject {
      * delete must yield a genuinely blank slate, not a chat that looks
      * empty locally but still remembers watermarks against history the
      * user asked to erase. If the contact is re-added, the peer's replayed
-     * receipts plus fork recovery re-establish consistency from scratch --
-     * nothing here needs to survive a delete to make that work.
+     * receipts plus fork recovery re-establish consistency from scratch.
+     *
+     * **One thing must survive: `authored_lamport_watermarks`.** This used to
+     * say that nothing did, and that was wrong in a way that cost a peer
+     * their history. Deletion is one-sided by design -- we drop our copy, the
+     * peer keeps theirs -- but the lamport counter was derived purely from
+     * rows this function deletes, so it restarted at 1 while the peer still
+     * held our stream up into the hundreds. Re-authoring over lamports they
+     * already have does not look like a restart to them; it looks like we
+     * forked our stream, and [`insert_message`]'s fork recovery responds by
+     * deleting their copy of the conversation from that lamport up. So a
+     * local delete silently destroyed the *other* person's history too.
+     * Keeping the watermark means our numbering continues where it left off
+     * and no fork is ever detected. It stores no content -- only how far the
+     * counter got -- but note it is keyed by the peer's UserID, so a bare
+     * counter does outlive a delete; that is the deliberate cost of not
+     * erasing someone else's chat from their phone.
      *
      * Atomic (single transaction) and idempotent: deleting an unknown
      * contact is a no-op. Returns `true` if a contact row was removed.
@@ -2610,6 +2632,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func listContactRelayRejections() throws  -> [ContactRelayRejection]
     
     /**
+     * Every contact endpoint carrying a persisted no-answer streak. Read once
+     * per sync pass so rest windows and the stale-contact UI survive process
+     * restarts without a query per contact.
+     */
+    func listContactRelayUnreachable() throws  -> [ContactRelayUnreachable]
+
+    /**
      * All contacts, alphabetical by name.
      */
     func listContacts() throws  -> [Contact]
@@ -2747,6 +2776,17 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func noteContactRelayRejected(userId: Data, nowMs: Int64) throws  -> Int64
     
+    /**
+     * Record one sync pass in which this contact's endpoint gave no HTTP
+     * answer even though another relay proved this device was online.
+     *
+     * The endpoint hash is part of the state: a changed friend card starts at
+     * one rather than inheriting a retired host's streak. The shell decides,
+     * through [`crate::core_contact_relay_unreachable_delta`], whether the
+     * observation is strong enough to call this method.
+     */
+    func noteContactRelayUnreachable(userId: Data, endpointKey: String, nowMs: Int64) throws  -> Int64
+
     /**
      * Notice that the set of ids our relay fetch hints derive from has
      * changed, and invalidate every remembered frontier if it has. Returns
@@ -3716,6 +3756,18 @@ open func clearContactRelayRejection(userId: Data)throws  {try rustCallWithError
 }
     
     /**
+     * Clear the transport-level streak when the endpoint gives any HTTP
+     * answer. A 401 may advance the separate rejection streak, but it proves
+     * the host is reachable and must settle the silence verdict.
+     */
+open func clearContactRelayUnreachable(userId: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_contact_relay_unreachable(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
+    )
+}
+}
+
+    /**
      * Erases every V2 field-metrics row.
      *
      * The counterpart to [`Self::export_delivery_metrics_csv`]. These rows
@@ -4128,8 +4180,23 @@ open func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], own
      * delete must yield a genuinely blank slate, not a chat that looks
      * empty locally but still remembers watermarks against history the
      * user asked to erase. If the contact is re-added, the peer's replayed
-     * receipts plus fork recovery re-establish consistency from scratch --
-     * nothing here needs to survive a delete to make that work.
+     * receipts plus fork recovery re-establish consistency from scratch.
+     *
+     * **One thing must survive: `authored_lamport_watermarks`.** This used to
+     * say that nothing did, and that was wrong in a way that cost a peer
+     * their history. Deletion is one-sided by design -- we drop our copy, the
+     * peer keeps theirs -- but the lamport counter was derived purely from
+     * rows this function deletes, so it restarted at 1 while the peer still
+     * held our stream up into the hundreds. Re-authoring over lamports they
+     * already have does not look like a restart to them; it looks like we
+     * forked our stream, and [`insert_message`]'s fork recovery responds by
+     * deleting their copy of the conversation from that lamport up. So a
+     * local delete silently destroyed the *other* person's history too.
+     * Keeping the watermark means our numbering continues where it left off
+     * and no fork is ever detected. It stores no content -- only how far the
+     * counter got -- but note it is keyed by the peer's UserID, so a bare
+     * counter does outlive a delete; that is the deliberate cost of not
+     * erasing someone else's chat from their phone.
      *
      * Atomic (single transaction) and idempotent: deleting an unknown
      * contact is a no-op. Returns `true` if a contact row was removed.
@@ -4652,6 +4719,18 @@ open func listContactRelayRejections()throws  -> [ContactRelayRejection] {
 }
     
     /**
+     * Every contact endpoint carrying a persisted no-answer streak. Read once
+     * per sync pass so rest windows and the stale-contact UI survive process
+     * restarts without a query per contact.
+     */
+open func listContactRelayUnreachable()throws  -> [ContactRelayUnreachable] {
+    return try  FfiConverterSequenceTypeContactRelayUnreachable.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_list_contact_relay_unreachable(self.uniffiClonePointer(),$0
+    )
+})
+}
+
+    /**
      * All contacts, alphabetical by name.
      */
 open func listContacts()throws  -> [Contact] {
@@ -4887,6 +4966,25 @@ open func noteContactRelayRejected(userId: Data, nowMs: Int64)throws  -> Int64 {
 })
 }
     
+    /**
+     * Record one sync pass in which this contact's endpoint gave no HTTP
+     * answer even though another relay proved this device was online.
+     *
+     * The endpoint hash is part of the state: a changed friend card starts at
+     * one rather than inheriting a retired host's streak. The shell decides,
+     * through [`crate::core_contact_relay_unreachable_delta`], whether the
+     * observation is strong enough to call this method.
+     */
+open func noteContactRelayUnreachable(userId: Data, endpointKey: String, nowMs: Int64)throws  -> Int64 {
+    return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_note_contact_relay_unreachable(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),
+        FfiConverterString.lower(endpointKey),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
     /**
      * Notice that the set of ids our relay fetch hints derive from has
      * changed, and invalidate every remembered frontier if it has. Returns
@@ -6770,6 +6868,97 @@ public func FfiConverterTypeContactRelayRejection_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeContactRelayRejection_lower(_ value: ContactRelayRejection) -> RustBuffer {
     return FfiConverterTypeContactRelayRejection.lower(value)
+}
+
+
+/**
+ * One contact endpoint's persisted transport-level failure streak.
+ *
+ * Kept separate from [`ContactRelayRejection`] because silence proves that an
+ * address is not answering, not that its credential was rejected. The shell
+ * therefore rests this endpoint without falling back to another mailbox, but
+ * can still surface a prolonged failure and resume the same rest after an app
+ * restart. `endpoint_key` is a hash of URL plus token, never the credential.
+ */
+public struct ContactRelayUnreachable {
+    public var userId: Data
+    public var endpointKey: String
+    public var unreachableStreak: Int64
+    public var unreachableAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(userId: Data, endpointKey: String, unreachableStreak: Int64, unreachableAtMs: Int64) {
+        self.userId = userId
+        self.endpointKey = endpointKey
+        self.unreachableStreak = unreachableStreak
+        self.unreachableAtMs = unreachableAtMs
+    }
+}
+
+
+
+extension ContactRelayUnreachable: Equatable, Hashable {
+    public static func ==(lhs: ContactRelayUnreachable, rhs: ContactRelayUnreachable) -> Bool {
+        if lhs.userId != rhs.userId {
+            return false
+        }
+        if lhs.endpointKey != rhs.endpointKey {
+            return false
+        }
+        if lhs.unreachableStreak != rhs.unreachableStreak {
+            return false
+        }
+        if lhs.unreachableAtMs != rhs.unreachableAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(userId)
+        hasher.combine(endpointKey)
+        hasher.combine(unreachableStreak)
+        hasher.combine(unreachableAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactRelayUnreachable: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactRelayUnreachable {
+        return
+            try ContactRelayUnreachable(
+                userId: FfiConverterData.read(from: &buf),
+                endpointKey: FfiConverterString.read(from: &buf),
+                unreachableStreak: FfiConverterInt64.read(from: &buf),
+                unreachableAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ContactRelayUnreachable, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.userId, into: &buf)
+        FfiConverterString.write(value.endpointKey, into: &buf)
+        FfiConverterInt64.write(value.unreachableStreak, into: &buf)
+        FfiConverterInt64.write(value.unreachableAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactRelayUnreachable_lift(_ buf: RustBuffer) throws -> ContactRelayUnreachable {
+    return try FfiConverterTypeContactRelayUnreachable.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactRelayUnreachable_lower(_ value: ContactRelayUnreachable) -> RustBuffer {
+    return FfiConverterTypeContactRelayUnreachable.lower(value)
 }
 
 
@@ -14874,6 +15063,31 @@ fileprivate struct FfiConverterSequenceTypeContactRelayRejection: FfiConverterRu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeContactRelayUnreachable: FfiConverterRustBuffer {
+    typealias SwiftType = [ContactRelayUnreachable]
+
+    public static func write(_ value: [ContactRelayUnreachable], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeContactRelayUnreachable.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ContactRelayUnreachable] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ContactRelayUnreachable]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeContactRelayUnreachable.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCoreDetectedLink: FfiConverterRustBuffer {
     typealias SwiftType = [CoreDetectedLink]
 
@@ -15872,6 +16086,21 @@ public func coreContactRelayUnreachableEndpointUsable(unreachableStreak: Int64, 
         FfiConverterInt64.lower(unreachableStreak),
         FfiConverterInt64.lower(restedAtMs),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * Has a transport-level failure lasted long enough to surface in the same
+ * contact-health affordance as an authoritatively rejected card?
+ *
+ * This does not change routing: a silent endpoint is still rested and never
+ * falls back to our own family mailbox. It only makes the prolonged failure
+ * visible to the person who can request a corrected friend card.
+ */
+public func coreContactRelayUnreachableIsStale(unreachableStreak: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_relay_unreachable_is_stale(
+        FfiConverterInt64.lower(unreachableStreak),$0
     )
 })
 }
@@ -18035,6 +18264,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_unreachable_endpoint_usable() != 17040) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_unreachable_is_stale() != 17717) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_detect_links() != 34673) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -18632,6 +18864,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_contact_relay_rejection() != 26476) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_contact_relay_unreachable() != 44436) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_delivery_metrics() != 11431) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -18680,7 +18915,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 39762) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 22558) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 20880) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_group() != 30648) {
@@ -18770,6 +19005,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_list_contact_relay_rejections() != 16233) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_list_contact_relay_unreachable() != 48443) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_list_contacts() != 40385) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -18813,6 +19051,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_contact_relay_rejected() != 13589) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_contact_relay_unreachable() != 15591) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_hint_sources() != 11955) {

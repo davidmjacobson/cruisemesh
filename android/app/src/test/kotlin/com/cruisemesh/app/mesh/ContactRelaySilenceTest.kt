@@ -1,15 +1,17 @@
 package com.cruisemesh.app.mesh
 
+import com.cruisemesh.app.chat.UserIdHex
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import uniffi.cruisemesh_core.ContactRelayUnreachable
 import uniffi.cruisemesh_core.relayCursorKey
 
 /**
- * The per-process record of contacts whose card relay endpoint has stopped
- * answering. The thresholds and windows are core's
+ * The pass-local breaker around core's persisted record of contacts whose
+ * card relay endpoint has stopped answering. The thresholds and windows are core's
  * (core/src/contact_relay_health.rs); what this pins is the state machine the
  * shell wraps around them — most of all that a rest belongs to an address and
  * dies with it.
@@ -61,7 +63,7 @@ class ContactRelaySilenceTest {
     fun `moving the contact to a different endpoint ends the rest immediately`() {
         // A new friend card or a T23 relay-update notice that changes the
         // address clears the persisted rejection streak in core; this is the
-        // same rule for the unpersisted silence rest. Without it a contact who
+        // same rule for the persisted silence rest. Without it a contact who
         // migrated to a working host would keep being skipped for up to half
         // an hour after the repair arrived.
         val silence = restedSilence()
@@ -94,6 +96,19 @@ class ContactRelaySilenceTest {
         val silence = restedSilence()
         silence.noteAnswered(alice)
         assertTrue(silence.endpointAnswering(alice, dead, now))
+    }
+
+    @Test
+    fun `a persisted rest is restored after process restart`() {
+        val silence = ContactRelaySilence()
+        val userId = "alice".toByteArray()
+        val userIdKey = UserIdHex.encode(userId)
+        silence.restore(
+            listOf(ContactRelayUnreachable(userId, dead, 2, now)),
+        )
+        assertFalse(silence.endpointAnswering(userIdKey, dead, now))
+        silence.restore(emptyList())
+        assertTrue("the store snapshot is authoritative", silence.endpointAnswering(userIdKey, dead, now))
     }
 
     @Test

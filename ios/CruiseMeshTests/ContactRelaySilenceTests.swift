@@ -64,7 +64,7 @@ final class ContactRelaySilenceTests: XCTestCase {
     func testMovingTheContactToADifferentEndpointEndsTheRestImmediately() {
         // A new friend card or a T23 relay-update notice that changes the
         // address clears the persisted rejection streak in core; this is the
-        // same rule for the unpersisted silence rest. Without it a contact who
+        // same rule for the persisted silence rest. Without it a contact who
         // migrated to a working host would keep being skipped for up to half
         // an hour after the repair arrived.
         rest()
@@ -87,6 +87,22 @@ final class ContactRelaySilenceTests: XCTestCase {
         rest()
         ContactRelaySilence.shared.noteAnswered(userId: alice)
         XCTAssertTrue(ContactRelaySilence.shared.endpointAnswering(userId: alice, endpointKey: dead, nowMs: now))
+    }
+
+    func testAPersistedRestIsRestoredAfterProcessRestart() {
+        let silence = ContactRelaySilence.shared
+        silence.restore([ContactRelayUnreachable(
+            userId: alice,
+            endpointKey: dead,
+            unreachableStreak: 2,
+            unreachableAtMs: now
+        )])
+        XCTAssertFalse(silence.endpointAnswering(userId: alice, endpointKey: dead, nowMs: now))
+        silence.restore([])
+        XCTAssertTrue(
+            silence.endpointAnswering(userId: alice, endpointKey: dead, nowMs: now),
+            "the store snapshot is authoritative"
+        )
     }
 
     // MARK: - the pass-local skip
