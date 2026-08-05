@@ -339,6 +339,20 @@ pub struct ContactRelayUnreachable {
     pub unreachable_at_ms: i64,
 }
 
+/// One pairwise-stream lamport consumed by this device without a durable
+/// `messages` row in that chat.
+///
+/// Receipts, profile updates, LAN endpoint hints, and other control envelopes
+/// share the sender's chat lamport counter. Keeping their exact positions lets
+/// the visible-gap scan distinguish a missing chat message from an intentional
+/// control-message hole without inventing a broad high-water mark that could
+/// hide a real loss.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct ConsumedHiddenLamport {
+    pub sender_user_id: Vec<u8>,
+    pub lamport: u64,
+}
+
 /// How far a relay mailbox has been walked, and when it was last walked in
 /// full. See [`crate::relay_cursor`] for what the two numbers mean and the
 /// rules that move them.
@@ -1237,6 +1251,20 @@ mod incoming_message_reference {
             ],
         )
         .map_err(store_err)?;
+        // Exact control-message evidence belongs to the same numbered
+        // stream. Positions at and beyond the fork are evidence about the
+        // abandoned tail and must not be allowed to close gaps in the
+        // replacement stream.
+        tx.execute(
+            "DELETE FROM consumed_hidden_lamports
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport >= ?3",
+            params![
+                message.chat_id,
+                message.sender_user_id,
+                message.lamport as i64
+            ],
+        )
+        .map_err(store_err)?;
         // ...and the watermarks we'd computed against that abandoned tail,
         // so we stop reporting stale "delivered/read through N" back to the
         // sender (root cause of the false ✓✓ this recovery fixes). These
@@ -1416,6 +1444,75 @@ impl MessageStore {
             .map_err(store_err)?;
         let rows = stmt
             .query_map(params![chat_id], row_to_message)
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Record an exact lamport this device consumed from a pairwise stream
+    /// even though that envelope leaves no durable `msg_id`-bearing message
+    /// row in this chat.
+    ///
+    /// Shells call this only after authenticated delivery finishes. Core still
+    /// refuses kinds whose ordinary incoming path already persists the exact
+    /// envelope as a message row; those rows are already gap evidence and a
+    /// second copy here would obscure the ownership boundary.
+    pub fn record_consumed_hidden_lamport(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        lamport: u64,
+        kind: u8,
+    ) -> Result<bool, CoreError> {
+        if crate::core_kind_persists_msg_id_row(kind) {
+            return Ok(false);
+        }
+        // Durable gap evidence is only meaningful for an accepted 1:1 chat.
+        // The two onboarding kinds may be sent by strangers; refusing them
+        // until their handler has actually created a contact prevents an
+        // unauthenticated sender from growing a history-lifetime table.
+        if chat_id != sender_user_id {
+            return Ok(false);
+        }
+        validate_sqlite_u64("consumed hidden lamport", lamport)?;
+        let conn = lock_conn(&self.conn);
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO consumed_hidden_lamports
+                    (chat_id, sender_user_id, lamport)
+                 SELECT ?1, ?2, ?3
+                 WHERE EXISTS (SELECT 1 FROM contacts WHERE user_id = ?2)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM messages
+                       WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
+                   )",
+                params![chat_id, sender_user_id, lamport as i64],
+            )
+            .map_err(store_err)?;
+        Ok(inserted > 0)
+    }
+
+    /// Exact consumed control-message positions for one chat, grouped by the
+    /// sender stream the visible-gap policy compares independently.
+    pub fn consumed_hidden_lamports(
+        &self,
+        chat_id: Vec<u8>,
+    ) -> Result<Vec<ConsumedHiddenLamport>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT sender_user_id, lamport
+                 FROM consumed_hidden_lamports
+                 WHERE chat_id = ?1
+                 ORDER BY sender_user_id ASC, lamport ASC",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![chat_id], |row| {
+                Ok(ConsumedHiddenLamport {
+                    sender_user_id: row.get(0)?,
+                    lamport: row.get::<_, i64>(1)? as u64,
+                })
+            })
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
@@ -3155,6 +3252,11 @@ impl MessageStore {
             .map_err(store_err)?;
         tx.execute("DELETE FROM messages WHERE chat_id = ?1", params![user_id])
             .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM consumed_hidden_lamports WHERE chat_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
         tx.execute("DELETE FROM receipts WHERE chat_id = ?1", params![user_id])
             .map_err(store_err)?;
         tx.execute(
@@ -3902,6 +4004,11 @@ impl MessageStore {
             .map_err(store_err)?;
         tx.execute(
             "DELETE FROM messages WHERE chat_id = ?1",
+            params![&group_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM consumed_hidden_lamports WHERE chat_id = ?1",
             params![&group_id],
         )
         .map_err(store_err)?;
@@ -5791,6 +5898,19 @@ CREATE TABLE IF NOT EXISTS consumed_hidden_msg_ids (
 );
 CREATE INDEX IF NOT EXISTS idx_consumed_hidden_expiry
     ON consumed_hidden_msg_ids(expiry_ms);
+
+-- Exact positions in a pairwise sender stream that this device consumed but
+-- did not retain as message rows in that chat. Unlike the relay-ack evidence
+-- above, these rows follow chat-history lifetime rather than envelope expiry:
+-- a visible message can sit on either side of a control-message lamport for as
+-- long as the user keeps the conversation, and forgetting the middle later
+-- would resurrect a false messages-still-arriving gap.
+CREATE TABLE IF NOT EXISTS consumed_hidden_lamports (
+    chat_id       BLOB    NOT NULL,
+    sender_user_id BLOB   NOT NULL,
+    lamport       INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, sender_user_id, lamport)
+);
 ";
 
 #[cfg(test)]
@@ -6813,16 +6933,26 @@ mod tests {
     #[test]
     fn insert_message_fork_recovers_abandoned_tail_and_resets_outgoing_receipts() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        // Alice's original stream: messages 1..5, and we'd told her (via
-        // outgoing_receipts) that we'd read through 5.
-        for lamport in 1..=5u64 {
+        store.upsert_contact(contact(b"alice", "Alice")).unwrap();
+        // Alice's original stream: message rows at 1, 2, 3, and 5, plus a
+        // consumed control envelope at 4. We'd told her (via
+        // outgoing_receipts) that we'd read through the full stream at 5.
+        for lamport in [1, 2, 3, 5] {
             store
-                .insert_message(msg(b"chat-a", b"alice", lamport, "old"))
+                .insert_message(msg(b"alice", b"alice", lamport, "old"))
                 .unwrap();
         }
         store
+            .record_consumed_hidden_lamport(
+                b"alice".to_vec(),
+                b"alice".to_vec(),
+                4,
+                crate::KIND_RECEIPT,
+            )
+            .unwrap();
+        store
             .record_outgoing_receipt(
-                b"chat-a".to_vec(),
+                b"alice".to_vec(),
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_READ,
                 5,
@@ -6831,7 +6961,7 @@ mod tests {
         assert_eq!(
             store
                 .outgoing_receipt_through(
-                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
                     b"alice".to_vec(),
                     crate::RECEIPT_TYPE_READ,
                 )
@@ -6842,22 +6972,29 @@ mod tests {
         // Alice deleted the chat and re-added us: her lamport counter
         // restarted, so she resends a genuinely new message 3 with different
         // content/timestamp -- a fork, not a duplicate of the old message 3.
-        let mut forked = msg(b"chat-a", b"alice", 3, "new-after-reset");
+        let mut forked = msg(b"alice", b"alice", 3, "new-after-reset");
         forked.timestamp = 1_700_000_500_000;
         assert!(store.insert_message(forked).unwrap());
 
         // Old messages 3, 4, 5 are gone; the new message 3 replaces them.
-        let remaining = store.messages_for_chat(b"chat-a".to_vec()).unwrap();
+        let remaining = store.messages_for_chat(b"alice".to_vec()).unwrap();
         assert_eq!(remaining.len(), 3); // 1, 2, and the new 3
         let three = remaining.iter().find(|m| m.lamport == 3).unwrap();
         assert_eq!(three.payload, b"new-after-reset");
         assert_eq!(three.timestamp, 1_700_000_500_000);
         assert!(remaining.iter().all(|m| m.lamport != 4 && m.lamport != 5));
+        assert!(
+            store
+                .consumed_hidden_lamports(b"alice".to_vec())
+                .unwrap()
+                .is_empty(),
+            "control-message evidence from the abandoned tail must be removed"
+        );
 
         // Our contiguous view of Alice's stream is now capped at the fork point.
         assert_eq!(
             store
-                .highest_contiguous_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+                .highest_contiguous_lamport(b"alice".to_vec(), b"alice".to_vec())
                 .unwrap(),
             3
         );
@@ -6869,7 +7006,7 @@ mod tests {
         assert_eq!(
             store
                 .outgoing_receipt_through(
-                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
                     b"alice".to_vec(),
                     crate::RECEIPT_TYPE_READ,
                 )
@@ -9509,6 +9646,14 @@ mod tests {
                 1,
             )
             .unwrap();
+        store
+            .record_consumed_hidden_lamport(
+                b"alice-id".to_vec(),
+                b"alice-id".to_vec(),
+                2,
+                crate::KIND_RECEIPT,
+            )
+            .unwrap();
 
         assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
 
@@ -9536,6 +9681,10 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert!(store
+            .consumed_hidden_lamports(b"alice-id".to_vec())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -11763,6 +11912,87 @@ mod tests {
     }
 
     #[test]
+    fn consumed_hidden_lamports_are_exact_accepted_pairwise_evidence() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice", "Alice")).unwrap();
+        store.upsert_contact(contact(b"bob", "Bob")).unwrap();
+        assert!(store
+            .record_consumed_hidden_lamport(
+                b"alice".to_vec(),
+                b"alice".to_vec(),
+                2,
+                crate::KIND_RECEIPT,
+            )
+            .unwrap());
+        assert!(!store
+            .record_consumed_hidden_lamport(
+                b"alice".to_vec(),
+                b"alice".to_vec(),
+                2,
+                crate::KIND_RECEIPT,
+            )
+            .unwrap());
+        assert!(store
+            .record_consumed_hidden_lamport(
+                b"bob".to_vec(),
+                b"bob".to_vec(),
+                3,
+                crate::KIND_PROFILE_SYNC,
+            )
+            .unwrap());
+        assert!(!store
+            .record_consumed_hidden_lamport(
+                b"not-a-pairwise-chat".to_vec(),
+                b"alice".to_vec(),
+                4,
+                crate::KIND_RECEIPT,
+            )
+            .unwrap());
+        assert!(!store
+            .record_consumed_hidden_lamport(
+                b"alice".to_vec(),
+                b"alice".to_vec(),
+                5,
+                crate::KIND_TEXT,
+            )
+            .unwrap());
+        assert!(!store
+            .record_consumed_hidden_lamport(
+                b"stranger".to_vec(),
+                b"stranger".to_vec(),
+                6,
+                crate::KIND_FRIEND_REQUEST,
+            )
+            .unwrap());
+        let mut stored_control = msg(b"alice", b"alice", 7, "stored control");
+        stored_control.kind = crate::KIND_LAN_ENDPOINT_HINT;
+        store.insert_message(stored_control).unwrap();
+        assert!(!store
+            .record_consumed_hidden_lamport(
+                b"alice".to_vec(),
+                b"alice".to_vec(),
+                7,
+                crate::KIND_LAN_ENDPOINT_HINT,
+            )
+            .unwrap());
+
+        assert_eq!(
+            store.consumed_hidden_lamports(b"alice".to_vec()).unwrap(),
+            vec![ConsumedHiddenLamport {
+                sender_user_id: b"alice".to_vec(),
+                lamport: 2,
+            }]
+        );
+        assert_eq!(
+            store.consumed_hidden_lamports(b"bob".to_vec()).unwrap(),
+            vec![ConsumedHiddenLamport {
+                sender_user_id: b"bob".to_vec(),
+                lamport: 3,
+            }]
+        );
+    }
+
+    #[test]
     fn open_migrates_a_store_that_predates_the_consumed_hidden_msg_id_table() {
         // A populated store written before this feature has no
         // `consumed_hidden_msg_ids` table at all. Opening it must add the
@@ -11821,6 +12051,55 @@ mod tests {
         assert_eq!(
             store.prune_expired_consumed_hidden_msg_ids(9_000).unwrap(),
             1
+        );
+
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn open_migrates_a_store_that_predates_consumed_hidden_lamports() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cruisemesh-store-migration-consumed-lamports-{unique}.sqlite"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        {
+            let store = MessageStore::open(path_str.clone()).unwrap();
+            store.upsert_contact(contact(b"alice", "Alice")).unwrap();
+            store
+                .insert_message(msg(b"alice", b"alice", 1, "before the upgrade"))
+                .unwrap();
+        }
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            conn.execute_batch("DROP TABLE IF EXISTS consumed_hidden_lamports;")
+                .unwrap();
+        }
+
+        let store = MessageStore::open(path_str).unwrap();
+        assert_eq!(
+            store.messages_for_chat(b"alice".to_vec()).unwrap().len(),
+            1,
+            "migration must not disturb existing rows",
+        );
+        assert!(store
+            .record_consumed_hidden_lamport(
+                b"alice".to_vec(),
+                b"alice".to_vec(),
+                2,
+                crate::KIND_RECEIPT,
+            )
+            .unwrap());
+        assert_eq!(
+            store.consumed_hidden_lamports(b"alice".to_vec()).unwrap(),
+            vec![ConsumedHiddenLamport {
+                sender_user_id: b"alice".to_vec(),
+                lamport: 2,
+            }]
         );
 
         drop(store);

@@ -1101,9 +1101,9 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             senderUserId: opened.senderUserId,
             receivedHopTtl: hopTtl
         )
-        let consumedKind: UInt8?
+        let consumed: PairwiseDeliveryResult?
         do {
-            consumedKind = try deliverOpened(
+            consumed = try deliverOpened(
                 sourceLabel: sourceLabel,
                 sourceAddress: sourceAddress,
                 opened: opened,
@@ -1124,10 +1124,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // ever re-presents it. Mirrors InboundEnvelopeProcessor.kt; see
         // `coreRecordConsumedHiddenMsgId` for every condition core re-checks
         // and for why anything unprovable must not be recorded.
-        if let consumedKind {
+        if let consumed {
             recordConsumedHiddenKind(
                 msgId: msgId,
-                kind: consumedKind,
+                consumed: consumed,
                 recipientHint: recipientHint,
                 expiry: expiry,
                 identity: identity,
@@ -1149,9 +1149,14 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// condition (kind, own-hint, group-hint, expiry) and simply declines to
     /// write a row when one doesn't hold, so this call site's only job is to
     /// be reached exclusively from the proven-consumption path above.
+    ///
+    /// The same terminal hook records an exact, validated pairwise lamport for
+    /// gap rendering when the handler left no message row. Core accepts that
+    /// longer-lived evidence only for an established contact and an actual 1:1
+    /// stream, so stranger onboarding traffic cannot grow it indefinitely.
     private func recordConsumedHiddenKind(
         msgId: Data,
-        kind: UInt8,
+        consumed: PairwiseDeliveryResult,
         recipientHint: Data,
         expiry: Int64,
         identity: Identity,
@@ -1159,12 +1164,21 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     ) {
         _ = try? store.coreRecordConsumedHiddenMsgId(
             msgId: msgId,
-            kind: kind,
+            kind: consumed.kind,
             recipientHint: recipientHint,
             expiryMs: expiry,
             ownUserId: identity.userId,
             nowMs: now
         )
+        guard consumed.recordStreamLamport else { return }
+        if (try? store.recordConsumedHiddenLamport(
+            chatId: consumed.senderUserId,
+            senderUserId: consumed.senderUserId,
+            lamport: consumed.lamport,
+            kind: consumed.kind
+        )) == true {
+            ChatEvents.notifyChatChanged(consumed.senderUserId)
+        }
     }
 
     private func messageArrival(
@@ -1217,8 +1231,19 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         return nil
     }
 
-    /// Returns the body's `kind` once it is known, or `nil` if the body could
-    /// not even be decoded. Every other early return still reports its kind:
+    private struct PairwiseDeliveryResult {
+        let kind: UInt8
+        let senderUserId: Data
+        let lamport: UInt64
+        /// Invalid/unauthorized stream metadata remains terminally consumed
+        /// for relay-ack purposes but cannot close a legitimate chat gap.
+        let recordStreamLamport: Bool
+    }
+
+    /// Returns the body's stream metadata once it is known, or `nil` if the
+    /// body could not even be decoded. Every other early return still reports
+    /// its kind for relay-ack evidence, but marks invalid/unauthorized stream
+    /// metadata as unable to close a chat gap:
     /// a deliberate discard (blocked sender, unauthorized sender, unhandled
     /// kind) is consumption by an endpoint that is finished with the envelope,
     /// which is exactly what `processInboundEnvelope` treats as `.consumed`
@@ -1233,7 +1258,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         identity: Identity,
         msgId: Data,
         arrival: MessageArrival
-    ) throws -> UInt8? {
+    ) throws -> PairwiseDeliveryResult? {
         let extendedBody: ExtendedMessageBody
         do {
             extendedBody = try decodeExtendedMessageBody(bytes: opened.payload)
@@ -1249,7 +1274,14 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             timestamp: extendedBody.timestamp,
             content: extendedBody.content
         )
-        guard body.chatId == opened.senderUserId else { return body.kind }
+        guard body.chatId == opened.senderUserId else {
+            return PairwiseDeliveryResult(
+                kind: body.kind,
+                senderUserId: opened.senderUserId,
+                lamport: body.lamport,
+                recordStreamLamport: false
+            )
+        }
         let senderIsContact = (try? store.getContact(userId: opened.senderUserId)) != nil
         guard corePairwiseSenderAuthorized(
             kind: body.kind,
@@ -1257,7 +1289,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             senderIsSelf: opened.senderUserId == identity.userId
         ) else {
             log.warning("Dropping pairwise envelope from unauthorized sender on \(sourceLabel, privacy: .public)")
-            return body.kind
+            return PairwiseDeliveryResult(
+                kind: body.kind,
+                senderUserId: opened.senderUserId,
+                lamport: body.lamport,
+                recordStreamLamport: false
+            )
         }
 
         // Blocked identities are dropped before ANY kind handler runs: a
@@ -1267,7 +1304,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // discard is consumption, so the mailbox doesn't refetch it forever.
         if (try? store.isUserBlocked(userId: opened.senderUserId)) == true {
             log.info("Dropping envelope from blocked sender on \(sourceLabel, privacy: .public)")
-            return body.kind
+            return PairwiseDeliveryResult(
+                kind: body.kind,
+                senderUserId: opened.senderUserId,
+                lamport: body.lamport,
+                recordStreamLamport: false
+            )
         }
 
         switch body.kind {
@@ -1343,7 +1385,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         default:
             log.info("Unhandled kind=\(body.kind) from \(sourceLabel, privacy: .public)")
         }
-        return body.kind
+        return PairwiseDeliveryResult(
+            kind: body.kind,
+            senderUserId: opened.senderUserId,
+            lamport: body.lamport,
+            recordStreamLamport: true
+        )
     }
 
     /// Delivers a group-sealed envelope we opened with an imported group key

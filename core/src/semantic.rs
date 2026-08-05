@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound::Excluded;
 
 use data_encoding::HEXLOWER;
 use rusqlite::{params, OptionalExtension};
@@ -6,7 +7,7 @@ use rusqlite::{params, OptionalExtension};
 use crate::store::store_err;
 use crate::CoreError;
 use crate::{
-    decode_reaction_payload, CoreMessageTarget, MessageStore, StoredMessage,
+    decode_reaction_payload, ConsumedHiddenLamport, CoreMessageTarget, MessageStore, StoredMessage,
     KIND_ATTACHMENT_MANIFEST, KIND_GROUP_INVITE, KIND_REACTION, KIND_TEXT, RECEIPT_TYPE_READ,
 };
 
@@ -172,25 +173,57 @@ pub fn core_reaction_summaries_by_target(
 }
 
 #[uniffi::export]
-pub fn core_visible_gap_indices(messages: Vec<StoredMessage>) -> Vec<u32> {
+pub fn core_visible_gap_indices(
+    messages: Vec<StoredMessage>,
+    consumed_hidden_lamports: Vec<ConsumedHiddenLamport>,
+) -> Vec<u32> {
     let visible = core_visible_chat_messages(messages.clone());
     let visible_indices: HashMap<String, u32> = visible
         .iter()
         .enumerate()
         .map(|(index, message)| (message_key(message), index as u32))
         .collect();
-    let mut last = HashMap::<Vec<u8>, u64>::new();
+    // A broad high-water mark is not evidence: knowing that control lamport 4
+    // arrived cannot prove user-visible lamport 3 did. Keep the exact known
+    // positions so only a completely covered interval closes a visible gap.
+    let mut known = HashMap::<Vec<u8>, BTreeSet<u64>>::new();
+    for message in &messages {
+        known
+            .entry(message.sender_user_id.clone())
+            .or_default()
+            .insert(message.lamport);
+    }
+    for consumed in consumed_hidden_lamports {
+        known
+            .entry(consumed.sender_user_id)
+            .or_default()
+            .insert(consumed.lamport);
+    }
+
+    let mut last_visible = HashMap::<Vec<u8>, u64>::new();
     let mut result = Vec::new();
     for message in messages {
-        let previous = last.get(&message.sender_user_id).copied();
-        if let (Some(index), Some(previous)) =
-            (visible_indices.get(&message_key(&message)), previous)
-        {
+        let Some(index) = visible_indices.get(&message_key(&message)) else {
+            continue;
+        };
+        if let Some(previous) = last_visible.get(&message.sender_user_id).copied() {
             if message.lamport > previous.saturating_add(1) {
-                result.push(*index);
+                let expected = message.lamport - previous - 1;
+                let covered = known
+                    .get(&message.sender_user_id)
+                    .map(|values| {
+                        values
+                            .range((Excluded(previous), Excluded(message.lamport)))
+                            .count() as u64
+                    })
+                    .unwrap_or(0);
+                if covered < expected {
+                    result.push(*index);
+                }
             }
         }
-        last.entry(message.sender_user_id)
+        last_visible
+            .entry(message.sender_user_id)
             .and_modify(|value| *value = (*value).max(message.lamport))
             .or_insert(message.lamport);
     }
@@ -336,7 +369,37 @@ mod tests {
             msg(1, 2, KIND_REACTION, vec![]),
             msg(1, 3, KIND_TEXT, vec![]),
         ];
-        assert!(core_visible_gap_indices(messages).is_empty());
+        assert!(core_visible_gap_indices(messages, vec![]).is_empty());
+    }
+
+    #[test]
+    fn consumed_but_discarded_control_lamports_close_a_visible_gap() {
+        let messages = vec![msg(1, 1, KIND_TEXT, vec![]), msg(1, 3, KIND_TEXT, vec![])];
+        let consumed = vec![ConsumedHiddenLamport {
+            sender_user_id: vec![1],
+            lamport: 2,
+        }];
+        assert!(core_visible_gap_indices(messages, consumed).is_empty());
+    }
+
+    #[test]
+    fn sparse_control_lamports_do_not_hide_a_real_missing_message() {
+        let messages = vec![
+            msg(1, 1, KIND_TEXT, vec![]),
+            msg(1, 3, KIND_REACTION, vec![]),
+            msg(1, 4, KIND_TEXT, vec![]),
+        ];
+        assert_eq!(core_visible_gap_indices(messages, vec![]), vec![1]);
+    }
+
+    #[test]
+    fn another_senders_control_lamport_cannot_close_the_gap() {
+        let messages = vec![msg(1, 1, KIND_TEXT, vec![]), msg(1, 3, KIND_TEXT, vec![])];
+        let consumed = vec![ConsumedHiddenLamport {
+            sender_user_id: vec![2],
+            lamport: 2,
+        }];
+        assert_eq!(core_visible_gap_indices(messages, consumed), vec![1]);
     }
 
     #[test]

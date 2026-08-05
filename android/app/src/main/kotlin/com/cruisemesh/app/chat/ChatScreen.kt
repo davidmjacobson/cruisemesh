@@ -126,6 +126,7 @@ import com.cruisemesh.app.ui.bubbleGroupingFor
 import com.cruisemesh.app.ui.formatConversationTimestamp
 import com.cruisemesh.app.ui.tickLegendText
 import uniffi.cruisemesh_core.ComposerReach
+import uniffi.cruisemesh_core.ConsumedHiddenLamport
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.MessageStore
@@ -200,6 +201,9 @@ fun ChatScreen(
     val context = LocalContext.current
     var currentContact by remember(contact.userId) { mutableStateOf(contact) }
     var messages by remember(contact.userId) { mutableStateOf(store.messagesForChat(currentContact.userId)) }
+    var consumedHiddenLamports by remember(contact.userId) {
+        mutableStateOf(store.consumedHiddenLamports(currentContact.userId))
+    }
     var contactAvatar by remember(contact.userId) { mutableStateOf(store.contactAvatar(currentContact.userId)) }
     var deliveredThrough by remember(contact.userId) {
         mutableStateOf(store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_DELIVERED))
@@ -232,6 +236,7 @@ fun ChatScreen(
     fun reload() {
         currentContact = store.getContact(contact.userId) ?: currentContact
         messages = store.messagesForChat(currentContact.userId)
+        consumedHiddenLamports = store.consumedHiddenLamports(currentContact.userId)
         contactAvatar = store.contactAvatar(currentContact.userId)
         deliveredThrough = store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_DELIVERED)
         readThrough = store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_READ)
@@ -326,6 +331,7 @@ fun ChatScreen(
         contact = currentContact,
         ownUserId = ownUserId,
         messages = messages,
+        consumedHiddenLamports = consumedHiddenLamports,
         store = store,
         contactAvatar = contactAvatar,
         deliveredThrough = deliveredThrough,
@@ -455,6 +461,7 @@ private fun ConversationScreen(
     contact: Contact,
     ownUserId: ByteArray,
     messages: List<StoredMessage>,
+    consumedHiddenLamports: List<ConsumedHiddenLamport> = emptyList(),
     store: MessageStore? = null,
     contactAvatar: ByteArray? = null,
     deliveredThrough: ULong,
@@ -536,7 +543,9 @@ private fun ConversationScreen(
             }
         }
     }
-    val gaps = remember(messages, visibleMessages) { visibleGapIndices(messages, visibleMessages) }
+    val gaps = remember(messages, consumedHiddenLamports) {
+        visibleGapIndices(messages, consumedHiddenLamports)
+    }
     val reactions = remember(messages, ownUserId) { reactionSummariesByTarget(messages, ownUserId) }
     val grouping = remember(visibleMessages) {
         val meta = visibleMessages.map { ConversationMessageMeta(formatUserId(it.senderUserId), it.timestamp) }
