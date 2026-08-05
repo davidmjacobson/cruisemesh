@@ -4,6 +4,7 @@ import com.cruisemesh.app.media.KIND_REACTION
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import uniffi.cruisemesh_core.ConsumedHiddenLamport
 import uniffi.cruisemesh_core.StoredMessage
 
 class MessageInteractionsTest {
@@ -44,9 +45,18 @@ class MessageInteractionsTest {
             reaction(peerUserId, 2uL, MessageTarget(ownUserId, 1uL, KIND_TEXT), "👍"),
             text(peerUserId, 3uL, "three"),
         )
-        val visible = messages.filter { it.kind == KIND_TEXT }
+        assertTrue(visibleGapIndices(messages, emptyList()).isEmpty())
+    }
 
-        assertTrue(visibleGapIndices(messages, visible).isEmpty())
+    @Test
+    fun consumedAndDiscardedControlLamportDoesNotCreateVisibleGap() {
+        val messages = listOf(
+            text(peerUserId, 1uL, "one"),
+            text(peerUserId, 3uL, "three"),
+        )
+        val consumed = listOf(ConsumedHiddenLamport(peerUserId, 2uL))
+
+        assertTrue(visibleGapIndices(messages, consumed).isEmpty())
     }
 
     private fun text(sender: ByteArray, lamport: ULong, body: String): StoredMessage =

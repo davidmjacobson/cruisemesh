@@ -3,6 +3,7 @@ package com.cruisemesh.app.chat
 import com.cruisemesh.app.media.KIND_REACTION
 import uniffi.cruisemesh_core.CoreMessageTarget
 import uniffi.cruisemesh_core.CoreReactionPayload
+import uniffi.cruisemesh_core.ConsumedHiddenLamport
 import uniffi.cruisemesh_core.decodeReactionPayload
 import uniffi.cruisemesh_core.encodeReactionPayload
 import uniffi.cruisemesh_core.coreReactionSummariesByTarget
@@ -68,8 +69,10 @@ fun reactionSummariesByTarget(
     }
 }
 
-fun visibleGapIndices(messages: List<StoredMessage>, visibleMessages: List<StoredMessage>): Set<Int> =
-    coreVisibleGapIndices(messages).mapTo(mutableSetOf()) { it.toInt() }
+fun visibleGapIndices(
+    messages: List<StoredMessage>,
+    consumedHiddenLamports: List<ConsumedHiddenLamport>,
+): Set<Int> = coreVisibleGapIndices(messages, consumedHiddenLamports).mapTo(mutableSetOf()) { it.toInt() }
 
 /**
  * "" clears an existing own reaction of [emoji] on [target]; any other value

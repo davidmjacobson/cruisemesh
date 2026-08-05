@@ -2029,6 +2029,12 @@ public protocol MessageStoreProtocol : AnyObject {
     func clearSharedRequestDismissal(requesterUserId: Data) throws 
     
     /**
+     * Exact consumed control-message positions for one chat, grouped by the
+     * sender stream the visible-gap policy compares independently.
+     */
+    func consumedHiddenLamports(chatId: Data) throws  -> [ConsumedHiddenLamport]
+
+    /**
      * Rows currently in the consumed-hidden-kind set, expired ones included
      * (diagnostics/tests).
      */
@@ -3044,6 +3050,18 @@ public protocol MessageStoreProtocol : AnyObject {
     func recentConsumedMsgIds(limit: UInt64) throws  -> [Data]
     
     /**
+     * Record an exact lamport this device consumed from a pairwise stream
+     * even though that envelope leaves no durable `msg_id`-bearing message
+     * row in this chat.
+     *
+     * Shells call this only after authenticated delivery finishes. Core still
+     * refuses kinds whose ordinary incoming path already persists the exact
+     * envelope as a message row; those rows are already gap evidence and a
+     * second copy here would obscure the ownership boundary.
+     */
+    func recordConsumedHiddenLamport(chatId: Data, senderUserId: Data, lamport: UInt64, kind: UInt8) throws  -> Bool
+
+    /**
      * V2 field metric: stamp the delivery time and return route (T6
      * `via_transport`) onto every outbound metric row in `chat_id` at or below
      * the confirmed `through_lamport` that isn't already marked delivered.
@@ -3052,14 +3070,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * stamps the messages it newly covers). Metadata only.
      */
     func recordDeliveredMetric(chatId: Data, throughLamport: UInt64, deliveredAtMs: Int64, viaTransport: UInt8?) throws 
-    
+
     /**
      * Attach first-arrival diagnostics to an already inserted incoming
      * message. A redundant mesh/relay copy never overwrites the original
      * route, hop count, or receive time.
      */
     func recordMessageArrival(chatId: Data, senderUserId: Data, lamport: UInt64, arrival: MessageArrival) throws  -> Bool
-    
+
     /**
      * Record that *this device* has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` -- the
@@ -3069,14 +3087,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * stale retries must never regress it.
      */
     func recordOutgoingReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64) throws 
-    
+
     /**
      * Record a bounded, metadata-only connection event for an accepted peer.
      * Identical high-frequency signals are coalesced for 30 seconds; detailed
      * events are retained for 30 days and capped at 1,000 rows.
      */
     func recordPeerConnectionEvent(userId: Data, transport: PeerConnectionTransport, kind: PeerConnectionEventKind, occurredAtMs: Int64) throws 
-    
+
     /**
      * Record that a peer has delivered/read messages authored by
      * `sender_user_id` in `chat_id` through `through_lamport` (DESIGN.md
@@ -3100,7 +3118,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * route isn't known.
      */
     func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws 
-    
+
     /**
      * V2 field metric: record that this device authored an outbound message
      * at `lamport` in `chat_id` at `sent_at_ms`, so the cruise-test export can
@@ -3829,6 +3847,18 @@ open func clearSharedRequestDismissal(requesterUserId: Data)throws  {try rustCal
 }
 }
     
+    /**
+     * Exact consumed control-message positions for one chat, grouped by the
+     * sender stream the visible-gap policy compares independently.
+     */
+open func consumedHiddenLamports(chatId: Data)throws  -> [ConsumedHiddenLamport] {
+    return try  FfiConverterSequenceTypeConsumedHiddenLamport.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_consumed_hidden_lamports(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),$0
+    )
+})
+}
+
     /**
      * Rows currently in the consumed-hidden-kind set, expired ones included
      * (diagnostics/tests).
@@ -5382,6 +5412,27 @@ open func recentConsumedMsgIds(limit: UInt64)throws  -> [Data] {
 }
     
     /**
+     * Record an exact lamport this device consumed from a pairwise stream
+     * even though that envelope leaves no durable `msg_id`-bearing message
+     * row in this chat.
+     *
+     * Shells call this only after authenticated delivery finishes. Core still
+     * refuses kinds whose ordinary incoming path already persists the exact
+     * envelope as a message row; those rows are already gap evidence and a
+     * second copy here would obscure the ownership boundary.
+     */
+open func recordConsumedHiddenLamport(chatId: Data, senderUserId: Data, lamport: UInt64, kind: UInt8)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_record_consumed_hidden_lamport(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterUInt64.lower(lamport),
+        FfiConverterUInt8.lower(kind),$0
+    )
+})
+}
+
+    /**
      * V2 field metric: stamp the delivery time and return route (T6
      * `via_transport`) onto every outbound metric row in `chat_id` at or below
      * the confirmed `through_lamport` that isn't already marked delivered.
@@ -6451,6 +6502,82 @@ public func FfiConverterTypeCarriedEnvelope_lift(_ buf: RustBuffer) throws -> Ca
 #endif
 public func FfiConverterTypeCarriedEnvelope_lower(_ value: CarriedEnvelope) -> RustBuffer {
     return FfiConverterTypeCarriedEnvelope.lower(value)
+}
+
+
+/**
+ * One pairwise-stream lamport consumed by this device without a durable
+ * `messages` row in that chat.
+ *
+ * Receipts, profile updates, LAN endpoint hints, and other control envelopes
+ * share the sender's chat lamport counter. Keeping their exact positions lets
+ * the visible-gap scan distinguish a missing chat message from an intentional
+ * control-message hole without inventing a broad high-water mark that could
+ * hide a real loss.
+ */
+public struct ConsumedHiddenLamport {
+    public var senderUserId: Data
+    public var lamport: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(senderUserId: Data, lamport: UInt64) {
+        self.senderUserId = senderUserId
+        self.lamport = lamport
+    }
+}
+
+
+
+extension ConsumedHiddenLamport: Equatable, Hashable {
+    public static func ==(lhs: ConsumedHiddenLamport, rhs: ConsumedHiddenLamport) -> Bool {
+        if lhs.senderUserId != rhs.senderUserId {
+            return false
+        }
+        if lhs.lamport != rhs.lamport {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(senderUserId)
+        hasher.combine(lamport)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConsumedHiddenLamport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsumedHiddenLamport {
+        return
+            try ConsumedHiddenLamport(
+                senderUserId: FfiConverterData.read(from: &buf),
+                lamport: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConsumedHiddenLamport, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.senderUserId, into: &buf)
+        FfiConverterUInt64.write(value.lamport, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsumedHiddenLamport_lift(_ buf: RustBuffer) throws -> ConsumedHiddenLamport {
+    return try FfiConverterTypeConsumedHiddenLamport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConsumedHiddenLamport_lower(_ value: ConsumedHiddenLamport) -> RustBuffer {
+    return FfiConverterTypeConsumedHiddenLamport.lower(value)
 }
 
 
@@ -15013,6 +15140,31 @@ fileprivate struct FfiConverterSequenceTypeCarriedEnvelope: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeConsumedHiddenLamport: FfiConverterRustBuffer {
+    typealias SwiftType = [ConsumedHiddenLamport]
+
+    public static func write(_ value: [ConsumedHiddenLamport], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeConsumedHiddenLamport.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ConsumedHiddenLamport] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ConsumedHiddenLamport]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeConsumedHiddenLamport.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeContact: FfiConverterRustBuffer {
     typealias SwiftType = [Contact]
 
@@ -16585,10 +16737,11 @@ public func coreVisibleChatMessages(messages: [StoredMessage]) -> [StoredMessage
     )
 })
 }
-public func coreVisibleGapIndices(messages: [StoredMessage]) -> [UInt32] {
+public func coreVisibleGapIndices(messages: [StoredMessage], consumedHiddenLamports: [ConsumedHiddenLamport]) -> [UInt32] {
     return try!  FfiConverterSequenceUInt32.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_visible_gap_indices(
-        FfiConverterSequenceTypeStoredMessage.lower(messages),$0
+        FfiConverterSequenceTypeStoredMessage.lower(messages),
+        FfiConverterSequenceTypeConsumedHiddenLamport.lower(consumedHiddenLamports),$0
     )
 })
 }
@@ -18360,7 +18513,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_visible_chat_messages() != 48182) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_visible_gap_indices() != 61862) {
+    if (uniffi_cruisemesh_core_checksum_func_core_visible_gap_indices() != 52100) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_create_group() != 45726) {
@@ -18882,6 +19035,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_shared_request_dismissal() != 60027) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_consumed_hidden_lamports() != 35201) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_consumed_hidden_msg_id_count() != 12326) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -19114,6 +19270,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_recent_consumed_msg_ids() != 58947) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_consumed_hidden_lamport() != 35967) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_delivered_metric() != 16840) {

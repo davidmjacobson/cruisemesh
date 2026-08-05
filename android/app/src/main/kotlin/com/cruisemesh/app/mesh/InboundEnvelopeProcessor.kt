@@ -106,6 +106,21 @@ private const val OWN_RECEIPT_SPRAY_BUDGET_BYTES: Long = 64L * 1024
 private const val CARRIED_SPRAY_BUDGET_BYTES: Long = 256L * 1024
 
 /**
+ * Decoded pairwise-stream metadata carried out of the delivery switch only
+ * after the handler has reached a terminal consumed state.
+ *
+ * [recordStreamLamport] is false for malformed/unauthorized stream metadata:
+ * those envelopes remain terminally consumed for relay-ack purposes, but
+ * cannot be allowed to close a legitimate chat gap.
+ */
+private data class PairwiseDeliveryResult(
+    val kind: UByte,
+    val senderUserId: ByteArray,
+    val lamport: ULong,
+    val recordStreamLamport: Boolean,
+)
+
+/**
  * FA15: the envelope half of what used to be MeshService — everything that
  * happens to a §6.4 envelope after a transport hands it over: the FA5
  * admission claim, the §5.3 gossip gate (dedupe/expiry), open-vs-relay, local
@@ -421,7 +436,7 @@ internal class InboundEnvelopeProcessor(
             return finishAdmission(CoreInboundDisposition.CARRIED, terminal = carried)
         }
         val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
-        val consumedKind = try {
+        val consumed = try {
             deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
         } catch (e: CoreException) {
             // T4-06: [deliverOpenedEnvelope] does not swallow store exceptions
@@ -443,8 +458,8 @@ internal class InboundEnvelopeProcessor(
         // ever re-presents it. See
         // [MessageStore.coreRecordConsumedHiddenMsgId] for every condition
         // core re-checks and for why anything unprovable must not be recorded.
-        if (consumedKind != null) {
-            recordConsumedHiddenKind(envelope, consumedKind, identity)
+        if (consumed != null) {
+            recordConsumedHiddenKind(envelope, consumed, identity)
         }
         // DTN D4: reaching here means the message was durably stored -- safe,
         // and required, to record.
@@ -462,12 +477,21 @@ internal class InboundEnvelopeProcessor(
      * condition (kind, own-hint, group-hint, expiry) and simply declines to
      * write a row when one doesn't hold, so this call site's only job is to
      * be reached exclusively from the proven-consumption path above.
+     *
+     * The same terminal hook records an exact, validated pairwise lamport for
+     * gap rendering when the handler left no message row. Core accepts that
+     * longer-lived evidence only for an established contact and an actual 1:1
+     * stream, so stranger onboarding traffic cannot grow it indefinitely.
      */
-    private fun recordConsumedHiddenKind(envelope: Frame.Envelope, kind: UByte, identity: Identity) {
+    private fun recordConsumedHiddenKind(
+        envelope: Frame.Envelope,
+        consumed: PairwiseDeliveryResult,
+        identity: Identity,
+    ) {
         try {
             store.coreRecordConsumedHiddenMsgId(
                 envelope.msgId,
-                kind,
+                consumed.kind,
                 envelope.recipientHint,
                 envelope.expiry,
                 identity.userId,
@@ -475,6 +499,24 @@ internal class InboundEnvelopeProcessor(
             )
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to record consumed hidden-kind msg_id: ${e.message}")
+        }
+        if (!consumed.recordStreamLamport) return
+        try {
+            if (
+                store.recordConsumedHiddenLamport(
+                    consumed.senderUserId,
+                    consumed.senderUserId,
+                    consumed.lamport,
+                    consumed.kind,
+                )
+            ) {
+                ChatEvents.notifyChatChanged(consumed.senderUserId)
+            }
+        } catch (e: CoreException) {
+            // Gap evidence is explanatory metadata, not delivery durability:
+            // failing to write it must not turn an already-handled control
+            // envelope into an unbounded retry loop.
+            Log.w(TAG, "Failed to record consumed hidden-kind lamport: ${e.message}")
         }
     }
 
@@ -740,8 +782,10 @@ internal class InboundEnvelopeProcessor(
      * Reached only for envelopes addressed to us; foreign traffic never gets
      * here (see [processInboundEnvelope]).
      *
-     * Returns the body's `kind` once it is known, or `null` if the body could
-     * not even be decoded. Every other early return still reports its kind:
+     * Returns the body's stream metadata once it is known, or `null` if the
+     * body could not even be decoded. Every other early return still reports
+     * its kind for relay-ack evidence, but marks invalid/unauthorized stream
+     * metadata as unable to close a chat gap:
      * a deliberate discard (blocked sender, unauthorized sender, unhandled
      * kind) is consumption by an endpoint that is finished with the envelope,
      * which is exactly what [processInboundEnvelope] treats as CONSUMED and
@@ -755,7 +799,7 @@ internal class InboundEnvelopeProcessor(
         identity: Identity,
         arrival: MessageArrival,
         msgId: ByteArray,
-    ): UByte? {
+    ): PairwiseDeliveryResult? {
         val extendedBody = try {
             decodeExtendedMessageBody(opened.payload)
         } catch (e: CoreException) {
@@ -771,7 +815,7 @@ internal class InboundEnvelopeProcessor(
         )
         if (!body.chatId.contentEquals(opened.senderUserId)) {
             Log.w(TAG, "Dropping envelope from $address: chatId does not match the verified sender")
-            return body.kind
+            return PairwiseDeliveryResult(body.kind, opened.senderUserId, body.lamport, false)
         }
         val senderIsContact = store.getContact(opened.senderUserId) != null
         if (
@@ -782,7 +826,7 @@ internal class InboundEnvelopeProcessor(
             )
         ) {
             Log.w(TAG, "Dropping envelope from $address: sender is not authorized for kind=${body.kind}")
-            return body.kind
+            return PairwiseDeliveryResult(body.kind, opened.senderUserId, body.lamport, false)
         }
 
         // Blocked identities are dropped before ANY kind handler runs: a
@@ -792,7 +836,7 @@ internal class InboundEnvelopeProcessor(
         // discard is consumption, so the mailbox doesn't refetch it forever.
         if (store.isUserBlocked(opened.senderUserId)) {
             Log.i(TAG, "Dropping envelope from $address: sender is blocked")
-            return body.kind
+            return PairwiseDeliveryResult(body.kind, opened.senderUserId, body.lamport, false)
         }
 
         when (body.kind) {
@@ -858,7 +902,7 @@ internal class InboundEnvelopeProcessor(
             )
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
         }
-        return body.kind
+        return PairwiseDeliveryResult(body.kind, opened.senderUserId, body.lamport, true)
     }
 
     private fun handleIncomingLanEndpointHint(
