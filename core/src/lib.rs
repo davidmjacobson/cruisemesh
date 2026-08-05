@@ -41,7 +41,8 @@ pub use contact_relay_health::{
     contact_relay_fault_is_authoritative, core_contact_relay_endpoint_usable,
     core_contact_relay_is_stale, core_contact_relay_recheck_due, core_contact_relay_streak_delta,
     core_contact_relay_unreachable_delta, core_contact_relay_unreachable_endpoint_usable,
-    CONTACT_RELAY_RECHECK_MS, CONTACT_RELAY_STALE_STREAK, CONTACT_RELAY_UNREACHABLE_REST_MS,
+    core_contact_relay_unreachable_is_stale, CONTACT_RELAY_RECHECK_MS, CONTACT_RELAY_STALE_STREAK,
+    CONTACT_RELAY_UNREACHABLE_REST_MS, CONTACT_RELAY_UNREACHABLE_STALE_STREAK,
     CONTACT_RELAY_UNREACHABLE_STREAK,
 };
 pub use content::{
@@ -139,11 +140,11 @@ pub use semantic::{
 };
 pub use store::{
     core_peer_transport_for_arrival, core_peer_transport_is_observed, CarriedEnvelope, Contact,
-    ContactDiscoveryPolicy, ContactProvenance, ContactRelayRejection, CoreCarriedCursor,
-    CoreCarriedSyncPage, CoreMessageReceivedAt, DigestEntry, FriendSuggestion, MessageArrival,
-    MessageOrigin, MessageReference, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
-    PeerConnectionEvent, PeerConnectionEventKind, PeerConnectionSummary, PeerConnectionTransport,
-    RelayFetchCursor, StoredMessage,
+    ContactDiscoveryPolicy, ContactProvenance, ContactRelayRejection, ContactRelayUnreachable,
+    CoreCarriedCursor, CoreCarriedSyncPage, CoreMessageReceivedAt, DigestEntry, FriendSuggestion,
+    MessageArrival, MessageOrigin, MessageReference, MessageStore, OutboundEnvelope,
+    OutgoingReceiptEnvelope, PeerConnectionEvent, PeerConnectionEventKind, PeerConnectionSummary,
+    PeerConnectionTransport, RelayFetchCursor, StoredMessage,
 };
 pub use transport_policy::{
     core_transport_send_plan, digest_is_expected_chat_id, digest_through_lamport_for_sender,

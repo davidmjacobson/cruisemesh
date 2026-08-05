@@ -37,9 +37,11 @@ import uniffi.cruisemesh_core.relayFetchWalkContinues
 import uniffi.cruisemesh_core.relayPassStartCursor
 import uniffi.cruisemesh_core.relaySweepDue
 import uniffi.cruisemesh_core.ContactRelayRejection
+import uniffi.cruisemesh_core.ContactRelayUnreachable
 import uniffi.cruisemesh_core.coreContactRelayEndpointUsable
 import uniffi.cruisemesh_core.coreContactRelayIsStale
 import uniffi.cruisemesh_core.coreContactRelayStreakDelta
+import uniffi.cruisemesh_core.coreContactRelayUnreachableIsStale
 import uniffi.cruisemesh_core.coreGroupFanoutRelayTarget
 import uniffi.cruisemesh_core.GroupRelayMember
 import uniffi.cruisemesh_core.resolvedContactDeliveryPollRelay
@@ -477,7 +479,10 @@ internal class RelaySyncEngine(
         passNowMs = now
         contactRelayRejections = store.listContactRelayRejections()
             .associateByTo(mutableMapOf()) { UserIdHex.encode(it.userId) }
+        contactRelayUnreachable = store.listContactRelayUnreachable()
+            .associateByTo(mutableMapOf()) { UserIdHex.encode(it.userId) }
         contactRelayCountedThisPass.clear()
+        contactRelaySilence.restore(contactRelayUnreachable.values)
         contactRelaySilence.beginPass()
         publishStaleContactRelays()
         backfillOutgoingReceipts(identity, now)
@@ -556,11 +561,13 @@ internal class RelaySyncEngine(
         }
         // Now that the pass knows whether our own mailbox answered, this
         // pass's silent contact endpoints can be judged (or discarded).
-        commitUnreachableContactRelays(ownRelayAnswered)
+        commitUnreachableContactRelays(ownRelayAnswered, contacts)
         // Re-read: the uploads above may have advanced or cleared streaks, and
         // a person who just watched a message fail should not have to wait a
         // whole poll interval for the explanation to appear.
         contactRelayRejections = store.listContactRelayRejections()
+            .associateByTo(mutableMapOf()) { UserIdHex.encode(it.userId) }
+        contactRelayUnreachable = store.listContactRelayUnreachable()
             .associateByTo(mutableMapOf()) { UserIdHex.encode(it.userId) }
         publishStaleContactRelays()
         val netDesc = if (network != null) "${networkLabel(network)}(pinned)" else "${networkLabel(connectivityManager.activeNetwork)}(default)"
@@ -1084,16 +1091,20 @@ internal class RelaySyncEngine(
 
     /**
      * Mirrors the written-off set into the observable the UI reads. Computed
-     * from the streak alone, not from [contactEndpointUsable]: a card stays
-     * *reported* stale through its six-hourly probe window, so the explanation
-     * in the chat doesn't blink out and back every six hours while nothing
-     * about the person's situation changed.
+     * from the streak alone, not from either current usability probe: a relay
+     * stays *reported* stale while its periodic probe is due, so the
+     * explanation in the chat does not blink out merely because one request is
+     * temporarily permitted.
      */
     private fun publishStaleContactRelays() {
+        val rejected = contactRelayRejections
+            .filterValues { coreContactRelayIsStale(it.rejectStreak) }
+            .keys
+        val unreachable = contactRelayUnreachable
+            .filterValues { coreContactRelayUnreachableIsStale(it.unreachableStreak) }
+            .keys
         MeshConnectivityStatus.setStaleRelayContacts(
-            contactRelayRejections
-                .filterValues { coreContactRelayIsStale(it.rejectStreak) }
-                .keys,
+            rejected + unreachable,
         )
     }
 
@@ -1171,6 +1182,9 @@ internal class RelaySyncEngine(
      */
     private var contactRelayRejections: MutableMap<String, ContactRelayRejection> = mutableMapOf()
 
+    /** Persisted transport-level failures, separate from HTTP rejections. */
+    private var contactRelayUnreachable: MutableMap<String, ContactRelayUnreachable> = mutableMapOf()
+
     /**
      * Contacts whose streak already advanced during this pass.
      *
@@ -1186,9 +1200,8 @@ internal class RelaySyncEngine(
     private val contactRelayCountedThisPass: MutableSet<String> = mutableSetOf()
 
     /**
-     * Per-process streaks of passes in which a contact's endpoint said
-     * nothing, plus the pass now running's provisional observations. See
-     * [ContactRelaySilence] for why neither is persisted.
+     * Persisted rests loaded into the in-pass breaker, plus the pass now
+     * running's provisional observations. See [ContactRelaySilence].
      */
     private val contactRelaySilence = ContactRelaySilence()
 
@@ -1261,6 +1274,10 @@ internal class RelaySyncEngine(
             }
             return
         }
+        // Any HTTP response proves the endpoint is answering. A structured
+        // rejection may advance its separate streak below, but must clear the
+        // persisted transport-silence verdict first.
+        noteContactRelayAnswered(contact)
         val fault = relayClassifyHttpError(http.code.toUShort(), http.relayCode)
         if (coreContactRelayStreakDelta(fault) == 0L) return
         val streak = advanceContactRelayStreak(contact) ?: return
@@ -1295,11 +1312,19 @@ internal class RelaySyncEngine(
     private fun noteContactRelaySuccess(contact: Contact, config: RelayConfig, fallbackConfig: RelayConfig?) {
         if (config == fallbackConfig) return
         val key = UserIdHex.encode(contact.userId)
-        contactRelaySilence.noteAnswered(key)
+        noteContactRelayAnswered(contact)
         if (!contactRelayRejections.containsKey(key)) return
         store.clearContactRelayRejection(contact.userId)
         contactRelayRejections.remove(key)
         contactRelayCountedThisPass.remove(key)
+    }
+
+    /** Any HTTP answer settles transport silence, including a non-2xx one. */
+    private fun noteContactRelayAnswered(contact: Contact) {
+        val key = UserIdHex.encode(contact.userId)
+        contactRelaySilence.noteAnswered(key)
+        store.clearContactRelayUnreachable(contact.userId)
+        contactRelayUnreachable.remove(key)
     }
 
     /**
@@ -1315,8 +1340,18 @@ internal class RelaySyncEngine(
      * from every contact for the whole rest window the moment connectivity
      * came back.
      */
-    private fun commitUnreachableContactRelays(ownRelayAnswered: Boolean) {
-        for ((key, streak) in contactRelaySilence.commitPass(ownRelayAnswered, passNowMs)) {
+    private fun commitUnreachableContactRelays(ownRelayAnswered: Boolean, contacts: List<Contact>) {
+        val contactsByKey = contacts.associateBy { UserIdHex.encode(it.userId) }
+        for ((key, _) in contactRelaySilence.commitPass(ownRelayAnswered, passNowMs)) {
+            val contact = contactsByKey[key] ?: continue
+            val endpointKey = contactEndpointKey(contact)
+            val streak = store.noteContactRelayUnreachable(contact.userId, endpointKey, passNowMs)
+            contactRelayUnreachable[key] = ContactRelayUnreachable(
+                contact.userId,
+                endpointKey,
+                streak,
+                passNowMs,
+            )
             Log.w(
                 TAG,
                 "Contact $key relay endpoint did not answer while our own relay did " +

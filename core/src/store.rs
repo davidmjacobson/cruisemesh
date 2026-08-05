@@ -324,6 +324,21 @@ pub struct ContactRelayRejection {
     pub rejected_at_ms: i64,
 }
 
+/// One contact endpoint's persisted transport-level failure streak.
+///
+/// Kept separate from [`ContactRelayRejection`] because silence proves that an
+/// address is not answering, not that its credential was rejected. The shell
+/// therefore rests this endpoint without falling back to another mailbox, but
+/// can still surface a prolonged failure and resume the same rest after an app
+/// restart. `endpoint_key` is a hash of URL plus token, never the credential.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct ContactRelayUnreachable {
+    pub user_id: Vec<u8>,
+    pub endpoint_key: String,
+    pub unreachable_streak: i64,
+    pub unreachable_at_ms: i64,
+}
+
 /// How far a relay mailbox has been walked, and when it was last walked in
 /// full. See [`crate::relay_cursor`] for what the two numbers mean and the
 /// rules that move them.
@@ -613,6 +628,16 @@ impl MessageStore {
         // very next sync pass re-establishes the truth.
         ensure_contact_column(&conn, "relay_reject_streak", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_contact_column(&conn, "relay_rejected_at", "INTEGER NOT NULL DEFAULT 0")?;
+        // Transport-level failures (DNS, refused connection, TLS) need their
+        // own persisted streak: they rest rather than fall back, and survive a
+        // restart without being mistaken for an authoritative rejection.
+        ensure_contact_column(&conn, "relay_unreachable_endpoint_key", "TEXT")?;
+        ensure_contact_column(
+            &conn,
+            "relay_unreachable_streak",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_contact_column(&conn, "relay_unreachable_at", "INTEGER NOT NULL DEFAULT 0")?;
         // Relay proxy-polling (see enqueue_relay_carried_envelope): marks a
         // carried envelope as one we pulled FROM the relay rather than one we
         // received over BLE, so the relay-upload query can skip re-uploading
@@ -2436,7 +2461,19 @@ impl MessageStore {
                 relay_rejected_at = CASE
                     WHEN excluded.relay_url IS NOT contacts.relay_url
                       OR excluded.relay_token IS NOT contacts.relay_token
-                    THEN 0 ELSE contacts.relay_rejected_at END",
+                    THEN 0 ELSE contacts.relay_rejected_at END,
+                relay_unreachable_endpoint_key = CASE
+                    WHEN excluded.relay_url IS NOT contacts.relay_url
+                      OR excluded.relay_token IS NOT contacts.relay_token
+                    THEN NULL ELSE contacts.relay_unreachable_endpoint_key END,
+                relay_unreachable_streak = CASE
+                    WHEN excluded.relay_url IS NOT contacts.relay_url
+                      OR excluded.relay_token IS NOT contacts.relay_token
+                    THEN 0 ELSE contacts.relay_unreachable_streak END,
+                relay_unreachable_at = CASE
+                    WHEN excluded.relay_url IS NOT contacts.relay_url
+                      OR excluded.relay_token IS NOT contacts.relay_token
+                    THEN 0 ELSE contacts.relay_unreachable_at END",
             params![
                 contact.user_id,
                 contact.name,
@@ -2506,7 +2543,19 @@ impl MessageStore {
                 relay_rejected_at = CASE
                     WHEN excluded.relay_url IS NOT contacts.relay_url
                       OR excluded.relay_token IS NOT contacts.relay_token
-                    THEN 0 ELSE contacts.relay_rejected_at END",
+                    THEN 0 ELSE contacts.relay_rejected_at END,
+                relay_unreachable_endpoint_key = CASE
+                    WHEN excluded.relay_url IS NOT contacts.relay_url
+                      OR excluded.relay_token IS NOT contacts.relay_token
+                    THEN NULL ELSE contacts.relay_unreachable_endpoint_key END,
+                relay_unreachable_streak = CASE
+                    WHEN excluded.relay_url IS NOT contacts.relay_url
+                      OR excluded.relay_token IS NOT contacts.relay_token
+                    THEN 0 ELSE contacts.relay_unreachable_streak END,
+                relay_unreachable_at = CASE
+                    WHEN excluded.relay_url IS NOT contacts.relay_url
+                      OR excluded.relay_token IS NOT contacts.relay_token
+                    THEN 0 ELSE contacts.relay_unreachable_at END",
             params![
                 contact.user_id,
                 contact.name,
@@ -2601,7 +2650,9 @@ impl MessageStore {
                 // repairs the contact.
                 "UPDATE contacts
                  SET relay_url = ?2, relay_token = ?3, relay_epoch = ?4,
-                     relay_reject_streak = 0, relay_rejected_at = 0
+                      relay_reject_streak = 0, relay_rejected_at = 0,
+                      relay_unreachable_endpoint_key = NULL,
+                      relay_unreachable_streak = 0, relay_unreachable_at = 0
                  WHERE user_id = ?1 AND ?4 > relay_epoch",
                 params![sender_user_id, url, token, content.relay_epoch],
             )
@@ -2705,6 +2756,97 @@ impl MessageStore {
                     user_id: row.get(0)?,
                     reject_streak: row.get(1)?,
                     rejected_at_ms: row.get(2)?,
+                })
+            })
+            .map_err(store_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(store_err)?;
+        Ok(rows)
+    }
+
+    /// Record one sync pass in which this contact's endpoint gave no HTTP
+    /// answer even though another relay proved this device was online.
+    ///
+    /// The endpoint hash is part of the state: a changed friend card starts at
+    /// one rather than inheriting a retired host's streak. The shell decides,
+    /// through [`crate::core_contact_relay_unreachable_delta`], whether the
+    /// observation is strong enough to call this method.
+    pub fn note_contact_relay_unreachable(
+        &self,
+        user_id: Vec<u8>,
+        endpoint_key: String,
+        now_ms: i64,
+    ) -> Result<i64, CoreError> {
+        if endpoint_key.is_empty() {
+            return Err(CoreError::Malformed(
+                "contact relay endpoint key must not be empty".into(),
+            ));
+        }
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "UPDATE contacts
+             SET relay_unreachable_streak = CASE
+                     WHEN relay_unreachable_endpoint_key = ?2
+                     THEN relay_unreachable_streak + 1
+                     ELSE 1
+                 END,
+                 relay_unreachable_endpoint_key = ?2,
+                 relay_unreachable_at = ?3
+             WHERE user_id = ?1",
+            params![user_id, endpoint_key, now_ms],
+        )
+        .map_err(store_err)?;
+        let streak: Option<i64> = conn
+            .query_row(
+                "SELECT relay_unreachable_streak FROM contacts WHERE user_id = ?1",
+                params![user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(streak.unwrap_or(0))
+    }
+
+    /// Clear the transport-level streak when the endpoint gives any HTTP
+    /// answer. A 401 may advance the separate rejection streak, but it proves
+    /// the host is reachable and must settle the silence verdict.
+    pub fn clear_contact_relay_unreachable(&self, user_id: Vec<u8>) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "UPDATE contacts
+             SET relay_unreachable_endpoint_key = NULL,
+                 relay_unreachable_streak = 0,
+                 relay_unreachable_at = 0
+             WHERE user_id = ?1 AND relay_unreachable_streak <> 0",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Every contact endpoint carrying a persisted no-answer streak. Read once
+    /// per sync pass so rest windows and the stale-contact UI survive process
+    /// restarts without a query per contact.
+    pub fn list_contact_relay_unreachable(
+        &self,
+    ) -> Result<Vec<ContactRelayUnreachable>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT user_id, relay_unreachable_endpoint_key,
+                        relay_unreachable_streak, relay_unreachable_at
+                 FROM contacts
+                 WHERE relay_unreachable_streak > 0
+                   AND relay_unreachable_endpoint_key IS NOT NULL",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ContactRelayUnreachable {
+                    user_id: row.get(0)?,
+                    endpoint_key: row.get(1)?,
+                    unreachable_streak: row.get(2)?,
+                    unreachable_at_ms: row.get(3)?,
                 })
             })
             .map_err(store_err)?
@@ -5378,7 +5520,10 @@ CREATE TABLE IF NOT EXISTS contacts (
     nickname TEXT,
     relay_epoch INTEGER NOT NULL DEFAULT 0,
     relay_reject_streak INTEGER NOT NULL DEFAULT 0,
-    relay_rejected_at INTEGER NOT NULL DEFAULT 0
+    relay_rejected_at INTEGER NOT NULL DEFAULT 0,
+    relay_unreachable_endpoint_key TEXT,
+    relay_unreachable_streak INTEGER NOT NULL DEFAULT 0,
+    relay_unreachable_at INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS contact_discovery_policy (
@@ -7536,7 +7681,6 @@ mod tests {
         assert_eq!(rows[0].msg_id, b"fam".to_vec());
     }
 
-    #[test]
     /// The mule queue starves like the outbound and receipt queues did: one
     /// unreachable destination's rows never clear, so under flat `received_at`
     /// order they refill the batch every pass. 236 of the 758 upload failures
@@ -9073,6 +9217,82 @@ mod tests {
     }
 
     #[test]
+    fn contact_relay_silence_survives_reopen_and_tracks_the_endpoint() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cruisemesh-contact-relay-silence-{unique}.sqlite"));
+        let path_str = path.to_string_lossy().to_string();
+        let mut alice = contact(b"alice-id", "Alice");
+        alice.relay_url = Some("https://dead.example".to_string());
+        alice.relay_token = Some("tok".to_string());
+
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        store.upsert_imported_contact(alice.clone()).unwrap();
+        assert_eq!(
+            store
+                .note_contact_relay_unreachable(
+                    b"alice-id".to_vec(),
+                    "dead-endpoint-key".to_string(),
+                    1_000,
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .note_contact_relay_unreachable(
+                    b"alice-id".to_vec(),
+                    "dead-endpoint-key".to_string(),
+                    2_000,
+                )
+                .unwrap(),
+            2
+        );
+        drop(store);
+
+        // A process restart must resume the rest instead of re-arming the dead
+        // endpoint from zero. Re-importing the unchanged card also preserves
+        // that verdict.
+        let store = MessageStore::open(path_str).unwrap();
+        assert_eq!(
+            store.list_contact_relay_unreachable().unwrap(),
+            vec![ContactRelayUnreachable {
+                user_id: b"alice-id".to_vec(),
+                endpoint_key: "dead-endpoint-key".to_string(),
+                unreachable_streak: 2,
+                unreachable_at_ms: 2_000,
+            }]
+        );
+        store.upsert_imported_contact(alice).unwrap();
+        assert_eq!(
+            store.list_contact_relay_unreachable().unwrap()[0].unreachable_streak,
+            2
+        );
+
+        // A different endpoint has never failed and starts its own streak.
+        assert_eq!(
+            store
+                .note_contact_relay_unreachable(
+                    b"alice-id".to_vec(),
+                    "new-endpoint-key".to_string(),
+                    3_000,
+                )
+                .unwrap(),
+            1
+        );
+        store
+            .clear_contact_relay_unreachable(b"alice-id".to_vec())
+            .unwrap();
+        assert!(store.list_contact_relay_unreachable().unwrap().is_empty());
+
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn re_importing_the_same_stale_card_does_not_launder_the_streak() {
         // The field repair is "ask them to share their card again" -- but a
         // card re-shared from a phone whose config never changed carries the
@@ -9089,11 +9309,22 @@ mod tests {
         store
             .note_contact_relay_rejected(b"alice-id".to_vec(), 2_000)
             .unwrap();
+        store
+            .note_contact_relay_unreachable(
+                b"alice-id".to_vec(),
+                "dead-endpoint-key".to_string(),
+                2_000,
+            )
+            .unwrap();
 
         store.upsert_imported_contact(alice).unwrap();
         assert_eq!(
             store.list_contact_relay_rejections().unwrap()[0].reject_streak,
             2
+        );
+        assert_eq!(
+            store.list_contact_relay_unreachable().unwrap()[0].unreachable_streak,
+            1
         );
 
         // A card that actually moves the endpoint has never been tried, so
@@ -9103,6 +9334,7 @@ mod tests {
         moved.relay_token = Some("tok".to_string());
         store.upsert_imported_contact(moved).unwrap();
         assert!(store.list_contact_relay_rejections().unwrap().is_empty());
+        assert!(store.list_contact_relay_unreachable().unwrap().is_empty());
     }
 
     #[test]
@@ -9118,6 +9350,13 @@ mod tests {
         store
             .note_contact_relay_rejected(b"alice-id".to_vec(), 2_000)
             .unwrap();
+        store
+            .note_contact_relay_unreachable(
+                b"alice-id".to_vec(),
+                "old-endpoint-key".to_string(),
+                2_000,
+            )
+            .unwrap();
 
         assert!(store
             .apply_contact_relay_update(
@@ -9126,6 +9365,7 @@ mod tests {
             )
             .unwrap());
         assert!(store.list_contact_relay_rejections().unwrap().is_empty());
+        assert!(store.list_contact_relay_unreachable().unwrap().is_empty());
     }
 
     #[test]

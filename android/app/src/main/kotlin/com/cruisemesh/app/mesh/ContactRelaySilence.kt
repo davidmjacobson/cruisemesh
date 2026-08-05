@@ -1,12 +1,14 @@
 package com.cruisemesh.app.mesh
 
+import com.cruisemesh.app.chat.UserIdHex
+import uniffi.cruisemesh_core.ContactRelayUnreachable
 import uniffi.cruisemesh_core.coreContactRelayUnreachableDelta
 import uniffi.cruisemesh_core.coreContactRelayUnreachableEndpointUsable
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Contacts whose friend-card relay endpoint has stopped answering this
- * process, and for how many consecutive sync passes.
+ * Contacts whose friend-card relay endpoint has stopped answering, and the
+ * current sync pass's provisional observations.
  *
  * The counterpart of the persisted rejection streaks in core
  * `contact_relay_health`, for the half of the failure that produces no HTTP
@@ -14,12 +16,10 @@ import java.util.concurrent.ConcurrentHashMap
  * nothing at all, and that transport failure never reached the rejection
  * streak, so the address was re-dialled on every pass indefinitely.
  *
- * In memory rather than in the store, on both shells, for two reasons. A host
- * that is down is usually down for minutes, so re-learning it after a restart
- * costs two passes and is cheaper than carrying a stale verdict across days.
- * And it keeps "not answering right now" out of the persisted stale-card set
- * the contact sheet reads, where the prompt is "ask them to share their card
- * again" — correct for a revoked token, wrong for a relay that is rebooting.
+ * The committed rest is persisted by core and restored at the start of every
+ * pass. Keeping only this pass's provisional set here preserves the immediate
+ * per-envelope breaker while ensuring an app restart cannot re-arm a dead
+ * endpoint from zero.
  *
  * A plain class with no Android imports so the state machine can be unit
  * tested directly; [RelaySyncEngine] holds one for its lifetime. Mirrors
@@ -42,6 +42,18 @@ internal class ContactRelaySilence {
      * address hash, so both arms agree about what a moved card means.
      */
     private val silentThisPass = ConcurrentHashMap<String, String>()
+
+    /** Replace the committed rests with the store's authoritative snapshot. */
+    fun restore(states: Collection<ContactRelayUnreachable>) {
+        rests.clear()
+        for (state in states) {
+            rests[UserIdHex.encode(state.userId)] = Rest(
+                state.endpointKey,
+                state.unreachableStreak,
+                state.unreachableAtMs,
+            )
+        }
+    }
 
     /** Forgets the previous pass's provisional observations. */
     fun beginPass() {
