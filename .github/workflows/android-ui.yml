@@ -42,20 +42,14 @@ jobs:
           distribution: temurin
           java-version: "17"
           cache: gradle
-      - name: Install Android NDK
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r27c
-          local-cache: true
       - name: Build Android native libraries and bindings
         env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
         run: bash core/build-android.sh
       - name: Run ${{ matrix.device }} UI tests
         working-directory: android
         env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
         run: |
           chmod +x ./gradlew
           ./gradlew :app:${{ matrix.device }}DebugAndroidTest \
