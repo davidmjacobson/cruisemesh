@@ -2143,24 +2143,49 @@ impl MessageStore {
 
     /// Relay-upload candidates: persisted receipt envelopes not yet marked as
     /// posted to a relay, unexpired as of `now_ms`, oldest first.
+    /// Receipts are drawn round-robin across recipients and honour the same
+    /// skip set as [`MessageStore::pending_relay_outbound_envelopes`], for the
+    /// same reason and with the same guarantees -- see that function's doc
+    /// comment for why flat queue order starves.
+    ///
+    /// This queue is not a lesser case of the problem: in the field capture it
+    /// was the one visibly failing (`Failed to upload receipt envelope` against
+    /// an unreachable host, over and over). Receipts are also the queue most
+    /// likely to be jammed by one bad contact, because every message received
+    /// from anyone generates one and they are re-queued until they post.
     pub fn pending_relay_outgoing_receipt_envelopes(
         &self,
         limit: u64,
         now_ms: i64,
+        skip_recipient_user_ids: Vec<Vec<u8>>,
     ) -> Result<Vec<OutgoingReceiptEnvelope>, CoreError> {
         let conn = lock_conn(&self.conn);
-        let mut stmt = conn
-            .prepare(
-                "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, receipt_type,
-                        through_lamport, timestamp, hop_ttl, expiry, recipient_hint, sealed
+        let mut args: Vec<Value> = vec![Value::Integer(now_ms)];
+        let skip_clause = if skip_recipient_user_ids.is_empty() {
+            String::new()
+        } else {
+            let placeholders = vec!["?"; skip_recipient_user_ids.len()].join(", ");
+            args.extend(skip_recipient_user_ids.into_iter().map(Value::Blob));
+            format!(" AND recipient_user_id NOT IN ({placeholders})")
+        };
+        args.push(Value::Integer(limit as i64));
+        let sql = format!(
+            "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, receipt_type,
+                    through_lamport, timestamp, hop_ttl, expiry, recipient_hint, sealed
+             FROM (
+                 SELECT *, ROW_NUMBER() OVER (
+                            PARTITION BY recipient_user_id
+                            ORDER BY queued_at ASC, msg_id ASC
+                        ) AS recipient_rank
                  FROM outgoing_receipt_envelopes
-                 WHERE relay_posted_at IS NULL AND expiry > ?1
-                 ORDER BY queued_at ASC, msg_id ASC
-                 LIMIT ?2",
-            )
-            .map_err(store_err)?;
+                 WHERE relay_posted_at IS NULL AND expiry > ?{skip_clause}
+             )
+             ORDER BY recipient_rank ASC, queued_at ASC, msg_id ASC
+             LIMIT ?"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
         let rows = stmt
-            .query_map(params![now_ms, limit as i64], row_to_outgoing_receipt)
+            .query_map(params_from_iter(args.iter()), row_to_outgoing_receipt)
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
@@ -7007,6 +7032,63 @@ mod tests {
         );
     }
 
+    /// The receipt queue starves the same way the outbound one does, and in
+    /// the field capture it was the queue visibly failing.
+    ///
+    /// A receipt row is a watermark per (chat, sender, type), so a single 1:1
+    /// contact only ever holds a couple of rows -- one recipient builds a deep
+    /// backlog by being a member of many group chats, which is what this
+    /// queues.
+    #[test]
+    fn one_recipients_receipt_backlog_cannot_consume_the_whole_relay_batch() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for i in 0..20u8 {
+            let envelope = outgoing_receipt_for(
+                &[0xB0 + i],
+                b"sender",
+                b"bob",
+                crate::RECEIPT_TYPE_DELIVERED,
+                i as u64 + 1,
+                format!("receipt-bob-{i:08}").as_bytes(),
+            );
+            store
+                .upsert_outgoing_receipt_envelope(envelope, 1_000 + i as i64)
+                .unwrap();
+        }
+        let carol = outgoing_receipt_for(
+            b"chat-carol",
+            b"sender",
+            b"carol",
+            crate::RECEIPT_TYPE_DELIVERED,
+            1,
+            b"receipt-carol-01",
+        );
+        store
+            .upsert_outgoing_receipt_envelope(carol.clone(), 900_000)
+            .unwrap();
+
+        // Flat queue order gives Carol's newer receipt none of the first four
+        // slots; Bob queued first and holds twenty.
+        let batch = store
+            .pending_relay_outgoing_receipt_envelopes(4, 2_000, vec![])
+            .unwrap();
+        assert_eq!(batch.len(), 4);
+        assert_eq!(
+            batch
+                .iter()
+                .filter(|e| e.recipient_user_id == b"carol".to_vec())
+                .count(),
+            1,
+            "every newer recipient's receipt must get a slot",
+        );
+
+        // And a known-unpostable recipient consumes no slots at all.
+        let skipped = store
+            .pending_relay_outgoing_receipt_envelopes(128, 2_000, vec![b"bob".to_vec()])
+            .unwrap();
+        assert_eq!(skipped, vec![carol]);
+    }
+
     #[test]
     fn relay_queue_depth_reports_the_backlog_per_recipient() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
@@ -7127,7 +7209,7 @@ mod tests {
 
         assert_eq!(
             store
-                .pending_relay_outgoing_receipt_envelopes(10, 3_000)
+                .pending_relay_outgoing_receipt_envelopes(10, 3_000, vec![])
                 .unwrap(),
             vec![second.clone()],
         );
@@ -7187,7 +7269,7 @@ mod tests {
 
         assert_eq!(
             store
-                .pending_relay_outgoing_receipt_envelopes(10, 2_000)
+                .pending_relay_outgoing_receipt_envelopes(10, 2_000, vec![])
                 .unwrap(),
             vec![live],
         );

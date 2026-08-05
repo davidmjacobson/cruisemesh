@@ -2864,8 +2864,18 @@ public protocol MessageStoreProtocol : AnyObject {
     /**
      * Relay-upload candidates: persisted receipt envelopes not yet marked as
      * posted to a relay, unexpired as of `now_ms`, oldest first.
+     * Receipts are drawn round-robin across recipients and honour the same
+     * skip set as [`MessageStore::pending_relay_outbound_envelopes`], for the
+     * same reason and with the same guarantees -- see that function's doc
+     * comment for why flat queue order starves.
+     *
+     * This queue is not a lesser case of the problem: in the field capture it
+     * was the one visibly failing (`Failed to upload receipt envelope` against
+     * an unreachable host, over and over). Receipts are also the queue most
+     * likely to be jammed by one bad contact, because every message received
+     * from anyone generates one and they are re-queued until they post.
      */
-    func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64) throws  -> [OutgoingReceiptEnvelope]
+    func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64, skipRecipientUserIds: [Data]) throws  -> [OutgoingReceiptEnvelope]
     
     /**
      * Delete every carried envelope whose `expiry` is at or before `now_ms`
@@ -5036,12 +5046,23 @@ open func pendingRelayOutboundEnvelopes(limit: UInt64, nowMs: Int64, skipRecipie
     /**
      * Relay-upload candidates: persisted receipt envelopes not yet marked as
      * posted to a relay, unexpired as of `now_ms`, oldest first.
+     * Receipts are drawn round-robin across recipients and honour the same
+     * skip set as [`MessageStore::pending_relay_outbound_envelopes`], for the
+     * same reason and with the same guarantees -- see that function's doc
+     * comment for why flat queue order starves.
+     *
+     * This queue is not a lesser case of the problem: in the field capture it
+     * was the one visibly failing (`Failed to upload receipt envelope` against
+     * an unreachable host, over and over). Receipts are also the queue most
+     * likely to be jammed by one bad contact, because every message received
+     * from anyone generates one and they are re-queued until they post.
      */
-open func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64)throws  -> [OutgoingReceiptEnvelope] {
+open func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64, skipRecipientUserIds: [Data])throws  -> [OutgoingReceiptEnvelope] {
     return try  FfiConverterSequenceTypeOutgoingReceiptEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_pending_relay_outgoing_receipt_envelopes(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(limit),
-        FfiConverterInt64.lower(nowMs),$0
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterSequenceData.lower(skipRecipientUserIds),$0
     )
 })
 }
@@ -18758,7 +18779,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outbound_envelopes() != 23243) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outgoing_receipt_envelopes() != 55668) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outgoing_receipt_envelopes() != 13280) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_carried() != 12206) {

@@ -567,6 +567,22 @@ internal class RelaySyncEngine(
         Log.i(TAG, "Relay sync complete: configs=${configs.size} net=$netDesc reason=$reason")
     }
 
+    /**
+     * Recipients we already know we cannot post to on this pass.
+     *
+     * Core excludes these in the query rather than the upload loops skipping
+     * them afterwards: a row that is fetched and then skipped has still
+     * consumed one of [RELAY_STORE_BATCH_LIMIT] slots, so filtering downstream
+     * leaves the starvation completely intact -- the app can diagnose a dead
+     * contact and still be unable to act on it.
+     */
+    private fun unpostableRecipients(
+        contacts: List<Contact>,
+        fallbackConfig: RelayConfig?,
+    ): List<ByteArray> = contacts
+        .filter { resolvedRelayConfig(it, fallbackConfig) == null }
+        .map { it.userId }
+
     private fun uploadPendingOutgoingReceiptEnvelopes(
         contacts: List<Contact>,
         fallbackConfig: RelayConfig?,
@@ -574,7 +590,8 @@ internal class RelaySyncEngine(
         network: Network?,
     ) {
         val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
-        for (envelope in store.pendingRelayOutgoingReceiptEnvelopes(RELAY_STORE_BATCH_LIMIT, now)) {
+        val skipRecipients = unpostableRecipients(contacts, fallbackConfig)
+        for (envelope in store.pendingRelayOutgoingReceiptEnvelopes(RELAY_STORE_BATCH_LIMIT, now, skipRecipients)) {
             val contact = contactsByUserId[UserIdHex.encode(envelope.recipientUserId)] ?: continue
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
@@ -600,14 +617,7 @@ internal class RelaySyncEngine(
         network: Network?,
     ) {
         val contactsByUserId = contacts.associateBy { UserIdHex.encode(it.userId) }
-        // Recipients we already know we cannot post to on this pass. Core
-        // excludes them in the query rather than the loop below: a row fetched
-        // and then skipped has still consumed one of RELAY_STORE_BATCH_LIMIT
-        // slots, so an unreachable contact with a deep backlog would keep
-        // refilling the whole window and starve every other conversation.
-        val skipRecipients = contacts
-            .filter { resolvedRelayConfig(it, fallbackConfig) == null }
-            .map { it.userId }
+        val skipRecipients = unpostableRecipients(contacts, fallbackConfig)
         if (skipRecipients.isNotEmpty()) {
             Log.i(
                 TAG,

@@ -700,7 +700,7 @@ impl MessageStore {
             own_outbound_budget_bytes,
         );
         let own_receipts = select_own_receipts(
-            self.pending_relay_outgoing_receipt_envelopes(receipt_query_limit, now_ms)?,
+            self.pending_relay_outgoing_receipt_envelopes(receipt_query_limit, now_ms, vec![])?,
             &peer_user_id,
             &known,
             now_ms,

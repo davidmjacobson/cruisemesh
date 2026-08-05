@@ -375,7 +375,7 @@ async fn no_internet_message_bridges_to_shore_and_receipt_returns_the_same_way()
         .expect("read watermark advanced");
     let carol_pending = carol
         .store
-        .pending_relay_outgoing_receipt_envelopes(16, t0)
+        .pending_relay_outgoing_receipt_envelopes(16, t0, vec![])
         .unwrap();
     assert_eq!(carol_pending.len(), 1);
     assert_eq!(carol_pending[0].msg_id, receipt.envelope.msg_id);
@@ -395,7 +395,7 @@ async fn no_internet_message_bridges_to_shore_and_receipt_returns_the_same_way()
         .unwrap();
     assert!(carol
         .store
-        .pending_relay_outgoing_receipt_envelopes(16, t0)
+        .pending_relay_outgoing_receipt_envelopes(16, t0, vec![])
         .unwrap()
         .is_empty());
 
