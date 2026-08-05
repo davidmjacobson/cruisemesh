@@ -3195,8 +3195,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                         userId: contact.userId,
                         endpointKey: endpointKey(contact)
                     ) {
+                        let contactId = relayDiagnosticContactId(contact.userId)
+                        let relayHost = relayDiagnosticHost(usedConfig.relayUrl)
                         relaySyncLog.warning(
-                            "Contact \(UserIdHex.encode(contact.userId), privacy: .public) relay \(usedConfig.relayUrl, privacy: .public) did not answer: \(error.localizedDescription, privacy: .public)"
+                            "Contact \(contactId, privacy: .public) relay host=\(relayHost, privacy: .public) did not answer: \(error.localizedDescription, privacy: .public)"
                         )
                     }
                     return
@@ -3208,13 +3210,19 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 )
                 guard coreContactRelayStreakDelta(fault: fault) != 0 else { return }
                 guard countedThisPass.insert(contact.userId).inserted else { return }
-                if let streak = try? store.noteContactRelayRejected(userId: contact.userId, nowMs: now) {
-                    rejections[contact.userId] = ContactRelayRejection(
-                        userId: contact.userId,
-                        rejectStreak: streak,
-                        rejectedAtMs: now
-                    )
+                guard let streak = try? store.noteContactRelayRejected(userId: contact.userId, nowMs: now) else {
+                    return
                 }
+                rejections[contact.userId] = ContactRelayRejection(
+                    userId: contact.userId,
+                    rejectStreak: streak,
+                    rejectedAtMs: now
+                )
+                let contactId = relayDiagnosticContactId(contact.userId)
+                let relayHost = relayDiagnosticHost(usedConfig.relayUrl)
+                relaySyncLog.warning(
+                    "Contact \(contactId, privacy: .public) relay host=\(relayHost, privacy: .public) rejected us (\(String(describing: fault), privacy: .public), streak=\(streak, privacy: .public)); their friend card looks stale"
+                )
             }
             /// Success is the only thing that clears a streak -- see
             /// `clear_contact_relay_rejection` for why a transient fault
@@ -3762,8 +3770,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     unreachableStreak: streak,
                     unreachableAtMs: now
                 )
+                let contactId = relayDiagnosticContactId(rested.userId)
+                let relayHost = relayDiagnosticHost(contact.relayUrl)
                 relaySyncLog.warning(
-                    "Contact \(UserIdHex.encode(rested.userId), privacy: .public) relay endpoint did not answer while our own did (silent passes=\(streak, privacy: .public)); resting it rather than retrying every pass"
+                    "Contact \(contactId, privacy: .public) relay host=\(relayHost, privacy: .public) did not answer while our own did (silent passes=\(streak, privacy: .public)); resting it rather than retrying every pass"
                 )
             }
             let syncedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
