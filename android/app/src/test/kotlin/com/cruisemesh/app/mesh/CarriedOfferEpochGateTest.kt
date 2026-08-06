@@ -42,4 +42,23 @@ class CarriedOfferEpochGateTest {
         assertNull(gate.tryReserve(nowMs = 1_099))
         assertNotNull(gate.tryReserve(nowMs = 1_100))
     }
+
+    @Test
+    fun duplicateAddressesForOneLogicalPeerGetOneOfferPerEpoch() {
+        val gate = CarriedOfferEpochGate(epochMs = 100)
+
+        val firstAddress = gate.tryReserve(nowMs = 1_000, logicalPeerId = "alice")!!
+        gate.commit(firstAddress)
+        assertNull(gate.tryReserve(nowMs = 1_000, logicalPeerId = "alice"))
+        assertNotNull(gate.tryReserve(nowMs = 1_000, logicalPeerId = "bob"))
+        assertNotNull(gate.tryReserve(nowMs = 1_100, logicalPeerId = "alice"))
+    }
+
+    @Test
+    fun releasedEmptyOfferDoesNotBlockSameLogicalPeer() {
+        val gate = CarriedOfferEpochGate(epochMs = 100)
+        val empty = gate.tryReserve(nowMs = 1_000, logicalPeerId = "alice")!!
+        gate.release(empty)
+        assertNotNull(gate.tryReserve(nowMs = 1_000, logicalPeerId = "alice"))
+    }
 }

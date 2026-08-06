@@ -37,6 +37,18 @@ class MeshRouterState {
     fun helloedUserIds(): Set<String> = core.helloedUserIds().mapTo(mutableSetOf(), UserIdHex::encode)
 
     /**
+     * One flood route per authenticated logical peer. Android can hold both
+     * BLE roles, a LAN socket, and rotating addresses for one phone at once;
+     * treating those as independent epidemic peers multiplies every foreign,
+     * profile, and friend-directory frame. Links that have not HELLO'd remain
+     * independent because there is no safe identity with which to collapse
+     * them. If [exceptAddress] is identified, every route for that same user
+     * is excluded so a frame is not echoed straight back over its other role.
+     */
+    fun relayRoutes(exceptAddress: String? = null): List<Pair<Transport, String>> =
+        logicalRelayPlan(connectedRoutes(), identifiedRoutes(), exceptAddress)
+
+    /**
      * hex userId -> the transport a send to that userId would take right now
      * (its highest-[Transport.routePriority] HELLO'd link, so LAN wins over
      * BLE -- the same precedence as [routeFor]). One entry per
@@ -61,6 +73,30 @@ class MeshRouterState {
 
     fun clearTransports(transports: Set<Transport>) = core.clearTransports(transports.map(Transport::toCore))
     fun clear() = core.clear()
+}
+
+internal fun logicalRelayPlan(
+    connected: List<Pair<MeshRouterState.Transport, String>>,
+    identified: List<MeshRouterState.IdentifiedRoute>,
+    exceptAddress: String?,
+): List<Pair<MeshRouterState.Transport, String>> {
+    val userByAddress = identified.associate { it.address to UserIdHex.encode(it.userId) }
+    val excludedUser = exceptAddress?.let(userByAddress::get)
+    val selected = mutableListOf<Pair<MeshRouterState.Transport, String>>()
+
+    for ((userId, routes) in connected.groupBy { (_, address) -> userByAddress[address] }) {
+        if (userId == null) {
+            selected += routes.filterNot { (_, address) -> address == exceptAddress }
+            continue
+        }
+        if (userId == excludedUser) continue
+        selected += routes.sortedWith(
+            compareByDescending<Pair<MeshRouterState.Transport, String>> { (transport, _) ->
+                transport.routePriority
+            }.thenBy { (_, address) -> address },
+        ).first()
+    }
+    return selected
 }
 
 internal fun MeshRouterState.Transport.toCore(): CoreTransport = when (this) {
