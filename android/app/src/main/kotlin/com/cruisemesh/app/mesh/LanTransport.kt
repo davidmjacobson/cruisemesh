@@ -93,6 +93,7 @@ internal class LanTransport(
     private val secureRandom = SecureRandom()
     private val activeSocketCount = AtomicInteger(0)
     private val scanGeneration = AtomicInteger(0)
+    private val scanBuildGate = LanScanBuildGate()
     private val connectionBackoff = ReconnectBackoffTracker()
     private val sockets = ConcurrentHashMap.newKeySet<Socket>()
     private val connections = ConcurrentHashMap<String, LanConnection>()
@@ -288,9 +289,6 @@ internal class LanTransport(
         automatic: Boolean = false,
     ): String? {
         if (!started) return "Start the mesh before searching the local subnet"
-        if ((runningSweep?.outcomes?.remainingCandidates() ?: 0) > 0) {
-            return "A local subnet search is already running"
-        }
         val network = wifiNetwork ?: return "This phone is not connected to Wi-Fi"
         val local = endpointHint?.host
             ?.let { runCatching { InetAddress.getByName(it) }.getOrNull() }
@@ -312,26 +310,62 @@ internal class LanTransport(
         } else {
             effectiveScanPrefixLength(prefixLength)
         }
-        val candidates = subnetHosts(local, effectivePrefix).shuffled()
-        val generation = scanGeneration.incrementAndGet()
-        val sweep = RunningSweep(
-            outcomes = SweepOutcomes(generation, candidates.size),
-            breadth = breadth,
-            prefixLength = effectivePrefix,
-        )
-        runningSweep = sweep
-        Log.i(
-            TAG,
-            "Scanning ${candidates.size} subnet hosts (/${sweep.prefixLength}) " +
-                "for CruiseMesh peers",
-        )
-        LanTransportDiagnostics.scanStarted(candidates.size)
-        for (candidate in candidates) {
-            try {
-                scanExecutor.execute { scanHost(network, candidate, sweep) }
-            } catch (_: RuntimeException) {
-                recordScanOutcome(sweep, SweepProbeOutcome.OTHER)
+        // Reserve the build before leaving this thread. `runningSweep` cannot
+        // be published until candidate materialization finishes on the scan
+        // executor; the reservation closes that gap for manual double-taps
+        // and automatic/manual overlap.
+        val buildToken = scanBuildGate.tryReserve(
+            sweepRunning = { (runningSweep?.outcomes?.remainingCandidates() ?: 0) > 0 },
+            nextGeneration = scanGeneration::incrementAndGet,
+        ) ?: return "A local subnet search is already running"
+        // G5: build the host list and enqueue probes off the calling thread
+        // (often main via UI / connectivity callbacks) so a /24 or larger
+        // sweep cannot ANR during candidate materialization.
+        val generation = buildToken.generation
+        try {
+            scanExecutor.execute {
+                try {
+                    val candidates = subnetHosts(local, effectivePrefix).shuffled()
+                    val sweep = RunningSweep(
+                        outcomes = SweepOutcomes(generation, candidates.size),
+                        breadth = breadth,
+                        prefixLength = effectivePrefix,
+                    )
+                    val activated = scanBuildGate.activate(buildToken) {
+                        if (
+                            !started ||
+                            wifiNetwork != network ||
+                            scanGeneration.get() != generation
+                        ) {
+                            false
+                        } else {
+                            runningSweep = sweep
+                            true
+                        }
+                    }
+                    if (!activated) return@execute
+                    Log.i(
+                        TAG,
+                        "Scanning ${candidates.size} subnet hosts (/${sweep.prefixLength}) " +
+                            "for CruiseMesh peers",
+                    )
+                    LanTransportDiagnostics.scanStarted(candidates.size)
+                    for (candidate in candidates) {
+                        try {
+                            scanExecutor.execute { scanHost(network, candidate, sweep) }
+                        } catch (_: RuntimeException) {
+                            recordScanOutcome(sweep, SweepProbeOutcome.OTHER)
+                        }
+                    }
+                } catch (error: RuntimeException) {
+                    Log.w(TAG, "Could not build the local subnet search", error)
+                } finally {
+                    scanBuildGate.release(buildToken)
+                }
             }
+        } catch (_: RuntimeException) {
+            scanBuildGate.release(buildToken)
+            return "Could not start the local subnet search"
         }
         return null
     }
@@ -432,8 +466,16 @@ internal class LanTransport(
      * periodic interval.
      */
     private fun onScanCompleted(sweep: RunningSweep, summary: SweepOutcomeSummary) {
-        if (runningSweep !== sweep || sweep.outcomes.generation != scanGeneration.get()) return
-        runningSweep = null
+        if (
+            !scanBuildGate.finishSweep(
+                isCurrent = {
+                    runningSweep === sweep && sweep.outcomes.generation == scanGeneration.get()
+                },
+                clear = { runningSweep = null },
+            )
+        ) {
+            return
+        }
         Log.i(TAG, summary.logLine(sweep.prefixLength))
         scanPlanner.onScanCompleted(
             sweep.breadth,
@@ -1294,8 +1336,10 @@ internal class LanTransport(
     private fun teardownNetworkSession() {
         mainHandler.removeCallbacks(automaticScanRunnable)
         scanPlanner.onNetworkLost()
-        runningSweep = null
-        scanGeneration.incrementAndGet()
+        scanBuildGate.reset {
+            runningSweep = null
+            scanGeneration.incrementAndGet()
+        }
         discoveryListener?.let(::stopDiscovery)
         discoveryListener = null
         registrationListener?.let(::unregisterService)

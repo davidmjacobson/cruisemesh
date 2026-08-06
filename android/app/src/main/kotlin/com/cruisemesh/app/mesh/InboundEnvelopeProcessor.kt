@@ -105,6 +105,11 @@ private const val OWN_RECEIPT_SPRAY_BUDGET_BYTES: Long = 64L * 1024
  */
 private const val CARRIED_SPRAY_BUDGET_BYTES: Long = 256L * 1024
 
+/** G3: rolling window in which concurrent foreign-carry offers are capped. */
+private const val CARRIED_OFFER_EPOCH_MS: Long = 5_000L
+
+private val carriedOfferGate = CarriedOfferEpochGate(CARRIED_OFFER_EPOCH_MS)
+
 /**
  * Decoded pairwise-stream metadata carried out of the delivery switch only
  * after the handler has reached a terminal consumed state.
@@ -695,19 +700,39 @@ internal class InboundEnvelopeProcessor(
         val now = System.currentTimeMillis()
         try {
             store.pruneExpiredCarried(now)
+            // G2: budgeted page + resume cursor (same DTN rules — offer only).
+            val lane = MeshRouter.targetedCarriedLaneFor(address, now)
+            if (lane.skip) {
+                Log.d(TAG, "Targeted carried drain parked for $address (rewalk cooldown)")
+                return
+            }
             // Peer userId hints plus every group that peer is a member of
             // (DESIGN.md §6.5: members mule for the whole group).
             val deliveryHints = store.deliveryHintsForPeer(peerUserId, now)
-            val toDeliver = store.carriedEnvelopesForHints(deliveryHints, now)
-            if (toDeliver.isEmpty()) return
+            val page = store.carriedEnvelopesForHintsPage(
+                deliveryHints,
+                now,
+                CARRIED_SPRAY_BUDGET_BYTES.toULong(),
+                lane.after,
+            )
+            if (page.rows.isEmpty()) {
+                MeshRouter.recordTargetedCarriedProgress(address, page.next, page.exhausted, now)
+                return
+            }
             var delivered = 0
-            for (env in toDeliver) {
+            for (env in page.rows) {
                 val frame = encodeEnvelopeFrame(env.msgId, env.hopTtl, env.expiry, env.recipientHint, env.sealed)
                 if (MeshRouter.sendToAddress(address, frame)) {
                     delivered++
                 }
             }
-            Log.i(TAG, "Attempted delivery of $delivered carried envelope(s) to $address (removal awaits their digest confirmation)")
+            // Never remove carried on send — digest proof only.
+            MeshRouter.recordTargetedCarriedProgress(address, page.next, page.exhausted, now)
+            Log.i(
+                TAG,
+                "Attempted delivery of $delivered/${page.rows.size} carried envelope(s) to $address " +
+                    "(budgeted HELLO drain; exhausted=${page.exhausted}; removal awaits their digest confirmation)",
+            )
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to drain carried envelopes to $address: ${e.message}")
         }
@@ -2126,6 +2151,7 @@ internal class InboundEnvelopeProcessor(
         identity: Identity,
     ) {
         val now = System.currentTimeMillis()
+        var carriedReservation: CarriedOfferEpochGate.Reservation? = null
         try {
             // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): confirm delivery
             // of anything this digest's advertised `msg_id`s prove the peer
@@ -2142,13 +2168,20 @@ internal class InboundEnvelopeProcessor(
             // oldest rows; once the walk reaches the tail the lane parks until
             // its cooldown elapses. A zero budget is the lane's own off switch.
             val lane = MeshRouter.carriedLaneFor(address, now)
+            // G3: cap concurrent foreign-carry offers across peers in a short
+            // epoch so a family desk cannot spray the whole store to N peers
+            // at once. Reservation is atomic across Android's concurrent BLE,
+            // LAN, and relay receive paths. Own mail/receipts still flow when
+            // carried is deferred.
+            carriedReservation = if (lane.skip) null else carriedOfferGate.tryReserve(now)
+            val allowCarried = carriedReservation != null
             val plan = store.coreDigestSprayPlan(
                 ownUserId = identity.userId,
                 peerUserId = peerUserId,
                 peerHints = recentHintsFor(peerUserId, now),
                 peerKnownMsgIds = peerKnownMsgIds,
                 nowMs = now,
-                carriedBudgetBytes = if (lane.skip) 0uL else CARRIED_SPRAY_BUDGET_BYTES.toULong(),
+                carriedBudgetBytes = if (allowCarried) CARRIED_SPRAY_BUDGET_BYTES.toULong() else 0uL,
                 ownOutboundBudgetBytes = OWN_OUTBOUND_SPRAY_BUDGET_BYTES.toULong(),
                 ownReceiptBudgetBytes = OWN_RECEIPT_SPRAY_BUDGET_BYTES.toULong(),
                 receiptQueryLimit = RELAY_STORE_BATCH_LIMIT,
@@ -2156,6 +2189,14 @@ internal class InboundEnvelopeProcessor(
                 hiddenAlreadyOffered = MeshRouter.hiddenOfferedFor(address),
                 carriedCursor = lane.after,
             )
+            if (carriedReservation != null) {
+                if (plan.carriedFrames.isEmpty()) {
+                    carriedOfferGate.release(carriedReservation)
+                } else {
+                    carriedOfferGate.commit(carriedReservation)
+                }
+                carriedReservation = null
+            }
             // Own lanes first, foreign carry last. On a slow link every frame
             // here lands in one FIFO, so whatever goes first delays everything
             // after it: live mail and receipts to real contacts must beat
@@ -2165,16 +2206,19 @@ internal class InboundEnvelopeProcessor(
             val frames = plan.ownOutboundFrames + plan.ownReceiptFrames + plan.carriedFrames
             val sprayed = frames.count { MeshRouter.sendToAddress(address, it) }
             MeshRouter.recordHiddenOffered(address, plan.offeredHiddenMsgIds)
-            if (!lane.skip) {
+            if (allowCarried) {
                 MeshRouter.recordCarriedProgress(address, plan.nextCarriedCursor, plan.carriedExhausted, now)
             }
+            val carriedNote = if (!allowCarried) ", carried deferred (cap/park)" else ""
             Log.i(
                 TAG,
                 "Digest spray to $address sent $sprayed/${frames.size} frame(s) " +
-                    "(carried=${plan.carriedFrames.size}, authored=${plan.ownOutboundFrames.size}, receipts=${plan.ownReceiptFrames.size})",
+                    "(carried=${plan.carriedFrames.size}, authored=${plan.ownOutboundFrames.size}, receipts=${plan.ownReceiptFrames.size}$carriedNote)",
             )
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to build digest spray plan for $address: ${e.message}")
+        } finally {
+            carriedReservation?.let(carriedOfferGate::release)
         }
     }
 }

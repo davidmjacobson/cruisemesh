@@ -527,6 +527,18 @@ pub struct CoreCarriedSyncPage {
     pub exhausted: bool,
 }
 
+/// Home chat-list preview for one chat (G1): last visible message, unread, and
+/// own receipt watermarks — without marshaling the full message history.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct CoreChatPreview {
+    pub chat_id: Vec<u8>,
+    pub last_message: Option<StoredMessage>,
+    pub unread_count: u32,
+    pub own_delivered_through: u64,
+    pub own_read_through: u64,
+    pub avatar_bytes: Option<Vec<u8>>,
+}
+
 /// One locally authored sealed envelope persisted for resend over BLE and
 /// relay. This is the exact §6.4 public header plus sealed bytes, alongside
 /// the local message metadata needed to query the queue by chat/sender/lamport
@@ -1446,6 +1458,92 @@ impl MessageStore {
             .query_map(params![chat_id], row_to_message)
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Home-list row data for one chat without marshaling the full history.
+    ///
+    /// G1 (PRIVATE-TODO §0b): the Android home list used to call
+    /// [`Self::messages_for_chat`] then `core_last_visible_message` per chat on
+    /// the main thread, which under a mesh storm ANR'd. One lock, one last
+    /// visible row, SQL unread, and receipt watermarks — never the whole chat.
+    pub fn chat_preview(
+        &self,
+        chat_id: Vec<u8>,
+        own_user_id: Vec<u8>,
+    ) -> Result<CoreChatPreview, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let last_message = conn
+            .query_row(
+                "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+                 FROM messages
+                 WHERE chat_id = ?1 AND kind IN (?2, ?3, ?4)
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                params![
+                    chat_id,
+                    crate::KIND_TEXT as i64,
+                    crate::KIND_ATTACHMENT_MANIFEST as i64,
+                    crate::KIND_GROUP_INVITE as i64
+                ],
+                row_to_message,
+            )
+            .optional()
+            .map_err(store_err)?;
+        let unread_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages m
+                 WHERE m.chat_id = ?1 AND m.sender_user_id != ?2 AND m.kind IN (?3, ?4, ?5)
+                   AND m.lamport > COALESCE((SELECT through_lamport FROM outgoing_receipts r
+                       WHERE r.chat_id = m.chat_id AND r.sender_user_id = m.sender_user_id
+                         AND r.receipt_type = ?6), 0)",
+                params![
+                    chat_id,
+                    own_user_id,
+                    crate::KIND_TEXT as i64,
+                    crate::KIND_ATTACHMENT_MANIFEST as i64,
+                    crate::KIND_GROUP_INVITE as i64,
+                    crate::RECEIPT_TYPE_READ as i64
+                ],
+                |row| row.get(0),
+            )
+            .map_err(store_err)?;
+        let own_delivered_through: i64 = conn
+            .query_row(
+                "SELECT through_lamport FROM receipts
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
+                params![chat_id, own_user_id, crate::RECEIPT_TYPE_DELIVERED as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?
+            .unwrap_or(0);
+        let own_read_through: i64 = conn
+            .query_row(
+                "SELECT through_lamport FROM receipts
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
+                params![chat_id, own_user_id, crate::RECEIPT_TYPE_READ as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?
+            .unwrap_or(0);
+        let avatar_bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT avatar FROM contacts WHERE user_id = ?1",
+                params![chat_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?
+            .flatten();
+        Ok(CoreChatPreview {
+            chat_id,
+            last_message,
+            unread_count: unread_count as u32,
+            own_delivered_through: own_delivered_through as u64,
+            own_read_through: own_read_through as u64,
+            avatar_bytes,
+        })
     }
 
     /// Record an exact lamport this device consumed from a pairwise stream
@@ -4176,30 +4274,98 @@ impl MessageStore {
         hints: Vec<Vec<u8>>,
         now_ms: i64,
     ) -> Result<Vec<CarriedEnvelope>, CoreError> {
-        if hints.is_empty() {
-            return Ok(Vec::new());
+        // Unlimited page for callers that still want the full matching set
+        // (tests, offline tooling). HELLO drain uses the budgeted page API.
+        Ok(self
+            .carried_envelopes_for_hints_page(hints, now_ms, u64::MAX, None)?
+            .rows)
+    }
+
+    /// Budgeted, cursor-resumable page of carried envelopes matching `hints`
+    /// (G2: HELLO `drainCarriedEnvelopesTo`). Same DTN rules as the unbudgeted
+    /// form: only *offers*; never removes. `budget_bytes == 0` is the off
+    /// switch. Head-of-line oversized exception matches
+    /// [`Self::carried_envelopes_for_peer_sync`].
+    pub fn carried_envelopes_for_hints_page(
+        &self,
+        hints: Vec<Vec<u8>>,
+        now_ms: i64,
+        budget_bytes: u64,
+        after: Option<CoreCarriedCursor>,
+    ) -> Result<CoreCarriedSyncPage, CoreError> {
+        if hints.is_empty() || budget_bytes == 0 {
+            return Ok(CoreCarriedSyncPage {
+                rows: Vec::new(),
+                next: None,
+                exhausted: hints.is_empty(),
+            });
         }
         let conn = lock_conn(&self.conn);
         let placeholders = std::iter::repeat("?")
             .take(hints.len())
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!(
-            "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
+        let mut sql = format!(
+            "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed, received_at
              FROM carried_envelopes
-             WHERE expiry > ?1 AND recipient_hint IN ({placeholders})
-             ORDER BY received_at ASC, msg_id ASC"
+             WHERE expiry > ?1 AND recipient_hint IN ({placeholders})"
         );
-        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
-        let mut bindings: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(hints.len() + 1);
-        bindings.push(&now_ms);
+        let mut bind: Vec<Value> = vec![Value::Integer(now_ms)];
         for hint in &hints {
-            bindings.push(hint);
+            bind.push(Value::Blob(hint.clone()));
         }
+        if let Some(cursor) = &after {
+            sql.push_str(" AND (received_at > ?");
+            bind.push(Value::Integer(cursor.received_at));
+            let received_at_param = bind.len();
+            sql.push_str(&received_at_param.to_string());
+            sql.push_str(" OR (received_at = ?");
+            sql.push_str(&received_at_param.to_string());
+            sql.push_str(" AND msg_id > ?");
+            bind.push(Value::Blob(cursor.msg_id.clone()));
+            sql.push_str(&bind.len().to_string());
+            sql.push_str("))");
+        }
+        sql.push_str(" ORDER BY received_at ASC, msg_id ASC");
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
         let rows = stmt
-            .query_map(bindings.as_slice(), row_to_carried)
+            .query_map(params_from_iter(bind.iter()), |row| {
+                Ok((row_to_carried(row)?, row.get::<_, i64>(5)?))
+            })
             .map_err(store_err)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+        let mut selected: Vec<CarriedEnvelope> = Vec::new();
+        let mut next: Option<CoreCarriedCursor> = None;
+        let mut used = 0_u64;
+        let mut exhausted = true;
+        for row in rows {
+            let (envelope, received_at) = row.map_err(store_err)?;
+            let size = envelope.sealed.len() as u64;
+            if used > 0 && used.saturating_add(size) > budget_bytes {
+                exhausted = false;
+                break;
+            }
+            if used == 0 && size > budget_bytes {
+                // Head-of-line liveness: offer one oversized row, then stop.
+                selected.push(envelope.clone());
+                next = Some(CoreCarriedCursor {
+                    received_at,
+                    msg_id: envelope.msg_id,
+                });
+                exhausted = false;
+                break;
+            }
+            used = used.saturating_add(size);
+            next = Some(CoreCarriedCursor {
+                received_at,
+                msg_id: envelope.msg_id.clone(),
+            });
+            selected.push(envelope);
+        }
+        Ok(CoreCarriedSyncPage {
+            rows: selected,
+            next,
+            exhausted,
+        })
     }
 
     /// Up to `limit` carried-envelope `msg_id`s, oldest first. This is the
@@ -6574,6 +6740,104 @@ mod tests {
             store.messages_for_chat(message.chat_id.clone()).unwrap(),
             vec![message],
         );
+    }
+
+    #[test]
+    fn chat_preview_returns_last_visible_without_full_history_marshal() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let own = b"me".to_vec();
+        let peer = b"alice-id".to_vec();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        store
+            .set_contact_avatar(peer.clone(), Some(vec![9, 9, 9]), 1)
+            .unwrap();
+        // Friend-request noise must not win the preview.
+        store
+            .insert_message(StoredMessage {
+                chat_id: peer.clone(),
+                sender_user_id: peer.clone(),
+                lamport: 1,
+                timestamp: 100,
+                kind: crate::KIND_FRIEND_REQUEST,
+                payload: b"noise".to_vec(),
+            })
+            .unwrap();
+        store
+            .insert_message(StoredMessage {
+                chat_id: peer.clone(),
+                sender_user_id: peer.clone(),
+                lamport: 2,
+                timestamp: 200,
+                kind: crate::KIND_TEXT,
+                payload: b"hello".to_vec(),
+            })
+            .unwrap();
+        store
+            .insert_message(StoredMessage {
+                chat_id: peer.clone(),
+                sender_user_id: peer.clone(),
+                lamport: 3,
+                timestamp: 300,
+                kind: crate::KIND_TEXT,
+                payload: b"world".to_vec(),
+            })
+            .unwrap();
+        let preview = store.chat_preview(peer.clone(), own).unwrap();
+        assert_eq!(preview.chat_id, peer);
+        assert_eq!(preview.last_message.as_ref().map(|m| m.lamport), Some(3));
+        assert_eq!(
+            preview.last_message.as_ref().map(|m| m.payload.as_slice()),
+            Some(b"world".as_slice())
+        );
+        assert_eq!(preview.unread_count, 2);
+        assert_eq!(preview.avatar_bytes, Some(vec![9, 9, 9]));
+        assert_eq!(preview.own_delivered_through, 0);
+        assert_eq!(preview.own_read_through, 0);
+        assert_eq!(store.messages_for_chat(peer).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn carried_envelopes_for_hints_page_respects_budget_and_does_not_remove_rows() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let hint = crate::compute_recipient_hint(b"peer".to_vec(), 0);
+        let now = 1_000_i64;
+        let foreign_budget = i64::MAX;
+        for i in 0..4u8 {
+            store
+                .enqueue_carried_envelope(
+                    CarriedEnvelope {
+                        msg_id: vec![i; 16],
+                        hop_ttl: 5,
+                        expiry: now + 60_000,
+                        recipient_hint: hint.clone(),
+                        sealed: vec![i; 100],
+                    },
+                    false,
+                    now + i as i64,
+                    foreign_budget,
+                )
+                .unwrap();
+        }
+        // 250 bytes fits two 100-byte sealed bodies; third would exceed.
+        let page = store
+            .carried_envelopes_for_hints_page(vec![hint.clone()], now, 250, None)
+            .unwrap();
+        assert_eq!(page.rows.len(), 2);
+        assert!(!page.exhausted);
+        assert!(page.next.is_some());
+        // Rows remain in the store (DTN: offer only).
+        assert_eq!(
+            store
+                .carried_envelopes_for_hints(vec![hint.clone()], now)
+                .unwrap()
+                .len(),
+            4
+        );
+        let page2 = store
+            .carried_envelopes_for_hints_page(vec![hint], now, 250, page.next)
+            .unwrap();
+        assert_eq!(page2.rows.len(), 2);
+        assert!(page2.exhausted);
     }
 
     #[test]

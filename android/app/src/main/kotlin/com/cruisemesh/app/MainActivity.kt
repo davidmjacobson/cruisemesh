@@ -34,7 +34,14 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import com.cruisemesh.app.chat.ChatSummaryLoader
+import com.cruisemesh.app.chat.ChatSummaryRefreshCoordinator
+import com.cruisemesh.app.chat.ChatSummaryRefreshPolicy
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -836,51 +843,33 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     }
 
     var summaries by remember { mutableStateOf(emptyList<ChatSummary>()) }
-    
-    fun reloadSummaries() {
-        val contacts = store.listContacts()
-        val direct = contacts.map { c ->
-            val messages = store.messagesForChat(c.userId)
-            val readThrough = store.receiptThrough(c.userId, identity.userId, RECEIPT_TYPE_READ)
-            val deliveredThrough = store.receiptThrough(c.userId, identity.userId, RECEIPT_TYPE_DELIVERED)
-            val unreadCount = store.semanticUnreadCount(c.userId, identity.userId).toInt()
-            ChatSummary(
-                chatId = c.userId,
-                title = coreContactDisplayName(c),
-                isGroup = false,
-                contact = c,
-                lastMessage = ChatListLogic.lastVisibleMessage(messages),
-                unreadCount = unreadCount,
-                ownDeliveredThrough = deliveredThrough,
-                ownReadThrough = readThrough,
-                avatarBytes = store.contactAvatar(c.userId),
-                draft = DraftStore.load(context, c.userId),
-                isMuted = ChatMuteStore.isMuted(context, c.userId),
-            )
-        }
-        val groups = store.listGroups().map { g ->
-            val messages = store.messagesForChat(g.id)
-            val unreadCount = store.semanticUnreadCount(g.id, identity.userId).toInt()
-            ChatSummary(
-                chatId = g.id,
-                title = g.name,
-                isGroup = true,
-                group = g,
-                lastMessage = ChatListLogic.lastVisibleMessage(messages),
-                unreadCount = unreadCount,
-                ownDeliveredThrough = 0uL,
-                ownReadThrough = 0uL,
-                draft = DraftStore.load(context, g.id),
-                isMuted = ChatMuteStore.isMuted(context, g.id),
-            )
-        }
-        summaries = (direct + groups).sortedByDescending { it.lastMessage?.timestamp ?: 0L }
+    val summaryScope = rememberCoroutineScope()
+    // G1: never load summaries on main. The coordinator debounces bursts,
+    // guarantees a periodic refresh during a sustained storm, and never
+    // cancels an in-flight UniFFI/SQLite load (those calls are blocking and
+    // would keep consuming IO after coroutine cancellation anyway).
+    val summaryRefreshCoordinator = remember(summaryScope, context, store, identity) {
+        ChatSummaryRefreshCoordinator(
+            scope = summaryScope,
+            debounceMs = ChatSummaryRefreshPolicy.DEBOUNCE_MS,
+            maxLatencyMs = ChatSummaryRefreshPolicy.MAX_LATENCY_MS,
+            load = {
+                withContext(Dispatchers.IO) {
+                    ChatSummaryLoader.loadAll(context, store, identity)
+                }
+            },
+            onLoaded = { summaries = it },
+        )
+    }
+
+    fun scheduleSummaryReload(immediate: Boolean = false) {
+        summaryRefreshCoordinator.request(immediate)
     }
 
     LaunchedEffect(Unit) {
-        reloadSummaries()
+        scheduleSummaryReload(immediate = true)
         com.cruisemesh.app.chat.ChatEvents.changes.collect {
-            reloadSummaries()
+            scheduleSummaryReload(immediate = false)
         }
     }
 
@@ -893,7 +882,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 internetDeliveryService = configuredInternetDeliveryService(context)
                 permissionRefreshToken += 1
                 bluetoothEnabled = isBluetoothRadioEnabled(context)
-                reloadSummaries()
+                scheduleSummaryReload(immediate = true)
             }
         }
         navController.addOnDestinationChangedListener(listener)
@@ -941,28 +930,32 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             }
         },
         onDeleteSummary = { summary ->
-            if (summary.isGroup) {
-                store.deleteGroup(summary.chatId)
-            } else {
-                store.deleteContact(summary.chatId)
-                FriendDirectorySender.queueToAllContacts(context, store, identity)
+            summaryScope.launch(Dispatchers.IO) {
+                if (summary.isGroup) {
+                    store.deleteGroup(summary.chatId)
+                } else {
+                    store.deleteContact(summary.chatId)
+                    FriendDirectorySender.queueToAllContacts(context, store, identity)
+                }
+                scheduleSummaryReload(immediate = true)
             }
-            reloadSummaries()
         },
         onMarkRead = { summary ->
-            val senderIds = if (summary.isGroup) {
-                summary.group?.memberUserIds.orEmpty().filterNot { it.contentEquals(identity.userId) }
-            } else {
-                listOf(summary.chatId)
-            }
-            for (senderId in senderIds) {
-                val through = store.highestLamport(summary.chatId, senderId)
-                if (through > 0uL) {
-                    store.recordOutgoingReceipt(summary.chatId, senderId, RECEIPT_TYPE_READ, through)
+            summaryScope.launch(Dispatchers.IO) {
+                val senderIds = if (summary.isGroup) {
+                    summary.group?.memberUserIds.orEmpty().filterNot { it.contentEquals(identity.userId) }
+                } else {
+                    listOf(summary.chatId)
                 }
+                for (senderId in senderIds) {
+                    val through = store.highestLamport(summary.chatId, senderId)
+                    if (through > 0uL) {
+                        store.recordOutgoingReceipt(summary.chatId, senderId, RECEIPT_TYPE_READ, through)
+                    }
+                }
+                MessageNotifier.cancel(context, summary.chatId)
+                scheduleSummaryReload(immediate = true)
             }
-            MessageNotifier.cancel(context, summary.chatId)
-            reloadSummaries()
         },
         onNewChatClick = { navController.navigate("contacts") },
         onAddFriendClick = { navController.navigate("addFriend") },

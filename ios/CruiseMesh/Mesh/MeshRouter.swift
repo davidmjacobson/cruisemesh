@@ -87,6 +87,15 @@ enum MeshRouter {
         state.recordCarriedProgress(address: address, next: next, exhausted: exhausted, nowMs: nowMs)
     }
 
+    /// Targeted HELLO drain lane (envelopes for this peer) — G2.
+    static func targetedCarriedLaneFor(address: String, nowMs: Int64) -> CoreCarriedLane {
+        state.targetedCarriedLaneFor(address: address, nowMs: nowMs)
+    }
+
+    static func recordTargetedCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64) {
+        state.recordTargetedCarriedProgress(address: address, next: next, exhausted: exhausted, nowMs: nowMs)
+    }
+
     static func userIdFor(address: String) -> Data? {
         state.userIdFor(address: address)
     }

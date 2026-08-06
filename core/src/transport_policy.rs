@@ -43,6 +43,33 @@ pub fn digest_is_expected_chat_id(digest_chat_id: Vec<u8>, hello_user_id: Option
 pub const REDIGEST_MIN_INTERVAL_MS: i64 = 3 * 60_000;
 pub const REDIGEST_MAX_INTERVAL_MS: i64 = 5 * 60_000;
 
+/// Max peers that may offer foreign-carry frames in one multi-peer spray pass
+/// (G3). A family desk can have 10+ simultaneous BLE links; walking the full
+/// carry store to every peer at once is a self-DoS. Shells count how many
+/// peers already received a non-skip carried offer this pass and consult
+/// [`may_start_carried_offer`] before starting another.
+pub const MAX_CONCURRENT_CARRIED_OFFERS: u32 = 2;
+
+/// Whether another peer may begin a foreign-carry offer given how many
+/// offers are already in flight this pass.
+#[uniffi::export]
+pub fn may_start_carried_offer(active_offers: u32) -> bool {
+    active_offers < MAX_CONCURRENT_CARRIED_OFFERS
+}
+
+#[cfg(test)]
+mod concurrent_offer_tests {
+    use super::*;
+
+    #[test]
+    fn may_start_carried_offer_caps_family_scale_spray() {
+        assert!(may_start_carried_offer(0));
+        assert!(may_start_carried_offer(MAX_CONCURRENT_CARRIED_OFFERS - 1));
+        assert!(!may_start_carried_offer(MAX_CONCURRENT_CARRIED_OFFERS));
+        assert!(!may_start_carried_offer(MAX_CONCURRENT_CARRIED_OFFERS + 5));
+    }
+}
+
 /// How long the foreign-carry lane of the digest spray stays parked on a link
 /// after it has walked this device's whole carry queue once.
 ///
@@ -135,6 +162,11 @@ struct Peer {
     /// evidence the previous session's frames survived the link.
     carried_cursor: Option<CoreCarriedCursor>,
     carried_walk_done_at_ms: Option<i64>,
+    /// Targeted HELLO drain (envelopes *for* this peer via
+    /// `carried_envelopes_for_hints_page`). Disjoint from the foreign-carry
+    /// cursor: different row sets, so they must not share resume state.
+    targeted_carried_cursor: Option<CoreCarriedCursor>,
+    targeted_carried_walk_done_at_ms: Option<i64>,
 }
 
 /// What the foreign-carry lane should do on this link right now
@@ -172,6 +204,8 @@ impl CoreMeshRouterState {
                 hidden_offered: std::collections::HashSet::new(),
                 carried_cursor: None,
                 carried_walk_done_at_ms: None,
+                targeted_carried_cursor: None,
+                targeted_carried_walk_done_at_ms: None,
             },
         );
     }
@@ -195,6 +229,8 @@ impl CoreMeshRouterState {
         peer.hidden_offered.clear();
         peer.carried_cursor = None;
         peer.carried_walk_done_at_ms = None;
+        peer.targeted_carried_cursor = None;
+        peer.targeted_carried_walk_done_at_ms = None;
         true
     }
 
@@ -327,6 +363,55 @@ impl CoreMeshRouterState {
         } else if next.is_some() {
             peer.carried_cursor = next;
             peer.carried_walk_done_at_ms = None;
+        }
+    }
+
+    /// Where the targeted HELLO carried drain should resume (G2), same three
+    /// states as [`Self::carried_lane_for`] but on a disjoint cursor.
+    pub fn targeted_carried_lane_for(&self, address: String, now_ms: i64) -> CoreCarriedLane {
+        let peers = self.peers.lock_recoverable();
+        let Some(peer) = peers.get(&address) else {
+            return CoreCarriedLane {
+                skip: false,
+                after: None,
+            };
+        };
+        match peer.targeted_carried_walk_done_at_ms {
+            Some(done_at) if now_ms.saturating_sub(done_at) < CARRIED_REWALK_MIN_INTERVAL_MS => {
+                CoreCarriedLane {
+                    skip: true,
+                    after: None,
+                }
+            }
+            Some(_) => CoreCarriedLane {
+                skip: false,
+                after: None,
+            },
+            None => CoreCarriedLane {
+                skip: false,
+                after: peer.targeted_carried_cursor.clone(),
+            },
+        }
+    }
+
+    /// Record progress of a targeted HELLO carried drain (G2).
+    pub fn record_targeted_carried_progress(
+        &self,
+        address: String,
+        next: Option<CoreCarriedCursor>,
+        exhausted: bool,
+        now_ms: i64,
+    ) {
+        let mut peers = self.peers.lock_recoverable();
+        let Some(peer) = peers.get_mut(&address) else {
+            return;
+        };
+        if exhausted {
+            peer.targeted_carried_cursor = None;
+            peer.targeted_carried_walk_done_at_ms = Some(now_ms);
+        } else if next.is_some() {
+            peer.targeted_carried_cursor = next;
+            peer.targeted_carried_walk_done_at_ms = None;
         }
     }
 

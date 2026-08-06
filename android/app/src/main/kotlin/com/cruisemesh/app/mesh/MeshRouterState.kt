@@ -24,6 +24,10 @@ class MeshRouterState {
     fun carriedLaneFor(address: String, nowMs: Long): CoreCarriedLane = core.carriedLaneFor(address, nowMs)
     fun recordCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Boolean, nowMs: Long) =
         core.recordCarriedProgress(address, next, exhausted, nowMs)
+    fun targetedCarriedLaneFor(address: String, nowMs: Long): CoreCarriedLane =
+        core.targetedCarriedLaneFor(address, nowMs)
+    fun recordTargetedCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Boolean, nowMs: Long) =
+        core.recordTargetedCarriedProgress(address, next, exhausted, nowMs)
     fun userIdFor(address: String): ByteArray? = core.userIdFor(address)
     fun transportFor(address: String): Transport? = core.transportFor(address)?.toPlatform()
     fun connectedRoutes(): List<Pair<Transport, String>> = core.connectedRoutes().map { it.transport.toPlatform() to it.address }
