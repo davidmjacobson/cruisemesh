@@ -81,8 +81,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private var relayTimer: DispatchSourceTimer?
     /// CP2b: epoch ms until which relayd asked us not to sync again
     /// (`Retry-After` on a 429); 0 = no backoff. `runRelaySync` drops nudges
-    /// inside the window; the 60 s poll tick retries once it has passed.
+    /// inside the window; `relayRateLimitRetryWorkItem` retries at its end.
     private var relayRateLimitedUntilMs: Int64 = 0
+    private var relayRateLimitRetryWorkItem: DispatchWorkItem?
+    private let familyRelayRequestPacer = FamilyRelayRequestPacer()
+    private let familyRelayBackoff = FamilyRelayBackoff()
     private var pathMonitor: NWPathMonitor?
     /// DTN_TODOS.md D3 (iOS half of audit finding F1, "relay poll-only"): opens
     /// relayd's `GET /ws` push socket (see `RelayPushClient`'s class doc) once
@@ -394,6 +397,9 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         relayTimer?.cancel()
         relayTimer = nil
         relayRateLimitedUntilMs = 0
+        relayRateLimitRetryWorkItem?.cancel()
+        relayRateLimitRetryWorkItem = nil
+        familyRelayBackoff.onSuccessfulPass()
         lastKnownPushHealthy = nil
         pathMonitor?.cancel()
         pathMonitor = nil
@@ -3105,7 +3111,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // success flags already express it as .failing. Mirrors
         // RelaySyncEngine.kt's noteOwnRelayFault.
         var ownRelayFault: CoreRelayFault?
-        var ownRetryAfterMs: UInt64 = 0
+        var familyRetryDelayMs: UInt64 = 0
         func noteFailure(_ error: Error, usedConfig: RelayConfig) {
             guard let own = config,
                   usedConfig.relayUrl == own.relayUrl,
@@ -3117,9 +3123,37 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             )
             guard fault != .outage else { return }
             ownRelayFault = RelayHealth.worseFault(ownRelayFault, fault)
-            if fault == .rateLimited {
-                ownRetryAfterMs = max(ownRetryAfterMs, relayRetryAfterMs(retryAfterHeader: relay.retryAfter))
+        }
+        let identityHash = familyRelayIdentityHash(identity.userId)
+        func relayRequest<T>(_ operation: () throws -> T) throws -> T {
+            let monotonicNowMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+            let waitMs = familyRelayRequestPacer.reserve(nowMs: monotonicNowMs)
+            if waitMs > 0 {
+                Thread.sleep(forTimeInterval: Double(waitMs) / 1_000)
             }
+            do {
+                return try operation()
+            } catch let relay as RelayHTTPError {
+                let fault = relayClassifyHttpError(
+                    httpStatus: UInt16(clamping: relay.statusCode),
+                    relayCode: relay.relayCode
+                )
+                guard fault == .rateLimited else { throw relay }
+                let advertisedMs = relayRetryAfterMs(retryAfterHeader: relay.retryAfter)
+                let delayMs = familyRelayBackoff.onRateLimited(
+                    retryAfterMs: advertisedMs,
+                    identityHash: identityHash
+                )
+                // A 429 is a family-token budget verdict even when this
+                // particular request used a contact-resolved config. Surface
+                // it and halt the whole pass rather than spending more budget.
+                ownRelayFault = RelayHealth.worseFault(ownRelayFault, .rateLimited)
+                familyRetryDelayMs = max(familyRetryDelayMs, delayMs)
+                throw FamilyRelayRateLimitAbort(retryDelayMs: delayMs)
+            }
+        }
+        func rethrowFamilyRateLimit(_ error: Error) throws {
+            if error is FamilyRelayRateLimitAbort { throw error }
         }
         do {
             // Upload receipts first, then authored, then family carry --
@@ -3314,10 +3348,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                       let cfg = sendConfig(for: contact)
                 else { continue }
                 do {
-                    _ = try RelayClient.postReceiptEnvelope(config: cfg, envelope: env)
+                    _ = try relayRequest { try RelayClient.postReceiptEnvelope(config: cfg, envelope: env) }
                     _ = try store.markOutgoingReceiptEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
                     noteContactSuccess(contact: contact, usedConfig: cfg)
                 } catch {
+                    try rethrowFamilyRateLimit(error)
                     noteFailure(error, usedConfig: cfg)
                     noteContactFailure(error, contact: contact, usedConfig: cfg)
                 }
@@ -3384,9 +3419,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                         // (e.g. a group deleted mid-queue); keep the legacy
                         // single post so the envelope isn't stranded.
                         do {
-                            _ = try RelayClient.postOutboundEnvelope(config: cfg, envelope: env)
+                            _ = try relayRequest { try RelayClient.postOutboundEnvelope(config: cfg, envelope: env) }
                             _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
-                        } catch { noteFailure(error, usedConfig: cfg) }
+                        } catch {
+                            try rethrowFamilyRateLimit(error)
+                            noteFailure(error, usedConfig: cfg)
+                        }
                         continue
                     }
                     // Group-addressed: per-member fan-out instead of one
@@ -3406,9 +3444,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     var posted = 0
                     for row in rows {
                         do {
-                            _ = try RelayClient.postFanoutRow(config: cfg, row: row)
+                            _ = try relayRequest { try RelayClient.postFanoutRow(config: cfg, row: row) }
                             posted += 1
-                        } catch { noteFailure(error, usedConfig: cfg) }
+                        } catch {
+                            try rethrowFamilyRateLimit(error)
+                            noteFailure(error, usedConfig: cfg)
+                        }
                     }
                     if posted == rows.count {
                         _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
@@ -3417,10 +3458,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 }
                 guard let cfg = sendConfig(for: contact) else { continue }
                 do {
-                    _ = try RelayClient.postOutboundEnvelope(config: cfg, envelope: env)
+                    _ = try relayRequest { try RelayClient.postOutboundEnvelope(config: cfg, envelope: env) }
                     _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
                     noteContactSuccess(contact: contact, usedConfig: cfg)
                 } catch {
+                    try rethrowFamilyRateLimit(error)
                     noteFailure(error, usedConfig: cfg)
                     noteContactFailure(error, contact: contact, usedConfig: cfg)
                 }
@@ -3448,10 +3490,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 if let contact = (try? store.contactMatchingHint(hint: env.recipientHint, nowMs: now)) ?? nil {
                     guard let cfg = sendConfig(for: contact) else { continue }
                     do {
-                        _ = try RelayClient.postCarriedEnvelope(config: cfg, envelope: env)
+                        _ = try relayRequest { try RelayClient.postCarriedEnvelope(config: cfg, envelope: env) }
                         _ = try store.markCarriedEnvelopeRelayUploaded(msgId: env.msgId, relayUrl: cfg.relayUrl)
                         noteContactSuccess(contact: contact, usedConfig: cfg)
                     } catch {
+                        try rethrowFamilyRateLimit(error)
                         noteFailure(error, usedConfig: cfg)
                         noteContactFailure(error, contact: contact, usedConfig: cfg)
                     }
@@ -3472,9 +3515,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     var posted = 0
                     for row in rows {
                         do {
-                            _ = try RelayClient.postFanoutRow(config: cfg, row: row)
+                            _ = try relayRequest { try RelayClient.postFanoutRow(config: cfg, row: row) }
                             posted += 1
-                        } catch { noteFailure(error, usedConfig: cfg) }
+                        } catch {
+                            try rethrowFamilyRateLimit(error)
+                            noteFailure(error, usedConfig: cfg)
+                        }
                     }
                     if posted == rows.count, !rows.isEmpty {
                         _ = try? store.markCarriedEnvelopeRelayUploaded(msgId: env.msgId, relayUrl: cfg.relayUrl)
@@ -3553,11 +3599,13 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                             presenceHints(contact.userId, now).map { ($0, contact.userId) }
                         })
                         do {
-                            let page = try RelayClient.syncPresence(
-                                config: cfg,
-                                announce: announce,
-                                query: query
-                            )
+                            let page = try relayRequest {
+                                try RelayClient.syncPresence(
+                                    config: cfg,
+                                    announce: announce,
+                                    query: query
+                                )
+                            }
                             let localNow = Int64(Date().timeIntervalSince1970 * 1_000)
                             // The store write stays off the main actor (it was
                             // only ever inside the hop because the published
@@ -3586,7 +3634,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                                     }
                                 }
                             }
-                        } catch { noteFailure(error, usedConfig: cfg) }
+                        } catch {
+                            try rethrowFamilyRateLimit(error)
+                            noteFailure(error, usedConfig: cfg)
+                        }
                     }
                 }
                 // FI2 proxy-polling included: core's relayFetchHints is self +
@@ -3664,15 +3715,17 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                         try? store.noteRelaySweepCompleted(configKey: cursorKey, nowMs: now)
                     }
                     while true {
-                        let fetched = try RelayClient.fetchEnvelopesWithinResponseCap(
-                            config: cfg,
-                            hints: fetchHints,
-                            afterId: afterId,
-                            limit: fetchBatchLimit
-                        ) { tried, smaller in
-                            relaySyncLog.warning(
-                                "Relay page was too big to take at limit=\(tried, privacy: .public); retrying with limit=\(smaller, privacy: .public)"
-                            )
+                        let fetched = try relayRequest {
+                            try RelayClient.fetchEnvelopesWithinResponseCap(
+                                config: cfg,
+                                hints: fetchHints,
+                                afterId: afterId,
+                                limit: fetchBatchLimit
+                            ) { tried, smaller in
+                                relaySyncLog.warning(
+                                    "Relay page was too big to take at limit=\(tried, privacy: .public); retrying with limit=\(smaller, privacy: .public)"
+                                )
+                            }
                         }
                         let page = fetched.page
                         // Carried to the next page of THIS mailbox only; see
@@ -3740,9 +3793,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                             // there until expiry, so the frontier waits for the
                             // next pass to retry.
                             if !acks.isEmpty {
-                                try RelayClient.ackEnvelopes(config: cfg, ids: acks)
+                                try relayRequest { try RelayClient.ackEnvelopes(config: cfg, ids: acks) }
                             }
                         } catch {
+                            try rethrowFamilyRateLimit(error)
                             pageFullyProcessed = false
                             noteFailure(error, usedConfig: cfg)
                             relaySyncLog.warning(
@@ -3783,6 +3837,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                         if mailboxAnswered { ownRelayAnswered = true }
                     }
                 } catch {
+                    try rethrowFamilyRateLimit(error)
                     // A contact can carry stale relay credentials from an
                     // older friend card. That mailbox failing must not abort
                     // polling of the remaining relays or declare our own
@@ -3824,9 +3879,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     "Contact \(contactId, privacy: .public) relay host=\(relayHost, privacy: .public) did not answer while our own did (silent passes=\(streak, privacy: .public)); resting it rather than retrying every pass"
                 )
             }
+            familyRelayBackoff.onSuccessfulPass()
             let syncedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
             let fault = ownRelayFault
-            let retryAfterMs = ownRetryAfterMs
+            let retryAfterMs = familyRetryDelayMs
             let ownSucceeded = ownRelaySucceeded
             let anySucceeded = anyRelaySucceeded
             // Reported from the streak alone, not from either current
@@ -3857,9 +3913,14 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             }
         } catch {
             if let config { noteFailure(error, usedConfig: config) }
-            let message = error.localizedDescription
+            let message: String
+            if let rateLimit = error as? FamilyRelayRateLimitAbort {
+                message = "Family relay rate limit halted pass; retrying in \(rateLimit.retryDelayMs)ms"
+            } else {
+                message = error.localizedDescription
+            }
             let fault = ownRelayFault
-            let retryAfterMs = ownRetryAfterMs
+            let retryAfterMs = familyRetryDelayMs
             await MainActor.run {
                 let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
                 MeshConnectivityStatus.shared.setRelayHealth(RelayHealth.afterSyncPass(
@@ -3876,13 +3937,26 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// CP2b: remember (or clear) the window relayd's Retry-After asked us to
-    /// stay quiet for. `runRelaySync` consults it before starting a pass.
+    /// Remember (or clear) the family quiet window and keep exactly one retry
+    /// scheduled at its end. `runRelaySync` coalesces every earlier nudge.
     private func noteRelayRateLimit(fault: CoreRelayFault?, retryAfterMs: UInt64) {
         if fault == .rateLimited {
             relayRateLimitedUntilMs = Int64(Date().timeIntervalSince1970 * 1_000) + Int64(retryAfterMs)
+            relayRateLimitRetryWorkItem?.cancel()
+            let retry = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.relayRateLimitRetryWorkItem = nil
+                self.runRelaySync()
+            }
+            relayRateLimitRetryWorkItem = retry
+            meshQueue.asyncAfter(
+                deadline: .now() + .milliseconds(Int(clamping: retryAfterMs)),
+                execute: retry
+            )
         } else {
             relayRateLimitedUntilMs = 0
+            relayRateLimitRetryWorkItem?.cancel()
+            relayRateLimitRetryWorkItem = nil
         }
     }
 
