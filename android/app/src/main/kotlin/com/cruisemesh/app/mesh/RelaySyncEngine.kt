@@ -1059,7 +1059,13 @@ internal class RelaySyncEngine(
             fallbackConfig?.let { add(it) }
             for (contact in contacts) {
                 val config = resolvedPollRelayConfig(contact, fallbackConfig) ?: continue
-                if (!contains(config)) add(config)
+                if (!contains(config)) {
+                    add(config)
+                    Log.i(
+                        TAG,
+                        "Secondary relay poll config added for contact ${UserIdHex.encode(contact.userId)}: ${config.relayUrl}",
+                    )
+                }
             }
         }
 

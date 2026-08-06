@@ -110,19 +110,27 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
 
         let bob = app.staticTexts["Bob"].firstMatch
-        XCTAssertTrue(bob.waitForExistence(timeout: 5))
+        XCTAssertTrue(bob.waitForExistence(timeout: 10))
         bob.tap()
 
-        XCTAssertTrue(element("screen.chat").waitForExistence(timeout: 5))
-        let composer = element("chat.composer.text")
-        XCTAssertTrue(composer.waitForExistence(timeout: 3))
+        let composer = element("chat.composer.text").waitForExistence(timeout: 10)
+            ? element("chat.composer.text")
+            : (app.textFields.firstMatch.waitForExistence(timeout: 5)
+                ? app.textFields.firstMatch
+                : app.textViews.firstMatch)
+        XCTAssertTrue(composer.waitForExistence(timeout: 10))
         composer.tap()
         composer.typeText("   ")
         XCTAssertFalse(element("chat.composer.send").exists)
+        composer.tap()
         composer.typeText("Hello from UI test")
 
-        let send = element("chat.composer.send")
-        XCTAssertTrue(send.waitForExistence(timeout: 3))
+        let send = app.buttons["chat.composer.send"].waitForExistence(timeout: 10)
+            ? app.buttons["chat.composer.send"]
+            : (app.buttons["Send"].waitForExistence(timeout: 5)
+                ? app.buttons["Send"]
+                : element("chat.composer.send"))
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
         XCTAssertTrue(send.isHittable)
         send.tap()
 

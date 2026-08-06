@@ -49,6 +49,7 @@ struct ChatComposerBar: View {
                 .accessibilityLabel("Attach")
 
                 TextField("Message", text: $draft, axis: .vertical)
+                    .accessibilityIdentifier("chat.composer.text")
                     .lineLimit(1...4)
                     .focused(composerFocused)
                     .padding(.horizontal, 14)
@@ -57,7 +58,6 @@ struct ChatComposerBar: View {
                         Capsule(style: .continuous)
                             .fill(Color(uiColor: .secondarySystemBackground))
                     )
-                    .accessibilityIdentifier("chat.composer.text")
 
                 if canSend {
                     Button(action: onSend) {
