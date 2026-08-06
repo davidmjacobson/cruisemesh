@@ -2312,8 +2312,9 @@ public protocol MessageStoreProtocol : AnyObject {
      * - [`CoreInboundDisposition::Seen`]: gather two independent pieces of
      * store evidence and ack only if
      * [`core_consumed_seen_is_ackable_with_hidden`] says so:
-     * [`Self::message_origin_by_msg_id`] (did we durably store this exact
-     * envelope as a 1:1 message from someone else?) and, for the kinds
+     * [`Self::message_origin_by_msg_id`] (did we durably retain this exact
+     * envelope as an accepted or quarantined 1:1 message from someone
+     * else?) and, for the kinds
      * that leave no such row, [`Self::consumed_hidden_msg_id_recorded`]
      * together with an own-self-hint check on the fetched row's
      * `recipient_hint`. Neither route acks something we merely muled,
@@ -2662,9 +2663,20 @@ public protocol MessageStoreProtocol : AnyObject {
 
     /**
      * Insert an opened incoming message together with the envelope id used
-     * for quoting it and an optional encrypted reply target.
+     * for quoting it and an optional encrypted reply target. `false` means
+     * either a true duplicate or a quarantined conflict; callers that log or
+     * otherwise act differently on those outcomes should use
+     * [`Self::insert_incoming_message_classified`].
      */
     func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgId: Data?) throws  -> Bool
+
+    /**
+     * Insert an opened incoming message without arrival-route evidence while
+     * preserving the full duplicate-versus-quarantine result. This covers
+     * local carry-queue drains where no live transport can truthfully be
+     * attributed to the original arrival.
+     */
+    func insertIncomingMessageClassified(message: StoredMessage, msgId: Data, replyToMsgId: Data?) throws  -> IncomingMessageInsertOutcome
 
     /**
      * Insert an opened incoming message and atomically retain first-arrival
@@ -2693,7 +2705,9 @@ public protocol MessageStoreProtocol : AnyObject {
      * - **Identical** on all three -> true duplicate. No-op, returns `Ok(false)`,
      * same behavior as the old plain `INSERT OR IGNORE`.
      * - **Different** -> ambiguous conflict. Keep the existing branch and all
-     * receipt state, ignore the incoming message, and return `Ok(false)`.
+     * receipt state, quarantine the private incoming content, and return
+     * `Ok(false)`. Callers that must distinguish this from a duplicate
+     * should use one of the classified incoming methods instead.
      * Timestamps cannot break the tie: they are sender wall-clock display
      * hints and may be wrong. A delayed courier or restored backup can
      * legitimately replay an older authenticated branch, while a confused
@@ -2815,8 +2829,9 @@ public protocol MessageStoreProtocol : AnyObject {
     func messageConflictSummaries(limit: UInt32) throws  -> [MessageConflictSummary]
 
     /**
-     * Chat and sender of a stored message keyed by its stable envelope
-     * `msg_id` alone, searched across every chat -- unlike
+     * Chat and sender of a durably consumed message keyed by its stable
+     * envelope `msg_id` alone, searched across accepted messages and the
+     * bounded conflict quarantine -- unlike
      * [`Self::message_by_msg_id`], which needs `chat_id` up front and is
      * useless here because a relay-fetched envelope only carries its own
      * `msg_id`.
@@ -2824,16 +2839,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * This backs the consumed-SEEN relay ack rule in `engine.rs`
      * (`MessageStore::core_relay_ack_ids_with_consumed`): a relay-fetched
      * copy that dedupes as `Seen` (already handled via some other path) is
-     * only safe to ack if THIS device actually consumed it as a real
-     * message, not merely muled it. A row only exists here for kinds that
-     * persist a durable `msg_id` -- 1:1/group text, attachment manifests,
-     * reactions (inserted via `insert_incoming_message`) and our own
-     * authored messages (via `insert_outgoing_message`/
-     * `insert_outgoing_reply`). Hidden kinds -- receipts, profile sync,
-     * friend requests/directory, group invites, LAN endpoint hints -- are
-     * stored, if at all, via the plain `insert_message` with `msg_id =
-     * NULL`, so they never match and the caller correctly treats "no
-     * match" as "cannot vouch for this copy, don't ack."
+     * only safe to ack if THIS device actually consumed and durably retained
+     * it as a real message, not merely muled it. An accepted message row or a
+     * quarantined alternative can provide that evidence for kinds carrying a
+     * durable `msg_id` -- 1:1/group text, attachment manifests, reactions,
+     * and group metadata updates. Hidden kinds -- receipts, profile sync,
+     * friend requests/directory, group invites, LAN endpoint hints -- use the
+     * plain `insert_message` path with no id and therefore never match here.
      *
      * Returns `None` for an unknown `msg_id` (never stored, or hidden-kind
      * with no durable id). The store deliberately returns the raw
@@ -4312,8 +4324,9 @@ open func coreRecordConsumedHiddenMsgId(msgId: Data, kind: UInt8, recipientHint:
      * - [`CoreInboundDisposition::Seen`]: gather two independent pieces of
      * store evidence and ack only if
      * [`core_consumed_seen_is_ackable_with_hidden`] says so:
-     * [`Self::message_origin_by_msg_id`] (did we durably store this exact
-     * envelope as a 1:1 message from someone else?) and, for the kinds
+     * [`Self::message_origin_by_msg_id`] (did we durably retain this exact
+     * envelope as an accepted or quarantined 1:1 message from someone
+     * else?) and, for the kinds
      * that leave no such row, [`Self::consumed_hidden_msg_id_recorded`]
      * together with an own-self-hint check on the fetched row's
      * `recipient_hint`. Neither route acks something we merely muled,
@@ -4833,11 +4846,30 @@ open func hintMatchesKnownTarget(hint: Data, nowMs: Int64)throws  -> Bool {
 
     /**
      * Insert an opened incoming message together with the envelope id used
-     * for quoting it and an optional encrypted reply target.
+     * for quoting it and an optional encrypted reply target. `false` means
+     * either a true duplicate or a quarantined conflict; callers that log or
+     * otherwise act differently on those outcomes should use
+     * [`Self::insert_incoming_message_classified`].
      */
 open func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgId: Data?)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_insert_incoming_message(self.uniffiClonePointer(),
+        FfiConverterTypeStoredMessage.lower(message),
+        FfiConverterData.lower(msgId),
+        FfiConverterOptionData.lower(replyToMsgId),$0
+    )
+})
+}
+
+    /**
+     * Insert an opened incoming message without arrival-route evidence while
+     * preserving the full duplicate-versus-quarantine result. This covers
+     * local carry-queue drains where no live transport can truthfully be
+     * attributed to the original arrival.
+     */
+open func insertIncomingMessageClassified(message: StoredMessage, msgId: Data, replyToMsgId: Data?)throws  -> IncomingMessageInsertOutcome {
+    return try  FfiConverterTypeIncomingMessageInsertOutcome.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_insert_incoming_message_classified(self.uniffiClonePointer(),
         FfiConverterTypeStoredMessage.lower(message),
         FfiConverterData.lower(msgId),
         FfiConverterOptionData.lower(replyToMsgId),$0
@@ -4881,7 +4913,9 @@ open func insertIncomingMessageWithArrival(message: StoredMessage, msgId: Data, 
      * - **Identical** on all three -> true duplicate. No-op, returns `Ok(false)`,
      * same behavior as the old plain `INSERT OR IGNORE`.
      * - **Different** -> ambiguous conflict. Keep the existing branch and all
-     * receipt state, ignore the incoming message, and return `Ok(false)`.
+     * receipt state, quarantine the private incoming content, and return
+     * `Ok(false)`. Callers that must distinguish this from a duplicate
+     * should use one of the classified incoming methods instead.
      * Timestamps cannot break the tie: they are sender wall-clock display
      * hints and may be wrong. A delayed courier or restored backup can
      * legitimately replay an older authenticated branch, while a confused
@@ -5116,8 +5150,9 @@ open func messageConflictSummaries(limit: UInt32)throws  -> [MessageConflictSumm
 }
 
     /**
-     * Chat and sender of a stored message keyed by its stable envelope
-     * `msg_id` alone, searched across every chat -- unlike
+     * Chat and sender of a durably consumed message keyed by its stable
+     * envelope `msg_id` alone, searched across accepted messages and the
+     * bounded conflict quarantine -- unlike
      * [`Self::message_by_msg_id`], which needs `chat_id` up front and is
      * useless here because a relay-fetched envelope only carries its own
      * `msg_id`.
@@ -5125,16 +5160,13 @@ open func messageConflictSummaries(limit: UInt32)throws  -> [MessageConflictSumm
      * This backs the consumed-SEEN relay ack rule in `engine.rs`
      * (`MessageStore::core_relay_ack_ids_with_consumed`): a relay-fetched
      * copy that dedupes as `Seen` (already handled via some other path) is
-     * only safe to ack if THIS device actually consumed it as a real
-     * message, not merely muled it. A row only exists here for kinds that
-     * persist a durable `msg_id` -- 1:1/group text, attachment manifests,
-     * reactions (inserted via `insert_incoming_message`) and our own
-     * authored messages (via `insert_outgoing_message`/
-     * `insert_outgoing_reply`). Hidden kinds -- receipts, profile sync,
-     * friend requests/directory, group invites, LAN endpoint hints -- are
-     * stored, if at all, via the plain `insert_message` with `msg_id =
-     * NULL`, so they never match and the caller correctly treats "no
-     * match" as "cannot vouch for this copy, don't ack."
+     * only safe to ack if THIS device actually consumed and durably retained
+     * it as a real message, not merely muled it. An accepted message row or a
+     * quarantined alternative can provide that evidence for kinds carrying a
+     * durable `msg_id` -- 1:1/group text, attachment manifests, reactions,
+     * and group metadata updates. Hidden kinds -- receipts, profile sync,
+     * friend requests/directory, group invites, LAN endpoint hints -- use the
+     * plain `insert_message` path with no id and therefore never match here.
      *
      * Returns `None` for an unknown `msg_id` (never stored, or hidden-kind
      * with no durable id). The store deliberately returns the raw
@@ -16875,17 +16907,17 @@ public func contactDelivery(contactRelayUrl: String?, contactRelayToken: String?
  * exact `msg_id`, as a 1:1 message addressed to us and to us alone?"
  *
  * `origin` is [`MessageStore::message_origin_by_msg_id`]'s result for the
- * envelope's `msg_id`, or `None` if no such row exists. A row only exists
- * for kinds that persist a durable `msg_id`: 1:1/group text, attachment
- * manifests, and reactions (inserted via `insert_incoming_message`), plus
- * our own authored outbound messages (`insert_outgoing_message`/
- * `insert_outgoing_reply`). Of those, exactly one shape is ackable -- a 1:1
- * incoming row, recognizable by the local storage convention that a 1:1
- * chat is keyed by the other party, so `chat_id == sender_user_id`:
+ * envelope's `msg_id`, or `None` if no durable accepted/quarantined record
+ * exists. Such evidence exists for kinds that persist a `msg_id`:
+ * 1:1/group text, attachment manifests, reactions, and group metadata, plus
+ * our own authored outbound messages. Of those, exactly one shape is
+ * ackable -- a 1:1 incoming record, recognizable by the local storage
+ * convention that a 1:1 chat is keyed by the other party, so
+ * `chat_id == sender_user_id`:
  *
  * - `origin` is `None` -> NOT ackable *on this evidence*. Either we never
- * consumed it (merely muled/flooded a copy -- the relay copy is the real
- * recipient's durable fallback), or it was a hidden kind -- receipts,
+ * consumed and retained it (merely muled/flooded a copy -- the relay copy
+ * is the real recipient's durable fallback), or it was a hidden kind -- receipts,
  * profile sync, friend requests/directory, group invites, LAN endpoint
  * hints, relay-change notices -- which are stored (if at all) via the
  * plain `insert_message` path that never records a `msg_id`. Hidden kinds
@@ -16900,12 +16932,13 @@ public func contactDelivery(contactRelayUrl: String?, contactRelayToken: String?
  * always dedupes as Seen): that relay copy exists *for the recipient*,
  * and deleting it would silently drop their only remaining way to fetch
  * the message.
- * - `chat_id != sender_user_id` -> a GROUP row -> NOT ackable. This SEEN
- * copy means we already durably consumed a copy of this exact `msg_id`
- * as a group message -- almost always over BLE first, with the relay
- * fetch re-presenting the SAME `msg_id` a moment later and deduping to
- * SEEN. The relay copy in that shape is always the per-member fan-out row
- * this device's own self-hint addresses (`specs/group-relay-durability.md`
+ * - `chat_id != sender_user_id` -> a GROUP record -> NOT ackable. This SEEN
+ * copy means we already durably retained a copy of this exact `msg_id`
+ * as an accepted or quarantined group message -- almost always over BLE
+ * first, with the relay fetch re-presenting the SAME `msg_id` a moment
+ * later and deduping to SEEN. The relay copy in that shape is always the
+ * per-member fan-out row this device's own self-hint addresses
+ * (`specs/group-relay-durability.md`
  * §4.3), which SHOULD be acked -- but it already was, on the ORIGINAL
  * fetch that produced the CONSUMED disposition and the `messages` row
  * this function is now looking up; there is no second ack to grant here.
@@ -16957,11 +16990,11 @@ public func coreConsumedSeenIsAckable(origin: MessageOrigin?, ownUserId: Data) -
  * The decision table, in full:
  *
  * - `origin` is `Some(..)` -> exactly [`core_consumed_seen_is_ackable`]'s
- * answer, unchanged: a 1:1 incoming row from someone else is ackable; our
- * own outbound echo and a group row are not. The hidden-kind evidence is
- * deliberately not consulted in this arm -- an envelope cannot be both,
- * and if a store ever disagreed with itself the un-acking answer is the
- * one to keep.
+ * answer, unchanged: a durably retained 1:1 incoming envelope from someone
+ * else is ackable; our own outbound echo and a group record are not. The
+ * hidden-kind evidence is deliberately not consulted in this arm -- an
+ * envelope cannot be both, and if a store ever disagreed with itself the
+ * un-acking answer is the one to keep.
  * - `origin` is `None` AND `recorded_consumed_hidden` AND
  * `hint_is_own_self_hint` -> ackable. All three are required:
  * `recorded_consumed_hidden` means this device opened the envelope with
@@ -17313,8 +17346,9 @@ public func coreIsVisibleChatKind(kind: UInt8) -> Bool {
 })
 }
 /**
- * Whether delivering a consumed envelope of this `kind` leaves a durable
- * `messages` row carrying the envelope's `msg_id` -- i.e. whether
+ * Whether delivering a consumed envelope of this `kind` leaves durable
+ * accepted-message or conflict-quarantine evidence carrying the envelope's
+ * `msg_id` -- i.e. whether
  * [`crate::MessageStore::message_origin_by_msg_id`] can later be asked "did
  * THIS device consume that exact envelope?" and answer truthfully.
  *
@@ -19308,10 +19342,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_contact_delivery() != 40561) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable() != 63440) {
+    if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable() != 64469) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable_with_hidden() != 10881) {
+    if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable_with_hidden() != 40155) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_contact_display_name() != 41746) {
@@ -19368,7 +19402,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_is_visible_chat_kind() != 47018) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_kind_persists_msg_id_row() != 53607) {
+    if (uniffi_cruisemesh_core_checksum_func_core_kind_persists_msg_id_row() != 48246) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_lan_network_id_for_components() != 6078) {
@@ -20019,7 +20053,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_record_consumed_hidden_msg_id() != 37215) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 39762) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 30982) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 9888) {
@@ -20097,13 +20131,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_hint_matches_known_target() != 15933) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message() != 46727) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message() != 27136) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message_classified() != 47726) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message_with_arrival() != 54638) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_message() != 61572) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_message() != 16710) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_outgoing_message() != 32750) {
@@ -20157,7 +20194,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_message_conflict_summaries() != 28865) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_origin_by_msg_id() != 10578) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_origin_by_msg_id() != 12991) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_message_reference() != 37519) {

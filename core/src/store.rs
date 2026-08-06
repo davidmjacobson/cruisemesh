@@ -1142,7 +1142,9 @@ impl MessageStore {
     /// - **Identical** on all three -> true duplicate. No-op, returns `Ok(false)`,
     ///   same behavior as the old plain `INSERT OR IGNORE`.
     /// - **Different** -> ambiguous conflict. Keep the existing branch and all
-    ///   receipt state, ignore the incoming message, and return `Ok(false)`.
+    ///   receipt state, quarantine the private incoming content, and return
+    ///   `Ok(false)`. Callers that must distinguish this from a duplicate
+    ///   should use one of the classified incoming methods instead.
     ///   Timestamps cannot break the tie: they are sender wall-clock display
     ///   hints and may be wrong. A delayed courier or restored backup can
     ///   legitimately replay an older authenticated branch, while a confused
@@ -1157,21 +1159,37 @@ impl MessageStore {
     }
 
     /// Insert an opened incoming message together with the envelope id used
-    /// for quoting it and an optional encrypted reply target.
+    /// for quoting it and an optional encrypted reply target. `false` means
+    /// either a true duplicate or a quarantined conflict; callers that log or
+    /// otherwise act differently on those outcomes should use
+    /// [`Self::insert_incoming_message_classified`].
     pub fn insert_incoming_message(
         &self,
         message: StoredMessage,
         msg_id: Vec<u8>,
         reply_to_msg_id: Option<Vec<u8>>,
     ) -> Result<bool, CoreError> {
+        Ok(matches!(
+            self.insert_incoming_message_classified(message, msg_id, reply_to_msg_id)?,
+            IncomingMessageInsertOutcome::Inserted
+        ))
+    }
+
+    /// Insert an opened incoming message without arrival-route evidence while
+    /// preserving the full duplicate-versus-quarantine result. This covers
+    /// local carry-queue drains where no live transport can truthfully be
+    /// attributed to the original arrival.
+    pub fn insert_incoming_message_classified(
+        &self,
+        message: StoredMessage,
+        msg_id: Vec<u8>,
+        reply_to_msg_id: Option<Vec<u8>>,
+    ) -> Result<IncomingMessageInsertOutcome, CoreError> {
         validate_msg_id("msg_id", &msg_id)?;
         if let Some(reply_to_msg_id) = reply_to_msg_id.as_deref() {
             validate_msg_id("reply_to_msg_id", reply_to_msg_id)?;
         }
-        Ok(matches!(
-            incoming_message_reference::insert(self, message, Some(msg_id), reply_to_msg_id, None,)?,
-            IncomingMessageInsertOutcome::Inserted
-        ))
+        incoming_message_reference::insert(self, message, Some(msg_id), reply_to_msg_id, None)
     }
 
     /// Insert an opened incoming message and atomically retain first-arrival
@@ -1612,6 +1630,8 @@ fn quarantine_message_conflict(
              existing_fingerprint = excluded.existing_fingerprint,
              last_seen_at = MAX(message_conflicts.last_seen_at, excluded.last_seen_at),
              seen_count = message_conflicts.seen_count + 1,
+             incoming_msg_id = COALESCE(message_conflicts.incoming_msg_id, excluded.incoming_msg_id),
+             incoming_reply_to_msg_id = COALESCE(message_conflicts.incoming_reply_to_msg_id, excluded.incoming_reply_to_msg_id),
              arrival_transport = COALESCE(message_conflicts.arrival_transport, excluded.arrival_transport),
              hops_taken = COALESCE(message_conflicts.hops_taken, excluded.hops_taken)",
         params![
@@ -1635,7 +1655,12 @@ fn quarantine_message_conflict(
         "DELETE FROM message_conflicts
          WHERE id IN (
              SELECT id FROM message_conflicts
-             ORDER BY last_seen_at DESC, id DESC
+             -- Envelope-backed chat paths leave a durable msg_id and are the
+             -- branch evidence most likely to explain missing user content.
+             -- Hidden/legacy collisions remain useful, but may not age those
+             -- rows out of the one global bounded quarantine.
+             ORDER BY (incoming_msg_id IS NOT NULL) DESC,
+                      last_seen_at DESC, id DESC
              LIMIT -1 OFFSET ?1
          )",
         params![MESSAGE_CONFLICT_QUARANTINE_LIMIT],
@@ -2238,8 +2263,9 @@ impl MessageStore {
         .map_err(store_err)
     }
 
-    /// Chat and sender of a stored message keyed by its stable envelope
-    /// `msg_id` alone, searched across every chat -- unlike
+    /// Chat and sender of a durably consumed message keyed by its stable
+    /// envelope `msg_id` alone, searched across accepted messages and the
+    /// bounded conflict quarantine -- unlike
     /// [`Self::message_by_msg_id`], which needs `chat_id` up front and is
     /// useless here because a relay-fetched envelope only carries its own
     /// `msg_id`.
@@ -2247,16 +2273,13 @@ impl MessageStore {
     /// This backs the consumed-SEEN relay ack rule in `engine.rs`
     /// (`MessageStore::core_relay_ack_ids_with_consumed`): a relay-fetched
     /// copy that dedupes as `Seen` (already handled via some other path) is
-    /// only safe to ack if THIS device actually consumed it as a real
-    /// message, not merely muled it. A row only exists here for kinds that
-    /// persist a durable `msg_id` -- 1:1/group text, attachment manifests,
-    /// reactions (inserted via `insert_incoming_message`) and our own
-    /// authored messages (via `insert_outgoing_message`/
-    /// `insert_outgoing_reply`). Hidden kinds -- receipts, profile sync,
-    /// friend requests/directory, group invites, LAN endpoint hints -- are
-    /// stored, if at all, via the plain `insert_message` with `msg_id =
-    /// NULL`, so they never match and the caller correctly treats "no
-    /// match" as "cannot vouch for this copy, don't ack."
+    /// only safe to ack if THIS device actually consumed and durably retained
+    /// it as a real message, not merely muled it. An accepted message row or a
+    /// quarantined alternative can provide that evidence for kinds carrying a
+    /// durable `msg_id` -- 1:1/group text, attachment manifests, reactions,
+    /// and group metadata updates. Hidden kinds -- receipts, profile sync,
+    /// friend requests/directory, group invites, LAN endpoint hints -- use the
+    /// plain `insert_message` path with no id and therefore never match here.
     ///
     /// Returns `None` for an unknown `msg_id` (never stored, or hidden-kind
     /// with no durable id). The store deliberately returns the raw
@@ -2271,8 +2294,16 @@ impl MessageStore {
     ) -> Result<Option<MessageOrigin>, CoreError> {
         let conn = lock_conn(&self.conn);
         conn.query_row(
-            "SELECT chat_id, sender_user_id FROM messages
-             WHERE msg_id = ?1 ORDER BY id ASC LIMIT 1",
+            "SELECT chat_id, sender_user_id
+             FROM (
+                 SELECT chat_id, sender_user_id, id, 0 AS source
+                 FROM messages WHERE msg_id = ?1
+                 UNION ALL
+                 SELECT chat_id, sender_user_id, id, 1 AS source
+                 FROM message_conflicts WHERE incoming_msg_id = ?1
+             )
+             ORDER BY source ASC, id ASC
+             LIMIT 1",
             params![msg_id],
             |row| {
                 Ok(MessageOrigin {
@@ -8020,6 +8051,59 @@ mod tests {
             store.message_conflict_summaries(1_000).unwrap().len(),
             MESSAGE_CONFLICT_QUARANTINE_LIMIT as usize
         );
+    }
+
+    #[test]
+    fn hidden_conflicts_cannot_evict_envelope_backed_chat_conflicts() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(store
+            .insert_message(msg(b"chat", b"sender", 1, "current"))
+            .unwrap());
+
+        for index in 0..MESSAGE_CONFLICT_QUARANTINE_LIMIT {
+            let mut conflict = msg(
+                b"chat",
+                b"sender",
+                1,
+                &format!("chat-conflicting-branch-{index}"),
+            );
+            conflict.timestamp += index;
+            assert_eq!(
+                store
+                    .insert_incoming_message_classified(
+                        conflict,
+                        vec![index as u8; MESSAGE_ID_LEN],
+                        None,
+                    )
+                    .unwrap(),
+                IncomingMessageInsertOutcome::QuarantinedConflict
+            );
+        }
+
+        // These plain inserts model hidden/legacy paths with no durable
+        // envelope id. The quarantine remains globally capped, but none may
+        // displace the chat-path recovery evidence already retained.
+        for index in 0..5 {
+            let mut hidden = msg(
+                b"chat",
+                b"sender",
+                1,
+                &format!("hidden-conflicting-branch-{index}"),
+            );
+            hidden.timestamp += 10_000 + index;
+            assert!(!store.insert_message(hidden).unwrap());
+        }
+
+        let conn = lock_conn(&store.conn);
+        let (total, envelope_backed): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(incoming_msg_id) FROM message_conflicts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(total, MESSAGE_CONFLICT_QUARANTINE_LIMIT);
+        assert_eq!(envelope_backed, MESSAGE_CONFLICT_QUARANTINE_LIMIT);
     }
 
     #[test]

@@ -1524,13 +1524,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 arrival: arrival
             )
         } else {
-            try store.insertIncomingMessage(
+            try store.insertIncomingMessageClassified(
                 message: message,
                 msgId: msgId,
                 replyToMsgId: replyToMsgId
             )
-                ? IncomingMessageInsertOutcome.inserted
-                : IncomingMessageInsertOutcome.duplicate
         }
         guard acceptIncomingInsert(
             outcome,
@@ -1573,13 +1571,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 arrival: arrival
             )
         } else {
-            try store.insertIncomingMessage(
+            try store.insertIncomingMessageClassified(
                 message: message,
                 msgId: msgId,
                 replyToMsgId: replyToMsgId
             )
-                ? IncomingMessageInsertOutcome.inserted
-                : IncomingMessageInsertOutcome.duplicate
         }
         guard acceptIncomingInsert(
             outcome,

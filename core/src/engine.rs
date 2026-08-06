@@ -378,17 +378,17 @@ pub fn core_relay_ack_ids(items: Vec<CoreRelayEnvelopeDisposition>) -> Vec<i64> 
 /// exact `msg_id`, as a 1:1 message addressed to us and to us alone?"
 ///
 /// `origin` is [`MessageStore::message_origin_by_msg_id`]'s result for the
-/// envelope's `msg_id`, or `None` if no such row exists. A row only exists
-/// for kinds that persist a durable `msg_id`: 1:1/group text, attachment
-/// manifests, and reactions (inserted via `insert_incoming_message`), plus
-/// our own authored outbound messages (`insert_outgoing_message`/
-/// `insert_outgoing_reply`). Of those, exactly one shape is ackable -- a 1:1
-/// incoming row, recognizable by the local storage convention that a 1:1
-/// chat is keyed by the other party, so `chat_id == sender_user_id`:
+/// envelope's `msg_id`, or `None` if no durable accepted/quarantined record
+/// exists. Such evidence exists for kinds that persist a `msg_id`:
+/// 1:1/group text, attachment manifests, reactions, and group metadata, plus
+/// our own authored outbound messages. Of those, exactly one shape is
+/// ackable -- a 1:1 incoming record, recognizable by the local storage
+/// convention that a 1:1 chat is keyed by the other party, so
+/// `chat_id == sender_user_id`:
 ///
 /// - `origin` is `None` -> NOT ackable *on this evidence*. Either we never
-///   consumed it (merely muled/flooded a copy -- the relay copy is the real
-///   recipient's durable fallback), or it was a hidden kind -- receipts,
+///   consumed and retained it (merely muled/flooded a copy -- the relay copy
+///   is the real recipient's durable fallback), or it was a hidden kind -- receipts,
 ///   profile sync, friend requests/directory, group invites, LAN endpoint
 ///   hints, relay-change notices -- which are stored (if at all) via the
 ///   plain `insert_message` path that never records a `msg_id`. Hidden kinds
@@ -403,12 +403,13 @@ pub fn core_relay_ack_ids(items: Vec<CoreRelayEnvelopeDisposition>) -> Vec<i64> 
 ///   always dedupes as Seen): that relay copy exists *for the recipient*,
 ///   and deleting it would silently drop their only remaining way to fetch
 ///   the message.
-/// - `chat_id != sender_user_id` -> a GROUP row -> NOT ackable. This SEEN
-///   copy means we already durably consumed a copy of this exact `msg_id`
-///   as a group message -- almost always over BLE first, with the relay
-///   fetch re-presenting the SAME `msg_id` a moment later and deduping to
-///   SEEN. The relay copy in that shape is always the per-member fan-out row
-///   this device's own self-hint addresses (`specs/group-relay-durability.md`
+/// - `chat_id != sender_user_id` -> a GROUP record -> NOT ackable. This SEEN
+///   copy means we already durably retained a copy of this exact `msg_id`
+///   as an accepted or quarantined group message -- almost always over BLE
+///   first, with the relay fetch re-presenting the SAME `msg_id` a moment
+///   later and deduping to SEEN. The relay copy in that shape is always the
+///   per-member fan-out row this device's own self-hint addresses
+///   (`specs/group-relay-durability.md`
 ///   §4.3), which SHOULD be acked -- but it already was, on the ORIGINAL
 ///   fetch that produced the CONSUMED disposition and the `messages` row
 ///   this function is now looking up; there is no second ack to grant here.
@@ -460,11 +461,11 @@ pub fn core_consumed_seen_is_ackable(origin: Option<MessageOrigin>, own_user_id:
 /// The decision table, in full:
 ///
 /// - `origin` is `Some(..)` -> exactly [`core_consumed_seen_is_ackable`]'s
-///   answer, unchanged: a 1:1 incoming row from someone else is ackable; our
-///   own outbound echo and a group row are not. The hidden-kind evidence is
-///   deliberately not consulted in this arm -- an envelope cannot be both,
-///   and if a store ever disagreed with itself the un-acking answer is the
-///   one to keep.
+///   answer, unchanged: a durably retained 1:1 incoming envelope from someone
+///   else is ackable; our own outbound echo and a group record are not. The
+///   hidden-kind evidence is deliberately not consulted in this arm -- an
+///   envelope cannot be both, and if a store ever disagreed with itself the
+///   un-acking answer is the one to keep.
 /// - `origin` is `None` AND `recorded_consumed_hidden` AND
 ///   `hint_is_own_self_hint` -> ackable. All three are required:
 ///   `recorded_consumed_hidden` means this device opened the envelope with
@@ -832,8 +833,9 @@ impl MessageStore {
     /// - [`CoreInboundDisposition::Seen`]: gather two independent pieces of
     ///   store evidence and ack only if
     ///   [`core_consumed_seen_is_ackable_with_hidden`] says so:
-    ///   [`Self::message_origin_by_msg_id`] (did we durably store this exact
-    ///   envelope as a 1:1 message from someone else?) and, for the kinds
+    ///   [`Self::message_origin_by_msg_id`] (did we durably retain this exact
+    ///   envelope as an accepted or quarantined 1:1 message from someone
+    ///   else?) and, for the kinds
     ///   that leave no such row, [`Self::consumed_hidden_msg_id_recorded`]
     ///   together with an own-self-hint check on the fetched row's
     ///   `recipient_hint`. Neither route acks something we merely muled,
@@ -1220,8 +1222,42 @@ mod tests {
 
         let unknown_msg_id = vec![23_u8; 16];
 
+        // A different authenticated branch consumed over BLE is retained in
+        // quarantine rather than rendered. That durable evidence is just as
+        // strong for a sole-recipient 1:1 relay copy: leaving it unacked would
+        // re-fetch the same conflict on every mailbox walk.
+        store
+            .insert_message(crate::StoredMessage {
+                chat_id: vec![3_u8; 16],
+                sender_user_id: vec![3_u8; 16],
+                lamport: 8,
+                timestamp: 1,
+                kind: 1,
+                payload: b"visible branch".to_vec(),
+            })
+            .unwrap();
+        let quarantined_msg_id = vec![26_u8; 16];
+        assert_eq!(
+            store
+                .insert_incoming_message_classified(
+                    crate::StoredMessage {
+                        chat_id: vec![3_u8; 16],
+                        sender_user_id: vec![3_u8; 16],
+                        lamport: 8,
+                        timestamp: 2,
+                        kind: 1,
+                        payload: b"conflicting branch".to_vec(),
+                    },
+                    quarantined_msg_id.clone(),
+                    None,
+                )
+                .unwrap(),
+            crate::IncomingMessageInsertOutcome::QuarantinedConflict
+        );
+
         let items = vec![
             disp(100, one_to_one_msg_id, CoreInboundDisposition::Seen),
+            disp(150, quarantined_msg_id, CoreInboundDisposition::Seen),
             disp(200, group_msg_id, CoreInboundDisposition::Seen),
             disp(300, unknown_msg_id, CoreInboundDisposition::Seen),
             disp(400, vec![24_u8; 16], CoreInboundDisposition::Carried),
@@ -1231,7 +1267,7 @@ mod tests {
         let acked = store
             .core_relay_ack_ids_with_consumed(items, own_user_id, 1_000)
             .unwrap();
-        assert_eq!(acked, vec![100, 500]);
+        assert_eq!(acked, vec![100, 150, 500]);
     }
 
     // -- consumed hidden-kind relay ack rule --------------------------------
