@@ -1,8 +1,10 @@
 import AVFoundation
 import Foundation
+import OSLog
 
 final class VoiceRecorder: NSObject {
     static let maxDurationSeconds: TimeInterval = 60
+    private static let log = Logger(subsystem: "com.cruisemesh", category: "VoiceMemo")
 
     private var recorder: AVAudioRecorder?
     private var outputURL: URL?
@@ -16,6 +18,7 @@ final class VoiceRecorder: NSObject {
             try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
             try session.setActive(true)
         } catch {
+            Self.log.error("Could not activate the recording session: \(error.localizedDescription, privacy: .public)")
             deactivateAudioSession()
             return false
         }
@@ -31,8 +34,15 @@ final class VoiceRecorder: NSObject {
         ]
         do {
             let rec = try AVAudioRecorder(url: url, settings: settings)
-            rec.prepareToRecord()
+            guard rec.prepareToRecord() else {
+                Self.log.error("Could not prepare the M4A voice recorder")
+                try? FileManager.default.removeItem(at: url)
+                deactivateAudioSession()
+                return false
+            }
             guard rec.record(forDuration: Self.maxDurationSeconds) else {
+                Self.log.error("Could not start the M4A voice recorder")
+                try? FileManager.default.removeItem(at: url)
                 deactivateAudioSession()
                 return false
             }
@@ -40,6 +50,8 @@ final class VoiceRecorder: NSObject {
             outputURL = url
             return true
         } catch {
+            Self.log.error("Could not create the M4A voice recorder: \(error.localizedDescription, privacy: .public)")
+            try? FileManager.default.removeItem(at: url)
             deactivateAudioSession()
             return false
         }
@@ -57,10 +69,15 @@ final class VoiceRecorder: NSObject {
         self.recorder = nil
         self.outputURL = nil
         guard FileManager.default.fileExists(atPath: url.path),
-              (try? Data(contentsOf: url))?.isEmpty == false else {
+              let bytes = try? Data(contentsOf: url),
+              !bytes.isEmpty else {
+            Self.log.error("Voice recording stopped without a readable M4A file")
             try? FileManager.default.removeItem(at: url)
             return nil
         }
+        Self.log.info(
+            "Finished voice recording (\(bytes.count, privacy: .public) bytes, \(duration, privacy: .public) ms)"
+        )
         return (url, max(0, duration))
     }
 
