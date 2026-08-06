@@ -17,7 +17,7 @@ final class FamilyRelayBackpressureTests: XCTestCase {
 
         let firstRetryDelays = zip(clients, identities).map { pair in
             let (client, identity) = pair
-            client.onRateLimited(
+            return client.onRateLimited(
                 retryAfterMs: 1_000,
                 identityHash: familyRelayIdentityHash(identity)
             )
@@ -27,7 +27,7 @@ final class FamilyRelayBackpressureTests: XCTestCase {
 
         let secondRetryDelays = zip(clients, identities).map { pair in
             let (client, identity) = pair
-            client.onRateLimited(
+            return client.onRateLimited(
                 retryAfterMs: 1_000,
                 identityHash: familyRelayIdentityHash(identity)
             )
@@ -37,7 +37,7 @@ final class FamilyRelayBackpressureTests: XCTestCase {
         clients.forEach { $0.onSuccessfulPass() }
         let recoveredRetryDelays = zip(clients, identities).map { pair in
             let (client, identity) = pair
-            client.onRateLimited(
+            return client.onRateLimited(
                 retryAfterMs: 1_000,
                 identityHash: familyRelayIdentityHash(identity)
             )
