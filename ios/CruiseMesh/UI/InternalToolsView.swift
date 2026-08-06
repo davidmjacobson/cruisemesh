@@ -89,8 +89,10 @@ struct InternalToolsView: View {
     }
 
     /// Shore Pass vs generic relay copy for a rejected family token.
+    /// Uses the core's `relaySetupIsOfficial` (same check as ShorePassView /
+    /// MeshStatusPillLogic) against the URL currently in the field.
     private var tokenRejectionMessage: String {
-        if appModel.relaySetupIsOfficial {
+        if relaySetupIsOfficial(relayUrl: relayUrl) {
             return String(localized: "Shore Pass rejected this family token. Messages will wait until the token is fixed — check it against another family phone.")
         }
         return String(localized: "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.")
