@@ -1,6 +1,7 @@
 package com.cruisemesh.app.friending
 
 import android.content.Context
+import com.cruisemesh.app.persist
 
 /** Local policy advertised through profile-sync v2. */
 object FriendsOfFriendsStore {
@@ -33,6 +34,20 @@ object FriendsOfFriendsStore {
             .putBoolean(KEY_ENABLED, enabled)
             .putLong(KEY_REVISION, next)
             .apply()
+        return next.toULong()
+    }
+
+    /** Restore a portable privacy choice durably before Android hard-exits. */
+    fun restoreEnabled(context: Context, enabled: Boolean): ULong {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val next = maxOf(
+            prefs.getLong(KEY_REVISION, 0L) + 1L,
+            System.currentTimeMillis().coerceAtLeast(1L),
+        )
+        prefs.edit()
+            .putBoolean(KEY_ENABLED, enabled)
+            .putLong(KEY_REVISION, next)
+            .persist(durable = true)
         return next.toULong()
     }
 

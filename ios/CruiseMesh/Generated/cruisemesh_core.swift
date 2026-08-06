@@ -1857,6 +1857,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func backfillPairwiseEnvelope(identity: Identity, contact: Contact, message: StoredMessage, replyToMsgId: Data?) throws  -> AuthoredEnvelope
 
     /**
+     * Return the redacted content inventory used by both mobile backup UIs.
+     * Expired queue rows are excluded because snapshot sanitation removes
+     * them regardless of which options the user selects.
+     */
+    func backupInventory(nowMs: Int64) throws  -> BackupInventory
+
+    /**
      * Writes a transactionally consistent standalone SQLite snapshot.
      * The destination must not already exist; callers should use a unique
      * temporary path and remove it after reading the backup bytes.
@@ -1879,6 +1886,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * unbounded restore-time replay.
      */
     func backupTo(destination: String) throws
+
+    /**
+     * Write a transactionally consistent snapshot and apply the Rust-owned
+     * content policy to the copy. This is the canonical export path; mobile
+     * shells only choose a destination and collect preferences that live
+     * outside SQLite.
+     */
+    func backupToWithOptions(destination: String, options: BackupContentOptions, nowMs: Int64) throws  -> BackupSanitizationReport
 
     /**
      * Block an identity (specs/friends-of-friends.md "dismissal-block
@@ -3599,6 +3614,19 @@ open func backfillPairwiseEnvelope(identity: Identity, contact: Contact, message
 }
 
     /**
+     * Return the redacted content inventory used by both mobile backup UIs.
+     * Expired queue rows are excluded because snapshot sanitation removes
+     * them regardless of which options the user selects.
+     */
+open func backupInventory(nowMs: Int64)throws  -> BackupInventory {
+    return try  FfiConverterTypeBackupInventory.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_backup_inventory(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+    /**
      * Writes a transactionally consistent standalone SQLite snapshot.
      * The destination must not already exist; callers should use a unique
      * temporary path and remove it after reading the backup bytes.
@@ -3625,6 +3653,22 @@ open func backupTo(destination: String)throws  {try rustCallWithError(FfiConvert
         FfiConverterString.lower(destination),$0
     )
 }
+}
+
+    /**
+     * Write a transactionally consistent snapshot and apply the Rust-owned
+     * content policy to the copy. This is the canonical export path; mobile
+     * shells only choose a destination and collect preferences that live
+     * outside SQLite.
+     */
+open func backupToWithOptions(destination: String, options: BackupContentOptions, nowMs: Int64)throws  -> BackupSanitizationReport {
+    return try  FfiConverterTypeBackupSanitizationReport.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_backup_to_with_options(self.uniffiClonePointer(),
+        FfiConverterString.lower(destination),
+        FfiConverterTypeBackupContentOptions.lower(options),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
 }
 
     /**
@@ -6478,6 +6522,309 @@ public func FfiConverterTypeAuthoredReceipt_lower(_ value: AuthoredReceipt) -> R
 
 
 /**
+ * User-visible choices for the content portion of an encrypted account
+ * backup. Identity, contacts, groups, cryptographic continuity and authored
+ * Lamport high-water marks are always included by the platform payload/store
+ * snapshot and cannot be disabled.
+ */
+public struct BackupContentOptions {
+    /**
+     * Visible conversations plus their receipt and pending-send state.
+     */
+    public var includeMessageHistory: Bool
+    /**
+     * Encrypted courier cargo held temporarily for other people. This is
+     * deliberately off by default: it can be large and a restored copy has
+     * weaker delivery-progress evidence than the live carrier did.
+     */
+    public var includePendingDeliveriesForOthers: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Visible conversations plus their receipt and pending-send state.
+         */includeMessageHistory: Bool,
+        /**
+         * Encrypted courier cargo held temporarily for other people. This is
+         * deliberately off by default: it can be large and a restored copy has
+         * weaker delivery-progress evidence than the live carrier did.
+         */includePendingDeliveriesForOthers: Bool) {
+        self.includeMessageHistory = includeMessageHistory
+        self.includePendingDeliveriesForOthers = includePendingDeliveriesForOthers
+    }
+}
+
+
+
+extension BackupContentOptions: Equatable, Hashable {
+    public static func ==(lhs: BackupContentOptions, rhs: BackupContentOptions) -> Bool {
+        if lhs.includeMessageHistory != rhs.includeMessageHistory {
+            return false
+        }
+        if lhs.includePendingDeliveriesForOthers != rhs.includePendingDeliveriesForOthers {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(includeMessageHistory)
+        hasher.combine(includePendingDeliveriesForOthers)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBackupContentOptions: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackupContentOptions {
+        return
+            try BackupContentOptions(
+                includeMessageHistory: FfiConverterBool.read(from: &buf),
+                includePendingDeliveriesForOthers: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BackupContentOptions, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.includeMessageHistory, into: &buf)
+        FfiConverterBool.write(value.includePendingDeliveriesForOthers, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupContentOptions_lift(_ buf: RustBuffer) throws -> BackupContentOptions {
+    return try FfiConverterTypeBackupContentOptions.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupContentOptions_lower(_ value: BackupContentOptions) -> RustBuffer {
+    return FfiConverterTypeBackupContentOptions.lower(value)
+}
+
+
+/**
+ * Redacted inventory shown before exporting or installing a backup. Byte
+ * counts cover encrypted/message payload bytes rather than SQLite overhead,
+ * so they are useful, stable estimates rather than promises about final file
+ * size after encryption.
+ */
+public struct BackupInventory {
+    public var contactCount: UInt64
+    public var groupCount: UInt64
+    public var messageCount: UInt64
+    public var messageBytes: UInt64
+    public var pendingOwnDeliveryCount: UInt64
+    public var pendingOwnDeliveryBytes: UInt64
+    public var pendingCourierDeliveryCount: UInt64
+    public var pendingCourierDeliveryBytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(contactCount: UInt64, groupCount: UInt64, messageCount: UInt64, messageBytes: UInt64, pendingOwnDeliveryCount: UInt64, pendingOwnDeliveryBytes: UInt64, pendingCourierDeliveryCount: UInt64, pendingCourierDeliveryBytes: UInt64) {
+        self.contactCount = contactCount
+        self.groupCount = groupCount
+        self.messageCount = messageCount
+        self.messageBytes = messageBytes
+        self.pendingOwnDeliveryCount = pendingOwnDeliveryCount
+        self.pendingOwnDeliveryBytes = pendingOwnDeliveryBytes
+        self.pendingCourierDeliveryCount = pendingCourierDeliveryCount
+        self.pendingCourierDeliveryBytes = pendingCourierDeliveryBytes
+    }
+}
+
+
+
+extension BackupInventory: Equatable, Hashable {
+    public static func ==(lhs: BackupInventory, rhs: BackupInventory) -> Bool {
+        if lhs.contactCount != rhs.contactCount {
+            return false
+        }
+        if lhs.groupCount != rhs.groupCount {
+            return false
+        }
+        if lhs.messageCount != rhs.messageCount {
+            return false
+        }
+        if lhs.messageBytes != rhs.messageBytes {
+            return false
+        }
+        if lhs.pendingOwnDeliveryCount != rhs.pendingOwnDeliveryCount {
+            return false
+        }
+        if lhs.pendingOwnDeliveryBytes != rhs.pendingOwnDeliveryBytes {
+            return false
+        }
+        if lhs.pendingCourierDeliveryCount != rhs.pendingCourierDeliveryCount {
+            return false
+        }
+        if lhs.pendingCourierDeliveryBytes != rhs.pendingCourierDeliveryBytes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(contactCount)
+        hasher.combine(groupCount)
+        hasher.combine(messageCount)
+        hasher.combine(messageBytes)
+        hasher.combine(pendingOwnDeliveryCount)
+        hasher.combine(pendingOwnDeliveryBytes)
+        hasher.combine(pendingCourierDeliveryCount)
+        hasher.combine(pendingCourierDeliveryBytes)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBackupInventory: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackupInventory {
+        return
+            try BackupInventory(
+                contactCount: FfiConverterUInt64.read(from: &buf),
+                groupCount: FfiConverterUInt64.read(from: &buf),
+                messageCount: FfiConverterUInt64.read(from: &buf),
+                messageBytes: FfiConverterUInt64.read(from: &buf),
+                pendingOwnDeliveryCount: FfiConverterUInt64.read(from: &buf),
+                pendingOwnDeliveryBytes: FfiConverterUInt64.read(from: &buf),
+                pendingCourierDeliveryCount: FfiConverterUInt64.read(from: &buf),
+                pendingCourierDeliveryBytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BackupInventory, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.contactCount, into: &buf)
+        FfiConverterUInt64.write(value.groupCount, into: &buf)
+        FfiConverterUInt64.write(value.messageCount, into: &buf)
+        FfiConverterUInt64.write(value.messageBytes, into: &buf)
+        FfiConverterUInt64.write(value.pendingOwnDeliveryCount, into: &buf)
+        FfiConverterUInt64.write(value.pendingOwnDeliveryBytes, into: &buf)
+        FfiConverterUInt64.write(value.pendingCourierDeliveryCount, into: &buf)
+        FfiConverterUInt64.write(value.pendingCourierDeliveryBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupInventory_lift(_ buf: RustBuffer) throws -> BackupInventory {
+    return try FfiConverterTypeBackupInventory.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupInventory_lower(_ value: BackupInventory) -> RustBuffer {
+    return FfiConverterTypeBackupInventory.lower(value)
+}
+
+
+/**
+ * What the core removed while preparing a snapshot or making a legacy
+ * full-database restore safe. Counts are intentionally content-free so the
+ * report is safe to log and include in diagnostics.
+ */
+public struct BackupSanitizationReport {
+    public var removedMessageCount: UInt64
+    public var removedPendingOwnDeliveryCount: UInt64
+    public var removedCourierDeliveryCount: UInt64
+    public var removedExpiredDeliveryCount: UInt64
+    public var removedConnectionEventCount: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(removedMessageCount: UInt64, removedPendingOwnDeliveryCount: UInt64, removedCourierDeliveryCount: UInt64, removedExpiredDeliveryCount: UInt64, removedConnectionEventCount: UInt64) {
+        self.removedMessageCount = removedMessageCount
+        self.removedPendingOwnDeliveryCount = removedPendingOwnDeliveryCount
+        self.removedCourierDeliveryCount = removedCourierDeliveryCount
+        self.removedExpiredDeliveryCount = removedExpiredDeliveryCount
+        self.removedConnectionEventCount = removedConnectionEventCount
+    }
+}
+
+
+
+extension BackupSanitizationReport: Equatable, Hashable {
+    public static func ==(lhs: BackupSanitizationReport, rhs: BackupSanitizationReport) -> Bool {
+        if lhs.removedMessageCount != rhs.removedMessageCount {
+            return false
+        }
+        if lhs.removedPendingOwnDeliveryCount != rhs.removedPendingOwnDeliveryCount {
+            return false
+        }
+        if lhs.removedCourierDeliveryCount != rhs.removedCourierDeliveryCount {
+            return false
+        }
+        if lhs.removedExpiredDeliveryCount != rhs.removedExpiredDeliveryCount {
+            return false
+        }
+        if lhs.removedConnectionEventCount != rhs.removedConnectionEventCount {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(removedMessageCount)
+        hasher.combine(removedPendingOwnDeliveryCount)
+        hasher.combine(removedCourierDeliveryCount)
+        hasher.combine(removedExpiredDeliveryCount)
+        hasher.combine(removedConnectionEventCount)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBackupSanitizationReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackupSanitizationReport {
+        return
+            try BackupSanitizationReport(
+                removedMessageCount: FfiConverterUInt64.read(from: &buf),
+                removedPendingOwnDeliveryCount: FfiConverterUInt64.read(from: &buf),
+                removedCourierDeliveryCount: FfiConverterUInt64.read(from: &buf),
+                removedExpiredDeliveryCount: FfiConverterUInt64.read(from: &buf),
+                removedConnectionEventCount: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BackupSanitizationReport, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.removedMessageCount, into: &buf)
+        FfiConverterUInt64.write(value.removedPendingOwnDeliveryCount, into: &buf)
+        FfiConverterUInt64.write(value.removedCourierDeliveryCount, into: &buf)
+        FfiConverterUInt64.write(value.removedExpiredDeliveryCount, into: &buf)
+        FfiConverterUInt64.write(value.removedConnectionEventCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupSanitizationReport_lift(_ buf: RustBuffer) throws -> BackupSanitizationReport {
+    return try FfiConverterTypeBackupSanitizationReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupSanitizationReport_lower(_ value: BackupSanitizationReport) -> RustBuffer {
+    return FfiConverterTypeBackupSanitizationReport.lower(value)
+}
+
+
+/**
  * A sealed envelope this node is muling for someone else (DESIGN.md §5.3
  * carry queue): a foreign envelope we couldn't open (so it isn't for us) but
  * hold on to, to hand to its recipient when we next meet them. These are the
@@ -7263,10 +7610,11 @@ public struct CoreBackupPayload {
     public var relayUrl: String?
     public var relayToken: String?
     public var shareOnline: Bool
+    public var friendsOfFriendsEnabled: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(identity: Data, sqlite: Data, srcVersionCode: Int32, createdAtMs: Int64, displayName: String?, ownAvatar: Data, ownAvatarEpoch: Int64, relayUrl: String?, relayToken: String?, shareOnline: Bool) {
+    public init(identity: Data, sqlite: Data, srcVersionCode: Int32, createdAtMs: Int64, displayName: String?, ownAvatar: Data, ownAvatarEpoch: Int64, relayUrl: String?, relayToken: String?, shareOnline: Bool, friendsOfFriendsEnabled: Bool) {
         self.identity = identity
         self.sqlite = sqlite
         self.srcVersionCode = srcVersionCode
@@ -7277,6 +7625,7 @@ public struct CoreBackupPayload {
         self.relayUrl = relayUrl
         self.relayToken = relayToken
         self.shareOnline = shareOnline
+        self.friendsOfFriendsEnabled = friendsOfFriendsEnabled
     }
 }
 
@@ -7314,6 +7663,9 @@ extension CoreBackupPayload: Equatable, Hashable {
         if lhs.shareOnline != rhs.shareOnline {
             return false
         }
+        if lhs.friendsOfFriendsEnabled != rhs.friendsOfFriendsEnabled {
+            return false
+        }
         return true
     }
 
@@ -7328,6 +7680,7 @@ extension CoreBackupPayload: Equatable, Hashable {
         hasher.combine(relayUrl)
         hasher.combine(relayToken)
         hasher.combine(shareOnline)
+        hasher.combine(friendsOfFriendsEnabled)
     }
 }
 
@@ -7348,7 +7701,8 @@ public struct FfiConverterTypeCoreBackupPayload: FfiConverterRustBuffer {
                 ownAvatarEpoch: FfiConverterInt64.read(from: &buf),
                 relayUrl: FfiConverterOptionString.read(from: &buf),
                 relayToken: FfiConverterOptionString.read(from: &buf),
-                shareOnline: FfiConverterBool.read(from: &buf)
+                shareOnline: FfiConverterBool.read(from: &buf),
+                friendsOfFriendsEnabled: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -7363,6 +7717,7 @@ public struct FfiConverterTypeCoreBackupPayload: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.relayUrl, into: &buf)
         FfiConverterOptionString.write(value.relayToken, into: &buf)
         FfiConverterBool.write(value.shareOnline, into: &buf)
+        FfiConverterBool.write(value.friendsOfFriendsEnabled, into: &buf)
     }
 }
 
@@ -17495,6 +17850,19 @@ public func generateMsgId() -> Data {
     )
 })
 }
+/**
+ * Inspect an untrusted/decrypted backup database after applying the ordinary
+ * forward schema migrations. The caller must use a private temporary copy:
+ * opening a legacy SQLite file can create journal siblings and migrate it.
+ */
+public func inspectRestoredMessageStore(path: String, nowMs: Int64)throws  -> BackupInventory {
+    return try  FfiConverterTypeBackupInventory.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_inspect_restored_message_store(
+        FfiConverterString.lower(path),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
 public func lanDefaultTcpPort() -> UInt16 {
     return try!  FfiConverterUInt16.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_lan_default_tcp_port($0
@@ -18415,12 +18783,29 @@ public func rotateGroup(group: Group, memberUserIds: [Data])throws  -> Group {
  *
  * Returns the number of carried envelopes discarded. User-owned history,
  * contacts, authored Lamport watermarks, outbound authored work, receipts and
- * the relay frontier are deliberately preserved.
+ * the relay frontier are deliberately preserved. New callers should use
+ * [`sanitize_restored_message_store_with_options`] to make the choice
+ * explicit and receive the full redacted report.
  */
 public func sanitizeRestoredMessageStore(path: String)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_sanitize_restored_message_store(
         FfiConverterString.lower(path),$0
+    )
+})
+}
+/**
+ * Apply the same Rust-owned classification policy to legacy and current
+ * backups immediately before installation. This second pass is deliberate:
+ * it protects old `.cmbak` files created before selectable/sanitized exports
+ * existed and prevents a modified platform shell from bypassing the policy.
+ */
+public func sanitizeRestoredMessageStoreWithOptions(path: String, options: BackupContentOptions, nowMs: Int64)throws  -> BackupSanitizationReport {
+    return try  FfiConverterTypeBackupSanitizationReport.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_sanitize_restored_message_store_with_options(
+        FfiConverterString.lower(path),
+        FfiConverterTypeBackupContentOptions.lower(options),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -18863,6 +19248,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_generate_msg_id() != 28688) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_inspect_restored_message_store() != 16215) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_lan_default_tcp_port() != 33372) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -19025,7 +19413,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_rotate_group() != 56003) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_sanitize_restored_message_store() != 61596) {
+    if (uniffi_cruisemesh_core_checksum_func_sanitize_restored_message_store() != 11131) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_sanitize_restored_message_store_with_options() != 9964) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_seal_backup() != 5887) {
@@ -19199,7 +19590,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_envelope() != 41114) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_inventory() != 55991) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to() != 30631) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to_with_options() != 33714) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_block_user() != 63065) {

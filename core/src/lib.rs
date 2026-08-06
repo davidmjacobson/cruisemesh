@@ -140,7 +140,9 @@ pub use semantic::{
 };
 pub use store::{
     core_peer_transport_for_arrival, core_peer_transport_is_observed,
-    sanitize_restored_message_store, CarriedEnvelope, ConsumedHiddenLamport, Contact,
+    inspect_restored_message_store, sanitize_restored_message_store,
+    sanitize_restored_message_store_with_options, BackupContentOptions, BackupInventory,
+    BackupSanitizationReport, CarriedEnvelope, ConsumedHiddenLamport, Contact,
     ContactDiscoveryPolicy, ContactProvenance, ContactRelayRejection, ContactRelayUnreachable,
     CoreCarriedCursor, CoreCarriedSyncPage, CoreChatPreview, CoreMessageReceivedAt, DigestEntry,
     FriendSuggestion, MessageArrival, MessageOrigin, MessageReference, MessageStore,

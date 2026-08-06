@@ -35,10 +35,10 @@ object BackupCrypto {
 
 private fun BackupPayload.toCore() = CoreBackupPayload(
     identity, sqlite, srcVersionCode, createdAtMs, displayName, ownAvatar,
-    ownAvatarEpoch, relayUrl, relayToken, shareOnline,
+    ownAvatarEpoch, relayUrl, relayToken, shareOnline, friendsOfFriendsEnabled,
 )
 
 private fun CoreBackupPayload.toPlatform() = BackupPayload(
     identity, sqlite, srcVersionCode, createdAtMs, displayName, ownAvatar,
-    ownAvatarEpoch, relayUrl, relayToken, shareOnline,
+    ownAvatarEpoch, relayUrl, relayToken, shareOnline, friendsOfFriendsEnabled,
 )

@@ -11,7 +11,8 @@ use crate::Identity;
 const MAGIC: &[u8; 7] = b"CMBAK1\0";
 const FORMAT_VERSION: u8 = 1;
 const LEGACY_INNER_VERSION: u8 = 1;
-const INNER_VERSION: u8 = 2;
+const PREVIOUS_INNER_VERSION: u8 = 2;
+const INNER_VERSION: u8 = 3;
 const KDF_PBKDF2_HMAC_SHA256: u8 = 3;
 const KDF_PARAMS_LEN: usize = 16;
 const SALT_LEN: usize = 16;
@@ -53,6 +54,7 @@ pub struct CoreBackupPayload {
     pub relay_url: Option<String>,
     pub relay_token: Option<String>,
     pub share_online: bool,
+    pub friends_of_friends_enabled: bool,
 }
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,13 +315,17 @@ fn encode_inner(payload: &CoreBackupPayload) -> Result<Vec<u8>, CoreBackupError>
     write_bytes16(&mut out, relay_url);
     write_bytes16(&mut out, relay_token);
     out.push(u8::from(payload.share_online));
+    out.push(u8::from(payload.friends_of_friends_enabled));
     Ok(out)
 }
 
 fn decode_inner(bytes: &[u8]) -> Result<CoreBackupPayload, CoreBackupError> {
     let mut cursor = Cursor::new(bytes);
     let version = cursor.u8()?;
-    if version != LEGACY_INNER_VERSION && version != INNER_VERSION {
+    if version != LEGACY_INNER_VERSION
+        && version != PREVIOUS_INNER_VERSION
+        && version != INNER_VERSION
+    {
         return Err(CoreBackupError::UnsupportedVersion { version });
     }
     let src_version_code = cursor.i32()?;
@@ -341,6 +347,7 @@ fn decode_inner(bytes: &[u8]) -> Result<CoreBackupPayload, CoreBackupError> {
             relay_url: None,
             relay_token: None,
             share_online: true,
+            friends_of_friends_enabled: true,
         });
     }
     let display_name = empty_to_none(cursor.string16()?);
@@ -352,6 +359,15 @@ fn decode_inner(bytes: &[u8]) -> Result<CoreBackupPayload, CoreBackupError> {
         0 => false,
         1 => true,
         _ => return Err(CoreBackupError::Truncated),
+    };
+    let friends_of_friends_enabled = if version == INNER_VERSION {
+        match cursor.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(CoreBackupError::Truncated),
+        }
+    } else {
+        true
     };
     if !cursor.finished() {
         return Err(CoreBackupError::Truncated);
@@ -367,6 +383,7 @@ fn decode_inner(bytes: &[u8]) -> Result<CoreBackupPayload, CoreBackupError> {
         relay_url,
         relay_token,
         share_online,
+        friends_of_friends_enabled,
     })
 }
 
@@ -463,6 +480,7 @@ mod tests {
             relay_url: Some("https://relay.example".into()),
             relay_token: Some("secret".into()),
             share_online: false,
+            friends_of_friends_enabled: false,
         }
     }
 
@@ -498,6 +516,37 @@ mod tests {
             open_backup("correct horse battery staple".into(), one).unwrap(),
             payload
         );
+    }
+
+    #[test]
+    fn previous_backup_payload_defaults_new_portable_settings_safely() {
+        let payload = payload();
+        let mut encoded = Vec::new();
+        encoded.push(PREVIOUS_INNER_VERSION);
+        encoded.extend_from_slice(&payload.src_version_code.to_be_bytes());
+        encoded.extend_from_slice(&payload.created_at_ms.to_be_bytes());
+        write_bytes16(&mut encoded, &payload.identity);
+        write_bytes32(&mut encoded, &payload.sqlite);
+        write_bytes16(
+            &mut encoded,
+            payload.display_name.as_deref().unwrap_or("").as_bytes(),
+        );
+        write_bytes32(&mut encoded, &payload.own_avatar);
+        encoded.extend_from_slice(&payload.own_avatar_epoch.to_be_bytes());
+        write_bytes16(
+            &mut encoded,
+            payload.relay_url.as_deref().unwrap_or("").as_bytes(),
+        );
+        write_bytes16(
+            &mut encoded,
+            payload.relay_token.as_deref().unwrap_or("").as_bytes(),
+        );
+        encoded.push(u8::from(payload.share_online));
+
+        let decoded = decode_inner(&encoded).unwrap();
+        assert!(decoded.friends_of_friends_enabled);
+        assert_eq!(decoded.share_online, payload.share_online);
+        assert_eq!(decoded.sqlite, payload.sqlite);
     }
 
     #[test]
