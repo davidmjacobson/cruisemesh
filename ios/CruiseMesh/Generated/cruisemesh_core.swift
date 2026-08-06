@@ -2076,6 +2076,15 @@ public protocol MessageStoreProtocol : AnyObject {
 
     func clearFriendSuggestions() throws
 
+    /**
+     * Erase quarantined conflict branches and their metadata. Diagnostic
+     * export deliberately exposes only redacted summaries, but the retained
+     * rows contain message bodies for a future recovery rule. The user-facing
+     * "Delete captured diagnostics" action therefore needs an explicit way
+     * to remove both the summary and its private backing evidence.
+     */
+    func clearMessageConflicts() throws
+
     func clearPeerConnectionHistory() throws
 
     /**
@@ -2471,6 +2480,14 @@ public protocol MessageStoreProtocol : AnyObject {
     func exportDeliveryMetricsCsv() throws  -> String
 
     /**
+     * Quarantined stream-conflict metadata as a diagnostics-safe CSV.
+     * Message bodies, raw chat ids, raw sender ids, and message ids never
+     * leave the core. The quarantine is globally bounded, so exporting all
+     * retained rows is also bounded.
+     */
+    func exportMessageConflictsCsv() throws  -> String
+
+    /**
      * Unexpired carried envelopes that were classified as family traffic
      * when received, oldest first. Used by relay upload so one phone with
      * internet can uplink ciphertext it is muling for known contacts.
@@ -2584,6 +2601,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func hasDeliveryMetrics() throws  -> Bool
 
     /**
+     * Whether the bounded conflict quarantine contains any rows. This is the
+     * cheap predicate used by diagnostics screens; unlike CSV export it does
+     * not materialise the retained summaries or touch the filesystem.
+     */
+    func hasMessageConflicts() throws  -> Bool
+
+    /**
      * The highest lamport value N such that every message `1..=N` from this
      * sender in this chat is present -- the point up to which there's no
      * gap (DESIGN.md §7.3: "message 12 arrived, 11 hasn't -- keep
@@ -2641,6 +2665,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * for quoting it and an optional encrypted reply target.
      */
     func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgId: Data?) throws  -> Bool
+
+    /**
+     * Insert an opened incoming message and atomically retain first-arrival
+     * transport evidence. If the stream position conflicts, the existing
+     * visible branch wins and the incoming branch plus its source is placed
+     * in the bounded conflict quarantine instead of being silently dropped.
+     */
+    func insertIncomingMessageWithArrival(message: StoredMessage, msgId: Data, replyToMsgId: Data?, arrival: MessageArrival) throws  -> IncomingMessageInsertOutcome
 
     /**
      * Insert a message from a remote sender's stream, merging metadata from a
@@ -2775,6 +2807,12 @@ public protocol MessageStoreProtocol : AnyObject {
      * Missing history is expected and returns `None`.
      */
     func messageByMsgId(chatId: Data, msgId: Data) throws  -> StoredMessage?
+
+    /**
+     * Newest quarantined stream conflicts, with identifiers and message
+     * bodies replaced by stable pseudonymous hashes.
+     */
+    func messageConflictSummaries(limit: UInt32) throws  -> [MessageConflictSummary]
 
     /**
      * Chat and sender of a stored message keyed by its stable envelope
@@ -3937,6 +3975,19 @@ open func clearFriendSuggestions()throws  {try rustCallWithError(FfiConverterTyp
 }
 }
 
+    /**
+     * Erase quarantined conflict branches and their metadata. Diagnostic
+     * export deliberately exposes only redacted summaries, but the retained
+     * rows contain message bodies for a future recovery rule. The user-facing
+     * "Delete captured diagnostics" action therefore needs an explicit way
+     * to remove both the summary and its private backing evidence.
+     */
+open func clearMessageConflicts()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_message_conflicts(self.uniffiClonePointer(),$0
+    )
+}
+}
+
 open func clearPeerConnectionHistory()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_clear_peer_connection_history(self.uniffiClonePointer(),$0
     )
@@ -4498,6 +4549,19 @@ open func exportDeliveryMetricsCsv()throws  -> String {
 }
 
     /**
+     * Quarantined stream-conflict metadata as a diagnostics-safe CSV.
+     * Message bodies, raw chat ids, raw sender ids, and message ids never
+     * leave the core. The quarantine is globally bounded, so exporting all
+     * retained rows is also bounded.
+     */
+open func exportMessageConflictsCsv()throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_export_message_conflicts_csv(self.uniffiClonePointer(),$0
+    )
+})
+}
+
+    /**
      * Unexpired carried envelopes that were classified as family traffic
      * when received, oldest first. Used by relay upload so one phone with
      * internet can uplink ciphertext it is muling for known contacts.
@@ -4682,6 +4746,18 @@ open func hasDeliveryMetrics()throws  -> Bool {
 }
 
     /**
+     * Whether the bounded conflict quarantine contains any rows. This is the
+     * cheap predicate used by diagnostics screens; unlike CSV export it does
+     * not materialise the retained summaries or touch the filesystem.
+     */
+open func hasMessageConflicts()throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_has_message_conflicts(self.uniffiClonePointer(),$0
+    )
+})
+}
+
+    /**
      * The highest lamport value N such that every message `1..=N` from this
      * sender in this chat is present -- the point up to which there's no
      * gap (DESIGN.md §7.3: "message 12 arrived, 11 hasn't -- keep
@@ -4765,6 +4841,23 @@ open func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgI
         FfiConverterTypeStoredMessage.lower(message),
         FfiConverterData.lower(msgId),
         FfiConverterOptionData.lower(replyToMsgId),$0
+    )
+})
+}
+
+    /**
+     * Insert an opened incoming message and atomically retain first-arrival
+     * transport evidence. If the stream position conflicts, the existing
+     * visible branch wins and the incoming branch plus its source is placed
+     * in the bounded conflict quarantine instead of being silently dropped.
+     */
+open func insertIncomingMessageWithArrival(message: StoredMessage, msgId: Data, replyToMsgId: Data?, arrival: MessageArrival)throws  -> IncomingMessageInsertOutcome {
+    return try  FfiConverterTypeIncomingMessageInsertOutcome.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_insert_incoming_message_with_arrival(self.uniffiClonePointer(),
+        FfiConverterTypeStoredMessage.lower(message),
+        FfiConverterData.lower(msgId),
+        FfiConverterOptionData.lower(replyToMsgId),
+        FfiConverterTypeMessageArrival.lower(arrival),$0
     )
 })
 }
@@ -5006,6 +5099,18 @@ open func messageByMsgId(chatId: Data, msgId: Data)throws  -> StoredMessage? {
     uniffi_cruisemesh_core_fn_method_messagestore_message_by_msg_id(self.uniffiClonePointer(),
         FfiConverterData.lower(chatId),
         FfiConverterData.lower(msgId),$0
+    )
+})
+}
+
+    /**
+     * Newest quarantined stream conflicts, with identifiers and message
+     * bodies replaced by stable pseudonymous hashes.
+     */
+open func messageConflictSummaries(limit: UInt32)throws  -> [MessageConflictSummary] {
+    return try  FfiConverterSequenceTypeMessageConflictSummary.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_message_conflict_summaries(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(limit),$0
     )
 })
 }
@@ -11139,6 +11244,133 @@ public func FfiConverterTypeMessageBody_lower(_ value: MessageBody) -> RustBuffe
 
 
 /**
+ * Redacted, metadata-only view of a quarantined stream conflict. The full
+ * incoming branch remains private inside the SQLite store for a future
+ * explicit recovery rule; diagnostics receive only stable hashes and counts.
+ */
+public struct MessageConflictSummary {
+    public var chatHash: String
+    public var senderHash: String
+    public var lamport: UInt64
+    public var existingFingerprint: String
+    public var incomingFingerprint: String
+    public var arrivalTransport: UInt8?
+    public var firstSeenAtMs: Int64
+    public var lastSeenAtMs: Int64
+    public var seenCount: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(chatHash: String, senderHash: String, lamport: UInt64, existingFingerprint: String, incomingFingerprint: String, arrivalTransport: UInt8?, firstSeenAtMs: Int64, lastSeenAtMs: Int64, seenCount: UInt64) {
+        self.chatHash = chatHash
+        self.senderHash = senderHash
+        self.lamport = lamport
+        self.existingFingerprint = existingFingerprint
+        self.incomingFingerprint = incomingFingerprint
+        self.arrivalTransport = arrivalTransport
+        self.firstSeenAtMs = firstSeenAtMs
+        self.lastSeenAtMs = lastSeenAtMs
+        self.seenCount = seenCount
+    }
+}
+
+
+
+extension MessageConflictSummary: Equatable, Hashable {
+    public static func ==(lhs: MessageConflictSummary, rhs: MessageConflictSummary) -> Bool {
+        if lhs.chatHash != rhs.chatHash {
+            return false
+        }
+        if lhs.senderHash != rhs.senderHash {
+            return false
+        }
+        if lhs.lamport != rhs.lamport {
+            return false
+        }
+        if lhs.existingFingerprint != rhs.existingFingerprint {
+            return false
+        }
+        if lhs.incomingFingerprint != rhs.incomingFingerprint {
+            return false
+        }
+        if lhs.arrivalTransport != rhs.arrivalTransport {
+            return false
+        }
+        if lhs.firstSeenAtMs != rhs.firstSeenAtMs {
+            return false
+        }
+        if lhs.lastSeenAtMs != rhs.lastSeenAtMs {
+            return false
+        }
+        if lhs.seenCount != rhs.seenCount {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(chatHash)
+        hasher.combine(senderHash)
+        hasher.combine(lamport)
+        hasher.combine(existingFingerprint)
+        hasher.combine(incomingFingerprint)
+        hasher.combine(arrivalTransport)
+        hasher.combine(firstSeenAtMs)
+        hasher.combine(lastSeenAtMs)
+        hasher.combine(seenCount)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageConflictSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageConflictSummary {
+        return
+            try MessageConflictSummary(
+                chatHash: FfiConverterString.read(from: &buf),
+                senderHash: FfiConverterString.read(from: &buf),
+                lamport: FfiConverterUInt64.read(from: &buf),
+                existingFingerprint: FfiConverterString.read(from: &buf),
+                incomingFingerprint: FfiConverterString.read(from: &buf),
+                arrivalTransport: FfiConverterOptionUInt8.read(from: &buf),
+                firstSeenAtMs: FfiConverterInt64.read(from: &buf),
+                lastSeenAtMs: FfiConverterInt64.read(from: &buf),
+                seenCount: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MessageConflictSummary, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.chatHash, into: &buf)
+        FfiConverterString.write(value.senderHash, into: &buf)
+        FfiConverterUInt64.write(value.lamport, into: &buf)
+        FfiConverterString.write(value.existingFingerprint, into: &buf)
+        FfiConverterString.write(value.incomingFingerprint, into: &buf)
+        FfiConverterOptionUInt8.write(value.arrivalTransport, into: &buf)
+        FfiConverterInt64.write(value.firstSeenAtMs, into: &buf)
+        FfiConverterInt64.write(value.lastSeenAtMs, into: &buf)
+        FfiConverterUInt64.write(value.seenCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageConflictSummary_lift(_ buf: RustBuffer) throws -> MessageConflictSummary {
+    return try FfiConverterTypeMessageConflictSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageConflictSummary_lower(_ value: MessageConflictSummary) -> RustBuffer {
+    return FfiConverterTypeMessageConflictSummary.lower(value)
+}
+
+
+/**
  * Where a stored message row lives (`chat_id`) and who authored it
  * (`sender_user_id`), keyed by stable envelope `msg_id` -- see
  * [`MessageStore::message_origin_by_msg_id`]. Both fields are needed by the
@@ -14604,6 +14836,82 @@ extension FriendImport: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Result of an arrival-aware incoming insert. Legacy callers still receive a
+ * boolean; transport shells use this richer result so a quarantined conflict
+ * is logged distinctly from an ordinary duplicate.
+ */
+
+public enum IncomingMessageInsertOutcome {
+
+    case inserted
+    case duplicate
+    case quarantinedConflict
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIncomingMessageInsertOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = IncomingMessageInsertOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IncomingMessageInsertOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .inserted
+
+        case 2: return .duplicate
+
+        case 3: return .quarantinedConflict
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: IncomingMessageInsertOutcome, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .inserted:
+            writeInt(&buf, Int32(1))
+
+
+        case .duplicate:
+            writeInt(&buf, Int32(2))
+
+
+        case .quarantinedConflict:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIncomingMessageInsertOutcome_lift(_ buf: RustBuffer) throws -> IncomingMessageInsertOutcome {
+    return try FfiConverterTypeIncomingMessageInsertOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIncomingMessageInsertOutcome_lower(_ value: IncomingMessageInsertOutcome) -> RustBuffer {
+    return FfiConverterTypeIncomingMessageInsertOutcome.lower(value)
+}
+
+
+
+extension IncomingMessageInsertOutcome: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * A metadata-only connection event. No addresses, network names, tokens, or
  * message content are retained.
  *
@@ -16187,6 +16495,31 @@ fileprivate struct FfiConverterSequenceTypeLateArrivalInput: FfiConverterRustBuf
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeLateArrivalInput.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeMessageConflictSummary: FfiConverterRustBuffer {
+    typealias SwiftType = [MessageConflictSummary]
+
+    public static func write(_ value: [MessageConflictSummary], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMessageConflictSummary.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MessageConflictSummary] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MessageConflictSummary]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMessageConflictSummary.read(from: &buf))
         }
         return seq
     }
@@ -18782,8 +19115,8 @@ public func rotateGroup(group: Group, memberUserIds: [Data])throws  -> Group {
  * schemas receive the normal forward migrations before the cleanup runs.
  *
  * Returns the number of carried envelopes discarded. User-owned history,
- * contacts, authored Lamport watermarks, outbound authored work, receipts and
- * the relay frontier are deliberately preserved. New callers should use
+ * contacts, authored Lamport watermarks, unexpired outbound authored work,
+ * receipts and the relay frontier are deliberately preserved. New callers should use
  * [`sanitize_restored_message_store_with_options`] to make the choice
  * explicit and receive the full redacted report.
  */
@@ -19413,7 +19746,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_rotate_group() != 56003) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_sanitize_restored_message_store() != 11131) {
+    if (uniffi_cruisemesh_core_checksum_func_sanitize_restored_message_store() != 11599) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_sanitize_restored_message_store_with_options() != 9964) {
@@ -19641,6 +19974,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_friend_suggestions() != 35411) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_message_conflicts() != 52976) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_peer_connection_history() != 2544) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -19713,6 +20049,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_export_delivery_metrics_csv() != 57937) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_export_message_conflicts_csv() != 84) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_family_carried_envelopes() != 13806) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -19746,6 +20085,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_has_delivery_metrics() != 11580) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_has_message_conflicts() != 27119) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 43009) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -19756,6 +20098,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message() != 46727) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message_with_arrival() != 54638) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_message() != 61572) {
@@ -19807,6 +20152,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_message_by_msg_id() != 40731) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_conflict_summaries() != 28865) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_message_origin_by_msg_id() != 10578) {

@@ -199,11 +199,12 @@ struct ConnectionDetailsView: View {
     }
 
     /// Everything captured, in one share sheet: the connection log, any crash
-    /// reports MetricKit delivered for previous launches, and the delivery
-    /// timings CSV.
+    /// reports MetricKit delivered for previous launches, the delivery
+    /// timings CSV, and redacted stream-conflict summaries.
     ///
-    /// The three answer different questions -- what the radios did, why a
-    /// launch died, and whether messages actually arrived -- and none is
+    /// The artifacts answer different questions -- what the radios did, why a
+    /// launch died, whether messages actually arrived, and whether a sender
+    /// stream fork was quarantined -- and none is
     /// derivable from the others, so splitting them across buttons only meant
     /// getting a partial answer from whoever tapped the obvious one.
     ///
@@ -214,6 +215,7 @@ struct ConnectionDetailsView: View {
         if let url = DiagnosticLogExport.writeLogFile() { urls.append(url) }
         urls.append(contentsOf: DiagnosticLogExport.metricKitFileURLs())
         if let url = FieldMetricsExport.writeCSVFile() { urls.append(url) }
+        if let url = ConflictDiagnosticsExport.writeCSVFile() { urls.append(url) }
         hasDiagnosticArchive = !urls.isEmpty
         if urls.isEmpty {
             supportMessage = String(localized: "No diagnostics captured yet.")
@@ -237,7 +239,8 @@ struct ConnectionDetailsView: View {
     private func hasAnythingCaptured() -> Bool {
         if DiagnosticLogExport.hasArchive() { return true }
         if !DiagnosticLogExport.metricKitFileURLs().isEmpty { return true }
-        return FieldMetricsExport.hasCapturedMetrics()
+        if FieldMetricsExport.hasCapturedMetrics() { return true }
+        return ConflictDiagnosticsExport.hasCapturedConflicts()
     }
 
     /// Erases everything `shareEverything` would send. Anything left behind
@@ -249,6 +252,8 @@ struct ConnectionDetailsView: View {
         }
         try? AppStore.get().clearDeliveryMetrics()
         FieldMetricsExport.deleteExportedCSV()
+        try? AppStore.get().clearMessageConflicts()
+        ConflictDiagnosticsExport.deleteExportedCSV()
         // The last share left a zip holding copies of all of the above.
         DiagnosticsArchive.deleteArchives()
         hasDiagnosticArchive = false

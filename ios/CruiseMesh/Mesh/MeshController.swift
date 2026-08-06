@@ -1461,6 +1461,28 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
     }
 
+    private func acceptIncomingInsert(
+        _ outcome: IncomingMessageInsertOutcome,
+        sourceLabel: String,
+        kind: UInt8,
+        lamport: UInt64
+    ) -> Bool {
+        switch outcome {
+        case .inserted:
+            return true
+        case .duplicate:
+            log.info(
+                "Ignoring duplicate kind=\(kind, privacy: .public) lamport=\(lamport, privacy: .public) on \(sourceLabel, privacy: .public)"
+            )
+            return false
+        case .quarantinedConflict:
+            log.warning(
+                "Quarantined message stream conflict kind=\(kind, privacy: .public) lamport=\(lamport, privacy: .public) on \(sourceLabel, privacy: .public); retained visible branch"
+            )
+            return false
+        }
+    }
+
     private func handleIncomingGroupMetadataUpdate(
         sourceLabel: String,
         group: Group,
@@ -1486,27 +1508,36 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             return
         }
         // T4-06: primary store failure propagates (see handleIncomingChat).
-        let inserted = try store.insertIncomingMessage(
-            message: StoredMessage(
-                chatId: group.id,
-                senderUserId: senderUserId,
-                lamport: body.lamport,
-                timestamp: body.timestamp,
-                kind: body.kind,
-                payload: body.content
-            ),
-            msgId: msgId,
-            replyToMsgId: replyToMsgId
+        let message = StoredMessage(
+            chatId: group.id,
+            senderUserId: senderUserId,
+            lamport: body.lamport,
+            timestamp: body.timestamp,
+            kind: body.kind,
+            payload: body.content
         )
-        guard inserted else { return }
-        if let arrival {
-            _ = try? store.recordMessageArrival(
-                chatId: group.id,
-                senderUserId: senderUserId,
-                lamport: body.lamport,
+        let outcome = if let arrival {
+            try store.insertIncomingMessageWithArrival(
+                message: message,
+                msgId: msgId,
+                replyToMsgId: replyToMsgId,
                 arrival: arrival
             )
+        } else {
+            try store.insertIncomingMessage(
+                message: message,
+                msgId: msgId,
+                replyToMsgId: replyToMsgId
+            )
+                ? IncomingMessageInsertOutcome.inserted
+                : IncomingMessageInsertOutcome.duplicate
         }
+        guard acceptIncomingInsert(
+            outcome,
+            sourceLabel: sourceLabel,
+            kind: body.kind,
+            lamport: body.lamport
+        ) else { return }
         if let updated {
             do {
                 try store.upsertGroup(group: updated)
@@ -1526,27 +1557,36 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         arrival: MessageArrival?
     ) throws {
         // T4-06: primary store failure propagates (see handleIncomingChat).
-        let inserted = try store.insertIncomingMessage(
-            message: StoredMessage(
-                chatId: group.id,
-                senderUserId: senderUserId,
-                lamport: body.lamport,
-                timestamp: body.timestamp,
-                kind: body.kind,
-                payload: body.content
-            ),
-            msgId: msgId,
-            replyToMsgId: replyToMsgId
+        let message = StoredMessage(
+            chatId: group.id,
+            senderUserId: senderUserId,
+            lamport: body.lamport,
+            timestamp: body.timestamp,
+            kind: body.kind,
+            payload: body.content
         )
-        guard inserted else { return }
-        if let arrival {
-            _ = try? store.recordMessageArrival(
-                chatId: group.id,
-                senderUserId: senderUserId,
-                lamport: body.lamport,
+        let outcome = if let arrival {
+            try store.insertIncomingMessageWithArrival(
+                message: message,
+                msgId: msgId,
+                replyToMsgId: replyToMsgId,
                 arrival: arrival
             )
+        } else {
+            try store.insertIncomingMessage(
+                message: message,
+                msgId: msgId,
+                replyToMsgId: replyToMsgId
+            )
+                ? IncomingMessageInsertOutcome.inserted
+                : IncomingMessageInsertOutcome.duplicate
         }
+        guard acceptIncomingInsert(
+            outcome,
+            sourceLabel: "group transport",
+            kind: body.kind,
+            lamport: body.lamport
+        ) else { return }
         recordInboundChatArrival(senderUserId: senderUserId, kind: body.kind, arrival: arrival)
         ChatEvents.notifyChatChanged(group.id)
 
@@ -1670,7 +1710,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // turns the throw into `.failed`, leaving the envelope re-presentable
         // and its relay copy un-acked. A `false` here is a real duplicate --
         // already durably stored -- so it stays a terminal (return) state.
-        let inserted = try store.insertIncomingMessage(
+        let outcome = try store.insertIncomingMessageWithArrival(
             message: StoredMessage(
                 chatId: senderUserId,
                 senderUserId: senderUserId,
@@ -1680,15 +1720,15 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 payload: body.content
             ),
             msgId: msgId,
-            replyToMsgId: replyToMsgId
-        )
-        guard inserted else { return }
-        _ = try? store.recordMessageArrival(
-            chatId: senderUserId,
-            senderUserId: senderUserId,
-            lamport: body.lamport,
+            replyToMsgId: replyToMsgId,
             arrival: arrival
         )
+        guard acceptIncomingInsert(
+            outcome,
+            sourceLabel: sourceAddress ?? "relay",
+            kind: kind,
+            lamport: body.lamport
+        ) else { return }
         ChatEvents.notifyChatChanged(senderUserId)
 
         let through = PeerStreamWatermark.through(

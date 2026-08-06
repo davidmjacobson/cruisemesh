@@ -46,6 +46,36 @@ enum FieldMetricsExport {
     }
 }
 
+/// Metadata-only summaries of ambiguous incoming stream conflicts. Rust owns
+/// both redaction and CSV formatting so neither mobile shell can accidentally
+/// leak raw identities or quarantined message bodies.
+enum ConflictDiagnosticsExport {
+    private static let fileName = "cruisemesh-message-conflicts.csv"
+
+    static func writeCSVFile() -> URL? {
+        guard let csv = try? AppStore.get().exportMessageConflictsCsv() else { return nil }
+        guard csv.split(separator: "\n", omittingEmptySubsequences: true).count > 1 else {
+            return nil
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        do {
+            try csv.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    static func hasCapturedConflicts() -> Bool {
+        (try? AppStore.get().hasMessageConflicts()) ?? false
+    }
+
+    static func deleteExportedCSV() {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
 /// Identifiable wrapper so a freshly written set of export files can drive
 /// `.sheet(item:)`. Plural because "Share diagnostics" shares the log file
 /// alongside any `MetricKitCollector` JSON payloads in one sheet.
