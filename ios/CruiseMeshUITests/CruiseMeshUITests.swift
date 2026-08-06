@@ -110,11 +110,20 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
 
         let bob = app.staticTexts["Bob"].firstMatch
-        XCTAssertTrue(bob.waitForExistence(timeout: 5))
+        XCTAssertTrue(bob.waitForExistence(timeout: 10))
+        if !bob.isHittable {
+            app.swipeDown()
+        }
         bob.tap()
 
         XCTAssertTrue(element("screen.chat").waitForExistence(timeout: 10))
+<<<<<<< agent/log-secondary-relay-configs
         let composer = element("chat.composer.text")
+=======
+        let composer = app.textViews["chat.composer.text"].exists
+            ? app.textViews["chat.composer.text"]
+            : element("chat.composer.text")
+>>>>>>> local
         XCTAssertTrue(composer.waitForExistence(timeout: 10))
         composer.tap()
         composer.typeText("   ")
