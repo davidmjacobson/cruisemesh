@@ -93,7 +93,7 @@
     <string name="ui_message_info">Message info</string>
     <string name="ui_mute_notifications">Mute notifications</string>
     <string name="ui_my_friend_card">My friend card</string>
-    <string name="ui_friend_card_too_large">Shorten your name or relay settings to create a friend card.</string>
+    <string name="ui_friend_card_too_large">Shorten your name or internet delivery settings to create a friend card.</string>
     <string name="ui_nearby_permissions_are_required_skipping_them_means_the">Nearby devices access is what lets CruiseMesh reach phones around you — grant it to start messaging.</string>
     <string name="ui_nearby_access_enabled">Nearby access enabled</string>
     <string name="ui_enable_nearby_access_required">Enable nearby access</string>
@@ -206,8 +206,8 @@
     <string name="ui_verify_my_identity_explanation">Have your friend match these words against your name in their contacts to confirm it\'s really you.</string>
     <string name="notification_mesh_channel_name">CruiseMesh mesh sync</string>
     <string name="notification_mesh_paused_bluetooth">Paused — turn on Bluetooth to sync nearby</string>
-    <string name="notification_mesh_relaying">Relaying messages nearby</string>
-    <string name="notification_mesh_relaying_with_audio">Relaying messages nearby (Bluetooth audio also connected)</string>
+    <string name="notification_mesh_relaying">Carrying messages nearby</string>
+    <string name="notification_mesh_relaying_with_audio">Carrying messages nearby (Bluetooth audio also connected)</string>
     <string name="notification_stop_cruisemesh">Stop CruiseMesh</string>
     <string name="ui_save">Save</string>
     <string name="ui_save_your_identity_and_messages_to_an_encrypted">Save your identity and messages to an encrypted file.</string>
@@ -251,6 +251,7 @@
     <string name="ui_couldn_t_read_that_file">That file couldn\'t be read. Pick it again.</string>
     <string name="ui_unsupported_attachment">Unsupported attachment</string>
     <string name="ui_relay_token_rejected">The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.</string>
+    <string name="ui_shore_pass_token_rejected">Shore Pass rejected this family token. Messages will wait until the token is fixed — check it against another family phone.</string>
     <string name="ui_when_any_family_phone_has_internet_queued_messages">When any family phone has internet, queued messages flush through this mailbox.</string>
     <string name="ui_your_name">Your name</string>
     <plurals name="ui_member_count">
@@ -328,6 +329,7 @@
     <string name="ui_set_up_another_family_phone">Set up another family phone</string>
     <string name="ui_scan_this_with_the_other_phone_it_configures">Scan this with the other phone. It configures internet delivery; it does not add a contact.</string>
     <string name="ui_remove_shore_pass_setup_confirm">Remove Shore Pass setup?</string>
+    <string name="ui_remove_custom_relay_setup_confirm">Remove relay setup?</string>
     <string name="ui_queued_internet_delivery_will_stop_until_another_cruise">Queued internet delivery will stop until another Shore Pass or custom relay is set up. Nearby delivery still works.</string>
     <string name="ui_remove">Remove</string>
     <!-- Shore Pass check results. Previously hardcoded Kotlin/Swift literals,

@@ -282,7 +282,7 @@ struct ShorePassView: View {
             if health.isPassVerdict { lastVerdict = health }
         }
         .confirmationDialog(
-            "Remove Shore Pass setup?",
+            (configured != nil && relaySetupIsOfficial(relayUrl: configured!.relayUrl)) ? "Remove Shore Pass setup?" : "Remove relay setup?",
             isPresented: $showRemoveConfirmation,
             titleVisibility: .visible
         ) {

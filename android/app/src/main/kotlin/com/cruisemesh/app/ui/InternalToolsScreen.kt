@@ -118,7 +118,9 @@ fun InternalToolsScreen(onBack: () -> Unit) {
                 modifier = Modifier.padding(top = 4.dp),
             )
             if (relayHealth is RelayHealth.TokenRejected) {
-                Text(stringResource(R.string.ui_relay_token_rejected),
+                val isOfficial = uniffi.cruisemesh_core.relaySetupIsOfficial(relayUrl)
+                val textRes = if (isOfficial) R.string.ui_shore_pass_token_rejected else R.string.ui_relay_token_rejected
+                Text(stringResource(textRes),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.padding(top = 8.dp),

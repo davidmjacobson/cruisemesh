@@ -551,7 +551,7 @@ struct MyQRView: View {
                         Label("Share card text", systemImage: "square.and.arrow.up")
                     }
                 } else {
-                    Text("Shorten your name or relay settings to create a friend card.")
+                    Text("Shorten your name or internet delivery settings to create a friend card.")
                         .font(.body)
                         .foregroundStyle(.red)
                         .multilineTextAlignment(.center)
