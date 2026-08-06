@@ -2,12 +2,13 @@
 //! §10). `insert_message` is idempotent on (chat_id, sender_user_id,
 //! lamport): re-delivering the same envelope (expected under DTN) is a
 //! no-op. A conflict whose (timestamp, kind, payload) *don't* match is
-//! treated as the sender having forked/reset their stream rather than a
-//! duplicate -- see [MessageStore::insert_message]'s doc comment for the
-//! recovery this triggers. Per-chat lamport counters are maintained
-//! independently by each sender (DESIGN.md §7.1), so gap detection in
-//! [MessageStore::highest_contiguous_lamport] is keyed on (chat_id,
-//! sender_user_id), not chat_id alone.
+//! ambiguous and is ignored: the current wire format has no authenticated
+//! stream generation with which to prove that either branch supersedes the
+//! other, so an incoming copy must never erase visible history -- see
+//! [MessageStore::insert_message]'s doc comment. Per-chat lamport counters
+//! are maintained independently by each sender (DESIGN.md §7.1), so gap
+//! detection in [MessageStore::highest_contiguous_lamport] is keyed on
+//! (chat_id, sender_user_id), not chat_id alone.
 //!
 //! Contacts (DESIGN.md §6.2) live in the same store/connection rather than a
 //! separate file: they're the other half of "who can I seal a message to,"
@@ -1025,9 +1026,9 @@ impl MessageStore {
         Ok(())
     }
 
-    /// Insert a message from a remote sender's stream, distinguishing a true
-    /// duplicate from a *forked* stream instead of silently dropping both the
-    /// same way.
+    /// Insert a message from a remote sender's stream, merging metadata from a
+    /// true duplicate while failing closed when two different authenticated
+    /// messages claim the same stream position.
     ///
     /// A conflict on `(chat_id, sender_user_id, lamport)` is ambiguous on its
     /// own: it could be a digest resend or relay copy of a message we already
@@ -1042,19 +1043,14 @@ impl MessageStore {
     ///
     /// - **Identical** on all three -> true duplicate. No-op, returns `Ok(false)`,
     ///   same behavior as the old plain `INSERT OR IGNORE`.
-    /// - **Different** -> a fork. The sender's old stream at and above this
-    ///   lamport is abandoned, so we drop our stale copy of that tail and
-    ///   insert the new message in its place. We also clear
-    ///   `outgoing_receipts` / `outgoing_receipt_envelopes` for this
-    ///   `(chat_id, sender_user_id)`: those are *our* "delivered/read through
-    ///   N" watermarks about *their* stream, and they were computed against
-    ///   the abandoned history -- left in place, they'd keep telling the
-    ///   sender (who now has no history past their reset) that we've already
-    ///   read messages they haven't sent yet, which is exactly the false ✓✓
-    ///   this recovery exists to stop. `receipts` (the peer's acks of *our*
-    ///   stream) is untouched -- unrelated to their stream resetting. All of
-    ///   this runs in one transaction so a crash mid-recovery can't leave the
-    ///   stale tail and the new message coexisting.
+    /// - **Different** -> ambiguous conflict. Keep the existing branch and all
+    ///   receipt state, ignore the incoming message, and return `Ok(false)`.
+    ///   Timestamps cannot break the tie: they are sender wall-clock display
+    ///   hints and may be wrong. A delayed courier or restored backup can
+    ///   legitimately replay an older authenticated branch, while a confused
+    ///   clock can make that stale branch appear newer. Automatic fork
+    ///   recovery therefore requires a future protocol revision carrying an
+    ///   explicit authenticated stream generation/epoch.
     pub fn insert_message(&self, message: StoredMessage) -> Result<bool, CoreError> {
         incoming_message_reference::insert(self, message, None, None)
     }
@@ -1250,67 +1246,13 @@ mod incoming_message_reference {
             return Ok(false);
         }
 
-        // Fork: the sender re-numbered from below what we already hold.
-        // Drop our stale copy of the abandoned tail (this and every later
-        // lamport we have from their old stream -- they'll resend anything
-        // beyond this message under the new numbering too)...
-        tx.execute(
-            "DELETE FROM messages WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport >= ?3",
-            params![
-                message.chat_id,
-                message.sender_user_id,
-                message.lamport as i64
-            ],
-        )
-        .map_err(store_err)?;
-        // Exact control-message evidence belongs to the same numbered
-        // stream. Positions at and beyond the fork are evidence about the
-        // abandoned tail and must not be allowed to close gaps in the
-        // replacement stream.
-        tx.execute(
-            "DELETE FROM consumed_hidden_lamports
-             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport >= ?3",
-            params![
-                message.chat_id,
-                message.sender_user_id,
-                message.lamport as i64
-            ],
-        )
-        .map_err(store_err)?;
-        // ...and the watermarks we'd computed against that abandoned tail,
-        // so we stop reporting stale "delivered/read through N" back to the
-        // sender (root cause of the false ✓✓ this recovery fixes). These
-        // regenerate correctly from the normal receive/view paths.
-        tx.execute(
-            "DELETE FROM outgoing_receipts WHERE chat_id = ?1 AND sender_user_id = ?2",
-            params![message.chat_id, message.sender_user_id],
-        )
-        .map_err(store_err)?;
-        tx.execute(
-            "DELETE FROM outgoing_receipt_envelopes WHERE chat_id = ?1 AND sender_user_id = ?2",
-            params![message.chat_id, message.sender_user_id],
-        )
-        .map_err(store_err)?;
-        tx.execute(
-            "INSERT INTO messages
-                (chat_id, sender_user_id, lamport, timestamp, kind, payload,
-                 msg_id, reply_to_msg_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                message.chat_id,
-                message.sender_user_id,
-                message.lamport as i64,
-                message.timestamp,
-                message.kind as i64,
-                message.payload,
-                msg_id,
-                reply_to_msg_id,
-            ],
-        )
-        .map_err(store_err)?;
-
+        // A conflict proves only that two authenticated branches claim the
+        // same stream position, not which one is authoritative. Preserve the
+        // branch already rendered to the user. In particular, never use the
+        // sender's wall clock as a generation signal: causal_order explicitly
+        // bounds its influence because phone clocks can be wrong.
         tx.commit().map_err(store_err)?;
-        Ok(true)
+        Ok(false)
     }
 }
 
@@ -3313,16 +3255,16 @@ impl MessageStore {
     ///
     /// The two queued-envelope tables matter as much as `messages` here: a
     /// deleted chat that left `outbound_envelopes` behind re-arms the
-    /// reset-stream trap fixed in fc6b9f9 (recover-from-forked-stream) --
-    /// stale queued envelopes can resend frames from the deleted history to
-    /// a peer whose lamport stream has since moved on, which is exactly the
-    /// shape of bug that recovery exists to catch, not reintroduce via a
-    /// leftover queue. And a leftover `receipts` row is exactly the
+    /// reset-stream trap: stale queued envelopes can resend frames from the
+    /// deleted history to a peer whose lamport stream has since moved on.
+    /// The peer now preserves its visible branch on such a conflict because
+    /// the protocol has no authenticated stream generation; preventing the
+    /// conflict here is still necessary so newly authored messages are not
+    /// ignored as ambiguous. And a leftover `receipts` row is exactly the
     /// overstated ratchet that painted false read-ticks before that fix: a
     /// delete must yield a genuinely blank slate, not a chat that looks
     /// empty locally but still remembers watermarks against history the
-    /// user asked to erase. If the contact is re-added, the peer's replayed
-    /// receipts plus fork recovery re-establish consistency from scratch.
+    /// user asked to erase.
     ///
     /// **One thing must survive: `authored_lamport_watermarks`.** This used to
     /// say that nothing did, and that was wrong in a way that cost a peer
@@ -3330,10 +3272,10 @@ impl MessageStore {
     /// peer keeps theirs -- but the lamport counter was derived purely from
     /// rows this function deletes, so it restarted at 1 while the peer still
     /// held our stream up into the hundreds. Re-authoring over lamports they
-    /// already have does not look like a restart to them; it looks like we
-    /// forked our stream, and [`insert_message`]'s fork recovery responds by
-    /// deleting their copy of the conversation from that lamport up. So a
-    /// local delete silently destroyed the *other* person's history too.
+    /// already have does not look like a restart to them; it looks like an
+    /// ambiguous fork. Older builds could respond by deleting their copy of
+    /// the conversation from that lamport up, while current builds preserve
+    /// their history but cannot accept our genuinely new colliding message.
     /// Keeping the watermark means our numbering continues where it left off
     /// and no fork is ever detected. It stores no content -- only how far the
     /// counter got -- but note it is keyed by the peer's UserID, so a bare
@@ -7108,7 +7050,8 @@ mod tests {
         // tail at and above this lamport and wiping `outgoing_receipts`.
         let store = MessageStore::open(":memory:".to_string()).unwrap();
 
-        // A watermark that a genuine fork recovery would incorrectly wipe.
+        // A watermark that the old destructive conflict recovery incorrectly
+        // wiped.
         store
             .insert_message(msg(b"chat-a", b"alice", 1, "hi"))
             .unwrap();
@@ -7160,8 +7103,7 @@ mod tests {
             "reply target and msg_id must be preserved, not wiped"
         );
 
-        // The unrelated watermark from before must survive too -- a real
-        // fork recovery would have cleared it; a merge must not.
+        // The unrelated watermark from before must survive too.
         assert_eq!(
             store
                 .outgoing_receipt_through(
@@ -7171,7 +7113,7 @@ mod tests {
                 )
                 .unwrap(),
             1,
-            "a reply-target-only difference must not trigger fork recovery's receipt wipe"
+            "a reply-target-only difference must not wipe receipt state"
         );
     }
 
@@ -7195,7 +7137,69 @@ mod tests {
     }
 
     #[test]
-    fn insert_message_fork_recovers_abandoned_tail_and_resets_outgoing_receipts() {
+    fn stale_conflict_cannot_delete_a_newer_delivered_tail() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+
+        // Katie's current visible David stream from the field report. Lamport
+        // 695 was a hidden/control event, so the visible rows are sparse.
+        for (lamport, timestamp, payload) in [
+            (694, 10_000, "david-current-694"),
+            (696, 30_000, "david-current-696"),
+            (697, 40_000, "david-current-697"),
+        ] {
+            let mut current = msg(b"katie", b"david", lamport, payload);
+            current.timestamp = timestamp;
+            assert!(store.insert_message(current).unwrap());
+        }
+        store
+            .record_outgoing_receipt(
+                b"katie".to_vec(),
+                b"david".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                697,
+            )
+            .unwrap();
+
+        // Restored couriers replay different authenticated David 694s. Test
+        // both ordinary stale time and a confused/future clock: neither is a
+        // trustworthy branch-generation signal.
+        for (timestamp, payload) in [
+            (5_000, "older-stale-restored-694"),
+            (90_000, "future-clock-stale-restored-694"),
+        ] {
+            let mut restored = msg(b"katie", b"david", 694, payload);
+            restored.timestamp = timestamp;
+            assert!(!store.insert_message(restored).unwrap());
+        }
+
+        let remaining = store.messages_for_chat(b"katie".to_vec()).unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|message| (message.lamport, message.payload.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![
+                (694, b"david-current-694".as_slice()),
+                (696, b"david-current-696".as_slice()),
+                (697, b"david-current-697".as_slice()),
+            ],
+            "a delayed conflicting envelope must not replace its collision or erase the visible tail"
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    b"katie".to_vec(),
+                    b"david".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED,
+                )
+                .unwrap(),
+            697,
+            "ignoring stale evidence must preserve the receipt derived from the retained branch"
+        );
+    }
+
+    #[test]
+    fn insert_message_conflict_preserves_tail_and_outgoing_receipts() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store.upsert_contact(contact(b"alice", "Alice")).unwrap();
         // Alice's original stream: message rows at 1, 2, 3, and 5, plus a
@@ -7233,29 +7237,33 @@ mod tests {
             5
         );
 
-        // Alice deleted the chat and re-added us: her lamport counter
-        // restarted, so she resends a genuinely new message 3 with different
-        // content/timestamp -- a fork, not a duplicate of the old message 3.
-        let mut forked = msg(b"alice", b"alice", 3, "new-after-reset");
-        forked.timestamp = 1_700_000_500_000;
-        assert!(store.insert_message(forked).unwrap());
+        // Alice may have reset her stream, or an old restored courier may be
+        // replaying another branch. Even a much newer timestamp cannot prove
+        // which: phone clocks are not authenticated stream generations.
+        let mut conflict = msg(b"alice", b"alice", 3, "new-after-reset");
+        conflict.timestamp = 1_700_000_500_000;
+        assert!(!store.insert_message(conflict).unwrap());
 
-        // Old messages 3, 4, 5 are gone; the new message 3 replaces them.
+        // The already-visible branch and exact hidden evidence stay intact.
         let remaining = store.messages_for_chat(b"alice".to_vec()).unwrap();
-        assert_eq!(remaining.len(), 3); // 1, 2, and the new 3
+        assert_eq!(remaining.len(), 4); // 1, 2, 3, and 5
         let three = remaining.iter().find(|m| m.lamport == 3).unwrap();
-        assert_eq!(three.payload, b"new-after-reset");
-        assert_eq!(three.timestamp, 1_700_000_500_000);
-        assert!(remaining.iter().all(|m| m.lamport != 4 && m.lamport != 5));
-        assert!(
+        assert_eq!(three.payload, b"old");
+        assert_eq!(three.timestamp, 1_700_000_000_000);
+        assert!(remaining.iter().any(|m| m.lamport == 5));
+        assert_eq!(
             store
                 .consumed_hidden_lamports(b"alice".to_vec())
                 .unwrap()
-                .is_empty(),
-            "control-message evidence from the abandoned tail must be removed"
+                .iter()
+                .map(|entry| entry.lamport)
+                .collect::<Vec<_>>(),
+            vec![4],
+            "ambiguous conflict must not erase accepted hidden evidence"
         );
 
-        // Our contiguous view of Alice's stream is now capped at the fork point.
+        // The messages-only contiguous view stays where it was: row 4 is a
+        // separately retained hidden/control event, so this helper stops at 3.
         assert_eq!(
             store
                 .highest_contiguous_lamport(b"alice".to_vec(), b"alice".to_vec())
@@ -7263,10 +7271,7 @@ mod tests {
             3
         );
 
-        // The stale "read through 5" watermark about Alice's *old* stream is
-        // cleared -- it was overstated relative to her reset stream and would
-        // otherwise keep painting false checkmarks on messages she hasn't
-        // sent yet under the new numbering.
+        // A receipt derived from the retained branch must not disappear.
         assert_eq!(
             store
                 .outgoing_receipt_through(
@@ -7275,12 +7280,12 @@ mod tests {
                     crate::RECEIPT_TYPE_READ,
                 )
                 .unwrap(),
-            0
+            5
         );
     }
 
     #[test]
-    fn insert_message_fork_recovery_does_not_touch_receipts_table() {
+    fn insert_message_conflict_does_not_touch_receipts_table() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         for lamport in 1..=5u64 {
             store
@@ -7288,8 +7293,8 @@ mod tests {
                 .unwrap();
         }
         // `receipts` in this chat is the peer's ack of *our own* outgoing
-        // stream ("self") -- unrelated to alice's stream resetting -- and
-        // must survive her fork recovery untouched.
+        // stream ("self") -- unrelated to alice's conflicting stream -- and
+        // must survive untouched.
         store
             .record_receipt(
                 b"chat-a".to_vec(),
@@ -7300,9 +7305,9 @@ mod tests {
             )
             .unwrap();
 
-        let mut forked = msg(b"chat-a", b"alice", 3, "new-after-reset");
-        forked.timestamp = 1_700_000_500_000;
-        assert!(store.insert_message(forked).unwrap());
+        let mut conflict = msg(b"chat-a", b"alice", 3, "new-after-reset");
+        conflict.timestamp = 1_700_000_500_000;
+        assert!(!store.insert_message(conflict).unwrap());
 
         assert_eq!(
             store
@@ -7591,12 +7596,12 @@ mod tests {
     }
 
     /// The peer's side of the field failure: a sender whose lamport counter
-    /// restarted re-authors over lamports the peer already holds, and the
-    /// peer's fork recovery deletes their copy of the conversation. This test
-    /// documents the mechanism the fix exists to prevent -- it is about
-    /// `insert_message`, and it passes both before and after.
+    /// restarted re-authors over lamports the peer already holds. Without an
+    /// authenticated stream generation there is no safe way to distinguish
+    /// that reset from a stale restored-courier replay, so the peer preserves
+    /// the branch it has already rendered.
     #[test]
-    fn a_sender_who_restarts_their_lamports_destroys_the_peers_history() {
+    fn a_sender_conflict_never_destroys_the_peers_history() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         for i in 1..=5u64 {
             let mut old = msg(b"david", b"david", i, "old");
@@ -7605,15 +7610,16 @@ mod tests {
         }
         assert_eq!(store.messages_for_chat(b"david".to_vec()).unwrap().len(), 5);
 
-        // Same lamport, different content: not a duplicate, so the peer reads
-        // it as a fork and drops everything from that lamport up.
+        // Same lamport, different content, and even a later timestamp remain
+        // ambiguous rather than authorizing destructive recovery.
         let mut restarted = msg(b"david", b"david", 1, "after a delete");
         restarted.timestamp += 999;
-        assert!(store.insert_message(restarted).unwrap());
+        assert!(!store.insert_message(restarted).unwrap());
 
         let rows = store.messages_for_chat(b"david".to_vec()).unwrap();
-        assert_eq!(rows.len(), 1, "the peer's whole history was erased");
-        assert_eq!(rows[0].payload, b"after a delete".to_vec());
+        assert_eq!(rows.len(), 5, "the peer's visible history must survive");
+        assert_eq!(rows[0].payload, b"old-1".to_vec());
+        assert_eq!(rows[4].payload, b"old-5".to_vec());
     }
 
     #[test]
