@@ -34,9 +34,14 @@ struct InternalToolsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if case .tokenRejected = connectivity.relay {
-                    let rejectionText = appModel.relaySetupIsOfficial
-                        ? String(localized: "Shore Pass rejected this family token. Messages will wait until the token is fixed — check it against another family phone.")
-                        : String(localized: "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.")
+                    // Explicit type + if/else: a multiline ternary here makes the
+                    // Swift type checker time out inside the Form body.
+                    let rejectionText: String
+                    if appModel.relaySetupIsOfficial {
+                        rejectionText = String(localized: "Shore Pass rejected this family token. Messages will wait until the token is fixed — check it against another family phone.")
+                    } else {
+                        rejectionText = String(localized: "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.")
+                    }
                     Text(rejectionText)
                         .font(.caption)
                         .foregroundStyle(.red)
