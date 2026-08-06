@@ -129,8 +129,8 @@ final class RelayFetchCursorTests: XCTestCase {
     }
 
     func testAMailboxNeverSweptSweepsOnceNotOncePerPass() {
-        // Fresh install, restore (cursor rows never ride a .cmbak), rotated
-        // token, moved host: all read as 0 and must walk from the beginning.
+        // Fresh install, rotated token, and moved host read as 0 and must walk
+        // from the beginning. Restore preserves a recent frontier instead.
         XCTAssertTrue(relaySweepDue(sweptThisSession: false, lastSweepAtMs: 0, nowMs: 5_000))
         // ...but a store write that keeps failing must not re-walk forever.
         XCTAssertFalse(relaySweepDue(sweptThisSession: true, lastSweepAtMs: 0, nowMs: 5_000))

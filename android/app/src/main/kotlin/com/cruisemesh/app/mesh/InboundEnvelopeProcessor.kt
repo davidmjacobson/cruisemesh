@@ -698,6 +698,7 @@ internal class InboundEnvelopeProcessor(
      */
     fun drainCarriedEnvelopesTo(address: String, peerUserId: ByteArray) {
         val now = System.currentTimeMillis()
+        var carriedReservation: CarriedOfferEpochGate.Reservation? = null
         try {
             store.pruneExpiredCarried(now)
             // G2: budgeted page + resume cursor (same DTN rules — offer only).
@@ -706,6 +707,16 @@ internal class InboundEnvelopeProcessor(
                 Log.d(TAG, "Targeted carried drain parked for $address (rewalk cooldown)")
                 return
             }
+            // HELLO drains share G3's global allowance with digest sprays and
+            // reserve by authenticated user. Duplicate BLE roles or rotating
+            // addresses for one phone cannot each enqueue a full page in the
+            // same connection burst.
+            carriedReservation = carriedOfferGate.tryReserve(now, UserIdHex.encode(peerUserId))
+            if (carriedReservation == null) {
+                Log.d(TAG, "Targeted carried drain deferred for $address (logical-peer/global cap)")
+                return
+            }
+            val reservation = carriedReservation
             // Peer userId hints plus every group that peer is a member of
             // (DESIGN.md §6.5: members mule for the whole group).
             val deliveryHints = store.deliveryHintsForPeer(peerUserId, now)
@@ -716,9 +727,13 @@ internal class InboundEnvelopeProcessor(
                 lane.after,
             )
             if (page.rows.isEmpty()) {
+                carriedOfferGate.release(reservation)
+                carriedReservation = null
                 MeshRouter.recordTargetedCarriedProgress(address, page.next, page.exhausted, now)
                 return
             }
+            carriedOfferGate.commit(reservation)
+            carriedReservation = null
             var delivered = 0
             for (env in page.rows) {
                 val frame = encodeEnvelopeFrame(env.msgId, env.hopTtl, env.expiry, env.recipientHint, env.sealed)
@@ -735,6 +750,8 @@ internal class InboundEnvelopeProcessor(
             )
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to drain carried envelopes to $address: ${e.message}")
+        } finally {
+            carriedReservation?.let(carriedOfferGate::release)
         }
     }
 
@@ -2173,7 +2190,11 @@ internal class InboundEnvelopeProcessor(
             // at once. Reservation is atomic across Android's concurrent BLE,
             // LAN, and relay receive paths. Own mail/receipts still flow when
             // carried is deferred.
-            carriedReservation = if (lane.skip) null else carriedOfferGate.tryReserve(now)
+            carriedReservation = if (lane.skip) {
+                null
+            } else {
+                carriedOfferGate.tryReserve(now, UserIdHex.encode(peerUserId))
+            }
             val allowCarried = carriedReservation != null
             val plan = store.coreDigestSprayPlan(
                 ownUserId = identity.userId,

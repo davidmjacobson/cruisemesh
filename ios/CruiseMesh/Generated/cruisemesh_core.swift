@@ -1861,24 +1861,22 @@ public protocol MessageStoreProtocol : AnyObject {
      * The destination must not already exist; callers should use a unique
      * temporary path and remove it after reading the backup bytes.
      *
-     * ## Relay fetch cursors do not ride the backup
+     * ## Courier state does not ride the backup
      *
-     * Everything else in the store is history and should come back exactly
-     * as it was. A relay fetch cursor is not history — it is a claim about
-     * the *current* state of a remote mailbox, and a backup is the one place
-     * that claim can be carried somewhere it was never true. Restore onto a
-     * second phone, restore months later, or restore after the relay box was
-     * rebuilt (its `families` table emptied and its row ids restarted at 1,
-     * which has happened in this project's own deployment) and an inherited
-     * frontier sits above every row that now exists. The phone would then
-     * fetch nothing, forever, and report perfect health while doing it —
-     * silent non-delivery, the worst failure this app can have.
+     * User-owned messages, contacts, authored Lamport watermarks and receipts
+     * are history and come back exactly as they were. Courier ciphertext in
+     * `carried_envelopes` is different: it belongs to other recipients and a
+     * restored copy has no delivery-progress evidence. Restoring hundreds of
+     * those rows used to offer the whole stale backlog again on every new BLE
+     * link, immediately multiplying traffic across rotating peer addresses.
      *
-     * So the snapshot is scrubbed of them before it is sealed. The restored
-     * device re-walks each mailbox once from 0 and re-establishes its own
-     * frontier from evidence. That costs one full walk and nothing else:
-     * everything already delivered is recognised and dropped by the seen-id
-     * filter on the way back in.
+     * Relay fetch cursors deliberately *do* ride the backup. Dropping a
+     * cursor forces an immediate walk from row zero; on a shared family
+     * mailbox that re-downloads the stale proxy mail we just discarded and
+     * can recreate the restore storm before the UI opens. The six-hour
+     * periodic sweep already repairs a stale frontier or rebuilt relay, so
+     * preserving it trades at most bounded delivery delay for avoiding an
+     * unbounded restore-time replay.
      */
     func backupTo(destination: String) throws
 
@@ -2069,12 +2067,10 @@ public protocol MessageStoreProtocol : AnyObject {
      * Forget every remembered frontier, so the next pass re-walks each
      * mailbox from the beginning.
      *
-     * This is the reset a restored `.cmbak` needs — [`Self::backup_to`]
-     * applies it to the snapshot it writes, so a restore never inherits
-     * another device's (or another relay generation's) idea of where the
-     * mailbox got to. Re-walking once is cheap and self-correcting:
-     * everything already delivered is deduped on the way back in by the
-     * seen-id gossip filter.
+     * This is an explicit administrative reset, not part of backup/restore.
+     * Restore preserves the frontier because clearing it immediately walks
+     * an entire shared mailbox and can recreate discarded courier backlog;
+     * scheduled sweeps provide the bounded stale-frontier repair path.
      */
     func clearRelayFetchCursors() throws
 
@@ -2346,16 +2342,16 @@ public protocol MessageStoreProtocol : AnyObject {
      *
      * The two queued-envelope tables matter as much as `messages` here: a
      * deleted chat that left `outbound_envelopes` behind re-arms the
-     * reset-stream trap fixed in fc6b9f9 (recover-from-forked-stream) --
-     * stale queued envelopes can resend frames from the deleted history to
-     * a peer whose lamport stream has since moved on, which is exactly the
-     * shape of bug that recovery exists to catch, not reintroduce via a
-     * leftover queue. And a leftover `receipts` row is exactly the
+     * reset-stream trap: stale queued envelopes can resend frames from the
+     * deleted history to a peer whose lamport stream has since moved on.
+     * The peer now preserves its visible branch on such a conflict because
+     * the protocol has no authenticated stream generation; preventing the
+     * conflict here is still necessary so newly authored messages are not
+     * ignored as ambiguous. And a leftover `receipts` row is exactly the
      * overstated ratchet that painted false read-ticks before that fix: a
      * delete must yield a genuinely blank slate, not a chat that looks
      * empty locally but still remembers watermarks against history the
-     * user asked to erase. If the contact is re-added, the peer's replayed
-     * receipts plus fork recovery re-establish consistency from scratch.
+     * user asked to erase.
      *
      * **One thing must survive: `authored_lamport_watermarks`.** This used to
      * say that nothing did, and that was wrong in a way that cost a peer
@@ -2363,10 +2359,10 @@ public protocol MessageStoreProtocol : AnyObject {
      * peer keeps theirs -- but the lamport counter was derived purely from
      * rows this function deletes, so it restarted at 1 while the peer still
      * held our stream up into the hundreds. Re-authoring over lamports they
-     * already have does not look like a restart to them; it looks like we
-     * forked our stream, and [`insert_message`]'s fork recovery responds by
-     * deleting their copy of the conversation from that lamport up. So a
-     * local delete silently destroyed the *other* person's history too.
+     * already have does not look like a restart to them; it looks like an
+     * ambiguous fork. Older builds could respond by deleting their copy of
+     * the conversation from that lamport up, while current builds preserve
+     * their history but cannot accept our genuinely new colliding message.
      * Keeping the watermark means our numbering continues where it left off
      * and no fork is ever detected. It stores no content -- only how far the
      * counter got -- but note it is keyed by the peer's UserID, so a bare
@@ -2632,9 +2628,9 @@ public protocol MessageStoreProtocol : AnyObject {
     func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgId: Data?) throws  -> Bool
 
     /**
-     * Insert a message from a remote sender's stream, distinguishing a true
-     * duplicate from a *forked* stream instead of silently dropping both the
-     * same way.
+     * Insert a message from a remote sender's stream, merging metadata from a
+     * true duplicate while failing closed when two different authenticated
+     * messages claim the same stream position.
      *
      * A conflict on `(chat_id, sender_user_id, lamport)` is ambiguous on its
      * own: it could be a digest resend or relay copy of a message we already
@@ -2649,19 +2645,14 @@ public protocol MessageStoreProtocol : AnyObject {
      *
      * - **Identical** on all three -> true duplicate. No-op, returns `Ok(false)`,
      * same behavior as the old plain `INSERT OR IGNORE`.
-     * - **Different** -> a fork. The sender's old stream at and above this
-     * lamport is abandoned, so we drop our stale copy of that tail and
-     * insert the new message in its place. We also clear
-     * `outgoing_receipts` / `outgoing_receipt_envelopes` for this
-     * `(chat_id, sender_user_id)`: those are *our* "delivered/read through
-     * N" watermarks about *their* stream, and they were computed against
-     * the abandoned history -- left in place, they'd keep telling the
-     * sender (who now has no history past their reset) that we've already
-     * read messages they haven't sent yet, which is exactly the false ✓✓
-     * this recovery exists to stop. `receipts` (the peer's acks of *our*
-     * stream) is untouched -- unrelated to their stream resetting. All of
-     * this runs in one transaction so a crash mid-recovery can't leave the
-     * stale tail and the new message coexisting.
+     * - **Different** -> ambiguous conflict. Keep the existing branch and all
+     * receipt state, ignore the incoming message, and return `Ok(false)`.
+     * Timestamps cannot break the tie: they are sender wall-clock display
+     * hints and may be wrong. A delayed courier or restored backup can
+     * legitimately replay an older authenticated branch, while a confused
+     * clock can make that stale branch appear newer. Automatic fork
+     * recovery therefore requires a future protocol revision carrying an
+     * explicit authenticated stream generation/epoch.
      */
     func insertMessage(message: StoredMessage) throws  -> Bool
 
@@ -3612,24 +3603,22 @@ open func backfillPairwiseEnvelope(identity: Identity, contact: Contact, message
      * The destination must not already exist; callers should use a unique
      * temporary path and remove it after reading the backup bytes.
      *
-     * ## Relay fetch cursors do not ride the backup
+     * ## Courier state does not ride the backup
      *
-     * Everything else in the store is history and should come back exactly
-     * as it was. A relay fetch cursor is not history — it is a claim about
-     * the *current* state of a remote mailbox, and a backup is the one place
-     * that claim can be carried somewhere it was never true. Restore onto a
-     * second phone, restore months later, or restore after the relay box was
-     * rebuilt (its `families` table emptied and its row ids restarted at 1,
-     * which has happened in this project's own deployment) and an inherited
-     * frontier sits above every row that now exists. The phone would then
-     * fetch nothing, forever, and report perfect health while doing it —
-     * silent non-delivery, the worst failure this app can have.
+     * User-owned messages, contacts, authored Lamport watermarks and receipts
+     * are history and come back exactly as they were. Courier ciphertext in
+     * `carried_envelopes` is different: it belongs to other recipients and a
+     * restored copy has no delivery-progress evidence. Restoring hundreds of
+     * those rows used to offer the whole stale backlog again on every new BLE
+     * link, immediately multiplying traffic across rotating peer addresses.
      *
-     * So the snapshot is scrubbed of them before it is sealed. The restored
-     * device re-walks each mailbox once from 0 and re-establishes its own
-     * frontier from evidence. That costs one full walk and nothing else:
-     * everything already delivered is recognised and dropped by the seen-id
-     * filter on the way back in.
+     * Relay fetch cursors deliberately *do* ride the backup. Dropping a
+     * cursor forces an immediate walk from row zero; on a shared family
+     * mailbox that re-downloads the stale proxy mail we just discarded and
+     * can recreate the restore storm before the UI opens. The six-hour
+     * periodic sweep already repairs a stale frontier or rebuilt relay, so
+     * preserving it trades at most bounded delivery delay for avoiding an
+     * unbounded restore-time replay.
      */
 open func backupTo(destination: String)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_backup_to(self.uniffiClonePointer(),
@@ -3914,12 +3903,10 @@ open func clearPeerConnectionHistory()throws  {try rustCallWithError(FfiConverte
      * Forget every remembered frontier, so the next pass re-walks each
      * mailbox from the beginning.
      *
-     * This is the reset a restored `.cmbak` needs — [`Self::backup_to`]
-     * applies it to the snapshot it writes, so a restore never inherits
-     * another device's (or another relay generation's) idea of where the
-     * mailbox got to. Re-walking once is cheap and self-correcting:
-     * everything already delivered is deduped on the way back in by the
-     * seen-id gossip filter.
+     * This is an explicit administrative reset, not part of backup/restore.
+     * Restore preserves the frontier because clearing it immediately walks
+     * an entire shared mailbox and can recreate discarded courier backlog;
+     * scheduled sweeps provide the bounded stale-frontier repair path.
      */
 open func clearRelayFetchCursors()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_clear_relay_fetch_cursors(self.uniffiClonePointer(),$0
@@ -4292,16 +4279,16 @@ open func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], own
      *
      * The two queued-envelope tables matter as much as `messages` here: a
      * deleted chat that left `outbound_envelopes` behind re-arms the
-     * reset-stream trap fixed in fc6b9f9 (recover-from-forked-stream) --
-     * stale queued envelopes can resend frames from the deleted history to
-     * a peer whose lamport stream has since moved on, which is exactly the
-     * shape of bug that recovery exists to catch, not reintroduce via a
-     * leftover queue. And a leftover `receipts` row is exactly the
+     * reset-stream trap: stale queued envelopes can resend frames from the
+     * deleted history to a peer whose lamport stream has since moved on.
+     * The peer now preserves its visible branch on such a conflict because
+     * the protocol has no authenticated stream generation; preventing the
+     * conflict here is still necessary so newly authored messages are not
+     * ignored as ambiguous. And a leftover `receipts` row is exactly the
      * overstated ratchet that painted false read-ticks before that fix: a
      * delete must yield a genuinely blank slate, not a chat that looks
      * empty locally but still remembers watermarks against history the
-     * user asked to erase. If the contact is re-added, the peer's replayed
-     * receipts plus fork recovery re-establish consistency from scratch.
+     * user asked to erase.
      *
      * **One thing must survive: `authored_lamport_watermarks`.** This used to
      * say that nothing did, and that was wrong in a way that cost a peer
@@ -4309,10 +4296,10 @@ open func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], own
      * peer keeps theirs -- but the lamport counter was derived purely from
      * rows this function deletes, so it restarted at 1 while the peer still
      * held our stream up into the hundreds. Re-authoring over lamports they
-     * already have does not look like a restart to them; it looks like we
-     * forked our stream, and [`insert_message`]'s fork recovery responds by
-     * deleting their copy of the conversation from that lamport up. So a
-     * local delete silently destroyed the *other* person's history too.
+     * already have does not look like a restart to them; it looks like an
+     * ambiguous fork. Older builds could respond by deleting their copy of
+     * the conversation from that lamport up, while current builds preserve
+     * their history but cannot accept our genuinely new colliding message.
      * Keeping the watermark means our numbering continues where it left off
      * and no fork is ever detected. It stores no content -- only how far the
      * counter got -- but note it is keyed by the peer's UserID, so a bare
@@ -4739,9 +4726,9 @@ open func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgI
 }
 
     /**
-     * Insert a message from a remote sender's stream, distinguishing a true
-     * duplicate from a *forked* stream instead of silently dropping both the
-     * same way.
+     * Insert a message from a remote sender's stream, merging metadata from a
+     * true duplicate while failing closed when two different authenticated
+     * messages claim the same stream position.
      *
      * A conflict on `(chat_id, sender_user_id, lamport)` is ambiguous on its
      * own: it could be a digest resend or relay copy of a message we already
@@ -4756,19 +4743,14 @@ open func insertIncomingMessage(message: StoredMessage, msgId: Data, replyToMsgI
      *
      * - **Identical** on all three -> true duplicate. No-op, returns `Ok(false)`,
      * same behavior as the old plain `INSERT OR IGNORE`.
-     * - **Different** -> a fork. The sender's old stream at and above this
-     * lamport is abandoned, so we drop our stale copy of that tail and
-     * insert the new message in its place. We also clear
-     * `outgoing_receipts` / `outgoing_receipt_envelopes` for this
-     * `(chat_id, sender_user_id)`: those are *our* "delivered/read through
-     * N" watermarks about *their* stream, and they were computed against
-     * the abandoned history -- left in place, they'd keep telling the
-     * sender (who now has no history past their reset) that we've already
-     * read messages they haven't sent yet, which is exactly the false ✓✓
-     * this recovery exists to stop. `receipts` (the peer's acks of *our*
-     * stream) is untouched -- unrelated to their stream resetting. All of
-     * this runs in one transaction so a crash mid-recovery can't leave the
-     * stale tail and the new message coexisting.
+     * - **Different** -> ambiguous conflict. Keep the existing branch and all
+     * receipt state, ignore the incoming message, and return `Ok(false)`.
+     * Timestamps cannot break the tie: they are sender wall-clock display
+     * hints and may be wrong. A delayed courier or restored backup can
+     * legitimately replay an older authenticated branch, while a confused
+     * clock can make that stale branch appear newer. Automatic fork
+     * recovery therefore requires a future protocol revision carrying an
+     * explicit authenticated stream generation/epoch.
      */
 open func insertMessage(message: StoredMessage)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -18240,13 +18222,11 @@ public func relaySetupIsOfficial(relayUrl: String) -> Bool {
  * Two valves stay open, because they are the states a stored timestamp
  * genuinely cannot speak for:
  *
- * - **Never swept** (`last_sweep_at_ms <= 0`) sweeps. This is also,
- * deliberately, the entire "heal promptly after an install or restore"
- * story, and the reason no extra cold-start grace period is warranted on
- * top of it. A fresh install has no `relay_fetch_cursors` row; those rows
- * deliberately do not ride a `.cmbak` (see `MessageStore::backup_to`), so a
- * restore has none either; and a rotated token or a moved host hashes to a
- * different [`relay_cursor_key`], which has no row of its own. All three
+ * - **Never swept** (`last_sweep_at_ms <= 0`) sweeps. This is also the
+ * entire "heal promptly after an install" story and the reason no extra
+ * cold-start grace period is warranted on top of it. A fresh install has
+ * no `relay_fetch_cursors` row; a rotated token or a moved host hashes to a
+ * different [`relay_cursor_key`], which has no row of its own. Both states
  * read as 0 here and sweep on their first pass. A grace period would buy
  * those cases nothing they don't already have, and would hand back a share
  * of exactly the restart-driven cost this rule exists to remove.
@@ -18425,6 +18405,22 @@ public func rotateGroup(group: Group, memberUserIds: [Data])throws  -> Group {
     uniffi_cruisemesh_core_fn_func_rotate_group(
         FfiConverterTypeGroup.lower(group),
         FfiConverterSequenceData.lower(memberUserIds),$0
+    )
+})
+}
+/**
+ * Make an installed legacy full-database backup safe before any transport
+ * opens it. The path is opened through [`MessageStore::open`] first so old
+ * schemas receive the normal forward migrations before the cleanup runs.
+ *
+ * Returns the number of carried envelopes discarded. User-owned history,
+ * contacts, authored Lamport watermarks, outbound authored work, receipts and
+ * the relay frontier are deliberately preserved.
+ */
+public func sanitizeRestoredMessageStore(path: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_sanitize_restored_message_store(
+        FfiConverterString.lower(path),$0
     )
 })
 }
@@ -19002,7 +18998,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 11572) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 13229) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 25542) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_interval_ms() != 37428) {
@@ -19027,6 +19023,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_rotate_group() != 56003) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_sanitize_restored_message_store() != 61596) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_seal_backup() != 5887) {
@@ -19200,7 +19199,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_envelope() != 41114) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to() != 2447) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to() != 30631) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_block_user() != 63065) {
@@ -19248,7 +19247,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_peer_connection_history() != 2544) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_relay_fetch_cursors() != 5399) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_relay_fetch_cursors() != 48310) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_shared_request_dismissal() != 60027) {
@@ -19290,7 +19289,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 39762) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 20880) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 9888) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_group() != 30648) {
@@ -19362,7 +19361,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message() != 46727) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_message() != 64810) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_message() != 61572) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_outgoing_message() != 32750) {

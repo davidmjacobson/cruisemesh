@@ -154,17 +154,21 @@ struct Peer {
     /// hidden kinds. Cleared on a fresh legacy HELLO (new handshake) and
     /// dropped with the peer on disconnect.
     hidden_offered: std::collections::HashSet<Vec<u8>>,
-    /// How far the foreign-carry lane has walked this device's carry queue
-    /// toward this peer during this link session, and when (if ever) that walk
-    /// last reached the tail. Same lifecycle as `hidden_offered`: fresh on
-    /// connect, reset by a fresh legacy HELLO, dropped with the peer on
-    /// disconnect -- a new session re-offers from the top, because there is no
-    /// evidence the previous session's frames survived the link.
+}
+
+/// Carry offering is encounter state for an authenticated logical peer, not
+/// link state. Android commonly has central + peripheral links (and rotating
+/// BLE addresses) for one phone at once. Keying these cursors by address made
+/// every link restart at the queue head and multiplied a single peer's offer
+/// by its address count. Retaining this small state across link reconnects
+/// also lets the next address resume the walk; the normal cooldown still
+/// schedules a full safety re-walk for frames lost from a transport FIFO.
+#[derive(Clone, Default)]
+struct LogicalCarryState {
     carried_cursor: Option<CoreCarriedCursor>,
     carried_walk_done_at_ms: Option<i64>,
-    /// Targeted HELLO drain (envelopes *for* this peer via
-    /// `carried_envelopes_for_hints_page`). Disjoint from the foreign-carry
-    /// cursor: different row sets, so they must not share resume state.
+    /// Targeted HELLO drain and foreign digest spray select different row
+    /// sets, so their cursors remain disjoint even though both are peer-keyed.
     targeted_carried_cursor: Option<CoreCarriedCursor>,
     targeted_carried_walk_done_at_ms: Option<i64>,
 }
@@ -183,6 +187,7 @@ pub struct CoreCarriedLane {
 #[derive(uniffi::Object)]
 pub struct CoreMeshRouterState {
     peers: Mutex<HashMap<String, Peer>>,
+    logical_carry: Mutex<HashMap<Vec<u8>, LogicalCarryState>>,
 }
 
 #[uniffi::export]
@@ -191,6 +196,7 @@ impl CoreMeshRouterState {
     pub fn new() -> Self {
         Self {
             peers: Mutex::new(HashMap::new()),
+            logical_carry: Mutex::new(HashMap::new()),
         }
     }
 
@@ -202,10 +208,6 @@ impl CoreMeshRouterState {
                 user_id: None,
                 capabilities: None,
                 hidden_offered: std::collections::HashSet::new(),
-                carried_cursor: None,
-                carried_walk_done_at_ms: None,
-                targeted_carried_cursor: None,
-                targeted_carried_walk_done_at_ms: None,
             },
         );
     }
@@ -222,15 +224,19 @@ impl CoreMeshRouterState {
         if peer.user_id.as_ref().is_some_and(|known| *known != user_id) {
             return false;
         }
-        peer.user_id = Some(user_id);
-        // A fresh legacy HELLO is a new handshake: the once-per-session
-        // hidden-kind spray bound resets so this session gets one new offer,
-        // and the carry walk restarts from the top for the same reason.
+        peer.user_id = Some(user_id.clone());
+        // A fresh legacy HELLO is a new handshake, so the once-per-session
+        // hidden-kind spray bound resets and this session gets one new offer.
+        // The carry walk deliberately does not reset: it belongs to the
+        // authenticated user, so a second address or reconnect must not
+        // multiply the same backlog offer. Its cooldown provides the eventual
+        // full re-walk needed for link-FIFO loss.
         peer.hidden_offered.clear();
-        peer.carried_cursor = None;
-        peer.carried_walk_done_at_ms = None;
-        peer.targeted_carried_cursor = None;
-        peer.targeted_carried_walk_done_at_ms = None;
+        drop(peers);
+        self.logical_carry
+            .lock_recoverable()
+            .entry(user_id)
+            .or_default();
         true
     }
 
@@ -309,8 +315,19 @@ impl CoreMeshRouterState {
     /// An unknown address reads as a fresh pass: the caller is about to spray
     /// down a link this state has no record of, and offering is always safe.
     pub fn carried_lane_for(&self, address: String, now_ms: i64) -> CoreCarriedLane {
-        let peers = self.peers.lock_recoverable();
-        let Some(peer) = peers.get(&address) else {
+        let user_id = self
+            .peers
+            .lock_recoverable()
+            .get(&address)
+            .and_then(|peer| peer.user_id.clone());
+        let Some(user_id) = user_id else {
+            return CoreCarriedLane {
+                skip: false,
+                after: None,
+            };
+        };
+        let carry = self.logical_carry.lock_recoverable();
+        let Some(peer) = carry.get(&user_id) else {
             return CoreCarriedLane {
                 skip: false,
                 after: None,
@@ -353,10 +370,16 @@ impl CoreMeshRouterState {
         exhausted: bool,
         now_ms: i64,
     ) {
-        let mut peers = self.peers.lock_recoverable();
-        let Some(peer) = peers.get_mut(&address) else {
+        let user_id = self
+            .peers
+            .lock_recoverable()
+            .get(&address)
+            .and_then(|peer| peer.user_id.clone());
+        let Some(user_id) = user_id else {
             return;
         };
+        let mut carry = self.logical_carry.lock_recoverable();
+        let peer = carry.entry(user_id).or_default();
         if exhausted {
             peer.carried_cursor = None;
             peer.carried_walk_done_at_ms = Some(now_ms);
@@ -369,8 +392,19 @@ impl CoreMeshRouterState {
     /// Where the targeted HELLO carried drain should resume (G2), same three
     /// states as [`Self::carried_lane_for`] but on a disjoint cursor.
     pub fn targeted_carried_lane_for(&self, address: String, now_ms: i64) -> CoreCarriedLane {
-        let peers = self.peers.lock_recoverable();
-        let Some(peer) = peers.get(&address) else {
+        let user_id = self
+            .peers
+            .lock_recoverable()
+            .get(&address)
+            .and_then(|peer| peer.user_id.clone());
+        let Some(user_id) = user_id else {
+            return CoreCarriedLane {
+                skip: false,
+                after: None,
+            };
+        };
+        let carry = self.logical_carry.lock_recoverable();
+        let Some(peer) = carry.get(&user_id) else {
             return CoreCarriedLane {
                 skip: false,
                 after: None,
@@ -402,10 +436,16 @@ impl CoreMeshRouterState {
         exhausted: bool,
         now_ms: i64,
     ) {
-        let mut peers = self.peers.lock_recoverable();
-        let Some(peer) = peers.get_mut(&address) else {
+        let user_id = self
+            .peers
+            .lock_recoverable()
+            .get(&address)
+            .and_then(|peer| peer.user_id.clone());
+        let Some(user_id) = user_id else {
             return;
         };
+        let mut carry = self.logical_carry.lock_recoverable();
+        let peer = carry.entry(user_id).or_default();
         if exhausted {
             peer.targeted_carried_cursor = None;
             peer.targeted_carried_walk_done_at_ms = Some(now_ms);
@@ -500,6 +540,7 @@ impl CoreMeshRouterState {
 
     pub fn clear(&self) {
         self.peers.lock_recoverable().clear();
+        self.logical_carry.lock_recoverable().clear();
     }
 }
 
@@ -893,32 +934,74 @@ mod tests {
             }
         );
 
-        // A fresh handshake resets the walk even mid-cooldown.
+        // A fresh handshake for the same logical peer does not reset the walk
+        // mid-cooldown. A rotating address must not multiply its offers.
         router.record_carried_progress("ble".into(), Some(cursor(4)), true, done_at);
         assert!(router.on_hello("ble".into(), vec![1; 16]));
         assert_eq!(
             router.carried_lane_for("ble".into(), done_at + 1),
             CoreCarriedLane {
-                skip: false,
+                skip: true,
                 after: None
             },
-            "a new handshake is a new session: walk from the top again"
+            "a new handshake for one user shares its parked logical lane"
         );
 
-        // And disconnect drops the cursor with the rest of the peer record.
-        router.record_carried_progress("ble".into(), Some(cursor(5)), false, done_at);
+        // Disconnect/reconnect under a rotated address also retains progress.
+        // The eventual cooldown re-walk is the safety net for a frame that was
+        // accepted into the old link's FIFO but lost at teardown.
         router.on_disconnected("ble".into());
+        router.on_connected("rotated".into(), CoreTransport::Peripheral);
+        assert!(router.on_hello("rotated".into(), vec![1; 16]));
         assert_eq!(
-            router.carried_lane_for("ble".into(), done_at),
+            router.carried_lane_for("rotated".into(), done_at + 2),
             CoreCarriedLane {
-                skip: false,
+                skip: true,
                 after: None
-            }
+            },
+            "reconnect does not restart a completed logical-peer walk"
         );
         // A progress report for a link that is already gone is a no-op, not a
         // resurrected peer entry.
         router.record_carried_progress("ble".into(), Some(cursor(6)), false, done_at);
-        assert_eq!(router.connected_user_count(), 0);
+        assert_eq!(router.connected_user_count(), 1);
+    }
+
+    #[test]
+    fn duplicate_links_share_foreign_and_targeted_carry_progress() {
+        let router = CoreMeshRouterState::new();
+        let alice = vec![1; 16];
+        let foreign = CoreCarriedCursor {
+            received_at: 1_000,
+            msg_id: vec![7; 16],
+        };
+        let targeted = CoreCarriedCursor {
+            received_at: 2_000,
+            msg_id: vec![8; 16],
+        };
+        router.on_connected("central".into(), CoreTransport::Central);
+        assert!(router.on_hello("central".into(), alice.clone()));
+        router.on_connected("peripheral".into(), CoreTransport::Peripheral);
+        assert!(router.on_hello("peripheral".into(), alice));
+
+        router.record_carried_progress("central".into(), Some(foreign.clone()), false, 10);
+        router.record_targeted_carried_progress(
+            "central".into(),
+            Some(targeted.clone()),
+            false,
+            10,
+        );
+
+        assert_eq!(
+            router.carried_lane_for("peripheral".into(), 11).after,
+            Some(foreign),
+        );
+        assert_eq!(
+            router
+                .targeted_carried_lane_for("peripheral".into(), 11)
+                .after,
+            Some(targeted),
+        );
     }
 
     #[test]

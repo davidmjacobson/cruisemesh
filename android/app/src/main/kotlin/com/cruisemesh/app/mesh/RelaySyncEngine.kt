@@ -276,6 +276,7 @@ internal class RelaySyncEngine(
     fun cancelRelayPolling() {
         handler.removeCallbacks(relayPollRunnable)
         handler.removeCallbacks(rateLimitRetryRunnable)
+        handler.removeCallbacks(mailboxContinuationRunnable)
     }
 
     /** Stops the push socket; MeshService.onDestroy's counterpart to [updateRelayPushSubscription]. */
@@ -461,6 +462,7 @@ internal class RelaySyncEngine(
     private fun performRelaySyncPass(reason: String) {
         val identity = identityProvider() ?: return
         val now = System.currentTimeMillis()
+        mailboxContinuationNeeded = false
         store.pruneExpiredOutboundEnvelopes(now)
         store.pruneExpiredOutgoingReceiptEnvelopes(now)
         store.pruneExpiredCarried(now)
@@ -572,6 +574,7 @@ internal class RelaySyncEngine(
         publishStaleContactRelays()
         val netDesc = if (network != null) "${networkLabel(network)}(pinned)" else "${networkLabel(connectivityManager.activeNetwork)}(default)"
         Log.i(TAG, "Relay sync complete: configs=${configs.size} net=$netDesc reason=$reason")
+        if (mailboxContinuationNeeded) scheduleMailboxContinuation()
     }
 
     /**
@@ -872,6 +875,12 @@ internal class RelaySyncEngine(
      * whose processing threw must be re-presented next pass, so nothing may
      * be persisted past it.
      *
+     * A pass is also bounded by [relayMailboxWalkAction]. This matters when a
+     * legacy/current backup restores without `relay_fetch_cursors`: starting
+     * at zero is correct, but must not synchronously drain an arbitrarily deep
+     * mailbox. Safe pages advance the durable frontier, then the walk yields
+     * and schedules a delayed continuation from that point.
+     *
      * Occasionally the pass sweeps instead -- walks the whole mailbox from 0,
      * exactly as before -- so those deliberately-unacked rows stay
      * re-discoverable for the phones that depend on this one re-offering
@@ -925,6 +934,8 @@ internal class RelaySyncEngine(
         // this device's internet works, so it must mean "this mailbox
         // answered", not "the walk was attempted".
         var answered = false
+        var pagesFetched = 0
+        var envelopesFetched = 0
         while (isRunning() && hasValidatedInternet()) {
             val fetched = RelayClient.fetchEnvelopesWithinResponseCap(
                 config,
@@ -950,6 +961,8 @@ internal class RelaySyncEngine(
                 if (sweeping) noteSweepCompleted(cursorKey, now)
                 return true
             }
+            pagesFetched += 1
+            envelopesFetched += page.envelopes.size
             var pageFullyProcessed = true
             val dispositions = ArrayList<CoreRelayEnvelopeDisposition>(page.envelopes.size)
             for (envelope in page.envelopes) {
@@ -1027,6 +1040,22 @@ internal class RelaySyncEngine(
                 return true
             }
             after = page.nextCursor
+            if (
+                relayMailboxWalkAction(pagesFetched, envelopesFetched) ==
+                RelayMailboxWalkAction.YIELD_AND_SCHEDULE_CONTINUATION
+            ) {
+                Log.i(
+                    TAG,
+                    "Relay ${config.relayUrl} mailbox walk yielding after " +
+                        "$pagesFetched page(s)/$envelopesFetched envelope(s); continuation scheduled",
+                )
+                // Start the delay only after the entire multi-mailbox pass
+                // finishes. Scheduling here could let the timer fire while a
+                // later config is still running and collapse the continuation
+                // into an immediate in-flight rerun.
+                mailboxContinuationNeeded = true
+                return true
+            }
         }
         return answered
     }
@@ -1221,6 +1250,13 @@ internal class RelaySyncEngine(
     @Volatile private var rateLimitedUntilMs = 0L
 
     private val rateLimitRetryRunnable = Runnable { requestRelaySync("rate limit retry") }
+    private val mailboxContinuationRunnable = Runnable { requestRelaySync("mailbox continuation") }
+    private var mailboxContinuationNeeded = false
+
+    private fun scheduleMailboxContinuation() {
+        handler.removeCallbacks(mailboxContinuationRunnable)
+        handler.postDelayed(mailboxContinuationRunnable, RELAY_MAILBOX_CONTINUATION_DELAY_MS)
+    }
 
     /**
      * Records a structured HTTP rejection when it concerns our OWN saved

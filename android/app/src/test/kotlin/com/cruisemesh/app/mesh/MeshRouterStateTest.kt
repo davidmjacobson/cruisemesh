@@ -274,4 +274,49 @@ class MeshRouterStateTest {
         assertEquals(setOf(hex), state.helloedUserIds())
         assertEquals(mapOf(hex to MeshRouterState.Transport.CENTRAL), state.nearbyTransports())
     }
+
+    @Test
+    fun `relay routes collapse duplicate addresses and roles for one authenticated user`() {
+        val state = MeshRouterState()
+        val alice = userId(1)
+        val bob = userId(2)
+        state.onConnected("ALICE-CENTRAL", MeshRouterState.Transport.CENTRAL)
+        state.onHello("ALICE-CENTRAL", alice)
+        state.onConnected("ALICE-PERIPHERAL", MeshRouterState.Transport.PERIPHERAL)
+        state.onHello("ALICE-PERIPHERAL", alice)
+        state.onConnected("ALICE-LAN", MeshRouterState.Transport.LAN)
+        state.onHello("ALICE-LAN", alice)
+        state.onConnected("BOB", MeshRouterState.Transport.CENTRAL)
+        state.onHello("BOB", bob)
+        state.onConnected("UNKNOWN-1", MeshRouterState.Transport.CENTRAL)
+        state.onConnected("UNKNOWN-2", MeshRouterState.Transport.PERIPHERAL)
+
+        assertEquals(
+            setOf(
+                MeshRouterState.Transport.LAN to "ALICE-LAN",
+                MeshRouterState.Transport.CENTRAL to "BOB",
+                MeshRouterState.Transport.CENTRAL to "UNKNOWN-1",
+                MeshRouterState.Transport.PERIPHERAL to "UNKNOWN-2",
+            ),
+            state.relayRoutes().toSet(),
+        )
+    }
+
+    @Test
+    fun `relay exclusion drops every route back to the arriving logical peer`() {
+        val state = MeshRouterState()
+        val alice = userId(1)
+        val bob = userId(2)
+        state.onConnected("ALICE-CENTRAL", MeshRouterState.Transport.CENTRAL)
+        state.onHello("ALICE-CENTRAL", alice)
+        state.onConnected("ALICE-PERIPHERAL", MeshRouterState.Transport.PERIPHERAL)
+        state.onHello("ALICE-PERIPHERAL", alice)
+        state.onConnected("BOB", MeshRouterState.Transport.CENTRAL)
+        state.onHello("BOB", bob)
+
+        assertEquals(
+            listOf(MeshRouterState.Transport.CENTRAL to "BOB"),
+            state.relayRoutes(exceptAddress = "ALICE-CENTRAL"),
+        )
+    }
 }

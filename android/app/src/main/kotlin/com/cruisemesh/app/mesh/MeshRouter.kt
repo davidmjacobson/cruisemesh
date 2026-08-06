@@ -174,27 +174,27 @@ object MeshRouter {
     }
 
     /**
-     * Floods [frame] to every currently connected link except [exceptAddress]
-     * (the one it arrived on) -- the epidemic-relay send primitive for
+     * Floods [frame] to one route per logical peer except [exceptAddress]'s
+     * peer (the one it arrived from) -- the epidemic-relay send primitive for
      * DESIGN.md §5.3 gossip. Returns the number of links it was dispatched to.
      * Callers are responsible for dedupe (see [com.cruisemesh.app.mesh.GossipState])
      * and hop-budget checks before relaying; this method just sprays the frame
-     * outward. Excluding the arriving link avoids the trivial immediate
-     * echo-back; the seen-ID set and `hop_ttl` bound the rest of the flood.
+     * outward. Unidentified links remain independent until HELLO gives us an
+     * identity to collapse. Excluding all routes for the arriving logical
+     * peer avoids echoing the frame back over that phone's other BLE role.
      */
     fun relayToAllExcept(exceptAddress: String, frame: ByteArray): Int {
         var sent = 0
-        for ((transport, address) in state.connectedRoutes()) {
-            if (address == exceptAddress) continue
+        for ((transport, address) in state.relayRoutes(exceptAddress)) {
             if (dispatch(transport, address, frame)) sent++
         }
         return sent
     }
 
-    /** Floods [frame] to every currently connected link. */
+    /** Floods [frame] once to each authenticated peer (plus each unknown link). */
     fun relayToAll(frame: ByteArray): Int {
         var sent = 0
-        for ((transport, address) in state.connectedRoutes()) {
+        for ((transport, address) in state.relayRoutes()) {
             if (dispatch(transport, address, frame)) sent++
         }
         return sent

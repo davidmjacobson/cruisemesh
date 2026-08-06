@@ -18,6 +18,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import uniffi.cruisemesh_core.backupMaxFileBytes
+import uniffi.cruisemesh_core.sanitizeRestoredMessageStore
 
 /**
  * Android glue for account backup/restore:
@@ -89,6 +90,7 @@ object BackupService {
         }
 
         val identity = decodeIdentity(payload.identity)
+        val sanitizedSqlite = sanitizeRestoredSqlite(context, payload.sqlite)
 
         // Replace the message store file. Clear any stale journal siblings so a
         // half-written journal from a prior install can't be replayed over the
@@ -97,8 +99,8 @@ object BackupService {
         for (suffix in listOf("-journal", "-wal", "-shm")) {
             context.filesDir.resolve(STORE_FILENAME + suffix).takeIf { it.exists() }?.delete()
         }
-        if (payload.sqlite.isNotEmpty()) {
-            sqliteFile.writeBytes(payload.sqlite)
+        if (sanitizedSqlite.isNotEmpty()) {
+            sqliteFile.writeBytes(sanitizedSqlite)
         } else {
             sqliteFile.takeIf { it.exists() }?.delete()
         }
@@ -190,6 +192,27 @@ object BackupService {
         val limit = backupMaxFileBytes()
         check(limit <= Int.MAX_VALUE.toULong())
         return limit.toInt()
+    }
+
+    /**
+     * Validate and migrate the SQLite payload away from the installed store,
+     * then remove courier and relay-runtime rows before the restored identity
+     * can start any transports. This also protects legacy full-DB backups that
+     * predate the same scrub in `MessageStore.backupTo`.
+     */
+    private fun sanitizeRestoredSqlite(context: Context, sqlite: ByteArray): ByteArray {
+        if (sqlite.isEmpty()) return sqlite
+        val staged = java.io.File.createTempFile("cruisemesh-restore-", ".sqlite", context.cacheDir)
+        return try {
+            staged.writeBytes(sqlite)
+            val discarded = sanitizeRestoredMessageStore(staged.absolutePath)
+            Log.i(TAG, "Sanitized restored store; discarded $discarded carried envelopes")
+            staged.readBytes()
+        } finally {
+            for (suffix in listOf("", "-journal", "-wal", "-shm")) {
+                staged.resolveSibling(staged.name + suffix).takeIf { it.exists() }?.delete()
+            }
+        }
     }
 }
 

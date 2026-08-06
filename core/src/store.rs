@@ -2,12 +2,13 @@
 //! §10). `insert_message` is idempotent on (chat_id, sender_user_id,
 //! lamport): re-delivering the same envelope (expected under DTN) is a
 //! no-op. A conflict whose (timestamp, kind, payload) *don't* match is
-//! treated as the sender having forked/reset their stream rather than a
-//! duplicate -- see [MessageStore::insert_message]'s doc comment for the
-//! recovery this triggers. Per-chat lamport counters are maintained
-//! independently by each sender (DESIGN.md §7.1), so gap detection in
-//! [MessageStore::highest_contiguous_lamport] is keyed on (chat_id,
-//! sender_user_id), not chat_id alone.
+//! ambiguous and is ignored: the current wire format has no authenticated
+//! stream generation with which to prove that either branch supersedes the
+//! other, so an incoming copy must never erase visible history -- see
+//! [MessageStore::insert_message]'s doc comment. Per-chat lamport counters
+//! are maintained independently by each sender (DESIGN.md §7.1), so gap
+//! detection in [MessageStore::highest_contiguous_lamport] is keyed on
+//! (chat_id, sender_user_id), not chat_id alone.
 //!
 //! Contacts (DESIGN.md §6.2) live in the same store/connection rather than a
 //! separate file: they're the other half of "who can I seal a message to,"
@@ -971,24 +972,22 @@ impl MessageStore {
     /// The destination must not already exist; callers should use a unique
     /// temporary path and remove it after reading the backup bytes.
     ///
-    /// ## Relay fetch cursors do not ride the backup
+    /// ## Courier state does not ride the backup
     ///
-    /// Everything else in the store is history and should come back exactly
-    /// as it was. A relay fetch cursor is not history — it is a claim about
-    /// the *current* state of a remote mailbox, and a backup is the one place
-    /// that claim can be carried somewhere it was never true. Restore onto a
-    /// second phone, restore months later, or restore after the relay box was
-    /// rebuilt (its `families` table emptied and its row ids restarted at 1,
-    /// which has happened in this project's own deployment) and an inherited
-    /// frontier sits above every row that now exists. The phone would then
-    /// fetch nothing, forever, and report perfect health while doing it —
-    /// silent non-delivery, the worst failure this app can have.
+    /// User-owned messages, contacts, authored Lamport watermarks and receipts
+    /// are history and come back exactly as they were. Courier ciphertext in
+    /// `carried_envelopes` is different: it belongs to other recipients and a
+    /// restored copy has no delivery-progress evidence. Restoring hundreds of
+    /// those rows used to offer the whole stale backlog again on every new BLE
+    /// link, immediately multiplying traffic across rotating peer addresses.
     ///
-    /// So the snapshot is scrubbed of them before it is sealed. The restored
-    /// device re-walks each mailbox once from 0 and re-establishes its own
-    /// frontier from evidence. That costs one full walk and nothing else:
-    /// everything already delivered is recognised and dropped by the seen-id
-    /// filter on the way back in.
+    /// Relay fetch cursors deliberately *do* ride the backup. Dropping a
+    /// cursor forces an immediate walk from row zero; on a shared family
+    /// mailbox that re-downloads the stale proxy mail we just discarded and
+    /// can recreate the restore storm before the UI opens. The six-hour
+    /// periodic sweep already repairs a stale frontier or rebuilt relay, so
+    /// preserving it trades at most bounded delivery delay for avoiding an
+    /// unbounded restore-time replay.
     pub fn backup_to(&self, destination: String) -> Result<(), CoreError> {
         let destination = std::path::Path::new(destination.trim());
         if !destination.is_absolute() {
@@ -1013,21 +1012,17 @@ impl MessageStore {
         let conn = lock_conn(&self.conn);
         conn.execute("VACUUM INTO ?1", params![destination.to_string_lossy()])
             .map_err(store_err)?;
-        // See the doc comment: the snapshot must not carry this device's idea
-        // of where each relay mailbox got to. Done on the copy rather than by
-        // deleting from the live store, so taking a backup never costs the
-        // running phone its frontier.
-        let snapshot = Connection::open(destination).map_err(store_err)?;
-        snapshot
-            .execute("DELETE FROM relay_fetch_cursors", [])
-            .map_err(store_err)?;
-        drop(snapshot);
+        // See the doc comment: scrub the copy, never the live store. Restore
+        // repeats this operation so legacy full-database `.cmbak` files made
+        // before this policy are safe too.
+        let mut snapshot = Connection::open(destination).map_err(store_err)?;
+        sanitize_restore_ephemera(&mut snapshot)?;
         Ok(())
     }
 
-    /// Insert a message from a remote sender's stream, distinguishing a true
-    /// duplicate from a *forked* stream instead of silently dropping both the
-    /// same way.
+    /// Insert a message from a remote sender's stream, merging metadata from a
+    /// true duplicate while failing closed when two different authenticated
+    /// messages claim the same stream position.
     ///
     /// A conflict on `(chat_id, sender_user_id, lamport)` is ambiguous on its
     /// own: it could be a digest resend or relay copy of a message we already
@@ -1042,19 +1037,14 @@ impl MessageStore {
     ///
     /// - **Identical** on all three -> true duplicate. No-op, returns `Ok(false)`,
     ///   same behavior as the old plain `INSERT OR IGNORE`.
-    /// - **Different** -> a fork. The sender's old stream at and above this
-    ///   lamport is abandoned, so we drop our stale copy of that tail and
-    ///   insert the new message in its place. We also clear
-    ///   `outgoing_receipts` / `outgoing_receipt_envelopes` for this
-    ///   `(chat_id, sender_user_id)`: those are *our* "delivered/read through
-    ///   N" watermarks about *their* stream, and they were computed against
-    ///   the abandoned history -- left in place, they'd keep telling the
-    ///   sender (who now has no history past their reset) that we've already
-    ///   read messages they haven't sent yet, which is exactly the false ✓✓
-    ///   this recovery exists to stop. `receipts` (the peer's acks of *our*
-    ///   stream) is untouched -- unrelated to their stream resetting. All of
-    ///   this runs in one transaction so a crash mid-recovery can't leave the
-    ///   stale tail and the new message coexisting.
+    /// - **Different** -> ambiguous conflict. Keep the existing branch and all
+    ///   receipt state, ignore the incoming message, and return `Ok(false)`.
+    ///   Timestamps cannot break the tie: they are sender wall-clock display
+    ///   hints and may be wrong. A delayed courier or restored backup can
+    ///   legitimately replay an older authenticated branch, while a confused
+    ///   clock can make that stale branch appear newer. Automatic fork
+    ///   recovery therefore requires a future protocol revision carrying an
+    ///   explicit authenticated stream generation/epoch.
     pub fn insert_message(&self, message: StoredMessage) -> Result<bool, CoreError> {
         incoming_message_reference::insert(self, message, None, None)
     }
@@ -1073,6 +1063,34 @@ impl MessageStore {
         }
         incoming_message_reference::insert(self, message, Some(msg_id), reply_to_msg_id)
     }
+}
+
+/// Make an installed legacy full-database backup safe before any transport
+/// opens it. The path is opened through [`MessageStore::open`] first so old
+/// schemas receive the normal forward migrations before the cleanup runs.
+///
+/// Returns the number of carried envelopes discarded. User-owned history,
+/// contacts, authored Lamport watermarks, outbound authored work, receipts and
+/// the relay frontier are deliberately preserved.
+#[uniffi::export]
+pub fn sanitize_restored_message_store(path: String) -> Result<u64, CoreError> {
+    let store = MessageStore::open(path)?;
+    let mut conn = lock_conn(&store.conn);
+    sanitize_restore_ephemera(&mut conn)
+}
+
+fn sanitize_restore_ephemera(conn: &mut Connection) -> Result<u64, CoreError> {
+    let tx = conn.transaction().map_err(store_err)?;
+    let discarded = tx
+        .execute("DELETE FROM carried_envelopes", [])
+        .map_err(store_err)?;
+    tx.commit().map_err(store_err)?;
+    // BackupService reads the sanitized main database file immediately after
+    // this function returns. Force any WAL pages into that file rather than
+    // relying on a best-effort checkpoint when SQLite closes the connection.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .map_err(store_err)?;
+    Ok(discarded as u64)
 }
 
 /// Internal-only helpers, never exported over UniFFI: not wrapped in
@@ -1250,67 +1268,13 @@ mod incoming_message_reference {
             return Ok(false);
         }
 
-        // Fork: the sender re-numbered from below what we already hold.
-        // Drop our stale copy of the abandoned tail (this and every later
-        // lamport we have from their old stream -- they'll resend anything
-        // beyond this message under the new numbering too)...
-        tx.execute(
-            "DELETE FROM messages WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport >= ?3",
-            params![
-                message.chat_id,
-                message.sender_user_id,
-                message.lamport as i64
-            ],
-        )
-        .map_err(store_err)?;
-        // Exact control-message evidence belongs to the same numbered
-        // stream. Positions at and beyond the fork are evidence about the
-        // abandoned tail and must not be allowed to close gaps in the
-        // replacement stream.
-        tx.execute(
-            "DELETE FROM consumed_hidden_lamports
-             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport >= ?3",
-            params![
-                message.chat_id,
-                message.sender_user_id,
-                message.lamport as i64
-            ],
-        )
-        .map_err(store_err)?;
-        // ...and the watermarks we'd computed against that abandoned tail,
-        // so we stop reporting stale "delivered/read through N" back to the
-        // sender (root cause of the false ✓✓ this recovery fixes). These
-        // regenerate correctly from the normal receive/view paths.
-        tx.execute(
-            "DELETE FROM outgoing_receipts WHERE chat_id = ?1 AND sender_user_id = ?2",
-            params![message.chat_id, message.sender_user_id],
-        )
-        .map_err(store_err)?;
-        tx.execute(
-            "DELETE FROM outgoing_receipt_envelopes WHERE chat_id = ?1 AND sender_user_id = ?2",
-            params![message.chat_id, message.sender_user_id],
-        )
-        .map_err(store_err)?;
-        tx.execute(
-            "INSERT INTO messages
-                (chat_id, sender_user_id, lamport, timestamp, kind, payload,
-                 msg_id, reply_to_msg_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                message.chat_id,
-                message.sender_user_id,
-                message.lamport as i64,
-                message.timestamp,
-                message.kind as i64,
-                message.payload,
-                msg_id,
-                reply_to_msg_id,
-            ],
-        )
-        .map_err(store_err)?;
-
+        // A conflict proves only that two authenticated branches claim the
+        // same stream position, not which one is authoritative. Preserve the
+        // branch already rendered to the user. In particular, never use the
+        // sender's wall clock as a generation signal: causal_order explicitly
+        // bounds its influence because phone clocks can be wrong.
         tx.commit().map_err(store_err)?;
-        Ok(true)
+        Ok(false)
     }
 }
 
@@ -3151,12 +3115,10 @@ impl MessageStore {
     /// Forget every remembered frontier, so the next pass re-walks each
     /// mailbox from the beginning.
     ///
-    /// This is the reset a restored `.cmbak` needs — [`Self::backup_to`]
-    /// applies it to the snapshot it writes, so a restore never inherits
-    /// another device's (or another relay generation's) idea of where the
-    /// mailbox got to. Re-walking once is cheap and self-correcting:
-    /// everything already delivered is deduped on the way back in by the
-    /// seen-id gossip filter.
+    /// This is an explicit administrative reset, not part of backup/restore.
+    /// Restore preserves the frontier because clearing it immediately walks
+    /// an entire shared mailbox and can recreate discarded courier backlog;
+    /// scheduled sweeps provide the bounded stale-frontier repair path.
     pub fn clear_relay_fetch_cursors(&self) -> Result<(), CoreError> {
         let conn = lock_conn(&self.conn);
         conn.execute("DELETE FROM relay_fetch_cursors", [])
@@ -3313,16 +3275,16 @@ impl MessageStore {
     ///
     /// The two queued-envelope tables matter as much as `messages` here: a
     /// deleted chat that left `outbound_envelopes` behind re-arms the
-    /// reset-stream trap fixed in fc6b9f9 (recover-from-forked-stream) --
-    /// stale queued envelopes can resend frames from the deleted history to
-    /// a peer whose lamport stream has since moved on, which is exactly the
-    /// shape of bug that recovery exists to catch, not reintroduce via a
-    /// leftover queue. And a leftover `receipts` row is exactly the
+    /// reset-stream trap: stale queued envelopes can resend frames from the
+    /// deleted history to a peer whose lamport stream has since moved on.
+    /// The peer now preserves its visible branch on such a conflict because
+    /// the protocol has no authenticated stream generation; preventing the
+    /// conflict here is still necessary so newly authored messages are not
+    /// ignored as ambiguous. And a leftover `receipts` row is exactly the
     /// overstated ratchet that painted false read-ticks before that fix: a
     /// delete must yield a genuinely blank slate, not a chat that looks
     /// empty locally but still remembers watermarks against history the
-    /// user asked to erase. If the contact is re-added, the peer's replayed
-    /// receipts plus fork recovery re-establish consistency from scratch.
+    /// user asked to erase.
     ///
     /// **One thing must survive: `authored_lamport_watermarks`.** This used to
     /// say that nothing did, and that was wrong in a way that cost a peer
@@ -3330,10 +3292,10 @@ impl MessageStore {
     /// peer keeps theirs -- but the lamport counter was derived purely from
     /// rows this function deletes, so it restarted at 1 while the peer still
     /// held our stream up into the hundreds. Re-authoring over lamports they
-    /// already have does not look like a restart to them; it looks like we
-    /// forked our stream, and [`insert_message`]'s fork recovery responds by
-    /// deleting their copy of the conversation from that lamport up. So a
-    /// local delete silently destroyed the *other* person's history too.
+    /// already have does not look like a restart to them; it looks like an
+    /// ambiguous fork. Older builds could respond by deleting their copy of
+    /// the conversation from that lamport up, while current builds preserve
+    /// their history but cannot accept our genuinely new colliding message.
     /// Keeping the watermark means our numbering continues where it left off
     /// and no fork is ever detected. It stores no content -- only how far the
     /// counter got -- but note it is keyed by the peer's UserID, so a bare
@@ -6027,8 +5989,10 @@ CREATE TABLE IF NOT EXISTS peer_connection_summary (
 -- How far the relay-mailbox walk has got, per mailbox. `config_key` is
 -- `relay_cursor_key(url, token)` -- a hash, so no relay credential is stored
 -- here and a rotated token simply has no row (which reads as cursor 0). See
--- `crate::relay_cursor` for the policy and `backup_to` for why these rows
--- deliberately do not ride a `.cmbak`.
+-- `crate::relay_cursor` for the policy. These rows ride a `.cmbak`: clearing
+-- them makes restore immediately re-walk a shared mailbox and recreate the
+-- stale courier backlog restore intentionally discarded. Scheduled sweeps
+-- bound the repair delay if a restored frontier is stale.
 CREATE TABLE IF NOT EXISTS relay_fetch_cursors (
     config_key    TEXT PRIMARY KEY,
     after_id      INTEGER NOT NULL DEFAULT 0,
@@ -7108,7 +7072,8 @@ mod tests {
         // tail at and above this lamport and wiping `outgoing_receipts`.
         let store = MessageStore::open(":memory:".to_string()).unwrap();
 
-        // A watermark that a genuine fork recovery would incorrectly wipe.
+        // A watermark that the old destructive conflict recovery incorrectly
+        // wiped.
         store
             .insert_message(msg(b"chat-a", b"alice", 1, "hi"))
             .unwrap();
@@ -7160,8 +7125,7 @@ mod tests {
             "reply target and msg_id must be preserved, not wiped"
         );
 
-        // The unrelated watermark from before must survive too -- a real
-        // fork recovery would have cleared it; a merge must not.
+        // The unrelated watermark from before must survive too.
         assert_eq!(
             store
                 .outgoing_receipt_through(
@@ -7171,7 +7135,7 @@ mod tests {
                 )
                 .unwrap(),
             1,
-            "a reply-target-only difference must not trigger fork recovery's receipt wipe"
+            "a reply-target-only difference must not wipe receipt state"
         );
     }
 
@@ -7195,7 +7159,69 @@ mod tests {
     }
 
     #[test]
-    fn insert_message_fork_recovers_abandoned_tail_and_resets_outgoing_receipts() {
+    fn stale_conflict_cannot_delete_a_newer_delivered_tail() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+
+        // Katie's current visible David stream from the field report. Lamport
+        // 695 was a hidden/control event, so the visible rows are sparse.
+        for (lamport, timestamp, payload) in [
+            (694, 10_000, "david-current-694"),
+            (696, 30_000, "david-current-696"),
+            (697, 40_000, "david-current-697"),
+        ] {
+            let mut current = msg(b"katie", b"david", lamport, payload);
+            current.timestamp = timestamp;
+            assert!(store.insert_message(current).unwrap());
+        }
+        store
+            .record_outgoing_receipt(
+                b"katie".to_vec(),
+                b"david".to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                697,
+            )
+            .unwrap();
+
+        // Restored couriers replay different authenticated David 694s. Test
+        // both ordinary stale time and a confused/future clock: neither is a
+        // trustworthy branch-generation signal.
+        for (timestamp, payload) in [
+            (5_000, "older-stale-restored-694"),
+            (90_000, "future-clock-stale-restored-694"),
+        ] {
+            let mut restored = msg(b"katie", b"david", 694, payload);
+            restored.timestamp = timestamp;
+            assert!(!store.insert_message(restored).unwrap());
+        }
+
+        let remaining = store.messages_for_chat(b"katie".to_vec()).unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|message| (message.lamport, message.payload.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![
+                (694, b"david-current-694".as_slice()),
+                (696, b"david-current-696".as_slice()),
+                (697, b"david-current-697".as_slice()),
+            ],
+            "a delayed conflicting envelope must not replace its collision or erase the visible tail"
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    b"katie".to_vec(),
+                    b"david".to_vec(),
+                    crate::RECEIPT_TYPE_DELIVERED,
+                )
+                .unwrap(),
+            697,
+            "ignoring stale evidence must preserve the receipt derived from the retained branch"
+        );
+    }
+
+    #[test]
+    fn insert_message_conflict_preserves_tail_and_outgoing_receipts() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store.upsert_contact(contact(b"alice", "Alice")).unwrap();
         // Alice's original stream: message rows at 1, 2, 3, and 5, plus a
@@ -7233,29 +7259,33 @@ mod tests {
             5
         );
 
-        // Alice deleted the chat and re-added us: her lamport counter
-        // restarted, so she resends a genuinely new message 3 with different
-        // content/timestamp -- a fork, not a duplicate of the old message 3.
-        let mut forked = msg(b"alice", b"alice", 3, "new-after-reset");
-        forked.timestamp = 1_700_000_500_000;
-        assert!(store.insert_message(forked).unwrap());
+        // Alice may have reset her stream, or an old restored courier may be
+        // replaying another branch. Even a much newer timestamp cannot prove
+        // which: phone clocks are not authenticated stream generations.
+        let mut conflict = msg(b"alice", b"alice", 3, "new-after-reset");
+        conflict.timestamp = 1_700_000_500_000;
+        assert!(!store.insert_message(conflict).unwrap());
 
-        // Old messages 3, 4, 5 are gone; the new message 3 replaces them.
+        // The already-visible branch and exact hidden evidence stay intact.
         let remaining = store.messages_for_chat(b"alice".to_vec()).unwrap();
-        assert_eq!(remaining.len(), 3); // 1, 2, and the new 3
+        assert_eq!(remaining.len(), 4); // 1, 2, 3, and 5
         let three = remaining.iter().find(|m| m.lamport == 3).unwrap();
-        assert_eq!(three.payload, b"new-after-reset");
-        assert_eq!(three.timestamp, 1_700_000_500_000);
-        assert!(remaining.iter().all(|m| m.lamport != 4 && m.lamport != 5));
-        assert!(
+        assert_eq!(three.payload, b"old");
+        assert_eq!(three.timestamp, 1_700_000_000_000);
+        assert!(remaining.iter().any(|m| m.lamport == 5));
+        assert_eq!(
             store
                 .consumed_hidden_lamports(b"alice".to_vec())
                 .unwrap()
-                .is_empty(),
-            "control-message evidence from the abandoned tail must be removed"
+                .iter()
+                .map(|entry| entry.lamport)
+                .collect::<Vec<_>>(),
+            vec![4],
+            "ambiguous conflict must not erase accepted hidden evidence"
         );
 
-        // Our contiguous view of Alice's stream is now capped at the fork point.
+        // The messages-only contiguous view stays where it was: row 4 is a
+        // separately retained hidden/control event, so this helper stops at 3.
         assert_eq!(
             store
                 .highest_contiguous_lamport(b"alice".to_vec(), b"alice".to_vec())
@@ -7263,10 +7293,7 @@ mod tests {
             3
         );
 
-        // The stale "read through 5" watermark about Alice's *old* stream is
-        // cleared -- it was overstated relative to her reset stream and would
-        // otherwise keep painting false checkmarks on messages she hasn't
-        // sent yet under the new numbering.
+        // A receipt derived from the retained branch must not disappear.
         assert_eq!(
             store
                 .outgoing_receipt_through(
@@ -7275,12 +7302,12 @@ mod tests {
                     crate::RECEIPT_TYPE_READ,
                 )
                 .unwrap(),
-            0
+            5
         );
     }
 
     #[test]
-    fn insert_message_fork_recovery_does_not_touch_receipts_table() {
+    fn insert_message_conflict_does_not_touch_receipts_table() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         for lamport in 1..=5u64 {
             store
@@ -7288,8 +7315,8 @@ mod tests {
                 .unwrap();
         }
         // `receipts` in this chat is the peer's ack of *our own* outgoing
-        // stream ("self") -- unrelated to alice's stream resetting -- and
-        // must survive her fork recovery untouched.
+        // stream ("self") -- unrelated to alice's conflicting stream -- and
+        // must survive untouched.
         store
             .record_receipt(
                 b"chat-a".to_vec(),
@@ -7300,9 +7327,9 @@ mod tests {
             )
             .unwrap();
 
-        let mut forked = msg(b"chat-a", b"alice", 3, "new-after-reset");
-        forked.timestamp = 1_700_000_500_000;
-        assert!(store.insert_message(forked).unwrap());
+        let mut conflict = msg(b"chat-a", b"alice", 3, "new-after-reset");
+        conflict.timestamp = 1_700_000_500_000;
+        assert!(!store.insert_message(conflict).unwrap());
 
         assert_eq!(
             store
@@ -7591,12 +7618,12 @@ mod tests {
     }
 
     /// The peer's side of the field failure: a sender whose lamport counter
-    /// restarted re-authors over lamports the peer already holds, and the
-    /// peer's fork recovery deletes their copy of the conversation. This test
-    /// documents the mechanism the fix exists to prevent -- it is about
-    /// `insert_message`, and it passes both before and after.
+    /// restarted re-authors over lamports the peer already holds. Without an
+    /// authenticated stream generation there is no safe way to distinguish
+    /// that reset from a stale restored-courier replay, so the peer preserves
+    /// the branch it has already rendered.
     #[test]
-    fn a_sender_who_restarts_their_lamports_destroys_the_peers_history() {
+    fn a_sender_conflict_never_destroys_the_peers_history() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         for i in 1..=5u64 {
             let mut old = msg(b"david", b"david", i, "old");
@@ -7605,15 +7632,16 @@ mod tests {
         }
         assert_eq!(store.messages_for_chat(b"david".to_vec()).unwrap().len(), 5);
 
-        // Same lamport, different content: not a duplicate, so the peer reads
-        // it as a fork and drops everything from that lamport up.
+        // Same lamport, different content, and even a later timestamp remain
+        // ambiguous rather than authorizing destructive recovery.
         let mut restarted = msg(b"david", b"david", 1, "after a delete");
         restarted.timestamp += 999;
-        assert!(store.insert_message(restarted).unwrap());
+        assert!(!store.insert_message(restarted).unwrap());
 
         let rows = store.messages_for_chat(b"david".to_vec()).unwrap();
-        assert_eq!(rows.len(), 1, "the peer's whole history was erased");
-        assert_eq!(rows[0].payload, b"after a delete".to_vec());
+        assert_eq!(rows.len(), 5, "the peer's visible history must survive");
+        assert_eq!(rows[0].payload, b"old-1".to_vec());
+        assert_eq!(rows[4].payload, b"old-5".to_vec());
     }
 
     #[test]
@@ -9151,9 +9179,8 @@ mod tests {
         assert_eq!(cursor.after_id, 0);
         assert_eq!(cursor.last_sweep_at_ms, 0);
         // A mailbox this device has never swept walks from the beginning on
-        // its first pass -- which is what a fresh install, a restore (these
-        // rows never ride a `.cmbak`), a rotated token and a moved host all
-        // look like from here.
+        // its first pass -- which is what a fresh install, a rotated token,
+        // or a moved host looks like from here.
         assert!(crate::relay_sweep_due(
             false,
             cursor.last_sweep_at_ms,
@@ -9537,12 +9564,10 @@ mod tests {
     }
 
     #[test]
-    fn a_backup_snapshot_carries_no_relay_fetch_cursor() {
-        // A cursor is a claim about a *remote* mailbox's current state, and a
-        // backup is the one place that claim travels somewhere it was never
-        // true (another phone, months later, or a relay rebuilt with its row
-        // ids restarted at 1). Inheriting one there means fetching nothing,
-        // forever, while reporting perfect health.
+    fn a_backup_snapshot_drops_courier_rows_but_keeps_the_relay_frontier() {
+        // Dropping the frontier used to force an immediate walk from zero,
+        // which re-downloaded proxy mail into the carry queue the backup had
+        // just discarded. Preserve it; scheduled sweeps repair a stale one.
         let dir = std::env::temp_dir().join(format!(
             "cruisemesh-cursor-backup-{}",
             SystemTime::now()
@@ -9562,6 +9587,18 @@ mod tests {
         store
             .note_relay_sweep_completed(cursor_key(), 1_000_000)
             .unwrap();
+        store
+            .enqueue_relay_carried_envelope(
+                CarriedEnvelope {
+                    msg_id: b"carried-envelope".to_vec(),
+                    hop_ttl: 7,
+                    expiry: 2_000_000,
+                    recipient_hint: b"hint".to_vec(),
+                    sealed: b"sealed".to_vec(),
+                },
+                900_000,
+            )
+            .unwrap();
 
         store.backup_to(path.to_string_lossy().to_string()).unwrap();
         let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
@@ -9570,15 +9607,161 @@ mod tests {
             restored.messages_for_chat(b"chat".to_vec()).unwrap().len(),
             1
         );
-        // ...the frontier does not, so the restored phone re-walks once.
+        assert_eq!(restored.carried_len().unwrap(), 0);
+        // ...and a recent frontier prevents an immediate mailbox replay.
         let cursor = restored.relay_fetch_cursor(cursor_key()).unwrap();
-        assert_eq!(cursor.after_id, 0);
-        assert_eq!(cursor.last_sweep_at_ms, 0);
+        assert_eq!(cursor.after_id, 9_000);
+        assert_eq!(cursor.last_sweep_at_ms, 1_000_000);
+        assert!(!crate::relay_sweep_due(
+            false,
+            cursor.last_sweep_at_ms,
+            1_000_001
+        ));
         // And taking the backup did not cost the live store its frontier.
         assert_eq!(
             store.relay_fetch_cursor(cursor_key()).unwrap().after_id,
             9_000
         );
+        drop(restored);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_full_database_restore_discards_large_carry_backlog_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "cruisemesh-legacy-restore-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("restored.sqlite");
+        let path_string = path.to_string_lossy().to_string();
+        let store = MessageStore::open(path_string.clone()).unwrap();
+
+        let alice = contact(b"alice-id", "Alice");
+        store.upsert_contact(alice.clone()).unwrap();
+        let authored = msg(b"alice-id", b"me", 777, "user-owned history");
+        let outbound = outbound_for(&authored, b"alice-id", b"msg-000000000777");
+        store
+            .insert_outgoing_message(authored.clone(), outbound.clone(), 1_700_000_000_100)
+            .unwrap();
+        store
+            .record_receipt(
+                b"alice-id".to_vec(),
+                b"me".to_vec(),
+                RECEIPT_TYPE_DELIVERED,
+                777,
+                Some(2),
+            )
+            .unwrap();
+        store
+            .record_outgoing_receipt(
+                b"alice-id".to_vec(),
+                b"alice-id".to_vec(),
+                RECEIPT_TYPE_READ,
+                42,
+            )
+            .unwrap();
+        let own_id = vec![9u8; 16];
+        assert!(!store.note_relay_hint_sources(own_id.clone()).unwrap());
+        store
+            .advance_relay_fetch_cursor(cursor_key(), 9_000, true)
+            .unwrap();
+        store
+            .note_relay_sweep_completed(cursor_key(), 1_000_000)
+            .unwrap();
+
+        {
+            let mut conn = lock_conn(&store.conn);
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO authored_lamport_watermarks
+                    (chat_id, sender_user_id, high_lamport) VALUES (?1, ?2, 777)",
+                params![b"alice-id".as_slice(), b"me".as_slice()],
+            )
+            .unwrap();
+            for i in 0u64..400 {
+                let msg_id = [i.to_be_bytes(), i.to_le_bytes()].concat();
+                tx.execute(
+                    "INSERT INTO carried_envelopes
+                        (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
+                         received_at, size_bytes, from_relay, content_digest)
+                     VALUES (?1, 7, 2000000, ?2, ?3, 1, ?4, 32, 1, ?5)",
+                    params![
+                        msg_id,
+                        b"proxy-hint".as_slice(),
+                        format!("restored-ciphertext-{i}").into_bytes(),
+                        900_000 + i as i64,
+                        i.to_be_bytes().to_vec(),
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        assert_eq!(store.carried_len().unwrap(), 400);
+        drop(store);
+
+        assert_eq!(
+            sanitize_restored_message_store(path_string.clone()).unwrap(),
+            400
+        );
+        let restored = MessageStore::open(path_string).unwrap();
+        assert_eq!(restored.carried_len().unwrap(), 0);
+        assert_eq!(
+            restored.get_contact(b"alice-id".to_vec()).unwrap(),
+            Some(alice)
+        );
+        assert_eq!(
+            restored.messages_for_chat(b"alice-id".to_vec()).unwrap(),
+            vec![authored]
+        );
+        assert_eq!(
+            restored
+                .outbound_envelopes_after(b"alice-id".to_vec(), b"me".to_vec(), 0)
+                .unwrap(),
+            vec![outbound]
+        );
+        assert_eq!(
+            restored
+                .receipt_through(b"alice-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED,)
+                .unwrap(),
+            777
+        );
+        assert_eq!(
+            restored
+                .outgoing_receipt_through(
+                    b"alice-id".to_vec(),
+                    b"alice-id".to_vec(),
+                    RECEIPT_TYPE_READ,
+                )
+                .unwrap(),
+            42
+        );
+        let authored_high: i64 = lock_conn(&restored.conn)
+            .query_row(
+                "SELECT high_lamport FROM authored_lamport_watermarks
+                 WHERE chat_id = ?1 AND sender_user_id = ?2",
+                params![b"alice-id".as_slice(), b"me".as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authored_high, 777);
+        let cursor = restored.relay_fetch_cursor(cursor_key()).unwrap();
+        assert_eq!(cursor.after_id, 9_000);
+        assert_eq!(cursor.last_sweep_at_ms, 1_000_000);
+        assert!(!crate::relay_sweep_due(
+            false,
+            cursor.last_sweep_at_ms,
+            1_000_001
+        ));
+        assert!(
+            !restored.note_relay_hint_sources(own_id).unwrap(),
+            "preserving the hint digest must not invalidate the preserved frontier"
+        );
+
         drop(restored);
         let _ = fs::remove_dir_all(&dir);
     }
