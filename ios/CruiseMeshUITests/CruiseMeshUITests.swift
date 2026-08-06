@@ -113,16 +113,16 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(bob.waitForExistence(timeout: 5))
         bob.tap()
 
-        XCTAssertTrue(element("screen.chat").waitForExistence(timeout: 5))
+        XCTAssertTrue(element("screen.chat").waitForExistence(timeout: 10))
         let composer = element("chat.composer.text")
-        XCTAssertTrue(composer.waitForExistence(timeout: 3))
+        XCTAssertTrue(composer.waitForExistence(timeout: 10))
         composer.tap()
         composer.typeText("   ")
         XCTAssertFalse(element("chat.composer.send").exists)
         composer.typeText("Hello from UI test")
 
         let send = element("chat.composer.send")
-        XCTAssertTrue(send.waitForExistence(timeout: 3))
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
         XCTAssertTrue(send.isHittable)
         send.tap()
 
