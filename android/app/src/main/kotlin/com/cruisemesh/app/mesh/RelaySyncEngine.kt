@@ -6,6 +6,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Handler
+import android.os.SystemClock
 import android.util.Log
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.relay.RelayClient
@@ -422,6 +423,12 @@ internal class RelaySyncEngine(
             while (true) {
                 try {
                     performRelaySyncPass(reason)
+                } catch (e: FamilyRateLimitAbort) {
+                    val remainingMs = (rateLimitedUntilMs - System.currentTimeMillis()).coerceAtLeast(1L)
+                    Log.w(TAG, "Family relay rate limit halted sync pass ($reason); retrying in ${remainingMs}ms")
+                    MeshConnectivityStatus.setRelayHealth(RelayHealth.RateLimited(System.currentTimeMillis()))
+                    handler.removeCallbacks(rateLimitRetryRunnable)
+                    handler.postDelayed(rateLimitRetryRunnable, remainingMs)
                 } catch (e: Exception) {
                     Log.w(TAG, "Relay sync failed ($reason): ${e.message}")
                     MeshConnectivityStatus.setRelayHealth(RelayHealth.Failing(System.currentTimeMillis()))
@@ -462,6 +469,7 @@ internal class RelaySyncEngine(
     private fun performRelaySyncPass(reason: String) {
         val identity = identityProvider() ?: return
         val now = System.currentTimeMillis()
+        familyBackoffIdentityHash = identity.userId.contentHashCode()
         mailboxContinuationNeeded = false
         store.pruneExpiredOutboundEnvelopes(now)
         store.pruneExpiredOutgoingReceiptEnvelopes(now)
@@ -477,7 +485,6 @@ internal class RelaySyncEngine(
         // default (normal networks and VPN tunnels route themselves).
         val network = relayBindTarget()
         ownRelayFault = null
-        ownRetryAfterMs = 0L
         passNowMs = now
         contactRelayRejections = store.listContactRelayRejections()
             .associateByTo(mutableMapOf()) { UserIdHex.encode(it.userId) }
@@ -542,6 +549,7 @@ internal class RelaySyncEngine(
                     if (answered) ownRelayAnswered = true
                 }
             } catch (e: Exception) {
+                rethrowFamilyRateLimit(e)
                 // A contact can carry stale relay credentials from an older
                 // friend card. That relay failing must not abort polling of
                 // the remaining relays or declare our own configured relay
@@ -556,11 +564,9 @@ internal class RelaySyncEngine(
         MeshConnectivityStatus.setRelayHealth(
             relayHealthAfterSyncPass(ownRelayFault, ownRelaySucceeded, anyRelaySucceeded, now),
         )
-        rateLimitedUntilMs = if (ownRelayFault == CoreRelayFault.RATE_LIMITED) {
-            System.currentTimeMillis() + ownRetryAfterMs
-        } else {
-            0L
-        }
+        // Reaching the end means every request completed without a new 429.
+        rateLimitedUntilMs = 0L
+        familyRelayBackoff.onSuccessfulPass()
         // Now that the pass knows whether our own mailbox answered, this
         // pass's silent contact endpoints can be judged (or discarded).
         commitUnreachableContactRelays(ownRelayAnswered, contacts)
@@ -605,7 +611,7 @@ internal class RelaySyncEngine(
             val contact = contactsByUserId[UserIdHex.encode(envelope.recipientUserId)] ?: continue
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
-                val relayId = RelayClient.postReceiptEnvelope(config, envelope, network)
+                val relayId = relayRequest { RelayClient.postReceiptEnvelope(config, envelope, network) }
                 store.markOutgoingReceiptEnvelopeRelayPosted(envelope.msgId, now)
                 noteContactRelaySuccess(contact, config, fallbackConfig)
                 Log.i(
@@ -613,6 +619,7 @@ internal class RelaySyncEngine(
                     "Uploaded receipt envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
+                rethrowFamilyRateLimit(e)
                 noteOwnRelayFault(config, fallbackConfig, e)
                 noteContactRelayFault(contact, config, fallbackConfig, e)
                 Log.w(TAG, "Failed to upload receipt envelope to relay ${config.relayUrl}: ${e.message}")
@@ -663,9 +670,10 @@ internal class RelaySyncEngine(
                     // group deleted mid-queue); keep the legacy single post so
                     // the envelope isn't stranded.
                     try {
-                        RelayClient.postOutboundEnvelope(config, envelope, network)
+                        relayRequest { RelayClient.postOutboundEnvelope(config, envelope, network) }
                         store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
                     } catch (e: Exception) {
+                        rethrowFamilyRateLimit(e)
                         noteOwnRelayFault(config, fallbackConfig, e)
                         Log.w(TAG, "Failed to upload outbound envelope to relay ${config.relayUrl}: ${e.message}")
                     }
@@ -685,9 +693,10 @@ internal class RelaySyncEngine(
                 var posted = 0
                 for (row in rows) {
                     try {
-                        RelayClient.postFanoutRow(config, row, network)
+                        relayRequest { RelayClient.postFanoutRow(config, row, network) }
                         posted++
                     } catch (e: Exception) {
+                        rethrowFamilyRateLimit(e)
                         noteOwnRelayFault(config, fallbackConfig, e)
                         Log.w(TAG, "Failed to upload fan-out row to relay ${config.relayUrl}: ${e.message}")
                     }
@@ -703,7 +712,7 @@ internal class RelaySyncEngine(
             }
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
-                val relayId = RelayClient.postOutboundEnvelope(config, envelope, network)
+                val relayId = relayRequest { RelayClient.postOutboundEnvelope(config, envelope, network) }
                 store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
                 noteContactRelaySuccess(contact, config, fallbackConfig)
                 Log.i(
@@ -711,6 +720,7 @@ internal class RelaySyncEngine(
                     "Uploaded outbound envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
+                rethrowFamilyRateLimit(e)
                 noteOwnRelayFault(config, fallbackConfig, e)
                 noteContactRelayFault(contact, config, fallbackConfig, e)
                 Log.w(TAG, "Failed to upload outbound envelope to relay ${config.relayUrl}: ${e.message}")
@@ -789,9 +799,10 @@ internal class RelaySyncEngine(
                 var posted = 0
                 for (row in rows) {
                     try {
-                        RelayClient.postFanoutRow(config, row, network)
+                        relayRequest { RelayClient.postFanoutRow(config, row, network) }
                         posted++
                     } catch (e: Exception) {
+                        rethrowFamilyRateLimit(e)
                         noteOwnRelayFault(config, fallbackConfig, e)
                         Log.w(TAG, "Failed to upload carried fan-out row to relay ${config.relayUrl}: ${e.message}")
                     }
@@ -803,7 +814,7 @@ internal class RelaySyncEngine(
             }
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
-                val relayId = RelayClient.postCarriedEnvelope(config, envelope, network)
+                val relayId = relayRequest { RelayClient.postCarriedEnvelope(config, envelope, network) }
                 noteContactRelaySuccess(contact, config, fallbackConfig)
                 // 2xx: the relay holds it now (a dedupe hit counts -- the
                 // response id proves presence either way). Stamp the row so
@@ -815,6 +826,7 @@ internal class RelaySyncEngine(
                     "Uploaded carried envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
+                rethrowFamilyRateLimit(e)
                 noteOwnRelayFault(config, fallbackConfig, e)
                 // Parity with the other two upload loops and with
                 // MeshController.swift, which already counted this path: a
@@ -937,18 +949,20 @@ internal class RelaySyncEngine(
         var pagesFetched = 0
         var envelopesFetched = 0
         while (isRunning() && hasValidatedInternet()) {
-            val fetched = RelayClient.fetchEnvelopesWithinResponseCap(
-                config,
-                fetchHints,
-                after,
-                fetchBatchLimit,
-                network,
-            ) { tried, smaller ->
-                Log.w(
-                    TAG,
-                    "Relay ${config.relayUrl} page after=$after was too big to take at limit=$tried; " +
-                        "retrying with limit=$smaller",
-                )
+            val fetched = relayRequest {
+                RelayClient.fetchEnvelopesWithinResponseCap(
+                    config,
+                    fetchHints,
+                    after,
+                    fetchBatchLimit,
+                    network,
+                ) { tried, smaller ->
+                    Log.w(
+                        TAG,
+                        "Relay ${config.relayUrl} page after=$after was too big to take at limit=$tried; " +
+                            "retrying with limit=$smaller",
+                    )
+                }
             }
             val page = fetched.page
             fetchBatchLimit = fetched.limit
@@ -1018,8 +1032,9 @@ internal class RelaySyncEngine(
                 // mailbox; skipping past them would strand them there until
                 // expiry, so the frontier waits for the next pass to retry.
                 try {
-                    RelayClient.ackEnvelopes(config, ackIds, network)
+                    relayRequest { RelayClient.ackEnvelopes(config, ackIds, network) }
                 } catch (e: Exception) {
+                    rethrowFamilyRateLimit(e)
                     pageFullyProcessed = false
                     Log.w(TAG, "Failed to ack relay envelope(s) on ${config.relayUrl}: ${e.message}")
                 }
@@ -1243,15 +1258,40 @@ internal class RelaySyncEngine(
     /** This pass's `now`, so streak timestamps and re-probe windows agree within a pass. */
     private var passNowMs: Long = 0L
 
-    /** Largest Retry-After (ms) a 429 advertised for our own config this pass. */
-    private var ownRetryAfterMs: Long = 0L
-
     /** Epoch ms until which relayd asked us not to sync again; 0 = no backoff. */
     @Volatile private var rateLimitedUntilMs = 0L
+
+    private var familyBackoffIdentityHash = 0
+    private val familyRelayRequestPacer = FamilyRelayRequestPacer()
+    private val familyRelayBackoff = FamilyRelayBackoff()
+
+    /** Internal signal that unwinds every nested upload/fetch loop on a 429. */
+    private class FamilyRateLimitAbort(cause: RelayHttpException) : RuntimeException(cause)
 
     private val rateLimitRetryRunnable = Runnable { requestRelaySync("rate limit retry") }
     private val mailboxContinuationRunnable = Runnable { requestRelaySync("mailbox continuation") }
     private var mailboxContinuationNeeded = false
+
+    private fun <T> relayRequest(request: () -> T): T {
+        val waitMs = familyRelayRequestPacer.reserve(SystemClock.elapsedRealtime())
+        if (waitMs > 0L) Thread.sleep(waitMs)
+        try {
+            return request()
+        } catch (error: RelayHttpException) {
+            if (relayClassifyHttpError(error.code.toUShort(), error.relayCode) == CoreRelayFault.RATE_LIMITED) {
+                val retryAfterMs = relayRetryAfterMs(error.retryAfter).toLong()
+                val delayMs = familyRelayBackoff.onRateLimited(retryAfterMs, familyBackoffIdentityHash)
+                rateLimitedUntilMs = maxOf(rateLimitedUntilMs, System.currentTimeMillis() + delayMs)
+                ownRelayFault = worseRelayFault(ownRelayFault, CoreRelayFault.RATE_LIMITED)
+                throw FamilyRateLimitAbort(error)
+            }
+            throw error
+        }
+    }
+
+    private fun rethrowFamilyRateLimit(error: Exception) {
+        if (error is FamilyRateLimitAbort) throw error
+    }
 
     private fun scheduleMailboxContinuation() {
         handler.removeCallbacks(mailboxContinuationRunnable)
@@ -1271,9 +1311,6 @@ internal class RelaySyncEngine(
         val fault = relayClassifyHttpError(http.code.toUShort(), http.relayCode)
         if (fault == CoreRelayFault.OUTAGE) return
         ownRelayFault = worseRelayFault(ownRelayFault, fault)
-        if (fault == CoreRelayFault.RATE_LIMITED) {
-            ownRetryAfterMs = maxOf(ownRetryAfterMs, relayRetryAfterMs(http.retryAfter).toLong())
-        }
     }
 
     /**
@@ -1434,7 +1471,7 @@ internal class RelaySyncEngine(
         }
         try {
             val localNow = System.currentTimeMillis()
-            val page = RelayClient.syncPresence(config, announce, query, network)
+            val page = relayRequest { RelayClient.syncPresence(config, announce, query, network) }
             for (presence in page.presence) {
                 val contact = contactByHint[UserIdHex.encode(presence.hint)] ?: continue
                 val ageMs = (page.nowMs - presence.lastSeenMs).coerceAtLeast(0L)
@@ -1454,6 +1491,7 @@ internal class RelaySyncEngine(
                 "Synced relay presence on ${config.relayUrl}: announce=${announce.size} query=${query.size} hits=${page.presence.size}",
             )
         } catch (e: Exception) {
+            rethrowFamilyRateLimit(e)
             Log.w(TAG, "Relay presence sync failed on ${config.relayUrl}: ${e.message}")
         }
     }
