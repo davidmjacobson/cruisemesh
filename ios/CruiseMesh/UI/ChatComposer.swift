@@ -1,6 +1,28 @@
+import OSLog
 import PhotosUI
 import SwiftUI
 import UIKit
+
+struct PhotoLibraryPickerAttempt: Equatable {
+    enum Dismissal: Equatable {
+        case selected
+        case cancelled
+    }
+
+    private(set) var receivedSelection = false
+
+    mutating func begin() {
+        receivedSelection = false
+    }
+
+    mutating func selected() {
+        receivedSelection = true
+    }
+
+    var dismissal: Dismissal {
+        receivedSelection ? .selected : .cancelled
+    }
+}
 
 /// The message-composer row shared by `ChatView` and `GroupChatView` (FI12):
 /// reply/pending-photo previews, the attach menu, the draft field, and the
@@ -8,6 +30,8 @@ import UIKit
 /// two screens. The two call sites differ only in what happens when the user
 /// sends or starts recording, which are supplied as closures.
 struct ChatComposerBar: View {
+    private static let log = Logger(subsystem: "com.cruisemesh", category: "PhotoLibrary")
+
     let replyingToPreview: QuotedMessagePreview?
     let pendingPhoto: Data?
     @Binding var draft: String
@@ -22,6 +46,8 @@ struct ChatComposerBar: View {
     let onSend: () -> Void
     let onVoiceFinished: (URL, Int32) -> Void
     let onVoiceError: (String) -> Void
+    @State private var showPhotoLibrary = false
+    @State private var photoLibraryAttempt = PhotoLibraryPickerAttempt()
 
     var body: some View {
         VStack(spacing: 8) {
@@ -33,9 +59,19 @@ struct ChatComposerBar: View {
             }
             HStack(alignment: .bottom, spacing: 8) {
                 Menu {
-                    PhotosPicker(selection: $photoItem, matching: .images) {
+                    Button {
+                        photoLibraryAttempt.begin()
+                        Self.log.info("Photo library picker requested from the chat attachment menu")
+                        // Let the Menu's popover dismiss before presenting the
+                        // system picker. Presenting a PhotosPicker directly
+                        // from that transient popover fails on iPad.
+                        DispatchQueue.main.async {
+                            showPhotoLibrary = true
+                        }
+                    } label: {
                         Label("Photo library", systemImage: "photo")
                     }
+                    .accessibilityIdentifier("chat.attach.photo-library")
                     Button { showCamera = true } label: {
                         Label("Take photo", systemImage: "camera")
                     }
@@ -78,6 +114,28 @@ struct ChatComposerBar: View {
         }
         .padding(12)
         .background(.bar)
+        .photosPicker(
+            isPresented: $showPhotoLibrary,
+            selection: $photoItem,
+            matching: .images
+        )
+        .onChange(of: showPhotoLibrary) { isPresented in
+            if isPresented {
+                Self.log.info("Photo library picker presentation became active")
+            } else {
+                switch photoLibraryAttempt.dismissal {
+                case .selected:
+                    Self.log.info("Photo library picker dismissed after a selection")
+                case .cancelled:
+                    Self.log.info("Photo library picker dismissed without a selection")
+                }
+            }
+        }
+        .onChange(of: photoItem) { item in
+            guard item != nil else { return }
+            photoLibraryAttempt.selected()
+            Self.log.info("Photo library picker returned a selection")
+        }
     }
 }
 
@@ -144,6 +202,8 @@ struct VoiceMemoRecorderSheet: View {
 /// only in where the resulting JPEG/audio lands and how failures are
 /// surfaced, supplied as closures.
 private struct AttachmentPickerModifiers: ViewModifier {
+    private static let log = Logger(subsystem: "com.cruisemesh", category: "PhotoLibrary")
+
     @Binding var photoItem: PhotosPickerItem?
     @Binding var showCamera: Bool
     @Binding var showVoice: Bool
@@ -158,10 +218,28 @@ private struct AttachmentPickerModifiers: ViewModifier {
             .onChange(of: photoItem) { item in
                 guard let item else { return }
                 Task {
-                    if let data = try? await item.loadTransferable(type: Data.self),
-                       let jpeg = MediaCompressor.compressImage(data: data) {
+                    do {
+                        guard let data = try await item.loadTransferable(type: Data.self) else {
+                            Self.log.error("Selected photo did not provide transferable bytes")
+                            onAttachmentError("Could not prepare photo")
+                            photoItem = nil
+                            return
+                        }
+                        Self.log.info("Loaded selected photo (\(data.count, privacy: .public) bytes)")
+                        guard let jpeg = MediaCompressor.compressImage(data: data) else {
+                            Self.log.error(
+                                "Could not decode or compress selected photo (\(data.count, privacy: .public) bytes)"
+                            )
+                            onAttachmentError("Could not prepare photo")
+                            photoItem = nil
+                            return
+                        }
+                        Self.log.info("Prepared selected photo (\(jpeg.count, privacy: .public) JPEG bytes)")
                         onPhotoReady(jpeg)
-                    } else {
+                    } catch {
+                        Self.log.error(
+                            "Could not load selected photo: \(error.localizedDescription, privacy: .public)"
+                        )
                         onAttachmentError("Could not prepare photo")
                     }
                     photoItem = nil
