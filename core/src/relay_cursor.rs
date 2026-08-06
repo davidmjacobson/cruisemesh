@@ -209,13 +209,11 @@ pub fn relay_hint_source_digest(mut source_ids: Vec<Vec<u8>>) -> String {
 /// Two valves stay open, because they are the states a stored timestamp
 /// genuinely cannot speak for:
 ///
-/// - **Never swept** (`last_sweep_at_ms <= 0`) sweeps. This is also,
-///   deliberately, the entire "heal promptly after an install or restore"
-///   story, and the reason no extra cold-start grace period is warranted on
-///   top of it. A fresh install has no `relay_fetch_cursors` row; those rows
-///   deliberately do not ride a `.cmbak` (see `MessageStore::backup_to`), so a
-///   restore has none either; and a rotated token or a moved host hashes to a
-///   different [`relay_cursor_key`], which has no row of its own. All three
+/// - **Never swept** (`last_sweep_at_ms <= 0`) sweeps. This is also the
+///   entire "heal promptly after an install" story and the reason no extra
+///   cold-start grace period is warranted on top of it. A fresh install has
+///   no `relay_fetch_cursors` row; a rotated token or a moved host hashes to a
+///   different [`relay_cursor_key`], which has no row of its own. Both states
 ///   read as 0 here and sweep on their first pass. A grace period would buy
 ///   those cases nothing they don't already have, and would hand back a share
 ///   of exactly the restart-driven cost this rule exists to remove.
@@ -478,9 +476,8 @@ mod tests {
 
     #[test]
     fn a_mailbox_never_swept_sweeps_on_its_first_pass() {
-        // Fresh install, a restore (cursor rows don't ride a `.cmbak`), a
-        // rotated token, a moved host: all of them read as 0 here, and all of
-        // them must walk from the beginning. This is the promptness a
+        // Fresh install, a rotated token, or a moved host reads as 0 here and
+        // must walk from the beginning. This is the promptness a
         // cold-start grace period would otherwise have had to provide.
         assert!(relay_sweep_due(false, 0, 5_000));
         assert!(relay_sweep_due(false, -1, 5_000));

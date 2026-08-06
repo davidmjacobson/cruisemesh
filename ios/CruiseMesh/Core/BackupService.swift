@@ -40,7 +40,7 @@ enum BackupService {
             at: pendingDatabaseURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try payload.sqlite.write(to: pendingDatabaseURL, options: .atomic)
+        try stageSanitizedDatabase(payload.sqlite)
         IdentityStore.save(identity)
         if let name = payload.displayName { ProfileStore.saveDisplayName(name) }
         ProfilePhotoStore.restoreBackupBytes(payload.ownAvatar)
@@ -52,6 +52,30 @@ enum BackupService {
         }
         RelayConfigStore.setShareOnline(payload.shareOnline)
         OnboardingStore.markCompleted()
+    }
+
+    /// Validate/migrate the payload and remove restored courier/relay runtime
+    /// state before placing it at the special path startup knows how to install.
+    /// A failed sanitization never leaves an unsafe pending restore behind.
+    private static func stageSanitizedDatabase(_ sqlite: Data) throws {
+        guard !sqlite.isEmpty else {
+            try sqlite.write(to: pendingDatabaseURL, options: .atomic)
+            return
+        }
+        let manager = FileManager.default
+        let staged = pendingDatabaseURL.deletingLastPathComponent()
+            .appendingPathComponent("cruisemesh-restore-\(UUID().uuidString).sqlite")
+        defer {
+            for suffix in ["", "-journal", "-wal", "-shm"] {
+                try? manager.removeItem(at: URL(fileURLWithPath: staged.path + suffix))
+            }
+        }
+        try sqlite.write(to: staged, options: .atomic)
+        _ = try sanitizeRestoredMessageStore(path: staged.path)
+        if manager.fileExists(atPath: pendingDatabaseURL.path) {
+            try manager.removeItem(at: pendingDatabaseURL)
+        }
+        try manager.moveItem(at: staged, to: pendingDatabaseURL)
     }
 
     /// Read a selected backup incrementally so a malicious file provider cannot

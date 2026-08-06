@@ -972,24 +972,22 @@ impl MessageStore {
     /// The destination must not already exist; callers should use a unique
     /// temporary path and remove it after reading the backup bytes.
     ///
-    /// ## Relay fetch cursors do not ride the backup
+    /// ## Courier state does not ride the backup
     ///
-    /// Everything else in the store is history and should come back exactly
-    /// as it was. A relay fetch cursor is not history — it is a claim about
-    /// the *current* state of a remote mailbox, and a backup is the one place
-    /// that claim can be carried somewhere it was never true. Restore onto a
-    /// second phone, restore months later, or restore after the relay box was
-    /// rebuilt (its `families` table emptied and its row ids restarted at 1,
-    /// which has happened in this project's own deployment) and an inherited
-    /// frontier sits above every row that now exists. The phone would then
-    /// fetch nothing, forever, and report perfect health while doing it —
-    /// silent non-delivery, the worst failure this app can have.
+    /// User-owned messages, contacts, authored Lamport watermarks and receipts
+    /// are history and come back exactly as they were. Courier ciphertext in
+    /// `carried_envelopes` is different: it belongs to other recipients and a
+    /// restored copy has no delivery-progress evidence. Restoring hundreds of
+    /// those rows used to offer the whole stale backlog again on every new BLE
+    /// link, immediately multiplying traffic across rotating peer addresses.
     ///
-    /// So the snapshot is scrubbed of them before it is sealed. The restored
-    /// device re-walks each mailbox once from 0 and re-establishes its own
-    /// frontier from evidence. That costs one full walk and nothing else:
-    /// everything already delivered is recognised and dropped by the seen-id
-    /// filter on the way back in.
+    /// Relay fetch cursors deliberately *do* ride the backup. Dropping a
+    /// cursor forces an immediate walk from row zero; on a shared family
+    /// mailbox that re-downloads the stale proxy mail we just discarded and
+    /// can recreate the restore storm before the UI opens. The six-hour
+    /// periodic sweep already repairs a stale frontier or rebuilt relay, so
+    /// preserving it trades at most bounded delivery delay for avoiding an
+    /// unbounded restore-time replay.
     pub fn backup_to(&self, destination: String) -> Result<(), CoreError> {
         let destination = std::path::Path::new(destination.trim());
         if !destination.is_absolute() {
@@ -1014,15 +1012,11 @@ impl MessageStore {
         let conn = lock_conn(&self.conn);
         conn.execute("VACUUM INTO ?1", params![destination.to_string_lossy()])
             .map_err(store_err)?;
-        // See the doc comment: the snapshot must not carry this device's idea
-        // of where each relay mailbox got to. Done on the copy rather than by
-        // deleting from the live store, so taking a backup never costs the
-        // running phone its frontier.
-        let snapshot = Connection::open(destination).map_err(store_err)?;
-        snapshot
-            .execute("DELETE FROM relay_fetch_cursors", [])
-            .map_err(store_err)?;
-        drop(snapshot);
+        // See the doc comment: scrub the copy, never the live store. Restore
+        // repeats this operation so legacy full-database `.cmbak` files made
+        // before this policy are safe too.
+        let mut snapshot = Connection::open(destination).map_err(store_err)?;
+        sanitize_restore_ephemera(&mut snapshot)?;
         Ok(())
     }
 
@@ -1069,6 +1063,34 @@ impl MessageStore {
         }
         incoming_message_reference::insert(self, message, Some(msg_id), reply_to_msg_id)
     }
+}
+
+/// Make an installed legacy full-database backup safe before any transport
+/// opens it. The path is opened through [`MessageStore::open`] first so old
+/// schemas receive the normal forward migrations before the cleanup runs.
+///
+/// Returns the number of carried envelopes discarded. User-owned history,
+/// contacts, authored Lamport watermarks, outbound authored work, receipts and
+/// the relay frontier are deliberately preserved.
+#[uniffi::export]
+pub fn sanitize_restored_message_store(path: String) -> Result<u64, CoreError> {
+    let store = MessageStore::open(path)?;
+    let mut conn = lock_conn(&store.conn);
+    sanitize_restore_ephemera(&mut conn)
+}
+
+fn sanitize_restore_ephemera(conn: &mut Connection) -> Result<u64, CoreError> {
+    let tx = conn.transaction().map_err(store_err)?;
+    let discarded = tx
+        .execute("DELETE FROM carried_envelopes", [])
+        .map_err(store_err)?;
+    tx.commit().map_err(store_err)?;
+    // BackupService reads the sanitized main database file immediately after
+    // this function returns. Force any WAL pages into that file rather than
+    // relying on a best-effort checkpoint when SQLite closes the connection.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .map_err(store_err)?;
+    Ok(discarded as u64)
 }
 
 /// Internal-only helpers, never exported over UniFFI: not wrapped in
@@ -3093,12 +3115,10 @@ impl MessageStore {
     /// Forget every remembered frontier, so the next pass re-walks each
     /// mailbox from the beginning.
     ///
-    /// This is the reset a restored `.cmbak` needs — [`Self::backup_to`]
-    /// applies it to the snapshot it writes, so a restore never inherits
-    /// another device's (or another relay generation's) idea of where the
-    /// mailbox got to. Re-walking once is cheap and self-correcting:
-    /// everything already delivered is deduped on the way back in by the
-    /// seen-id gossip filter.
+    /// This is an explicit administrative reset, not part of backup/restore.
+    /// Restore preserves the frontier because clearing it immediately walks
+    /// an entire shared mailbox and can recreate discarded courier backlog;
+    /// scheduled sweeps provide the bounded stale-frontier repair path.
     pub fn clear_relay_fetch_cursors(&self) -> Result<(), CoreError> {
         let conn = lock_conn(&self.conn);
         conn.execute("DELETE FROM relay_fetch_cursors", [])
@@ -5969,8 +5989,10 @@ CREATE TABLE IF NOT EXISTS peer_connection_summary (
 -- How far the relay-mailbox walk has got, per mailbox. `config_key` is
 -- `relay_cursor_key(url, token)` -- a hash, so no relay credential is stored
 -- here and a rotated token simply has no row (which reads as cursor 0). See
--- `crate::relay_cursor` for the policy and `backup_to` for why these rows
--- deliberately do not ride a `.cmbak`.
+-- `crate::relay_cursor` for the policy. These rows ride a `.cmbak`: clearing
+-- them makes restore immediately re-walk a shared mailbox and recreate the
+-- stale courier backlog restore intentionally discarded. Scheduled sweeps
+-- bound the repair delay if a restored frontier is stale.
 CREATE TABLE IF NOT EXISTS relay_fetch_cursors (
     config_key    TEXT PRIMARY KEY,
     after_id      INTEGER NOT NULL DEFAULT 0,
@@ -9157,9 +9179,8 @@ mod tests {
         assert_eq!(cursor.after_id, 0);
         assert_eq!(cursor.last_sweep_at_ms, 0);
         // A mailbox this device has never swept walks from the beginning on
-        // its first pass -- which is what a fresh install, a restore (these
-        // rows never ride a `.cmbak`), a rotated token and a moved host all
-        // look like from here.
+        // its first pass -- which is what a fresh install, a rotated token,
+        // or a moved host looks like from here.
         assert!(crate::relay_sweep_due(
             false,
             cursor.last_sweep_at_ms,
@@ -9543,12 +9564,10 @@ mod tests {
     }
 
     #[test]
-    fn a_backup_snapshot_carries_no_relay_fetch_cursor() {
-        // A cursor is a claim about a *remote* mailbox's current state, and a
-        // backup is the one place that claim travels somewhere it was never
-        // true (another phone, months later, or a relay rebuilt with its row
-        // ids restarted at 1). Inheriting one there means fetching nothing,
-        // forever, while reporting perfect health.
+    fn a_backup_snapshot_drops_courier_rows_but_keeps_the_relay_frontier() {
+        // Dropping the frontier used to force an immediate walk from zero,
+        // which re-downloaded proxy mail into the carry queue the backup had
+        // just discarded. Preserve it; scheduled sweeps repair a stale one.
         let dir = std::env::temp_dir().join(format!(
             "cruisemesh-cursor-backup-{}",
             SystemTime::now()
@@ -9568,6 +9587,18 @@ mod tests {
         store
             .note_relay_sweep_completed(cursor_key(), 1_000_000)
             .unwrap();
+        store
+            .enqueue_relay_carried_envelope(
+                CarriedEnvelope {
+                    msg_id: b"carried-envelope".to_vec(),
+                    hop_ttl: 7,
+                    expiry: 2_000_000,
+                    recipient_hint: b"hint".to_vec(),
+                    sealed: b"sealed".to_vec(),
+                },
+                900_000,
+            )
+            .unwrap();
 
         store.backup_to(path.to_string_lossy().to_string()).unwrap();
         let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
@@ -9576,15 +9607,161 @@ mod tests {
             restored.messages_for_chat(b"chat".to_vec()).unwrap().len(),
             1
         );
-        // ...the frontier does not, so the restored phone re-walks once.
+        assert_eq!(restored.carried_len().unwrap(), 0);
+        // ...and a recent frontier prevents an immediate mailbox replay.
         let cursor = restored.relay_fetch_cursor(cursor_key()).unwrap();
-        assert_eq!(cursor.after_id, 0);
-        assert_eq!(cursor.last_sweep_at_ms, 0);
+        assert_eq!(cursor.after_id, 9_000);
+        assert_eq!(cursor.last_sweep_at_ms, 1_000_000);
+        assert!(!crate::relay_sweep_due(
+            false,
+            cursor.last_sweep_at_ms,
+            1_000_001
+        ));
         // And taking the backup did not cost the live store its frontier.
         assert_eq!(
             store.relay_fetch_cursor(cursor_key()).unwrap().after_id,
             9_000
         );
+        drop(restored);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_full_database_restore_discards_large_carry_backlog_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "cruisemesh-legacy-restore-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("restored.sqlite");
+        let path_string = path.to_string_lossy().to_string();
+        let store = MessageStore::open(path_string.clone()).unwrap();
+
+        let alice = contact(b"alice-id", "Alice");
+        store.upsert_contact(alice.clone()).unwrap();
+        let authored = msg(b"alice-id", b"me", 777, "user-owned history");
+        let outbound = outbound_for(&authored, b"alice-id", b"msg-000000000777");
+        store
+            .insert_outgoing_message(authored.clone(), outbound.clone(), 1_700_000_000_100)
+            .unwrap();
+        store
+            .record_receipt(
+                b"alice-id".to_vec(),
+                b"me".to_vec(),
+                RECEIPT_TYPE_DELIVERED,
+                777,
+                Some(2),
+            )
+            .unwrap();
+        store
+            .record_outgoing_receipt(
+                b"alice-id".to_vec(),
+                b"alice-id".to_vec(),
+                RECEIPT_TYPE_READ,
+                42,
+            )
+            .unwrap();
+        let own_id = vec![9u8; 16];
+        assert!(!store.note_relay_hint_sources(own_id.clone()).unwrap());
+        store
+            .advance_relay_fetch_cursor(cursor_key(), 9_000, true)
+            .unwrap();
+        store
+            .note_relay_sweep_completed(cursor_key(), 1_000_000)
+            .unwrap();
+
+        {
+            let mut conn = lock_conn(&store.conn);
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO authored_lamport_watermarks
+                    (chat_id, sender_user_id, high_lamport) VALUES (?1, ?2, 777)",
+                params![b"alice-id".as_slice(), b"me".as_slice()],
+            )
+            .unwrap();
+            for i in 0u64..400 {
+                let msg_id = [i.to_be_bytes(), i.to_le_bytes()].concat();
+                tx.execute(
+                    "INSERT INTO carried_envelopes
+                        (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
+                         received_at, size_bytes, from_relay, content_digest)
+                     VALUES (?1, 7, 2000000, ?2, ?3, 1, ?4, 32, 1, ?5)",
+                    params![
+                        msg_id,
+                        b"proxy-hint".as_slice(),
+                        format!("restored-ciphertext-{i}").into_bytes(),
+                        900_000 + i as i64,
+                        i.to_be_bytes().to_vec(),
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        assert_eq!(store.carried_len().unwrap(), 400);
+        drop(store);
+
+        assert_eq!(
+            sanitize_restored_message_store(path_string.clone()).unwrap(),
+            400
+        );
+        let restored = MessageStore::open(path_string).unwrap();
+        assert_eq!(restored.carried_len().unwrap(), 0);
+        assert_eq!(
+            restored.get_contact(b"alice-id".to_vec()).unwrap(),
+            Some(alice)
+        );
+        assert_eq!(
+            restored.messages_for_chat(b"alice-id".to_vec()).unwrap(),
+            vec![authored]
+        );
+        assert_eq!(
+            restored
+                .outbound_envelopes_after(b"alice-id".to_vec(), b"me".to_vec(), 0)
+                .unwrap(),
+            vec![outbound]
+        );
+        assert_eq!(
+            restored
+                .receipt_through(b"alice-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED,)
+                .unwrap(),
+            777
+        );
+        assert_eq!(
+            restored
+                .outgoing_receipt_through(
+                    b"alice-id".to_vec(),
+                    b"alice-id".to_vec(),
+                    RECEIPT_TYPE_READ,
+                )
+                .unwrap(),
+            42
+        );
+        let authored_high: i64 = lock_conn(&restored.conn)
+            .query_row(
+                "SELECT high_lamport FROM authored_lamport_watermarks
+                 WHERE chat_id = ?1 AND sender_user_id = ?2",
+                params![b"alice-id".as_slice(), b"me".as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authored_high, 777);
+        let cursor = restored.relay_fetch_cursor(cursor_key()).unwrap();
+        assert_eq!(cursor.after_id, 9_000);
+        assert_eq!(cursor.last_sweep_at_ms, 1_000_000);
+        assert!(!crate::relay_sweep_due(
+            false,
+            cursor.last_sweep_at_ms,
+            1_000_001
+        ));
+        assert!(
+            !restored.note_relay_hint_sources(own_id).unwrap(),
+            "preserving the hint digest must not invalidate the preserved frontier"
+        );
+
         drop(restored);
         let _ = fs::remove_dir_all(&dir);
     }

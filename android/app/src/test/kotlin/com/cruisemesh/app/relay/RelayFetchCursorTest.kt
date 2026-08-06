@@ -144,8 +144,8 @@ class RelayFetchCursorTest {
 
     @Test
     fun `a mailbox never swept sweeps once, not once per pass`() {
-        // Fresh install, restore (cursor rows never ride a .cmbak), rotated
-        // token, moved host: all read as 0 and must walk from the beginning.
+        // Fresh install, rotated token, and moved host read as 0 and must walk
+        // from the beginning. Restore preserves a recent frontier instead.
         assertTrue(relaySweepDue(false, 0L, 5_000L))
         // ...but a store write that keeps failing must not re-walk forever.
         assertFalse(relaySweepDue(true, 0L, 5_000L))

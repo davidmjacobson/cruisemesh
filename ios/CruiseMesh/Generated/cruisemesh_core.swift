@@ -18428,6 +18428,22 @@ public func rotateGroup(group: Group, memberUserIds: [Data])throws  -> Group {
     )
 })
 }
+/**
+ * Make an installed legacy full-database backup safe before any transport
+ * opens it. The path is opened through [`MessageStore::open`] first so old
+ * schemas receive the normal forward migrations before the cleanup runs.
+ *
+ * Returns the number of carried envelopes discarded. User-owned history,
+ * contacts, authored Lamport watermarks, outbound authored work, receipts and
+ * the relay frontier are deliberately preserved.
+ */
+public func sanitizeRestoredMessageStore(path: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_sanitize_restored_message_store(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
 public func sealBackup(passphrase: String, payload: CoreBackupPayload, iterations: UInt32?)throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreBackupError.lift) {
     uniffi_cruisemesh_core_fn_func_seal_backup(
@@ -19002,7 +19018,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 11572) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 13229) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 25542) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_interval_ms() != 37428) {
@@ -19027,6 +19043,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_rotate_group() != 56003) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_sanitize_restored_message_store() != 61596) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_seal_backup() != 5887) {
@@ -19200,7 +19219,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_envelope() != 41114) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to() != 2447) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to() != 30631) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_block_user() != 63065) {
@@ -19248,7 +19267,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_peer_connection_history() != 2544) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_relay_fetch_cursors() != 5399) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_relay_fetch_cursors() != 48310) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_shared_request_dismissal() != 60027) {
