@@ -3034,11 +3034,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             ) {
                 if !result.contains(where: { $0.relayUrl == cfg.relayUrl && $0.relayToken == cfg.relayToken }) {
                     result.append(cfg)
-<<<<<<< agent/log-secondary-relay-configs
-                    logger.info("Secondary relay poll config added for contact \(contact.userId.hexEncodedString(), privacy: .public): \(cfg.relayUrl, privacy: .public)")
-=======
                     relaySyncLog.info("Secondary relay poll config added for contact \(UserIdHex.encode(contact.userId), privacy: .public): \(cfg.relayUrl, privacy: .public)")
->>>>>>> local
                 }
             }
         }
