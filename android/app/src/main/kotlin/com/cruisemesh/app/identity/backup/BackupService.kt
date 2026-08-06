@@ -10,6 +10,7 @@ import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.OnboardingStore
 import com.cruisemesh.app.identity.ProfilePhotoStore
 import com.cruisemesh.app.identity.ProfileStore
+import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.identity.decodeIdentity
 import com.cruisemesh.app.identity.encodeIdentity
 import com.cruisemesh.app.relay.RelayConfigStore
@@ -18,7 +19,10 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import uniffi.cruisemesh_core.backupMaxFileBytes
-import uniffi.cruisemesh_core.sanitizeRestoredMessageStore
+import uniffi.cruisemesh_core.BackupContentOptions
+import uniffi.cruisemesh_core.BackupInventory
+import uniffi.cruisemesh_core.inspectRestoredMessageStore
+import uniffi.cruisemesh_core.sanitizeRestoredMessageStoreWithOptions
 
 /**
  * Android glue for account backup/restore:
@@ -36,14 +40,33 @@ object BackupService {
     private const val STORE_FILENAME = "cruisemesh.sqlite"
     private const val TAG = "BackupService"
 
+    fun inventory(context: Context, nowMs: Long = System.currentTimeMillis()): BackupInventory =
+        AppStore.get(context).backupInventory(nowMs)
+
     /** Build the encrypted `.cmbak` bytes from the current on-device identity and message store. */
-    fun buildBackup(context: Context, passphrase: CharArray): ByteArray {
+    fun buildBackup(
+        context: Context,
+        passphrase: CharArray,
+        options: BackupContentOptions = defaultContentOptions(),
+    ): ByteArray {
         val identity = IdentityStore.load(context)
             ?: throw IllegalStateException("No identity on this device to back up")
         val snapshotFile = java.io.File.createTempFile("cruisemesh-backup-", ".sqlite", context.cacheDir)
         snapshotFile.delete()
         val sqliteBytes = try {
-            AppStore.get(context).backupTo(snapshotFile.absolutePath)
+            val report = AppStore.get(context).backupToWithOptions(
+                snapshotFile.absolutePath,
+                options,
+                System.currentTimeMillis(),
+            )
+            Log.i(
+                TAG,
+                "Prepared backup snapshot; removed messages=${report.removedMessageCount}, " +
+                    "ownPending=${report.removedPendingOwnDeliveryCount}, " +
+                    "courier=${report.removedCourierDeliveryCount}, " +
+                    "expired=${report.removedExpiredDeliveryCount}, " +
+                    "connectionEvents=${report.removedConnectionEventCount}",
+            )
             snapshotFile.inputStream().use { input -> readBackupBytes(context, input) }
         } finally {
             snapshotFile.delete()
@@ -61,6 +84,7 @@ object BackupService {
             relayUrl = relay?.relayUrl,
             relayToken = relay?.relayToken,
             shareOnline = RelayConfigStore.shareOnline(context),
+            friendsOfFriendsEnabled = FriendsOfFriendsStore.isEnabled(context),
         )
         return BackupCrypto.seal(passphrase, payload)
     }
@@ -73,24 +97,32 @@ object BackupService {
      * on success the caller should restart the app so the identity and store are
      * re-read cleanly.
      */
-    fun restoreBackup(context: Context, fileBytes: ByteArray, passphrase: CharArray) {
-        val payload = BackupCrypto.open(passphrase, fileBytes)
+    fun previewBackup(
+        context: Context,
+        fileBytes: ByteArray,
+        passphrase: CharArray,
+    ): BackupPreview {
+        val payload = openAndValidatePayload(context, fileBytes, passphrase)
+        val inventory = withStagedSqlite(context, payload.sqlite) { staged ->
+            inspectRestoredMessageStore(staged.absolutePath, System.currentTimeMillis())
+        }
+        return BackupPreview(
+            inventory = inventory,
+            createdAtMs = payload.createdAtMs,
+            sourceVersionCode = payload.srcVersionCode,
+        )
+    }
 
-        val appVersion = appVersionCode(context)
-        if (refuseNewerBackup(payload.srcVersionCode, appVersion, isDebuggableBuild(context))) {
-            throw BackupException.NewerBackup(payload.srcVersionCode, appVersion)
-        }
-        if (payload.srcVersionCode > appVersion) {
-            Log.w(
-                TAG,
-                "Restoring a backup made by version ${payload.srcVersionCode} onto $appVersion; " +
-                    "this build is debuggable and its version code is a frozen constant, so the " +
-                    "newer-backup refusal does not apply.",
-            )
-        }
+    fun restoreBackup(
+        context: Context,
+        fileBytes: ByteArray,
+        passphrase: CharArray,
+        options: BackupContentOptions = defaultContentOptions(),
+    ) {
+        val payload = openAndValidatePayload(context, fileBytes, passphrase)
 
         val identity = decodeIdentity(payload.identity)
-        val sanitizedSqlite = sanitizeRestoredSqlite(context, payload.sqlite)
+        val sanitizedSqlite = sanitizeRestoredSqlite(context, payload.sqlite, options)
 
         // Replace the message store file. Clear any stale journal siblings so a
         // half-written journal from a prior install can't be replayed over the
@@ -119,8 +151,14 @@ object BackupService {
             RelayConfigStore.save(context, payload.relayUrl, payload.relayToken, durable = true)
         }
         RelayConfigStore.setShareOnline(context, payload.shareOnline, durable = true)
+        FriendsOfFriendsStore.restoreEnabled(context, payload.friendsOfFriendsEnabled)
         OnboardingStore.markCompleted(context, durable = true)
     }
+
+    fun defaultContentOptions() = BackupContentOptions(
+        includeMessageHistory = true,
+        includePendingDeliveriesForOthers = false,
+    )
 
     /** Read a SAF document without ever accumulating more than the core's backup cap. */
     fun readBytes(context: Context, uri: Uri): ByteArray {
@@ -200,14 +238,59 @@ object BackupService {
      * can start any transports. This also protects legacy full-DB backups that
      * predate the same scrub in `MessageStore.backupTo`.
      */
-    private fun sanitizeRestoredSqlite(context: Context, sqlite: ByteArray): ByteArray {
+    private fun openAndValidatePayload(
+        context: Context,
+        fileBytes: ByteArray,
+        passphrase: CharArray,
+    ): BackupPayload {
+        val payload = BackupCrypto.open(passphrase, fileBytes)
+        val appVersion = appVersionCode(context)
+        if (refuseNewerBackup(payload.srcVersionCode, appVersion, isDebuggableBuild(context))) {
+            throw BackupException.NewerBackup(payload.srcVersionCode, appVersion)
+        }
+        if (payload.srcVersionCode > appVersion) {
+            Log.w(
+                TAG,
+                "Reading a backup made by version ${payload.srcVersionCode} on $appVersion; " +
+                    "this debuggable build uses a frozen version code.",
+            )
+        }
+        return payload
+    }
+
+    private fun sanitizeRestoredSqlite(
+        context: Context,
+        sqlite: ByteArray,
+        options: BackupContentOptions,
+    ): ByteArray {
         if (sqlite.isEmpty()) return sqlite
+        return withStagedSqlite(context, sqlite) { staged ->
+            val report = sanitizeRestoredMessageStoreWithOptions(
+                staged.absolutePath,
+                options,
+                System.currentTimeMillis(),
+            )
+            Log.i(
+                TAG,
+                "Sanitized restored store; removed messages=${report.removedMessageCount}, " +
+                    "ownPending=${report.removedPendingOwnDeliveryCount}, " +
+                    "courier=${report.removedCourierDeliveryCount}, " +
+                    "expired=${report.removedExpiredDeliveryCount}, " +
+                    "connectionEvents=${report.removedConnectionEventCount}",
+            )
+            staged.readBytes()
+        }
+    }
+
+    private inline fun <T> withStagedSqlite(
+        context: Context,
+        sqlite: ByteArray,
+        block: (java.io.File) -> T,
+    ): T {
         val staged = java.io.File.createTempFile("cruisemesh-restore-", ".sqlite", context.cacheDir)
         return try {
             staged.writeBytes(sqlite)
-            val discarded = sanitizeRestoredMessageStore(staged.absolutePath)
-            Log.i(TAG, "Sanitized restored store; discarded $discarded carried envelopes")
-            staged.readBytes()
+            block(staged)
         } finally {
             for (suffix in listOf("", "-journal", "-wal", "-shm")) {
                 staged.resolveSibling(staged.name + suffix).takeIf { it.exists() }?.delete()
@@ -215,6 +298,12 @@ object BackupService {
         }
     }
 }
+
+data class BackupPreview(
+    val inventory: BackupInventory,
+    val createdAtMs: Long,
+    val sourceVersionCode: Int,
+)
 
 internal class BackupFileTooLargeException : IOException()
 

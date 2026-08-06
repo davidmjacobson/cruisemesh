@@ -21,6 +21,9 @@ struct BackupExportView: View {
     @State private var document = BackupDocument()
     @State private var showExporter = false
     @State private var error: String?
+    @State private var inventory: BackupInventory?
+    @State private var includeHistory = true
+    @State private var includeCourier = false
 
     private var acceptable: Bool {
         passphrase.count >= Int(backupMinPassphraseLength()) && passphrase == confirmation
@@ -28,6 +31,19 @@ struct BackupExportView: View {
 
     var body: some View {
         Form {
+            Section("Backup contents") {
+                Toggle("Include my message history", isOn: $includeHistory)
+                Text(historyInventoryText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Include pending deliveries for others", isOn: $includeCourier)
+                Text(courierInventoryText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Your identity, contacts, groups, privacy settings, and message-number continuity are always included.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Protect your backup") {
                 SecureField("Passphrase", text: $passphrase)
                 SecureField("Confirm passphrase", text: $confirmation)
@@ -47,6 +63,9 @@ struct BackupExportView: View {
             }
         }
         .navigationTitle("Back up account")
+        .task {
+            inventory = try? await Task.detached { try BackupService.inventory() }.value
+        }
         .fileExporter(
             isPresented: $showExporter,
             document: document,
@@ -68,13 +87,32 @@ struct BackupExportView: View {
         }
     }
 
+    private var historyInventoryText: String {
+        guard let inventory else { return "Counting messages…" }
+        return "\(inventory.messageCount) messages · \(formatBackupBytes(inventory.messageBytes)); " +
+            "\(inventory.pendingOwnDeliveryCount) pending deliveries from me."
+    }
+
+    private var courierInventoryText: String {
+        guard let inventory else { return "Counting encrypted courier messages…" }
+        return "\(inventory.pendingCourierDeliveryCount) encrypted messages · " +
+            "\(formatBackupBytes(inventory.pendingCourierDeliveryBytes)). " +
+            "They are unreadable on this device."
+    }
+
     private func createBackup() {
         exporting = true
         error = nil
         let secret = passphrase
         Task {
             do {
-                let data = try await Task.detached { try BackupService.buildBackup(passphrase: secret) }.value
+                let options = BackupContentOptions(
+                    includeMessageHistory: includeHistory,
+                    includePendingDeliveriesForOthers: includeCourier
+                )
+                let data = try await Task.detached {
+                    try BackupService.buildBackup(passphrase: secret, options: options)
+                }.value
                 document = BackupDocument(data: data)
                 showExporter = true
             } catch {
@@ -95,6 +133,9 @@ struct BackupRestoreView: View {
     @State private var restoring = false
     @State private var error: String?
     @State private var restartRequired = false
+    @State private var preview: BackupPreview?
+    @State private var includeHistory = true
+    @State private var includeCourier = false
 
     var body: some View {
         NavigationStack {
@@ -107,8 +148,29 @@ struct BackupRestoreView: View {
                 }
                 Section("Unlock backup") {
                     SecureField("Passphrase", text: $passphrase)
-                    Button(restoring ? "Restoring…" : "Restore account") { restore() }
+                        .onChange(of: passphrase) { _ in preview = nil }
+                    if preview == nil {
+                        Button(restoring ? "Reviewing…" : "Review backup") { review() }
+                            .disabled(file.isEmpty || passphrase.isEmpty || restoring)
+                    }
+                }
+                if let preview {
+                    Section("Restore preview") {
+                        Text("\(preview.inventory.contactCount) contacts · \(preview.inventory.groupCount) groups")
+                        Toggle("Restore my message history", isOn: $includeHistory)
+                        Text("\(preview.inventory.messageCount) messages · \(formatBackupBytes(preview.inventory.messageBytes))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Toggle("Restore pending deliveries for others", isOn: $includeCourier)
+                        Text("\(preview.inventory.pendingCourierDeliveryCount) encrypted messages · \(formatBackupBytes(preview.inventory.pendingCourierDeliveryBytes))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("Identity, contacts, groups, privacy settings, and message-number continuity will always be restored.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button(restoring ? "Restoring…" : "Restore account") { restore() }
                         .disabled(file.isEmpty || passphrase.isEmpty || restoring)
+                    }
                 }
                 if let error { Section { Text(error).foregroundStyle(.red) } }
             }
@@ -128,6 +190,7 @@ struct BackupRestoreView: View {
                     defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                     file = try BackupService.readBackupFile(at: url)
                     fileName = url.lastPathComponent
+                    preview = nil
                     error = nil
                 } catch {
                     self.error = backupFailureText(error, fallback: .couldNotReadFile).text
@@ -144,15 +207,40 @@ struct BackupRestoreView: View {
         }
     }
 
-    private func restore() {
+    private func review() {
         restoring = true
         error = nil
         let selected = file
         let secret = passphrase
         Task {
             do {
+                preview = try await Task.detached {
+                    try BackupService.previewBackup(file: selected, passphrase: secret)
+                }.value
+            } catch {
+                self.error = backupFailureText(error, fallback: .couldNotRestore).text
+            }
+            restoring = false
+        }
+    }
+
+    private func restore() {
+        restoring = true
+        error = nil
+        let selected = file
+        let secret = passphrase
+        let options = BackupContentOptions(
+            includeMessageHistory: includeHistory,
+            includePendingDeliveriesForOthers: includeCourier
+        )
+        Task {
+            do {
                 try await Task.detached {
-                    try BackupService.stageRestore(file: selected, passphrase: secret)
+                    try BackupService.stageRestore(
+                        file: selected,
+                        passphrase: secret,
+                        options: options
+                    )
                 }.value
                 restartRequired = true
             } catch {
@@ -161,4 +249,8 @@ struct BackupRestoreView: View {
             restoring = false
         }
     }
+}
+
+private func formatBackupBytes(_ bytes: UInt64) -> String {
+    ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
 }

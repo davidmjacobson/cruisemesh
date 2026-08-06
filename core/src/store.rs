@@ -569,6 +569,57 @@ pub struct RelayQueueDepth {
     pub queued: u64,
 }
 
+/// User-visible choices for the content portion of an encrypted account
+/// backup. Identity, contacts, groups, cryptographic continuity and authored
+/// Lamport high-water marks are always included by the platform payload/store
+/// snapshot and cannot be disabled.
+#[derive(uniffi::Record, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackupContentOptions {
+    /// Visible conversations plus their receipt and pending-send state.
+    pub include_message_history: bool,
+    /// Encrypted courier cargo held temporarily for other people. This is
+    /// deliberately off by default: it can be large and a restored copy has
+    /// weaker delivery-progress evidence than the live carrier did.
+    pub include_pending_deliveries_for_others: bool,
+}
+
+impl Default for BackupContentOptions {
+    fn default() -> Self {
+        Self {
+            include_message_history: true,
+            include_pending_deliveries_for_others: false,
+        }
+    }
+}
+
+/// Redacted inventory shown before exporting or installing a backup. Byte
+/// counts cover encrypted/message payload bytes rather than SQLite overhead,
+/// so they are useful, stable estimates rather than promises about final file
+/// size after encryption.
+#[derive(uniffi::Record, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BackupInventory {
+    pub contact_count: u64,
+    pub group_count: u64,
+    pub message_count: u64,
+    pub message_bytes: u64,
+    pub pending_own_delivery_count: u64,
+    pub pending_own_delivery_bytes: u64,
+    pub pending_courier_delivery_count: u64,
+    pub pending_courier_delivery_bytes: u64,
+}
+
+/// What the core removed while preparing a snapshot or making a legacy
+/// full-database restore safe. Counts are intentionally content-free so the
+/// report is safe to log and include in diagnostics.
+#[derive(uniffi::Record, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BackupSanitizationReport {
+    pub removed_message_count: u64,
+    pub removed_pending_own_delivery_count: u64,
+    pub removed_courier_delivery_count: u64,
+    pub removed_expired_delivery_count: u64,
+    pub removed_connection_event_count: u64,
+}
+
 /// One persisted outgoing receipt envelope for relay upload and retry.
 /// Unlike [`OutboundEnvelope`], this queue is keyed by the cumulative receipt
 /// watermark rather than the chat lamport stream, so `through_lamport` is the
@@ -989,6 +1040,33 @@ impl MessageStore {
     /// preserving it trades at most bounded delivery delay for avoiding an
     /// unbounded restore-time replay.
     pub fn backup_to(&self, destination: String) -> Result<(), CoreError> {
+        self.backup_to_with_options(
+            destination,
+            BackupContentOptions::default(),
+            current_unix_time_ms()?,
+        )?;
+        Ok(())
+    }
+
+    /// Return the redacted content inventory used by both mobile backup UIs.
+    /// Expired queue rows are excluded because snapshot sanitation removes
+    /// them regardless of which options the user selects.
+    pub fn backup_inventory(&self, now_ms: i64) -> Result<BackupInventory, CoreError> {
+        validate_backup_now(now_ms)?;
+        backup_inventory_from_conn(&lock_conn(&self.conn), now_ms)
+    }
+
+    /// Write a transactionally consistent snapshot and apply the Rust-owned
+    /// content policy to the copy. This is the canonical export path; mobile
+    /// shells only choose a destination and collect preferences that live
+    /// outside SQLite.
+    pub fn backup_to_with_options(
+        &self,
+        destination: String,
+        options: BackupContentOptions,
+        now_ms: i64,
+    ) -> Result<BackupSanitizationReport, CoreError> {
+        validate_backup_now(now_ms)?;
         let destination = std::path::Path::new(destination.trim());
         if !destination.is_absolute() {
             return Err(CoreError::Store(
@@ -1016,8 +1094,8 @@ impl MessageStore {
         // repeats this operation so legacy full-database `.cmbak` files made
         // before this policy are safe too.
         let mut snapshot = Connection::open(destination).map_err(store_err)?;
-        sanitize_restore_ephemera(&mut snapshot)?;
-        Ok(())
+        let report = sanitize_restore_contents(&mut snapshot, options, now_ms)?;
+        Ok(report)
     }
 
     /// Insert a message from a remote sender's stream, merging metadata from a
@@ -1070,27 +1148,228 @@ impl MessageStore {
 /// schemas receive the normal forward migrations before the cleanup runs.
 ///
 /// Returns the number of carried envelopes discarded. User-owned history,
-/// contacts, authored Lamport watermarks, outbound authored work, receipts and
-/// the relay frontier are deliberately preserved.
+/// contacts, authored Lamport watermarks, unexpired outbound authored work,
+/// receipts and the relay frontier are deliberately preserved. New callers should use
+/// [`sanitize_restored_message_store_with_options`] to make the choice
+/// explicit and receive the full redacted report.
 #[uniffi::export]
 pub fn sanitize_restored_message_store(path: String) -> Result<u64, CoreError> {
-    let store = MessageStore::open(path)?;
-    let mut conn = lock_conn(&store.conn);
-    sanitize_restore_ephemera(&mut conn)
+    let report = sanitize_restored_message_store_with_options(
+        path,
+        BackupContentOptions::default(),
+        current_unix_time_ms()?,
+    )?;
+    Ok(report.removed_courier_delivery_count)
 }
 
-fn sanitize_restore_ephemera(conn: &mut Connection) -> Result<u64, CoreError> {
+/// Inspect an untrusted/decrypted backup database after applying the ordinary
+/// forward schema migrations. The caller must use a private temporary copy:
+/// opening a legacy SQLite file can create journal siblings and migrate it.
+#[uniffi::export]
+pub fn inspect_restored_message_store(
+    path: String,
+    now_ms: i64,
+) -> Result<BackupInventory, CoreError> {
+    validate_backup_now(now_ms)?;
+    let store = MessageStore::open(path)?;
+    store.backup_inventory(now_ms)
+}
+
+/// Apply the same Rust-owned classification policy to legacy and current
+/// backups immediately before installation. This second pass is deliberate:
+/// it protects old `.cmbak` files created before selectable/sanitized exports
+/// existed and prevents a modified platform shell from bypassing the policy.
+#[uniffi::export]
+pub fn sanitize_restored_message_store_with_options(
+    path: String,
+    options: BackupContentOptions,
+    now_ms: i64,
+) -> Result<BackupSanitizationReport, CoreError> {
+    validate_backup_now(now_ms)?;
+    let store = MessageStore::open(path)?;
+    let mut conn = lock_conn(&store.conn);
+    sanitize_restore_contents(&mut conn, options, now_ms)
+}
+
+fn backup_inventory_from_conn(
+    conn: &Connection,
+    now_ms: i64,
+) -> Result<BackupInventory, CoreError> {
+    let contact_count = conn
+        .query_row("SELECT COUNT(*) FROM contacts", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(store_err)?;
+    let group_count = conn
+        .query_row("SELECT COUNT(*) FROM groups", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(store_err)?;
+    let (message_count, message_bytes) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(payload)), 0) FROM messages",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(store_err)?;
+    let (pending_own_delivery_count, pending_own_delivery_bytes) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM (
+                 SELECT LENGTH(sealed) AS bytes FROM outbound_envelopes WHERE expiry > ?1
+                 UNION ALL
+                 SELECT LENGTH(sealed) AS bytes FROM outgoing_receipt_envelopes WHERE expiry > ?1
+             )",
+            params![now_ms],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(store_err)?;
+    let (pending_courier_delivery_count, pending_courier_delivery_bytes) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)
+             FROM carried_envelopes WHERE expiry > ?1",
+            params![now_ms],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(store_err)?;
+    let to_u64 = |label: &str, value: i64| {
+        u64::try_from(value)
+            .map_err(|_| CoreError::Store(format!("negative {label} while inventorying backup")))
+    };
+    Ok(BackupInventory {
+        contact_count: to_u64("contact count", contact_count)?,
+        group_count: to_u64("group count", group_count)?,
+        message_count: to_u64("message count", message_count)?,
+        message_bytes: to_u64("message bytes", message_bytes)?,
+        pending_own_delivery_count: to_u64(
+            "pending own-delivery count",
+            pending_own_delivery_count,
+        )?,
+        pending_own_delivery_bytes: to_u64(
+            "pending own-delivery bytes",
+            pending_own_delivery_bytes,
+        )?,
+        pending_courier_delivery_count: to_u64(
+            "pending courier-delivery count",
+            pending_courier_delivery_count,
+        )?,
+        pending_courier_delivery_bytes: to_u64(
+            "pending courier-delivery bytes",
+            pending_courier_delivery_bytes,
+        )?,
+    })
+}
+
+fn sanitize_restore_contents(
+    conn: &mut Connection,
+    options: BackupContentOptions,
+    now_ms: i64,
+) -> Result<BackupSanitizationReport, CoreError> {
     let tx = conn.transaction().map_err(store_err)?;
-    let discarded = tx
-        .execute("DELETE FROM carried_envelopes", [])
-        .map_err(store_err)?;
+
+    // Connection history and reachability streaks describe the phone and
+    // network that created the backup, not the restored device. They must not
+    // make the new installation claim a stale peer is online or unreachable.
+    let removed_connection_event_count = (tx
+        .execute("DELETE FROM peer_connection_events", [])
+        .map_err(store_err)?
+        + tx.execute("DELETE FROM peer_connection_summary", [])
+            .map_err(store_err)?) as u64;
+    let mut report = BackupSanitizationReport {
+        removed_connection_event_count,
+        ..BackupSanitizationReport::default()
+    };
+    tx.execute(
+        "UPDATE contacts SET
+             relay_reject_streak = 0,
+             relay_rejected_at = 0,
+             relay_unreachable_endpoint_key = NULL,
+             relay_unreachable_streak = 0,
+             relay_unreachable_at = 0",
+        [],
+    )
+    .map_err(store_err)?;
+
+    if options.include_message_history {
+        report.removed_expired_delivery_count += tx
+            .execute(
+                "DELETE FROM outbound_envelopes WHERE expiry <= ?1",
+                params![now_ms],
+            )
+            .map_err(store_err)? as u64;
+        report.removed_expired_delivery_count += tx
+            .execute(
+                "DELETE FROM outgoing_receipt_envelopes WHERE expiry <= ?1",
+                params![now_ms],
+            )
+            .map_err(store_err)? as u64;
+        report.removed_expired_delivery_count += tx
+            .execute(
+                "DELETE FROM consumed_hidden_msg_ids WHERE expiry_ms <= ?1",
+                params![now_ms],
+            )
+            .map_err(store_err)? as u64;
+    } else {
+        report.removed_message_count =
+            tx.execute("DELETE FROM messages", []).map_err(store_err)? as u64;
+        report.removed_pending_own_delivery_count = (tx
+            .execute("DELETE FROM outbound_envelopes", [])
+            .map_err(store_err)?
+            + tx.execute("DELETE FROM outgoing_receipt_envelopes", [])
+                .map_err(store_err)?) as u64;
+        for table in [
+            "receipts",
+            "outgoing_receipts",
+            "delivery_metrics",
+            "consumed_hidden_msg_ids",
+            "consumed_hidden_lamports",
+        ] {
+            tx.execute(&format!("DELETE FROM {table}"), [])
+                .map_err(store_err)?;
+        }
+        // authored_lamport_watermarks intentionally survives: it contains no
+        // content and prevents a restored identity from reusing old stream
+        // positions after the user chooses not to restore conversations.
+    }
+
+    if options.include_pending_deliveries_for_others {
+        report.removed_expired_delivery_count += tx
+            .execute(
+                "DELETE FROM carried_envelopes WHERE expiry <= ?1",
+                params![now_ms],
+            )
+            .map_err(store_err)? as u64;
+    } else {
+        report.removed_courier_delivery_count = tx
+            .execute("DELETE FROM carried_envelopes", [])
+            .map_err(store_err)? as u64;
+    }
+
     tx.commit().map_err(store_err)?;
-    // BackupService reads the sanitized main database file immediately after
-    // this function returns. Force any WAL pages into that file rather than
-    // relying on a best-effort checkpoint when SQLite closes the connection.
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+    // DELETE alone leaves content in SQLite freelist pages. Compact the
+    // private snapshot so an excluded conversation/courier ciphertext is not
+    // merely unreachable through SQL but still recoverable from the `.cmbak`
+    // plaintext after decryption. Then force all WAL pages into the main file,
+    // which is the only file the platform seals or stages.
+    conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE)")
         .map_err(store_err)?;
-    Ok(discarded as u64)
+    Ok(report)
+}
+
+fn validate_backup_now(now_ms: i64) -> Result<(), CoreError> {
+    if now_ms < 0 {
+        return Err(CoreError::Malformed(
+            "backup inventory time cannot be negative".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn current_unix_time_ms() -> Result<i64, CoreError> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| CoreError::Store(format!("system clock precedes Unix epoch: {error}")))?;
+    i64::try_from(duration.as_millis())
+        .map_err(|_| CoreError::Store("system clock does not fit backup timestamp".into()))
 }
 
 /// Internal-only helpers, never exported over UniFFI: not wrapped in
@@ -9627,7 +9906,204 @@ mod tests {
     }
 
     #[test]
-    fn legacy_full_database_restore_discards_large_carry_backlog_only() {
+    fn selectable_backup_keeps_continuity_without_history_and_prunes_opted_in_cargo() {
+        let dir = std::env::temp_dir().join(format!(
+            "cruisemesh-selectable-backup-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snapshot.sqlite");
+        let now_ms = 1_700_000_000_500;
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut alice = contact(b"alice-id", "Alice");
+        alice.relay_url = Some("https://relay.example".into());
+        store.upsert_contact(alice).unwrap();
+        let authored = msg(b"alice-id", b"me", 777, "private history");
+        let outbound = outbound_for(&authored, b"alice-id", b"msg-000000000777");
+        store
+            .insert_outgoing_message(authored, outbound, now_ms - 100)
+            .unwrap();
+        store
+            .record_peer_connection_event(
+                b"alice-id".to_vec(),
+                PeerConnectionTransport::Bluetooth,
+                PeerConnectionEventKind::Connected,
+                now_ms - 50,
+            )
+            .unwrap();
+        {
+            let conn = lock_conn(&store.conn);
+            conn.execute(
+                "INSERT INTO authored_lamport_watermarks
+                    (chat_id, sender_user_id, high_lamport) VALUES (?1, ?2, 777)",
+                params![b"alice-id".as_slice(), b"me".as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE contacts SET relay_reject_streak = 4, relay_rejected_at = ?1,
+                     relay_unreachable_endpoint_key = 'stale', relay_unreachable_streak = 3,
+                     relay_unreachable_at = ?1 WHERE user_id = ?2",
+                params![now_ms - 1, b"alice-id".as_slice()],
+            )
+            .unwrap();
+            for (id, expiry, bytes) in [
+                (b"active-courier-1".as_slice(), now_ms + 10_000, 111_i64),
+                (b"expired-courier".as_slice(), now_ms, 222_i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO carried_envelopes
+                        (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
+                         received_at, size_bytes, from_relay, content_digest)
+                     VALUES (?1, 7, ?2, X'01', zeroblob(?3), 1, ?4, ?3, 0, ?1)",
+                    params![id, expiry, bytes, now_ms - 200],
+                )
+                .unwrap();
+            }
+        }
+
+        assert_eq!(
+            store.backup_inventory(now_ms).unwrap(),
+            BackupInventory {
+                contact_count: 1,
+                message_count: 1,
+                message_bytes: "private history".len() as u64,
+                pending_own_delivery_count: 1,
+                pending_own_delivery_bytes: "sealed-777".len() as u64,
+                pending_courier_delivery_count: 1,
+                pending_courier_delivery_bytes: 111,
+                ..BackupInventory::default()
+            }
+        );
+
+        let report = store
+            .backup_to_with_options(
+                path.to_string_lossy().to_string(),
+                BackupContentOptions {
+                    include_message_history: false,
+                    include_pending_deliveries_for_others: true,
+                },
+                now_ms,
+            )
+            .unwrap();
+        assert_eq!(report.removed_message_count, 1);
+        assert_eq!(report.removed_pending_own_delivery_count, 1);
+        assert_eq!(report.removed_courier_delivery_count, 0);
+        assert_eq!(report.removed_expired_delivery_count, 1);
+        assert_eq!(report.removed_connection_event_count, 2);
+
+        let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
+        assert!(restored
+            .messages_for_chat(b"alice-id".to_vec())
+            .unwrap()
+            .is_empty());
+        assert!(restored
+            .outbound_envelopes_after(b"alice-id".to_vec(), b"me".to_vec(), 0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(restored.carried_len().unwrap(), 1);
+        assert_eq!(restored.list_contacts().unwrap().len(), 1);
+        let conn = lock_conn(&restored.conn);
+        let authored_high: i64 = conn
+            .query_row(
+                "SELECT high_lamport FROM authored_lamport_watermarks
+                 WHERE chat_id = ?1 AND sender_user_id = ?2",
+                params![b"alice-id".as_slice(), b"me".as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authored_high, 777);
+        let transient: (i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT relay_reject_streak, relay_unreachable_streak,
+                        relay_unreachable_endpoint_key
+                 FROM contacts WHERE user_id = ?1",
+                params![b"alice-id".as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(transient, (0, 0, None));
+        drop(conn);
+        drop(restored);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_content_options_cover_all_four_combinations() {
+        let dir = std::env::temp_dir().join(format!(
+            "cruisemesh-backup-options-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let now_ms = 1_700_000_000_500;
+
+        for (index, include_history, include_courier) in [
+            (0, false, false),
+            (1, false, true),
+            (2, true, false),
+            (3, true, true),
+        ] {
+            let path = dir.join(format!("snapshot-{index}.sqlite"));
+            let store = MessageStore::open(":memory:".to_string()).unwrap();
+            let history = msg(b"alice-id", b"me", 8, "history");
+            store.insert_message(history).unwrap();
+            {
+                let conn = lock_conn(&store.conn);
+                conn.execute(
+                    "INSERT INTO authored_lamport_watermarks
+                        (chat_id, sender_user_id, high_lamport) VALUES (?1, ?2, 8)",
+                    params![b"alice-id".as_slice(), b"me".as_slice()],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO carried_envelopes
+                        (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
+                         received_at, size_bytes, from_relay, content_digest)
+                     VALUES (X'01020304', 7, ?1, X'01', X'02', 1, ?2, 1, 0, X'03')",
+                    params![now_ms + 10_000, now_ms - 1],
+                )
+                .unwrap();
+            }
+
+            store
+                .backup_to_with_options(
+                    path.to_string_lossy().to_string(),
+                    BackupContentOptions {
+                        include_message_history: include_history,
+                        include_pending_deliveries_for_others: include_courier,
+                    },
+                    now_ms,
+                )
+                .unwrap();
+            let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
+            assert_eq!(
+                !restored
+                    .messages_for_chat(b"alice-id".to_vec())
+                    .unwrap()
+                    .is_empty(),
+                include_history
+            );
+            assert_eq!(restored.carried_len().unwrap() == 1, include_courier);
+            let authored_high: i64 = lock_conn(&restored.conn)
+                .query_row(
+                    "SELECT high_lamport FROM authored_lamport_watermarks
+                     WHERE chat_id = ?1 AND sender_user_id = ?2",
+                    params![b"alice-id".as_slice(), b"me".as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(authored_high, 8);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_full_database_restore_discards_cargo_and_expired_runtime_rows() {
         let dir = std::env::temp_dir().join(format!(
             "cruisemesh-legacy-restore-{}",
             SystemTime::now()
@@ -9718,12 +10194,10 @@ mod tests {
             restored.messages_for_chat(b"alice-id".to_vec()).unwrap(),
             vec![authored]
         );
-        assert_eq!(
-            restored
-                .outbound_envelopes_after(b"alice-id".to_vec(), b"me".to_vec(), 0)
-                .unwrap(),
-            vec![outbound]
-        );
+        assert!(restored
+            .outbound_envelopes_after(b"alice-id".to_vec(), b"me".to_vec(), 0)
+            .unwrap()
+            .is_empty());
         assert_eq!(
             restored
                 .receipt_through(b"alice-id".to_vec(), b"me".to_vec(), RECEIPT_TYPE_DELIVERED,)

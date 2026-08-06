@@ -14,7 +14,8 @@ final class BackupCompatibilityTests: XCTestCase {
             ownAvatarEpoch: 3,
             relayUrl: "https://relay.example",
             relayToken: "secret",
-            shareOnline: false
+            shareOnline: false,
+            friendsOfFriendsEnabled: false
         )
         // Must be within the core's accepted PBKDF2 range (100_000..=1_200_000,
         // the T4-07 KDF-bomb guard); the minimum keeps the test fast. Mirrors

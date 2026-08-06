@@ -12,6 +12,7 @@ data class BackupPayload(
     val relayUrl: String? = null,
     val relayToken: String? = null,
     val shareOnline: Boolean = true,
+    val friendsOfFriendsEnabled: Boolean = true,
 ) {
     override fun equals(other: Any?): Boolean =
         other is BackupPayload &&
@@ -24,7 +25,8 @@ data class BackupPayload(
             ownAvatarEpoch == other.ownAvatarEpoch &&
             relayUrl == other.relayUrl &&
             relayToken == other.relayToken &&
-            shareOnline == other.shareOnline
+            shareOnline == other.shareOnline &&
+            friendsOfFriendsEnabled == other.friendsOfFriendsEnabled
 
     override fun hashCode(): Int {
         var result = identity.contentHashCode()
@@ -37,6 +39,7 @@ data class BackupPayload(
         result = 31 * result + (relayUrl?.hashCode() ?: 0)
         result = 31 * result + (relayToken?.hashCode() ?: 0)
         result = 31 * result + shareOnline.hashCode()
+        result = 31 * result + friendsOfFriendsEnabled.hashCode()
         return result
     }
 }

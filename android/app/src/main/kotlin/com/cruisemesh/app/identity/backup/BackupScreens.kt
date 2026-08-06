@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -17,6 +18,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -27,6 +29,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -44,6 +47,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
+import uniffi.cruisemesh_core.BackupContentOptions
+import uniffi.cruisemesh_core.BackupInventory
 
 /** UI state shared by both flows: nothing running, working, done, or a typed error message. */
 private sealed interface BackupUiState {
@@ -79,6 +84,13 @@ fun BackupExportScreen(onBack: () -> Unit) {
     var passphrase by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf("") }
     var state by remember { mutableStateOf<BackupUiState>(BackupUiState.Idle) }
+    var inventory by remember { mutableStateOf<BackupInventory?>(null) }
+    var includeHistory by remember { mutableStateOf(true) }
+    var includeCourier by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        inventory = withContext(Dispatchers.IO) { BackupService.inventory(context) }
+    }
 
     val strength = remember(passphrase) { BackupPassphrase.strength(passphrase.toCharArray()) }
     val acceptable = passphrase.length >= BackupPassphrase.MIN_LENGTH
@@ -93,7 +105,11 @@ fun BackupExportScreen(onBack: () -> Unit) {
         scope.launch {
             state = try {
                 val bytes = withContext(Dispatchers.IO) {
-                    BackupService.buildBackup(context, passphrase.toCharArray())
+                    BackupService.buildBackup(
+                        context,
+                        passphrase.toCharArray(),
+                        BackupContentOptions(includeHistory, includeCourier),
+                    )
                 }
                 withContext(Dispatchers.IO) { BackupService.writeBytes(context, uri, bytes) }
                 BackupUiState.Done
@@ -129,6 +145,34 @@ fun BackupExportScreen(onBack: () -> Unit) {
                     "if you forget the passphrase, the backup can't be recovered. " +
                     "Store both carefully.",
             )
+            Spacer(Modifier.height(16.dp))
+
+            BackupChoice(
+                checked = includeHistory,
+                onCheckedChange = { includeHistory = it },
+                title = "Include my message history",
+                detail = inventory?.let {
+                    "${it.messageCount} messages · ${formatBackupBytes(it.messageBytes)}; " +
+                        "${it.pendingOwnDeliveryCount} pending deliveries from me"
+                } ?: "Counting messages…",
+            )
+            BackupChoice(
+                checked = includeCourier,
+                onCheckedChange = { includeCourier = it },
+                title = "Include pending deliveries for others",
+                detail = inventory?.let {
+                    "${it.pendingCourierDeliveryCount} encrypted messages · " +
+                        formatBackupBytes(it.pendingCourierDeliveryBytes) +
+                        ". They are unreadable on this phone."
+                } ?: "Counting encrypted courier messages…",
+            )
+            Text(
+                "Your identity, contacts, groups, privacy settings, and message-number continuity " +
+                    "are always included.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
             Spacer(Modifier.height(16.dp))
 
             PassphraseField(
@@ -185,12 +229,18 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
     var pickedBytes by remember { mutableStateOf<ByteArray?>(null) }
     var passphrase by remember { mutableStateOf("") }
     var state by remember { mutableStateOf<BackupUiState>(BackupUiState.Idle) }
+    var preview by remember { mutableStateOf<BackupPreview?>(null) }
+    var includeHistory by remember { mutableStateOf(true) }
+    var includeCourier by remember { mutableStateOf(false) }
 
     val openDocument = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         state = BackupUiState.Idle
+        preview = null
+        pickedBytes = null
+        pickedName = null
         scope.launch {
             try {
                 pickedBytes = withContext(Dispatchers.IO) { BackupService.readBytes(context, uri) }
@@ -201,7 +251,8 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
         }
     }
 
-    val canRestore = pickedBytes != null && passphrase.isNotEmpty() && state != BackupUiState.Working
+    val canReview = pickedBytes != null && passphrase.isNotEmpty() && state != BackupUiState.Working
+    val canRestore = preview != null && state != BackupUiState.Working
 
     fun restart() {
         val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
@@ -259,11 +310,69 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(16.dp))
             PassphraseField(
                 value = passphrase,
-                onValueChange = { passphrase = it },
+                onValueChange = {
+                    passphrase = it
+                    preview = null
+                },
                 label = "Backup passphrase",
             )
 
             Spacer(Modifier.height(24.dp))
+            if (preview == null) {
+                Button(
+                    onClick = {
+                        val bytes = pickedBytes ?: return@Button
+                        state = BackupUiState.Working
+                        scope.launch {
+                            state = try {
+                                preview = withContext(Dispatchers.IO) {
+                                    BackupService.previewBackup(context, bytes, passphrase.toCharArray())
+                                }
+                                BackupUiState.Idle
+                            } catch (e: Exception) {
+                                BackupUiState.Error(
+                                    backupFailureText(e, R.string.ui_couldn_t_restore_that_backup),
+                                )
+                            }
+                        }
+                    },
+                    enabled = canReview,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Review backup")
+                }
+            }
+
+            preview?.let { reviewed ->
+                Text(
+                    "Backup contains ${reviewed.inventory.contactCount} contacts and " +
+                        "${reviewed.inventory.groupCount} groups.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                )
+                BackupChoice(
+                    checked = includeHistory,
+                    onCheckedChange = { includeHistory = it },
+                    title = "Restore my message history",
+                    detail = "${reviewed.inventory.messageCount} messages · " +
+                        formatBackupBytes(reviewed.inventory.messageBytes),
+                )
+                BackupChoice(
+                    checked = includeCourier,
+                    onCheckedChange = { includeCourier = it },
+                    title = "Restore pending deliveries for others",
+                    detail = "${reviewed.inventory.pendingCourierDeliveryCount} encrypted messages · " +
+                        formatBackupBytes(reviewed.inventory.pendingCourierDeliveryBytes),
+                )
+                Text(
+                    "Identity, contacts, groups, privacy settings, and message-number continuity " +
+                        "will always be restored.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(16.dp))
+            }
+
             Button(
                 onClick = {
                     val bytes = pickedBytes ?: return@Button
@@ -271,7 +380,12 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                     scope.launch {
                         try {
                             withContext(Dispatchers.IO) {
-                                BackupService.restoreBackup(context, bytes, passphrase.toCharArray())
+                                BackupService.restoreBackup(
+                                    context,
+                                    bytes,
+                                    passphrase.toCharArray(),
+                                    BackupContentOptions(includeHistory, includeCourier),
+                                )
                             }
                             state = BackupUiState.Done
                             restart()
@@ -328,6 +442,35 @@ private fun PassphraseStrengthText(strength: BackupPassphrase.Strength, empty: B
         BackupPassphrase.Strength.STRONG -> "Strong" to MaterialTheme.colorScheme.primary
     }
     Text(label, color = color, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+}
+
+@Composable
+private fun BackupChoice(
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    title: String,
+    detail: String,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = androidx.compose.ui.Alignment.Top,
+    ) {
+        Checkbox(checked = checked, onCheckedChange = onCheckedChange)
+        Column(modifier = Modifier.weight(1f).padding(top = 10.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+            Text(
+                detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+private fun formatBackupBytes(bytes: ULong): String = when {
+    bytes >= 1024uL * 1024uL -> "%.1f MB".format(bytes.toDouble() / (1024.0 * 1024.0))
+    bytes >= 1024uL -> "%.1f KB".format(bytes.toDouble() / 1024.0)
+    else -> "$bytes bytes"
 }
 
 @Composable

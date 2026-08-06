@@ -5,14 +5,37 @@ enum BackupService {
         AppStore.databaseURL.appendingPathExtension("restore")
     }
 
-    static func buildBackup(passphrase: String) throws -> Data {
+    static let defaultContentOptions = BackupContentOptions(
+        includeMessageHistory: true,
+        includePendingDeliveriesForOthers: false
+    )
+
+    static func inventory(nowMs: Int64 = currentTimeMs) throws -> BackupInventory {
+        try AppStore.get().backupInventory(nowMs: nowMs)
+    }
+
+    static func buildBackup(
+        passphrase: String,
+        options: BackupContentOptions = defaultContentOptions
+    ) throws -> Data {
         guard let identity = IdentityStore.load() else {
             throw BackupServiceError.noIdentity
         }
         let snapshot = FileManager.default.temporaryDirectory
             .appendingPathComponent("cruisemesh-\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: snapshot) }
-        try AppStore.get().backupTo(destination: snapshot.path)
+        let report = try AppStore.get().backupToWithOptions(
+            destination: snapshot.path,
+            options: options,
+            nowMs: currentTimeMs
+        )
+        NSLog(
+            "Prepared backup snapshot; removed messages=\(report.removedMessageCount) " +
+                "ownPending=\(report.removedPendingOwnDeliveryCount) " +
+                "courier=\(report.removedCourierDeliveryCount) " +
+                "expired=\(report.removedExpiredDeliveryCount) " +
+                "connectionEvents=\(report.removedConnectionEventCount)"
+        )
         let sqlite = try Data(contentsOf: snapshot)
         let relay = RelayConfigStore.load()
         let payload = CoreBackupPayload(
@@ -25,22 +48,36 @@ enum BackupService {
             ownAvatarEpoch: ProfileStore.loadOwnAvatarEpoch(),
             relayUrl: relay?.relayUrl,
             relayToken: relay?.relayToken,
-            shareOnline: RelayConfigStore.shareOnline()
+            shareOnline: RelayConfigStore.shareOnline(),
+            friendsOfFriendsEnabled: FriendsOfFriendsStore.isEnabled()
         )
         return try sealBackup(passphrase: passphrase, payload: payload, iterations: nil)
     }
 
-    static func stageRestore(file: Data, passphrase: String) throws {
-        let payload = try openBackup(passphrase: passphrase, file: file)
-        guard payload.srcVersionCode <= appVersionCode else {
-            throw BackupServiceError.newerBackup(payload.srcVersionCode)
+    static func previewBackup(file: Data, passphrase: String) throws -> BackupPreview {
+        let payload = try openAndValidatePayload(file: file, passphrase: passphrase)
+        let inventory = try withTemporaryDatabase(payload.sqlite) { staged in
+            try inspectRestoredMessageStore(path: staged.path, nowMs: currentTimeMs)
         }
+        return BackupPreview(
+            inventory: inventory,
+            createdAtMs: payload.createdAtMs,
+            sourceVersionCode: payload.srcVersionCode
+        )
+    }
+
+    static func stageRestore(
+        file: Data,
+        passphrase: String,
+        options: BackupContentOptions = defaultContentOptions
+    ) throws {
+        let payload = try openAndValidatePayload(file: file, passphrase: passphrase)
         let identity = try decodeIdentityBytes(bytes: payload.identity)
         try FileManager.default.createDirectory(
             at: pendingDatabaseURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try stageSanitizedDatabase(payload.sqlite)
+        try stageSanitizedDatabase(payload.sqlite, options: options)
         IdentityStore.save(identity)
         if let name = payload.displayName { ProfileStore.saveDisplayName(name) }
         ProfilePhotoStore.restoreBackupBytes(payload.ownAvatar)
@@ -51,19 +88,60 @@ enum BackupService {
             RelayConfigStore.save(relayUrl: "", relayToken: "")
         }
         RelayConfigStore.setShareOnline(payload.shareOnline)
+        _ = FriendsOfFriendsStore.setEnabled(payload.friendsOfFriendsEnabled)
         OnboardingStore.markCompleted()
     }
 
     /// Validate/migrate the payload and remove restored courier/relay runtime
     /// state before placing it at the special path startup knows how to install.
     /// A failed sanitization never leaves an unsafe pending restore behind.
-    private static func stageSanitizedDatabase(_ sqlite: Data) throws {
+    private static func stageSanitizedDatabase(
+        _ sqlite: Data,
+        options: BackupContentOptions
+    ) throws {
         guard !sqlite.isEmpty else {
             try sqlite.write(to: pendingDatabaseURL, options: .atomic)
             return
         }
         let manager = FileManager.default
-        let staged = pendingDatabaseURL.deletingLastPathComponent()
+        let staged = try withTemporaryDatabase(sqlite) { staged in
+            let report = try sanitizeRestoredMessageStoreWithOptions(
+                path: staged.path,
+                options: options,
+                nowMs: currentTimeMs
+            )
+            NSLog(
+                "Sanitized restored store; removed messages=\(report.removedMessageCount) " +
+                    "ownPending=\(report.removedPendingOwnDeliveryCount) " +
+                    "courier=\(report.removedCourierDeliveryCount) " +
+                    "expired=\(report.removedExpiredDeliveryCount) " +
+                    "connectionEvents=\(report.removedConnectionEventCount)"
+            )
+            return try Data(contentsOf: staged)
+        }
+        if manager.fileExists(atPath: pendingDatabaseURL.path) {
+            try manager.removeItem(at: pendingDatabaseURL)
+        }
+        try staged.write(to: pendingDatabaseURL, options: .atomic)
+    }
+
+    private static func openAndValidatePayload(
+        file: Data,
+        passphrase: String
+    ) throws -> CoreBackupPayload {
+        let payload = try openBackup(passphrase: passphrase, file: file)
+        guard payload.srcVersionCode <= appVersionCode else {
+            throw BackupServiceError.newerBackup(payload.srcVersionCode)
+        }
+        return payload
+    }
+
+    private static func withTemporaryDatabase<T>(
+        _ sqlite: Data,
+        operation: (URL) throws -> T
+    ) throws -> T {
+        let manager = FileManager.default
+        let staged = manager.temporaryDirectory
             .appendingPathComponent("cruisemesh-restore-\(UUID().uuidString).sqlite")
         defer {
             for suffix in ["", "-journal", "-wal", "-shm"] {
@@ -71,11 +149,7 @@ enum BackupService {
             }
         }
         try sqlite.write(to: staged, options: .atomic)
-        _ = try sanitizeRestoredMessageStore(path: staged.path)
-        if manager.fileExists(atPath: pendingDatabaseURL.path) {
-            try manager.removeItem(at: pendingDatabaseURL)
-        }
-        try manager.moveItem(at: staged, to: pendingDatabaseURL)
+        return try operation(staged)
     }
 
     /// Read a selected backup incrementally so a malicious file provider cannot
@@ -149,6 +223,16 @@ enum BackupService {
     private static var appVersionCode: Int32 {
         Int32(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0") ?? 0
     }
+
+    private static var currentTimeMs: Int64 {
+        Int64(Date().timeIntervalSince1970 * 1_000)
+    }
+}
+
+struct BackupPreview: Equatable {
+    let inventory: BackupInventory
+    let createdAtMs: Int64
+    let sourceVersionCode: Int32
 }
 
 enum BackupServiceError: LocalizedError, Equatable {
