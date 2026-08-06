@@ -34,7 +34,10 @@ struct InternalToolsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if case .tokenRejected = connectivity.relay {
-                    Text("The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.")
+                    let rejectionText = appModel.relaySetupIsOfficial
+                        ? String(localized: "Shore Pass rejected this family token. Messages will wait until the token is fixed — check it against another family phone.")
+                        : String(localized: "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.")
+                    Text(rejectionText)
                         .font(.caption)
                         .foregroundStyle(.red)
                 }

@@ -504,8 +504,11 @@ private struct MeshStatusSheet: View {
                     Toggle("Mesh running", isOn: meshOn)
                 }
                 Section("Reachability dots") {
+                    let legendService = InternetDeliveryService.of(RelayConfigStore.load())
+                    let legendLabel = legendService == .shorePass ? "Shore Pass" : "Relay"
+                    let legendDetail = legendService == .shorePass ? "Online through Shore Pass" : "Online through relay"
                     LegendRow(color: .green, label: "Nearby", detail: "Direct Bluetooth link")
-                    LegendRow(color: .blue, label: "Relay", detail: "Online through relay")
+                    LegendRow(color: .blue, label: legendLabel, detail: legendDetail)
                     LegendRow(color: .orange, label: "Recent", detail: "Seen recently")
                     LegendRow(color: .orange, hollow: true, label: "Carried", detail: "Nearby phones may carry messages")
                     LegendRow(color: .gray, label: "Offline", detail: "No recent route")

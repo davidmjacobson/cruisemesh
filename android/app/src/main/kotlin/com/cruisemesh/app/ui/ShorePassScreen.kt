@@ -617,9 +617,10 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
     }
 
     if (showRemoveConfirmation) {
+        val removeTitleRes = if (isOfficialRelay) R.string.ui_remove_shore_pass_setup_confirm else R.string.ui_remove_custom_relay_setup_confirm
         AlertDialog(
             onDismissRequest = { showRemoveConfirmation = false },
-            title = { Text(stringResource(R.string.ui_remove_shore_pass_setup_confirm)) },
+            title = { Text(stringResource(removeTitleRes)) },
             text = { Text(stringResource(R.string.ui_queued_internet_delivery_will_stop_until_another_cruise)) },
             confirmButton = {
                 TextButton(

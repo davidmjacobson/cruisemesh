@@ -1801,6 +1801,26 @@
         }
       }
     },
+    "Remove Shore Pass setup?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove Shore Pass setup?"
+          }
+        }
+      }
+    },
+    "Remove relay setup?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove relay setup?"
+          }
+        }
+      }
+    },
     "Remove photo": {
       "localizations": {
         "en": {
@@ -2201,12 +2221,12 @@
         }
       }
     },
-    "Shorten your name or relay settings to create a friend card.": {
+    "Shorten your name or internet delivery settings to create a friend card.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Shorten your name or relay settings to create a friend card."
+            "value": "Shorten your name or internet delivery settings to create a friend card."
           }
         }
       }
@@ -2427,6 +2447,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "The port is optional. An accepted friend and encrypted identity check are still required."
+          }
+        }
+      }
+    },
+    "Shore Pass rejected this family token. Messages will wait until the token is fixed — check it against another family phone.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass rejected this family token. Messages will wait until the token is fixed — check it against another family phone."
           }
         }
       }

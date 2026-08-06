@@ -184,6 +184,14 @@ fun MeshStatusLegendDialog(
     val carriedCount = remember {
         runCatching { AppStore.get(context).carriedLen().toLong() }.getOrDefault(0L)
     }
+    val internetDeliveryService = remember {
+        runCatching {
+            val config = com.cruisemesh.app.relay.RelayConfigStore.load(context)
+            InternetDeliveryService.of(config)
+        }.getOrNull()
+    }
+    val relayLegendLabel = if (internetDeliveryService == InternetDeliveryService.CRUISE_PASS) "Shore Pass" else "Relay"
+    val relayLegendDetail = if (internetDeliveryService == InternetDeliveryService.CRUISE_PASS) "Online through Shore Pass" else "Online through relay"
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.ui_mesh_status)) },
@@ -199,7 +207,7 @@ fun MeshStatusLegendDialog(
                 )
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     LegendRow(ReachabilityLevel.NEARBY, "Nearby", "Direct Bluetooth link")
-                    LegendRow(ReachabilityLevel.ONLINE_RELAY, "Relay", "Online through relay")
+                    LegendRow(ReachabilityLevel.ONLINE_RELAY, relayLegendLabel, relayLegendDetail)
                     LegendRow(ReachabilityLevel.RECENT, "Recent", "Seen recently")
                     LegendRow(ReachabilityLevel.MESH_CARRY, "Carried", "Nearby phones may carry messages")
                     LegendRow(ReachabilityLevel.OFFLINE, "Offline", "No recent route")
