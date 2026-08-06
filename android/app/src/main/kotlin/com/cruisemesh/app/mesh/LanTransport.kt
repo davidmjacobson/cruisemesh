@@ -312,26 +312,35 @@ internal class LanTransport(
         } else {
             effectiveScanPrefixLength(prefixLength)
         }
-        val candidates = subnetHosts(local, effectivePrefix).shuffled()
+        // G5: build the host list and enqueue probes off the calling thread
+        // (often main via UI / connectivity callbacks) so a /24 or larger
+        // sweep cannot ANR during candidate materialization.
         val generation = scanGeneration.incrementAndGet()
-        val sweep = RunningSweep(
-            outcomes = SweepOutcomes(generation, candidates.size),
-            breadth = breadth,
-            prefixLength = effectivePrefix,
-        )
-        runningSweep = sweep
-        Log.i(
-            TAG,
-            "Scanning ${candidates.size} subnet hosts (/${sweep.prefixLength}) " +
-                "for CruiseMesh peers",
-        )
-        LanTransportDiagnostics.scanStarted(candidates.size)
-        for (candidate in candidates) {
-            try {
-                scanExecutor.execute { scanHost(network, candidate, sweep) }
-            } catch (_: RuntimeException) {
-                recordScanOutcome(sweep, SweepProbeOutcome.OTHER)
+        try {
+            scanExecutor.execute {
+                val candidates = subnetHosts(local, effectivePrefix).shuffled()
+                val sweep = RunningSweep(
+                    outcomes = SweepOutcomes(generation, candidates.size),
+                    breadth = breadth,
+                    prefixLength = effectivePrefix,
+                )
+                runningSweep = sweep
+                Log.i(
+                    TAG,
+                    "Scanning ${candidates.size} subnet hosts (/${sweep.prefixLength}) " +
+                        "for CruiseMesh peers",
+                )
+                LanTransportDiagnostics.scanStarted(candidates.size)
+                for (candidate in candidates) {
+                    try {
+                        scanExecutor.execute { scanHost(network, candidate, sweep) }
+                    } catch (_: RuntimeException) {
+                        recordScanOutcome(sweep, SweepProbeOutcome.OTHER)
+                    }
+                }
             }
+        } catch (_: RuntimeException) {
+            return "Could not start the local subnet search"
         }
         return null
     }

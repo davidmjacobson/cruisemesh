@@ -112,6 +112,13 @@ object MeshRouter {
     fun recordCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Boolean, nowMs: Long) =
         state.recordCarriedProgress(address, next, exhausted, nowMs)
 
+    /** Targeted HELLO drain lane (envelopes for this peer) — G2. */
+    fun targetedCarriedLaneFor(address: String, nowMs: Long): CoreCarriedLane =
+        state.targetedCarriedLaneFor(address, nowMs)
+
+    fun recordTargetedCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Boolean, nowMs: Long) =
+        state.recordTargetedCarriedProgress(address, next, exhausted, nowMs)
+
     /** The userId [address] identified as, if known. */
     fun userIdFor(address: String): ByteArray? = state.userIdFor(address)
 

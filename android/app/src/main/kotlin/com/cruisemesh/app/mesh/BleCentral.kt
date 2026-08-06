@@ -15,6 +15,7 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
@@ -171,11 +172,12 @@ class BleCentral(
     // called outside the lock below) cannot deadlock against it.
     private val lock = Any()
 
-    // GATT callbacks arrive on a binder thread, but Handler.postDelayed's
-    // callback runs on whichever Looper the Handler was built with -- use
-    // the main looper so watchdog firing (and its map mutations) lands on
-    // the same thread as the rest of this class's Android-framework calls.
-    private val handler = Handler(Looper.getMainLooper())
+    // G5: do not run connectGatt / scan follow-up on the main looper. GATT
+    // callbacks arrive on a binder thread; post delayed work and connect
+    // initiation onto a dedicated worker so UI ANRs are not starved by radio
+    // setup during dense discovery.
+    private val workerThread = HandlerThread("BleCentral-worker").apply { start() }
+    private val handler = Handler(workerThread.looper)
 
     // Per-address pending "connect is taking too long" timer, keyed the same
     // way as [connections] so a watchdog can always be found and cancelled
@@ -257,11 +259,15 @@ class BleCentral(
                 return
             }
             if (!backoff.canAttempt(device.address, now)) return
-            Log.i(TAG, "Discovered peer ${device.address}, connecting ($diagnostics)")
-            val gatt = device.connectGatt(context, false, gattClientCallback)
-            synchronized(lock) {
-                connections[device.address] = gatt
-                scheduleConnectWatchdogLocked(device.address, gatt)
+            Log.d(TAG, "Discovered peer ${device.address}, connecting ($diagnostics)")
+            // G5: connectGatt off main / binder — post to worker looper.
+            handler.post {
+                if (synchronized(lock) { connections.containsKey(device.address) }) return@post
+                val gatt = device.connectGatt(context, false, gattClientCallback)
+                synchronized(lock) {
+                    connections[device.address] = gatt
+                    scheduleConnectWatchdogLocked(device.address, gatt)
+                }
             }
         }
 
@@ -537,7 +543,7 @@ class BleCentral(
             return
         }
         writeQueue.enqueue(deviceAddress, fragments)
-        Log.i(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
+        Log.d(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
         sendNextQueuedFragment(gatt)
     }
 

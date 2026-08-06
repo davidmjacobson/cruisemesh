@@ -231,7 +231,7 @@ class BlePeripheral(
             offset: Int,
             value: ByteArray,
         ) {
-            Log.i(TAG, "Write request from ${device.address} for ${characteristic.uuid} (${value.size} bytes)")
+            Log.d(TAG, "Write request from ${device.address} for ${characteristic.uuid} (${value.size} bytes)")
             if (characteristic.uuid == MeshConstants.INBOUND_CHARACTERISTIC_UUID) {
                 // Only the map access needs the lock; GATT write requests on
                 // one connection are request/response-serialized, so the
@@ -505,7 +505,7 @@ class BlePeripheral(
                 return
             }
             notifyQueues.getOrPut(deviceAddress) { ArrayDeque() }.add(ArrayDeque(fragments))
-            Log.i(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
+            Log.d(TAG, "sendFrame: queued ${fragments.size} fragment(s) for $deviceAddress (${frame.size} bytes)")
             sendNextQueuedFragment(device)
         }
     }

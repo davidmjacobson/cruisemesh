@@ -2666,10 +2666,18 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private func drainCarriedEnvelopesTo(address: String, peerUserId: Data) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         try? store.pruneExpiredCarried(nowMs: now)
+        // G2: budgeted page + resume cursor (DTN: offer only, never remove on send).
+        let lane = MeshRouter.targetedCarriedLaneFor(address: address, nowMs: now)
+        if lane.skip { return }
         let hints = (try? store.deliveryHintsForPeer(peerUserId: peerUserId, nowMs: now)) ?? []
-        let toDeliver = (try? store.carriedEnvelopesForHints(hints: hints, nowMs: now)) ?? []
+        guard let page = try? store.carriedEnvelopesForHintsPage(
+            hints: hints,
+            nowMs: now,
+            budgetBytes: MeshDefaults.carriedSprayBudgetBytes,
+            after: lane.after
+        ) else { return }
         var delivered = 0
-        for env in toDeliver {
+        for env in page.rows {
             let frame = encodeEnvelopeFrame(
                 msgId: env.msgId,
                 hopTtl: env.hopTtl,
@@ -2681,9 +2689,38 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 delivered += 1
             }
         }
+        MeshRouter.recordTargetedCarriedProgress(
+            address: address,
+            next: page.next,
+            exhausted: page.exhausted,
+            nowMs: now
+        )
         if delivered > 0 {
-            log.info("Attempted delivery of \(delivered) carried envelope(s) to \(address, privacy: .public) (removal awaits their digest confirmation)")
+            log.info("Attempted delivery of \(delivered)/\(page.rows.count) carried envelope(s) to \(address, privacy: .public) (budgeted HELLO drain; removal awaits their digest confirmation)")
         }
+    }
+
+    private static let carriedOfferEpochLock = NSLock()
+    private static var carriedOfferEpochStartMs: Int64 = 0
+    private static var carriedOffersThisEpoch: UInt32 = 0
+    private static let carriedOfferEpochMs: Int64 = 5_000
+
+    private static func activeCarriedOffersInEpoch(nowMs: Int64) -> UInt32 {
+        carriedOfferEpochLock.lock(); defer { carriedOfferEpochLock.unlock() }
+        if nowMs - carriedOfferEpochStartMs > carriedOfferEpochMs {
+            carriedOfferEpochStartMs = nowMs
+            carriedOffersThisEpoch = 0
+        }
+        return carriedOffersThisEpoch
+    }
+
+    private static func noteCarriedOfferInEpoch(nowMs: Int64) {
+        carriedOfferEpochLock.lock(); defer { carriedOfferEpochLock.unlock() }
+        if nowMs - carriedOfferEpochStartMs > carriedOfferEpochMs {
+            carriedOfferEpochStartMs = nowMs
+            carriedOffersThisEpoch = 0
+        }
+        carriedOffersThisEpoch += 1
     }
 
     private func sprayDigestPlanTo(
@@ -2711,13 +2748,16 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // rows; once the walk reaches the tail the lane parks until its
         // cooldown elapses. A zero budget is the lane's own off switch.
         let lane = MeshRouter.carriedLaneFor(address: address, nowMs: now)
+        // G3: cap concurrent foreign-carry offers across peers.
+        let active = Self.activeCarriedOffersInEpoch(nowMs: now)
+        let allowCarried = !lane.skip && mayStartCarriedOffer(activeOffers: active)
         guard let plan = try? store.coreDigestSprayPlan(
             ownUserId: identity.userId,
             peerUserId: peerUserId,
             peerHints: recentHintsFor(userId: peerUserId, nowMs: now),
             peerKnownMsgIds: peerKnownIds,
             nowMs: now,
-            carriedBudgetBytes: lane.skip ? 0 : MeshDefaults.carriedSprayBudgetBytes,
+            carriedBudgetBytes: allowCarried ? MeshDefaults.carriedSprayBudgetBytes : 0,
             ownOutboundBudgetBytes: MeshDefaults.ownOutboundSprayBudgetBytes,
             ownReceiptBudgetBytes: MeshDefaults.ownReceiptSprayBudgetBytes,
             receiptQueryLimit: MeshDefaults.relayStoreBatchLimit,
@@ -2739,13 +2779,16 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             _ = MeshRouter.sendToAddress(address: address, frame: frame)
         }
         MeshRouter.recordHiddenOffered(address: address, msgIds: plan.offeredHiddenMsgIds)
-        if !lane.skip {
+        if allowCarried {
             MeshRouter.recordCarriedProgress(
                 address: address,
                 next: plan.nextCarriedCursor,
                 exhausted: plan.carriedExhausted,
                 nowMs: now
             )
+            if !plan.carriedFrames.isEmpty {
+                Self.noteCarriedOfferInEpoch(nowMs: now)
+            }
         }
     }
 
