@@ -117,9 +117,11 @@ final class CruiseMeshUITests: XCTestCase {
         bob.tap()
 
         XCTAssertTrue(element("screen.chat").waitForExistence(timeout: 10))
-        let composer = app.textViews["chat.composer.text"].exists
+        let composer = app.textViews["chat.composer.text"].waitForExistence(timeout: 10)
             ? app.textViews["chat.composer.text"]
-            : element("chat.composer.text")
+            : (app.textFields["chat.composer.text"].waitForExistence(timeout: 5)
+                ? app.textFields["chat.composer.text"]
+                : element("chat.composer.text"))
         XCTAssertTrue(composer.waitForExistence(timeout: 10))
         composer.tap()
         composer.typeText("   ")
