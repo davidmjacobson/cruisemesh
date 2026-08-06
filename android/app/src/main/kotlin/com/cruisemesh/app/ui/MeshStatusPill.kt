@@ -186,12 +186,17 @@ fun MeshStatusLegendDialog(
     }
     val internetDeliveryService = remember {
         runCatching {
-            val config = com.cruisemesh.app.relay.RelayConfigStore.load(context)
-            InternetDeliveryService.of(config)
+            com.cruisemesh.app.relay.RelayConfigStore.load(context)?.let { config ->
+                if (uniffi.cruisemesh_core.relaySetupIsOfficial(config.relayUrl)) {
+                    InternetDeliveryService.SHORE_PASS
+                } else {
+                    InternetDeliveryService.CUSTOM_RELAY
+                }
+            }
         }.getOrNull()
     }
-    val relayLegendLabel = if (internetDeliveryService == InternetDeliveryService.CRUISE_PASS) "Shore Pass" else "Relay"
-    val relayLegendDetail = if (internetDeliveryService == InternetDeliveryService.CRUISE_PASS) "Online through Shore Pass" else "Online through relay"
+    val relayLegendLabel = if (internetDeliveryService == InternetDeliveryService.SHORE_PASS) "Shore Pass" else "Relay"
+    val relayLegendDetail = if (internetDeliveryService == InternetDeliveryService.SHORE_PASS) "Online through Shore Pass" else "Online through relay"
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.ui_mesh_status)) },

@@ -617,7 +617,8 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
     }
 
     if (showRemoveConfirmation) {
-        val removeTitleRes = if (isOfficialRelay) R.string.ui_remove_shore_pass_setup_confirm else R.string.ui_remove_custom_relay_setup_confirm
+        val isOfficial = configured?.let { relaySetupIsOfficial(it.relayUrl) } ?: false
+        val removeTitleRes = if (isOfficial) R.string.ui_remove_shore_pass_setup_confirm else R.string.ui_remove_custom_relay_setup_confirm
         AlertDialog(
             onDismissRequest = { showRemoveConfirmation = false },
             title = { Text(stringResource(removeTitleRes)) },
