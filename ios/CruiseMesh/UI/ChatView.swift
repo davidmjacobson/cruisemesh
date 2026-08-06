@@ -1,4 +1,3 @@
-import AVFoundation
 import Combine
 import PhotosUI
 import SwiftUI
@@ -1063,38 +1062,28 @@ struct ChatImageView: View {
 struct VoiceMemoPlayerView: View {
     let blob: Data
     let durationMs: Int32
-    @State private var player: AVAudioPlayer?
-    @State private var playing = false
+    @StateObject private var playback = VoiceMemoPlaybackController()
 
     var body: some View {
-        HStack {
-            Button {
-                if playing {
-                    player?.stop()
-                    playing = false
-                } else {
-                    do {
-                        let p = try AVAudioPlayer(data: blob)
-                        p.play()
-                        player = p
-                        playing = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + p.duration) {
-                            if player === p {
-                                player = nil
-                                playing = false
-                            }
-                        }
-                    } catch {
-                        playing = false
-                    }
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Button {
+                    playback.toggle(blob: blob)
+                } label: {
+                    Image(systemName: playback.isPlaying ? "stop.fill" : "play.fill")
                 }
-            } label: {
-                Image(systemName: playing ? "stop.fill" : "play.fill")
+                .accessibilityLabel(playback.isPlaying ? "Stop voice memo" : "Play voice memo")
+                let secs = max(1, Int((durationMs + 500) / 1000))
+                Text("Voice memo · \(secs / 60):\(String(format: "%02d", secs % 60))")
+                    .font(.subheadline)
             }
-            let secs = max(1, Int((durationMs + 500) / 1000))
-            Text("Voice memo · \(secs / 60):\(String(format: "%02d", secs % 60))")
-                .font(.subheadline)
+            if playback.playbackFailed {
+                Text("Could not play voice memo")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
+        .onDisappear { playback.stop() }
     }
 }
 
