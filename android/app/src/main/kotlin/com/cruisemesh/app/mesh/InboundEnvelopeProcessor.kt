@@ -108,29 +108,7 @@ private const val CARRIED_SPRAY_BUDGET_BYTES: Long = 256L * 1024
 /** G3: rolling window in which concurrent foreign-carry offers are capped. */
 private const val CARRIED_OFFER_EPOCH_MS: Long = 5_000L
 
-private val carriedOfferEpochLock = Any()
-@Volatile private var carriedOfferEpochStartMs: Long = 0L
-private val carriedOffersThisEpoch = java.util.concurrent.atomic.AtomicInteger(0)
-
-private fun activeCarriedOffersInEpoch(nowMs: Long): Int {
-    synchronized(carriedOfferEpochLock) {
-        if (nowMs - carriedOfferEpochStartMs > CARRIED_OFFER_EPOCH_MS) {
-            carriedOfferEpochStartMs = nowMs
-            carriedOffersThisEpoch.set(0)
-        }
-        return carriedOffersThisEpoch.get()
-    }
-}
-
-private fun noteCarriedOfferInEpoch(nowMs: Long) {
-    synchronized(carriedOfferEpochLock) {
-        if (nowMs - carriedOfferEpochStartMs > CARRIED_OFFER_EPOCH_MS) {
-            carriedOfferEpochStartMs = nowMs
-            carriedOffersThisEpoch.set(0)
-        }
-        carriedOffersThisEpoch.incrementAndGet()
-    }
-}
+private val carriedOfferGate = CarriedOfferEpochGate(CARRIED_OFFER_EPOCH_MS)
 
 /**
  * Decoded pairwise-stream metadata carried out of the delivery switch only
@@ -2173,6 +2151,7 @@ internal class InboundEnvelopeProcessor(
         identity: Identity,
     ) {
         val now = System.currentTimeMillis()
+        var carriedReservation: CarriedOfferEpochGate.Reservation? = null
         try {
             // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): confirm delivery
             // of anything this digest's advertised `msg_id`s prove the peer
@@ -2191,9 +2170,11 @@ internal class InboundEnvelopeProcessor(
             val lane = MeshRouter.carriedLaneFor(address, now)
             // G3: cap concurrent foreign-carry offers across peers in a short
             // epoch so a family desk cannot spray the whole store to N peers
-            // at once. Own mail/receipts still flow when carried is deferred.
-            val active = activeCarriedOffersInEpoch(now)
-            val allowCarried = !lane.skip && uniffi.cruisemesh_core.mayStartCarriedOffer(active.toUInt())
+            // at once. Reservation is atomic across Android's concurrent BLE,
+            // LAN, and relay receive paths. Own mail/receipts still flow when
+            // carried is deferred.
+            carriedReservation = if (lane.skip) null else carriedOfferGate.tryReserve(now)
+            val allowCarried = carriedReservation != null
             val plan = store.coreDigestSprayPlan(
                 ownUserId = identity.userId,
                 peerUserId = peerUserId,
@@ -2208,6 +2189,14 @@ internal class InboundEnvelopeProcessor(
                 hiddenAlreadyOffered = MeshRouter.hiddenOfferedFor(address),
                 carriedCursor = lane.after,
             )
+            if (carriedReservation != null) {
+                if (plan.carriedFrames.isEmpty()) {
+                    carriedOfferGate.release(carriedReservation)
+                } else {
+                    carriedOfferGate.commit(carriedReservation)
+                }
+                carriedReservation = null
+            }
             // Own lanes first, foreign carry last. On a slow link every frame
             // here lands in one FIFO, so whatever goes first delays everything
             // after it: live mail and receipts to real contacts must beat
@@ -2219,9 +2208,6 @@ internal class InboundEnvelopeProcessor(
             MeshRouter.recordHiddenOffered(address, plan.offeredHiddenMsgIds)
             if (allowCarried) {
                 MeshRouter.recordCarriedProgress(address, plan.nextCarriedCursor, plan.carriedExhausted, now)
-                if (plan.carriedFrames.isNotEmpty()) {
-                    noteCarriedOfferInEpoch(now)
-                }
             }
             val carriedNote = if (!allowCarried) ", carried deferred (cap/park)" else ""
             Log.i(
@@ -2231,6 +2217,8 @@ internal class InboundEnvelopeProcessor(
             )
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to build digest spray plan for $address: ${e.message}")
+        } finally {
+            carriedReservation?.let(carriedOfferGate::release)
         }
     }
 }

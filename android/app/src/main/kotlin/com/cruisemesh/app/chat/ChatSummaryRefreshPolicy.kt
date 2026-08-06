@@ -11,6 +11,9 @@ object ChatSummaryRefreshPolicy {
     /** Quiet window after the last change event before a refresh runs. */
     const val DEBOUNCE_MS: Long = 250L
 
+    /** Maximum time a continuous event storm may postpone a refresh. */
+    const val MAX_LATENCY_MS: Long = 1_000L
+
     /**
      * Whether a change at [eventAtMs] should schedule a new debounce timer
      * given [lastEventAtMs] (0 if none) and [nowMs]. Always true for the first

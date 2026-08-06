@@ -37,11 +37,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.cruisemesh.app.chat.ChatSummaryLoader
+import com.cruisemesh.app.chat.ChatSummaryRefreshCoordinator
 import com.cruisemesh.app.chat.ChatSummaryRefreshPolicy
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -845,36 +844,26 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
 
     var summaries by remember { mutableStateOf(emptyList<ChatSummary>()) }
     val summaryScope = rememberCoroutineScope()
-    // G1: never load summaries on main. Debounce ChatEvents so a mesh storm
-    // collapses to one off-main refresh after quiet, not N full reloads.
-    var summaryDebounceJob by remember { mutableStateOf<Job?>(null) }
-    var lastChatEventAtMs by remember { mutableStateOf(0L) }
+    // G1: never load summaries on main. The coordinator debounces bursts,
+    // guarantees a periodic refresh during a sustained storm, and never
+    // cancels an in-flight UniFFI/SQLite load (those calls are blocking and
+    // would keep consuming IO after coroutine cancellation anyway).
+    val summaryRefreshCoordinator = remember(summaryScope, context, store, identity) {
+        ChatSummaryRefreshCoordinator(
+            scope = summaryScope,
+            debounceMs = ChatSummaryRefreshPolicy.DEBOUNCE_MS,
+            maxLatencyMs = ChatSummaryRefreshPolicy.MAX_LATENCY_MS,
+            load = {
+                withContext(Dispatchers.IO) {
+                    ChatSummaryLoader.loadAll(context, store, identity)
+                }
+            },
+            onLoaded = { summaries = it },
+        )
+    }
 
     fun scheduleSummaryReload(immediate: Boolean = false) {
-        val now = System.currentTimeMillis()
-        if (!immediate) {
-            lastChatEventAtMs = now
-        }
-        summaryDebounceJob?.cancel()
-        summaryDebounceJob = summaryScope.launch {
-            if (!immediate) {
-                delay(ChatSummaryRefreshPolicy.DEBOUNCE_MS)
-                // Trailing debounce: only fire after quiet window.
-                val last = lastChatEventAtMs
-                if (!ChatSummaryRefreshPolicy.shouldFireRefresh(
-                        lastEventAtMs = last,
-                        scheduledFireAtMs = last + ChatSummaryRefreshPolicy.DEBOUNCE_MS,
-                        nowMs = System.currentTimeMillis(),
-                    )
-                ) {
-                    return@launch
-                }
-            }
-            val snapshot = withContext(Dispatchers.IO) {
-                ChatSummaryLoader.loadAll(context, store, identity)
-            }
-            summaries = snapshot
-        }
+        summaryRefreshCoordinator.request(immediate)
     }
 
     LaunchedEffect(Unit) {

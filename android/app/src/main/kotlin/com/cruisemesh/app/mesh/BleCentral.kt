@@ -16,7 +16,6 @@ import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
-import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 
@@ -149,6 +148,7 @@ class BleCentral(
     private val reassemblers = mutableMapOf<String, FrameReassembler>()
     private val writeQueue = GattWriteQueue()
     private val scanDiagnostics = mutableMapOf<String, ScanDiagnostics>()
+    private val connectAdmission = CentralConnectAdmission(MAX_CENTRAL_LINKS)
 
     // Battery: which ScanSettings mode [start]/[restartScan] build with --
     // see [setScanDutyMode] and RadioPowerPolicy's class doc. Volatile (not
@@ -234,41 +234,57 @@ class BleCentral(
                 return
             }
 
-            if (synchronized(lock) { connections.containsKey(device.address) }) return
             val now = System.currentTimeMillis()
-            // Dense-fleet churn guard: once the central role is holding its
-            // share of the shared ACL slot budget, stop issuing new connects
-            // (each doomed connectGatt against a rotated one-shot address is
-            // pure radio/battery burn and never accumulates backoff). Freed
-            // slots let the next scan result through; the peripheral role stays
-            // uncapped so contacts can still reach us inbound. See
-            // [MAX_CENTRAL_LINKS].
-            val liveLinkCount = synchronized(lock) { connections.size }
-            if (liveLinkCount >= MAX_CENTRAL_LINKS) {
+            if (!backoff.canAttempt(device.address, now)) return
+            // Reserve before posting. Counting both pending and established
+            // addresses closes the async admission race where a dense burst
+            // queued far more than MAX_CENTRAL_LINKS before the worker had
+            // inserted even its first BluetoothGatt into [connections].
+            val attempt = connectAdmission.tryReserve(device.address)
+            val reservation = attempt.reservation
+            if (reservation == null) {
+                if (!attempt.atCapacity) return
                 val shouldLog = synchronized(lock) {
                     (now - lastAtCapLogMs >= AT_CAP_LOG_INTERVAL_MS).also { if (it) lastAtCapLogMs = now }
                 }
                 if (shouldLog) {
                     Log.i(
                         TAG,
-                        "At central link cap ($liveLinkCount/$MAX_CENTRAL_LINKS); not connecting newly " +
+                        "At central link cap (${attempt.activeCount}/$MAX_CENTRAL_LINKS); not connecting newly " +
                             "discovered peers (e.g. ${device.address}) until a slot frees -- dense-fleet " +
                             "connect-churn guard ($diagnostics)",
                     )
                 }
                 return
             }
-            if (!backoff.canAttempt(device.address, now)) return
             Log.d(TAG, "Discovered peer ${device.address}, connecting ($diagnostics)")
             // G5: connectGatt off main / binder — post to worker looper.
-            handler.post {
-                if (synchronized(lock) { connections.containsKey(device.address) }) return@post
-                val gatt = device.connectGatt(context, false, gattClientCallback)
-                synchronized(lock) {
-                    connections[device.address] = gatt
-                    scheduleConnectWatchdogLocked(device.address, gatt)
+            val posted = handler.post {
+                if (!connectAdmission.beginConnect(reservation)) return@post
+                val gatt = try {
+                    device.connectGatt(context, false, gattClientCallback)
+                } catch (error: RuntimeException) {
+                    connectAdmission.cancel(reservation)
+                    Log.w(TAG, "connectGatt failed for ${device.address}", error)
+                    return@post
                 }
+                if (gatt == null) {
+                    connectAdmission.cancel(reservation)
+                    Log.w(TAG, "connectGatt returned null for ${device.address}")
+                    return@post
+                }
+                val accepted = synchronized(lock) {
+                    if (!connectAdmission.completeConnect(reservation)) {
+                        false
+                    } else {
+                        connections[device.address] = gatt
+                        scheduleConnectWatchdogLocked(device.address, gatt)
+                        true
+                    }
+                }
+                if (!accepted) runCatching { gatt.close() }
             }
+            if (!posted) connectAdmission.cancel(reservation)
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -429,8 +445,19 @@ class BleCentral(
             Log.i(TAG, "start: central role already running; ignoring")
             return
         }
-        scanner = btAdapter.bluetoothLeScanner
-        scanner?.startScan(listOf(buildScanFilter()), buildScanSettings(), scanCallback)
+        val nextScanner = btAdapter.bluetoothLeScanner ?: run {
+            Log.w(TAG, "Bluetooth LE scanner unavailable; cannot start central role")
+            return
+        }
+        synchronized(lock) { connectAdmission.startSession() }
+        scanner = nextScanner
+        try {
+            nextScanner.startScan(listOf(buildScanFilter()), buildScanSettings(), scanCallback)
+        } catch (error: RuntimeException) {
+            scanner = null
+            synchronized(lock) { connectAdmission.stopSession() }
+            Log.w(TAG, "Unable to start BLE scan", error)
+        }
     }
 
     /**
@@ -509,11 +536,15 @@ class BleCentral(
             Log.w(TAG, "stopScan during stop() failed (adapter likely off): ${e.message}")
         }
         scanner = null
+        // Drop queued connect tasks. A task already inside connectGatt is
+        // invalidated by stopSession and closes its returned GATT instead of
+        // publishing it back into a stopped central.
+        handler.removeCallbacksAndMessages(null)
         // gatt.close() is a binder call -- snapshot the connections under the
         // lock, then close them after releasing it, mirroring BlePeripheral's
         // notifyFrame() pattern of taking the lock only to copy state out.
         val connectionsSnapshot = synchronized(lock) {
-            connectWatchdogs.values.forEach { handler.removeCallbacks(it) }
+            connectAdmission.stopSession()
             connectWatchdogs.clear()
             fullyConnected.clear()
             val snapshot = connections.values.toList()
@@ -661,15 +692,24 @@ class BleCentral(
     private fun tearDownLink(gatt: BluetoothGatt, reason: String) {
         val address = gatt.device.address
         Log.i(TAG, "tearDownLink: $address ($reason)")
-        synchronized(lock) {
-            connections.remove(address)
-            negotiatedMtu.remove(address)
-            reassemblers.remove(address)
-            fullyConnected.remove(address)
-            cancelConnectWatchdogLocked(address)
+        val removedCurrent = synchronized(lock) {
+            val tracked = connections[address]
+            if (tracked !== gatt) {
+                false
+            } else {
+                connections.remove(address)
+                connectAdmission.disconnect(address)
+                negotiatedMtu.remove(address)
+                reassemblers.remove(address)
+                fullyConnected.remove(address)
+                cancelConnectWatchdogLocked(address)
+                true
+            }
         }
-        writeQueue.clear(address)
-        onPeerDisconnected(address)
+        if (removedCurrent) {
+            writeQueue.clear(address)
+            onPeerDisconnected(address)
+        }
         gatt.close()
     }
 }
