@@ -3023,7 +3023,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
         add(fallback)
         for contact in contacts {
-            add(Self.resolvedPollRelayConfig(
+            if let cfg = Self.resolvedPollRelayConfig(
                 contact: contact,
                 fallback: fallback,
                 endpointUsable: Self.contactEndpointUsable(
@@ -3031,7 +3031,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     rejections: rejections,
                     nowMs: nowMs
                 )
-            ))
+            ) {
+                if !result.contains(where: { $0.relayUrl == cfg.relayUrl && $0.relayToken == cfg.relayToken }) {
+                    result.append(cfg)
+                    logger.info("Secondary relay poll config added for contact \(contact.userId.hexEncodedString(), privacy: .public): \(cfg.relayUrl, privacy: .public)")
+                }
+            }
         }
         return result
     }
