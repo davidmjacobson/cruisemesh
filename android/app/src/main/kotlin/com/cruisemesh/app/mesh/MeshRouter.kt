@@ -227,8 +227,11 @@ object MeshRouter {
 }
 
 /**
- * Rust returns the single elected route for this logical peer. When it
- * disconnects, the next call naturally selects the best remaining route.
+ * Returns the first route from Rust's preference-ordered [MeshRouterState.routesFor]
+ * result. Do not pass an arbitrary route list: BLE role preference depends on
+ * both authenticated user IDs and cannot be reconstructed from transport type
+ * alone. When the elected route disconnects, the next router query naturally
+ * promotes the best remaining route.
  */
 internal fun transportSendPlan(
     routes: List<Pair<MeshRouterState.Transport, String>>,

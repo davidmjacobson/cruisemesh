@@ -100,6 +100,9 @@ private extension CoreTransport {
     }
 }
 
+/// Returns the first route from `MeshRouterState.routesFor`, whose ordering was
+/// already elected in Rust. Callers must not supply arbitrary routes: BLE-role
+/// preference depends on both authenticated identities, not transport alone.
 func transportSendPlan(
     routes: [(MeshRouterState.Transport, String)],
     frameSize: Int

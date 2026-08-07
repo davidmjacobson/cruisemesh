@@ -275,6 +275,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         lan.onAuthenticated = { [weak self] address, userId in
             self?.meshQueue.async {
                 guard let self, self.isRunning else { return }
+                let previouslySelectedAddress = MeshRouter.routeFor(userId: userId)?.1
                 MeshRouter.onConnected(address: address, transport: .lan)
                 guard MeshRouter.onHello(address: address, userId: userId) else { return }
                 let seenAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
@@ -298,6 +299,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 }
                 LanTransportDiagnostics.shared.authenticated(address: address, peerName: name)
                 self.sendHello(address: address)
+                if MeshRouter.routeFor(userId: userId)?.1 != previouslySelectedAddress {
+                    // Authentication already proves the LAN peer's identity.
+                    // Continue immediately on the promoted route rather than
+                    // waiting for its wire HELLO or periodic maintenance.
+                    self.resumeLogicalPeerSync(peerUserId: userId)
+                }
                 self.sendLanEndpointHint(address: address)
                 self.queueCurrentLanEndpoint(to: userId)
                 self.refreshNearby()
@@ -313,7 +320,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 LanTransportDiagnostics.shared.disconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 if wasSelected, let peerUserId {
-                    self.resumeLogicalPeerAfterRouteLoss(peerUserId: peerUserId)
+                    self.resumeLogicalPeerSync(peerUserId: peerUserId)
                 }
                 self.refreshNearby()
             }
@@ -354,7 +361,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 MeshController.shared.recordPeerDisconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 if wasSelected, let peerUserId {
-                    MeshController.shared.resumeLogicalPeerAfterRouteLoss(peerUserId: peerUserId)
+                    MeshController.shared.resumeLogicalPeerSync(peerUserId: peerUserId)
                 }
                 MeshController.shared.refreshNearby()
             }
@@ -373,7 +380,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 MeshController.shared.recordPeerDisconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 if wasSelected, let peerUserId {
-                    MeshController.shared.resumeLogicalPeerAfterRouteLoss(peerUserId: peerUserId)
+                    MeshController.shared.resumeLogicalPeerSync(peerUserId: peerUserId)
                 }
                 MeshController.shared.refreshNearby()
             }
@@ -800,6 +807,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     }
 
     private func handleHello(address: String, userId: Data, identity: Identity) {
+        let previouslySelectedAddress = MeshRouter.routeFor(userId: userId)?.1
+        // Match Android's per-HELLO reaffirmation. Startup ordering already
+        // installs this in `configure`, but keeping election input adjacent to
+        // HELLO processing prevents a future lifecycle reorder from silently
+        // restoring the central-first fallback.
+        MeshRouter.setLocalUserId(identity.userId)
         guard MeshRouter.onHello(address: address, userId: userId) else {
             log.warning("Dropping HELLO that conflicts with the authenticated link identity")
             return
@@ -811,6 +824,15 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             recordPeerConnection(userId: userId, transport: transport, kind: .connected)
         }
         log.info("HELLO from \(address, privacy: .public) \(UserIdHex.encode(userId), privacy: .public)")
+        let selectedAddress = MeshRouter.routeFor(userId: userId)?.1
+        if let selectedAddress,
+           selectedAddress != previouslySelectedAddress,
+           selectedAddress != address {
+            // Reaffirming identity can elect an already-HELLO'd inverse BLE
+            // role. Resume there even though this HELLO is on the superseded
+            // route.
+            resumeLogicalPeerSync(peerUserId: userId)
+        }
         guard MeshRouter.isSelectedRoute(address: address) else {
             log.info("HELLO route retained for control/failover; bulk sync uses the elected logical-peer route")
             refreshNearby()
@@ -823,13 +845,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         refreshNearby()
     }
 
-    /// Continue immediately on the elected fallback when the preferred route
-    /// disappears; waiting for the periodic digest would create a needless
-    /// delivery gap during LAN/BLE handoff.
-    private func resumeLogicalPeerAfterRouteLoss(peerUserId: Data) {
+    /// Continue immediately after route promotion or failover; waiting for
+    /// periodic maintenance would create a needless LAN/BLE handoff gap.
+    private func resumeLogicalPeerSync(peerUserId: Data) {
         guard let identity,
               let route = MeshRouter.routeFor(userId: peerUserId) else { return }
-        log.info("Logical peer failed over to \(route.1, privacy: .public); resuming carry and digest sync")
+        log.info("Logical peer selected \(route.1, privacy: .public); resuming carry and digest sync")
         drainCarriedEnvelopesTo(address: route.1, peerUserId: peerUserId)
         sendDigest(address: route.1, userId: peerUserId, identity: identity)
     }

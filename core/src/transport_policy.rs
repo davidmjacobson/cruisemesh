@@ -684,14 +684,23 @@ fn route_ordering(
 }
 
 #[uniffi::export]
+/// Return exactly the first route supplied by the caller.
+///
+/// # Contract
+///
+/// `routes` must come from [`CoreMeshRouterState::routes_for`], which has
+/// already applied LAN preference, authenticated symmetric BLE-role election,
+/// and sticky connection age. This helper deliberately does not re-sort:
+/// without both user ids it cannot reproduce the identity-dependent BLE
+/// election. `frame_size` remains in the ABI for compatibility with clients
+/// that predate the single-route policy.
 pub fn core_transport_send_plan(
     routes: Vec<CoreTransportRoute>,
     frame_size: u32,
 ) -> Vec<CoreTransportRoute> {
     let _ = frame_size;
-    // `routes_for` is preference ordered. A logical peer gets exactly one
-    // application-data route; disconnecting that route makes the next call
-    // naturally fail over to the next live candidate.
+    // A logical peer gets exactly one application-data route; disconnecting
+    // it makes the next preference-ordered call naturally fail over.
     routes.into_iter().take(1).collect()
 }
 
@@ -1175,10 +1184,34 @@ mod tests {
         router.on_connected("ble".into(), CoreTransport::Central);
         router.on_connected("lan".into(), CoreTransport::Lan);
         assert!(router.on_hello("ble".into(), vec![1]));
+        assert_eq!(router.route_for(vec![1]).unwrap().address, "ble");
         assert!(router.on_hello("lan".into(), vec![1]));
         assert!(!router.on_hello("lan".into(), vec![2]));
         assert_eq!(router.route_for(vec![1]).unwrap().address, "lan");
         assert_eq!(router.connected_user_count(), 1);
+    }
+
+    #[test]
+    fn installing_local_identity_can_flip_an_existing_dual_role_peer() {
+        let router = CoreMeshRouterState::new();
+        let local = vec![2; 16];
+        let peer = vec![1; 16];
+        router.on_connected("central".into(), CoreTransport::Central);
+        router.on_connected("peripheral".into(), CoreTransport::Peripheral);
+        assert!(router.on_hello("central".into(), peer.clone()));
+        assert!(router.on_hello("peripheral".into(), peer.clone()));
+        assert_eq!(
+            router.route_for(peer.clone()).unwrap().address,
+            "central",
+            "missing local identity uses the documented central-first fallback"
+        );
+
+        router.set_local_user_id(local);
+        assert_eq!(
+            router.route_for(peer).unwrap().address,
+            "peripheral",
+            "the larger local identity elects the inverse BLE role"
+        );
     }
 
     #[test]
