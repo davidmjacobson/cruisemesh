@@ -222,11 +222,9 @@ final class MeshConnectivityStatus: ObservableObject {
 
     func refreshNearbyRoutes() {
         var paths: [Data: DirectPath] = [:]
-        for route in MeshRouter.identifiedRoutes() {
+        for route in MeshRouter.selectedIdentifiedRoutes() {
             let path: DirectPath = route.transport == .lan ? .localWifi : .bluetooth
-            if path == .localWifi || paths[route.userId] == nil {
-                paths[route.userId] = path
-            }
+            paths[route.userId] = path
         }
         directPaths = paths
         nearbyPeerIds = Set(paths.keys)

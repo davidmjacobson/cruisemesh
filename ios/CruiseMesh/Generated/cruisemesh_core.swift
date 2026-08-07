@@ -917,6 +917,14 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
 
     func identifiedRoutes()  -> [CoreIdentifiedRoute]
 
+    /**
+     * Whether this authenticated address is the elected application-data
+     * route for its logical peer. Other live links remain available for
+     * exact-link handshake/control replies but are quarantined from bulk
+     * drains and periodic fanout.
+     */
+    func isSelectedRoute(address: String)  -> Bool
+
     func onConnected(address: String, transport: CoreTransport)
 
     func onDisconnected(address: String)
@@ -968,9 +976,34 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
      */
     func recordTargetedCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64)
 
+    /**
+     * Epidemic fanout plan: one route per authenticated user plus every
+     * not-yet-identified link. If the source is identified, exclude all of
+     * that user's physical routes so a frame cannot echo through its other
+     * BLE role or rotated address.
+     */
+    func relayRoutes(exceptAddress: String?)  -> [CoreTransportRoute]
+
     func routeFor(userId: Data)  -> CoreTransportRoute?
 
     func routesFor(userId: Data)  -> [CoreTransportRoute]
+
+    /**
+     * One selected route per authenticated logical peer. LAN wins over BLE;
+     * the two BLE roles use the symmetric identity election documented in
+     * [`Self::set_local_user_id`]. Equal-ranked links keep the oldest live
+     * connection, making address rotation sticky until the incumbent drops.
+     */
+    func selectedIdentifiedRoutes()  -> [CoreIdentifiedRoute]
+
+    /**
+     * Install the identity used for symmetric BLE-role election. For two
+     * authenticated users, the smaller user id selects its central route and
+     * the larger selects the inverse peripheral route, so both endpoints pick
+     * the same physical connection rather than crossing over and duplicating
+     * every frame on the two links.
+     */
+    func setLocalUserId(userId: Data)
 
     /**
      * Where the targeted HELLO carried drain should resume (G2), same three
@@ -1117,6 +1150,20 @@ open func identifiedRoutes() -> [CoreIdentifiedRoute] {
 })
 }
 
+    /**
+     * Whether this authenticated address is the elected application-data
+     * route for its logical peer. Other live links remain available for
+     * exact-link handshake/control replies but are quarantined from bulk
+     * drains and periodic fanout.
+     */
+open func isSelectedRoute(address: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_is_selected_route(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),$0
+    )
+})
+}
+
 open func onConnected(address: String, transport: CoreTransport) {try! rustCall() {
     uniffi_cruisemesh_core_fn_method_coremeshrouterstate_on_connected(self.uniffiClonePointer(),
         FfiConverterString.lower(address),
@@ -1222,6 +1269,20 @@ open func recordTargetedCarriedProgress(address: String, next: CoreCarriedCursor
 }
 }
 
+    /**
+     * Epidemic fanout plan: one route per authenticated user plus every
+     * not-yet-identified link. If the source is identified, exclude all of
+     * that user's physical routes so a frame cannot echo through its other
+     * BLE role or rotated address.
+     */
+open func relayRoutes(exceptAddress: String?) -> [CoreTransportRoute] {
+    return try!  FfiConverterSequenceTypeCoreTransportRoute.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_relay_routes(self.uniffiClonePointer(),
+        FfiConverterOptionString.lower(exceptAddress),$0
+    )
+})
+}
+
 open func routeFor(userId: Data) -> CoreTransportRoute? {
     return try!  FfiConverterOptionTypeCoreTransportRoute.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_method_coremeshrouterstate_route_for(self.uniffiClonePointer(),
@@ -1236,6 +1297,33 @@ open func routesFor(userId: Data) -> [CoreTransportRoute] {
         FfiConverterData.lower(userId),$0
     )
 })
+}
+
+    /**
+     * One selected route per authenticated logical peer. LAN wins over BLE;
+     * the two BLE roles use the symmetric identity election documented in
+     * [`Self::set_local_user_id`]. Equal-ranked links keep the oldest live
+     * connection, making address rotation sticky until the incumbent drops.
+     */
+open func selectedIdentifiedRoutes() -> [CoreIdentifiedRoute] {
+    return try!  FfiConverterSequenceTypeCoreIdentifiedRoute.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_selected_identified_routes(self.uniffiClonePointer(),$0
+    )
+})
+}
+
+    /**
+     * Install the identity used for symmetric BLE-role election. For two
+     * authenticated users, the smaller user id selects its central route and
+     * the larger selects the inverse peripheral route, so both endpoints pick
+     * the same physical connection rather than crossing over and duplicating
+     * every frame on the two links.
+     */
+open func setLocalUserId(userId: Data) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_set_local_user_id(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
+    )
+}
 }
 
     /**
@@ -19849,6 +19937,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_identified_routes() != 51137) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_is_selected_route() != 55603) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_connected() != 62233) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -19873,10 +19964,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_record_targeted_carried_progress() != 46713) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_relay_routes() != 63158) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_route_for() != 36259) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_routes_for() != 5491) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_selected_identified_routes() != 3316) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_set_local_user_id() != 14555) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_targeted_carried_lane_for() != 28835) {

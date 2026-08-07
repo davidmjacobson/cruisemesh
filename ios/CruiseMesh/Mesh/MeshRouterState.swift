@@ -6,8 +6,6 @@ final class MeshRouterState {
         case central
         case peripheral
         case lan
-
-        var routePriority: Int { self == .lan ? 10 : 0 }
     }
 
     struct IdentifiedRoute: Equatable {
@@ -17,6 +15,8 @@ final class MeshRouterState {
     }
 
     private let core = CoreMeshRouterState()
+
+    func setLocalUserId(_ userId: Data) { core.setLocalUserId(userId: userId) }
 
     func onConnected(address: String, transport: Transport) {
         core.onConnected(address: address, transport: transport.core)
@@ -61,6 +61,13 @@ final class MeshRouterState {
     func connectedRoutes() -> [(Transport, String)] { core.connectedRoutes().map { ($0.transport.platform, $0.address) } }
     func identifiedRoutes() -> [IdentifiedRoute] {
         core.identifiedRoutes().map { IdentifiedRoute(transport: $0.transport.platform, address: $0.address, userId: $0.userId) }
+    }
+    func selectedIdentifiedRoutes() -> [IdentifiedRoute] {
+        core.selectedIdentifiedRoutes().map { IdentifiedRoute(transport: $0.transport.platform, address: $0.address, userId: $0.userId) }
+    }
+    func isSelectedRoute(address: String) -> Bool { core.isSelectedRoute(address: address) }
+    func relayRoutes(exceptAddress: String? = nil) -> [(Transport, String)] {
+        core.relayRoutes(exceptAddress: exceptAddress).map { ($0.transport.platform, $0.address) }
     }
     func connectedUserCount() -> Int { Int(core.connectedUserCount()) }
     func routeFor(userId: Data) -> (Transport, String)? {

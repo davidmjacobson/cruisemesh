@@ -46,22 +46,44 @@ final class MeshRouterStateTests: XCTestCase {
     func testSamePeerViaBothRolesRoutableWhileEitherLinkUp() {
         let state = MeshRouterState()
         let alice = userId(1)
+        state.setLocalUserId(userId(0))
         state.onConnected(address: "CENTRAL-LINK", transport: .central)
         state.onHello(address: "CENTRAL-LINK", userId: alice)
         state.onConnected(address: "PERIPHERAL-LINK", transport: .peripheral)
         state.onHello(address: "PERIPHERAL-LINK", userId: alice)
 
         let route = state.routeFor(userId: alice)
-        XCTAssertNotNil(route)
-        XCTAssertTrue(
-            (route?.0 == .central && route?.1 == "CENTRAL-LINK")
-                || (route?.0 == .peripheral && route?.1 == "PERIPHERAL-LINK")
-        )
+        XCTAssertEqual(route?.0, .central)
+        XCTAssertEqual(route?.1, "CENTRAL-LINK")
+        XCTAssertEqual(state.selectedIdentifiedRoutes().count, 1)
+        XCTAssertTrue(state.isSelectedRoute(address: "CENTRAL-LINK"))
+        XCTAssertFalse(state.isSelectedRoute(address: "PERIPHERAL-LINK"))
 
         state.onDisconnected(address: "CENTRAL-LINK")
         let remaining = state.routeFor(userId: alice)
         XCTAssertEqual(remaining?.0, .peripheral)
         XCTAssertEqual(remaining?.1, "PERIPHERAL-LINK")
+    }
+
+    func testRelayRoutesCollapsePhysicalLinksAndExcludeTheWholeSourcePeer() {
+        let state = MeshRouterState()
+        let alice = userId(1)
+        let bob = userId(2)
+        state.setLocalUserId(userId(0))
+        state.onConnected(address: "ALICE-CENTRAL", transport: .central)
+        state.onHello(address: "ALICE-CENTRAL", userId: alice)
+        state.onConnected(address: "ALICE-PERIPHERAL", transport: .peripheral)
+        state.onHello(address: "ALICE-PERIPHERAL", userId: alice)
+        state.onConnected(address: "ALICE-LAN", transport: .lan)
+        state.onHello(address: "ALICE-LAN", userId: alice)
+        state.onConnected(address: "BOB", transport: .central)
+        state.onHello(address: "BOB", userId: bob)
+
+        XCTAssertEqual(
+            Set(state.relayRoutes().map(\.1)),
+            Set(["ALICE-LAN", "BOB"])
+        )
+        XCTAssertEqual(state.relayRoutes(exceptAddress: "ALICE-PERIPHERAL").map(\.1), ["BOB"])
     }
 
     func testTwoPeersNeverConfused() {

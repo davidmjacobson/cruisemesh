@@ -91,7 +91,7 @@ final class LanTransportTests: XCTestCase {
         )
     }
 
-    func testTransportSendPlanRacesSmallFramesButNotLargeOnes() {
+    func testTransportSendPlanUsesOneLogicalPeerRouteForEveryFrameSize() {
         let routes: [(MeshRouterState.Transport, String)] = [
             (.lan, "LAN"),
             (.central, "BLE-1"),
@@ -99,7 +99,7 @@ final class LanTransportTests: XCTestCase {
         ]
         XCTAssertEqual(
             transportSendPlan(routes: routes, frameSize: 512).map(\.1),
-            ["LAN", "BLE-1"]
+            ["LAN"]
         )
         XCTAssertEqual(
             transportSendPlan(routes: routes, frameSize: 64 * 1_024).map(\.1),

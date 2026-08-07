@@ -181,7 +181,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     // MARK: - Lifecycle
 
     func configure(identity: Identity) {
-        meshQueue.async { self.identity = identity }
+        meshQueue.async {
+            self.identity = identity
+            MeshRouter.setLocalUserId(identity.userId)
+        }
     }
 
     func start() {
@@ -264,7 +267,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     instanceToken: instanceToken,
                     networkId: networkId
                 )
-                for route in MeshRouter.identifiedRoutes() {
+                for route in MeshRouter.selectedIdentifiedRoutes() {
                     self.sendLanEndpointHint(address: route.address)
                 }
             }
@@ -303,10 +306,15 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         lan.onDisconnected = { [weak self] address in
             self?.meshQueue.async {
                 guard let self, self.isRunning else { return }
+                let peerUserId = MeshRouter.userIdFor(address: address)
+                let wasSelected = MeshRouter.isSelectedRoute(address: address)
                 self.recordPeerDisconnected(address: address)
                 self.lanHealth.remove(address: address)
                 LanTransportDiagnostics.shared.disconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
+                if wasSelected, let peerUserId {
+                    self.resumeLogicalPeerAfterRouteLoss(peerUserId: peerUserId)
+                }
                 self.refreshNearby()
             }
         }
@@ -341,8 +349,13 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             // replaces: frames land in the same queue as connection events, so
             // the whole mesh event stream keeps one order.
             self?.meshQueue.async {
+                let peerUserId = MeshRouter.userIdFor(address: address)
+                let wasSelected = MeshRouter.isSelectedRoute(address: address)
                 MeshController.shared.recordPeerDisconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
+                if wasSelected, let peerUserId {
+                    MeshController.shared.resumeLogicalPeerAfterRouteLoss(peerUserId: peerUserId)
+                }
                 MeshController.shared.refreshNearby()
             }
         }
@@ -355,8 +368,13 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
         transport.onPeripheralUnsubscribed = { [weak self] address in
             self?.meshQueue.async {
+                let peerUserId = MeshRouter.userIdFor(address: address)
+                let wasSelected = MeshRouter.isSelectedRoute(address: address)
                 MeshController.shared.recordPeerDisconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
+                if wasSelected, let peerUserId {
+                    MeshController.shared.resumeLogicalPeerAfterRouteLoss(peerUserId: peerUserId)
+                }
                 MeshController.shared.refreshNearby()
             }
         }
@@ -793,11 +811,27 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             recordPeerConnection(userId: userId, transport: transport, kind: .connected)
         }
         log.info("HELLO from \(address, privacy: .public) \(UserIdHex.encode(userId), privacy: .public)")
+        guard MeshRouter.isSelectedRoute(address: address) else {
+            log.info("HELLO route retained for control/failover; bulk sync uses the elected logical-peer route")
+            refreshNearby()
+            return
+        }
         sendLanEndpointHint(address: address)
         queueCurrentLanEndpoint(to: userId)
         drainCarriedEnvelopesTo(address: address, peerUserId: userId)
         sendDigest(address: address, userId: userId, identity: identity)
         refreshNearby()
+    }
+
+    /// Continue immediately on the elected fallback when the preferred route
+    /// disappears; waiting for the periodic digest would create a needless
+    /// delivery gap during LAN/BLE handoff.
+    private func resumeLogicalPeerAfterRouteLoss(peerUserId: Data) {
+        guard let identity,
+              let route = MeshRouter.routeFor(userId: peerUserId) else { return }
+        log.info("Logical peer failed over to \(route.1, privacy: .public); resuming carry and digest sync")
+        drainCarriedEnvelopesTo(address: route.1, peerUserId: peerUserId)
+        sendDigest(address: route.1, userId: peerUserId, identity: identity)
     }
 
     /// Encode and send the §7.3 digest for `address` and record the time so
@@ -868,7 +902,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// idempotent, so over-calling is safe.
     private func checkDigestMaintenance() {
         guard let identity else { return }
-        let routes = MeshRouter.identifiedRoutes()
+        let routes = MeshRouter.selectedIdentifiedRoutes()
         let active = Set(routes.map { $0.address })
         lastDigestAtByAddress = lastDigestAtByAddress.filter { active.contains($0.key) }
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
