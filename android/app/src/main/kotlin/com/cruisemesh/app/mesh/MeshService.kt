@@ -276,6 +276,14 @@ class MeshService : Service() {
      * [scheduleFailoverResume] and the core's `CoreFailoverResumeDebounce`.
      */
     private val failoverResumeDebounce = FailoverResumeDebounce()
+
+    /**
+     * The one pending [scheduleDeferredSpray] timer per logical peer (keyed by
+     * hex user id), kept so a newer deferral can cancel the older one instead of
+     * stacking a second burst behind it. Guarded by its own monitor: HELLO and
+     * DIGEST frames for one peer can arrive on different binder threads.
+     */
+    private val pendingSprayDeferrals = mutableMapOf<String, Runnable>()
     private val relayMainHandler by lazy { Handler(Looper.getMainLooper()) }
     private val bluetoothManager by lazy {
         getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -684,6 +692,13 @@ class MeshService : Service() {
         // submitting anything to storeExecutor, so it cannot outlive this;
         // clearing the armed windows just keeps the state honest.
         failoverResumeDebounce.clear()
+        // Same for a spray deferral still counting down (#275): its runnable
+        // re-checks `running` too, but removing the callbacks stops the timers
+        // from keeping this instance's closures alive until they fire.
+        synchronized(pendingSprayDeferrals) {
+            pendingSprayDeferrals.values.forEach(relayMainHandler::removeCallbacks)
+            pendingSprayDeferrals.clear()
+        }
         // FA3: stop accepting new storeExecutor work only after every producer
         // that could submit some is already stopped above (relaySync?.stopPush()
         // clears the push client's hintsProvider and cancels any pending reconnect;
@@ -1559,7 +1574,9 @@ class MeshService : Service() {
         // below is what was failing. The connection is welcome back
         // immediately -- see PeripheralSprayCooldown -- but the multi-KB half
         // of the exchange waits out the window rather than re-running the
-        // thing that just broke the link.
+        // thing that just broke the link. [handleDigest] gates the other
+        // outbound half of the same exchange for the same window; either one
+        // alone leaves the reconnect loop unbraked.
         val syncDeferralMs = peripheralSyncSprayDeferralMs(address)
 
         // Hand off anything we're muling for this peer (DESIGN.md §5.3 carry
@@ -1613,12 +1630,34 @@ class MeshService : Service() {
      * absorbed into it, so the peer gets one burst rather than two overlapping
      * ones. Re-electing the route at fire time also means a peer that has since
      * moved to a better route (LAN, or the outbound BLE half) is served there.
+     *
+     * At most one deferral is pending per logical peer. Without that, every
+     * gated frame inside one window -- a HELLO and the DIGEST that answers it,
+     * or a peer that re-HELLOs on its own retry path -- would post its own
+     * timer, and because they fire at different milliseconds the debounce
+     * cannot collapse them: its window has closed again between each pair. The
+     * result would be N staggered multi-KB bursts ~300ms apart on the one link
+     * the cooldown is protecting, which is the overlapping fan-out #269 removed.
+     * Replacing the pending timer (rather than keeping the first) is what makes
+     * the deferral track the newest cooldown arming instead of firing early.
      */
     private fun scheduleDeferredSpray(peerUserId: ByteArray, delayMs: Long) {
-        relayMainHandler.postDelayed({
-            if (!running) return@postDelayed
+        val key = UserIdHex.encode(peerUserId)
+        var pending: Runnable? = null
+        val runnable = Runnable {
+            synchronized(pendingSprayDeferrals) {
+                // Only retire the map entry if it is still *this* timer: a newer
+                // deferral armed in the meantime owns the key now.
+                if (pendingSprayDeferrals[key] === pending) pendingSprayDeferrals.remove(key)
+            }
+            if (!running) return@Runnable
             scheduleFailoverResume(peerUserId)
-        }, delayMs)
+        }
+        pending = runnable
+        synchronized(pendingSprayDeferrals) {
+            pendingSprayDeferrals.put(key, runnable)?.let(relayMainHandler::removeCallbacks)
+        }
+        relayMainHandler.postDelayed(runnable, delayMs)
     }
 
     /**
@@ -1730,6 +1769,32 @@ class MeshService : Service() {
         }
 
         val resolvedPeerUserId = peerUserId!!
+
+        // Post-reject cooldown (#275), the other half of the one in
+        // [handleHello]. Everything below this line is outbound on the same
+        // notify path the cooldown was armed for, and it is the *larger* half of
+        // the burst: receipts, every 1:1 message the peer's watermark says it is
+        // missing, every group envelope we authored (from lamport 0 -- there are
+        // no group digests yet), and the carry-queue spray. Gating only the
+        // HELLO side would not brake the reconnect loop at all: our own HELLO is
+        // still sent -- it must be, or the link is useless for anything -- and
+        // the peer answers a HELLO with its DIGEST, which lands right here. The
+        // peer's digest is dropped rather than queued; nothing from a digest is
+        // ever written to our store, and the peer's own maintenance tick re-sends
+        // it, so the only cost of dropping it is that our outbound backlog to
+        // this peer waits for that tick rather than going out into a link we
+        // just watched fail.
+        val syncDeferralMs = peripheralSyncSprayDeferralMs(address)
+        if (syncDeferralMs > 0L) {
+            Log.i(
+                TAG,
+                "Holding the digest response for $address for ${syncDeferralMs}ms " +
+                    "after a notify-reject teardown on this address",
+            )
+            scheduleDeferredSpray(resolvedPeerUserId, syncDeferralMs)
+            return
+        }
+
         val contact = store.getContact(resolvedPeerUserId)
         if (contact != null) {
             envelopeProcessor?.syncReceiptsFirst(identity, contact, address)

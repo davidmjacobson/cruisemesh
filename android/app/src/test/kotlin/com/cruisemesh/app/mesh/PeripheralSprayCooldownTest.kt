@@ -41,6 +41,23 @@ class PeripheralSprayCooldownTest {
     }
 
     @Test
+    fun `every outbound frame of the exchange is gated, not just the first`() {
+        // The reconnect exchange has two outbound halves on this notify path:
+        // the response to the peer's HELLO, and -- once the peer answers our own
+        // HELLO with its DIGEST ~200ms later -- the response to that, which is
+        // the larger of the two. Gating one and not the other brakes nothing, so
+        // reading the window must not consume it.
+        val cooldown = PeripheralSprayCooldown(windowMs = 5_000)
+        cooldown.armAfterRejectTeardown("aa:bb", nowMs = 1_000)
+
+        assertEquals(4_000L, cooldown.deferralMs("aa:bb", nowMs = 2_000))
+        assertEquals(3_800L, cooldown.deferralMs("aa:bb", nowMs = 2_200))
+        assertEquals(3_800L, cooldown.deferralMs("aa:bb", nowMs = 2_200))
+        // ...and the window still ends where it was armed to end.
+        assertEquals(0L, cooldown.deferralMs("aa:bb", nowMs = 6_000))
+    }
+
+    @Test
     fun `the window lapses exactly at its end and stays lapsed`() {
         val cooldown = PeripheralSprayCooldown(windowMs = 5_000)
         cooldown.armAfterRejectTeardown("aa:bb", nowMs = 1_000)

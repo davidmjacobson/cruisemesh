@@ -102,6 +102,57 @@ class PeripheralLinkAdmissionTest {
     }
 
     @Test
+    fun `an undroppable rejected link is recorded rather than counted as free`() {
+        // Reconciliation for the one case the radio and the ledger disagree: a
+        // central that was turned away but that repeated cancelConnection calls
+        // could not actually disconnect. It is holding an ACL slot whatever this
+        // class believes, so the honest count includes it -- calling that slot
+        // free would over-subscribe the very pool the cap protects.
+        val admission = PeripheralLinkAdmission(maxLinks = 2)
+        admission.admit("a")
+        admission.admit("b")
+        assertEquals(PeripheralAdmissionDecision.Rejected(2), admission.admit("stuck"))
+
+        assertEquals(3, admission.forceHold("stuck"))
+        assertTrue(admission.holds("stuck"))
+        assertEquals(3, admission.activeCount())
+    }
+
+    @Test
+    fun `a force-held slot is released by an ordinary teardown`() {
+        val admission = PeripheralLinkAdmission(maxLinks = 1)
+        admission.admit("a")
+        admission.forceHold("stuck")
+        assertEquals(2, admission.activeCount())
+
+        assertTrue(admission.release("stuck"))
+        assertEquals(1, admission.activeCount())
+        // Still at the cap on the one real link, so the next arrival waits.
+        assertEquals(PeripheralAdmissionDecision.Rejected(1), admission.admit("c"))
+    }
+
+    @Test
+    fun `being over the cap does not let the next arrival in`() {
+        // forceHold is not a cap increase: while the count is over the cap,
+        // ordinary admissions are refused exactly as they are at it.
+        val admission = PeripheralLinkAdmission(maxLinks = 1)
+        admission.admit("a")
+        admission.forceHold("stuck")
+
+        assertEquals(PeripheralAdmissionDecision.Rejected(2), admission.admit("newcomer"))
+        assertFalse(admission.holds("newcomer"))
+    }
+
+    @Test
+    fun `force-holding an address that already holds a slot changes nothing`() {
+        val admission = PeripheralLinkAdmission(maxLinks = 2)
+        admission.admit("a")
+
+        assertEquals(1, admission.forceHold("a"))
+        assertEquals(1, admission.activeCount())
+    }
+
+    @Test
     fun `clearAll releases every slot for a restarted peripheral role`() {
         val admission = PeripheralLinkAdmission(maxLinks = 2)
         admission.admit("a")

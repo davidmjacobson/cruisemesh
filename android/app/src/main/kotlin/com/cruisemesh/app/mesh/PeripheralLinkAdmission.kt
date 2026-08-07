@@ -63,17 +63,36 @@ sealed interface PeripheralAdmissionDecision {
  * fleet for the peers whose links it already holds -- see
  * [BleAdvertiserStateMachine] for how expensive an unadvertised phone is.
  *
- * ## Known limitation
+ * ## Known limitation: the decision is never revisited
  *
- * The cap cannot flex for "this link is the peer's only route". Admission is
- * decided at `STATE_CONNECTED`, which is the one moment we know nothing about
- * who the peer is: the identity arrives later in the HELLO, and the BLE
- * address in hand is a rotating RPA. By the time `MeshRouter` could say whether
- * a sibling route exists, the slot has already been granted or refused. A
- * later revision could admit provisionally and re-check at HELLO time, at the
- * cost of letting an unidentified central hold a slot through the whole
- * connect/subscribe/HELLO burst -- which is exactly the window the cap exists
- * to bound.
+ * The cap cannot flex for "this link is the peer's only route", in two stages.
+ *
+ * At admission it *cannot* know: `STATE_CONNECTED` is the one moment nothing is
+ * known about who the peer is -- the identity arrives later in the HELLO, and
+ * the BLE address in hand is a rotating RPA -- so by the time `MeshRouter`
+ * could say whether a sibling route exists, the slot has already been granted
+ * or refused.
+ *
+ * The sharper half is that a second later it *could* know and still does not.
+ * Slots are keyed by BLE address and released only by a real teardown, so an
+ * inbound link that #266's collapse-by-authenticated-peer has since superseded
+ * -- the peer is also on LAN, or its own outbound BLE half won election --
+ * keeps its slot for the life of the link even though `MeshRouter` never
+ * selects it and nothing bulk ever flows over it. Such a link accumulates no
+ * notify failures (it is never notified) and there is no peripheral-side
+ * watchdog, so nothing retires it. Three of those can hold the whole inbound
+ * budget against the one peer a spare inbound slot exists to serve: a BLE-only
+ * peer with no other way in.
+ *
+ * Closing that means either evicting superseded links or releasing their slots
+ * while the ACL stays up. The first re-opens the churn this class is built to
+ * avoid, since route election flaps and each flap would drop a link; the second
+ * over-subscribes the very ACL pool the cap protects. Both want a peripheral
+ * link-health watchdog that does not exist yet, so this ships with the cap
+ * simple and the limitation stated. Its practical weight is small: it needs a
+ * phone whose inbound links are *all* superseded at once, and the excluded peer
+ * still reaches this phone over its own inbound half or by carrying via
+ * another mule.
  *
  * All methods are `@Synchronized`: GATT server callbacks arrive on arbitrary
  * binder threads. This is a leaf monitor -- it never calls out -- so it cannot
@@ -98,6 +117,24 @@ class PeripheralLinkAdmission(private val maxLinks: Int) {
             held += address
             PeripheralAdmissionDecision.Admitted(held.size)
         }
+    }
+
+    /**
+     * Record a slot for [address] even if that puts the count over the cap, and
+     * return the resulting count.
+     *
+     * Not an admission decision and never called on the admission path: this is
+     * reconciliation for the one case where the radio and the ledger disagree --
+     * a central this class turned away that could not actually be disconnected
+     * (see [BlePeripheral.adoptUndroppableCentral]). The controller is holding
+     * that ACL slot whatever this class thinks, and a ledger that calls it free
+     * would over-subscribe the pool the cap exists to protect, so the honest
+     * count is the one that includes it. [release] frees it like any other.
+     */
+    @Synchronized
+    fun forceHold(address: String): Int {
+        held += address
+        return held.size
     }
 
     /**
@@ -146,14 +183,29 @@ class PeripheralLinkAdmission(private val maxLinks: Int) {
  * address-to-identity mapping honest, without which the link is useless for
  * anything at all.
  *
+ * Both outbound halves have to be gated for that to mean anything, and this is
+ * the part that is easy to get wrong. Holding back only what the peer's HELLO
+ * triggers brakes nothing: our own HELLO still goes out (it must), the peer
+ * answers a HELLO with its DIGEST, and our response to *that* is the bigger
+ * burst of the two -- receipts, every 1:1 message its watermark says it is
+ * missing, every group envelope we authored, and the carry-queue spray. So
+ * `MeshService` consults this window in both `handleHello` and `handleDigest`.
+ *
  * ## Nothing is dropped, only delayed
  *
  * A suppressed burst is re-armed for when the window lapses, and it re-enters
  * through the same coalescing resume the failover debounce uses, so a peer
  * whose link genuinely settled gets its carry drain and digest one window
- * late rather than not at all. (Even without that, the 60s digest-maintenance
- * pass would re-send the digest -- but it would never re-run the carry drain,
- * which is the DTN-carrying half.)
+ * late rather than not at all -- one re-arm per peer, not one per gated frame.
+ * (Even without that, the 60s digest-maintenance pass would re-send the digest
+ * -- but it would never re-run the carry drain, which is the DTN-carrying
+ * half.)
+ *
+ * A peer *digest* gated by the window is the one thing dropped rather than
+ * queued: nothing a digest says is written to our store, so there is nothing to
+ * replay, and the peer's own maintenance tick re-sends it. The cost is bounded
+ * by that tick -- our outbound backlog to this peer can wait one maintenance
+ * interval instead of going out into a link we just watched fail.
  *
  * ## Sizing
  *
