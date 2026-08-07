@@ -268,6 +268,12 @@ class MeshService : Service() {
      * [handleLanEndpointHint] (stashes) and [handleHello] (replays).
      */
     private val pendingLanHints = PendingLanHintHold()
+
+    /**
+     * Coalesces the failover resume fan-out per logical peer -- see
+     * [scheduleFailoverResume] and the core's `CoreFailoverResumeDebounce`.
+     */
+    private val failoverResumeDebounce = FailoverResumeDebounce()
     private val relayMainHandler by lazy { Handler(Looper.getMainLooper()) }
     private val bluetoothManager by lazy {
         getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -665,6 +671,11 @@ class MeshService : Service() {
         cancelLanHealth()
         cancelDigestMaintenance()
         cancelRadioPowerChecks()
+        // A debounced failover resume can still be pending on relayMainHandler.
+        // Its posted callback re-checks `running` (already false above) before
+        // submitting anything to storeExecutor, so it cannot outlive this;
+        // clearing the armed windows just keeps the state honest.
+        failoverResumeDebounce.clear()
         // FA3: stop accepting new storeExecutor work only after every producer
         // that could submit some is already stopped above (relaySync?.stopPush()
         // clears the push client's hintsProvider and cancels any pending reconnect;
@@ -1065,7 +1076,7 @@ class MeshService : Service() {
         MeshRouter.onDisconnected(address)
         pendingLanHints.clear(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
-        if (wasSelected) peerUserId?.let(::resumeLogicalPeerSync)
+        if (wasSelected) peerUserId?.let(::scheduleFailoverResume)
         noteLinkChangeAndReevaluate("central peer disconnected")
     }
 
@@ -1082,7 +1093,7 @@ class MeshService : Service() {
         MeshRouter.onDisconnected(address)
         pendingLanHints.clear(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
-        if (wasSelected) peerUserId?.let(::resumeLogicalPeerSync)
+        if (wasSelected) peerUserId?.let(::scheduleFailoverResume)
         noteLinkChangeAndReevaluate("peripheral central disconnected")
     }
 
@@ -1151,8 +1162,44 @@ class MeshService : Service() {
         lanHealthTracker.remove(address)
         LanTransportDiagnostics.disconnected(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
-        if (wasSelected) peerUserId?.let(::resumeLogicalPeerSync)
+        if (wasSelected) peerUserId?.let(::scheduleFailoverResume)
         noteLinkChangeAndReevaluate("LAN peer disconnected")
+    }
+
+    /**
+     * Failover path into [resumeLogicalPeerSync], delayed and coalesced per
+     * logical peer.
+     *
+     * Running the resume synchronously inside the disconnect callback (which
+     * is what the three `onDisconnected` handlers above used to do) is wrong
+     * when several links die in one radio event: the first callback picks
+     * whatever route is *currently* elected -- often a sibling link to the same
+     * phone whose own `STATE_DISCONNECTED` is still ~100ms out -- and
+     * immediately queues a multi-KB carry drain plus a digest onto it. The
+     * peripheral rejects the notification, the link is torn down as a send
+     * failure, and the sync has to happen again on the route that actually
+     * survived. Waiting one [FailoverResumeDebounce] window lets the rest of
+     * the burst land first, so the resume runs once, against the real
+     * survivor.
+     *
+     * The timer lives on [relayMainHandler] but the work does not: the resume
+     * touches [store] (via `drainCarriedEnvelopesTo`/[sendDigestTo]) and so
+     * hops to [storeExecutor], the same shape as [digestMaintenanceRunnable].
+     * Promotion callers ([onLanPeerAuthenticated], [handleHello]) still call
+     * [resumeLogicalPeerSync] directly and immediately -- a promotion means a
+     * link just came *up*, so there is no dying sibling to wait for.
+     */
+    private fun scheduleFailoverResume(peerUserId: ByteArray) {
+        val key = UserIdHex.encode(peerUserId)
+        val delayMs = failoverResumeDebounce.request(key, System.currentTimeMillis()) ?: return
+        relayMainHandler.postDelayed({
+            // Cleared before the work runs, so a disconnect arriving while the
+            // resume is in flight arms a fresh window instead of being
+            // swallowed by this one.
+            failoverResumeDebounce.fired(key)
+            if (!running) return@postDelayed
+            runOnStoreExecutor("failover resume") { resumeLogicalPeerSync(peerUserId) }
+        }, delayMs)
     }
 
     /** Immediately continue sync after either promotion or failover instead

@@ -720,6 +720,294 @@ public func FfiConverterTypeBleFrameReassembler_lower(_ value: BleFrameReassembl
 
 
 
+/**
+ * Leading-edge, per-logical-peer debounce for the failover resume fan-out
+ * (Android `MeshService.resumeLogicalPeerSync`, iOS
+ * `MeshController.resumeLogicalPeerSync`).
+ *
+ * The bug this exists for (2026-08-07): resuming ran *synchronously inside*
+ * the BLE disconnect callback, so when several centrals dropped in one radio
+ * event the very first callback immediately queued a multi-KB carry drain
+ * plus a digest onto the peer's sibling route — a route whose own
+ * disconnect callback was still ~100ms away. The notification was rejected
+ * outright and the sibling link was torn down as a send failure, which is a
+ * worse outcome than simply waiting: the frames were wasted, the teardown
+ * was attributed to the wrong cause, and the sync had to happen again anyway
+ * once the real route was elected.
+ *
+ * Semantics are deliberately *leading-edge with no extension*: the first
+ * request for a key arms a window and every further request inside that
+ * window is absorbed into it, so a burst of `n` disconnects for one logical
+ * peer produces exactly one resume, and that resume is guaranteed to run
+ * within one window of the burst's *start* rather than being pushed further
+ * out by each new event. A trailing/extending debounce could starve a resume
+ * indefinitely under a steady disconnect stream, which for a mesh whose
+ * whole job is to keep syncing is the worse failure.
+ *
+ * Coalescing is per key (the peer's UserID hex), never global: two different
+ * peers failing over in the same radio event each get their own resume.
+ */
+public protocol CoreFailoverResumeDebounceProtocol : AnyObject {
+
+    /**
+     * Drops a pending window without running it (the caller cancelled its
+     * timer, e.g. the peer went away entirely).
+     */
+    func cancel(key: String)
+
+    /**
+     * Forgets every pending window, e.g. on a full mesh stop.
+     */
+    func clear()
+
+    /**
+     * The armed timer for `key` just ran; the window is over, so the next
+     * failover for this peer arms a fresh one. Call this *before* doing the
+     * resume work so a disconnect arriving during that work starts a new
+     * window instead of being swallowed.
+     */
+    func fired(key: String)
+
+    func isPending(key: String)  -> Bool
+
+    /**
+     * Asks whether this failover should arm a timer. `Some(delay_ms)` means
+     * the caller owns the window and must schedule the resume that far out,
+     * calling [`Self::fired`] when the timer runs; `None` means an already
+     * armed window will cover this request, so the caller does nothing.
+     *
+     * A marker older than the window is treated as lost rather than as
+     * permanently pending (a cancelled timer, a process-lifecycle hiccup, or
+     * a wall-clock jump backwards): it re-arms. Without that, one dropped
+     * timer would silently disable failover resume for that peer forever,
+     * which is exactly the class of silent-permanent-failure this file's
+     * other trackers are written to avoid.
+     */
+    func request(key: String, nowMs: Int64)  -> Int64?
+
+    func windowMs()  -> Int64
+
+}
+
+/**
+ * Leading-edge, per-logical-peer debounce for the failover resume fan-out
+ * (Android `MeshService.resumeLogicalPeerSync`, iOS
+ * `MeshController.resumeLogicalPeerSync`).
+ *
+ * The bug this exists for (2026-08-07): resuming ran *synchronously inside*
+ * the BLE disconnect callback, so when several centrals dropped in one radio
+ * event the very first callback immediately queued a multi-KB carry drain
+ * plus a digest onto the peer's sibling route — a route whose own
+ * disconnect callback was still ~100ms away. The notification was rejected
+ * outright and the sibling link was torn down as a send failure, which is a
+ * worse outcome than simply waiting: the frames were wasted, the teardown
+ * was attributed to the wrong cause, and the sync had to happen again anyway
+ * once the real route was elected.
+ *
+ * Semantics are deliberately *leading-edge with no extension*: the first
+ * request for a key arms a window and every further request inside that
+ * window is absorbed into it, so a burst of `n` disconnects for one logical
+ * peer produces exactly one resume, and that resume is guaranteed to run
+ * within one window of the burst's *start* rather than being pushed further
+ * out by each new event. A trailing/extending debounce could starve a resume
+ * indefinitely under a steady disconnect stream, which for a mesh whose
+ * whole job is to keep syncing is the worse failure.
+ *
+ * Coalescing is per key (the peer's UserID hex), never global: two different
+ * peers failing over in the same radio event each get their own resume.
+ */
+open class CoreFailoverResumeDebounce:
+    CoreFailoverResumeDebounceProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_corefailoverresumedebounce(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_corefailoverresumedebounce_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_corefailoverresumedebounce(pointer, $0) }
+    }
+
+
+public static func withWindowMs(windowMs: Int64) -> CoreFailoverResumeDebounce {
+    return try!  FfiConverterTypeCoreFailoverResumeDebounce.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_corefailoverresumedebounce_with_window_ms(
+        FfiConverterInt64.lower(windowMs),$0
+    )
+})
+}
+
+
+
+    /**
+     * Drops a pending window without running it (the caller cancelled its
+     * timer, e.g. the peer went away entirely).
+     */
+open func cancel(key: String) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corefailoverresumedebounce_cancel(self.uniffiClonePointer(),
+        FfiConverterString.lower(key),$0
+    )
+}
+}
+
+    /**
+     * Forgets every pending window, e.g. on a full mesh stop.
+     */
+open func clear() {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corefailoverresumedebounce_clear(self.uniffiClonePointer(),$0
+    )
+}
+}
+
+    /**
+     * The armed timer for `key` just ran; the window is over, so the next
+     * failover for this peer arms a fresh one. Call this *before* doing the
+     * resume work so a disconnect arriving during that work starts a new
+     * window instead of being swallowed.
+     */
+open func fired(key: String) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corefailoverresumedebounce_fired(self.uniffiClonePointer(),
+        FfiConverterString.lower(key),$0
+    )
+}
+}
+
+open func isPending(key: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corefailoverresumedebounce_is_pending(self.uniffiClonePointer(),
+        FfiConverterString.lower(key),$0
+    )
+})
+}
+
+    /**
+     * Asks whether this failover should arm a timer. `Some(delay_ms)` means
+     * the caller owns the window and must schedule the resume that far out,
+     * calling [`Self::fired`] when the timer runs; `None` means an already
+     * armed window will cover this request, so the caller does nothing.
+     *
+     * A marker older than the window is treated as lost rather than as
+     * permanently pending (a cancelled timer, a process-lifecycle hiccup, or
+     * a wall-clock jump backwards): it re-arms. Without that, one dropped
+     * timer would silently disable failover resume for that peer forever,
+     * which is exactly the class of silent-permanent-failure this file's
+     * other trackers are written to avoid.
+     */
+open func request(key: String, nowMs: Int64) -> Int64? {
+    return try!  FfiConverterOptionInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corefailoverresumedebounce_request(self.uniffiClonePointer(),
+        FfiConverterString.lower(key),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func windowMs() -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corefailoverresumedebounce_window_ms(self.uniffiClonePointer(),$0
+    )
+})
+}
+
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreFailoverResumeDebounce: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CoreFailoverResumeDebounce
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreFailoverResumeDebounce {
+        return CoreFailoverResumeDebounce(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CoreFailoverResumeDebounce) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreFailoverResumeDebounce {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CoreFailoverResumeDebounce, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFailoverResumeDebounce_lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreFailoverResumeDebounce {
+    return try FfiConverterTypeCoreFailoverResumeDebounce.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFailoverResumeDebounce_lower(_ value: CoreFailoverResumeDebounce) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCoreFailoverResumeDebounce.lower(value)
+}
+
+
+
+
 public protocol CoreLanHealthTrackerProtocol : AnyObject {
 
     func clear()
@@ -17254,6 +17542,16 @@ public func coreDetectLinks(body: String) -> [CoreDetectedLink] {
     )
 })
 }
+/**
+ * The default [`CoreFailoverResumeDebounce`] window, exported so both shells
+ * read one number instead of each hardcoding its own copy.
+ */
+public func coreFailoverResumeWindowMs() -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_failover_resume_window_ms($0
+    )
+})
+}
 public func coreFormatLanEndpoint(endpoint: CoreLanEndpoint) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_format_lan_endpoint(
@@ -17688,6 +17986,18 @@ public func coreTickStatusFor(lamport: UInt64, deliveredThrough: UInt64, readThr
     )
 })
 }
+/**
+ * Return exactly the first route supplied by the caller.
+ *
+ * # Contract
+ *
+ * `routes` must come from [`CoreMeshRouterState::routes_for`], which has
+ * already applied LAN preference, authenticated symmetric BLE-role election,
+ * and sticky connection age. This helper deliberately does not re-sort:
+ * without both user ids it cannot reproduce the identity-dependent BLE
+ * election. `frame_size` remains in the ABI for compatibility with clients
+ * that predate the single-route policy.
+ */
 public func coreTransportSendPlan(routes: [CoreTransportRoute], frameSize: UInt32) -> [CoreTransportRoute] {
     return try!  FfiConverterSequenceTypeCoreTransportRoute.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_transport_send_plan(
@@ -19463,6 +19773,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_detect_links() != 34673) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_failover_resume_window_ms() != 41431) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_format_lan_endpoint() != 59419) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -19544,7 +19857,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_tick_status_for() != 17631) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_transport_send_plan() != 40925) {
+    if (uniffi_cruisemesh_core_checksum_func_core_transport_send_plan() != 58576) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_unread_count() != 12034) {
@@ -19899,6 +20212,24 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_bleframereassembler_accept() != 35445) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_cancel() != 29753) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_clear() != 44323) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_fired() != 6024) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_is_pending() != 9366) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_request() != 40999) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_window_ms() != 26799) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corelanhealthtracker_clear() != 47217) {
@@ -20478,6 +20809,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_bleframereassembler_new() != 1261) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corefailoverresumedebounce_new() != 9684) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corefailoverresumedebounce_with_window_ms() != 55154) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_corelanhealthtracker_new() != 56458) {

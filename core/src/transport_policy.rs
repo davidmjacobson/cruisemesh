@@ -920,6 +920,131 @@ fn health_decision(action: CoreLanHealthAction, nonce: Option<u64>) -> CoreLanHe
     CoreLanHealthDecision { action, nonce }
 }
 
+/// How long a failover "resume sync" fan-out waits for the rest of a radio
+/// event's disconnects to land before it runs — see
+/// [`CoreFailoverResumeDebounce`].
+///
+/// Sized from field evidence (2026-08-07 capture): when several BLE links die
+/// in one radio event, the per-link disconnect callbacks arrived spread over
+/// roughly 240ms. A window that outlasts that whole spread is what makes the
+/// difference between resuming onto a route whose own death is still in
+/// flight and resuming onto whatever route actually survived. 300ms is the
+/// smallest round number above the observed spread; it is deliberately not
+/// much larger, because this delay is added to every genuine failover before
+/// bulk sync continues.
+pub const FAILOVER_RESUME_WINDOW_MS: i64 = 300;
+
+/// The default [`CoreFailoverResumeDebounce`] window, exported so both shells
+/// read one number instead of each hardcoding its own copy.
+#[uniffi::export]
+pub fn core_failover_resume_window_ms() -> i64 {
+    FAILOVER_RESUME_WINDOW_MS
+}
+
+/// Leading-edge, per-logical-peer debounce for the failover resume fan-out
+/// (Android `MeshService.resumeLogicalPeerSync`, iOS
+/// `MeshController.resumeLogicalPeerSync`).
+///
+/// The bug this exists for (2026-08-07): resuming ran *synchronously inside*
+/// the BLE disconnect callback, so when several centrals dropped in one radio
+/// event the very first callback immediately queued a multi-KB carry drain
+/// plus a digest onto the peer's sibling route — a route whose own
+/// disconnect callback was still ~100ms away. The notification was rejected
+/// outright and the sibling link was torn down as a send failure, which is a
+/// worse outcome than simply waiting: the frames were wasted, the teardown
+/// was attributed to the wrong cause, and the sync had to happen again anyway
+/// once the real route was elected.
+///
+/// Semantics are deliberately *leading-edge with no extension*: the first
+/// request for a key arms a window and every further request inside that
+/// window is absorbed into it, so a burst of `n` disconnects for one logical
+/// peer produces exactly one resume, and that resume is guaranteed to run
+/// within one window of the burst's *start* rather than being pushed further
+/// out by each new event. A trailing/extending debounce could starve a resume
+/// indefinitely under a steady disconnect stream, which for a mesh whose
+/// whole job is to keep syncing is the worse failure.
+///
+/// Coalescing is per key (the peer's UserID hex), never global: two different
+/// peers failing over in the same radio event each get their own resume.
+#[derive(uniffi::Object)]
+pub struct CoreFailoverResumeDebounce {
+    window_ms: i64,
+    /// key -> the `now_ms` at which the pending window was armed.
+    armed: Mutex<HashMap<String, i64>>,
+}
+
+#[uniffi::export]
+impl CoreFailoverResumeDebounce {
+    #[uniffi::constructor]
+    pub fn new() -> Self {
+        Self::with_window_ms(FAILOVER_RESUME_WINDOW_MS)
+    }
+
+    #[uniffi::constructor]
+    pub fn with_window_ms(window_ms: i64) -> Self {
+        Self {
+            window_ms: window_ms.max(0),
+            armed: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn window_ms(&self) -> i64 {
+        self.window_ms
+    }
+
+    /// Asks whether this failover should arm a timer. `Some(delay_ms)` means
+    /// the caller owns the window and must schedule the resume that far out,
+    /// calling [`Self::fired`] when the timer runs; `None` means an already
+    /// armed window will cover this request, so the caller does nothing.
+    ///
+    /// A marker older than the window is treated as lost rather than as
+    /// permanently pending (a cancelled timer, a process-lifecycle hiccup, or
+    /// a wall-clock jump backwards): it re-arms. Without that, one dropped
+    /// timer would silently disable failover resume for that peer forever,
+    /// which is exactly the class of silent-permanent-failure this file's
+    /// other trackers are written to avoid.
+    pub fn request(&self, key: String, now_ms: i64) -> Option<i64> {
+        let mut armed = self.armed.lock_recoverable();
+        if let Some(&armed_at_ms) = armed.get(&key) {
+            let elapsed = now_ms.saturating_sub(armed_at_ms);
+            if elapsed >= 0 && elapsed < self.window_ms {
+                return None;
+            }
+        }
+        armed.insert(key, now_ms);
+        Some(self.window_ms)
+    }
+
+    /// The armed timer for `key` just ran; the window is over, so the next
+    /// failover for this peer arms a fresh one. Call this *before* doing the
+    /// resume work so a disconnect arriving during that work starts a new
+    /// window instead of being swallowed.
+    pub fn fired(&self, key: String) {
+        self.armed.lock_recoverable().remove(&key);
+    }
+
+    /// Drops a pending window without running it (the caller cancelled its
+    /// timer, e.g. the peer went away entirely).
+    pub fn cancel(&self, key: String) {
+        self.armed.lock_recoverable().remove(&key);
+    }
+
+    pub fn is_pending(&self, key: String) -> bool {
+        self.armed.lock_recoverable().contains_key(&key)
+    }
+
+    /// Forgets every pending window, e.g. on a full mesh stop.
+    pub fn clear(&self) {
+        self.armed.lock_recoverable().clear();
+    }
+}
+
+impl Default for CoreFailoverResumeDebounce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1388,5 +1513,68 @@ mod tests {
             tracker.next("a".into(), 28, 5).action,
             CoreLanHealthAction::Close
         );
+    }
+
+    #[test]
+    fn failover_resume_window_outlasts_the_observed_disconnect_burst() {
+        // The 2026-08-07 capture showed one radio event's disconnect
+        // callbacks spread over ~240ms. The window has to outlast that or the
+        // resume still fans out into a link whose death is in flight.
+        assert!(core_failover_resume_window_ms() > 240);
+        assert_eq!(core_failover_resume_window_ms(), FAILOVER_RESUME_WINDOW_MS);
+        assert_eq!(
+            CoreFailoverResumeDebounce::new().window_ms(),
+            FAILOVER_RESUME_WINDOW_MS
+        );
+    }
+
+    #[test]
+    fn failover_resume_coalesces_a_burst_into_one_armed_window() {
+        let debounce = CoreFailoverResumeDebounce::with_window_ms(300);
+        // First disconnect of the burst arms the window.
+        assert_eq!(debounce.request("peer".into(), 1_000), Some(300));
+        // The sibling links dying over the next 240ms are absorbed: exactly
+        // one resume runs for the whole radio event.
+        assert_eq!(debounce.request("peer".into(), 1_100), None);
+        assert_eq!(debounce.request("peer".into(), 1_240), None);
+        assert!(debounce.is_pending("peer".into()));
+        // The window is not extended by the later events -- it still expires
+        // one window after the burst *started*.
+        assert_eq!(debounce.request("peer".into(), 1_299), None);
+        debounce.fired("peer".into());
+        assert!(!debounce.is_pending("peer".into()));
+        // A later failover for the same peer is a new burst, not a repeat.
+        assert_eq!(debounce.request("peer".into(), 1_400), Some(300));
+    }
+
+    #[test]
+    fn failover_resume_coalesces_per_peer_not_globally() {
+        let debounce = CoreFailoverResumeDebounce::with_window_ms(300);
+        assert_eq!(debounce.request("peer-a".into(), 0), Some(300));
+        // Two peers failing over in the same radio event each get a resume.
+        assert_eq!(debounce.request("peer-b".into(), 10), Some(300));
+        assert_eq!(debounce.request("peer-a".into(), 20), None);
+    }
+
+    #[test]
+    fn failover_resume_rearms_when_a_pending_window_was_lost() {
+        let debounce = CoreFailoverResumeDebounce::with_window_ms(300);
+        assert_eq!(debounce.request("peer".into(), 0), Some(300));
+        // A timer that never fired must not disable this peer's resume
+        // forever; once the window has elapsed the next failover re-arms.
+        assert_eq!(debounce.request("peer".into(), 300), Some(300));
+        // Same for a wall clock that jumped backwards.
+        assert_eq!(debounce.request("peer".into(), 100), Some(300));
+    }
+
+    #[test]
+    fn failover_resume_cancel_and_clear_drop_pending_windows() {
+        let debounce = CoreFailoverResumeDebounce::with_window_ms(300);
+        assert_eq!(debounce.request("peer".into(), 0), Some(300));
+        debounce.cancel("peer".into());
+        assert_eq!(debounce.request("peer".into(), 10), Some(300));
+        debounce.clear();
+        assert!(!debounce.is_pending("peer".into()));
+        assert_eq!(debounce.request("peer".into(), 20), Some(300));
     }
 }
