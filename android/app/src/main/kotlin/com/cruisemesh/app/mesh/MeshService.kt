@@ -519,6 +519,7 @@ class MeshService : Service() {
             return START_NOT_STICKY
         }
         identity = loadedIdentity
+        MeshRouter.setLocalUserId(loadedIdentity.userId)
         store = AppStore.get(this)
         // FA3: was a synchronous main-thread call here (full outbound-envelope
         // scans for every contact/group plus carried ids) -- now dispatched to
@@ -950,10 +951,9 @@ class MeshService : Service() {
         val now = System.currentTimeMillis()
         val inputs = RadioPowerInputs(
             screenInteractive = screenInteractive,
-            // identifiedRoutes(), not the raw connected-socket count: a link
-            // that hasn't HELLO'd yet can't carry a message yet either, so it
-            // shouldn't count as "not lonely" for duty-mode purposes.
-            liveLinkCount = MeshRouter.identifiedRoutes().size,
+            // Logical peers, not raw connected routes: a pre-HELLO link cannot
+            // carry a message yet, and a peer's dual BLE roles still count once.
+            liveLinkCount = MeshRouter.connectedUserCount(),
             msSinceLastLinkChange = if (lastLinkChangeAtMs == 0L) Long.MAX_VALUE / 2 else now - lastLinkChangeAtMs,
             msSinceCarryQueueGrew =
                 if (carryQueueLastGrewAtMs == 0L) Long.MAX_VALUE / 2 else now - carryQueueLastGrewAtMs,
@@ -1059,10 +1059,13 @@ class MeshService : Service() {
     }
 
     private fun onCentralPeerDisconnected(address: String) {
+        val peerUserId = MeshRouter.userIdFor(address)
+        val wasSelected = MeshRouter.isSelectedRoute(address)
         recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
         pendingLanHints.clear(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
+        if (wasSelected) peerUserId?.let(::resumeLogicalPeerSync)
         noteLinkChangeAndReevaluate("central peer disconnected")
     }
 
@@ -1073,10 +1076,13 @@ class MeshService : Service() {
     }
 
     private fun onPeripheralCentralDisconnected(address: String) {
+        val peerUserId = MeshRouter.userIdFor(address)
+        val wasSelected = MeshRouter.isSelectedRoute(address)
         recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
         pendingLanHints.clear(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
+        if (wasSelected) peerUserId?.let(::resumeLogicalPeerSync)
         noteLinkChangeAndReevaluate("peripheral central disconnected")
     }
 
@@ -1086,6 +1092,7 @@ class MeshService : Service() {
         endpoint: LanManualEndpoint?,
         networkId: String?,
     ) {
+        val previouslySelectedAddress = MeshRouter.routeFor(userId)?.second
         MeshRouter.onConnected(address, MeshRouterState.Transport.LAN)
         noteLinkChangeAndReevaluate("LAN peer authenticated")
         if (!MeshRouter.onHello(address, userId)) {
@@ -1110,6 +1117,12 @@ class MeshService : Service() {
         LanTransportDiagnostics.authenticated(address, peerName)
         Log.i(TAG, "Secure LAN link active with $peerName")
         sendHello(address)
+        if (MeshRouter.routeFor(userId)?.second != previouslySelectedAddress) {
+            // LAN authentication itself installs the identity mapping. Do not
+            // wait for the peer's wire HELLO (or the periodic digest tick) to
+            // continue bulk sync on this newly preferred route.
+            resumeLogicalPeerSync(userId)
+        }
         val currentTransport = lanTransport
         val eagerHint = authenticatedLanEndpointHint(
             contact = contact,
@@ -1131,17 +1144,30 @@ class MeshService : Service() {
     }
 
     private fun onLanPeerDisconnected(address: String) {
+        val peerUserId = MeshRouter.userIdFor(address)
+        val wasSelected = MeshRouter.isSelectedRoute(address)
         recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
         lanHealthTracker.remove(address)
         LanTransportDiagnostics.disconnected(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
+        if (wasSelected) peerUserId?.let(::resumeLogicalPeerSync)
         noteLinkChangeAndReevaluate("LAN peer disconnected")
+    }
+
+    /** Immediately continue sync after either promotion or failover instead
+     * of waiting for the next periodic digest. */
+    private fun resumeLogicalPeerSync(peerUserId: ByteArray) {
+        val identity = identity ?: return
+        val (_, address) = MeshRouter.routeFor(peerUserId) ?: return
+        Log.i(TAG, "Logical peer selected $address; resuming carry and digest sync")
+        envelopeProcessor?.drainCarriedEnvelopesTo(address, peerUserId)
+        sendDigestTo(address, peerUserId, identity)
     }
 
     private fun onLanNetworkReady(hint: Frame.LanEndpoint, networkId: String?) {
         val frame = encodeLanEndpointFrame(hint) ?: return
-        for (route in MeshRouter.identifiedRoutes()) {
+        for (route in MeshRouter.selectedIdentifiedRoutes()) {
             if (route.transport == MeshRouterState.Transport.LAN) continue
             if (store.getContact(route.userId) == null) continue
             MeshRouter.sendToAddress(route.address, frame)
@@ -1407,6 +1433,8 @@ class MeshService : Service() {
         // binder thread, can otherwise reach handleDigest's
         // MeshRouter.userIdFor(address) lookup before this registration is
         // visible.
+        val previouslySelectedAddress = MeshRouter.routeFor(userId)?.second
+        MeshRouter.setLocalUserId(identity.userId)
         if (!MeshRouter.onHello(address, userId)) {
             Log.w(TAG, "Dropping HELLO that conflicts with the authenticated identity for $address")
             return
@@ -1427,6 +1455,25 @@ class MeshService : Service() {
         pendingLanHints.take(address)?.let { hint ->
             Log.i(TAG, "Replaying held LAN endpoint hint from $address")
             handleLanEndpointHint(address, hint)
+        }
+
+        val selectedAddress = MeshRouter.routeFor(userId)?.second
+        if (selectedAddress != null &&
+            selectedAddress != previouslySelectedAddress &&
+            selectedAddress != address
+        ) {
+            // Installing our identity can flip election to an already-HELLO'd
+            // inverse BLE role. Continue there even though this HELLO arrived
+            // on the now-superseded link.
+            resumeLogicalPeerSync(userId)
+        }
+
+        if (!MeshRouter.isSelectedRoute(address)) {
+            Log.i(
+                TAG,
+                "HELLO route $address retained for control/failover; bulk sync uses the elected logical-peer route",
+            )
+            return
         }
 
         // Hand off anything we're muling for this peer (DESIGN.md §5.3 carry
@@ -1487,7 +1534,7 @@ class MeshService : Service() {
         assertOffMainThreadForStore("checkDigestMaintenance")
         val identity = this.identity ?: return
         if (!running) return
-        val routes = MeshRouter.identifiedRoutes()
+        val routes = MeshRouter.selectedIdentifiedRoutes()
         // Drop bookkeeping for links that have gone away.
         lastDigestAtByAddress.keys.retainAll(routes.map { it.address }.toSet())
         val now = System.currentTimeMillis()

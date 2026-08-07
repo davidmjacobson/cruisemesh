@@ -46,6 +46,10 @@ enum MeshRouter {
         state.clear(transports: [.central, .peripheral])
     }
 
+    static func setLocalUserId(_ userId: Data) {
+        state.setLocalUserId(userId)
+    }
+
     static func onConnected(address: String, transport: MeshRouterState.Transport) {
         state.onConnected(address: address, transport: transport)
     }
@@ -108,8 +112,20 @@ enum MeshRouter {
         state.transportFor(address: address)
     }
 
+    static func routeFor(userId: Data) -> (MeshRouterState.Transport, String)? {
+        state.routeFor(userId: userId)
+    }
+
     static func identifiedRoutes() -> [MeshRouterState.IdentifiedRoute] {
         state.identifiedRoutes()
+    }
+
+    static func selectedIdentifiedRoutes() -> [MeshRouterState.IdentifiedRoute] {
+        state.selectedIdentifiedRoutes()
+    }
+
+    static func isSelectedRoute(address: String) -> Bool {
+        state.isSelectedRoute(address: address)
     }
 
     @discardableResult
@@ -134,7 +150,7 @@ enum MeshRouter {
     @discardableResult
     static func relayToAllExcept(_ exceptAddress: String, frame: Data) -> Int {
         var count = 0
-        for (transport, address) in state.connectedRoutes() where address != exceptAddress {
+        for (transport, address) in state.relayRoutes(exceptAddress: exceptAddress) {
             if dispatch(transport: transport, address: address, frame: frame) { count += 1 }
         }
         return count
@@ -143,7 +159,7 @@ enum MeshRouter {
     @discardableResult
     static func relayToAll(frame: Data) -> Int {
         var count = 0
-        for (transport, address) in state.connectedRoutes() {
+        for (transport, address) in state.relayRoutes() {
             if dispatch(transport: transport, address: address, frame: frame) { count += 1 }
         }
         return count

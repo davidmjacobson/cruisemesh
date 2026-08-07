@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::{CoreCarriedCursor, DigestEntry};
@@ -24,7 +25,6 @@ impl<T> PoisonRecoverable<T> for Mutex<T> {
     }
 }
 
-pub const SMALL_FRAME_RACE_MAX_BYTES: u32 = 8 * 1024;
 pub const DEFAULT_INITIAL_BACKOFF_MS: i64 = 5_000;
 pub const DEFAULT_MAX_BACKOFF_MS: i64 = 5 * 60_000;
 pub const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 6;
@@ -122,10 +122,17 @@ pub enum CoreTransport {
 }
 
 impl CoreTransport {
-    fn priority(self) -> u8 {
+    fn priority(self, local_user_id: Option<&[u8]>, peer_user_id: &[u8]) -> u8 {
         match self {
-            Self::Lan => 10,
-            Self::Central | Self::Peripheral => 0,
+            Self::Lan => 30,
+            // Both phones can simultaneously hold the two inverse BLE roles.
+            // Elect the same physical direction at both ends from authenticated
+            // identities: the lexicographically smaller user is central and
+            // the larger user is peripheral. If local identity has not been
+            // installed yet, preserve a deterministic central-first fallback.
+            Self::Central if local_user_id.is_none_or(|local| local < peer_user_id) => 20,
+            Self::Peripheral if local_user_id.is_some_and(|local| local > peer_user_id) => 20,
+            Self::Central | Self::Peripheral => 10,
         }
     }
 }
@@ -146,6 +153,7 @@ pub struct CoreIdentifiedRoute {
 #[derive(Clone)]
 struct Peer {
     transport: CoreTransport,
+    connected_sequence: u64,
     user_id: Option<Vec<u8>>,
     /// From HELLO2; `None` = peer never sent one (a pre-HELLO2 build).
     capabilities: Option<u32>,
@@ -188,6 +196,8 @@ pub struct CoreCarriedLane {
 pub struct CoreMeshRouterState {
     peers: Mutex<HashMap<String, Peer>>,
     logical_carry: Mutex<HashMap<Vec<u8>, LogicalCarryState>>,
+    local_user_id: Mutex<Option<Vec<u8>>>,
+    next_connected_sequence: AtomicU64,
 }
 
 #[uniffi::export]
@@ -197,7 +207,18 @@ impl CoreMeshRouterState {
         Self {
             peers: Mutex::new(HashMap::new()),
             logical_carry: Mutex::new(HashMap::new()),
+            local_user_id: Mutex::new(None),
+            next_connected_sequence: AtomicU64::new(0),
         }
+    }
+
+    /// Install the identity used for symmetric BLE-role election. For two
+    /// authenticated users, the smaller user id selects its central route and
+    /// the larger selects the inverse peripheral route, so both endpoints pick
+    /// the same physical connection rather than crossing over and duplicating
+    /// every frame on the two links.
+    pub fn set_local_user_id(&self, user_id: Vec<u8>) {
+        *self.local_user_id.lock_recoverable() = Some(user_id);
     }
 
     pub fn on_connected(&self, address: String, transport: CoreTransport) {
@@ -205,6 +226,7 @@ impl CoreMeshRouterState {
             address,
             Peer {
                 transport,
+                connected_sequence: self.next_connected_sequence.fetch_add(1, Ordering::Relaxed),
                 user_id: None,
                 capabilities: None,
                 hidden_offered: std::collections::HashSet::new(),
@@ -494,6 +516,84 @@ impl CoreMeshRouterState {
             .collect()
     }
 
+    /// One selected route per authenticated logical peer. LAN wins over BLE;
+    /// the two BLE roles use the symmetric identity election documented in
+    /// [`Self::set_local_user_id`]. Equal-ranked links keep the oldest live
+    /// connection, making address rotation sticky until the incumbent drops.
+    pub fn selected_identified_routes(&self) -> Vec<CoreIdentifiedRoute> {
+        let peers = self.peers.lock_recoverable();
+        let local_user_id = self.local_user_id.lock_recoverable();
+        let mut selected: HashMap<Vec<u8>, (&String, &Peer)> = HashMap::new();
+        for (address, peer) in peers.iter() {
+            let Some(user_id) = peer.user_id.as_ref() else {
+                continue;
+            };
+            let replace = selected.get(user_id).is_none_or(|(_, current)| {
+                route_precedes(peer, current, local_user_id.as_deref(), user_id)
+            });
+            if replace {
+                selected.insert(user_id.clone(), (address, peer));
+            }
+        }
+        let mut routes: Vec<_> = selected
+            .into_iter()
+            .map(|(user_id, (address, peer))| CoreIdentifiedRoute {
+                transport: peer.transport,
+                address: address.clone(),
+                user_id,
+            })
+            .collect();
+        routes.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+        routes
+    }
+
+    /// Whether this authenticated address is the elected application-data
+    /// route for its logical peer. Other live links remain available for
+    /// exact-link handshake/control replies but are quarantined from bulk
+    /// drains and periodic fanout.
+    pub fn is_selected_route(&self, address: String) -> bool {
+        self.selected_identified_routes()
+            .iter()
+            .any(|route| route.address == address)
+    }
+
+    /// Epidemic fanout plan: one route per authenticated user plus every
+    /// not-yet-identified link. If the source is identified, exclude all of
+    /// that user's physical routes so a frame cannot echo through its other
+    /// BLE role or rotated address.
+    pub fn relay_routes(&self, except_address: Option<String>) -> Vec<CoreTransportRoute> {
+        let excluded_user = {
+            let peers = self.peers.lock_recoverable();
+            except_address
+                .as_ref()
+                .and_then(|address| peers.get(address))
+                .and_then(|peer| peer.user_id.clone())
+        };
+        let selected_addresses: HashSet<_> = self
+            .selected_identified_routes()
+            .into_iter()
+            .filter(|route| excluded_user.as_ref() != Some(&route.user_id))
+            .map(|route| route.address)
+            .collect();
+        let peers = self.peers.lock_recoverable();
+        let mut routes: Vec<_> = peers
+            .iter()
+            .filter(|(address, peer)| {
+                if peer.user_id.is_some() {
+                    selected_addresses.contains(*address)
+                } else {
+                    except_address.as_ref() != Some(*address)
+                }
+            })
+            .map(|(address, peer)| CoreTransportRoute {
+                transport: peer.transport,
+                address: address.clone(),
+            })
+            .collect();
+        routes.sort_by(|a, b| a.address.cmp(&b.address));
+        routes
+    }
+
     pub fn connected_user_count(&self) -> u32 {
         self.peers
             .lock_recoverable()
@@ -508,18 +608,29 @@ impl CoreMeshRouterState {
     }
 
     pub fn routes_for(&self, user_id: Vec<u8>) -> Vec<CoreTransportRoute> {
-        let mut routes: Vec<_> = self
-            .peers
-            .lock_recoverable()
+        let peers = self.peers.lock_recoverable();
+        let local_user_id = self.local_user_id.lock_recoverable();
+        let mut matching: Vec<_> = peers
             .iter()
             .filter(|(_, peer)| peer.user_id.as_ref() == Some(&user_id))
+            .collect();
+        matching.sort_by(|(address_a, peer_a), (address_b, peer_b)| {
+            route_ordering(
+                peer_a,
+                address_a,
+                peer_b,
+                address_b,
+                local_user_id.as_deref(),
+                &user_id,
+            )
+        });
+        matching
+            .into_iter()
             .map(|(address, peer)| CoreTransportRoute {
                 transport: peer.transport,
                 address: address.clone(),
             })
-            .collect();
-        routes.sort_by_key(|route| std::cmp::Reverse(route.transport.priority()));
-        routes
+            .collect()
     }
 
     pub fn helloed_user_ids(&self) -> Vec<Vec<u8>> {
@@ -544,28 +655,53 @@ impl CoreMeshRouterState {
     }
 }
 
+fn route_precedes(
+    candidate: &Peer,
+    current: &Peer,
+    local_user_id: Option<&[u8]>,
+    peer_user_id: &[u8],
+) -> bool {
+    let candidate_priority = candidate.transport.priority(local_user_id, peer_user_id);
+    let current_priority = current.transport.priority(local_user_id, peer_user_id);
+    candidate_priority > current_priority
+        || (candidate_priority == current_priority
+            && candidate.connected_sequence < current.connected_sequence)
+}
+
+fn route_ordering(
+    a: &Peer,
+    address_a: &str,
+    b: &Peer,
+    address_b: &str,
+    local_user_id: Option<&[u8]>,
+    peer_user_id: &[u8],
+) -> std::cmp::Ordering {
+    b.transport
+        .priority(local_user_id, peer_user_id)
+        .cmp(&a.transport.priority(local_user_id, peer_user_id))
+        .then_with(|| a.connected_sequence.cmp(&b.connected_sequence))
+        .then_with(|| address_a.cmp(address_b))
+}
+
 #[uniffi::export]
+/// Return exactly the first route supplied by the caller.
+///
+/// # Contract
+///
+/// `routes` must come from [`CoreMeshRouterState::routes_for`], which has
+/// already applied LAN preference, authenticated symmetric BLE-role election,
+/// and sticky connection age. This helper deliberately does not re-sort:
+/// without both user ids it cannot reproduce the identity-dependent BLE
+/// election. `frame_size` remains in the ABI for compatibility with clients
+/// that predate the single-route policy.
 pub fn core_transport_send_plan(
     routes: Vec<CoreTransportRoute>,
     frame_size: u32,
 ) -> Vec<CoreTransportRoute> {
-    let Some(lan) = routes
-        .iter()
-        .find(|route| route.transport == CoreTransport::Lan)
-        .cloned()
-    else {
-        return routes.into_iter().take(1).collect();
-    };
-    if frame_size > SMALL_FRAME_RACE_MAX_BYTES {
-        return vec![lan];
-    }
-    let Some(ble) = routes
-        .into_iter()
-        .find(|route| route.transport != CoreTransport::Lan)
-    else {
-        return vec![lan];
-    };
-    vec![lan, ble]
+    let _ = frame_size;
+    // A logical peer gets exactly one application-data route; disconnecting
+    // it makes the next preference-ordered call naturally fail over.
+    routes.into_iter().take(1).collect()
 }
 
 #[derive(Clone, Copy)]
@@ -1044,9 +1180,11 @@ mod tests {
     #[test]
     fn router_rejects_identity_changes_and_prefers_lan() {
         let router = CoreMeshRouterState::new();
+        router.set_local_user_id(vec![0]);
         router.on_connected("ble".into(), CoreTransport::Central);
         router.on_connected("lan".into(), CoreTransport::Lan);
         assert!(router.on_hello("ble".into(), vec![1]));
+        assert_eq!(router.route_for(vec![1]).unwrap().address, "ble");
         assert!(router.on_hello("lan".into(), vec![1]));
         assert!(!router.on_hello("lan".into(), vec![2]));
         assert_eq!(router.route_for(vec![1]).unwrap().address, "lan");
@@ -1054,7 +1192,30 @@ mod tests {
     }
 
     #[test]
-    fn send_plan_races_small_frames_and_uses_lan_for_large_frames() {
+    fn installing_local_identity_can_flip_an_existing_dual_role_peer() {
+        let router = CoreMeshRouterState::new();
+        let local = vec![2; 16];
+        let peer = vec![1; 16];
+        router.on_connected("central".into(), CoreTransport::Central);
+        router.on_connected("peripheral".into(), CoreTransport::Peripheral);
+        assert!(router.on_hello("central".into(), peer.clone()));
+        assert!(router.on_hello("peripheral".into(), peer.clone()));
+        assert_eq!(
+            router.route_for(peer.clone()).unwrap().address,
+            "central",
+            "missing local identity uses the documented central-first fallback"
+        );
+
+        router.set_local_user_id(local);
+        assert_eq!(
+            router.route_for(peer).unwrap().address,
+            "peripheral",
+            "the larger local identity elects the inverse BLE role"
+        );
+    }
+
+    #[test]
+    fn send_plan_uses_exactly_one_elected_route_for_every_frame_size() {
         let routes = vec![
             CoreTransportRoute {
                 transport: CoreTransport::Lan,
@@ -1065,8 +1226,117 @@ mod tests {
                 address: "ble".into(),
             },
         ];
-        assert_eq!(core_transport_send_plan(routes.clone(), 100).len(), 2);
-        assert_eq!(core_transport_send_plan(routes, 9_000).len(), 1);
+        assert_eq!(
+            core_transport_send_plan(routes.clone(), 100),
+            vec![routes[0].clone()]
+        );
+        assert_eq!(
+            core_transport_send_plan(routes.clone(), 9_000),
+            vec![routes[0].clone()]
+        );
+    }
+
+    #[test]
+    fn authenticated_ids_elect_the_same_ble_connection_at_both_ends() {
+        let alice = vec![1; 16];
+        let bob = vec![2; 16];
+
+        let alice_router = CoreMeshRouterState::new();
+        alice_router.set_local_user_id(alice.clone());
+        alice_router.on_connected("alice-central".into(), CoreTransport::Central);
+        alice_router.on_connected("alice-peripheral".into(), CoreTransport::Peripheral);
+        assert!(alice_router.on_hello("alice-central".into(), bob.clone()));
+        assert!(alice_router.on_hello("alice-peripheral".into(), bob.clone()));
+
+        let bob_router = CoreMeshRouterState::new();
+        bob_router.set_local_user_id(bob.clone());
+        bob_router.on_connected("bob-central".into(), CoreTransport::Central);
+        bob_router.on_connected("bob-peripheral".into(), CoreTransport::Peripheral);
+        assert!(bob_router.on_hello("bob-central".into(), alice.clone()));
+        assert!(bob_router.on_hello("bob-peripheral".into(), alice.clone()));
+
+        assert_eq!(
+            alice_router.route_for(bob).unwrap().transport,
+            CoreTransport::Central,
+            "smaller authenticated user elects its central half"
+        );
+        assert_eq!(
+            bob_router.route_for(alice).unwrap().transport,
+            CoreTransport::Peripheral,
+            "larger authenticated user elects the inverse half of that link"
+        );
+    }
+
+    #[test]
+    fn selected_route_is_sticky_across_rotation_and_fails_over_on_disconnect() {
+        let router = CoreMeshRouterState::new();
+        let local = vec![1; 16];
+        let peer = vec![2; 16];
+        router.set_local_user_id(local);
+        router.on_connected("old-central".into(), CoreTransport::Central);
+        assert!(router.on_hello("old-central".into(), peer.clone()));
+        router.on_connected("rotated-central".into(), CoreTransport::Central);
+        assert!(router.on_hello("rotated-central".into(), peer.clone()));
+        router.on_connected("peripheral".into(), CoreTransport::Peripheral);
+        assert!(router.on_hello("peripheral".into(), peer.clone()));
+
+        assert_eq!(
+            router.route_for(peer.clone()).unwrap().address,
+            "old-central"
+        );
+        assert!(router.is_selected_route("old-central".into()));
+        assert!(!router.is_selected_route("rotated-central".into()));
+        assert_eq!(router.selected_identified_routes().len(), 1);
+
+        router.on_disconnected("old-central".into());
+        assert_eq!(
+            router.route_for(peer.clone()).unwrap().address,
+            "rotated-central",
+            "the next oldest preferred-role address takes over"
+        );
+        router.on_disconnected("rotated-central".into());
+        assert_eq!(
+            router.route_for(peer).unwrap().address,
+            "peripheral",
+            "the inverse BLE role remains a bounded fallback"
+        );
+    }
+
+    #[test]
+    fn relay_plan_selects_one_route_per_user_and_excludes_the_source_user() {
+        let router = CoreMeshRouterState::new();
+        let local = vec![1; 16];
+        let alice = vec![2; 16];
+        let bob = vec![3; 16];
+        router.set_local_user_id(local);
+        for (address, transport, user_id) in [
+            ("alice-central", CoreTransport::Central, Some(alice.clone())),
+            (
+                "alice-peripheral",
+                CoreTransport::Peripheral,
+                Some(alice.clone()),
+            ),
+            ("alice-lan", CoreTransport::Lan, Some(alice.clone())),
+            ("bob", CoreTransport::Central, Some(bob)),
+            ("unknown", CoreTransport::Peripheral, None),
+        ] {
+            router.on_connected(address.into(), transport);
+            if let Some(user_id) = user_id {
+                assert!(router.on_hello(address.into(), user_id));
+            }
+        }
+
+        let all = router.relay_routes(None);
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().any(|route| route.address == "alice-lan"));
+        assert!(all.iter().any(|route| route.address == "bob"));
+        assert!(all.iter().any(|route| route.address == "unknown"));
+
+        let excluding_alice = router.relay_routes(Some("alice-peripheral".into()));
+        assert_eq!(excluding_alice.len(), 2);
+        assert!(!excluding_alice
+            .iter()
+            .any(|route| route.address.starts_with("alice-")));
     }
 
     #[test]

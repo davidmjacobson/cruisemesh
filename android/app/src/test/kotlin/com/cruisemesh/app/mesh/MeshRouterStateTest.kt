@@ -54,15 +54,13 @@ class MeshRouterStateTest {
     fun `same peer connected via both roles is routable while either link is up`() {
         val state = MeshRouterState()
         val alice = userId(1)
+        state.setLocalUserId(userId(0))
         state.onConnected("CENTRAL-LINK", MeshRouterState.Transport.CENTRAL)
         state.onHello("CENTRAL-LINK", alice)
         state.onConnected("PERIPHERAL-LINK", MeshRouterState.Transport.PERIPHERAL)
         state.onHello("PERIPHERAL-LINK", alice)
 
-        // Either link is a valid route; routeFor just needs to find one.
-        val route = state.routeFor(alice)
-        assert(route == (MeshRouterState.Transport.CENTRAL to "CENTRAL-LINK") ||
-            route == (MeshRouterState.Transport.PERIPHERAL to "PERIPHERAL-LINK"))
+        assertEquals(MeshRouterState.Transport.CENTRAL to "CENTRAL-LINK", state.routeFor(alice))
 
         // Dropping one link leaves the other still routable to the same userId.
         state.onDisconnected("CENTRAL-LINK")
@@ -85,7 +83,7 @@ class MeshRouterStateTest {
     }
 
     @Test
-    fun `small frames race over LAN and one BLE route while large frames prefer LAN`() {
+    fun `all frame sizes use one elected logical peer route`() {
         val routes = listOf(
             MeshRouterState.Transport.LAN to "LAN",
             MeshRouterState.Transport.CENTRAL to "BLE-1",
@@ -93,10 +91,7 @@ class MeshRouterStateTest {
         )
 
         assertEquals(
-            listOf(
-                MeshRouterState.Transport.LAN to "LAN",
-                MeshRouterState.Transport.CENTRAL to "BLE-1",
-            ),
+            listOf(MeshRouterState.Transport.LAN to "LAN"),
             transportSendPlan(routes, frameSize = 512),
         )
         assertEquals(
@@ -210,6 +205,7 @@ class MeshRouterStateTest {
         state.onHello("PERIPHERAL-LINK", alice)
 
         assertEquals(setOf(com.cruisemesh.app.chat.UserIdHex.encode(alice)), state.helloedUserIds())
+        assertEquals(1, state.connectedUserCount())
 
         state.onDisconnected("CENTRAL-LINK")
         assertEquals(setOf(com.cruisemesh.app.chat.UserIdHex.encode(alice)), state.helloedUserIds())

@@ -187,11 +187,14 @@ and relay continue to work.
 
 ## Delivery policy
 
-LAN links are preferred over BLE for large frames. Small control and text
-frames race over LAN plus one BLE route so one unhealthy path does not add a
-full retry delay. Message IDs keep the duplicate arrival harmless. Relay upload
-remains useful whenever internet is available because it provides durable
-delivery after the local encounter ends.
+Each authenticated logical peer has one selected application-data route. LAN
+wins over BLE; when both BLE roles exist, authenticated user IDs elect the same
+physical direction at both endpoints. Superseded links remain available for
+exact-link handshake/control replies and bounded failover, but do not multiply
+message, digest, or epidemic fanout. When the selected link disconnects, the
+best remaining live route takes over immediately. Relay upload remains useful
+whenever internet is available because it provides durable delivery after the
+local encounter ends.
 
 The transport reuses existing digest synchronization and deduplication. The
 profile screen exposes listener/peer endpoints, authenticated peer names,

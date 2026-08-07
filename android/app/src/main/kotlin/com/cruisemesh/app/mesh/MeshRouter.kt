@@ -79,6 +79,9 @@ object MeshRouter {
         )
     }
 
+    /** Identity used by Rust to elect the same BLE direction at both peers. */
+    fun setLocalUserId(userId: ByteArray) = state.setLocalUserId(userId)
+
     /** A link to [address] over [transport] just became usable; see [MeshRouterState]. */
     fun onConnected(address: String, transport: MeshRouterState.Transport) = state.onConnected(address, transport)
 
@@ -126,9 +129,8 @@ object MeshRouter {
     fun transportFor(address: String): MeshRouterState.Transport? = state.transportFor(address)
 
     /**
-     * The route a send to [userId] would actually take right now (highest
-     * [MeshRouterState.Transport.routePriority] among its HELLO'd links, so
-     * LAN wins over BLE) -- e.g. so UI copy can say which transport a
+     * The route Rust elects for a send to [userId] right now (LAN wins over
+     * BLE) -- e.g. so UI copy can say which transport a
      * [ReachabilityLevel.NEARBY] contact is actually nearby over instead of
      * assuming BLE.
      */
@@ -137,11 +139,20 @@ object MeshRouter {
     /** Distinct HELLO'd peer userIds, hex-encoded; see [MeshRouterState.helloedUserIds]. */
     fun helloedUserIds(): Set<String> = state.helloedUserIds()
 
+    /** Number of authenticated logical peers, independent of physical links. */
+    fun connectedUserCount(): Int = state.connectedUserCount()
+
     /** Per-userId live transport for every HELLO'd peer; see [MeshRouterState.nearbyTransports]. */
     fun nearbyTransports(): Map<String, MeshRouterState.Transport> = state.nearbyTransports()
 
     /** Live routes that have identified themselves via HELLO. */
     fun identifiedRoutes(): List<MeshRouterState.IdentifiedRoute> = state.identifiedRoutes()
+
+    /** One elected application-data route per authenticated logical peer. */
+    fun selectedIdentifiedRoutes(): List<MeshRouterState.IdentifiedRoute> = state.selectedIdentifiedRoutes()
+
+    /** False for a superseded link retained only for exact-link control traffic. */
+    fun isSelectedRoute(address: String): Boolean = state.isSelectedRoute(address)
 
     /**
      * Sends [frame] to whichever live link has identified itself as [userId].
@@ -216,8 +227,11 @@ object MeshRouter {
 }
 
 /**
- * Small control/text frames race over LAN plus one BLE route; large payloads
- * use only the highest-priority route so photos do not duplicate over BLE.
+ * Returns the first route from Rust's preference-ordered [MeshRouterState.routesFor]
+ * result. Do not pass an arbitrary route list: BLE role preference depends on
+ * both authenticated user IDs and cannot be reconstructed from transport type
+ * alone. When the elected route disconnects, the next router query naturally
+ * promotes the best remaining route.
  */
 internal fun transportSendPlan(
     routes: List<Pair<MeshRouterState.Transport, String>>,
