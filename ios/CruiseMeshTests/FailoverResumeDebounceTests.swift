@@ -17,28 +17,53 @@ final class FailoverResumeDebounceTests: XCTestCase {
     func testOneRadioEventProducesExactlyOneResume() {
         let debounce = FailoverResumeDebounce(windowMs: 300)
         let peer = "aabbccdd"
-        XCTAssertEqual(debounce.request(key: peer, nowMs: 1_000), 300)
+        let arm = debounce.request(key: peer, nowMs: 1_000)
+        XCTAssertEqual(arm?.delayMs, 300)
         XCTAssertNil(debounce.request(key: peer, nowMs: 1_090))
         XCTAssertNil(debounce.request(key: peer, nowMs: 1_240))
         XCTAssertTrue(debounce.isPending(key: peer))
 
-        debounce.fired(key: peer)
+        debounce.fired(key: peer, token: arm?.token ?? 0)
         XCTAssertFalse(debounce.isPending(key: peer))
         // A genuinely later failover is a new burst.
-        XCTAssertEqual(debounce.request(key: peer, nowMs: 5_000), 300)
+        XCTAssertEqual(debounce.request(key: peer, nowMs: 5_000)?.delayMs, 300)
     }
 
     func testTwoPeersFailingOverTogetherEachGetTheirOwnResume() {
         let debounce = FailoverResumeDebounce(windowMs: 300)
-        XCTAssertEqual(debounce.request(key: "peer-a", nowMs: 0), 300)
-        XCTAssertEqual(debounce.request(key: "peer-b", nowMs: 5), 300)
+        XCTAssertEqual(debounce.request(key: "peer-a", nowMs: 0)?.delayMs, 300)
+        XCTAssertEqual(debounce.request(key: "peer-b", nowMs: 5)?.delayMs, 300)
+    }
+
+    func testAStaleTimerCannotClearANewlyArmedWindow() {
+        let debounce = FailoverResumeDebounce(windowMs: 300)
+        let first = debounce.request(key: "peer", nowMs: 0)
+        let second = debounce.request(key: "peer", nowMs: 300)
+        XCTAssertNotEqual(first?.token, second?.token)
+
+        // The first timer runs after the window was re-armed. Clearing the new
+        // window's marker here is what would let one burst resume twice.
+        debounce.fired(key: "peer", token: first?.token ?? 0)
+        XCTAssertTrue(debounce.isPending(key: "peer"))
+        XCTAssertNil(debounce.request(key: "peer", nowMs: 310))
     }
 
     func testClearDropsPendingWindows() {
         let debounce = FailoverResumeDebounce(windowMs: 300)
-        XCTAssertEqual(debounce.request(key: "peer", nowMs: 0), 300)
+        XCTAssertEqual(debounce.request(key: "peer", nowMs: 0)?.delayMs, 300)
         debounce.clear()
         XCTAssertFalse(debounce.isPending(key: "peer"))
-        XCTAssertEqual(debounce.request(key: "peer", nowMs: 10), 300)
+        XCTAssertEqual(debounce.request(key: "peer", nowMs: 10)?.delayMs, 300)
+    }
+
+    func testMonotonicClockIsUsedForTheWindow() {
+        // The window and the `asyncAfter` timer must read the same clock: a
+        // wall-clock marker paired with a monotonic timer desynchronises on any
+        // time correction, which splits one burst into two resumes.
+        let first = FailoverResumeDebounce.monotonicNowMs
+        let second = FailoverResumeDebounce.monotonicNowMs
+        XCTAssertGreaterThanOrEqual(second, first)
+        // Uptime, not epoch: nowhere near a 2026 wall-clock millisecond count.
+        XCTAssertLessThan(first, 1_000_000_000_000)
     }
 }

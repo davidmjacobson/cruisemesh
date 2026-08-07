@@ -19,6 +19,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
+import android.os.SystemClock
 import android.util.Log
 import java.util.ArrayDeque
 
@@ -118,7 +119,11 @@ internal fun shouldPaceFrameStart(
  * with nothing logged. Each start now registers a *fresh* callback tagged
  * with a generation number, and every stop names exactly the generation that
  * started. [BleAdvertiserStateMachine] owns those decisions (and carries the
- * three field reproductions); everything here is binder glue.
+ * three field reproductions); everything here is binder glue. It also owns the
+ * recovery those generations need -- a start that fails, or that the framework
+ * never answers at all, re-arms on a capped backoff via [advertiseWatchdog],
+ * because a phone that is not advertising gets no link events and so has
+ * nothing else left to re-trigger it.
  */
 @SuppressLint("MissingPermission")
 class BlePeripheral(
@@ -131,6 +136,10 @@ class BlePeripheral(
         context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? = bluetoothManager.adapter
 
+    // Written under [advertiseLock] (start/stop) but read from GATT binder
+    // threads under [lock] (sendFragment), so the publication has to be
+    // visible without holding advertiseLock.
+    @Volatile
     private var gattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private var outboundCharacteristic: BluetoothGattCharacteristic? = null
@@ -206,6 +215,21 @@ class BlePeripheral(
     private val advertiseLock = Any()
 
     /**
+     * The one pending [BleAdvertiserStateMachine.onWatchdogDue] tick, kept as a
+     * single instance so [scheduleAdvertiseWatchdog] can replace it rather than
+     * pile ticks up. It is what makes the machine's self-recovery real: a start
+     * that fails, and a start the framework never answers at all, both leave
+     * this armed instead of leaving the phone silently undiscoverable until
+     * some unrelated link event happens to come along (which, for a phone that
+     * is not advertising, may be never).
+     */
+    private val advertiseWatchdog = Runnable {
+        synchronized(advertiseLock) {
+            applyAdvertiseAction(advertiseMachine.onWatchdogDue(SystemClock.elapsedRealtime()))
+        }
+    }
+
+    /**
      * Fresh per start. Its [generation] is what makes a late callback from a
      * retired advertising set identifiable and therefore ignorable.
      */
@@ -218,7 +242,7 @@ class BlePeripheral(
                     return
                 }
                 Log.i(TAG, "Advertising started (generation $generation)")
-                applyAdvertiseAction(advertiseMachine.onStartSucceeded(generation))
+                applyAdvertiseAction(advertiseMachine.onStartSucceeded(generation, SystemClock.elapsedRealtime()))
             }
         }
 
@@ -245,7 +269,7 @@ class BlePeripheral(
                 } else {
                     Log.w(TAG, "Advertising failed: $errorCode (generation $generation)")
                 }
-                applyAdvertiseAction(advertiseMachine.onStartFailed(generation))
+                applyAdvertiseAction(advertiseMachine.onStartFailed(generation, SystemClock.elapsedRealtime()))
             }
         }
     }
@@ -417,12 +441,19 @@ class BlePeripheral(
             return
         }
 
-        gattServer = bluetoothManager.openGattServer(context, gattServerCallback)?.also { server ->
-            server.addService(buildGattService())
+        val server = bluetoothManager.openGattServer(context, gattServerCallback)?.also {
+            it.addService(buildGattService())
         }
 
-        advertiser = btAdapter.bluetoothLeAdvertiser
-        beginAdvertising()
+        // Publishing the server and asking for the first advertising generation
+        // happen under one lock so a teardown racing in between cannot start a
+        // generation against a server this method is still installing (the
+        // mirror of the window stop() closes).
+        synchronized(advertiseLock) {
+            gattServer = server
+            advertiser = btAdapter.bluetoothLeAdvertiser
+            beginAdvertising()
+        }
     }
 
     /**
@@ -439,14 +470,14 @@ class BlePeripheral(
      */
     private fun beginAdvertising() {
         synchronized(advertiseLock) {
-            applyAdvertiseAction(advertiseMachine.onStartRequested())
+            applyAdvertiseAction(advertiseMachine.onStartRequested(SystemClock.elapsedRealtime()))
         }
     }
 
     /** See [BleAdvertiserStateMachine.onConnectRestartRequested]. */
     private fun restartAdvertisingAfterConnect() {
         synchronized(advertiseLock) {
-            applyAdvertiseAction(advertiseMachine.onConnectRestartRequested())
+            applyAdvertiseAction(advertiseMachine.onConnectRestartRequested(SystemClock.elapsedRealtime()))
         }
     }
 
@@ -454,7 +485,8 @@ class BlePeripheral(
      * Runs one [AdvertiserAction] against the framework: the stop always
      * passes back the exact [AdvertiseCallback] instance its generation was
      * started with (`BluetoothLeAdvertiser` looks its advertising sets up by
-     * callback identity), and the start registers a brand-new one.
+     * callback identity), the start registers a brand-new one, and a requested
+     * watchdog is (re)armed on [handler].
      *
      * Callers must hold [advertiseLock].
      */
@@ -475,7 +507,23 @@ class BlePeripheral(
                 }
             }
         }
+        // The watchdog is armed *before* the start: a synchronous failure
+        // inside startAdvertisingGeneration re-enters here with the retry's own
+        // (shorter) watchdog, and whichever runs last is the one that stays
+        // armed.
+        action.watchdogInMs?.let(::scheduleAdvertiseWatchdog)
         action.startGeneration?.let(::startAdvertisingGeneration)
+    }
+
+    /**
+     * Arms the single [advertiseWatchdog] tick, replacing any pending one --
+     * the state machine always asks for the one deadline that matters next, so
+     * there is never a second one worth keeping. Callers must hold
+     * [advertiseLock].
+     */
+    private fun scheduleAdvertiseWatchdog(delayMs: Long) {
+        handler.removeCallbacks(advertiseWatchdog)
+        handler.postDelayed(advertiseWatchdog, delayMs.coerceAtLeast(0))
     }
 
     /** Callers must hold [advertiseLock]; see [applyAdvertiseAction]. */
@@ -485,10 +533,13 @@ class BlePeripheral(
         // Reporting the non-start back to the state machine matters as much as
         // not starting: leaving it in STARTING forever would early-return every
         // later restart, which is the shape of the very bug this file is
-        // fixing.
+        // fixing. This is a *stop*, not a failure -- there is no peripheral
+        // role to be discoverable for, so retrying on a timer would be a
+        // pointless wakeup every minute for as long as the mesh is off.
         val adv = advertiser
         if (gattServer == null || adv == null) {
-            advertiseMachine.onStartFailed(generation)
+            Log.i(TAG, "Not starting advertising generation $generation: peripheral role is not running")
+            applyAdvertiseAction(advertiseMachine.onStopRequested())
             return
         }
         val settings = AdvertiseSettings.Builder()
@@ -536,7 +587,10 @@ class BlePeripheral(
             // advertises again.
             Log.w(TAG, "startAdvertising for generation $generation threw: ${e.message}")
             advertiseCallbacks.remove(generation)
-            advertiseMachine.onStartFailed(generation)
+            // Unlike the no-server case above this *is* a failure: the
+            // peripheral role is meant to be up, so it re-arms and tries again
+            // (the adapter may simply be mid-toggle).
+            applyAdvertiseAction(advertiseMachine.onStartFailed(generation, SystemClock.elapsedRealtime()))
         }
     }
 
@@ -556,7 +610,7 @@ class BlePeripheral(
     fun setAdvertiseDutyMode(mode: RadioDutyMode) {
         val outcome = synchronized(advertiseLock) {
             if (advertiseMachine.desiredMode() == mode) return
-            val action = advertiseMachine.onDutyModeRequested(mode)
+            val action = advertiseMachine.onDutyModeRequested(mode, SystemClock.elapsedRealtime())
             applyAdvertiseAction(action)
             when {
                 !action.isNone -> "applied"
@@ -576,9 +630,16 @@ class BlePeripheral(
             // stale, and holding it would just leak the BlePeripheral it
             // closes over.
             advertiseCallbacks.clear()
+            // Closing and un-publishing the server belongs under the same lock
+            // as the stop decision. Released early, it leaves a window where a
+            // GATT binder thread delivering STATE_DISCONNECTED runs
+            // tearDownLink -> beginAdvertising, sees IDLE and a still-non-null
+            // gattServer, and starts a generation against a server this method
+            // is about to close -- leaving the machine STARTING for an
+            // advertiser that cannot exist, which absorbs the next start().
+            runCatching { gattServer?.close() }
+            gattServer = null
         }
-        runCatching { gattServer?.close() }
-        gattServer = null
         handler.removeCallbacksAndMessages(null)
         synchronized(lock) {
             connectedDevices.clear()

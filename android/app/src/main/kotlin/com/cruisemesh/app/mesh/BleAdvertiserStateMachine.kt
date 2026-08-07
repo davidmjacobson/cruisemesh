@@ -14,17 +14,30 @@ enum class AdvertiserState {
 
 /**
  * What [BlePeripheral] must actually do with `BluetoothLeAdvertiser` for a
- * decision. Both fields are generation numbers, never callbacks: the binder
- * owns the mapping from generation to the one `AdvertiseCallback` instance it
- * registered for that generation, which is the whole point (see the class doc
- * of [BleAdvertiserStateMachine]).
+ * decision. [stopGeneration] and [startGeneration] are generation numbers,
+ * never callbacks: the binder owns the mapping from generation to the one
+ * `AdvertiseCallback` instance it registered for that generation, which is the
+ * whole point (see the class doc of [BleAdvertiserStateMachine]).
  *
  * When both are set, the stop happens first and the start immediately after.
+ *
+ * [watchdogInMs], when set, asks the binder to call
+ * [BleAdvertiserStateMachine.onWatchdogDue] that many milliseconds from now on
+ * a monotonic clock. It is how the machine drives its own recovery -- either
+ * "this start has to have reported by then" or "retry the failed start then" --
+ * without owning a timer itself. A watchdog that turns out to be unnecessary is
+ * harmless: [BleAdvertiserStateMachine.onWatchdogDue] is state-guarded.
  */
 data class AdvertiserAction(
     val stopGeneration: Long? = null,
     val startGeneration: Long? = null,
+    val watchdogInMs: Long? = null,
 ) {
+    /**
+     * Nothing to ask the radio for. Deliberately ignores [watchdogInMs]: a
+     * bare timer request is not something the caller "applied" (this is what
+     * [BlePeripheral.setAdvertiseDutyMode] logs on).
+     */
     val isNone: Boolean get() = stopGeneration == null && startGeneration == null
 
     companion object {
@@ -85,15 +98,75 @@ data class AdvertiserAction(
  * [restartPending] is what a start-in-flight does with a request it cannot
  * serve yet.
  *
+ * ## Why the machine owns a watchdog
+ *
+ * Three states plus a generation would still be a one-way trip into the dark
+ * if a start could fail (or simply never report) with nothing arranged to try
+ * again:
+ *
+ * - **A failed start.** `ADVERTISE_FAILED_INTERNAL_ERROR` /
+ *   `TOO_MANY_ADVERTISERS` leave [AdvertiserState.IDLE]. Every organic
+ *   re-trigger is a *link* event -- a teardown, a central connect -- and a
+ *   phone that is not advertising gets no link events, so the one thing that
+ *   could restart advertising is the thing that being dark prevents. The
+ *   boolean this class replaced was accidentally protected here: it never
+ *   really stopped anything, so the framework's own legacy re-enable covered
+ *   for it.
+ * - **A start that never reports.** If the framework registers the set but
+ *   never delivers a callback, [AdvertiserState.STARTING] would absorb every
+ *   later request forever -- strictly worse than the boolean, which retried on
+ *   the next teardown.
+ *
+ * So [onStartFailed] arms a bounded re-arm ([RETRY_MIN_DELAY_MS], doubling per
+ * consecutive failure, capped at [RETRY_MAX_DELAY_MS]) and a start that has not
+ * reported within [START_WATCHDOG_MS] is force-retired and retried the same
+ * way. Both come back to the binder as [AdvertiserAction.watchdogInMs]. The
+ * retry never gives up: a phone that stops advertising is invisible to the
+ * whole fleet, so the capped-rate retry is the conservative choice, and a
+ * genuine full stop ([onStopRequested]) clears it.
+ *
  * All methods are `@Synchronized`: advertise callbacks arrive on binder
  * threads. This is a leaf monitor -- it never calls out -- so it cannot
  * deadlock with [BlePeripheral]'s own locks.
+ *
+ * Every `nowMs` argument must come from a monotonic clock
+ * (`SystemClock.elapsedRealtime()`), the same one the binder's timer counts
+ * down on.
  */
 class BleAdvertiserStateMachine(initialMode: RadioDutyMode = RadioDutyMode.LOW_POWER) {
+
+    companion object {
+        /**
+         * How long a `startAdvertising` may sit without `onStartSuccess` or
+         * `onStartFailure` before the generation is force-retired and retried.
+         * The framework answers in milliseconds when it answers at all, so this
+         * is generous on purpose: it is a stuck-state breaker, not a deadline.
+         */
+        const val START_WATCHDOG_MS = 8_000L
+
+        /** First re-arm delay after a failed (or stuck) start. */
+        const val RETRY_MIN_DELAY_MS = 2_000L
+
+        /**
+         * Ceiling for the doubling re-arm delay. Bounds how often a phone
+         * whose adapter is refusing advertisements retries, without ever
+         * abandoning discoverability.
+         */
+        const val RETRY_MAX_DELAY_MS = 60_000L
+    }
 
     private var state = AdvertiserState.IDLE
     private var generation = 0L
     private var desiredMode = initialMode
+
+    /** When the [AdvertiserState.STARTING] generation was handed to the framework. */
+    private var startedAtMs = 0L
+
+    /** When the next re-arm after a failed start is due, or null if none is. */
+    private var retryDueAtMs: Long? = null
+
+    /** Consecutive failed starts, for the doubling re-arm delay. */
+    private var failureStreak = 0
 
     /**
      * A restart was asked for while a start was still in flight. It cannot be
@@ -119,6 +192,10 @@ class BleAdvertiserStateMachine(initialMode: RadioDutyMode = RadioDutyMode.LOW_P
     @Synchronized
     fun hasRestartPending(): Boolean = restartPending
 
+    /** Visible for tests: a re-arm after a failed start is scheduled. */
+    @Synchronized
+    fun hasRetryPending(): Boolean = retryDueAtMs != null
+
     /**
      * Whether a `onStartSuccess`/`onStartFailure` callback tagged
      * [callbackGeneration] is still the one being waited on. False means the
@@ -132,11 +209,13 @@ class BleAdvertiserStateMachine(initialMode: RadioDutyMode = RadioDutyMode.LOW_P
     /**
      * "Make sure we are advertising." Idempotent: a start already in flight or
      * already succeeded is left alone, which is what keeps repeated calls
-     * (every link teardown calls this) from thrashing the advertiser.
+     * (every link teardown calls this) from thrashing the advertiser. A start
+     * request while a re-arm is pending starts now and drops the re-arm -- the
+     * caller has a fresher reason to advertise than the timer did.
      */
     @Synchronized
-    fun onStartRequested(): AdvertiserAction = when (state) {
-        AdvertiserState.IDLE -> beginStart(stopGeneration = null)
+    fun onStartRequested(nowMs: Long): AdvertiserAction = when (state) {
+        AdvertiserState.IDLE -> beginStart(nowMs, stopGeneration = null)
         AdvertiserState.STARTING, AdvertiserState.ADVERTISING -> AdvertiserAction.NONE
     }
 
@@ -148,7 +227,7 @@ class BleAdvertiserStateMachine(initialMode: RadioDutyMode = RadioDutyMode.LOW_P
      * outlive it and disable a later generation -- and start a fresh one.
      */
     @Synchronized
-    fun onConnectRestartRequested(): AdvertiserAction = forceRestart()
+    fun onConnectRestartRequested(nowMs: Long): AdvertiserAction = forceRestart(nowMs)
 
     /**
      * Battery: [RadioPowerPolicy]'s latest decision. A no-op if the mode is
@@ -166,14 +245,15 @@ class BleAdvertiserStateMachine(initialMode: RadioDutyMode = RadioDutyMode.LOW_P
      * - [AdvertiserState.ADVERTISING]: restart now.
      */
     @Synchronized
-    fun onDutyModeRequested(mode: RadioDutyMode): AdvertiserAction {
+    fun onDutyModeRequested(mode: RadioDutyMode, nowMs: Long): AdvertiserAction {
         if (mode == desiredMode) return AdvertiserAction.NONE
         desiredMode = mode
         return when (state) {
             // A policy tick is not a request to advertise: if the advertiser
-            // is down, only the mode is recorded, exactly as before.
+            // is down, only the mode is recorded, exactly as before. Any
+            // pending re-arm keeps its own schedule and picks the new mode up.
             AdvertiserState.IDLE -> AdvertiserAction.NONE
-            AdvertiserState.STARTING, AdvertiserState.ADVERTISING -> forceRestart()
+            AdvertiserState.STARTING, AdvertiserState.ADVERTISING -> forceRestart(nowMs)
         }
     }
 
@@ -182,10 +262,12 @@ class BleAdvertiserStateMachine(initialMode: RadioDutyMode = RadioDutyMode.LOW_P
      * follow-up restart if one was queued behind it.
      */
     @Synchronized
-    fun onStartSucceeded(callbackGeneration: Long): AdvertiserAction {
+    fun onStartSucceeded(callbackGeneration: Long, nowMs: Long): AdvertiserAction {
         if (!acceptsResultFor(callbackGeneration)) return AdvertiserAction.NONE
         state = AdvertiserState.ADVERTISING
-        return if (restartPending) forceRestart() else AdvertiserAction.NONE
+        failureStreak = 0
+        retryDueAtMs = null
+        return if (restartPending) forceRestart(nowMs) else AdvertiserAction.NONE
     }
 
     /**
@@ -195,26 +277,28 @@ class BleAdvertiserStateMachine(initialMode: RadioDutyMode = RadioDutyMode.LOW_P
      * binder therefore logs as unexpected. Mapping that code to "advertising"
      * is precisely how this class's first bug stayed invisible.
      *
-     * No retry is scheduled here: the next start request (a link teardown, a
-     * central connect, a duty-mode change, or a fresh [BlePeripheral.start])
-     * finds [AdvertiserState.IDLE] and tries again with a new generation.
+     * A re-arm is scheduled (see the class doc): the organic re-triggers are
+     * all link events, and a phone that is not advertising stops getting link
+     * events, so "the next teardown will retry" is not a recovery plan.
      */
     @Synchronized
-    fun onStartFailed(callbackGeneration: Long): AdvertiserAction {
+    fun onStartFailed(callbackGeneration: Long, nowMs: Long): AdvertiserAction {
         if (!acceptsResultFor(callbackGeneration)) return AdvertiserAction.NONE
-        state = AdvertiserState.IDLE
         restartPending = false
-        return AdvertiserAction.NONE
+        return AdvertiserAction(watchdogInMs = armRetry(nowMs))
     }
 
     /**
      * Full stop (the peripheral role is going away). Retires the current
      * generation whether or not its start ever reported, so a callback still
-     * in flight lands as stale and cannot resurrect a dead advertiser.
+     * in flight lands as stale and cannot resurrect a dead advertiser, and
+     * drops any pending re-arm -- a stopped peripheral must stay stopped.
      */
     @Synchronized
     fun onStopRequested(): AdvertiserAction {
         restartPending = false
+        retryDueAtMs = null
+        failureStreak = 0
         val stopGeneration = if (state == AdvertiserState.IDLE) null else generation
         // Retire unconditionally: the point is that nothing tagged with the
         // old generation is ever accepted again.
@@ -223,19 +307,97 @@ class BleAdvertiserStateMachine(initialMode: RadioDutyMode = RadioDutyMode.LOW_P
         return AdvertiserAction(stopGeneration = stopGeneration)
     }
 
-    private fun forceRestart(): AdvertiserAction = when (state) {
-        AdvertiserState.IDLE -> beginStart(stopGeneration = null)
+    /**
+     * The binder's timer fired. This is the machine's only self-recovery
+     * trigger, and it covers both stuck-state cases:
+     *
+     * - [AdvertiserState.STARTING] past [START_WATCHDOG_MS]: the framework
+     *   never answered. Retire the generation (which unregisters its callback,
+     *   so a very late answer lands as stale) and re-arm like any other failed
+     *   start.
+     * - [AdvertiserState.IDLE] with a re-arm due: start a fresh generation.
+     *
+     * Anything else -- including a tick that arrives early, or one left over
+     * from a state that has since moved on -- either reschedules itself for the
+     * remaining time or is a no-op, so spurious ticks are free and the binder
+     * never has to reason about cancelling them.
+     */
+    @Synchronized
+    fun onWatchdogDue(nowMs: Long): AdvertiserAction = when (state) {
+        AdvertiserState.ADVERTISING -> AdvertiserAction.NONE
+        AdvertiserState.STARTING -> {
+            val remaining = START_WATCHDOG_MS - elapsedSince(startedAtMs, nowMs)
+            if (remaining > 0) {
+                AdvertiserAction(watchdogInMs = remaining)
+            } else {
+                // Retire the unanswered generation *and* re-arm rather than
+                // restarting instantly: whatever wedged the framework is
+                // unlikely to be fixed microseconds later, and the doubling
+                // delay is what bounds the retry rate if it is not.
+                val stuck = generation
+                restartPending = false
+                AdvertiserAction(stopGeneration = stuck, watchdogInMs = armRetry(nowMs))
+            }
+        }
+        AdvertiserState.IDLE -> {
+            val due = retryDueAtMs
+            when {
+                due == null -> AdvertiserAction.NONE
+                nowMs - due >= 0 -> beginStart(nowMs, stopGeneration = null)
+                else -> AdvertiserAction(watchdogInMs = due - nowMs)
+            }
+        }
+    }
+
+    private fun forceRestart(nowMs: Long): AdvertiserAction = when (state) {
+        AdvertiserState.IDLE -> beginStart(nowMs, stopGeneration = null)
         AdvertiserState.STARTING -> {
             restartPending = true
             AdvertiserAction.NONE
         }
-        AdvertiserState.ADVERTISING -> beginStart(stopGeneration = generation)
+        AdvertiserState.ADVERTISING -> beginStart(nowMs, stopGeneration = generation)
     }
 
-    private fun beginStart(stopGeneration: Long?): AdvertiserAction {
+    private fun beginStart(nowMs: Long, stopGeneration: Long?): AdvertiserAction {
         restartPending = false
+        retryDueAtMs = null
         generation += 1
         state = AdvertiserState.STARTING
-        return AdvertiserAction(stopGeneration = stopGeneration, startGeneration = generation)
+        startedAtMs = nowMs
+        return AdvertiserAction(
+            stopGeneration = stopGeneration,
+            startGeneration = generation,
+            // Every start is watched: an unanswered one is exactly as dark as
+            // a failed one, and much harder to notice.
+            watchdogInMs = START_WATCHDOG_MS,
+        )
     }
+
+    /** Parks in [AdvertiserState.IDLE] with a re-arm due; returns its delay. */
+    private fun armRetry(nowMs: Long): Long {
+        state = AdvertiserState.IDLE
+        failureStreak += 1
+        val delayMs = retryDelayMs(failureStreak)
+        retryDueAtMs = nowMs + delayMs
+        return delayMs
+    }
+
+    /** [RETRY_MIN_DELAY_MS] doubling per consecutive failure, capped. */
+    private fun retryDelayMs(streak: Int): Long {
+        var delayMs = RETRY_MIN_DELAY_MS
+        repeat((streak - 1).coerceAtLeast(0)) {
+            if (delayMs >= RETRY_MAX_DELAY_MS) return RETRY_MAX_DELAY_MS
+            delayMs *= 2
+        }
+        return delayMs.coerceAtMost(RETRY_MAX_DELAY_MS)
+    }
+
+    /**
+     * A monotonic clock cannot go backwards, but a caller confusing clocks (or
+     * a test) can: treat a negative interval as "past due" rather than as a
+     * wait that never ends, since erring towards a redundant restart is the
+     * cheap direction.
+     */
+    private fun elapsedSince(startMs: Long, nowMs: Long): Long =
+        (nowMs - startMs).let { if (it < 0) Long.MAX_VALUE else it }
 }

@@ -874,16 +874,22 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     ///
     /// Promotion callers still resume immediately — a promotion means a link
     /// just came *up*, so there is no dying sibling to wait for.
+    ///
+    /// The window is measured on the same monotonic clock `asyncAfter` counts
+    /// down on: on the wall clock, a time correction landing mid-burst would
+    /// expire the window early and produce the second fan-out this exists to
+    /// prevent.
     private func scheduleFailoverResume(peerUserId: Data) {
         let key = UserIdHex.encode(peerUserId)
-        let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
-        guard let delayMs = failoverResumeDebounce.request(key: key, nowMs: nowMs) else { return }
-        meshQueue.asyncAfter(deadline: .now() + .milliseconds(Int(clamping: delayMs))) { [weak self] in
+        let nowMs = FailoverResumeDebounce.monotonicNowMs
+        guard let arm = failoverResumeDebounce.request(key: key, nowMs: nowMs) else { return }
+        meshQueue.asyncAfter(deadline: .now() + .milliseconds(Int(clamping: arm.delayMs))) { [weak self] in
             guard let self else { return }
             // Cleared before the work runs, so a disconnect arriving while the
             // resume is in flight arms a fresh window instead of being
-            // swallowed by this one.
-            self.failoverResumeDebounce.fired(key: key)
+            // swallowed by this one. The token scopes that to *this* window: a
+            // window armed in the meantime keeps its own timer.
+            self.failoverResumeDebounce.fired(key: key, token: arm.token)
             guard self.isRunning else { return }
             self.resumeLogicalPeerSync(peerUserId: peerUserId)
         }

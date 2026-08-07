@@ -21,6 +21,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -1188,18 +1189,24 @@ class MeshService : Service() {
      * Promotion callers ([onLanPeerAuthenticated], [handleHello]) still call
      * [resumeLogicalPeerSync] directly and immediately -- a promotion means a
      * link just came *up*, so there is no dying sibling to wait for.
+     *
+     * The window is measured on [SystemClock.elapsedRealtime], the same
+     * monotonic clock `postDelayed` counts down on: on the wall clock, an NTP
+     * correction landing mid-burst would expire the window early and produce
+     * the second fan-out this exists to prevent.
      */
     private fun scheduleFailoverResume(peerUserId: ByteArray) {
         val key = UserIdHex.encode(peerUserId)
-        val delayMs = failoverResumeDebounce.request(key, System.currentTimeMillis()) ?: return
+        val arm = failoverResumeDebounce.request(key, SystemClock.elapsedRealtime()) ?: return
         relayMainHandler.postDelayed({
             // Cleared before the work runs, so a disconnect arriving while the
             // resume is in flight arms a fresh window instead of being
-            // swallowed by this one.
-            failoverResumeDebounce.fired(key)
+            // swallowed by this one. The token scopes that to *this* window: a
+            // window armed in the meantime keeps its own timer.
+            failoverResumeDebounce.fired(key, arm.token)
             if (!running) return@postDelayed
             runOnStoreExecutor("failover resume") { resumeLogicalPeerSync(peerUserId) }
-        }, delayMs)
+        }, arm.delayMs)
     }
 
     /** Immediately continue sync after either promotion or failover instead

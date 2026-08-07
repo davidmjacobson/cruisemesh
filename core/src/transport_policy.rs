@@ -966,11 +966,40 @@ pub fn core_failover_resume_window_ms() -> i64 {
 ///
 /// Coalescing is per key (the peer's UserID hex), never global: two different
 /// peers failing over in the same radio event each get their own resume.
+///
+/// Callers must pass the [`CoreFailoverResumeArm::token`] they were handed back
+/// to [`Self::fired`]. Without it, a timer finishing at the exact moment a new
+/// window is armed for the same peer would clear the *new* window's marker, and
+/// the next disconnect would arm (and run) a third resume — the very
+/// duplication this object exists to prevent. The token makes "the window I
+/// armed is over" exact rather than "some window for this peer is over".
 #[derive(uniffi::Object)]
 pub struct CoreFailoverResumeDebounce {
     window_ms: i64,
-    /// key -> the `now_ms` at which the pending window was armed.
-    armed: Mutex<HashMap<String, i64>>,
+    state: Mutex<FailoverResumeState>,
+}
+
+/// The caller's half of an armed window: schedule the resume `delay_ms` out,
+/// then hand `token` back to [`CoreFailoverResumeDebounce::fired`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct CoreFailoverResumeArm {
+    pub delay_ms: i64,
+    pub token: i64,
+}
+
+#[derive(Default)]
+struct FailoverResumeState {
+    /// key -> the window currently armed for it.
+    armed: HashMap<String, ArmedResumeWindow>,
+    /// Monotonically increasing, so a token is never confused with an older
+    /// window's token for the same key.
+    last_token: i64,
+}
+
+#[derive(Clone, Copy)]
+struct ArmedResumeWindow {
+    armed_at_ms: i64,
+    token: i64,
 }
 
 #[uniffi::export]
@@ -984,7 +1013,7 @@ impl CoreFailoverResumeDebounce {
     pub fn with_window_ms(window_ms: i64) -> Self {
         Self {
             window_ms: window_ms.max(0),
-            armed: Mutex::new(HashMap::new()),
+            state: Mutex::new(FailoverResumeState::default()),
         }
     }
 
@@ -992,50 +1021,74 @@ impl CoreFailoverResumeDebounce {
         self.window_ms
     }
 
-    /// Asks whether this failover should arm a timer. `Some(delay_ms)` means
-    /// the caller owns the window and must schedule the resume that far out,
-    /// calling [`Self::fired`] when the timer runs; `None` means an already
-    /// armed window will cover this request, so the caller does nothing.
+    /// Asks whether this failover should arm a timer. `Some(arm)` means the
+    /// caller owns the window and must schedule the resume `arm.delay_ms` out,
+    /// calling [`Self::fired`] with `arm.token` when the timer runs; `None`
+    /// means an already armed window will cover this request, so the caller
+    /// does nothing.
     ///
     /// A marker older than the window is treated as lost rather than as
     /// permanently pending (a cancelled timer, a process-lifecycle hiccup, or
-    /// a wall-clock jump backwards): it re-arms. Without that, one dropped
-    /// timer would silently disable failover resume for that peer forever,
-    /// which is exactly the class of silent-permanent-failure this file's
-    /// other trackers are written to avoid.
-    pub fn request(&self, key: String, now_ms: i64) -> Option<i64> {
-        let mut armed = self.armed.lock_recoverable();
-        if let Some(&armed_at_ms) = armed.get(&key) {
-            let elapsed = now_ms.saturating_sub(armed_at_ms);
+    /// a clock jump backwards): it re-arms. Without that, one dropped timer
+    /// would silently disable failover resume for that peer forever, which is
+    /// exactly the class of silent-permanent-failure this file's other
+    /// trackers are written to avoid.
+    ///
+    /// `now_ms` must come from the *same* clock the caller's timer runs on --
+    /// a monotonic one on both shells (`SystemClock.elapsedRealtime()` /
+    /// `DispatchTime.now()`). Measuring the window on the wall clock while the
+    /// timer counts down on a monotonic one lets an NTP correction desynchronise
+    /// the two and produce a second resume for one burst.
+    pub fn request(&self, key: String, now_ms: i64) -> Option<CoreFailoverResumeArm> {
+        let mut state = self.state.lock_recoverable();
+        if let Some(existing) = state.armed.get(&key) {
+            let elapsed = now_ms.saturating_sub(existing.armed_at_ms);
             if elapsed >= 0 && elapsed < self.window_ms {
                 return None;
             }
         }
-        armed.insert(key, now_ms);
-        Some(self.window_ms)
+        state.last_token = state.last_token.wrapping_add(1);
+        let token = state.last_token;
+        state.armed.insert(
+            key,
+            ArmedResumeWindow {
+                armed_at_ms: now_ms,
+                token,
+            },
+        );
+        Some(CoreFailoverResumeArm {
+            delay_ms: self.window_ms,
+            token,
+        })
     }
 
-    /// The armed timer for `key` just ran; the window is over, so the next
-    /// failover for this peer arms a fresh one. Call this *before* doing the
-    /// resume work so a disconnect arriving during that work starts a new
-    /// window instead of being swallowed.
-    pub fn fired(&self, key: String) {
-        self.armed.lock_recoverable().remove(&key);
+    /// The timer armed as `token` for `key` just ran; that window is over, so
+    /// the next failover for this peer arms a fresh one. Call this *before*
+    /// doing the resume work so a disconnect arriving during that work starts a
+    /// new window instead of being swallowed.
+    ///
+    /// A stale token (the window was already replaced or cancelled) is ignored:
+    /// clearing someone else's marker is what would under-coalesce.
+    pub fn fired(&self, key: String, token: i64) {
+        let mut state = self.state.lock_recoverable();
+        if state.armed.get(&key).map(|window| window.token) == Some(token) {
+            state.armed.remove(&key);
+        }
     }
 
-    /// Drops a pending window without running it (the caller cancelled its
-    /// timer, e.g. the peer went away entirely).
+    /// Drops whatever window is pending for `key` without running it (the peer
+    /// went away entirely, so no token is at hand and none is wanted).
     pub fn cancel(&self, key: String) {
-        self.armed.lock_recoverable().remove(&key);
+        self.state.lock_recoverable().armed.remove(&key);
     }
 
     pub fn is_pending(&self, key: String) -> bool {
-        self.armed.lock_recoverable().contains_key(&key)
+        self.state.lock_recoverable().armed.contains_key(&key)
     }
 
     /// Forgets every pending window, e.g. on a full mesh stop.
     pub fn clear(&self) {
-        self.armed.lock_recoverable().clear();
+        self.state.lock_recoverable().armed.clear();
     }
 }
 
@@ -1532,7 +1585,8 @@ mod tests {
     fn failover_resume_coalesces_a_burst_into_one_armed_window() {
         let debounce = CoreFailoverResumeDebounce::with_window_ms(300);
         // First disconnect of the burst arms the window.
-        assert_eq!(debounce.request("peer".into(), 1_000), Some(300));
+        let arm = debounce.request("peer".into(), 1_000).expect("armed");
+        assert_eq!(arm.delay_ms, 300);
         // The sibling links dying over the next 240ms are absorbed: exactly
         // one resume runs for the whole radio event.
         assert_eq!(debounce.request("peer".into(), 1_100), None);
@@ -1541,40 +1595,71 @@ mod tests {
         // The window is not extended by the later events -- it still expires
         // one window after the burst *started*.
         assert_eq!(debounce.request("peer".into(), 1_299), None);
-        debounce.fired("peer".into());
+        debounce.fired("peer".into(), arm.token);
         assert!(!debounce.is_pending("peer".into()));
         // A later failover for the same peer is a new burst, not a repeat.
-        assert_eq!(debounce.request("peer".into(), 1_400), Some(300));
+        assert!(debounce.request("peer".into(), 1_400).is_some());
     }
 
     #[test]
     fn failover_resume_coalesces_per_peer_not_globally() {
         let debounce = CoreFailoverResumeDebounce::with_window_ms(300);
-        assert_eq!(debounce.request("peer-a".into(), 0), Some(300));
+        assert!(debounce.request("peer-a".into(), 0).is_some());
         // Two peers failing over in the same radio event each get a resume.
-        assert_eq!(debounce.request("peer-b".into(), 10), Some(300));
+        assert!(debounce.request("peer-b".into(), 10).is_some());
         assert_eq!(debounce.request("peer-a".into(), 20), None);
     }
 
     #[test]
     fn failover_resume_rearms_when_a_pending_window_was_lost() {
         let debounce = CoreFailoverResumeDebounce::with_window_ms(300);
-        assert_eq!(debounce.request("peer".into(), 0), Some(300));
+        assert!(debounce.request("peer".into(), 0).is_some());
         // A timer that never fired must not disable this peer's resume
         // forever; once the window has elapsed the next failover re-arms.
-        assert_eq!(debounce.request("peer".into(), 300), Some(300));
-        // Same for a wall clock that jumped backwards.
-        assert_eq!(debounce.request("peer".into(), 100), Some(300));
+        assert!(debounce.request("peer".into(), 300).is_some());
+        // Same for a clock that jumped backwards.
+        assert!(debounce.request("peer".into(), 100).is_some());
+    }
+
+    #[test]
+    fn failover_resume_ignores_a_stale_fired_token() {
+        let debounce = CoreFailoverResumeDebounce::with_window_ms(300);
+        // Timer A is armed at 0 and re-armed as timer B at exactly the window
+        // boundary, before A's message has been dispatched.
+        let first = debounce.request("peer".into(), 0).expect("armed");
+        let second = debounce.request("peer".into(), 300).expect("re-armed");
+        assert_ne!(first.token, second.token);
+
+        // Timer A now runs. Clearing B's marker here is what used to let a
+        // third disconnect arm a third window inside one burst.
+        debounce.fired("peer".into(), first.token);
+        assert!(debounce.is_pending("peer".into()));
+        assert_eq!(debounce.request("peer".into(), 310), None);
+
+        // B's own firing is honoured.
+        debounce.fired("peer".into(), second.token);
+        assert!(!debounce.is_pending("peer".into()));
+    }
+
+    #[test]
+    fn failover_resume_tokens_are_never_reused() {
+        let debounce = CoreFailoverResumeDebounce::with_window_ms(300);
+        let mut seen = HashSet::new();
+        for i in 0..10 {
+            let arm = debounce.request("peer".into(), i * 1_000).expect("armed");
+            assert!(seen.insert(arm.token), "token {} reused", arm.token);
+            debounce.fired("peer".into(), arm.token);
+        }
     }
 
     #[test]
     fn failover_resume_cancel_and_clear_drop_pending_windows() {
         let debounce = CoreFailoverResumeDebounce::with_window_ms(300);
-        assert_eq!(debounce.request("peer".into(), 0), Some(300));
+        assert!(debounce.request("peer".into(), 0).is_some());
         debounce.cancel("peer".into());
-        assert_eq!(debounce.request("peer".into(), 10), Some(300));
+        assert!(debounce.request("peer".into(), 10).is_some());
         debounce.clear();
         assert!(!debounce.is_pending("peer".into()));
-        assert_eq!(debounce.request("peer".into(), 20), Some(300));
+        assert!(debounce.request("peer".into(), 20).is_some());
     }
 }

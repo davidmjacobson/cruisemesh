@@ -746,12 +746,19 @@ public func FfiConverterTypeBleFrameReassembler_lower(_ value: BleFrameReassembl
  *
  * Coalescing is per key (the peer's UserID hex), never global: two different
  * peers failing over in the same radio event each get their own resume.
+ *
+ * Callers must pass the [`CoreFailoverResumeArm::token`] they were handed back
+ * to [`Self::fired`]. Without it, a timer finishing at the exact moment a new
+ * window is armed for the same peer would clear the *new* window's marker, and
+ * the next disconnect would arm (and run) a third resume — the very
+ * duplication this object exists to prevent. The token makes "the window I
+ * armed is over" exact rather than "some window for this peer is over".
  */
 public protocol CoreFailoverResumeDebounceProtocol : AnyObject {
 
     /**
-     * Drops a pending window without running it (the caller cancelled its
-     * timer, e.g. the peer went away entirely).
+     * Drops whatever window is pending for `key` without running it (the peer
+     * went away entirely, so no token is at hand and none is wanted).
      */
     func cancel(key: String)
 
@@ -761,29 +768,39 @@ public protocol CoreFailoverResumeDebounceProtocol : AnyObject {
     func clear()
 
     /**
-     * The armed timer for `key` just ran; the window is over, so the next
-     * failover for this peer arms a fresh one. Call this *before* doing the
-     * resume work so a disconnect arriving during that work starts a new
-     * window instead of being swallowed.
+     * The timer armed as `token` for `key` just ran; that window is over, so
+     * the next failover for this peer arms a fresh one. Call this *before*
+     * doing the resume work so a disconnect arriving during that work starts a
+     * new window instead of being swallowed.
+     *
+     * A stale token (the window was already replaced or cancelled) is ignored:
+     * clearing someone else's marker is what would under-coalesce.
      */
-    func fired(key: String)
+    func fired(key: String, token: Int64)
 
     func isPending(key: String)  -> Bool
 
     /**
-     * Asks whether this failover should arm a timer. `Some(delay_ms)` means
-     * the caller owns the window and must schedule the resume that far out,
-     * calling [`Self::fired`] when the timer runs; `None` means an already
-     * armed window will cover this request, so the caller does nothing.
+     * Asks whether this failover should arm a timer. `Some(arm)` means the
+     * caller owns the window and must schedule the resume `arm.delay_ms` out,
+     * calling [`Self::fired`] with `arm.token` when the timer runs; `None`
+     * means an already armed window will cover this request, so the caller
+     * does nothing.
      *
      * A marker older than the window is treated as lost rather than as
      * permanently pending (a cancelled timer, a process-lifecycle hiccup, or
-     * a wall-clock jump backwards): it re-arms. Without that, one dropped
-     * timer would silently disable failover resume for that peer forever,
-     * which is exactly the class of silent-permanent-failure this file's
-     * other trackers are written to avoid.
+     * a clock jump backwards): it re-arms. Without that, one dropped timer
+     * would silently disable failover resume for that peer forever, which is
+     * exactly the class of silent-permanent-failure this file's other
+     * trackers are written to avoid.
+     *
+     * `now_ms` must come from the *same* clock the caller's timer runs on --
+     * a monotonic one on both shells (`SystemClock.elapsedRealtime()` /
+     * `DispatchTime.now()`). Measuring the window on the wall clock while the
+     * timer counts down on a monotonic one lets an NTP correction desynchronise
+     * the two and produce a second resume for one burst.
      */
-    func request(key: String, nowMs: Int64)  -> Int64?
+    func request(key: String, nowMs: Int64)  -> CoreFailoverResumeArm?
 
     func windowMs()  -> Int64
 
@@ -815,6 +832,13 @@ public protocol CoreFailoverResumeDebounceProtocol : AnyObject {
  *
  * Coalescing is per key (the peer's UserID hex), never global: two different
  * peers failing over in the same radio event each get their own resume.
+ *
+ * Callers must pass the [`CoreFailoverResumeArm::token`] they were handed back
+ * to [`Self::fired`]. Without it, a timer finishing at the exact moment a new
+ * window is armed for the same peer would clear the *new* window's marker, and
+ * the next disconnect would arm (and run) a third resume — the very
+ * duplication this object exists to prevent. The token makes "the window I
+ * armed is over" exact rather than "some window for this peer is over".
  */
 open class CoreFailoverResumeDebounce:
     CoreFailoverResumeDebounceProtocol {
@@ -882,8 +906,8 @@ public static func withWindowMs(windowMs: Int64) -> CoreFailoverResumeDebounce {
 
 
     /**
-     * Drops a pending window without running it (the caller cancelled its
-     * timer, e.g. the peer went away entirely).
+     * Drops whatever window is pending for `key` without running it (the peer
+     * went away entirely, so no token is at hand and none is wanted).
      */
 open func cancel(key: String) {try! rustCall() {
     uniffi_cruisemesh_core_fn_method_corefailoverresumedebounce_cancel(self.uniffiClonePointer(),
@@ -902,14 +926,18 @@ open func clear() {try! rustCall() {
 }
 
     /**
-     * The armed timer for `key` just ran; the window is over, so the next
-     * failover for this peer arms a fresh one. Call this *before* doing the
-     * resume work so a disconnect arriving during that work starts a new
-     * window instead of being swallowed.
+     * The timer armed as `token` for `key` just ran; that window is over, so
+     * the next failover for this peer arms a fresh one. Call this *before*
+     * doing the resume work so a disconnect arriving during that work starts a
+     * new window instead of being swallowed.
+     *
+     * A stale token (the window was already replaced or cancelled) is ignored:
+     * clearing someone else's marker is what would under-coalesce.
      */
-open func fired(key: String) {try! rustCall() {
+open func fired(key: String, token: Int64) {try! rustCall() {
     uniffi_cruisemesh_core_fn_method_corefailoverresumedebounce_fired(self.uniffiClonePointer(),
-        FfiConverterString.lower(key),$0
+        FfiConverterString.lower(key),
+        FfiConverterInt64.lower(token),$0
     )
 }
 }
@@ -923,20 +951,27 @@ open func isPending(key: String) -> Bool {
 }
 
     /**
-     * Asks whether this failover should arm a timer. `Some(delay_ms)` means
-     * the caller owns the window and must schedule the resume that far out,
-     * calling [`Self::fired`] when the timer runs; `None` means an already
-     * armed window will cover this request, so the caller does nothing.
+     * Asks whether this failover should arm a timer. `Some(arm)` means the
+     * caller owns the window and must schedule the resume `arm.delay_ms` out,
+     * calling [`Self::fired`] with `arm.token` when the timer runs; `None`
+     * means an already armed window will cover this request, so the caller
+     * does nothing.
      *
      * A marker older than the window is treated as lost rather than as
      * permanently pending (a cancelled timer, a process-lifecycle hiccup, or
-     * a wall-clock jump backwards): it re-arms. Without that, one dropped
-     * timer would silently disable failover resume for that peer forever,
-     * which is exactly the class of silent-permanent-failure this file's
-     * other trackers are written to avoid.
+     * a clock jump backwards): it re-arms. Without that, one dropped timer
+     * would silently disable failover resume for that peer forever, which is
+     * exactly the class of silent-permanent-failure this file's other
+     * trackers are written to avoid.
+     *
+     * `now_ms` must come from the *same* clock the caller's timer runs on --
+     * a monotonic one on both shells (`SystemClock.elapsedRealtime()` /
+     * `DispatchTime.now()`). Measuring the window on the wall clock while the
+     * timer counts down on a monotonic one lets an NTP correction desynchronise
+     * the two and produce a second resume for one burst.
      */
-open func request(key: String, nowMs: Int64) -> Int64? {
-    return try!  FfiConverterOptionInt64.lift(try! rustCall() {
+open func request(key: String, nowMs: Int64) -> CoreFailoverResumeArm? {
+    return try!  FfiConverterOptionTypeCoreFailoverResumeArm.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_method_corefailoverresumedebounce_request(self.uniffiClonePointer(),
         FfiConverterString.lower(key),
         FfiConverterInt64.lower(nowMs),$0
@@ -8868,6 +8903,76 @@ public func FfiConverterTypeCoreDigestSprayPlan_lower(_ value: CoreDigestSprayPl
 
 
 /**
+ * The caller's half of an armed window: schedule the resume `delay_ms` out,
+ * then hand `token` back to [`CoreFailoverResumeDebounce::fired`].
+ */
+public struct CoreFailoverResumeArm {
+    public var delayMs: Int64
+    public var token: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(delayMs: Int64, token: Int64) {
+        self.delayMs = delayMs
+        self.token = token
+    }
+}
+
+
+
+extension CoreFailoverResumeArm: Equatable, Hashable {
+    public static func ==(lhs: CoreFailoverResumeArm, rhs: CoreFailoverResumeArm) -> Bool {
+        if lhs.delayMs != rhs.delayMs {
+            return false
+        }
+        if lhs.token != rhs.token {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(delayMs)
+        hasher.combine(token)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreFailoverResumeArm: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreFailoverResumeArm {
+        return
+            try CoreFailoverResumeArm(
+                delayMs: FfiConverterInt64.read(from: &buf),
+                token: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreFailoverResumeArm, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.delayMs, into: &buf)
+        FfiConverterInt64.write(value.token, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFailoverResumeArm_lift(_ buf: RustBuffer) throws -> CoreFailoverResumeArm {
+    return try FfiConverterTypeCoreFailoverResumeArm.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFailoverResumeArm_lower(_ value: CoreFailoverResumeArm) -> RustBuffer {
+    return FfiConverterTypeCoreFailoverResumeArm.lower(value)
+}
+
+
+/**
  * One relay-post row of a group message's per-member fan-out
  * (`specs/group-relay-durability.md` §4, DTN_TODOS.md N1). Deliberately
  * NOT [`CarriedEnvelope`], even though the fields coincide -- a fan-out row
@@ -15803,6 +15908,30 @@ fileprivate struct FfiConverterOptionTypeCoreCarriedCursor: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreFailoverResumeArm: FfiConverterRustBuffer {
+    typealias SwiftType = CoreFailoverResumeArm?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreFailoverResumeArm.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreFailoverResumeArm.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreLanEndpoint: FfiConverterRustBuffer {
     typealias SwiftType = CoreLanEndpoint?
 
@@ -20214,19 +20343,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_bleframereassembler_accept() != 35445) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_cancel() != 29753) {
+    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_cancel() != 27215) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_clear() != 44323) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_fired() != 6024) {
+    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_fired() != 60258) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_is_pending() != 9366) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_request() != 40999) {
+    if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_request() != 52151) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_window_ms() != 26799) {
