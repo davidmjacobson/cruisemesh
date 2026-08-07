@@ -2811,6 +2811,56 @@
         }
       }
     },
+    "Backup contents": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Backup contents"
+          }
+        }
+      }
+    },
+    "Could not play voice memo": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Could not play voice memo"
+          }
+        }
+      }
+    },
+    "Identity, contacts, groups, privacy settings, and message-number continuity will always be restored.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Identity, contacts, groups, privacy settings, and message-number continuity will always be restored."
+          }
+        }
+      }
+    },
+    "Restore preview": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restore preview"
+          }
+        }
+      }
+    },
+    "Your identity, contacts, groups, privacy settings, and message-number continuity are always included.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your identity, contacts, groups, privacy settings, and message-number continuity are always included."
+          }
+        }
+      }
+    },
     "You’re all set": {
       "localizations": {
         "en": {
