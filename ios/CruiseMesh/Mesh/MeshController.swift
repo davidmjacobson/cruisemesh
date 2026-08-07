@@ -3846,7 +3846,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 // pages every second, indefinitely, and never completed. The
                 // frontier cannot stand in for it -- it never moves backwards,
                 // so on an established mailbox it says nothing about where the
-                // sweep is.
+                // sweep is. That cursor is trusted only while the id space it
+                // names still exists: a sweep still unfinished a whole
+                // interval after it began walks from 0 instead, which is what
+                // keeps a phone that was offline while its relay was rebuilt
+                // healing on its first pass back.
                 let cursorKey = relayCursorKey(relayUrl: cfg.relayUrl, relayToken: cfg.relayToken)
                 do {
                     let cursor = try store.relayFetchCursor(configKey: cursorKey)
@@ -3856,10 +3860,46 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                         sweepProgressAfterId: cursor.sweepAfterId,
                         nowMs: now
                     )
+                    // A resume cursor is a row id, and a row id only means
+                    // anything in the id space it was recorded in. A relay
+                    // rebuilt from a fresh volume restarts its ids at 1, so a
+                    // cursor remembered from before it points past the end of
+                    // the mailbox: the resumed walk would fetch one empty
+                    // page, read it as end-of-mailbox and record a sweep that
+                    // covered nothing -- putting the mailbox back to sleep for
+                    // another interval with real mail sitting below a frontier
+                    // no ordinary pass goes under. `relaySweepRestartFromZero`
+                    // decides from the sweep's age rather than from the empty
+                    // page: a sweep that yielded a second ago is simply
+                    // finished, while one still unfinished a whole interval
+                    // after it began has lived through the window in which a
+                    // relay can be replaced. Mirrors RelaySyncEngine.kt.
+                    var sweepProgress = cursor.sweepAfterId
+                    if sweeping, relaySweepRestartFromZero(
+                        sweepProgressAfterId: sweepProgress,
+                        sweepStartedAtMs: cursor.sweepStartedAtMs,
+                        nowMs: now
+                    ) {
+                        // Zero the local progress only if the store took the
+                        // write. If it did not, resuming is the safe answer: a
+                        // restart that cannot be recorded would happen again
+                        // next pass, and the pass after that.
+                        do {
+                            try store.resetRelaySweepProgress(configKey: cursorKey, nowMs: now)
+                            relaySyncLog.info(
+                                "Relay sweep stalled at after=\(sweepProgress, privacy: .public); restarting the walk from 0"
+                            )
+                            sweepProgress = 0
+                        } catch {
+                            relaySyncLog.warning(
+                                "Failed to restart a stalled relay sweep: \(error.localizedDescription, privacy: .public)"
+                            )
+                        }
+                    }
                     var afterId = relayPassStartCursor(
                         sweeping: sweeping,
                         persistedAfterId: cursor.afterId,
-                        sweepProgressAfterId: cursor.sweepAfterId
+                        sweepProgressAfterId: sweepProgress
                     )
                     // Once a page fails to fully process, both cursors stop
                     // moving for the rest of this pass: persisting a later
@@ -3867,6 +3907,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     // walk itself continues, so one bad page never blocks the
                     // mail behind it.
                     var cursorsAdvancing = true
+                    // Whether this walk wrote any cursor down at all. It is
+                    // what makes a continuation worth scheduling: a pass that
+                    // persisted nothing would fetch and fail on exactly the
+                    // same page a second later.
+                    var persistedThisWalk = false
                     // Not a `let`: a page this client cannot take -- too big to
                     // decode, or too big to finish moving over this link --
                     // halves the ask and retries the same cursor, and the
@@ -3993,6 +4038,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                         }
                         if !pageFullyProcessed { cursorsAdvancing = false }
                         if cursorsAdvancing {
+                            persistedThisWalk = true
                             _ = try? store.advanceRelayFetchCursor(
                                 configKey: cursorKey,
                                 pageNextCursor: page.nextCursor,
@@ -4007,7 +4053,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                                 _ = try? store.advanceRelaySweepCursor(
                                     configKey: cursorKey,
                                     pageNextCursor: page.nextCursor,
-                                    pageFullyProcessed: true
+                                    pageFullyProcessed: true,
+                                    nowMs: now
                                 )
                             }
                         }
@@ -4027,6 +4074,17 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                             relaySyncLog.warning(
                                 "Relay returned rows without advancing the cursor; ending the walk"
                             )
+                            // The sweep this walk belonged to is abandoned,
+                            // not paused, so its progress goes too. Left
+                            // behind, a non-zero progress reads as "a sweep is
+                            // under way" on every later pass (`relaySweepDue`),
+                            // and a mailbox permanently in sweep mode never
+                            // runs an ordinary frontier pass again -- new mail
+                            // at the top of it would stop arriving. Clearing
+                            // it hands the mailbox back to the schedule.
+                            if sweeping {
+                                _ = try? store.resetRelaySweepProgress(configKey: cursorKey, nowMs: now)
+                            }
                             break
                         }
                         afterId = page.nextCursor
@@ -4039,10 +4097,23 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                             pagesFetched: pagesFetched,
                             envelopesFetched: envelopesFetched
                         ) == .yieldAndScheduleContinuation {
+                            let continuationNote = persistedThisWalk
+                                ? "scheduled"
+                                : "declined (nothing persisted)"
                             relaySyncLog.info(
-                                "Relay mailbox walk yielding after \(pagesFetched, privacy: .public) page(s)/\(envelopesFetched, privacy: .public) envelope(s) at after=\(afterId, privacy: .public); continuation scheduled"
+                                "Relay mailbox walk yielding after \(pagesFetched, privacy: .public) page(s)/\(envelopesFetched, privacy: .public) envelope(s) at after=\(afterId, privacy: .public); continuation \(continuationNote, privacy: .public)"
                             )
-                            mailboxContinuationNeeded = true
+                            // Only ask for one if this walk actually wrote a
+                            // cursor down. A pass whose pages could not be
+                            // processed or acked persists nothing, so the pass
+                            // a second later starts from the same cursor,
+                            // fetches the same pages and fails the same way: a
+                            // 1s-cadence re-download of the same 512
+                            // envelopes. The ordinary poll interval retries it
+                            // instead, and a walk that persisted even one page
+                            // still gets its continuation. Mirrors
+                            // RelaySyncEngine.kt.
+                            if persistedThisWalk { mailboxContinuationNeeded = true }
                             break
                         }
                     }

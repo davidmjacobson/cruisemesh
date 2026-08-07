@@ -219,7 +219,8 @@ final class RelayFetchCursorTests: XCTestCase {
             _ = try store.advanceRelaySweepCursor(
                 configKey: key(),
                 pageNextCursor: pageCursor,
-                pageFullyProcessed: true
+                pageFullyProcessed: true,
+                nowMs: 1_000
             )
         }
 
@@ -271,7 +272,8 @@ final class RelayFetchCursorTests: XCTestCase {
             try store.advanceRelaySweepCursor(
                 configKey: key(),
                 pageNextCursor: 256,
-                pageFullyProcessed: true
+                pageFullyProcessed: true,
+                nowMs: 1_000
             ),
             256
         )
@@ -281,7 +283,8 @@ final class RelayFetchCursorTests: XCTestCase {
             try store.advanceRelaySweepCursor(
                 configKey: key(),
                 pageNextCursor: 512,
-                pageFullyProcessed: false
+                pageFullyProcessed: false,
+                nowMs: 1_000
             ),
             256
         )
@@ -290,7 +293,8 @@ final class RelayFetchCursorTests: XCTestCase {
             try store.advanceRelaySweepCursor(
                 configKey: key(),
                 pageNextCursor: 128,
-                pageFullyProcessed: true
+                pageFullyProcessed: true,
+                nowMs: 1_000
             ),
             256
         )
@@ -299,7 +303,8 @@ final class RelayFetchCursorTests: XCTestCase {
             try store.advanceRelaySweepCursor(
                 configKey: "",
                 pageNextCursor: 512,
-                pageFullyProcessed: true
+                pageFullyProcessed: true,
+                nowMs: 1_000
             ),
             0
         )
@@ -313,7 +318,8 @@ final class RelayFetchCursorTests: XCTestCase {
         _ = try store.advanceRelaySweepCursor(
             configKey: key(),
             pageNextCursor: 512,
-            pageFullyProcessed: true
+            pageFullyProcessed: true,
+            nowMs: 1_000
         )
         let cursor = try store.relayFetchCursor(configKey: key())
         // RelaySweepSession is empty again after a restart, but that guard is
@@ -331,6 +337,148 @@ final class RelayFetchCursorTests: XCTestCase {
                 sweepProgressAfterId: cursor.sweepAfterId
             ),
             512
+        )
+    }
+
+    func testASweepStalledAcrossDaysOfflineWalksFromZeroAgain() throws {
+        // The rebuilt-relay case. A phone goes offline mid-sweep for days;
+        // while it is away the relay is rebuilt from a fresh volume and its row
+        // ids restart at 1. The remembered resume cursor now points past the
+        // end of the mailbox, so resuming from it would fetch one empty page,
+        // record a sweep that covered nothing at all, and put the mailbox back
+        // to sleep for another interval while real mail sat below a frontier no
+        // ordinary pass goes under.
+        let store = try MessageStore.open(path: ":memory:")
+        _ = try store.advanceRelayFetchCursor(
+            configKey: key(),
+            pageNextCursor: 29_000,
+            pageFullyProcessed: true
+        )
+        try store.noteRelaySweepCompleted(configKey: key(), nowMs: 1_000_000)
+        let sweepStarted: Int64 = 1_000_000 + relaySweepIntervalMs()
+        _ = try store.advanceRelaySweepCursor(
+            configKey: key(),
+            pageNextCursor: 20_000,
+            pageFullyProcessed: true,
+            nowMs: sweepStarted
+        )
+
+        let backOnline: Int64 = sweepStarted + 3 * 24 * 60 * 60 * 1000
+        var cursor = try store.relayFetchCursor(configKey: key())
+        XCTAssertTrue(relaySweepDue(
+            sweptThisSession: false,
+            lastSweepAtMs: cursor.lastSweepAtMs,
+            sweepProgressAfterId: cursor.sweepAfterId,
+            nowMs: backOnline
+        ))
+        XCTAssertTrue(relaySweepRestartFromZero(
+            sweepProgressAfterId: cursor.sweepAfterId,
+            sweepStartedAtMs: cursor.sweepStartedAtMs,
+            nowMs: backOnline
+        ))
+
+        try store.resetRelaySweepProgress(configKey: key(), nowMs: backOnline)
+        cursor = try store.relayFetchCursor(configKey: key())
+        XCTAssertEqual(
+            relayPassStartCursor(
+                sweeping: true,
+                persistedAfterId: cursor.afterId,
+                sweepProgressAfterId: cursor.sweepAfterId
+            ),
+            0
+        )
+        // The frontier is not what proved wrong, so it is left alone.
+        XCTAssertEqual(cursor.afterId, 29_000)
+
+        // ...and the walk that starts here is dated, so the pass a second later
+        // resumes it rather than restarting it again -- otherwise the repair
+        // would be its own re-download loop.
+        _ = try store.advanceRelaySweepCursor(
+            configKey: key(),
+            pageNextCursor: 512,
+            pageFullyProcessed: true,
+            nowMs: backOnline
+        )
+        cursor = try store.relayFetchCursor(configKey: key())
+        XCTAssertFalse(relaySweepRestartFromZero(
+            sweepProgressAfterId: cursor.sweepAfterId,
+            sweepStartedAtMs: cursor.sweepStartedAtMs,
+            nowMs: backOnline + relayMailboxContinuationDelayMs()
+        ))
+        XCTAssertEqual(
+            relayPassStartCursor(
+                sweeping: true,
+                persistedAfterId: cursor.afterId,
+                sweepProgressAfterId: cursor.sweepAfterId
+            ),
+            512
+        )
+    }
+
+    func testASweepThatYieldedMomentsAgoResumesRatherThanRestarting() throws {
+        // Why this is a staleness question rather than an empty-page one: a
+        // walk yields on a fixed budget, so about one sweep in four yields
+        // exactly at the end of the mailbox and then resumes into a perfectly
+        // honest empty page. Re-walking that from 0 would land on the same
+        // boundary again -- the same loop, slower.
+        let store = try MessageStore.open(path: ":memory:")
+        _ = try store.advanceRelaySweepCursor(
+            configKey: key(),
+            pageNextCursor: 512,
+            pageFullyProcessed: true,
+            nowMs: 5_000_000
+        )
+        let cursor = try store.relayFetchCursor(configKey: key())
+        XCTAssertEqual(cursor.sweepStartedAtMs, 5_000_000)
+        XCTAssertFalse(relaySweepRestartFromZero(
+            sweepProgressAfterId: cursor.sweepAfterId,
+            sweepStartedAtMs: cursor.sweepStartedAtMs,
+            nowMs: 5_001_000
+        ))
+    }
+
+    func testAbandoningAWalkHandsTheMailboxBackToTheSchedule() throws {
+        // A relay that answers incoherently -- rows returned, cursor standing
+        // still -- ends the walk without completing the sweep. The progress it
+        // leaves behind has to go: a mailbox that reads as "a sweep is under
+        // way" on every pass never runs an ordinary frontier pass again, so new
+        // mail at the top of it would stop arriving altogether.
+        let store = try MessageStore.open(path: ":memory:")
+        _ = try store.advanceRelayFetchCursor(
+            configKey: key(),
+            pageNextCursor: 29_000,
+            pageFullyProcessed: true
+        )
+        _ = try store.advanceRelaySweepCursor(
+            configKey: key(),
+            pageNextCursor: 512,
+            pageFullyProcessed: true,
+            nowMs: 1_000
+        )
+        var cursor = try store.relayFetchCursor(configKey: key())
+        XCTAssertTrue(relaySweepDue(
+            sweptThisSession: true,
+            lastSweepAtMs: cursor.lastSweepAtMs,
+            sweepProgressAfterId: cursor.sweepAfterId,
+            nowMs: 2_000
+        ))
+
+        try store.resetRelaySweepProgress(configKey: key(), nowMs: 2_000)
+        cursor = try store.relayFetchCursor(configKey: key())
+        XCTAssertEqual(cursor.sweepAfterId, 0)
+        XCTAssertFalse(relaySweepDue(
+            sweptThisSession: true,
+            lastSweepAtMs: cursor.lastSweepAtMs,
+            sweepProgressAfterId: cursor.sweepAfterId,
+            nowMs: 2_000
+        ))
+        XCTAssertEqual(
+            relayPassStartCursor(
+                sweeping: false,
+                persistedAfterId: cursor.afterId,
+                sweepProgressAfterId: cursor.sweepAfterId
+            ),
+            29_000
         )
     }
 

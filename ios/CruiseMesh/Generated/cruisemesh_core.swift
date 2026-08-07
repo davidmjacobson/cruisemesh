@@ -1045,11 +1045,11 @@ public func FfiConverterTypeCoreFailoverResumeDebounce_lower(_ value: CoreFailov
 
 public protocol CoreLanHealthTrackerProtocol : AnyObject {
 
-    func clear()
+    func clear() 
 
     func next(address: String, nowMs: Int64, nonce: UInt64)  -> CoreLanHealthDecision
 
-    func remove(address: String)
+    func remove(address: String) 
 
     func response(address: String, nonce: UInt64, nowMs: Int64)  -> Int64?
 
@@ -1226,9 +1226,9 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
      */
     func carriedLaneFor(address: String, nowMs: Int64)  -> CoreCarriedLane
 
-    func clear()
+    func clear() 
 
-    func clearTransports(transports: [CoreTransport])
+    func clearTransports(transports: [CoreTransport]) 
 
     func connectedRoutes()  -> [CoreTransportRoute]
 
@@ -1248,9 +1248,9 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
      */
     func isSelectedRoute(address: String)  -> Bool
 
-    func onConnected(address: String, transport: CoreTransport)
+    func onConnected(address: String, transport: CoreTransport) 
 
-    func onDisconnected(address: String)
+    func onDisconnected(address: String) 
 
     func onHello(address: String, userId: Data)  -> Bool
 
@@ -1290,14 +1290,14 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
      * tail -- the lane's zero-budget off switch -- changes nothing, so the
      * next round reconsiders exactly the same page.
      */
-    func recordCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64)
+    func recordCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64) 
 
-    func recordHiddenOffered(address: String, msgIds: [Data])
+    func recordHiddenOffered(address: String, msgIds: [Data]) 
 
     /**
      * Record progress of a targeted HELLO carried drain (G2).
      */
-    func recordTargetedCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64)
+    func recordTargetedCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64) 
 
     /**
      * Epidemic fanout plan: one route per authenticated user plus every
@@ -1326,7 +1326,7 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
      * the same physical connection rather than crossing over and duplicating
      * every frame on the two links.
      */
-    func setLocalUserId(userId: Data)
+    func setLocalUserId(userId: Data) 
 
     /**
      * Where the targeted HELLO carried drain should resume (G2), same three
@@ -1739,7 +1739,7 @@ public protocol CoreReconnectBackoffTrackerProtocol : AnyObject {
 
     func canAttempt(address: String, nowMs: Int64)  -> Bool
 
-    func clear()
+    func clear() 
 
     func failureCount(address: String)  -> UInt32
 
@@ -1753,7 +1753,7 @@ public protocol CoreReconnectBackoffTrackerProtocol : AnyObject {
 
     func recordFailure(address: String, nowMs: Int64)  -> UInt32
 
-    func recordSuccess(address: String)
+    func recordSuccess(address: String) 
 
     func retryDelayMs(address: String, nowMs: Int64)  -> Int64?
 
@@ -1961,7 +1961,7 @@ public protocol LanNoiseSessionProtocol : AnyObject {
      * Consume the next Noise XX handshake message. CruiseMesh does not put
      * application data in handshake payloads; non-empty payloads fail closed.
      */
-    func readHandshakeMessage(message: Data) throws
+    func readHandshakeMessage(message: Data) throws 
 
     /**
      * The remote X25519 static public key once Noise has revealed it.
@@ -2206,8 +2206,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * cursors here would leave behind progress claiming coverage of rows the
      * sweep never looked at, and `sweep_after_id` is also what
      * [`crate::relay_sweep_due`] reads as "a sweep is under way".
+     *
+     * The first page that actually moves a sweep off 0 also dates the sweep,
+     * in `sweep_started_at`. Nothing else writes it, so it is the age of the
+     * walk rather than of the last page — which is the question
+     * [`crate::relay_sweep_restart_from_zero`] has to answer, and the reason
+     * `now_ms` is a parameter of an otherwise timeless function.
      */
-    func advanceRelaySweepCursor(configKey: String, pageNextCursor: Int64, pageFullyProcessed: Bool) throws  -> Int64
+    func advanceRelaySweepCursor(configKey: String, pageNextCursor: Int64, pageFullyProcessed: Bool, nowMs: Int64) throws  -> Int64
 
     /**
      * T23: apply a contact's relay-change notice to their stored endpoint.
@@ -2318,7 +2324,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * preserving it trades at most bounded delivery delay for avoiding an
      * unbounded restore-time replay.
      */
-    func backupTo(destination: String) throws
+    func backupTo(destination: String) throws 
 
     /**
      * Write a transactionally consistent snapshot and apply the Rust-owned
@@ -2337,7 +2343,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * re-import of their card ([MessageStore::upsert_imported_contact])
      * clears the block.
      */
-    func blockUser(userId: Data, nowMs: Int64) throws
+    func blockUser(userId: Data, nowMs: Int64) throws 
 
     /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
@@ -2480,14 +2486,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * us could launder itself back to healthy on the strength of the 429
      * and resume hammering forever.
      */
-    func clearContactRelayRejection(userId: Data) throws
+    func clearContactRelayRejection(userId: Data) throws 
 
     /**
      * Clear the transport-level streak when the endpoint gives any HTTP
      * answer. A 401 may advance the separate rejection streak, but it proves
      * the host is reachable and must settle the silence verdict.
      */
-    func clearContactRelayUnreachable(userId: Data) throws
+    func clearContactRelayUnreachable(userId: Data) throws 
 
     /**
      * Erases every V2 field-metrics row.
@@ -2505,9 +2511,9 @@ public protocol MessageStoreProtocol : AnyObject {
      * renders, not captured diagnostics, and clearing them would silently
      * change what the app says about existing conversations.
      */
-    func clearDeliveryMetrics() throws
+    func clearDeliveryMetrics() throws 
 
-    func clearFriendSuggestions() throws
+    func clearFriendSuggestions() throws 
 
     /**
      * Erase quarantined conflict branches and their metadata. Diagnostic
@@ -2516,9 +2522,9 @@ public protocol MessageStoreProtocol : AnyObject {
      * "Delete captured diagnostics" action therefore needs an explicit way
      * to remove both the summary and its private backing evidence.
      */
-    func clearMessageConflicts() throws
+    func clearMessageConflicts() throws 
 
-    func clearPeerConnectionHistory() throws
+    func clearPeerConnectionHistory() throws 
 
     /**
      * Forget every remembered frontier, so the next pass re-walks each
@@ -2529,13 +2535,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * an entire shared mailbox and can recreate discarded courier backlog;
      * scheduled sweeps provide the bounded stale-frontier repair path.
      */
-    func clearRelayFetchCursors() throws
+    func clearRelayFetchCursors() throws 
 
     /**
      * Directly scanning the person's own QR code is the escape hatch that
      * clears both a suppression and any dismissal history.
      */
-    func clearSharedRequestDismissal(requesterUserId: Data) throws
+    func clearSharedRequestDismissal(requesterUserId: Data) throws 
 
     /**
      * Exact consumed control-message positions for one chat, grouped by the
@@ -2844,9 +2850,9 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func deleteGroup(groupId: Data) throws  -> Bool
 
-    func deleteOutgoingSharedRequest(candidateUserId: Data) throws
+    func deleteOutgoingSharedRequest(candidateUserId: Data) throws 
 
-    func deletePendingSharedRequest(requesterUserId: Data) throws
+    func deletePendingSharedRequest(requesterUserId: Data) throws 
 
     /**
      * `recipient_hint`s the peer can open: their own userId over recent
@@ -3417,7 +3423,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * than aspirational, and clearing it here is the single act that turns a
      * sweep from in-progress back into scheduled.
      */
-    func noteRelaySweepCompleted(configKey: String, nowMs: Int64) throws
+    func noteRelaySweepCompleted(configKey: String, nowMs: Int64) throws 
 
     /**
      * Should this requester's pending request raise a prompt right now, and
@@ -3628,7 +3634,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * them all; the first confirmation wins (a later, higher watermark still
      * stamps the messages it newly covers). Metadata only.
      */
-    func recordDeliveredMetric(chatId: Data, throughLamport: UInt64, deliveredAtMs: Int64, viaTransport: UInt8?) throws
+    func recordDeliveredMetric(chatId: Data, throughLamport: UInt64, deliveredAtMs: Int64, viaTransport: UInt8?) throws 
 
     /**
      * Attach first-arrival diagnostics to an already inserted incoming
@@ -3645,14 +3651,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * [`MessageStore::record_receipt`]: once a receipt watermark advances,
      * stale retries must never regress it.
      */
-    func recordOutgoingReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64) throws
+    func recordOutgoingReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64) throws 
 
     /**
      * Record a bounded, metadata-only connection event for an accepted peer.
      * Identical high-frequency signals are coalesced for 30 seconds; detailed
      * events are retained for 30 days and capped at 1,000 rows.
      */
-    func recordPeerConnectionEvent(userId: Data, transport: PeerConnectionTransport, kind: PeerConnectionEventKind, occurredAtMs: Int64) throws
+    func recordPeerConnectionEvent(userId: Data, transport: PeerConnectionTransport, kind: PeerConnectionEventKind, occurredAtMs: Int64) throws 
 
     /**
      * Record that a peer has delivered/read messages authored by
@@ -3676,7 +3682,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * None`) never clears an already-known one. Pass `None` when the return
      * route isn't known.
      */
-    func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws
+    func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws 
 
     /**
      * V2 field metric: record that this device authored an outbound message
@@ -3685,7 +3691,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * Idempotent per (chat, lamport); metadata only -- the chat is stored as
      * an 8-byte hash and no content is kept. See [`delivery_metrics`].
      */
-    func recordSentMetric(chatId: Data, lamport: UInt64, sentAtMs: Int64) throws
+    func recordSentMetric(chatId: Data, lamport: UInt64, sentAtMs: Int64) throws 
 
     /**
      * Record a **Not now** and return the new dismissal count, so the shell
@@ -3769,12 +3775,41 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func removeCarriedEnvelope(msgId: Data) throws  -> Bool
 
-    func removeFriendSuggestion(candidateUserId: Data) throws
+    func removeFriendSuggestion(candidateUserId: Data) throws 
 
     /**
      * Resolve all stable ids and reply targets for a timeline under one lock.
      */
     func replyMetadata(messages: [StoredMessage]) throws  -> [CoreReplyMetadata]
+
+    /**
+     * Forget how far the sweep now under way has walked, so the next walk of
+     * this mailbox starts at 0 again, and date the restart.
+     *
+     * Two callers, both of them cases where the remembered progress has
+     * stopped meaning what it says:
+     *
+     * - a sweep whose resume cursor is stale enough to be pointing into an id
+     * space that no longer exists ([`crate::relay_sweep_restart_from_zero`]
+     * decides; the shell calls this and then walks from 0 in the same
+     * pass);
+     * - a walk abandoned because the relay returned rows without advancing
+     * its cursor. That mailbox is answering incoherently, and leaving
+     * non-zero progress behind would hold it in "a sweep is under way"
+     * ([`crate::relay_sweep_due`]) on *every* pass from then on — which
+     * also means never running an ordinary frontier pass against it again,
+     * so new mail at the top of that mailbox would stop arriving
+     * altogether. Clearing it hands the mailbox back to the schedule.
+     *
+     * Stamping `sweep_started_at` matters for the first caller and is
+     * harmless for the second: it is what stops the walk this call is about
+     * to start from being judged stale on the very next pass and restarted
+     * again, which would be the same re-download loop in a new costume.
+     * Writes nothing for a mailbox with no cursor row — there is no progress
+     * to forget, and inventing a row would only claim a sweep that is not
+     * happening.
+     */
+    func resetRelaySweepProgress(configKey: String, nowMs: Int64) throws 
 
     /**
      * Unread visible messages across every non-self sender stream in a chat,
@@ -3800,12 +3835,12 @@ public protocol MessageStoreProtocol : AnyObject {
     /**
      * State values: 0 available, 1 requested, 2 hidden.
      */
-    func setFriendSuggestionState(candidateUserId: Data, state: UInt8) throws
+    func setFriendSuggestionState(candidateUserId: Data, state: UInt8) throws 
 
     /**
      * "Don't ask again": a quiet local tombstone, no notification to anyone.
      */
-    func suppressSharedRequests(requesterUserId: Data) throws
+    func suppressSharedRequests(requesterUserId: Data) throws 
 
     func unblockUser(userId: Data) throws  -> Bool
 
@@ -3814,21 +3849,21 @@ public protocol MessageStoreProtocol : AnyObject {
      * FriendCard (e.g. after they update their display name) replaces the
      * row rather than erroring or duplicating.
      */
-    func upsertContact(contact: Contact) throws
+    func upsertContact(contact: Contact) throws 
 
     /**
      * Apply an authenticated contact's discovery policy if it is newer.
      */
     func upsertContactDiscoveryPolicy(policy: ContactDiscoveryPolicy) throws  -> Bool
 
-    func upsertContactProvenance(provenance: ContactProvenance) throws
+    func upsertContactProvenance(provenance: ContactProvenance) throws 
 
     /**
      * Add or replace a group definition and its full membership. Updating an
      * existing group id replaces the stored key/member list atomically,
      * which is the v1 rotation path for membership changes.
      */
-    func upsertGroup(group: Group) throws
+    func upsertGroup(group: Group) throws 
 
     /**
      * Import a friend card without allowing an older/blank card to erase a
@@ -3848,7 +3883,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * Record (or refresh, on a re-send) the requester-side "waiting" state
      * for one shared-card connection.
      */
-    func upsertOutgoingSharedRequest(request: OutgoingSharedRequest) throws
+    func upsertOutgoingSharedRequest(request: OutgoingSharedRequest) throws 
 
     /**
      * Record or refresh an inbound shared-card request. A duplicate delivery
@@ -3856,7 +3891,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * `last_prompted_ms` are preserved so redelivery neither resets the
      * prompt-rate clock nor re-raises the sheet.
      */
-    func upsertPendingSharedRequest(request: PendingSharedRequest) throws
+    func upsertPendingSharedRequest(request: PendingSharedRequest) throws 
 
 }
 
@@ -3965,13 +4000,20 @@ open func advanceRelayFetchCursor(configKey: String, pageNextCursor: Int64, page
      * cursors here would leave behind progress claiming coverage of rows the
      * sweep never looked at, and `sweep_after_id` is also what
      * [`crate::relay_sweep_due`] reads as "a sweep is under way".
+     *
+     * The first page that actually moves a sweep off 0 also dates the sweep,
+     * in `sweep_started_at`. Nothing else writes it, so it is the age of the
+     * walk rather than of the last page — which is the question
+     * [`crate::relay_sweep_restart_from_zero`] has to answer, and the reason
+     * `now_ms` is a parameter of an otherwise timeless function.
      */
-open func advanceRelaySweepCursor(configKey: String, pageNextCursor: Int64, pageFullyProcessed: Bool)throws  -> Int64 {
+open func advanceRelaySweepCursor(configKey: String, pageNextCursor: Int64, pageFullyProcessed: Bool, nowMs: Int64)throws  -> Int64 {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_advance_relay_sweep_cursor(self.uniffiClonePointer(),
         FfiConverterString.lower(configKey),
         FfiConverterInt64.lower(pageNextCursor),
-        FfiConverterBool.lower(pageFullyProcessed),$0
+        FfiConverterBool.lower(pageFullyProcessed),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -6447,6 +6489,41 @@ open func replyMetadata(messages: [StoredMessage])throws  -> [CoreReplyMetadata]
 }
 
     /**
+     * Forget how far the sweep now under way has walked, so the next walk of
+     * this mailbox starts at 0 again, and date the restart.
+     *
+     * Two callers, both of them cases where the remembered progress has
+     * stopped meaning what it says:
+     *
+     * - a sweep whose resume cursor is stale enough to be pointing into an id
+     * space that no longer exists ([`crate::relay_sweep_restart_from_zero`]
+     * decides; the shell calls this and then walks from 0 in the same
+     * pass);
+     * - a walk abandoned because the relay returned rows without advancing
+     * its cursor. That mailbox is answering incoherently, and leaving
+     * non-zero progress behind would hold it in "a sweep is under way"
+     * ([`crate::relay_sweep_due`]) on *every* pass from then on — which
+     * also means never running an ordinary frontier pass against it again,
+     * so new mail at the top of that mailbox would stop arriving
+     * altogether. Clearing it hands the mailbox back to the schedule.
+     *
+     * Stamping `sweep_started_at` matters for the first caller and is
+     * harmless for the second: it is what stops the walk this call is about
+     * to start from being judged stale on the very next pass and restarted
+     * again, which would be the same re-download loop in a new costume.
+     * Writes nothing for a mailbox with no cursor row — there is no progress
+     * to forget, and inventing a row would only claim a sweep that is not
+     * happening.
+     */
+open func resetRelaySweepProgress(configKey: String, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_reset_relay_sweep_progress(self.uniffiClonePointer(),
+        FfiConverterString.lower(configKey),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
+}
+
+    /**
      * Unread visible messages across every non-self sender stream in a chat,
      * using each stream's persisted local READ watermark.
      */
@@ -6727,7 +6804,7 @@ public protocol SeenIdsProtocol : AnyObject {
      * re-relayed. Idempotent -- recording an already-seen id is a no-op and
      * won't create a duplicate eviction-queue entry.
      */
-    func record(msgId: Data)
+    func record(msgId: Data) 
 
 }
 
@@ -6978,9 +7055,9 @@ public struct FfiConverterTypeAuthoredEnvelope: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AuthoredEnvelope {
         return
             try AuthoredEnvelope(
-                message: FfiConverterTypeStoredMessage.read(from: &buf),
-                envelope: FfiConverterTypeOutboundEnvelope.read(from: &buf),
-                frame: FfiConverterData.read(from: &buf),
+                message: FfiConverterTypeStoredMessage.read(from: &buf), 
+                envelope: FfiConverterTypeOutboundEnvelope.read(from: &buf), 
+                frame: FfiConverterData.read(from: &buf), 
                 acknowledgedDelivered: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -7054,8 +7131,8 @@ public struct FfiConverterTypeAuthoredGroupMetadataUpdate: FfiConverterRustBuffe
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AuthoredGroupMetadataUpdate {
         return
             try AuthoredGroupMetadataUpdate(
-                group: FfiConverterTypeGroup.read(from: &buf),
-                update: FfiConverterTypeGroupMetadataUpdate.read(from: &buf),
+                group: FfiConverterTypeGroup.read(from: &buf), 
+                update: FfiConverterTypeGroupMetadataUpdate.read(from: &buf), 
                 authored: FfiConverterTypeAuthoredEnvelope.read(from: &buf)
         )
     }
@@ -7122,7 +7199,7 @@ public struct FfiConverterTypeAuthoredReceipt: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AuthoredReceipt {
         return
             try AuthoredReceipt(
-                envelope: FfiConverterTypeOutgoingReceiptEnvelope.read(from: &buf),
+                envelope: FfiConverterTypeOutgoingReceiptEnvelope.read(from: &buf), 
                 frame: FfiConverterData.read(from: &buf)
         )
     }
@@ -7172,7 +7249,7 @@ public struct BackupContentOptions {
     public init(
         /**
          * Visible conversations plus their receipt and pending-send state.
-         */includeMessageHistory: Bool,
+         */includeMessageHistory: Bool, 
         /**
          * Encrypted courier cargo held temporarily for other people. This is
          * deliberately off by default: it can be large and a restored copy has
@@ -7210,7 +7287,7 @@ public struct FfiConverterTypeBackupContentOptions: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackupContentOptions {
         return
             try BackupContentOptions(
-                includeMessageHistory: FfiConverterBool.read(from: &buf),
+                includeMessageHistory: FfiConverterBool.read(from: &buf), 
                 includePendingDeliveriesForOthers: FfiConverterBool.read(from: &buf)
         )
     }
@@ -7318,13 +7395,13 @@ public struct FfiConverterTypeBackupInventory: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackupInventory {
         return
             try BackupInventory(
-                contactCount: FfiConverterUInt64.read(from: &buf),
-                groupCount: FfiConverterUInt64.read(from: &buf),
-                messageCount: FfiConverterUInt64.read(from: &buf),
-                messageBytes: FfiConverterUInt64.read(from: &buf),
-                pendingOwnDeliveryCount: FfiConverterUInt64.read(from: &buf),
-                pendingOwnDeliveryBytes: FfiConverterUInt64.read(from: &buf),
-                pendingCourierDeliveryCount: FfiConverterUInt64.read(from: &buf),
+                contactCount: FfiConverterUInt64.read(from: &buf), 
+                groupCount: FfiConverterUInt64.read(from: &buf), 
+                messageCount: FfiConverterUInt64.read(from: &buf), 
+                messageBytes: FfiConverterUInt64.read(from: &buf), 
+                pendingOwnDeliveryCount: FfiConverterUInt64.read(from: &buf), 
+                pendingOwnDeliveryBytes: FfiConverterUInt64.read(from: &buf), 
+                pendingCourierDeliveryCount: FfiConverterUInt64.read(from: &buf), 
                 pendingCourierDeliveryBytes: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -7419,10 +7496,10 @@ public struct FfiConverterTypeBackupSanitizationReport: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackupSanitizationReport {
         return
             try BackupSanitizationReport(
-                removedMessageCount: FfiConverterUInt64.read(from: &buf),
-                removedPendingOwnDeliveryCount: FfiConverterUInt64.read(from: &buf),
-                removedCourierDeliveryCount: FfiConverterUInt64.read(from: &buf),
-                removedExpiredDeliveryCount: FfiConverterUInt64.read(from: &buf),
+                removedMessageCount: FfiConverterUInt64.read(from: &buf), 
+                removedPendingOwnDeliveryCount: FfiConverterUInt64.read(from: &buf), 
+                removedCourierDeliveryCount: FfiConverterUInt64.read(from: &buf), 
+                removedExpiredDeliveryCount: FfiConverterUInt64.read(from: &buf), 
                 removedConnectionEventCount: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -7520,10 +7597,10 @@ public struct FfiConverterTypeCarriedEnvelope: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CarriedEnvelope {
         return
             try CarriedEnvelope(
-                msgId: FfiConverterData.read(from: &buf),
-                hopTtl: FfiConverterUInt8.read(from: &buf),
-                expiry: FfiConverterInt64.read(from: &buf),
-                recipientHint: FfiConverterData.read(from: &buf),
+                msgId: FfiConverterData.read(from: &buf), 
+                hopTtl: FfiConverterUInt8.read(from: &buf), 
+                expiry: FfiConverterInt64.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf), 
                 sealed: FfiConverterData.read(from: &buf)
         )
     }
@@ -7602,7 +7679,7 @@ public struct FfiConverterTypeConsumedHiddenLamport: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConsumedHiddenLamport {
         return
             try ConsumedHiddenLamport(
-                senderUserId: FfiConverterData.read(from: &buf),
+                senderUserId: FfiConverterData.read(from: &buf), 
                 lamport: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -7652,7 +7729,7 @@ public struct Contact {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(userId: Data, name: String, signPk: Data, agreePk: Data, relayUrl: String?, relayToken: String?,
+    public init(userId: Data, name: String, signPk: Data, agreePk: Data, relayUrl: String?, relayToken: String?, 
         /**
          * A local-only nickname the user set for this contact (T16). Presentation
          * only: it is NEVER written to a `FriendCard`, digest, or any wire format,
@@ -7716,12 +7793,12 @@ public struct FfiConverterTypeContact: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Contact {
         return
             try Contact(
-                userId: FfiConverterData.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
-                signPk: FfiConverterData.read(from: &buf),
-                agreePk: FfiConverterData.read(from: &buf),
-                relayUrl: FfiConverterOptionString.read(from: &buf),
-                relayToken: FfiConverterOptionString.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                signPk: FfiConverterData.read(from: &buf), 
+                agreePk: FfiConverterData.read(from: &buf), 
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
+                relayToken: FfiConverterOptionString.read(from: &buf), 
                 nickname: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -7807,9 +7884,9 @@ public struct FfiConverterTypeContactDiscoveryPolicy: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactDiscoveryPolicy {
         return
             try ContactDiscoveryPolicy(
-                userId: FfiConverterData.read(from: &buf),
-                protocolVersion: FfiConverterUInt8.read(from: &buf),
-                enabled: FfiConverterBool.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                protocolVersion: FfiConverterUInt8.read(from: &buf), 
+                enabled: FfiConverterBool.read(from: &buf), 
                 revision: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -7866,11 +7943,11 @@ public struct ContactProvenance {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(userId: Data,
+    public init(userId: Data, 
         /**
          * 0 = direct QR/link, 1 = introduced by another accepted contact,
          * 2 = added from a shared contact card (specs/share-contact.md).
-         */source: UInt8, introducerUserId: Data?, introducedAtMs: Int64,
+         */source: UInt8, introducerUserId: Data?, introducedAtMs: Int64, 
         /**
          * Were we standing next to this person when we accepted them? True for a
          * camera QR scan (co-presence by construction) and for any add where the
@@ -7930,10 +8007,10 @@ public struct FfiConverterTypeContactProvenance: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactProvenance {
         return
             try ContactProvenance(
-                userId: FfiConverterData.read(from: &buf),
-                source: FfiConverterUInt8.read(from: &buf),
-                introducerUserId: FfiConverterOptionData.read(from: &buf),
-                introducedAtMs: FfiConverterInt64.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                source: FfiConverterUInt8.read(from: &buf), 
+                introducerUserId: FfiConverterOptionData.read(from: &buf), 
+                introducedAtMs: FfiConverterInt64.read(from: &buf), 
                 addedNearby: FfiConverterBool.read(from: &buf)
         )
     }
@@ -8017,8 +8094,8 @@ public struct FfiConverterTypeContactRelayRejection: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactRelayRejection {
         return
             try ContactRelayRejection(
-                userId: FfiConverterData.read(from: &buf),
-                rejectStreak: FfiConverterInt64.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                rejectStreak: FfiConverterInt64.read(from: &buf), 
                 rejectedAtMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -8106,9 +8183,9 @@ public struct FfiConverterTypeContactRelayUnreachable: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactRelayUnreachable {
         return
             try ContactRelayUnreachable(
-                userId: FfiConverterData.read(from: &buf),
-                endpointKey: FfiConverterString.read(from: &buf),
-                unreachableStreak: FfiConverterInt64.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                endpointKey: FfiConverterString.read(from: &buf), 
+                unreachableStreak: FfiConverterInt64.read(from: &buf), 
                 unreachableAtMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -8194,10 +8271,10 @@ public struct FfiConverterTypeCoreAttachmentPayload: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreAttachmentPayload {
         return
             try CoreAttachmentPayload(
-                mediaType: FfiConverterTypeAttachmentMediaType.read(from: &buf),
-                mimeType: FfiConverterString.read(from: &buf),
-                durationMs: FfiConverterInt64.read(from: &buf),
-                blob: FfiConverterData.read(from: &buf),
+                mediaType: FfiConverterTypeAttachmentMediaType.read(from: &buf), 
+                mimeType: FfiConverterString.read(from: &buf), 
+                durationMs: FfiConverterInt64.read(from: &buf), 
+                blob: FfiConverterData.read(from: &buf), 
                 caption: FfiConverterString.read(from: &buf)
         )
     }
@@ -8320,16 +8397,16 @@ public struct FfiConverterTypeCoreBackupPayload: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreBackupPayload {
         return
             try CoreBackupPayload(
-                identity: FfiConverterData.read(from: &buf),
-                sqlite: FfiConverterData.read(from: &buf),
-                srcVersionCode: FfiConverterInt32.read(from: &buf),
-                createdAtMs: FfiConverterInt64.read(from: &buf),
-                displayName: FfiConverterOptionString.read(from: &buf),
-                ownAvatar: FfiConverterData.read(from: &buf),
-                ownAvatarEpoch: FfiConverterInt64.read(from: &buf),
-                relayUrl: FfiConverterOptionString.read(from: &buf),
-                relayToken: FfiConverterOptionString.read(from: &buf),
-                shareOnline: FfiConverterBool.read(from: &buf),
+                identity: FfiConverterData.read(from: &buf), 
+                sqlite: FfiConverterData.read(from: &buf), 
+                srcVersionCode: FfiConverterInt32.read(from: &buf), 
+                createdAtMs: FfiConverterInt64.read(from: &buf), 
+                displayName: FfiConverterOptionString.read(from: &buf), 
+                ownAvatar: FfiConverterData.read(from: &buf), 
+                ownAvatarEpoch: FfiConverterInt64.read(from: &buf), 
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
+                relayToken: FfiConverterOptionString.read(from: &buf), 
+                shareOnline: FfiConverterBool.read(from: &buf), 
                 friendsOfFriendsEnabled: FfiConverterBool.read(from: &buf)
         )
     }
@@ -8419,7 +8496,7 @@ public struct FfiConverterTypeCoreCarriedCursor: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreCarriedCursor {
         return
             try CoreCarriedCursor(
-                receivedAt: FfiConverterInt64.read(from: &buf),
+                receivedAt: FfiConverterInt64.read(from: &buf), 
                 msgId: FfiConverterData.read(from: &buf)
         )
     }
@@ -8467,7 +8544,7 @@ public struct CoreCarriedLane {
         /**
          * Offer no carried frames at all this round: the walk is complete and
          * still inside its re-walk cooldown.
-         */skip: Bool,
+         */skip: Bool, 
         /**
          * Resume point to hand to the spray plan. `None` is a fresh full pass.
          */after: CoreCarriedCursor?) {
@@ -8503,7 +8580,7 @@ public struct FfiConverterTypeCoreCarriedLane: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreCarriedLane {
         return
             try CoreCarriedLane(
-                skip: FfiConverterBool.read(from: &buf),
+                skip: FfiConverterBool.read(from: &buf), 
                 after: FfiConverterOptionTypeCoreCarriedCursor.read(from: &buf)
         )
     }
@@ -8549,11 +8626,11 @@ public struct CoreCarriedSyncPage {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(rows: [CarriedEnvelope],
+    public init(rows: [CarriedEnvelope], 
         /**
          * Resume point for the next page: the last row on this one, or `None`
          * if the page is empty (nothing to resume past).
-         */next: CoreCarriedCursor?,
+         */next: CoreCarriedCursor?, 
         /**
          * Whether the scan reached the tail of the queue rather than stopping on
          * the byte budget. `true` means the walk is complete: everything this
@@ -8596,8 +8673,8 @@ public struct FfiConverterTypeCoreCarriedSyncPage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreCarriedSyncPage {
         return
             try CoreCarriedSyncPage(
-                rows: FfiConverterSequenceTypeCarriedEnvelope.read(from: &buf),
-                next: FfiConverterOptionTypeCoreCarriedCursor.read(from: &buf),
+                rows: FfiConverterSequenceTypeCarriedEnvelope.read(from: &buf), 
+                next: FfiConverterOptionTypeCoreCarriedCursor.read(from: &buf), 
                 exhausted: FfiConverterBool.read(from: &buf)
         )
     }
@@ -8692,11 +8769,11 @@ public struct FfiConverterTypeCoreChatPreview: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreChatPreview {
         return
             try CoreChatPreview(
-                chatId: FfiConverterData.read(from: &buf),
-                lastMessage: FfiConverterOptionTypeStoredMessage.read(from: &buf),
-                unreadCount: FfiConverterUInt32.read(from: &buf),
-                ownDeliveredThrough: FfiConverterUInt64.read(from: &buf),
-                ownReadThrough: FfiConverterUInt64.read(from: &buf),
+                chatId: FfiConverterData.read(from: &buf), 
+                lastMessage: FfiConverterOptionTypeStoredMessage.read(from: &buf), 
+                unreadCount: FfiConverterUInt32.read(from: &buf), 
+                ownDeliveredThrough: FfiConverterUInt64.read(from: &buf), 
+                ownReadThrough: FfiConverterUInt64.read(from: &buf), 
                 avatarBytes: FfiConverterOptionData.read(from: &buf)
         )
     }
@@ -8758,14 +8835,14 @@ public struct CoreDetectedLink {
     public init(
         /**
          * First UTF-16 code unit of the link, inclusive.
-         */startUtf16: UInt32,
+         */startUtf16: UInt32, 
         /**
          * One past the last UTF-16 code unit of the link, exclusive.
-         */endUtf16: UInt32,
+         */endUtf16: UInt32, 
         /**
          * The link text, byte-for-byte as it appears in the body. This is both
          * what must be displayed and where the tap must go.
-         */url: String,
+         */url: String, 
         /**
          * Which scheme it uses.
          */scheme: CoreLinkScheme) {
@@ -8811,9 +8888,9 @@ public struct FfiConverterTypeCoreDetectedLink: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDetectedLink {
         return
             try CoreDetectedLink(
-                startUtf16: FfiConverterUInt32.read(from: &buf),
-                endUtf16: FfiConverterUInt32.read(from: &buf),
-                url: FfiConverterString.read(from: &buf),
+                startUtf16: FfiConverterUInt32.read(from: &buf), 
+                endUtf16: FfiConverterUInt32.read(from: &buf), 
+                url: FfiConverterString.read(from: &buf), 
                 scheme: FfiConverterTypeCoreLinkScheme.read(from: &buf)
         )
     }
@@ -8876,20 +8953,20 @@ public struct CoreDigestSprayPlan {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(carriedFrames: [Data], ownOutboundFrames: [Data], ownReceiptFrames: [Data],
+    public init(carriedFrames: [Data], ownOutboundFrames: [Data], ownReceiptFrames: [Data], 
         /**
          * Hidden-kind msg_ids newly included for a peer that can't ack hidden
          * kinds. The shell records these on the peer's router entry
          * (`record_hidden_offered`) after sending, so the next plan for this
          * session excludes them — the once-per-session re-spray bound. Empty
          * when the peer advertised CAP_ACKS_HIDDEN_KINDS.
-         */offeredHiddenMsgIds: [Data],
+         */offeredHiddenMsgIds: [Data], 
         /**
          * Resume point for this link session's next carried-lane round: the last
          * carried row this plan offered, or `None` if it offered none. The shell
          * hands it straight back via `record_carried_progress`. It is offering
          * bookkeeping only, never a delete signal.
-         */nextCarriedCursor: CoreCarriedCursor?,
+         */nextCarriedCursor: CoreCarriedCursor?, 
         /**
          * Whether the carried lane reached the tail of the queue this round --
          * i.e. this peer has now been offered everything it is eligible for, so
@@ -8947,11 +9024,11 @@ public struct FfiConverterTypeCoreDigestSprayPlan: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDigestSprayPlan {
         return
             try CoreDigestSprayPlan(
-                carriedFrames: FfiConverterSequenceData.read(from: &buf),
-                ownOutboundFrames: FfiConverterSequenceData.read(from: &buf),
-                ownReceiptFrames: FfiConverterSequenceData.read(from: &buf),
-                offeredHiddenMsgIds: FfiConverterSequenceData.read(from: &buf),
-                nextCarriedCursor: FfiConverterOptionTypeCoreCarriedCursor.read(from: &buf),
+                carriedFrames: FfiConverterSequenceData.read(from: &buf), 
+                ownOutboundFrames: FfiConverterSequenceData.read(from: &buf), 
+                ownReceiptFrames: FfiConverterSequenceData.read(from: &buf), 
+                offeredHiddenMsgIds: FfiConverterSequenceData.read(from: &buf), 
+                nextCarriedCursor: FfiConverterOptionTypeCoreCarriedCursor.read(from: &buf), 
                 carriedExhausted: FfiConverterBool.read(from: &buf)
         )
     }
@@ -9118,10 +9195,10 @@ public struct FfiConverterTypeCoreGroupFanoutRow: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreGroupFanoutRow {
         return
             try CoreGroupFanoutRow(
-                msgId: FfiConverterData.read(from: &buf),
-                hopTtl: FfiConverterUInt8.read(from: &buf),
-                expiry: FfiConverterInt64.read(from: &buf),
-                recipientHint: FfiConverterData.read(from: &buf),
+                msgId: FfiConverterData.read(from: &buf), 
+                hopTtl: FfiConverterUInt8.read(from: &buf), 
+                expiry: FfiConverterInt64.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf), 
                 sealed: FfiConverterData.read(from: &buf)
         )
     }
@@ -9196,8 +9273,8 @@ public struct FfiConverterTypeCoreIdentifiedRoute: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreIdentifiedRoute {
         return
             try CoreIdentifiedRoute(
-                transport: FfiConverterTypeCoreTransport.read(from: &buf),
-                address: FfiConverterString.read(from: &buf),
+                transport: FfiConverterTypeCoreTransport.read(from: &buf), 
+                address: FfiConverterString.read(from: &buf), 
                 userId: FfiConverterData.read(from: &buf)
         )
     }
@@ -9264,7 +9341,7 @@ public struct FfiConverterTypeCoreLanEndpoint: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLanEndpoint {
         return
             try CoreLanEndpoint(
-                host: FfiConverterString.read(from: &buf),
+                host: FfiConverterString.read(from: &buf), 
                 port: FfiConverterUInt16.read(from: &buf)
         )
     }
@@ -9330,7 +9407,7 @@ public struct FfiConverterTypeCoreLanHealthDecision: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLanHealthDecision {
         return
             try CoreLanHealthDecision(
-                action: FfiConverterTypeCoreLanHealthAction.read(from: &buf),
+                action: FfiConverterTypeCoreLanHealthAction.read(from: &buf), 
                 nonce: FfiConverterOptionUInt64.read(from: &buf)
         )
     }
@@ -9407,8 +9484,8 @@ public struct FfiConverterTypeCoreMessageReceivedAt: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreMessageReceivedAt {
         return
             try CoreMessageReceivedAt(
-                senderUserId: FfiConverterData.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
+                senderUserId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
                 receivedAtMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -9481,8 +9558,8 @@ public struct FfiConverterTypeCoreMessageTarget: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreMessageTarget {
         return
             try CoreMessageTarget(
-                senderUserId: FfiConverterData.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
+                senderUserId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
                 kind: FfiConverterUInt8.read(from: &buf)
         )
     }
@@ -9549,7 +9626,7 @@ public struct FfiConverterTypeCoreReactionPayload: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreReactionPayload {
         return
             try CoreReactionPayload(
-                target: FfiConverterTypeCoreMessageTarget.read(from: &buf),
+                target: FfiConverterTypeCoreMessageTarget.read(from: &buf), 
                 emoji: FfiConverterString.read(from: &buf)
         )
     }
@@ -9621,8 +9698,8 @@ public struct FfiConverterTypeCoreReactionSummary: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreReactionSummary {
         return
             try CoreReactionSummary(
-                emoji: FfiConverterString.read(from: &buf),
-                count: FfiConverterUInt32.read(from: &buf),
+                emoji: FfiConverterString.read(from: &buf), 
+                count: FfiConverterUInt32.read(from: &buf), 
                 reactedByOwnUser: FfiConverterBool.read(from: &buf)
         )
     }
@@ -9689,7 +9766,7 @@ public struct FfiConverterTypeCoreReactionTargetSummary: FfiConverterRustBuffer 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreReactionTargetSummary {
         return
             try CoreReactionTargetSummary(
-                target: FfiConverterTypeCoreMessageTarget.read(from: &buf),
+                target: FfiConverterTypeCoreMessageTarget.read(from: &buf), 
                 reactions: FfiConverterSequenceTypeCoreReactionSummary.read(from: &buf)
         )
     }
@@ -9744,14 +9821,14 @@ public struct CoreRelayEnvelopeDisposition {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(relayId: Int64,
+    public init(relayId: Int64, 
         /**
          * Stable envelope id. Only consulted for [`CoreInboundDisposition::Seen`]
          * items, to look up whether THIS device durably consumed this exact
          * envelope -- either as a `messages` row or, for a kind that leaves
          * none, in the consumed-hidden-kind set. See
          * [`MessageStore::core_relay_ack_ids_with_consumed`].
-         */msgId: Data, disposition: CoreInboundDisposition,
+         */msgId: Data, disposition: CoreInboundDisposition, 
         /**
          * This fetched envelope's `recipient_hint` off the §6.4 header --
          * whichever hint the fetch actually matched. Used by
@@ -9807,9 +9884,9 @@ public struct FfiConverterTypeCoreRelayEnvelopeDisposition: FfiConverterRustBuff
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayEnvelopeDisposition {
         return
             try CoreRelayEnvelopeDisposition(
-                relayId: FfiConverterInt64.read(from: &buf),
-                msgId: FfiConverterData.read(from: &buf),
-                disposition: FfiConverterTypeCoreInboundDisposition.read(from: &buf),
+                relayId: FfiConverterInt64.read(from: &buf), 
+                msgId: FfiConverterData.read(from: &buf), 
+                disposition: FfiConverterTypeCoreInboundDisposition.read(from: &buf), 
                 recipientHint: FfiConverterData.read(from: &buf)
         )
     }
@@ -9877,7 +9954,7 @@ public struct FfiConverterTypeCoreRelayFetchPage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayFetchPage {
         return
             try CoreRelayFetchPage(
-                envelopes: FfiConverterSequenceTypeCoreRelayFetchedEnvelope.read(from: &buf),
+                envelopes: FfiConverterSequenceTypeCoreRelayFetchedEnvelope.read(from: &buf), 
                 nextCursor: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -9967,11 +10044,11 @@ public struct FfiConverterTypeCoreRelayFetchedEnvelope: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayFetchedEnvelope {
         return
             try CoreRelayFetchedEnvelope(
-                id: FfiConverterInt64.read(from: &buf),
-                msgId: FfiConverterData.read(from: &buf),
-                hopTtl: FfiConverterUInt8.read(from: &buf),
-                recipientHint: FfiConverterData.read(from: &buf),
-                sealed: FfiConverterData.read(from: &buf),
+                id: FfiConverterInt64.read(from: &buf), 
+                msgId: FfiConverterData.read(from: &buf), 
+                hopTtl: FfiConverterUInt8.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf), 
+                sealed: FfiConverterData.read(from: &buf), 
                 expiryMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -10041,7 +10118,7 @@ public struct FfiConverterTypeCoreRelayPresence: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayPresence {
         return
             try CoreRelayPresence(
-                hint: FfiConverterData.read(from: &buf),
+                hint: FfiConverterData.read(from: &buf), 
                 lastSeenMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -10107,7 +10184,7 @@ public struct FfiConverterTypeCoreRelayPresencePage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayPresencePage {
         return
             try CoreRelayPresencePage(
-                nowMs: FfiConverterInt64.read(from: &buf),
+                nowMs: FfiConverterInt64.read(from: &buf), 
                 presence: FfiConverterSequenceTypeCoreRelayPresence.read(from: &buf)
         )
     }
@@ -10185,9 +10262,9 @@ public struct FfiConverterTypeCoreReplyMetadata: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreReplyMetadata {
         return
             try CoreReplyMetadata(
-                message: FfiConverterTypeCoreMessageTarget.read(from: &buf),
-                msgId: FfiConverterOptionData.read(from: &buf),
-                replyToMsgId: FfiConverterOptionData.read(from: &buf),
+                message: FfiConverterTypeCoreMessageTarget.read(from: &buf), 
+                msgId: FfiConverterOptionData.read(from: &buf), 
+                replyToMsgId: FfiConverterOptionData.read(from: &buf), 
                 target: FfiConverterOptionTypeStoredMessage.read(from: &buf)
         )
     }
@@ -10255,7 +10332,7 @@ public struct FfiConverterTypeCoreTransportRoute: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreTransportRoute {
         return
             try CoreTransportRoute(
-                transport: FfiConverterTypeCoreTransport.read(from: &buf),
+                transport: FfiConverterTypeCoreTransport.read(from: &buf), 
                 address: FfiConverterString.read(from: &buf)
         )
     }
@@ -10325,7 +10402,7 @@ public struct FfiConverterTypeDigestEntry: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DigestEntry {
         return
             try DigestEntry(
-                senderUserId: FfiConverterData.read(from: &buf),
+                senderUserId: FfiConverterData.read(from: &buf), 
                 throughLamport: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -10419,11 +10496,11 @@ public struct FfiConverterTypeExtendedMessageBody: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ExtendedMessageBody {
         return
             try ExtendedMessageBody(
-                kind: FfiConverterUInt8.read(from: &buf),
-                chatId: FfiConverterData.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
-                timestamp: FfiConverterInt64.read(from: &buf),
-                content: FfiConverterData.read(from: &buf),
+                kind: FfiConverterUInt8.read(from: &buf), 
+                chatId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
+                timestamp: FfiConverterInt64.read(from: &buf), 
+                content: FfiConverterData.read(from: &buf), 
                 replyToMsgId: FfiConverterOptionData.read(from: &buf)
         )
     }
@@ -10515,10 +10592,10 @@ public struct FfiConverterTypeFriendCard: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendCard {
         return
             try FriendCard(
-                name: FfiConverterString.read(from: &buf),
-                signPk: FfiConverterData.read(from: &buf),
-                agreePk: FfiConverterData.read(from: &buf),
-                relayUrl: FfiConverterOptionString.read(from: &buf),
+                name: FfiConverterString.read(from: &buf), 
+                signPk: FfiConverterData.read(from: &buf), 
+                agreePk: FfiConverterData.read(from: &buf), 
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
                 relayToken: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -10593,8 +10670,8 @@ public struct FfiConverterTypeFriendDirectoryContent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendDirectoryContent {
         return
             try FriendDirectoryContent(
-                version: FfiConverterUInt8.read(from: &buf),
-                revision: FfiConverterUInt64.read(from: &buf),
+                version: FfiConverterUInt8.read(from: &buf), 
+                revision: FfiConverterUInt64.read(from: &buf), 
                 entries: FfiConverterSequenceTypeFriendDirectoryEntry.read(from: &buf)
         )
     }
@@ -10667,8 +10744,8 @@ public struct FfiConverterTypeFriendDirectoryEntry: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendDirectoryEntry {
         return
             try FriendDirectoryEntry(
-                candidate: FfiConverterTypeSuggestedFriendCard.read(from: &buf),
-                candidatePolicyRevision: FfiConverterUInt64.read(from: &buf),
+                candidate: FfiConverterTypeSuggestedFriendCard.read(from: &buf), 
+                candidatePolicyRevision: FfiConverterUInt64.read(from: &buf), 
                 ticket: FfiConverterTypeIntroductionTicket.read(from: &buf)
         )
     }
@@ -10741,7 +10818,7 @@ public struct FfiConverterTypeFriendRequestContent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendRequestContent {
         return
             try FriendRequestContent(
-                card: FfiConverterTypeFriendCard.read(from: &buf),
+                card: FfiConverterTypeFriendCard.read(from: &buf), 
                 shared: FfiConverterOptionTypeSharedFriendCard.read(from: &buf)
         )
     }
@@ -10783,7 +10860,7 @@ public struct FriendSuggestion {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(candidate: SuggestedFriendCard, introducerUserId: Data, ticket: IntroductionTicket,
+    public init(candidate: SuggestedFriendCard, introducerUserId: Data, ticket: IntroductionTicket, 
         /**
          * 0 = available, 1 = requested, 2 = hidden.
          */state: UInt8) {
@@ -10829,9 +10906,9 @@ public struct FfiConverterTypeFriendSuggestion: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FriendSuggestion {
         return
             try FriendSuggestion(
-                candidate: FfiConverterTypeSuggestedFriendCard.read(from: &buf),
-                introducerUserId: FfiConverterData.read(from: &buf),
-                ticket: FfiConverterTypeIntroductionTicket.read(from: &buf),
+                candidate: FfiConverterTypeSuggestedFriendCard.read(from: &buf), 
+                introducerUserId: FfiConverterData.read(from: &buf), 
+                ticket: FfiConverterTypeIntroductionTicket.read(from: &buf), 
                 state: FfiConverterUInt8.read(from: &buf)
         )
     }
@@ -10927,11 +11004,11 @@ public struct FfiConverterTypeGroup: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Group {
         return
             try Group(
-                id: FfiConverterData.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
-                memberUserIds: FfiConverterSequenceData.read(from: &buf),
-                key: FfiConverterData.read(from: &buf),
-                metadataRevision: FfiConverterUInt64.read(from: &buf),
+                id: FfiConverterData.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                memberUserIds: FfiConverterSequenceData.read(from: &buf), 
+                key: FfiConverterData.read(from: &buf), 
+                metadataRevision: FfiConverterUInt64.read(from: &buf), 
                 metadataChangedBy: FfiConverterData.read(from: &buf)
         )
     }
@@ -11024,10 +11101,10 @@ public struct FfiConverterTypeGroupMetadataUpdate: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupMetadataUpdate {
         return
             try GroupMetadataUpdate(
-                groupId: FfiConverterData.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
-                revision: FfiConverterUInt64.read(from: &buf),
-                changedBy: FfiConverterData.read(from: &buf),
+                groupId: FfiConverterData.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                revision: FfiConverterUInt64.read(from: &buf), 
+                changedBy: FfiConverterData.read(from: &buf), 
                 memberUserIds: FfiConverterSequenceData.read(from: &buf)
         )
     }
@@ -11081,11 +11158,11 @@ public struct GroupRelayMember {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(relayUrl: String?, relayToken: String?,
+    public init(relayUrl: String?, relayToken: String?, 
         /**
          * False once this member's card endpoint has been written off for
          * authoritative rejections — [`crate::contact_relay_health::core_contact_relay_endpoint_usable`].
-         */endpointUsable: Bool,
+         */endpointUsable: Bool, 
         /**
          * False while this member's card endpoint is resting because it stopped
          * answering — [`crate::contact_relay_health::core_contact_relay_unreachable_endpoint_usable`].
@@ -11132,9 +11209,9 @@ public struct FfiConverterTypeGroupRelayMember: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupRelayMember {
         return
             try GroupRelayMember(
-                relayUrl: FfiConverterOptionString.read(from: &buf),
-                relayToken: FfiConverterOptionString.read(from: &buf),
-                endpointUsable: FfiConverterBool.read(from: &buf),
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
+                relayToken: FfiConverterOptionString.read(from: &buf), 
+                endpointUsable: FfiConverterBool.read(from: &buf), 
                 endpointAnswering: FfiConverterBool.read(from: &buf)
         )
     }
@@ -11226,10 +11303,10 @@ public struct FfiConverterTypeIdentity: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Identity {
         return
             try Identity(
-                userId: FfiConverterData.read(from: &buf),
-                signPk: FfiConverterData.read(from: &buf),
-                signSk: FfiConverterData.read(from: &buf),
-                agreePk: FfiConverterData.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                signPk: FfiConverterData.read(from: &buf), 
+                signSk: FfiConverterData.read(from: &buf), 
+                agreePk: FfiConverterData.read(from: &buf), 
                 agreeSk: FfiConverterData.read(from: &buf)
         )
     }
@@ -11304,8 +11381,8 @@ public struct FfiConverterTypeIntroducedFriendRequest: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IntroducedFriendRequest {
         return
             try IntroducedFriendRequest(
-                version: FfiConverterUInt8.read(from: &buf),
-                friendCardJson: FfiConverterString.read(from: &buf),
+                version: FfiConverterUInt8.read(from: &buf), 
+                friendCardJson: FfiConverterString.read(from: &buf), 
                 ticket: FfiConverterTypeIntroductionTicket.read(from: &buf)
         )
     }
@@ -11418,14 +11495,14 @@ public struct FfiConverterTypeIntroductionTicket: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IntroductionTicket {
         return
             try IntroductionTicket(
-                version: FfiConverterUInt8.read(from: &buf),
-                introducerUserId: FfiConverterData.read(from: &buf),
-                candidateUserId: FfiConverterData.read(from: &buf),
-                inviteeUserId: FfiConverterData.read(from: &buf),
-                candidatePolicyRevision: FfiConverterUInt64.read(from: &buf),
-                issuedAtMs: FfiConverterInt64.read(from: &buf),
-                expiresAtMs: FfiConverterInt64.read(from: &buf),
-                offerId: FfiConverterData.read(from: &buf),
+                version: FfiConverterUInt8.read(from: &buf), 
+                introducerUserId: FfiConverterData.read(from: &buf), 
+                candidateUserId: FfiConverterData.read(from: &buf), 
+                inviteeUserId: FfiConverterData.read(from: &buf), 
+                candidatePolicyRevision: FfiConverterUInt64.read(from: &buf), 
+                issuedAtMs: FfiConverterInt64.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf), 
+                offerId: FfiConverterData.read(from: &buf), 
                 signature: FfiConverterData.read(from: &buf)
         )
     }
@@ -11520,10 +11597,10 @@ public struct FfiConverterTypeLanEndpointContent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanEndpointContent {
         return
             try LanEndpointContent(
-                instanceToken: FfiConverterData.read(from: &buf),
-                networkId: FfiConverterData.read(from: &buf),
-                host: FfiConverterString.read(from: &buf),
-                port: FfiConverterUInt16.read(from: &buf),
+                instanceToken: FfiConverterData.read(from: &buf), 
+                networkId: FfiConverterData.read(from: &buf), 
+                host: FfiConverterString.read(from: &buf), 
+                port: FfiConverterUInt16.read(from: &buf), 
                 expiresAtMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -11583,7 +11660,7 @@ public struct LateArrivalInput {
         /**
          * The author-clock timestamp this row renders with
          * (`StoredMessage::timestamp`).
-         */displayTsMs: Int64,
+         */displayTsMs: Int64, 
         /**
          * When this device first received the row (`messages.received_at`).
          *
@@ -11592,7 +11669,7 @@ public struct LateArrivalInput {
          * annotated -- we cannot claim an arrival time we never wrote down --
          * but they still take part in the ordering below, standing in with
          * their display timestamp.
-         */arrivalTsMs: Int64?,
+         */arrivalTsMs: Int64?, 
         /**
          * Whether this device authored the row.
          */isOwn: Bool) {
@@ -11633,8 +11710,8 @@ public struct FfiConverterTypeLateArrivalInput: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LateArrivalInput {
         return
             try LateArrivalInput(
-                displayTsMs: FfiConverterInt64.read(from: &buf),
-                arrivalTsMs: FfiConverterOptionInt64.read(from: &buf),
+                displayTsMs: FfiConverterInt64.read(from: &buf), 
+                arrivalTsMs: FfiConverterOptionInt64.read(from: &buf), 
                 isOwn: FfiConverterBool.read(from: &buf)
         )
     }
@@ -11712,8 +11789,8 @@ public struct FfiConverterTypeMessageArrival: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageArrival {
         return
             try MessageArrival(
-                transport: FfiConverterUInt8.read(from: &buf),
-                hopsTaken: FfiConverterUInt8.read(from: &buf),
+                transport: FfiConverterUInt8.read(from: &buf), 
+                hopsTaken: FfiConverterUInt8.read(from: &buf), 
                 receivedAt: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -11803,10 +11880,10 @@ public struct FfiConverterTypeMessageBody: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageBody {
         return
             try MessageBody(
-                kind: FfiConverterUInt8.read(from: &buf),
-                chatId: FfiConverterData.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
-                timestamp: FfiConverterInt64.read(from: &buf),
+                kind: FfiConverterUInt8.read(from: &buf), 
+                chatId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
+                timestamp: FfiConverterInt64.read(from: &buf), 
                 content: FfiConverterData.read(from: &buf)
         )
     }
@@ -11922,14 +11999,14 @@ public struct FfiConverterTypeMessageConflictSummary: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageConflictSummary {
         return
             try MessageConflictSummary(
-                chatHash: FfiConverterString.read(from: &buf),
-                senderHash: FfiConverterString.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
-                existingFingerprint: FfiConverterString.read(from: &buf),
-                incomingFingerprint: FfiConverterString.read(from: &buf),
-                arrivalTransport: FfiConverterOptionUInt8.read(from: &buf),
-                firstSeenAtMs: FfiConverterInt64.read(from: &buf),
-                lastSeenAtMs: FfiConverterInt64.read(from: &buf),
+                chatHash: FfiConverterString.read(from: &buf), 
+                senderHash: FfiConverterString.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
+                existingFingerprint: FfiConverterString.read(from: &buf), 
+                incomingFingerprint: FfiConverterString.read(from: &buf), 
+                arrivalTransport: FfiConverterOptionUInt8.read(from: &buf), 
+                firstSeenAtMs: FfiConverterInt64.read(from: &buf), 
+                lastSeenAtMs: FfiConverterInt64.read(from: &buf), 
                 seenCount: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -12011,7 +12088,7 @@ public struct FfiConverterTypeMessageOrigin: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageOrigin {
         return
             try MessageOrigin(
-                chatId: FfiConverterData.read(from: &buf),
+                chatId: FfiConverterData.read(from: &buf), 
                 senderUserId: FfiConverterData.read(from: &buf)
         )
     }
@@ -12081,7 +12158,7 @@ public struct FfiConverterTypeMessageReference: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageReference {
         return
             try MessageReference(
-                msgId: FfiConverterData.read(from: &buf),
+                msgId: FfiConverterData.read(from: &buf), 
                 replyToMsgId: FfiConverterOptionData.read(from: &buf)
         )
     }
@@ -12151,7 +12228,7 @@ public struct FfiConverterTypeOpenedMessage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OpenedMessage {
         return
             try OpenedMessage(
-                senderUserId: FfiConverterData.read(from: &buf),
+                senderUserId: FfiConverterData.read(from: &buf), 
                 payload: FfiConverterData.read(from: &buf)
         )
     }
@@ -12277,16 +12354,16 @@ public struct FfiConverterTypeOutboundEnvelope: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutboundEnvelope {
         return
             try OutboundEnvelope(
-                msgId: FfiConverterData.read(from: &buf),
-                recipientUserId: FfiConverterData.read(from: &buf),
-                chatId: FfiConverterData.read(from: &buf),
-                senderUserId: FfiConverterData.read(from: &buf),
-                kind: FfiConverterUInt8.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
-                timestamp: FfiConverterInt64.read(from: &buf),
-                hopTtl: FfiConverterUInt8.read(from: &buf),
-                expiry: FfiConverterInt64.read(from: &buf),
-                recipientHint: FfiConverterData.read(from: &buf),
+                msgId: FfiConverterData.read(from: &buf), 
+                recipientUserId: FfiConverterData.read(from: &buf), 
+                chatId: FfiConverterData.read(from: &buf), 
+                senderUserId: FfiConverterData.read(from: &buf), 
+                kind: FfiConverterUInt8.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
+                timestamp: FfiConverterInt64.read(from: &buf), 
+                hopTtl: FfiConverterUInt8.read(from: &buf), 
+                expiry: FfiConverterInt64.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf), 
                 sealed: FfiConverterData.read(from: &buf)
         )
     }
@@ -12422,16 +12499,16 @@ public struct FfiConverterTypeOutgoingReceiptEnvelope: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutgoingReceiptEnvelope {
         return
             try OutgoingReceiptEnvelope(
-                msgId: FfiConverterData.read(from: &buf),
-                recipientUserId: FfiConverterData.read(from: &buf),
-                chatId: FfiConverterData.read(from: &buf),
-                senderUserId: FfiConverterData.read(from: &buf),
-                receiptType: FfiConverterUInt8.read(from: &buf),
-                throughLamport: FfiConverterUInt64.read(from: &buf),
-                timestamp: FfiConverterInt64.read(from: &buf),
-                hopTtl: FfiConverterUInt8.read(from: &buf),
-                expiry: FfiConverterInt64.read(from: &buf),
-                recipientHint: FfiConverterData.read(from: &buf),
+                msgId: FfiConverterData.read(from: &buf), 
+                recipientUserId: FfiConverterData.read(from: &buf), 
+                chatId: FfiConverterData.read(from: &buf), 
+                senderUserId: FfiConverterData.read(from: &buf), 
+                receiptType: FfiConverterUInt8.read(from: &buf), 
+                throughLamport: FfiConverterUInt64.read(from: &buf), 
+                timestamp: FfiConverterInt64.read(from: &buf), 
+                hopTtl: FfiConverterUInt8.read(from: &buf), 
+                expiry: FfiConverterInt64.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf), 
                 sealed: FfiConverterData.read(from: &buf)
         )
     }
@@ -12516,8 +12593,8 @@ public struct FfiConverterTypeOutgoingSharedRequest: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutgoingSharedRequest {
         return
             try OutgoingSharedRequest(
-                candidateUserId: FfiConverterData.read(from: &buf),
-                expiresAtMs: FfiConverterInt64.read(from: &buf),
+                candidateUserId: FfiConverterData.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf), 
                 sentAtMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -12596,9 +12673,9 @@ public struct FfiConverterTypePeerConnectionEvent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PeerConnectionEvent {
         return
             try PeerConnectionEvent(
-                userId: FfiConverterData.read(from: &buf),
-                transport: FfiConverterTypePeerConnectionTransport.read(from: &buf),
-                kind: FfiConverterTypePeerConnectionEventKind.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                transport: FfiConverterTypePeerConnectionTransport.read(from: &buf), 
+                kind: FfiConverterTypePeerConnectionEventKind.read(from: &buf), 
                 occurredAtMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -12702,12 +12779,12 @@ public struct FfiConverterTypePeerConnectionSummary: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PeerConnectionSummary {
         return
             try PeerConnectionSummary(
-                userId: FfiConverterData.read(from: &buf),
-                transport: FfiConverterTypePeerConnectionTransport.read(from: &buf),
-                lastConnectedAtMs: FfiConverterOptionInt64.read(from: &buf),
-                lastDisconnectedAtMs: FfiConverterOptionInt64.read(from: &buf),
-                lastSeenAtMs: FfiConverterOptionInt64.read(from: &buf),
-                lastDeliveredAtMs: FfiConverterOptionInt64.read(from: &buf),
+                userId: FfiConverterData.read(from: &buf), 
+                transport: FfiConverterTypePeerConnectionTransport.read(from: &buf), 
+                lastConnectedAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                lastDisconnectedAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                lastSeenAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                lastDeliveredAtMs: FfiConverterOptionInt64.read(from: &buf), 
                 lastReceivedAtMs: FfiConverterOptionInt64.read(from: &buf)
         )
     }
@@ -12763,7 +12840,7 @@ public struct PendingSharedRequest {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(requesterUserId: Data, name: String, signPk: Data, agreePk: Data, relayUrl: String?, relayToken: String?, sharerUserId: Data, expiresAtMs: Int64, firstSeenMs: Int64,
+    public init(requesterUserId: Data, name: String, signPk: Data, agreePk: Data, relayUrl: String?, relayToken: String?, sharerUserId: Data, expiresAtMs: Int64, firstSeenMs: Int64, 
         /**
          * When this request last raised a prompt; 0 = never. Gates the
          * one-prompt-per-requester-per-day rule.
@@ -12840,15 +12917,15 @@ public struct FfiConverterTypePendingSharedRequest: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PendingSharedRequest {
         return
             try PendingSharedRequest(
-                requesterUserId: FfiConverterData.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
-                signPk: FfiConverterData.read(from: &buf),
-                agreePk: FfiConverterData.read(from: &buf),
-                relayUrl: FfiConverterOptionString.read(from: &buf),
-                relayToken: FfiConverterOptionString.read(from: &buf),
-                sharerUserId: FfiConverterData.read(from: &buf),
-                expiresAtMs: FfiConverterInt64.read(from: &buf),
-                firstSeenMs: FfiConverterInt64.read(from: &buf),
+                requesterUserId: FfiConverterData.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                signPk: FfiConverterData.read(from: &buf), 
+                agreePk: FfiConverterData.read(from: &buf), 
+                relayUrl: FfiConverterOptionString.read(from: &buf), 
+                relayToken: FfiConverterOptionString.read(from: &buf), 
+                sharerUserId: FfiConverterData.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf), 
+                firstSeenMs: FfiConverterInt64.read(from: &buf), 
                 lastPromptedMs: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -12951,11 +13028,11 @@ public struct FfiConverterTypeProfileSyncContent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProfileSyncContent {
         return
             try ProfileSyncContent(
-                avatarEpoch: FfiConverterInt64.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
-                avatar: FfiConverterData.read(from: &buf),
-                friendsOfFriendsVersion: FfiConverterUInt8.read(from: &buf),
-                friendsOfFriendsEnabled: FfiConverterBool.read(from: &buf),
+                avatarEpoch: FfiConverterInt64.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterData.read(from: &buf), 
+                friendsOfFriendsVersion: FfiConverterUInt8.read(from: &buf), 
+                friendsOfFriendsEnabled: FfiConverterBool.read(from: &buf), 
                 friendsOfFriendsRevision: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -13042,9 +13119,9 @@ public struct FfiConverterTypeReceiptContent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceiptContent {
         return
             try ReceiptContent(
-                chatId: FfiConverterData.read(from: &buf),
-                senderUserId: FfiConverterData.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
+                chatId: FfiConverterData.read(from: &buf), 
+                senderUserId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
                 receiptType: FfiConverterUInt8.read(from: &buf)
         )
     }
@@ -13120,7 +13197,7 @@ public struct FfiConverterTypeRelayEndpoint: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayEndpoint {
         return
             try RelayEndpoint(
-                url: FfiConverterString.read(from: &buf),
+                url: FfiConverterString.read(from: &buf), 
                 token: FfiConverterString.read(from: &buf)
         )
     }
@@ -13183,6 +13260,22 @@ public struct RelayFetchCursor {
      * change that invalidates the coverage it claims.
      */
     public var sweepAfterId: Int64
+    /**
+     * When the sweep now under way first got somewhere, or 0 when no sweep
+     * is part-way through (or when one is, but has not yet fully processed a
+     * page).
+     *
+     * A resume cursor is only as good as the id space it points into. A relay
+     * rebuilt from scratch restarts its row ids at 1, and a cursor remembered
+     * from the old id space then points past the end of the new mailbox: the
+     * resumed walk fetches one empty page, reads it as end-of-mailbox, and
+     * records a sweep that covered nothing. This timestamp is how
+     * [`crate::relay_sweep_restart_from_zero`] tells a sweep that yielded a
+     * second ago — whose empty page is simply the end of the mailbox — from
+     * one that has been stalled across days offline, which is the case in
+     * which the mailbox underneath it can have been replaced.
+     */
+    public var sweepStartedAtMs: Int64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -13190,10 +13283,10 @@ public struct RelayFetchCursor {
         /**
          * The highest relay row id whose page was fully processed. A normal
          * pass resumes its `after=` here.
-         */afterId: Int64,
+         */afterId: Int64, 
         /**
          * When a walk from 0 last completed for this mailbox, or 0 if never.
-         */lastSweepAtMs: Int64,
+         */lastSweepAtMs: Int64, 
         /**
          * How far the sweep currently in progress has walked, or 0 when no sweep
          * is part-way through.
@@ -13208,10 +13301,26 @@ public struct RelayFetchCursor {
          * reads it that way — so it is cleared exactly when a sweep stops being
          * under way: on the empty page that completes it, and on a hint-set
          * change that invalidates the coverage it claims.
-         */sweepAfterId: Int64) {
+         */sweepAfterId: Int64, 
+        /**
+         * When the sweep now under way first got somewhere, or 0 when no sweep
+         * is part-way through (or when one is, but has not yet fully processed a
+         * page).
+         *
+         * A resume cursor is only as good as the id space it points into. A relay
+         * rebuilt from scratch restarts its row ids at 1, and a cursor remembered
+         * from the old id space then points past the end of the new mailbox: the
+         * resumed walk fetches one empty page, reads it as end-of-mailbox, and
+         * records a sweep that covered nothing. This timestamp is how
+         * [`crate::relay_sweep_restart_from_zero`] tells a sweep that yielded a
+         * second ago — whose empty page is simply the end of the mailbox — from
+         * one that has been stalled across days offline, which is the case in
+         * which the mailbox underneath it can have been replaced.
+         */sweepStartedAtMs: Int64) {
         self.afterId = afterId
         self.lastSweepAtMs = lastSweepAtMs
         self.sweepAfterId = sweepAfterId
+        self.sweepStartedAtMs = sweepStartedAtMs
     }
 }
 
@@ -13228,6 +13337,9 @@ extension RelayFetchCursor: Equatable, Hashable {
         if lhs.sweepAfterId != rhs.sweepAfterId {
             return false
         }
+        if lhs.sweepStartedAtMs != rhs.sweepStartedAtMs {
+            return false
+        }
         return true
     }
 
@@ -13235,6 +13347,7 @@ extension RelayFetchCursor: Equatable, Hashable {
         hasher.combine(afterId)
         hasher.combine(lastSweepAtMs)
         hasher.combine(sweepAfterId)
+        hasher.combine(sweepStartedAtMs)
     }
 }
 
@@ -13246,9 +13359,10 @@ public struct FfiConverterTypeRelayFetchCursor: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayFetchCursor {
         return
             try RelayFetchCursor(
-                afterId: FfiConverterInt64.read(from: &buf),
-                lastSweepAtMs: FfiConverterInt64.read(from: &buf),
-                sweepAfterId: FfiConverterInt64.read(from: &buf)
+                afterId: FfiConverterInt64.read(from: &buf), 
+                lastSweepAtMs: FfiConverterInt64.read(from: &buf), 
+                sweepAfterId: FfiConverterInt64.read(from: &buf), 
+                sweepStartedAtMs: FfiConverterInt64.read(from: &buf)
         )
     }
 
@@ -13256,6 +13370,7 @@ public struct FfiConverterTypeRelayFetchCursor: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.afterId, into: &buf)
         FfiConverterInt64.write(value.lastSweepAtMs, into: &buf)
         FfiConverterInt64.write(value.sweepAfterId, into: &buf)
+        FfiConverterInt64.write(value.sweepStartedAtMs, into: &buf)
     }
 }
 
@@ -13320,7 +13435,7 @@ public struct FfiConverterTypeRelayQueueDepth: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayQueueDepth {
         return
             try RelayQueueDepth(
-                recipientUserId: FfiConverterData.read(from: &buf),
+                recipientUserId: FfiConverterData.read(from: &buf), 
                 queued: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -13386,7 +13501,7 @@ public struct FfiConverterTypeRelaySetup: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelaySetup {
         return
             try RelaySetup(
-                relayUrl: FfiConverterString.read(from: &buf),
+                relayUrl: FfiConverterString.read(from: &buf), 
                 relayToken: FfiConverterString.read(from: &buf)
         )
     }
@@ -13481,9 +13596,9 @@ public struct FfiConverterTypeRelayUpdateContent: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayUpdateContent {
         return
             try RelayUpdateContent(
-                subjectUserId: FfiConverterData.read(from: &buf),
-                relayEpoch: FfiConverterInt64.read(from: &buf),
-                relayUrl: FfiConverterString.read(from: &buf),
+                subjectUserId: FfiConverterData.read(from: &buf), 
+                relayEpoch: FfiConverterInt64.read(from: &buf), 
+                relayUrl: FfiConverterString.read(from: &buf), 
                 relayToken: FfiConverterString.read(from: &buf)
         )
     }
@@ -13537,7 +13652,7 @@ public struct SharedFriendCard {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(version: UInt8, card: FriendCard, sharerUserId: Data,
+    public init(version: UInt8, card: FriendCard, sharerUserId: Data, 
         /**
          * The shared person's discovery-policy revision at issue time. Checked
          * for equality on their phone (decision 10) so an off-then-on cycle
@@ -13600,12 +13715,12 @@ public struct FfiConverterTypeSharedFriendCard: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SharedFriendCard {
         return
             try SharedFriendCard(
-                version: FfiConverterUInt8.read(from: &buf),
-                card: FfiConverterTypeFriendCard.read(from: &buf),
-                sharerUserId: FfiConverterData.read(from: &buf),
-                sharedPolicyRevision: FfiConverterUInt64.read(from: &buf),
-                issuedAtMs: FfiConverterInt64.read(from: &buf),
-                expiresAtMs: FfiConverterInt64.read(from: &buf),
+                version: FfiConverterUInt8.read(from: &buf), 
+                card: FfiConverterTypeFriendCard.read(from: &buf), 
+                sharerUserId: FfiConverterData.read(from: &buf), 
+                sharedPolicyRevision: FfiConverterUInt64.read(from: &buf), 
+                issuedAtMs: FfiConverterInt64.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf), 
                 signature: FfiConverterData.read(from: &buf)
         )
     }
@@ -13652,7 +13767,7 @@ public struct SharedRequestDismissal {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(requesterUserId: Data, count: UInt32,
+    public init(requesterUserId: Data, count: UInt32, 
         /**
          * Once true ("Don't ask again"), matching requests are dropped before
          * any prompt. Cleared only by directly scanning that person's own code.
@@ -13694,8 +13809,8 @@ public struct FfiConverterTypeSharedRequestDismissal: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SharedRequestDismissal {
         return
             try SharedRequestDismissal(
-                requesterUserId: FfiConverterData.read(from: &buf),
-                count: FfiConverterUInt32.read(from: &buf),
+                requesterUserId: FfiConverterData.read(from: &buf), 
+                count: FfiConverterUInt32.read(from: &buf), 
                 suppressed: FfiConverterBool.read(from: &buf)
         )
     }
@@ -13791,11 +13906,11 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StoredMessage {
         return
             try StoredMessage(
-                chatId: FfiConverterData.read(from: &buf),
-                senderUserId: FfiConverterData.read(from: &buf),
-                lamport: FfiConverterUInt64.read(from: &buf),
-                timestamp: FfiConverterInt64.read(from: &buf),
-                kind: FfiConverterUInt8.read(from: &buf),
+                chatId: FfiConverterData.read(from: &buf), 
+                senderUserId: FfiConverterData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf), 
+                timestamp: FfiConverterInt64.read(from: &buf), 
+                kind: FfiConverterUInt8.read(from: &buf), 
                 payload: FfiConverterData.read(from: &buf)
         )
     }
@@ -13881,9 +13996,9 @@ public struct FfiConverterTypeSuggestedFriendCard: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SuggestedFriendCard {
         return
             try SuggestedFriendCard(
-                name: FfiConverterString.read(from: &buf),
-                userId: FfiConverterData.read(from: &buf),
-                signPk: FfiConverterData.read(from: &buf),
+                name: FfiConverterString.read(from: &buf), 
+                userId: FfiConverterData.read(from: &buf), 
+                signPk: FfiConverterData.read(from: &buf), 
                 agreePk: FfiConverterData.read(from: &buf)
         )
     }
@@ -14394,7 +14509,7 @@ public struct FfiConverterTypeCoreError: FfiConverterRustBuffer {
             try FfiConverterString.read(from: &buf)
             )
         case 2: return .InvalidKeyLength(
-            expected: try FfiConverterUInt32.read(from: &buf),
+            expected: try FfiConverterUInt32.read(from: &buf), 
             actual: try FfiConverterUInt32.read(from: &buf)
             )
         case 3: return .Store(
@@ -15308,7 +15423,7 @@ public enum FriendCardMatch {
     case alreadySaved(
         /**
          * What this phone currently shows them as (nickname wins over card name).
-         */savedName: String,
+         */savedName: String, 
         /**
          * A *different* contact also goes by this name — worth saying out loud
          * so the two are not confused, but not a security warning.
@@ -19677,6 +19792,10 @@ public func relayMaxResponseBytes() -> UInt32 {
  * A negative persisted value on either cursor (corrupt row, hand-edited
  * database) reads as 0 rather than being sent to a relay that would reject
  * it.
+ *
+ * Progress is only trusted while it still describes a mailbox that exists;
+ * [`relay_sweep_restart_from_zero`] is the guard, and the shell zeroes the
+ * progress it passes here when that guard fires.
  */
 public func relayPassStartCursor(sweeping: Bool, persistedAfterId: Int64, sweepProgressAfterId: Int64) -> Int64 {
     return try!  FfiConverterInt64.lift(try! rustCall() {
@@ -19753,6 +19872,14 @@ public func relaySetupIsOfficial(relayUrl: String) -> Bool {
  * completed sweep proves the mailbox's ids have regressed would fix it
  * properly and is the obvious follow-up; nothing here forecloses it.
  *
+ * The sweep's own resume cursor could have made that case *worse* — a cursor
+ * remembered from the old id space points past the end of a rebuilt mailbox,
+ * so the resumed walk sees one empty page and records a sweep that covered
+ * nothing at all. [`relay_sweep_restart_from_zero`] is what stops it: a sweep
+ * still unfinished a whole interval after it began walks from 0 rather than
+ * resuming, so the phone that was offline while the relay was rebuilt heals
+ * on its first pass back, exactly as it did before the cursor existed.
+ *
  * Three valves stay open, because they are the states a stored sweep
  * timestamp genuinely cannot speak for:
  *
@@ -19824,6 +19951,62 @@ public func relaySweepDue(sweptThisSession: Bool, lastSweepAtMs: Int64, sweepPro
 public func relaySweepIntervalMs() -> Int64 {
     return try!  FfiConverterInt64.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_relay_sweep_interval_ms($0
+    )
+})
+}
+/**
+ * Must this sweep throw its resume cursor away and walk from 0?
+ *
+ * A resume cursor is a row id, and a row id only means anything inside the id
+ * space it was recorded in. A relay rebuilt from scratch — a fresh volume, a
+ * re-created mailbox — restarts its ids at 1, and a cursor remembered from
+ * the old space then points *past the end* of the new mailbox. The resumed
+ * walk fetches one page, gets nothing, and reads that as end-of-mailbox: it
+ * records a completed sweep that covered no rows at all, stamps
+ * `last_sweep_at`, and hands the mailbox back to the schedule for a fresh
+ * [`RELAY_SWEEP_INTERVAL_MS`] while real mail sits below the frontier
+ * unreachable by any ordinary pass. That is the one case where resuming is
+ * worse than restarting, and it is worth saying plainly that a sweep that
+ * starts at 0 has never had it.
+ *
+ * The tempting fix — treat *any* empty first page after a resume as
+ * suspicious and re-walk from 0 — is a livelock in disguise. A sweep yields
+ * on a fixed budget, so roughly one sweep in four yields exactly at the end
+ * of the mailbox; the next pass then resumes to a genuinely empty page, would
+ * restart at 0, would re-walk the whole mailbox, and would land on the same
+ * budget boundary again. That is the loop this module exists to remove, with
+ * a longer period.
+ *
+ * So the question asked here is not "was the page empty" but "could the
+ * mailbox have been replaced since this sweep started". A sweep that yielded
+ * a second ago and resumes into an empty page is simply finished. A sweep
+ * still holding progress a whole [`RELAY_SWEEP_INTERVAL_MS`] after it began —
+ * a phone that went offline mid-walk and came back days later, which is the
+ * ordinary shape of this app's life, and the window in which an operator
+ * rebuilds a relay — has a cursor no one should trust. It re-walks, once, and
+ * the walk it starts is dated so the next pass resumes it normally instead of
+ * restarting it again.
+ *
+ * Two more readings of the timestamp, both of them "I cannot date this
+ * sweep, so I will not trust it":
+ *
+ * - progress with no start date at all. Only a store upgraded across the
+ * column's introduction can produce it, and only for a sweep that was
+ * part-way through at the time.
+ * - a start date in the future (a clock that jumped backwards, a restore onto
+ * a phone set to another time), which the rest of this module treats the
+ * same way for the same reason.
+ *
+ * Progress of 0 is never restarted: there is nothing to throw away, the walk
+ * already starts at 0, and answering `true` there would make every sweep
+ * re-walk before it had walked at all.
+ */
+public func relaySweepRestartFromZero(sweepProgressAfterId: Int64, sweepStartedAtMs: Int64, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_sweep_restart_from_zero(
+        FfiConverterInt64.lower(sweepProgressAfterId),
+        FfiConverterInt64.lower(sweepStartedAtMs),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -20578,7 +20761,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_pass_start_cursor() != 15530) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_pass_start_cursor() != 57175) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_retry_after_ms() != 10198) {
@@ -20587,10 +20770,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 11572) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 62593) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 44099) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_interval_ms() != 37428) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_restart_from_zero() != 61201) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_token_is_deposit() != 58985) {
@@ -20794,7 +20980,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_advance_relay_fetch_cursor() != 11436) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_advance_relay_sweep_cursor() != 32345) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_advance_relay_sweep_cursor() != 33864) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 21099) {
@@ -21188,6 +21374,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_reply_metadata() != 61728) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_reset_relay_sweep_progress() != 31015) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_semantic_unread_count() != 2210) {
