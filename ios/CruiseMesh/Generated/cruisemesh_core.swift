@@ -19105,6 +19105,33 @@ public func lanEndpointHostIsLocal(host: String) -> Bool {
     )
 })
 }
+/**
+ * Whether `candidate_host` sits on the same local IPv4 network as
+ * `local_host` -- the same /24 the network-id fingerprint is built from.
+ *
+ * This decides whether a hinted address may be *filed* under this phone's
+ * current network id, not whether it may be dialed. Dialing a hint across
+ * subnets is deliberate (a routed LAN can carry TCP where mDNS cannot), but
+ * that one bounded attempt must not leave a seven-day cache entry claiming a
+ * foreign-subnet host belongs to the network we are on: a cached entry is
+ * re-dialed on every Wi-Fi join, so one stale hint otherwise becomes an
+ * endless probe of an address that can never answer here.
+ *
+ * Both hosts must be IPv4 address literals. A name, an IPv6 literal, or any
+ * unparseable string answers `false` -- "same network" is only claimed when
+ * it can be shown.
+ *
+ * Nothing here discovers or forwards an address; it compares two the caller
+ * already holds.
+ */
+public func lanHostsShareLocalNetwork(localHost: String, candidateHost: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_hosts_share_local_network(
+        FfiConverterString.lower(localHost),
+        FfiConverterString.lower(candidateHost),$0
+    )
+})
+}
 public func lanMaxFrameSize() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_lan_max_frame_size($0
@@ -20630,6 +20657,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_host_is_local() != 16139) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_hosts_share_local_network() != 28208) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_max_frame_size() != 29933) {

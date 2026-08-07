@@ -85,6 +85,31 @@ pub fn core_lan_network_id_for_ipv4(address: String) -> Option<String> {
     core_lan_network_id_for_components(vec![format!("ipv4:{prefix}")])
 }
 
+/// Whether `candidate_host` sits on the same local IPv4 network as
+/// `local_host` -- the same /24 the network-id fingerprint is built from.
+///
+/// This decides whether a hinted address may be *filed* under this phone's
+/// current network id, not whether it may be dialed. Dialing a hint across
+/// subnets is deliberate (a routed LAN can carry TCP where mDNS cannot), but
+/// that one bounded attempt must not leave a seven-day cache entry claiming a
+/// foreign-subnet host belongs to the network we are on: a cached entry is
+/// re-dialed on every Wi-Fi join, so one stale hint otherwise becomes an
+/// endless probe of an address that can never answer here.
+///
+/// Both hosts must be IPv4 address literals. A name, an IPv6 literal, or any
+/// unparseable string answers `false` -- "same network" is only claimed when
+/// it can be shown.
+///
+/// Nothing here discovers or forwards an address; it compares two the caller
+/// already holds.
+#[uniffi::export]
+pub fn lan_hosts_share_local_network(local_host: String, candidate_host: String) -> bool {
+    let Some(local) = core_lan_network_id_for_ipv4(local_host) else {
+        return false;
+    };
+    core_lan_network_id_for_ipv4(candidate_host).is_some_and(|candidate| candidate == local)
+}
+
 #[uniffi::export]
 pub fn core_lan_network_id_for_components(components: Vec<String>) -> Option<String> {
     if components.is_empty() {
@@ -230,6 +255,55 @@ mod tests {
             "",
         ] {
             assert!(!lan_endpoint_host_is_local(host.into()), "{host}");
+        }
+    }
+
+    #[test]
+    fn same_network_check_only_says_yes_for_a_shared_ipv4_24() {
+        assert!(lan_hosts_share_local_network(
+            "192.168.86.31".into(),
+            "192.168.86.23".into()
+        ));
+        assert!(lan_hosts_share_local_network(
+            "10.80.209.1".into(),
+            "10.80.209.68".into()
+        ));
+        // The field case: a hint from a foreign subnet must never be filed
+        // under the network this phone is actually on.
+        assert!(!lan_hosts_share_local_network(
+            "192.168.86.31".into(),
+            "10.80.209.68".into()
+        ));
+        // Neighbouring /24s are different networks even inside one prefix.
+        assert!(!lan_hosts_share_local_network(
+            "192.168.86.31".into(),
+            "192.168.87.23".into()
+        ));
+        // Same host is trivially on its own network.
+        assert!(lan_hosts_share_local_network(
+            "192.168.86.31".into(),
+            "192.168.86.31".into()
+        ));
+    }
+
+    #[test]
+    fn same_network_check_rejects_anything_it_cannot_parse() {
+        for (local, candidate) in [
+            ("192.168.86.31", "phone.local"),
+            ("192.168.86.31", "fe80::1"),
+            ("192.168.86.31", "[fe80::1]"),
+            ("192.168.86.31", ""),
+            ("192.168.86.31", "192.168.86"),
+            ("192.168.86.31", "192.168.86.999"),
+            ("192.168.86.31", "192.168.86.23:45892"),
+            ("fe80::1", "fe80::1"),
+            ("", "192.168.86.23"),
+            ("router", "192.168.86.23"),
+        ] {
+            assert!(
+                !lan_hosts_share_local_network(local.into(), candidate.into()),
+                "{local} vs {candidate}"
+            );
         }
     }
 

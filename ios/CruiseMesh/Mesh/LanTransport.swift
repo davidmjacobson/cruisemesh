@@ -161,14 +161,26 @@ final class LanTransport {
         }
     }
 
-    func connect(_ endpoint: LanManualEndpoint, remoteInstanceToken: Data? = nil, manual: Bool = false) {
+    func connect(
+        _ endpoint: LanManualEndpoint,
+        remoteInstanceToken: Data? = nil,
+        manual: Bool = false,
+        cached: Bool = false
+    ) {
         queue.async { [weak self] in
             guard let self, started else { return }
             // A hinted address came from the contact, not from anything this
-            // phone observed, so it gets its own single-shot key.
-            let key = remoteInstanceToken == nil
-                ? "endpoint:\(endpoint.display)"
-                : lanHintConnectKey(endpoint.display)
+            // phone observed, so it gets its own single-shot key -- and so
+            // does the cache entry that remembers one, which is why a
+            // replayed cached endpoint is keyed apart from a manual dial.
+            let key: String
+            if remoteInstanceToken != nil {
+                key = lanHintConnectKey(endpoint.display)
+            } else if cached {
+                key = lanCachedConnectKey(endpoint.display)
+            } else {
+                key = "endpoint:\(endpoint.display)"
+            }
             let networkEndpoint = NWEndpoint.hostPort(
                 host: NWEndpoint.Host(endpoint.host),
                 port: NWEndpoint.Port(rawValue: endpoint.port) ?? .any

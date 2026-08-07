@@ -8,6 +8,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.lanDefaultTcpPort
+import uniffi.cruisemesh_core.lanHostsShareLocalNetwork
 import uniffi.cruisemesh_core.lanServiceType
 
 class LanTransportTest {
@@ -109,14 +110,58 @@ class LanTransportTest {
         val hintKey = lanHintConnectKey("a1b2c3d4e5f60718")
         assertTrue(isSingleShotLanConnectKey(hintKey))
         // Keys this phone found itself keep retrying: mDNS service names,
-        // subnet sweep hits, the cached endpoint, and manual entry.
+        // subnet sweep hits, and manual entry.
         assertTrue(!isSingleShotLanConnectKey("CruiseMesh-abc123._cruisemesh._tcp"))
         assertTrue(!isSingleShotLanConnectKey("scan:10.0.0.2"))
-        assertTrue(!isSingleShotLanConnectKey("cache:friend:10.0.0.5:45892"))
         assertTrue(!isSingleShotLanConnectKey("manual:10.0.0.4:45892"))
         // The hint key stays distinct from the bare instance token so a
         // hint can never take over a discovered peer's retry state.
         assertTrue(!isSingleShotLanConnectKey("a1b2c3d4e5f60718"))
+    }
+
+    @Test
+    fun `a cached address is a remembered hint and retries no harder than one`() {
+        // A cache entry is only ever a hint this phone wrote down, so it
+        // carries no better evidence than the hint did. Retrying it on a
+        // timer is what turned one stale address into a dial every sixty
+        // seconds forever; onLanNetworkReady replays the cache on each Wi-Fi
+        // join, so the address still gets an attempt whenever anything about
+        // the network could have changed.
+        val cachedKey = lanCachedConnectKey("a1b2c3d4e5f60718", "10.0.0.5:45892")
+        assertEquals("cache:a1b2c3d4e5f60718:10.0.0.5:45892", cachedKey)
+        assertTrue(isSingleShotLanConnectKey(cachedKey))
+        assertTrue(isSingleShotLanConnectKey("cache:friend:10.0.0.5:45892"))
+        // A key that merely mentions the word is not a cached key.
+        assertTrue(!isSingleShotLanConnectKey("scan:10.0.0.2/cache:"))
+    }
+
+    @Test
+    fun `only an address on this phone's own subnet may be filed in the cache`() {
+        // The field failure: a phone on 192.168.86.0/24 kept a hint for
+        // 10.80.209.68 as if it belonged to the network it was on.
+        assertTrue(
+            lanHostsShareLocalNetwork(
+                localHost = "192.168.86.31",
+                candidateHost = "192.168.86.23",
+            ),
+        )
+        assertTrue(
+            !lanHostsShareLocalNetwork(
+                localHost = "192.168.86.31",
+                candidateHost = "10.80.209.68",
+            ),
+        )
+        // Unprovable is treated as "no": names, IPv6 literals, and garbage.
+        assertTrue(
+            !lanHostsShareLocalNetwork(
+                localHost = "192.168.86.31",
+                candidateHost = "phone.local",
+            ),
+        )
+        assertTrue(
+            !lanHostsShareLocalNetwork(localHost = "192.168.86.31", candidateHost = "fe80::1"),
+        )
+        assertTrue(!lanHostsShareLocalNetwork(localHost = "", candidateHost = "192.168.86.23"))
     }
 
     @Test

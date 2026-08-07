@@ -27,10 +27,40 @@ final class LanTransportTests: XCTestCase {
     func testHintedAddressIsTriedOnceAndNeverRemembered() {
         XCTAssertTrue(isSingleShotLanConnectKey(lanHintConnectKey("10.0.0.5:45892")))
         // Keys this phone found itself keep retrying: Bonjour discovery,
-        // subnet sweep hits, and the manual/cached endpoint.
+        // subnet sweep hits, and the manual endpoint a human typed.
         XCTAssertFalse(isSingleShotLanConnectKey("endpoint:10.0.0.5:45892"))
         XCTAssertFalse(isSingleShotLanConnectKey("scan:10.0.0.2"))
         XCTAssertFalse(isSingleShotLanConnectKey("CruiseMesh-abc123"))
+    }
+
+    func testCachedAddressIsARememberedHintAndRetriesNoHarder() {
+        // A cache entry is only ever a hint this phone wrote down, so it
+        // carries no better evidence than the hint did. Retrying it on a
+        // timer turned one stale address into a dial every sixty seconds;
+        // onNetworkReady replays the cache on each Wi-Fi join, so the
+        // address still gets an attempt whenever the network could have
+        // changed.
+        let cachedKey = lanCachedConnectKey("10.0.0.5:45892")
+        XCTAssertEqual(cachedKey, "cache:10.0.0.5:45892")
+        XCTAssertTrue(isSingleShotLanConnectKey(cachedKey))
+        XCTAssertFalse(isSingleShotLanConnectKey("scan:10.0.0.2/cache:"))
+    }
+
+    func testOnlyAnAddressOnThisPhonesSubnetMayBeCached() {
+        // The field failure: a phone on 192.168.86.0/24 kept a hint for
+        // 10.80.209.68 as if it belonged to the network it was on.
+        XCTAssertTrue(
+            lanHintMayBeCached(localHost: "192.168.86.31", candidateHost: "192.168.86.23")
+        )
+        XCTAssertFalse(
+            lanHintMayBeCached(localHost: "192.168.86.31", candidateHost: "10.80.209.68")
+        )
+        // Unprovable is treated as "no": no local address, names, IPv6.
+        XCTAssertFalse(lanHintMayBeCached(localHost: nil, candidateHost: "192.168.86.23"))
+        XCTAssertFalse(
+            lanHintMayBeCached(localHost: "192.168.86.31", candidateHost: "phone.local")
+        )
+        XCTAssertFalse(lanHintMayBeCached(localHost: "192.168.86.31", candidateHost: "fe80::1"))
     }
 
     func testNoiseStaticKeyResolvesOnlyAcceptedContact() {

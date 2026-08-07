@@ -267,7 +267,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 self.currentLanNetworkId = networkId
                 for contact in (try? self.store.listContacts()) ?? [] {
                     if let cached = LanEndpointCache.load(networkId: networkId, userId: contact.userId) {
-                        lan.connect(cached)
+                        lan.connect(cached, cached: true)
                     }
                 }
                 LanEndpointSender.queueToAllCapableContacts(
@@ -694,11 +694,23 @@ final class MeshController: ObservableObject, @unchecked Sendable {
               (try? store.getContact(userId: userId)) != nil else { return }
         LanCapabilityStore.markSupported(userId: userId)
         refreshLanCapableContacts()
-        LanEndpointCache.save(
-            networkId: currentLanNetworkId,
-            userId: userId,
-            endpoint: endpoint
-        )
+        // The dial below is deliberately attempted even when the hinted host
+        // is on another subnet -- a routed LAN can carry TCP where Bonjour
+        // cannot, and it is one bounded attempt Noise authenticates. Filing
+        // that address is a different matter: the cache is keyed by THIS
+        // phone's network, is re-dialed on every Wi-Fi join and lives for
+        // seven days, so a foreign-subnet host written here becomes a
+        // standing probe of an address that can never answer on this network.
+        if lanHintMayBeCached(
+            localHost: currentLanEndpoint?.host,
+            candidateHost: endpoint.host
+        ) {
+            LanEndpointCache.save(
+                networkId: currentLanNetworkId,
+                userId: userId,
+                endpoint: endpoint
+            )
+        }
         queueCurrentLanEndpoint(to: userId)
         guard MeshRouter.transportFor(address: address) != .lan else { return }
         lanTransport?.connect(endpoint, remoteInstanceToken: instanceToken)
@@ -2176,22 +2188,30 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         let endpoint = LanManualEndpoint(host: hint.host, port: hint.port)
         LanCapabilityStore.markSupported(userId: senderUserId)
         refreshLanCapableContacts()
-        LanEndpointCache.save(networkId: networkId, userId: senderUserId, endpoint: endpoint)
         queueCurrentLanEndpoint(to: senderUserId)
         if let sourceAddress {
             sendLanEndpointHint(address: sourceAddress)
         }
 
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
-        // The network fingerprint is stored with the cached endpoint but
-        // deliberately does NOT gate this dial: requiring an exact match
-        // silently disabled fresh hints on routed multi-subnet LANs -- the
-        // case the sealed hint exists for (mDNS is link-local; TCP may
-        // still route). A cross-network false positive is one bounded TCP
-        // attempt to an endpoint the contact sealed to us, and Noise
-        // authenticates. Being on some Wi-Fi is the only requirement.
-        if hint.expiresAtMs > now, currentLanNetworkId != nil {
-            lanTransport?.connect(endpoint, remoteInstanceToken: hint.instanceToken)
+        // A sealed hint is only good for its stated lifetime (fifteen
+        // minutes; see LanEndpointSender). This envelope may have sat in a
+        // relay backlog for hours or days, so an expired hint is neither
+        // saved nor dialed -- saving first would re-file a long-dead address
+        // and reset its seven-day cache clock on every replay.
+        if hint.expiresAtMs > now {
+            LanEndpointCache.save(networkId: networkId, userId: senderUserId, endpoint: endpoint)
+            // The network fingerprint is stored with the cached endpoint but
+            // deliberately does NOT gate this dial: requiring an exact match
+            // silently disabled fresh hints on routed multi-subnet LANs --
+            // the case the sealed hint exists for (mDNS is link-local; TCP
+            // may still route). A cross-network false positive is one
+            // bounded TCP attempt to an endpoint the contact sealed to us,
+            // and Noise authenticates. Being on some Wi-Fi is the only
+            // requirement.
+            if currentLanNetworkId != nil {
+                lanTransport?.connect(endpoint, remoteInstanceToken: hint.instanceToken)
+            }
         }
 
         let inserted = try store.insertMessage(message: StoredMessage(

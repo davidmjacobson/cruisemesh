@@ -41,6 +41,7 @@ import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.LanNoiseSession
 import uniffi.cruisemesh_core.lanDefaultTcpPort
+import uniffi.cruisemesh_core.lanHostsShareLocalNetwork
 import uniffi.cruisemesh_core.lanServiceType
 
 /**
@@ -508,7 +509,22 @@ internal class LanTransport(
             val remoteToken = hint.instanceToken.toHex()
             val hintKey = lanHintConnectKey(remoteToken)
             val endpoint = LanManualEndpoint(hint.host, hint.port.toInt())
-            onEndpointObserved(expectedUserId, endpoint, currentNetworkId)
+            // The dial below is deliberately attempted even when the hinted
+            // host sits on another subnet -- a routed LAN can carry TCP where
+            // mDNS cannot, and it is one bounded attempt Noise authenticates.
+            // Filing that address in the endpoint cache is a different matter:
+            // the cache is keyed by THIS phone's network, is re-dialed on
+            // every Wi-Fi join and lives for seven days, so a foreign-subnet
+            // host written here became a permanent background probe of an
+            // address that can never answer on this network. Only remember an
+            // address we can show is on the network we are on.
+            val localHost = endpointHint?.host
+            if (
+                localHost != null &&
+                lanHostsShareLocalNetwork(localHost = localHost, candidateHost = endpoint.host)
+            ) {
+                onEndpointObserved(expectedUserId, endpoint, currentNetworkId)
+            }
             if (!started) return@post
             notePeerEvidence(remoteToken)
             if (!shouldInitiateLanConnection(instanceToken, remoteToken)) {
@@ -541,7 +557,7 @@ internal class LanTransport(
             val network = wifiNetwork ?: return@post
             connectToEndpoints(
                 network = network,
-                key = "cache:${expectedUserId.toHex()}:${endpoint.display}",
+                key = lanCachedConnectKey(expectedUserId.toHex(), endpoint.display),
                 endpoints = listOf(InetSocketAddress(endpoint.host, endpoint.port)),
                 expectedUserId = expectedUserId,
             )
@@ -1786,18 +1802,36 @@ internal fun shouldRetainLanReconnectTarget(
 /** Prefix marking a connection key that came from a contact's LAN hint. */
 internal const val LAN_HINT_KEY_PREFIX = "hint:"
 
+/** Prefix marking a connection key replayed from the saved endpoint cache. */
+internal const val LAN_CACHED_KEY_PREFIX = "cache:"
+
 internal fun lanHintConnectKey(remoteInstanceToken: String): String =
     "$LAN_HINT_KEY_PREFIX$remoteInstanceToken"
 
+internal fun lanCachedConnectKey(userIdHex: String, endpointDisplay: String): String =
+    "$LAN_CACHED_KEY_PREFIX$userIdHex:$endpointDisplay"
+
 /**
  * Whether a connection key may only ever be attempted once per piece of
- * evidence. A hint carries an address supplied by the contact rather than one
- * this phone observed, so it is tried when it arrives and never retried on a
- * timer; a fresh hint, mDNS discovery, or the cached endpoint is what starts
- * another attempt. Keys this phone found itself keep their reconnect target.
+ * evidence. Keys this phone found itself (mDNS, a subnet scan, a manual
+ * address a human typed) keep their reconnect target and retry on a timer.
+ * Two kinds do not:
+ *
+ * - a hint carries an address supplied by the contact rather than one this
+ *   phone observed, so it is tried when it arrives and never retried;
+ * - a cached endpoint is a *remembered* hint, so it is no better evidence
+ *   than the hint was. Retrying it on a timer is what turned a single stale
+ *   address into a dial every sixty seconds for as long as the phone stayed
+ *   on the network.
+ *
+ * Retry coverage is not lost: `MeshService.onLanNetworkReady` replays every
+ * cached endpoint on each Wi-Fi join, so a cached address still gets one
+ * attempt per network join, plus another whenever a fresh hint or discovery
+ * arrives -- which is the only kind of event that can make a dead address
+ * live again.
  */
 internal fun isSingleShotLanConnectKey(serviceKey: String): Boolean =
-    serviceKey.startsWith(LAN_HINT_KEY_PREFIX)
+    serviceKey.startsWith(LAN_HINT_KEY_PREFIX) || serviceKey.startsWith(LAN_CACHED_KEY_PREFIX)
 
 private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
