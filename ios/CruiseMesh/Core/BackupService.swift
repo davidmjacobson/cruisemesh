@@ -95,6 +95,12 @@ enum BackupService {
     /// Validate/migrate the payload and remove restored courier/relay runtime
     /// state before placing it at the special path startup knows how to install.
     /// A failed sanitization never leaves an unsafe pending restore behind.
+    ///
+    /// Mirrors the Android restore path: sanitize on a temp file, then place it
+    /// at the pending path without re-materializing the whole DB as `Data`.
+    /// Holding the encrypted backup + decrypted sqlite already peaks memory;
+    /// `Data(contentsOf:)` of an ~88 MiB store was a third full copy (Android
+    /// OOM on Pixel 10 under a 256 MiB heap).
     private static func stageSanitizedDatabase(
         _ sqlite: Data,
         options: BackupContentOptions
@@ -104,25 +110,41 @@ enum BackupService {
             return
         }
         let manager = FileManager.default
-        let staged = try withTemporaryDatabase(sqlite) { staged in
-            let report = try sanitizeRestoredMessageStoreWithOptions(
-                path: staged.path,
-                options: options,
-                nowMs: currentTimeMs
-            )
-            NSLog(
-                "Sanitized restored store; removed messages=\(report.removedMessageCount) " +
-                    "ownPending=\(report.removedPendingOwnDeliveryCount) " +
-                    "courier=\(report.removedCourierDeliveryCount) " +
-                    "expired=\(report.removedExpiredDeliveryCount) " +
-                    "connectionEvents=\(report.removedConnectionEventCount)"
-            )
-            return try Data(contentsOf: staged)
+        let staged = manager.temporaryDirectory
+            .appendingPathComponent("cruisemesh-restore-\(UUID().uuidString).sqlite")
+        var movedToDestination = false
+        defer {
+            for suffix in ["-journal", "-wal", "-shm"] {
+                try? manager.removeItem(at: URL(fileURLWithPath: staged.path + suffix))
+            }
+            if !movedToDestination {
+                try? manager.removeItem(at: staged)
+            }
         }
+        try sqlite.write(to: staged, options: .atomic)
+        let report = try sanitizeRestoredMessageStoreWithOptions(
+            path: staged.path,
+            options: options,
+            nowMs: currentTimeMs
+        )
+        NSLog(
+            "Sanitized restored store; removed messages=\(report.removedMessageCount) " +
+                "ownPending=\(report.removedPendingOwnDeliveryCount) " +
+                "courier=\(report.removedCourierDeliveryCount) " +
+                "expired=\(report.removedExpiredDeliveryCount) " +
+                "connectionEvents=\(report.removedConnectionEventCount)"
+        )
         if manager.fileExists(atPath: pendingDatabaseURL.path) {
             try manager.removeItem(at: pendingDatabaseURL)
         }
-        try staged.write(to: pendingDatabaseURL, options: .atomic)
+        // Prefer rename (zero extra RAM). Fall back to file-to-file copy if
+        // move is refused — never load the whole DB into a third `Data`.
+        do {
+            try manager.moveItem(at: staged, to: pendingDatabaseURL)
+            movedToDestination = true
+        } catch {
+            try manager.copyItem(at: staged, to: pendingDatabaseURL)
+        }
     }
 
     private static func openAndValidatePayload(
@@ -205,8 +227,10 @@ enum BackupService {
             if manager.fileExists(atPath: sibling.path) { try manager.removeItem(at: sibling) }
         }
         if manager.fileExists(atPath: destination.path) { try manager.removeItem(at: destination) }
-        let bytes = try Data(contentsOf: pendingDatabaseURL)
-        if !bytes.isEmpty {
+        // Empty-store restore writes a zero-length pending file. Check size
+        // only — do not load the pending DB into memory just to test emptiness.
+        let size = try manager.attributesOfItem(atPath: pendingDatabaseURL.path)[.size] as? NSNumber
+        if let size, size.intValue > 0 {
             try manager.moveItem(at: pendingDatabaseURL, to: destination)
         } else {
             try manager.removeItem(at: pendingDatabaseURL)
