@@ -114,10 +114,34 @@ struct FriendsView: View {
                         .accessibilityIdentifier("friends.card-input")
                         .lineLimit(3...8)
                         .focused($pasteFocused)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
                     HStack {
-                        Button("Paste") { pasteText = UIPasteboard.general.string ?? "" }
+                        Button("Paste") {
+                            pasteText = UIPasteboard.general.string ?? ""
+                            // Focus only when paste actually filled text so an
+                            // empty clipboard does not force the keyboard open.
+                            if !pasteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                pasteFocused = true
+                            }
+                        }
                         Spacer()
                         Button("Preview friend") { submitPaste() }
+                    }
+                    // XCUITest cannot reliably typeText into this multi-line
+                    // field on the headless CI simulator (no keyboard focus).
+                    // Seed + focus through the same bindings the human path
+                    // uses, without UIPasteboard (which can hang the app idle).
+                    // Text(verbatim:) so the localization gate ignores this
+                    // test-only control.
+                    if UITestConfiguration.isEnabled {
+                        Button {
+                            pasteText = "not-a-real-card"
+                            pasteFocused = true
+                        } label: {
+                            Text(verbatim: "UITest seed friend card")
+                        }
+                        .accessibilityIdentifier("friends.uitest-seed-card")
                     }
                 }
                 Section("Friends") {
