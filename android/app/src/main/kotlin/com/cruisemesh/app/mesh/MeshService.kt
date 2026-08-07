@@ -1209,6 +1209,11 @@ class MeshService : Service() {
      * monotonic clock `postDelayed` counts down on: on the wall clock, an NTP
      * correction landing mid-burst would expire the window early and produce
      * the second fan-out this exists to prevent.
+     *
+     * This is also the coalescing entry point [scheduleDeferredSpray] re-enters
+     * through when a peripheral-side spray cooldown lapses (#275), so a
+     * deferral landing on top of a live failover burst produces one resume
+     * rather than two.
      */
     private fun scheduleFailoverResume(peerUserId: ByteArray) {
         val key = UserIdHex.encode(peerUserId)
@@ -1549,19 +1554,71 @@ class MeshService : Service() {
             return
         }
 
+        // Post-reject cooldown (#275): this link was torn down moments ago
+        // because our own notifications to it were failing, and the burst
+        // below is what was failing. The connection is welcome back
+        // immediately -- see PeripheralSprayCooldown -- but the multi-KB half
+        // of the exchange waits out the window rather than re-running the
+        // thing that just broke the link.
+        val syncDeferralMs = peripheralSyncSprayDeferralMs(address)
+
         // Hand off anything we're muling for this peer (DESIGN.md §5.3 carry
         // queue) before the digest sync. This runs for *any* peer, contact or
         // not: we carry foreign envelopes for strangers too, and a stranger to
         // us may still be the intended recipient of something we picked up.
-        envelopeProcessor?.drainCarriedEnvelopesTo(address, userId)
+        if (syncDeferralMs <= 0L) envelopeProcessor?.drainCarriedEnvelopesTo(address, userId)
 
         val contact = store.getContact(userId)
         if (contact == null) {
             Log.i(TAG, "HELLO from unrecognized userId=${UserIdHex.encode(userId)}; sending carry-suppression digest only")
         } else {
+            // One small frame, and the fastest way off this radio entirely if
+            // the peer turns out to share our Wi-Fi -- it is not part of the
+            // burst the cooldown holds back.
             sendLanEndpointHintTo(address)
         }
+        if (syncDeferralMs > 0L) {
+            Log.i(
+                TAG,
+                "Holding carry drain and digest for $address for ${syncDeferralMs}ms " +
+                    "after a notify-reject teardown on this address",
+            )
+            scheduleDeferredSpray(userId, syncDeferralMs)
+            return
+        }
         sendDigestTo(address, userId, identity)
+    }
+
+    /**
+     * The peripheral role's post-notify-reject brake, or 0 when this address
+     * isn't an inbound BLE link at all. Only the peripheral role can reject its
+     * own notifications this way: as a central we write rather than notify, and
+     * LAN has no such failure mode.
+     */
+    private fun peripheralSyncSprayDeferralMs(address: String): Long {
+        if (MeshRouter.transportFor(address) != MeshRouterState.Transport.PERIPHERAL) return 0L
+        return peripheral.syncSprayDeferralMs(address)
+    }
+
+    /**
+     * Re-arms a burst the cooldown held back, so a suppressed carry drain is
+     * delayed rather than lost -- the digest would come back on its own via
+     * [checkDigestMaintenance], but nothing re-runs the DTN carry drain on a
+     * link that stays up.
+     *
+     * It lands in [scheduleFailoverResume] rather than calling
+     * [resumeLogicalPeerSync] directly so it composes with the #269 debounce
+     * instead of racing it: if the link died again during the window, that
+     * disconnect has already armed a resume for this peer and this deferral is
+     * absorbed into it, so the peer gets one burst rather than two overlapping
+     * ones. Re-electing the route at fire time also means a peer that has since
+     * moved to a better route (LAN, or the outbound BLE half) is served there.
+     */
+    private fun scheduleDeferredSpray(peerUserId: ByteArray, delayMs: Long) {
+        relayMainHandler.postDelayed({
+            if (!running) return@postDelayed
+            scheduleFailoverResume(peerUserId)
+        }, delayMs)
     }
 
     /**
