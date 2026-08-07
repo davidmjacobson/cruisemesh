@@ -95,13 +95,52 @@ final class CruiseMeshUITests: XCTestCase {
         app.buttons["Add a friend"].tap()
         XCTAssertTrue(element("screen.friends").waitForExistence(timeout: 5))
 
-        let card = element("friends.card-input")
+        // Multi-line SwiftUI TextFields often report no keyboard focus to
+        // XCTest after a tap on the headless CI simulator, so typeText fails
+        // with "Neither element nor any descendant has keyboard focus". Fill
+        // via the in-app Paste control (which also focuses the field), then
+        // assert the keyboard accessory is available.
+        let card = app.textFields.matching(identifier: "friends.card-input").firstMatch
+            .waitForExistence(timeout: 3)
+            ? app.textFields.matching(identifier: "friends.card-input").firstMatch
+            : element("friends.card-input")
         XCTAssertTrue(card.waitForExistence(timeout: 3))
-        card.tap()
-        card.typeText("not-a-real-card")
+
+        // Bring the paste section into view under the QR rows.
+        for _ in 0..<4 where !card.isHittable {
+            app.swipeUp()
+        }
+
+        UIPasteboard.general.string = "not-a-real-card"
+        let paste = app.buttons.matching(identifier: "friends.card-paste").firstMatch
+            .waitForExistence(timeout: 2)
+            ? app.buttons.matching(identifier: "friends.card-paste").firstMatch
+            : app.buttons["Paste"]
+        XCTAssertTrue(paste.waitForExistence(timeout: 3))
+        paste.tap()
+
+        // Paste sets focus; if the keyboard is still missing, tap the field.
+        if !app.keyboards.firstMatch.waitForExistence(timeout: 3) {
+            card.tap()
+            XCTAssertTrue(
+                app.keyboards.firstMatch.waitForExistence(timeout: 5),
+                "Keyboard should open when the friend-card field is focused"
+            )
+        }
+
+        // If Paste did not land text (pasteboard isolation), fall back to
+        // typing into the first responder once the keyboard is up — app-level
+        // typeText, not element.typeText, which requires hasKeyboardFocus.
+        let fieldValue = (card.value as? String) ?? ""
+        if fieldValue == "Friend card" || fieldValue.isEmpty {
+            app.typeText("not-a-real-card")
+        }
 
         let keyboardAction = element("friends.preview-keyboard")
-        XCTAssertTrue(keyboardAction.waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            keyboardAction.waitForExistence(timeout: 5),
+            "Keyboard accessory Preview friend should appear while typing a card"
+        )
         XCTAssertTrue(keyboardAction.isHittable)
     }
 

@@ -114,8 +114,18 @@ struct FriendsView: View {
                         .accessibilityIdentifier("friends.card-input")
                         .lineLimit(3...8)
                         .focused($pasteFocused)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
                     HStack {
-                        Button("Paste") { pasteText = UIPasteboard.general.string ?? "" }
+                        // Focus after paste so the keyboard toolbar "Preview
+                        // friend" action appears without a second tap — and so
+                        // XCUITest can open the keyboard without relying on
+                        // typeText focus (flaky for multi-line TextFields).
+                        Button("Paste") {
+                            pasteText = UIPasteboard.general.string ?? ""
+                            pasteFocused = true
+                        }
+                        .accessibilityIdentifier("friends.card-paste")
                         Spacer()
                         Button("Preview friend") { submitPaste() }
                     }

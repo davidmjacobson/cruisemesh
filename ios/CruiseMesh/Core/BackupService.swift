@@ -134,16 +134,31 @@ enum BackupService {
                 "expired=\(report.removedExpiredDeliveryCount) " +
                 "connectionEvents=\(report.removedConnectionEventCount)"
         )
-        if manager.fileExists(atPath: pendingDatabaseURL.path) {
-            try manager.removeItem(at: pendingDatabaseURL)
+        try relocateStagedDatabase(from: staged, to: pendingDatabaseURL, fileManager: manager)
+        movedToDestination = true
+    }
+
+    /// Places a staged SQLite file at the pending restore path without loading
+    /// the whole DB into a third `Data` buffer. Prefer rename; fall back to
+    /// file-to-file copy if move is refused. On success the staged URL is
+    /// always consumed (removed after a copy fallback).
+    ///
+    /// Internal (not private) so unit tests can drive the same path restore
+    /// uses after sanitize — the step that used to OOM on Android via
+    /// `Data(contentsOf:)`.
+    static func relocateStagedDatabase(
+        from staged: URL,
+        to destination: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        if fileManager.fileExists(atPath: destination.path) {
+            try fileManager.removeItem(at: destination)
         }
-        // Prefer rename (zero extra RAM). Fall back to file-to-file copy if
-        // move is refused — never load the whole DB into a third `Data`.
         do {
-            try manager.moveItem(at: staged, to: pendingDatabaseURL)
-            movedToDestination = true
+            try fileManager.moveItem(at: staged, to: destination)
         } catch {
-            try manager.copyItem(at: staged, to: pendingDatabaseURL)
+            try fileManager.copyItem(at: staged, to: destination)
+            try? fileManager.removeItem(at: staged)
         }
     }
 
