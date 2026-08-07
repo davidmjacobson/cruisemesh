@@ -19106,8 +19106,9 @@ public func lanEndpointHostIsLocal(host: String) -> Bool {
 })
 }
 /**
- * Whether `candidate_host` sits on the same local IPv4 network as
- * `local_host` -- the same /24 the network-id fingerprint is built from.
+ * Whether `candidate_host` sits on the same local network as `local_host` --
+ * the same IPv4 /24 the network-id fingerprint is built from, or the same
+ * routable IPv6 /64.
  *
  * This decides whether a hinted address may be *filed* under this phone's
  * current network id, not whether it may be dialed. Dialing a hint across
@@ -19117,9 +19118,13 @@ public func lanEndpointHostIsLocal(host: String) -> Bool {
  * re-dialed on every Wi-Fi join, so one stale hint otherwise becomes an
  * endless probe of an address that can never answer here.
  *
- * Both hosts must be IPv4 address literals. A name, an IPv6 literal, or any
- * unparseable string answers `false` -- "same network" is only claimed when
- * it can be shown.
+ * Both hosts must be address literals of the same family. A name, a mixed
+ * pair, or any unparseable string answers `false` -- "same network" is only
+ * claimed when it can be shown. IPv6 link-local addresses answer `false` as
+ * well: every link is `fe80::/64`, so a match there is no evidence at all,
+ * which is exactly the mistake this function exists to prevent. A global or
+ * unique-local /64 is a real fingerprint and is honoured, so an IPv6-only
+ * Wi-Fi network is not silently excluded from the cache.
  *
  * Nothing here discovers or forwards an address; it compares two the caller
  * already holds.
@@ -20659,7 +20664,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_host_is_local() != 16139) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_lan_hosts_share_local_network() != 28208) {
+    if (uniffi_cruisemesh_core_checksum_func_lan_hosts_share_local_network() != 4244) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_max_frame_size() != 29933) {

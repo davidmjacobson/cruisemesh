@@ -636,6 +636,16 @@ final class LanTransport {
         log.info("Authenticated CruiseMesh peer over local Wi-Fi")
         if let serviceKey = link.serviceKey {
             reconnectAttempts[serviceKey] = 0
+            if isSingleShotLanConnectKey(serviceKey) {
+                // A hinted or cached address is dialed once precisely because
+                // nothing proved it was real. Finishing Noise is that proof,
+                // so it earns a retry endpoint now: a link the access point
+                // or the background scheduler kills comes back on the retry
+                // timer instead of waiting for the next Wi-Fi join. If that
+                // retry fails, `connectionClosed` retires the endpoint again
+                // and the address is back to single-shot.
+                discoveredEndpoints[serviceKey] = link.dialedEndpoint
+            }
         }
         // Only an authenticated friend counts as a sweep find -- a bare TCP
         // connect could be any unrelated service on the default port, and
@@ -684,6 +694,14 @@ final class LanTransport {
                     // check promptly whether a fallback sweep is due
                     // instead of waiting out the periodic interval.
                     scheduleAutomaticScan(after: Self.reconnectAutomaticScanDelay)
+                    // A single-shot address only holds a retry endpoint
+                    // because an earlier handshake proved it. It just failed,
+                    // so it is unproven again: retire it rather than let one
+                    // good handshake license a standing probe. The retry
+                    // below then finds nothing and stops there.
+                    if isSingleShotLanConnectKey(serviceKey) {
+                        discoveredEndpoints.removeValue(forKey: serviceKey)
+                    }
                 }
                 queue.asyncAfter(deadline: .now() + delay) { [weak self] in
                     guard let self,
@@ -1044,6 +1062,10 @@ private final class LanConnection {
 
     let address: String
     let serviceKey: String?
+    /// The endpoint this link was created for. For an outbound link that is
+    /// the address dialed, which `LanTransport.connectionAuthenticated` files
+    /// as a retry target once the handshake proves it real.
+    let dialedEndpoint: NWEndpoint
     /// The sweep generation that dialed this link, if a subnet sweep did.
     /// Only that sweep may be credited with what this handshake finds -- see
     /// `LanTransport.markSweepFoundFriend`.
@@ -1079,6 +1101,7 @@ private final class LanConnection {
         self.initiator = initiator
         self.owner = owner
         self.serviceKey = serviceKey
+        self.dialedEndpoint = connection.endpoint
         self.scanGeneration = scanGeneration
         noise = try LanNoiseSession(initiator: initiator, localPrivateKey: localPrivateKey)
         phase = initiator ? .awaitMessage2 : .awaitMessage1

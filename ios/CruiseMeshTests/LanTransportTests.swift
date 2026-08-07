@@ -46,9 +46,12 @@ final class LanTransportTests: XCTestCase {
         XCTAssertFalse(isSingleShotLanConnectKey("scan:10.0.0.2/cache:"))
     }
 
-    func testOnlyAnAddressOnThisPhonesSubnetMayBeCached() {
+    func testAHintedAddressIsFiledOnlyWhenItIsOnThisPhonesSubnet() {
         // The field failure: a phone on 192.168.86.0/24 kept a hint for
-        // 10.80.209.68 as if it belonged to the network it was on.
+        // 10.80.209.68 as if it belonged to the network it was on. This is
+        // the rule for a *hint*; an endpoint that authenticated is filed on
+        // its own authority (onLanPeerAuthenticated), because an address that
+        // answered is better evidence than a claim about one.
         XCTAssertTrue(
             lanHintMayBeCached(localHost: "192.168.86.31", candidateHost: "192.168.86.23")
         )
@@ -61,6 +64,16 @@ final class LanTransportTests: XCTestCase {
             lanHintMayBeCached(localHost: "192.168.86.31", candidateHost: "phone.local")
         )
         XCTAssertFalse(lanHintMayBeCached(localHost: "192.168.86.31", candidateHost: "fe80::1"))
+        // An IPv6-only network still has a usable fingerprint, so hints on
+        // one are cacheable -- except link-local, which is fe80::/64 on every
+        // link there has ever been and so proves nothing.
+        XCTAssertTrue(
+            lanHintMayBeCached(localHost: "2001:db8:1:2::31", candidateHost: "2001:db8:1:2::23")
+        )
+        XCTAssertFalse(
+            lanHintMayBeCached(localHost: "2001:db8:1:2::31", candidateHost: "2001:db8:1:3::23")
+        )
+        XCTAssertFalse(lanHintMayBeCached(localHost: "fe80::1", candidateHost: "fe80::2"))
     }
 
     func testNoiseStaticKeyResolvesOnlyAcceptedContact() {
