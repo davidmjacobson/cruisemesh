@@ -122,20 +122,12 @@ object BackupService {
         val payload = openAndValidatePayload(context, fileBytes, passphrase)
 
         val identity = decodeIdentity(payload.identity)
-        val sanitizedSqlite = sanitizeRestoredSqlite(context, payload.sqlite, options)
-
-        // Replace the message store file. Clear any stale journal siblings so a
-        // half-written journal from a prior install can't be replayed over the
-        // restored DB.
-        val sqliteFile = context.filesDir.resolve(STORE_FILENAME)
-        for (suffix in listOf("-journal", "-wal", "-shm")) {
-            context.filesDir.resolve(STORE_FILENAME + suffix).takeIf { it.exists() }?.delete()
-        }
-        if (sanitizedSqlite.isNotEmpty()) {
-            sqliteFile.writeBytes(sanitizedSqlite)
-        } else {
-            sqliteFile.takeIf { it.exists() }?.delete()
-        }
+        // Install the message store from a staged file. Do NOT round-trip the
+        // sanitized DB through a second heap ByteArray: on a default 256 MiB
+        // heap the encrypted backup + decrypted sqlite already fill most of
+        // the process, and `File.readBytes()` of an ~88 MiB store OOMs
+        // (Pixel 10, 2026-08-07).
+        installSanitizedMessageStore(context, payload.sqlite, options)
 
         // Every preference write below must be durable. The caller restarts by
         // hard-exiting the process, which outruns an `apply()` and used to drop
@@ -258,13 +250,27 @@ object BackupService {
         return payload
     }
 
-    private fun sanitizeRestoredSqlite(
+    /**
+     * Sanitize the restored SQLite on a temp path, then place it at the live
+     * store path without ever re-materializing the whole DB as a ByteArray.
+     */
+    private fun installSanitizedMessageStore(
         context: Context,
         sqlite: ByteArray,
         options: BackupContentOptions,
-    ): ByteArray {
-        if (sqlite.isEmpty()) return sqlite
-        return withStagedSqlite(context, sqlite) { staged ->
+    ) {
+        val sqliteFile = context.filesDir.resolve(STORE_FILENAME)
+        clearMessageStoreSiblings(context)
+
+        if (sqlite.isEmpty()) {
+            sqliteFile.takeIf { it.exists() }?.delete()
+            return
+        }
+
+        val staged = java.io.File.createTempFile("cruisemesh-restore-", ".sqlite", context.cacheDir)
+        var movedToDestination = false
+        try {
+            staged.writeBytes(sqlite)
             val report = sanitizeRestoredMessageStoreWithOptions(
                 staged.absolutePath,
                 options,
@@ -278,7 +284,30 @@ object BackupService {
                     "expired=${report.removedExpiredDeliveryCount}, " +
                     "connectionEvents=${report.removedConnectionEventCount}",
             )
-            staged.readBytes()
+
+            // Prefer a same-filesystem rename (zero extra heap). Fall back to a
+            // streamed copy if rename is refused (cross-device, or dest open).
+            sqliteFile.takeIf { it.exists() }?.delete()
+            if (staged.renameTo(sqliteFile)) {
+                movedToDestination = true
+            } else {
+                staged.inputStream().use { input ->
+                    sqliteFile.outputStream().use { output -> input.copyTo(output) }
+                }
+            }
+        } finally {
+            for (suffix in listOf("-journal", "-wal", "-shm")) {
+                java.io.File(staged.path + suffix).takeIf { it.exists() }?.delete()
+            }
+            if (!movedToDestination) {
+                staged.takeIf { it.exists() }?.delete()
+            }
+        }
+    }
+
+    private fun clearMessageStoreSiblings(context: Context) {
+        for (suffix in listOf("-journal", "-wal", "-shm")) {
+            context.filesDir.resolve(STORE_FILENAME + suffix).takeIf { it.exists() }?.delete()
         }
     }
 

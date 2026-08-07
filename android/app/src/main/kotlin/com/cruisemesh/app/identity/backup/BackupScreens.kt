@@ -376,7 +376,11 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
 
             Button(
                 onClick = {
+                    // Take the bytes and drop the Compose-held copy so peak
+                    // heap during decrypt/install is encrypted + sqlite, not
+                    // encrypted × 2 + sqlite.
                     val bytes = pickedBytes ?: return@Button
+                    pickedBytes = null
                     state = BackupUiState.Working
                     scope.launch {
                         try {
@@ -391,6 +395,9 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                             state = BackupUiState.Done
                             restart()
                         } catch (e: Exception) {
+                            // Put the bytes back so the user can retry without
+                            // re-picking the file after a failed restore.
+                            pickedBytes = bytes
                             state = BackupUiState.Error(
                                 backupFailureText(e, R.string.ui_couldn_t_restore_that_backup),
                             )
