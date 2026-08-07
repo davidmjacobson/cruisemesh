@@ -42,6 +42,7 @@ import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.DigestEntry
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Identity
+import uniffi.cruisemesh_core.LanEndpointProvenance
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.PeerConnectionEventKind
@@ -564,8 +565,11 @@ class MeshService : Service() {
                     lanTransport?.connectToHint(hint, peerUserId)
                 }
 
-                override fun saveLanEndpoint(networkId: String?, userId: ByteArray, endpoint: LanManualEndpoint) =
-                    lanEndpointCache.save(networkId, userId, endpoint)
+                override fun saveHintedLanEndpoint(
+                    networkId: String?,
+                    userId: ByteArray,
+                    endpoint: LanManualEndpoint,
+                ) = lanEndpointCache.save(networkId, userId, endpoint, LanEndpointProvenance.HINTED)
 
                 override fun currentLanNetworkId(): String? = lanTransport?.currentNetworkId()
 
@@ -596,7 +600,10 @@ class MeshService : Service() {
             unlinkedCapableContacts = ::countUnlinkedCapableContacts,
             onNetworkReady = ::onLanNetworkReady,
             onEndpointObserved = { userId, endpoint, networkId ->
-                lanEndpointCache.save(networkId, userId, endpoint)
+                // An address the contact hinted at, already checked against
+                // this phone's own network by the transport. Still only a
+                // claim until a handshake completes, so it is filed unproven.
+                lanEndpointCache.save(networkId, userId, endpoint, LanEndpointProvenance.HINTED)
             },
             onAuthenticated = ::onLanPeerAuthenticated,
             onDisconnected = ::onLanPeerDisconnected,
@@ -1125,7 +1132,15 @@ class MeshService : Service() {
             )
         }
         val peerName = contact?.name ?: "Accepted friend"
-        endpoint?.let { lanEndpointCache.save(networkId, userId, it) }
+        // A completed Noise handshake is the proof a hint never had, so the
+        // address is filed as authenticated -- promoting whatever unproven
+        // entry was already there. That, and only that, lets it survive a
+        // later load on a routed LAN where this phone cannot see itself on
+        // the peer's subnet. It mirrors [shouldRetainLanReconnectTarget]:
+        // an address that answered is evidence, a claim about one is not.
+        endpoint?.let {
+            lanEndpointCache.save(networkId, userId, it, LanEndpointProvenance.AUTHENTICATED)
+        }
         LanTransportDiagnostics.authenticated(address, peerName)
         Log.i(TAG, "Secure LAN link active with $peerName")
         sendHello(address)
@@ -1227,7 +1242,11 @@ class MeshService : Service() {
             MeshRouter.sendToAddress(route.address, frame)
         }
         for (contact in store.listContacts()) {
-            lanEndpointCache.load(networkId, contact.userId)?.let { endpoint ->
+            // This phone's own address on the network it just joined is what
+            // lets the cache throw out an unproven entry that belongs to some
+            // other subnet -- the entries shipped builds filed, each of which
+            // costs a connect timeout on every join until it does.
+            lanEndpointCache.load(networkId, contact.userId, localHost = hint.host)?.let { endpoint ->
                 lanTransport?.connectCached(endpoint, contact.userId)
             }
         }

@@ -8,7 +8,10 @@ final class LanTransport {
     typealias TrustedPeerLookup = (Data) -> Data?
 
     var onNetworkReady: ((LanManualEndpoint, Data, String?) -> Void)?
-    var onAuthenticated: ((String, Data) -> Void)?
+    /// A link finished the Noise handshake. The third argument is the address
+    /// this phone dialed to get there, when there is one worth remembering --
+    /// see `LanConnection.advertisedEndpoint`.
+    var onAuthenticated: ((String, Data, LanManualEndpoint?) -> Void)?
     var onDisconnected: ((String) -> Void)?
     var onFrame: ((String, Data) -> Void)?
 
@@ -206,7 +209,11 @@ final class LanTransport {
             }
             if manual { reconnectAttempts[key] = 0 }
             diagnostics.discovered(endpoint.display)
-            connect(to: networkEndpoint, serviceKey: key)
+            // The link carries the address it dialed: if the handshake below
+            // succeeds, that address stops being a claim and becomes evidence,
+            // which is what the endpoint cache needs to keep it across
+            // subnets.
+            connect(to: networkEndpoint, serviceKey: key, advertised: endpoint)
         }
     }
 
@@ -545,7 +552,17 @@ final class LanTransport {
         connections.values.contains { $0.wasAuthenticated && $0.authenticatedUserId == userId }
     }
 
-    private func connect(to endpoint: NWEndpoint, serviceKey: String, scanGeneration: UUID? = nil) {
+    /// `advertised` is the address being dialed, when the caller knows it as a
+    /// host and the port the peer *listens* on. Only such an address is worth
+    /// remembering once a handshake proves it, so it rides along on the link
+    /// (see `LanConnection.advertisedEndpoint`) instead of being looked up
+    /// afterwards from a table that would have to be bounded and swept.
+    private func connect(
+        to endpoint: NWEndpoint,
+        serviceKey: String,
+        scanGeneration: UUID? = nil,
+        advertised: LanManualEndpoint? = nil
+    ) {
         guard started else { return }
         guard connections.count < Self.maxConnections else {
             // The link table is full, which with a friend on one of those
@@ -566,7 +583,8 @@ final class LanTransport {
                 connection,
                 initiator: true,
                 serviceKey: serviceKey,
-                scanGeneration: scanGeneration
+                scanGeneration: scanGeneration,
+                advertised: advertised
             )
             return
         }
@@ -600,7 +618,8 @@ final class LanTransport {
         _ connection: NWConnection,
         initiator: Bool,
         serviceKey: String?,
-        scanGeneration: UUID? = nil
+        scanGeneration: UUID? = nil,
+        advertised: LanManualEndpoint? = nil
     ) {
         let address = "lan:\(UUID().uuidString.lowercased())"
         do {
@@ -611,7 +630,8 @@ final class LanTransport {
                 localPrivateKey: identity.agreeSk,
                 owner: self,
                 serviceKey: serviceKey,
-                scanGeneration: scanGeneration
+                scanGeneration: scanGeneration,
+                advertisedEndpoint: advertised
             )
             connections[address] = link
             if let serviceKey {
@@ -651,7 +671,10 @@ final class LanTransport {
         // connect could be any unrelated service on the default port, and
         // must not disarm the full-subnet tier.
         markSweepFoundFriend(dialedBy: link)
-        onAuthenticated?(link.address, userId)
+        // Non-nil only for a link this phone dialed at a known listening
+        // address, which is the one case worth remembering: the handshake
+        // just turned that address from a claim into evidence.
+        onAuthenticated?(link.address, userId, link.advertisedEndpoint)
         scheduleAutomaticScan(after: Self.automaticScanRetryInterval)
     }
 
@@ -789,7 +812,12 @@ final class LanTransport {
                     self.diagnostics.discovered("\(host):\(lanDefaultTcpPort())")
                     let key = "scan:\(host):\(lanDefaultTcpPort())"
                     self.discoveredEndpoints[key] = endpoint
-                    self.connect(to: endpoint, serviceKey: key, scanGeneration: generation)
+                    self.connect(
+                        to: endpoint,
+                        serviceKey: key,
+                        scanGeneration: generation,
+                        advertised: LanManualEndpoint(host: host, port: lanDefaultTcpPort())
+                    )
                     // A bare TCP connect is not a find -- only the Noise
                     // handshake authenticating a friend marks the sweep
                     // (see connectionAuthenticated). It is still a
@@ -1066,6 +1094,13 @@ private final class LanConnection {
     /// the address dialed, which `LanTransport.connectionAuthenticated` files
     /// as a retry target once the handshake proves it real.
     let dialedEndpoint: NWEndpoint
+    /// The address this link dialed, as a host and the port the peer *listens*
+    /// on -- the only form the endpoint cache can hold. Non-nil only for an
+    /// outbound link whose caller knew that address. An accepted link is
+    /// always nil: its remote endpoint carries the peer's ephemeral source
+    /// port, so filing it would cache an address nothing can dial. The Android
+    /// transport draws the same line.
+    let advertisedEndpoint: LanManualEndpoint?
     /// The sweep generation that dialed this link, if a subnet sweep did.
     /// Only that sweep may be credited with what this handshake finds -- see
     /// `LanTransport.markSweepFoundFriend`.
@@ -1094,7 +1129,8 @@ private final class LanConnection {
         localPrivateKey: Data,
         owner: LanTransport,
         serviceKey: String?,
-        scanGeneration: UUID? = nil
+        scanGeneration: UUID? = nil,
+        advertisedEndpoint: LanManualEndpoint? = nil
     ) throws {
         self.address = address
         self.connection = connection
@@ -1102,6 +1138,7 @@ private final class LanConnection {
         self.owner = owner
         self.serviceKey = serviceKey
         self.dialedEndpoint = connection.endpoint
+        self.advertisedEndpoint = initiator ? advertisedEndpoint : nil
         self.scanGeneration = scanGeneration
         noise = try LanNoiseSession(initiator: initiator, localPrivateKey: localPrivateKey)
         phase = initiator ? .awaitMessage2 : .awaitMessage1

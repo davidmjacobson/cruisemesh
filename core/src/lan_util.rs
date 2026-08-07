@@ -164,6 +164,213 @@ pub fn lan_endpoint_cache_is_fresh(saved_at_ms: i64, now_ms: i64) -> bool {
     now_ms.saturating_sub(saved_at_ms) <= LAN_ENDPOINT_CACHE_MAX_AGE_MS
 }
 
+/// How a cached LAN endpoint came to be known.
+///
+/// The distinction exists because the two are worth very different amounts.
+/// A hint is a claim the contact made about an address; an authenticated
+/// entry is an address this phone reached and completed a Noise handshake
+/// with. Only the second is evidence, so only the second may sit in the cache
+/// on a subnet this phone cannot see itself on -- a routed LAN carries TCP
+/// where mDNS cannot, and a peer proven there is legitimately cross-subnet.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanEndpointProvenance {
+    /// The address arrived in a contact's endpoint hint and nothing has
+    /// confirmed it. Values written before provenance was recorded decode as
+    /// this: the conservative reading, since a pre-provenance build filed
+    /// hints and proven addresses through the same door.
+    Hinted,
+    /// The address completed a Noise handshake with this phone.
+    Authenticated,
+}
+
+/// One entry of the per-network LAN endpoint cache, as both apps hold it.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct LanEndpointCacheEntry {
+    pub host: String,
+    pub port: u16,
+    pub saved_at_ms: i64,
+    pub provenance: LanEndpointProvenance,
+}
+
+/// What a shell should do with an entry it just read off disk.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanEndpointCacheDecision {
+    /// Dial it.
+    Use,
+    /// Do not dial it, but leave it stored -- this load could not judge it.
+    Skip,
+    /// Delete it. It can never be dialed successfully from here again.
+    Evict,
+}
+
+const CACHE_FIELD_SEPARATOR: char = '|';
+const PROVENANCE_HINTED: &str = "h";
+const PROVENANCE_AUTHENTICATED: &str = "a";
+
+/// Serialises a cache entry to the single string both shells persist.
+///
+/// The shape is `base64url(host)|port|savedAtMs|provenance`, extending the
+/// three-field value shipped builds wrote by appending a field rather than
+/// changing one, so the three fields those builds wrote keep their meaning and
+/// their position. The host is encoded because it can contain the separator
+/// (an IPv6 literal) and a zone suffix.
+///
+/// That only buys forward compatibility because [`lan_endpoint_cache_decode`]
+/// ignores fields it does not know: shipped builds did **not** -- their
+/// three-field parsers rejected anything longer, and the shells delete a value
+/// they cannot parse. So a phone that rolls back past this change loses its
+/// cache; a phone that rolls back past a *later* appended field does not.
+#[uniffi::export]
+pub fn lan_endpoint_cache_encode(entry: LanEndpointCacheEntry) -> String {
+    let provenance = match entry.provenance {
+        LanEndpointProvenance::Hinted => PROVENANCE_HINTED,
+        LanEndpointProvenance::Authenticated => PROVENANCE_AUTHENTICATED,
+    };
+    format!(
+        "{}|{}|{}|{}",
+        BASE64URL.encode(entry.host.as_bytes()),
+        entry.port,
+        entry.saved_at_ms,
+        provenance
+    )
+}
+
+/// Parses a stored cache value, or `None` when it cannot be trusted at all.
+///
+/// A legacy three-field value parses as [`LanEndpointProvenance::Hinted`].
+/// That is the conservative reading and the whole point of the migration: the
+/// builds that wrote those values filed cross-subnet hints, so treating them
+/// as proven would preserve exactly the entries this is meant to clear.
+/// An unrecognised provenance field is read as `Hinted` for the same reason.
+///
+/// Fields past the fourth are ignored rather than rejected. Both shells delete
+/// a value this returns `None` for, so being strict about length would mean
+/// that appending a fifth field later silently wipes the whole cache -- proven
+/// cross-subnet entries included -- on any phone that rolls back to this build.
+/// Ignoring the tail costs nothing and makes the next append survivable.
+#[uniffi::export]
+pub fn lan_endpoint_cache_decode(value: String) -> Option<LanEndpointCacheEntry> {
+    let parts: Vec<&str> = value.split(CACHE_FIELD_SEPARATOR).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let host = decode_cached_host(parts[0])?;
+    if host.is_empty() {
+        return None;
+    }
+    let port = parts[1].parse::<u16>().ok().filter(|port| *port > 0)?;
+    let saved_at_ms = parts[2].parse::<i64>().ok()?;
+    let provenance = match parts.get(3) {
+        Some(&PROVENANCE_AUTHENTICATED) => LanEndpointProvenance::Authenticated,
+        _ => LanEndpointProvenance::Hinted,
+    };
+    Some(LanEndpointCacheEntry {
+        host,
+        port,
+        saved_at_ms,
+        provenance,
+    })
+}
+
+/// The value to store for `entry`, given whatever is already stored under the
+/// same key (`None` when nothing is).
+///
+/// This exists so a save never silently *demotes* a proven address. A contact
+/// keeps resending its endpoint hint, and if that hint names the address this
+/// phone already authenticated, rewriting the entry as merely hinted would
+/// hand it back to the eviction rule below and drop a working cross-subnet
+/// peer on the next Wi-Fi join. A hint about an already-proven address
+/// refreshes its clock and keeps the proof; anything else -- a different
+/// address, or a fresh handshake -- writes what the caller passed.
+#[uniffi::export]
+pub fn lan_endpoint_cache_encode_update(
+    existing_value: Option<String>,
+    entry: LanEndpointCacheEntry,
+) -> String {
+    let mut merged = entry;
+    if merged.provenance == LanEndpointProvenance::Hinted {
+        let proven = existing_value
+            .and_then(lan_endpoint_cache_decode)
+            .filter(|stored| {
+                stored.provenance == LanEndpointProvenance::Authenticated
+                    && stored.host == merged.host
+                    && stored.port == merged.port
+            });
+        if proven.is_some() {
+            merged.provenance = LanEndpointProvenance::Authenticated;
+        }
+    }
+    lan_endpoint_cache_encode(merged)
+}
+
+/// What to do with a cache entry read back on this phone's current network.
+///
+/// `local_host` is this phone's own LAN address, or `None` when it has none to
+/// compare with.
+///
+/// Shipped builds filed a hinted address under this phone's network id
+/// whatever subnet the address was on, so a phone that ever received such a
+/// hint burns one connect timeout per Wi-Fi join for the seven days the entry
+/// lives. Freshness and the host rule alone could not clear those: an address
+/// that authenticated on a routed LAN is a legitimate cross-subnet entry and
+/// looks identical without provenance. With provenance recorded, the rule is
+/// finally expressible -- an unproven address must be on the network we are
+/// on, a proven one need not be.
+///
+/// The two "cannot tell" cases are deliberately not the same answer. When
+/// *this phone* has no address that can fingerprint a network, the load itself
+/// is uninformative, so an unproven entry is skipped and left alone: not
+/// dialing is enough to stop the loop, and the next load on a readable
+/// interface can still judge it. When the *entry's* host is the unprovable one
+/// (a link-local IPv6 address, identical on every link there has ever been) no
+/// future load can judge it either -- unprovable is exactly what #271 said may
+/// not be remembered -- so that is a terminal answer and the entry goes.
+///
+/// Nothing here discovers or forwards an address; every value examined is one
+/// this phone already holds.
+#[uniffi::export]
+pub fn lan_endpoint_cache_decision(
+    entry: LanEndpointCacheEntry,
+    local_host: Option<String>,
+    now_ms: i64,
+) -> LanEndpointCacheDecision {
+    if !lan_endpoint_cache_is_fresh(entry.saved_at_ms, now_ms) {
+        return LanEndpointCacheDecision::Evict;
+    }
+    if !lan_endpoint_host_is_local(entry.host.clone()) {
+        return LanEndpointCacheDecision::Evict;
+    }
+    if entry.provenance == LanEndpointProvenance::Authenticated {
+        return LanEndpointCacheDecision::Use;
+    }
+    let Some(local_host) = local_host.filter(|host| host_can_fingerprint_network(host)) else {
+        return LanEndpointCacheDecision::Skip;
+    };
+    if lan_hosts_share_local_network(local_host, entry.host) {
+        LanEndpointCacheDecision::Use
+    } else {
+        LanEndpointCacheDecision::Evict
+    }
+}
+
+/// Whether an address is specific enough to say which network it is on -- the
+/// precondition for [`lan_hosts_share_local_network`] to mean anything. A name
+/// or a link-local IPv6 address is not.
+fn host_can_fingerprint_network(host: &str) -> bool {
+    core_lan_network_id_for_ipv4(host.to_string()).is_some()
+        || routable_ipv6_prefix_64(host).is_some()
+}
+
+/// Accepts both the padded URL-safe base64 shipped Android builds wrote and
+/// the unpadded form, so no stored value becomes unreadable.
+fn decode_cached_host(encoded: &str) -> Option<String> {
+    let bytes = BASE64URL
+        .decode(encoded.as_bytes())
+        .or_else(|_| BASE64URL_NOPAD.decode(encoded.as_bytes()))
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 /// Whether a host may be dialed as a contact's LAN endpoint: an address
 /// literal on the local network, never a name (see
 /// [`crate::protocol`]'s `is_local_lan_host`, which this delegates to).
@@ -375,6 +582,270 @@ mod tests {
                 "{local} vs {candidate}"
             );
         }
+    }
+
+    fn entry(host: &str, provenance: LanEndpointProvenance) -> LanEndpointCacheEntry {
+        LanEndpointCacheEntry {
+            host: host.into(),
+            port: 45_892,
+            saved_at_ms: 1_000,
+            provenance,
+        }
+    }
+
+    /// The exact bytes a pre-provenance build wrote: URL-safe padded base64 of
+    /// the host, then port and timestamp, with no fourth field.
+    fn legacy_value(host: &str, port: u16, saved_at_ms: i64) -> String {
+        format!("{}|{port}|{saved_at_ms}", BASE64URL.encode(host.as_bytes()))
+    }
+
+    #[test]
+    fn cache_entries_round_trip_through_the_stored_string() {
+        for provenance in [
+            LanEndpointProvenance::Hinted,
+            LanEndpointProvenance::Authenticated,
+        ] {
+            for host in ["192.168.86.23", "fe80::1%wlan0", "10.0.0.7"] {
+                let original = entry(host, provenance);
+                let encoded = lan_endpoint_cache_encode(original.clone());
+                assert_eq!(lan_endpoint_cache_decode(encoded), Some(original), "{host}");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_three_field_values_decode_as_hinted() {
+        // The migration hinge: a value written before provenance existed came
+        // from a build that filed cross-subnet hints, so it must read as
+        // unproven -- reading it as proven would preserve the very entries
+        // this change exists to clear.
+        assert_eq!(
+            lan_endpoint_cache_decode(legacy_value("10.80.209.68", 45_892, 1_000)),
+            Some(LanEndpointCacheEntry {
+                host: "10.80.209.68".into(),
+                port: 45_892,
+                saved_at_ms: 1_000,
+                provenance: LanEndpointProvenance::Hinted,
+            })
+        );
+        // Unpadded base64 reads too, and so does an unrecognised provenance.
+        assert_eq!(
+            lan_endpoint_cache_decode(format!(
+                "{}|45892|1000|z",
+                BASE64URL_NOPAD.encode("10.0.0.7".as_bytes())
+            ))
+            .map(|it| it.provenance),
+            Some(LanEndpointProvenance::Hinted)
+        );
+    }
+
+    #[test]
+    fn fields_past_the_fourth_are_ignored_rather_than_rejected() {
+        // Room for the next append. Both shells delete a value they cannot
+        // parse, so rejecting an unknown tail would mean that adding a fifth
+        // field later wipes the entire cache -- proven cross-subnet entries
+        // included -- on any phone that rolls back to a build older than the
+        // append. Ignoring it costs nothing.
+        assert_eq!(
+            lan_endpoint_cache_decode(format!(
+                "{}|45892|1000|a|whatever-comes-next",
+                BASE64URL.encode(b"10.80.209.68")
+            )),
+            Some(LanEndpointCacheEntry {
+                host: "10.80.209.68".into(),
+                port: 45_892,
+                saved_at_ms: 1_000,
+                provenance: LanEndpointProvenance::Authenticated,
+            })
+        );
+    }
+
+    #[test]
+    fn undecodable_cache_values_are_rejected() {
+        // Each of these fails on a field it must be able to read -- too few
+        // fields, an unusable host, port or timestamp. Never on a field it
+        // does not recognise: see the test above.
+        for value in [
+            "",
+            "only-one-field",
+            "a|b",
+            "a|b|c|d|e",
+            &format!("{}|0|1000|h", BASE64URL.encode(b"10.0.0.7")),
+            &format!("{}|45892|nope|h", BASE64URL.encode(b"10.0.0.7")),
+            &format!("{}|45892|1000|h", BASE64URL.encode(b"")),
+            "!!!|45892|1000|h",
+        ] {
+            assert!(
+                lan_endpoint_cache_decode(value.to_string()).is_none(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_poisoned_legacy_entry_is_evicted_and_a_proven_one_survives() {
+        let now = 2_000;
+        let local = Some("192.168.86.31".to_string());
+        // The field case: 10.80.209.68 filed by a shipped build while this
+        // phone sat on 192.168.86.0/24. It can never answer here.
+        let poisoned = lan_endpoint_cache_decode(legacy_value("10.80.209.68", 45_892, 1_000))
+            .expect("legacy value parses");
+        assert_eq!(
+            lan_endpoint_cache_decision(poisoned, local.clone(), now),
+            LanEndpointCacheDecision::Evict
+        );
+        // A peer proven on a routed LAN is legitimately cross-subnet.
+        assert_eq!(
+            lan_endpoint_cache_decision(
+                entry("10.80.209.68", LanEndpointProvenance::Authenticated),
+                local.clone(),
+                now
+            ),
+            LanEndpointCacheDecision::Use
+        );
+        // A legacy entry on this phone's own subnet is still dialable.
+        let same_subnet = lan_endpoint_cache_decode(legacy_value("192.168.86.23", 45_892, 1_000))
+            .expect("legacy value parses");
+        assert_eq!(
+            lan_endpoint_cache_decision(same_subnet, local, now),
+            LanEndpointCacheDecision::Use
+        );
+    }
+
+    #[test]
+    fn cache_decision_evicts_only_what_it_can_show_is_unusable() {
+        let local = Some("192.168.86.31".to_string());
+        // Stale beats everything, proven or not.
+        for provenance in [
+            LanEndpointProvenance::Hinted,
+            LanEndpointProvenance::Authenticated,
+        ] {
+            assert_eq!(
+                lan_endpoint_cache_decision(
+                    entry("192.168.86.23", provenance),
+                    local.clone(),
+                    1_000 + LAN_ENDPOINT_CACHE_MAX_AGE_MS + 1
+                ),
+                LanEndpointCacheDecision::Evict
+            );
+            // So does a host a hint may no longer carry.
+            assert_eq!(
+                lan_endpoint_cache_decision(entry("8.8.8.8", provenance), local.clone(), 2_000),
+                LanEndpointCacheDecision::Evict
+            );
+        }
+        // A link-local entry can never be shown to be on this network -- every
+        // link is fe80::/64 -- so, unlike the case below, no later load will
+        // do better and the entry is retired for good.
+        assert_eq!(
+            lan_endpoint_cache_decision(
+                entry("fe80::1%wlan0", LanEndpointProvenance::Hinted),
+                local.clone(),
+                2_000
+            ),
+            LanEndpointCacheDecision::Evict
+        );
+        // No local address to compare with, or one that fingerprints nothing:
+        // skip the dial, but keep the entry -- a later load can still judge it.
+        for local_host in [
+            None,
+            Some("router".to_string()),
+            Some("fe80::1".to_string()),
+        ] {
+            assert_eq!(
+                lan_endpoint_cache_decision(
+                    entry("10.80.209.68", LanEndpointProvenance::Hinted),
+                    local_host.clone(),
+                    2_000
+                ),
+                LanEndpointCacheDecision::Skip,
+                "{local_host:?}"
+            );
+            // A proven entry is dialed regardless: it answered once already.
+            assert_eq!(
+                lan_endpoint_cache_decision(
+                    entry("10.80.209.68", LanEndpointProvenance::Authenticated),
+                    local_host,
+                    2_000
+                ),
+                LanEndpointCacheDecision::Use
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_hint_never_demotes_a_proven_entry() {
+        let proven = lan_endpoint_cache_encode(LanEndpointCacheEntry {
+            host: "10.80.209.68".into(),
+            port: 45_892,
+            saved_at_ms: 1_000,
+            provenance: LanEndpointProvenance::Authenticated,
+        });
+        // The same address arriving again as a mere hint refreshes the clock
+        // and keeps the proof; losing it would evict a working routed-LAN
+        // peer on the next Wi-Fi join.
+        let refreshed = lan_endpoint_cache_encode_update(
+            Some(proven.clone()),
+            LanEndpointCacheEntry {
+                host: "10.80.209.68".into(),
+                port: 45_892,
+                saved_at_ms: 9_000,
+                provenance: LanEndpointProvenance::Hinted,
+            },
+        );
+        assert_eq!(
+            lan_endpoint_cache_decode(refreshed),
+            Some(LanEndpointCacheEntry {
+                host: "10.80.209.68".into(),
+                port: 45_892,
+                saved_at_ms: 9_000,
+                provenance: LanEndpointProvenance::Authenticated,
+            })
+        );
+        // A *different* address is new information and is filed as hinted --
+        // the old proof said nothing about this one.
+        let replaced = lan_endpoint_cache_encode_update(
+            Some(proven.clone()),
+            entry("192.168.86.23", LanEndpointProvenance::Hinted),
+        );
+        assert_eq!(
+            lan_endpoint_cache_decode(replaced).map(|it| it.provenance),
+            Some(LanEndpointProvenance::Hinted)
+        );
+        // A different port on the same host is a different endpoint too.
+        let other_port = lan_endpoint_cache_encode_update(
+            Some(proven),
+            LanEndpointCacheEntry {
+                host: "10.80.209.68".into(),
+                port: 45_893,
+                saved_at_ms: 9_000,
+                provenance: LanEndpointProvenance::Hinted,
+            },
+        );
+        assert_eq!(
+            lan_endpoint_cache_decode(other_port).map(|it| it.provenance),
+            Some(LanEndpointProvenance::Hinted)
+        );
+        // Nothing stored, or an unreadable value: the caller's word stands.
+        for existing in [None, Some("garbage".to_string())] {
+            assert_eq!(
+                lan_endpoint_cache_decode(lan_endpoint_cache_encode_update(
+                    existing,
+                    entry("10.80.209.68", LanEndpointProvenance::Hinted)
+                ))
+                .map(|it| it.provenance),
+                Some(LanEndpointProvenance::Hinted)
+            );
+        }
+        // A handshake promotes a stored hint in place.
+        let promoted = lan_endpoint_cache_encode_update(
+            Some(legacy_value("10.80.209.68", 45_892, 1_000)),
+            entry("10.80.209.68", LanEndpointProvenance::Authenticated),
+        );
+        assert_eq!(
+            lan_endpoint_cache_decode(promoted).map(|it| it.provenance),
+            Some(LanEndpointProvenance::Authenticated)
+        );
     }
 
     #[test]

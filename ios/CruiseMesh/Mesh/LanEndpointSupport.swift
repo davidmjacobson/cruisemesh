@@ -71,8 +71,10 @@ func isSingleShotLanConnectKey(_ serviceKey: String) -> Bool {
 /// this phone's cache is keyed by an IPv4 network fingerprint
 /// (`lanNetworkId(ipv4Address:)`), so without an IPv4 address there is no
 /// cache to write to in the first place. And if the hint's dial
-/// authenticates, `onLanPeerAuthenticated` files the endpoint anyway, on the
-/// stronger authority of having reached it.
+/// authenticates, `MeshController`'s `onAuthenticated` files the endpoint
+/// anyway, on the stronger authority of having reached it -- as
+/// `LanEndpointProvenance.authenticated`, which is what lets a legitimately
+/// cross-subnet peer survive the eviction rule this gate feeds.
 func lanHintMayBeCached(localHost: String?, candidateHost: String) -> Bool {
     guard let localHost else { return false }
     return lanHostsShareLocalNetwork(localHost: localHost, candidateHost: candidateHost)

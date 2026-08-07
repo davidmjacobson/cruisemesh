@@ -83,7 +83,7 @@ class GroupFanoutRelayDeliveryTest {
     private val lanHooks = object : InboundEnvelopeProcessor.LanHooks {
         override fun sendLanEndpointHintTo(address: String) {}
         override fun connectToLanHint(hint: Frame.LanEndpoint, peerUserId: ByteArray) {}
-        override fun saveLanEndpoint(
+        override fun saveHintedLanEndpoint(
             networkId: String?,
             userId: ByteArray,
             endpoint: LanManualEndpoint,
