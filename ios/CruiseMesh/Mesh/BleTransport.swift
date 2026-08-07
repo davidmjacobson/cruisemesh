@@ -513,6 +513,27 @@ extension BleTransport: CBPeripheralManagerDelegate {
         peripheral.respond(to: first, withResult: allValid ? .success : .invalidAttributeValueLength)
     }
 
+    /// Android reports every advertising start through a per-start callback;
+    /// CoreBluetooth's equivalent is this one optional delegate method, which
+    /// this transport did not implement — so an advertising start that failed
+    /// left the phone undiscoverable with nothing in the log at all.
+    ///
+    /// Observability only. CoreBluetooth hands out no per-start handle to
+    /// retire (`stopAdvertising()` takes no argument and there is exactly one
+    /// advertisement per manager), it does not stop advertising when a central
+    /// connects, and it exposes no advertising duty-mode knob — so none of the
+    /// three restart hazards Android's `BleAdvertiserStateMachine` exists for
+    /// can arise here, and there is no state to fix up in this callback.
+    /// `startAdvertisingIfReady` is already re-run on every state change and
+    /// on state restoration.
+    func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
+        if let error {
+            log.error("Peripheral advertising failed to start: \(error.localizedDescription, privacy: .public)")
+        } else {
+            log.info("Peripheral advertising started")
+        }
+    }
+
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
         for address in Array(pendingPeripheralUpdates.keys) {
             flushPeripheralUpdates(address: address)

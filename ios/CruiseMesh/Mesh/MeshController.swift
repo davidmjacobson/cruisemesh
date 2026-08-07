@@ -77,6 +77,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private let lanHealth = LanHealthTracker()
     private let store = AppStore.get()
     private let bluetoothAudioBackoff = BluetoothAudioBackoff()
+    /// Coalesces the failover resume fan-out per logical peer — see
+    /// `scheduleFailoverResume`. Confined to `meshQueue` like the rest of the
+    /// mesh event state.
+    private let failoverResumeDebounce = FailoverResumeDebounce()
     private var identity: Identity!
     private var relayTimer: DispatchSourceTimer?
     /// CP2b: epoch ms until which relayd asked us not to sync again
@@ -320,7 +324,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 LanTransportDiagnostics.shared.disconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 if wasSelected, let peerUserId {
-                    self.resumeLogicalPeerSync(peerUserId: peerUserId)
+                    self.scheduleFailoverResume(peerUserId: peerUserId)
                 }
                 self.refreshNearby()
             }
@@ -361,7 +365,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 MeshController.shared.recordPeerDisconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 if wasSelected, let peerUserId {
-                    MeshController.shared.resumeLogicalPeerSync(peerUserId: peerUserId)
+                    MeshController.shared.scheduleFailoverResume(peerUserId: peerUserId)
                 }
                 MeshController.shared.refreshNearby()
             }
@@ -380,7 +384,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 MeshController.shared.recordPeerDisconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 if wasSelected, let peerUserId {
-                    MeshController.shared.resumeLogicalPeerSync(peerUserId: peerUserId)
+                    MeshController.shared.scheduleFailoverResume(peerUserId: peerUserId)
                 }
                 MeshController.shared.refreshNearby()
             }
@@ -407,6 +411,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         lanHealthTimer?.cancel()
         lanHealthTimer = nil
         lanHealth.clear()
+        // A debounced failover resume can still be queued on meshQueue. Its
+        // block re-checks `isRunning` (already false above) before doing any
+        // work, so it cannot outlive this; clearing the armed windows just
+        // keeps the state honest for the next start.
+        failoverResumeDebounce.clear()
         digestMaintenanceTimer?.cancel()
         digestMaintenanceTimer = nil
         lastDigestAtByAddress.removeAll()
@@ -843,6 +852,47 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         drainCarriedEnvelopesTo(address: address, peerUserId: userId)
         sendDigest(address: address, userId: userId, identity: identity)
         refreshNearby()
+    }
+
+    /// Failover path into `resumeLogicalPeerSync`, delayed and coalesced per
+    /// logical peer.
+    ///
+    /// Running the resume straight out of a disconnect callback is wrong when
+    /// several links die in one radio event: the first callback picks whatever
+    /// route is *currently* elected — often a sibling link to the same phone
+    /// whose own disconnect has not been delivered yet — and immediately
+    /// queues a multi-KB carry drain plus a digest onto it, which is then
+    /// thrown away when that link dies too. Waiting one
+    /// `FailoverResumeDebounce` window lets the rest of the burst land first,
+    /// so the resume runs once, against the route that actually survived.
+    ///
+    /// iOS reaches this from BLE and LAN disconnects the same way Android
+    /// does. The hop `meshQueue` already provides is *not* a substitute: it
+    /// orders our own callbacks, but the sibling link's disconnect has not
+    /// been reported by CoreBluetooth yet, so it is not on the queue to be
+    /// ordered against.
+    ///
+    /// Promotion callers still resume immediately — a promotion means a link
+    /// just came *up*, so there is no dying sibling to wait for.
+    ///
+    /// The window is measured on the same monotonic clock `asyncAfter` counts
+    /// down on: on the wall clock, a time correction landing mid-burst would
+    /// expire the window early and produce the second fan-out this exists to
+    /// prevent.
+    private func scheduleFailoverResume(peerUserId: Data) {
+        let key = UserIdHex.encode(peerUserId)
+        let nowMs = FailoverResumeDebounce.monotonicNowMs
+        guard let arm = failoverResumeDebounce.request(key: key, nowMs: nowMs) else { return }
+        meshQueue.asyncAfter(deadline: .now() + .milliseconds(Int(clamping: arm.delayMs))) { [weak self] in
+            guard let self else { return }
+            // Cleared before the work runs, so a disconnect arriving while the
+            // resume is in flight arms a fresh window instead of being
+            // swallowed by this one. The token scopes that to *this* window: a
+            // window armed in the meantime keeps its own timer.
+            self.failoverResumeDebounce.fired(key: key, token: arm.token)
+            guard self.isRunning else { return }
+            self.resumeLogicalPeerSync(peerUserId: peerUserId)
+        }
     }
 
     /// Continue immediately after route promotion or failover; waiting for
