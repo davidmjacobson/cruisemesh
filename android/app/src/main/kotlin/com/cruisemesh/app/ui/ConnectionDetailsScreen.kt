@@ -40,6 +40,7 @@ import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.UserIdHex
+import com.cruisemesh.app.debug.ConflictDiagnosticsExport
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.debug.DiagnosticsShare
 import com.cruisemesh.app.debug.FieldMetricsExport
@@ -277,7 +278,9 @@ fun ConnectionDetailsScreen(onBack: () -> Unit) {
                         // leave behind the one captured thing it did not name.
                         runCatching { AppStore.get(context).clearDeliveryMetrics() }
                         FieldMetricsExport.deleteCsvFile(context)
-                        // The last share left a zip holding copies of both.
+                        runCatching { AppStore.get(context).clearMessageConflicts() }
+                        ConflictDiagnosticsExport.deleteCsvFile(context)
+                        // The last share left a zip holding copies of them all.
                         DiagnosticsShare.deleteArchive(context)
                         hasCapturedDiagnostics = false
                         supportMessage = context.getString(R.string.ui_diagnostics_deleted)

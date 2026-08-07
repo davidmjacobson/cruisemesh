@@ -14,11 +14,12 @@ import java.util.zip.ZipOutputStream
  * Everything captured, in one share sheet.
  *
  * The connection log and the delivery-timings CSV answer different questions --
- * what the radios did, versus whether messages actually arrived and how fast --
- * and neither is derivable from the other. Splitting them across two buttons
- * meant that asking a family member to "send diagnostics" reliably produced
- * half the picture, and the round trip to ask for the other half can cost a day
- * at sea. So the tester-facing surface has one button, and it sends both.
+ * what the radios did, whether messages actually arrived and how fast, and
+ * whether an ambiguous sender stream was quarantined. None is derivable from
+ * the others. Splitting them across buttons meant that asking a family member
+ * to "send diagnostics" reliably produced only part of the picture, and the
+ * round trip to ask for the rest can cost a day at sea. So the tester-facing
+ * surface has one button, and it sends them all.
  *
  * The granular per-file exports still exist on the internal tools screen, where
  * the point is analysis rather than a support hand-off.
@@ -71,7 +72,9 @@ object DiagnosticsShare {
      */
     fun hasAnythingCaptured(context: Context): Boolean {
         if (DebugFileLog.hasCapturedLogs(context)) return true
-        return runCatching { AppStore.get(context).hasDeliveryMetrics() }.getOrNull() ?: false
+        val store = AppStore.get(context)
+        if (runCatching { store.hasDeliveryMetrics() }.getOrNull() == true) return true
+        return runCatching { store.hasMessageConflicts() }.getOrNull() ?: false
     }
 
     /**
@@ -87,7 +90,7 @@ object DiagnosticsShare {
 
     /**
      * The captured files, in the order a reader wants them: the log first,
-     * since it is the narrative, then the metrics CSV.
+     * since it is the narrative, then the delivery and conflict CSVs.
      *
      * Writing the CSV is a side effect of asking -- it is regenerated from the
      * core on each call rather than kept on disk -- so this is only ever called
@@ -97,6 +100,7 @@ object DiagnosticsShare {
         val files = mutableListOf<File>()
         DebugFileLog.logFile(context).takeIf { it.exists() && it.length() > 0 }?.let(files::add)
         FieldMetricsExport.writeCsvFile(context)?.let(files::add)
+        ConflictDiagnosticsExport.writeCsvFile(context)?.let(files::add)
         return files
     }
 

@@ -167,8 +167,7 @@ fun BackupExportScreen(onBack: () -> Unit) {
                 } ?: "Counting encrypted courier messages…",
             )
             Text(
-                "Your identity, contacts, groups, privacy settings, and message-number continuity " +
-                    "are always included.",
+                stringResource(R.string.ui_backup_identity_always_included),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -339,14 +338,17 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                     enabled = canReview,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text("Review backup")
+                    Text(stringResource(R.string.ui_review_backup))
                 }
             }
 
             preview?.let { reviewed ->
                 Text(
-                    "Backup contains ${reviewed.inventory.contactCount} contacts and " +
-                        "${reviewed.inventory.groupCount} groups.",
+                    stringResource(
+                        R.string.ui_backup_contains_contacts_and_groups,
+                        reviewed.inventory.contactCount.toString(),
+                        reviewed.inventory.groupCount.toString(),
+                    ),
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Medium,
                 )
@@ -365,8 +367,7 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                         formatBackupBytes(reviewed.inventory.pendingCourierDeliveryBytes),
                 )
                 Text(
-                    "Identity, contacts, groups, privacy settings, and message-number continuity " +
-                        "will always be restored.",
+                    stringResource(R.string.ui_backup_identity_always_restored),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

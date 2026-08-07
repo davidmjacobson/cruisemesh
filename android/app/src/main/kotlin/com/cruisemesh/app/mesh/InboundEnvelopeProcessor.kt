@@ -31,6 +31,7 @@ import uniffi.cruisemesh_core.CoreInboundGate
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
+import uniffi.cruisemesh_core.IncomingMessageInsertOutcome
 import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.PeerConnectionEventKind
 import uniffi.cruisemesh_core.MessageBody
@@ -1068,6 +1069,32 @@ internal class InboundEnvelopeProcessor(
         }
     }
 
+    private fun acceptIncomingInsert(
+        outcome: IncomingMessageInsertOutcome,
+        address: String,
+        kind: UByte,
+        senderUserId: ByteArray,
+        lamport: ULong,
+    ): Boolean = when (outcome) {
+        IncomingMessageInsertOutcome.INSERTED -> true
+        IncomingMessageInsertOutcome.DUPLICATE -> {
+            Log.i(
+                TAG,
+                "Ignoring duplicate kind=$kind from $address " +
+                    "sender=${UserIdHex.encode(senderUserId)} lamport=$lamport",
+            )
+            false
+        }
+        IncomingMessageInsertOutcome.QUARANTINED_CONFLICT -> {
+            Log.w(
+                TAG,
+                "Quarantined message stream conflict kind=$kind from $address " +
+                    "sender=${UserIdHex.encode(senderUserId)} lamport=$lamport; retained visible branch",
+            )
+            false
+        }
+    }
+
     private fun handleIncomingGroupMetadataUpdate(
         address: String,
         group: Group,
@@ -1084,7 +1111,7 @@ internal class InboundEnvelopeProcessor(
             Log.w(TAG, "Dropping invalid group metadata from $address: ${e.message}")
             return
         }
-        val inserted = store.insertIncomingMessage(
+        val outcome = store.insertIncomingMessageWithArrival(
             StoredMessage(
                 chatId = group.id,
                 senderUserId = senderUserId,
@@ -1095,9 +1122,9 @@ internal class InboundEnvelopeProcessor(
             ),
             msgId,
             replyToMsgId,
+            arrival,
         )
-        if (!inserted) return
-        store.recordMessageArrival(group.id, senderUserId, body.lamport, arrival)
+        if (!acceptIncomingInsert(outcome, address, body.kind, senderUserId, body.lamport)) return
         if (updated != null) {
             store.upsertGroup(updated)
             Log.i(TAG, "Applied group metadata revision ${updated.metadataRevision} for ${updated.name}")
@@ -1114,7 +1141,7 @@ internal class InboundEnvelopeProcessor(
         msgId: ByteArray,
         replyToMsgId: ByteArray?,
     ) {
-        val inserted = store.insertIncomingMessage(
+        val outcome = store.insertIncomingMessageWithArrival(
             StoredMessage(
                 chatId = group.id,
                 senderUserId = senderUserId,
@@ -1125,16 +1152,9 @@ internal class InboundEnvelopeProcessor(
             ),
             msgId,
             replyToMsgId,
+            arrival,
         )
-        if (!inserted) {
-            Log.i(
-                TAG,
-                "Ignoring duplicate group kind=${body.kind} from $address " +
-                    "sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
-            )
-            return
-        }
-        store.recordMessageArrival(group.id, senderUserId, body.lamport, arrival)
+        if (!acceptIncomingInsert(outcome, address, body.kind, senderUserId, body.lamport)) return
         Log.i(
             TAG,
             "Stored group kind=${body.kind} in ${group.name} from $address " +
@@ -1811,7 +1831,7 @@ internal class InboundEnvelopeProcessor(
         msgId: ByteArray,
         replyToMsgId: ByteArray?,
     ) {
-        val inserted = store.insertIncomingMessage(
+        val outcome = store.insertIncomingMessageWithArrival(
             StoredMessage(
                 chatId = senderUserId,
                 senderUserId = senderUserId,
@@ -1822,15 +1842,9 @@ internal class InboundEnvelopeProcessor(
             ),
             msgId,
             replyToMsgId,
+            arrival,
         )
-        if (!inserted) {
-            Log.i(
-                TAG,
-                "Ignoring duplicate kind=$kind from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
-            )
-            return
-        }
-        store.recordMessageArrival(senderUserId, senderUserId, body.lamport, arrival)
+        if (!acceptIncomingInsert(outcome, address, kind, senderUserId, body.lamport)) return
         Log.i(
             TAG,
             "Stored kind=$kind from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",

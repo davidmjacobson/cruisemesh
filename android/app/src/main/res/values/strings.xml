@@ -33,6 +33,9 @@
     <string name="ui_arrived_at">Arrived %1$s</string>
     <string name="ui_back">Back</string>
     <string name="ui_back_up_account">Back up account</string>
+    <string name="ui_backup_contains_contacts_and_groups">Backup contains %1$s contacts and %2$s groups.</string>
+    <string name="ui_backup_identity_always_included">Your identity, contacts, groups, privacy settings, and message-number continuity are always included.</string>
+    <string name="ui_backup_identity_always_restored">Identity, contacts, groups, privacy settings, and message-number continuity will always be restored.</string>
     <string name="ui_block">Block</string>
     <string name="ui_block_contact">Block contact</string>
     <string name="ui_block_explanation">They won\'t be able to message you, and they won\'t appear as a suggested friend. They won\'t be told. Scanning their card again unblocks them.</string>
@@ -199,6 +202,7 @@
     <string name="ui_reply">Reply</string>
     <string name="ui_restore">Restore</string>
     <string name="ui_restore_from_backup">Restore from backup</string>
+    <string name="ui_review_backup">Review backup</string>
     <string name="ui_safety_words">Safety words</string>
     <string name="ui_verify_contact">Verify contact</string>
     <string name="ui_verify_contact_explanation">Match these words with your friend\'s screen to confirm it\'s really them.</string>

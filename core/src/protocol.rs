@@ -354,8 +354,9 @@ pub fn core_is_hidden_spray_kind(kind: u8) -> bool {
     )
 }
 
-/// Whether delivering a consumed envelope of this `kind` leaves a durable
-/// `messages` row carrying the envelope's `msg_id` -- i.e. whether
+/// Whether delivering a consumed envelope of this `kind` leaves durable
+/// accepted-message or conflict-quarantine evidence carrying the envelope's
+/// `msg_id` -- i.e. whether
 /// [`crate::MessageStore::message_origin_by_msg_id`] can later be asked "did
 /// THIS device consume that exact envelope?" and answer truthfully.
 ///

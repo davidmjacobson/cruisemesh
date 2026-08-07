@@ -161,6 +161,32 @@ pub struct MessageArrival {
     pub received_at: i64,
 }
 
+/// Redacted, metadata-only view of a quarantined stream conflict. The full
+/// incoming branch remains private inside the SQLite store for a future
+/// explicit recovery rule; diagnostics receive only stable hashes and counts.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct MessageConflictSummary {
+    pub chat_hash: String,
+    pub sender_hash: String,
+    pub lamport: u64,
+    pub existing_fingerprint: String,
+    pub incoming_fingerprint: String,
+    pub arrival_transport: Option<u8>,
+    pub first_seen_at_ms: i64,
+    pub last_seen_at_ms: i64,
+    pub seen_count: u64,
+}
+
+/// Result of an arrival-aware incoming insert. Legacy callers still receive a
+/// boolean; transport shells use this richer result so a quarantined conflict
+/// is logged distinctly from an ordinary duplicate.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncomingMessageInsertOutcome {
+    Inserted,
+    Duplicate,
+    QuarantinedConflict,
+}
+
 /// When one message in a chat first reached this device, keyed by the
 /// (sender, lamport) pair that identifies it within that chat. Returned in
 /// bulk by [`MessageStore::chat_received_times`].
@@ -1116,7 +1142,9 @@ impl MessageStore {
     /// - **Identical** on all three -> true duplicate. No-op, returns `Ok(false)`,
     ///   same behavior as the old plain `INSERT OR IGNORE`.
     /// - **Different** -> ambiguous conflict. Keep the existing branch and all
-    ///   receipt state, ignore the incoming message, and return `Ok(false)`.
+    ///   receipt state, quarantine the private incoming content, and return
+    ///   `Ok(false)`. Callers that must distinguish this from a duplicate
+    ///   should use one of the classified incoming methods instead.
     ///   Timestamps cannot break the tie: they are sender wall-clock display
     ///   hints and may be wrong. A delayed courier or restored backup can
     ///   legitimately replay an older authenticated branch, while a confused
@@ -1124,22 +1152,166 @@ impl MessageStore {
     ///   recovery therefore requires a future protocol revision carrying an
     ///   explicit authenticated stream generation/epoch.
     pub fn insert_message(&self, message: StoredMessage) -> Result<bool, CoreError> {
-        incoming_message_reference::insert(self, message, None, None)
+        Ok(matches!(
+            incoming_message_reference::insert(self, message, None, None, None)?,
+            IncomingMessageInsertOutcome::Inserted
+        ))
     }
 
     /// Insert an opened incoming message together with the envelope id used
-    /// for quoting it and an optional encrypted reply target.
+    /// for quoting it and an optional encrypted reply target. `false` means
+    /// either a true duplicate or a quarantined conflict; callers that log or
+    /// otherwise act differently on those outcomes should use
+    /// [`Self::insert_incoming_message_classified`].
     pub fn insert_incoming_message(
         &self,
         message: StoredMessage,
         msg_id: Vec<u8>,
         reply_to_msg_id: Option<Vec<u8>>,
     ) -> Result<bool, CoreError> {
+        Ok(matches!(
+            self.insert_incoming_message_classified(message, msg_id, reply_to_msg_id)?,
+            IncomingMessageInsertOutcome::Inserted
+        ))
+    }
+
+    /// Insert an opened incoming message without arrival-route evidence while
+    /// preserving the full duplicate-versus-quarantine result. This covers
+    /// local carry-queue drains where no live transport can truthfully be
+    /// attributed to the original arrival.
+    pub fn insert_incoming_message_classified(
+        &self,
+        message: StoredMessage,
+        msg_id: Vec<u8>,
+        reply_to_msg_id: Option<Vec<u8>>,
+    ) -> Result<IncomingMessageInsertOutcome, CoreError> {
         validate_msg_id("msg_id", &msg_id)?;
         if let Some(reply_to_msg_id) = reply_to_msg_id.as_deref() {
             validate_msg_id("reply_to_msg_id", reply_to_msg_id)?;
         }
-        incoming_message_reference::insert(self, message, Some(msg_id), reply_to_msg_id)
+        incoming_message_reference::insert(self, message, Some(msg_id), reply_to_msg_id, None)
+    }
+
+    /// Insert an opened incoming message and atomically retain first-arrival
+    /// transport evidence. If the stream position conflicts, the existing
+    /// visible branch wins and the incoming branch plus its source is placed
+    /// in the bounded conflict quarantine instead of being silently dropped.
+    pub fn insert_incoming_message_with_arrival(
+        &self,
+        message: StoredMessage,
+        msg_id: Vec<u8>,
+        reply_to_msg_id: Option<Vec<u8>>,
+        arrival: MessageArrival,
+    ) -> Result<IncomingMessageInsertOutcome, CoreError> {
+        validate_msg_id("msg_id", &msg_id)?;
+        if let Some(reply_to_msg_id) = reply_to_msg_id.as_deref() {
+            validate_msg_id("reply_to_msg_id", reply_to_msg_id)?;
+        }
+        validate_message_arrival(&arrival)?;
+        incoming_message_reference::insert(
+            self,
+            message,
+            Some(msg_id),
+            reply_to_msg_id,
+            Some(arrival),
+        )
+    }
+
+    /// Newest quarantined stream conflicts, with identifiers and message
+    /// bodies replaced by stable pseudonymous hashes.
+    pub fn message_conflict_summaries(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MessageConflictSummary>, CoreError> {
+        let limit = i64::from(limit.clamp(1, MESSAGE_CONFLICT_QUARANTINE_LIMIT as u32));
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT chat_id, sender_user_id, lamport,
+                        existing_fingerprint, incoming_fingerprint,
+                        arrival_transport, first_seen_at, last_seen_at, seen_count
+                 FROM message_conflicts
+                 ORDER BY last_seen_at DESC, id DESC
+                 LIMIT ?1",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                let chat_id: Vec<u8> = row.get(0)?;
+                let sender_user_id: Vec<u8> = row.get(1)?;
+                let existing_fingerprint: Vec<u8> = row.get(3)?;
+                let incoming_fingerprint: Vec<u8> = row.get(4)?;
+                Ok(MessageConflictSummary {
+                    chat_hash: hex_lower(&metric_chat_hash(&chat_id)),
+                    sender_hash: hex_lower(&metric_sender_hash(&sender_user_id)),
+                    lamport: row.get::<_, i64>(2)? as u64,
+                    existing_fingerprint: hex_lower(&existing_fingerprint),
+                    incoming_fingerprint: hex_lower(&incoming_fingerprint),
+                    arrival_transport: row.get::<_, Option<i64>>(5)?.map(|value| value as u8),
+                    first_seen_at_ms: row.get(6)?,
+                    last_seen_at_ms: row.get(7)?,
+                    seen_count: row.get::<_, i64>(8)? as u64,
+                })
+            })
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Quarantined stream-conflict metadata as a diagnostics-safe CSV.
+    /// Message bodies, raw chat ids, raw sender ids, and message ids never
+    /// leave the core. The quarantine is globally bounded, so exporting all
+    /// retained rows is also bounded.
+    pub fn export_message_conflicts_csv(&self) -> Result<String, CoreError> {
+        let summaries =
+            self.message_conflict_summaries(MESSAGE_CONFLICT_QUARANTINE_LIMIT as u32)?;
+        let mut out = String::from(
+            "chat,sender,lamport,existing_fingerprint,incoming_fingerprint,arrival_transport,first_seen_at_ms,last_seen_at_ms,seen_count\n",
+        );
+        for summary in summaries {
+            let arrival_transport = summary
+                .arrival_transport
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{}\n",
+                summary.chat_hash,
+                summary.sender_hash,
+                summary.lamport,
+                summary.existing_fingerprint,
+                summary.incoming_fingerprint,
+                arrival_transport,
+                summary.first_seen_at_ms,
+                summary.last_seen_at_ms,
+                summary.seen_count,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Whether the bounded conflict quarantine contains any rows. This is the
+    /// cheap predicate used by diagnostics screens; unlike CSV export it does
+    /// not materialise the retained summaries or touch the filesystem.
+    pub fn has_message_conflicts(&self) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_conflicts)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(store_err)
+    }
+
+    /// Erase quarantined conflict branches and their metadata. Diagnostic
+    /// export deliberately exposes only redacted summaries, but the retained
+    /// rows contain message bodies for a future recovery rule. The user-facing
+    /// "Delete captured diagnostics" action therefore needs an explicit way
+    /// to remove both the summary and its private backing evidence.
+    pub fn clear_message_conflicts(&self) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute("DELETE FROM message_conflicts", [])
+            .map_err(store_err)?;
+        Ok(())
     }
 }
 
@@ -1311,6 +1483,10 @@ fn sanitize_restore_contents(
     } else {
         report.removed_message_count =
             tx.execute("DELETE FROM messages", []).map_err(store_err)? as u64;
+        // Quarantined alternatives are private backing evidence, not visible
+        // message-history rows counted by the inventory/report.
+        tx.execute("DELETE FROM message_conflicts", [])
+            .map_err(store_err)?;
         report.removed_pending_own_delivery_count = (tx
             .execute("DELETE FROM outbound_envelopes", [])
             .map_err(store_err)?
@@ -1370,6 +1546,127 @@ fn current_unix_time_ms() -> Result<i64, CoreError> {
         .map_err(|error| CoreError::Store(format!("system clock precedes Unix epoch: {error}")))?;
     i64::try_from(duration.as_millis())
         .map_err(|_| CoreError::Store("system clock does not fit backup timestamp".into()))
+}
+
+const MESSAGE_CONFLICT_QUARANTINE_LIMIT: i64 = 64;
+const MESSAGE_CONFLICT_FINGERPRINT_LEN: usize = 16;
+
+fn validate_message_arrival(arrival: &MessageArrival) -> Result<(), CoreError> {
+    if arrival.transport > 4 {
+        return Err(CoreError::Malformed(
+            "invalid message arrival transport".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn message_conflict_fingerprint(
+    chat_id: &[u8],
+    sender_user_id: &[u8],
+    timestamp: i64,
+    kind: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut hasher =
+        Blake2bVar::new(MESSAGE_CONFLICT_FINGERPRINT_LEN).expect("valid BLAKE2b digest length");
+    // Bind the fingerprint to the random conversation and sender ids. Besides
+    // preventing cross-chat correlation, this makes guessing short/common
+    // plaintext from an exported fingerprint impractical without the raw ids,
+    // neither of which crosses the diagnostics boundary.
+    hasher.update(&(chat_id.len() as u64).to_be_bytes());
+    hasher.update(chat_id);
+    hasher.update(&(sender_user_id.len() as u64).to_be_bytes());
+    hasher.update(sender_user_id);
+    hasher.update(&timestamp.to_be_bytes());
+    hasher.update(&[kind]);
+    hasher.update(payload);
+    let mut digest = vec![0; MESSAGE_CONFLICT_FINGERPRINT_LEN];
+    hasher
+        .finalize_variable(&mut digest)
+        .expect("digest output has configured length");
+    digest
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quarantine_message_conflict(
+    tx: &Transaction<'_>,
+    existing_timestamp: i64,
+    existing_kind: i64,
+    existing_payload: &[u8],
+    incoming: &StoredMessage,
+    incoming_msg_id: Option<&[u8]>,
+    incoming_reply_to_msg_id: Option<&[u8]>,
+    arrival: Option<&MessageArrival>,
+) -> Result<(), CoreError> {
+    let existing_kind = u8::try_from(existing_kind)
+        .map_err(|_| CoreError::Store("stored message kind is outside u8 range".into()))?;
+    let existing_fingerprint = message_conflict_fingerprint(
+        &incoming.chat_id,
+        &incoming.sender_user_id,
+        existing_timestamp,
+        existing_kind,
+        existing_payload,
+    );
+    let incoming_fingerprint = message_conflict_fingerprint(
+        &incoming.chat_id,
+        &incoming.sender_user_id,
+        incoming.timestamp,
+        incoming.kind,
+        &incoming.payload,
+    );
+    let observed_at = match arrival {
+        Some(value) => value.received_at,
+        None => current_unix_time_ms()?,
+    };
+    tx.execute(
+        "INSERT INTO message_conflicts
+            (chat_id, sender_user_id, lamport, existing_fingerprint,
+             incoming_fingerprint, incoming_timestamp, incoming_kind,
+             incoming_payload, incoming_msg_id, incoming_reply_to_msg_id,
+             arrival_transport, hops_taken, first_seen_at, last_seen_at, seen_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, 1)
+         ON CONFLICT(chat_id, sender_user_id, lamport, incoming_fingerprint)
+         DO UPDATE SET
+             existing_fingerprint = excluded.existing_fingerprint,
+             last_seen_at = MAX(message_conflicts.last_seen_at, excluded.last_seen_at),
+             seen_count = message_conflicts.seen_count + 1,
+             incoming_msg_id = COALESCE(message_conflicts.incoming_msg_id, excluded.incoming_msg_id),
+             incoming_reply_to_msg_id = COALESCE(message_conflicts.incoming_reply_to_msg_id, excluded.incoming_reply_to_msg_id),
+             arrival_transport = COALESCE(message_conflicts.arrival_transport, excluded.arrival_transport),
+             hops_taken = COALESCE(message_conflicts.hops_taken, excluded.hops_taken)",
+        params![
+            incoming.chat_id,
+            incoming.sender_user_id,
+            incoming.lamport as i64,
+            existing_fingerprint,
+            incoming_fingerprint,
+            incoming.timestamp,
+            incoming.kind as i64,
+            incoming.payload,
+            incoming_msg_id,
+            incoming_reply_to_msg_id,
+            arrival.map(|value| value.transport as i64),
+            arrival.map(|value| value.hops_taken as i64),
+            observed_at,
+        ],
+    )
+    .map_err(store_err)?;
+    tx.execute(
+        "DELETE FROM message_conflicts
+         WHERE id IN (
+             SELECT id FROM message_conflicts
+             -- Envelope-backed chat paths leave a durable msg_id and are the
+             -- branch evidence most likely to explain missing user content.
+             -- Hidden/legacy collisions remain useful, but may not age those
+             -- rows out of the one global bounded quarantine.
+             ORDER BY (incoming_msg_id IS NOT NULL) DESC,
+                      last_seen_at DESC, id DESC
+             LIMIT -1 OFFSET ?1
+         )",
+        params![MESSAGE_CONFLICT_QUARANTINE_LIMIT],
+    )
+    .map_err(store_err)?;
+    Ok(())
 }
 
 /// Internal-only helpers, never exported over UniFFI: not wrapped in
@@ -1455,8 +1752,12 @@ mod incoming_message_reference {
         message: StoredMessage,
         msg_id: Option<Vec<u8>>,
         reply_to_msg_id: Option<Vec<u8>>,
-    ) -> Result<bool, CoreError> {
+        arrival: Option<MessageArrival>,
+    ) -> Result<IncomingMessageInsertOutcome, CoreError> {
         validate_stored_message(&message)?;
+        if let Some(arrival) = arrival.as_ref() {
+            validate_message_arrival(arrival)?;
+        }
         let mut conn = lock_conn(&store.conn);
         let tx = conn.transaction().map_err(store_err)?;
 
@@ -1464,8 +1765,8 @@ mod incoming_message_reference {
             .execute(
                 "INSERT OR IGNORE INTO messages
                     (chat_id, sender_user_id, lamport, timestamp, kind, payload,
-                     msg_id, reply_to_msg_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     msg_id, reply_to_msg_id, arrival_transport, hops_taken, received_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     message.chat_id,
                     message.sender_user_id,
@@ -1475,14 +1776,37 @@ mod incoming_message_reference {
                     message.payload,
                     msg_id,
                     reply_to_msg_id,
+                    arrival.as_ref().map(|value| value.transport as i64),
+                    arrival.as_ref().map(|value| value.hops_taken as i64),
+                    arrival.as_ref().map(|value| value.received_at),
                 ],
             )
             .map_err(store_err)?
             > 0;
 
         if inserted {
+            if let Some(arrival) = arrival.as_ref() {
+                // Preserve the field metric previously written by the shells'
+                // follow-up `record_message_arrival` call. Keeping it in this
+                // transaction also prevents a crash gap between content and
+                // first-arrival diagnostics.
+                let _ = tx.execute(
+                    "INSERT OR IGNORE INTO delivery_metrics
+                        (chat_hash, lamport, direction, sender_hash, at_ms,
+                         arrival_transport, hop_count)
+                     VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6)",
+                    params![
+                        metric_chat_hash(&message.chat_id),
+                        message.lamport as i64,
+                        metric_sender_hash(&message.sender_user_id),
+                        arrival.received_at,
+                        arrival.transport as i64,
+                        arrival.hops_taken as i64,
+                    ],
+                );
+            }
             tx.commit().map_err(store_err)?;
-            return Ok(true);
+            return Ok(IncomingMessageInsertOutcome::Inserted);
         }
 
         // Conflict: a row already exists at this (chat_id, sender_user_id,
@@ -1522,7 +1846,7 @@ mod incoming_message_reference {
             // if the row vanished under us, treat it as nothing to recover.
             None => {
                 tx.commit().map_err(store_err)?;
-                return Ok(false);
+                return Ok(IncomingMessageInsertOutcome::Duplicate);
             }
         };
 
@@ -1544,16 +1868,30 @@ mod incoming_message_reference {
                 .map_err(store_err)?;
             }
             tx.commit().map_err(store_err)?;
-            return Ok(false);
+            return Ok(IncomingMessageInsertOutcome::Duplicate);
         }
 
         // A conflict proves only that two authenticated branches claim the
         // same stream position, not which one is authoritative. Preserve the
         // branch already rendered to the user. In particular, never use the
         // sender's wall clock as a generation signal: causal_order explicitly
-        // bounds its influence because phone clocks can be wrong.
+        // bounds its influence because phone clocks can be wrong. Keep the
+        // incoming branch in a bounded quarantine so diagnostics and a future
+        // authenticated recovery rule have evidence instead of a silent drop.
+        let (existing_timestamp, existing_kind, existing_payload) =
+            existing.expect("conflicting row was selected above");
+        quarantine_message_conflict(
+            &tx,
+            existing_timestamp,
+            existing_kind,
+            &existing_payload,
+            &message,
+            msg_id.as_deref(),
+            reply_to_msg_id.as_deref(),
+            arrival.as_ref(),
+        )?;
         tx.commit().map_err(store_err)?;
-        Ok(false)
+        Ok(IncomingMessageInsertOutcome::QuarantinedConflict)
     }
 }
 
@@ -1925,8 +2263,9 @@ impl MessageStore {
         .map_err(store_err)
     }
 
-    /// Chat and sender of a stored message keyed by its stable envelope
-    /// `msg_id` alone, searched across every chat -- unlike
+    /// Chat and sender of a durably consumed message keyed by its stable
+    /// envelope `msg_id` alone, searched across accepted messages and the
+    /// bounded conflict quarantine -- unlike
     /// [`Self::message_by_msg_id`], which needs `chat_id` up front and is
     /// useless here because a relay-fetched envelope only carries its own
     /// `msg_id`.
@@ -1934,16 +2273,13 @@ impl MessageStore {
     /// This backs the consumed-SEEN relay ack rule in `engine.rs`
     /// (`MessageStore::core_relay_ack_ids_with_consumed`): a relay-fetched
     /// copy that dedupes as `Seen` (already handled via some other path) is
-    /// only safe to ack if THIS device actually consumed it as a real
-    /// message, not merely muled it. A row only exists here for kinds that
-    /// persist a durable `msg_id` -- 1:1/group text, attachment manifests,
-    /// reactions (inserted via `insert_incoming_message`) and our own
-    /// authored messages (via `insert_outgoing_message`/
-    /// `insert_outgoing_reply`). Hidden kinds -- receipts, profile sync,
-    /// friend requests/directory, group invites, LAN endpoint hints -- are
-    /// stored, if at all, via the plain `insert_message` with `msg_id =
-    /// NULL`, so they never match and the caller correctly treats "no
-    /// match" as "cannot vouch for this copy, don't ack."
+    /// only safe to ack if THIS device actually consumed and durably retained
+    /// it as a real message, not merely muled it. An accepted message row or a
+    /// quarantined alternative can provide that evidence for kinds carrying a
+    /// durable `msg_id` -- 1:1/group text, attachment manifests, reactions,
+    /// and group metadata updates. Hidden kinds -- receipts, profile sync,
+    /// friend requests/directory, group invites, LAN endpoint hints -- use the
+    /// plain `insert_message` path with no id and therefore never match here.
     ///
     /// Returns `None` for an unknown `msg_id` (never stored, or hidden-kind
     /// with no durable id). The store deliberately returns the raw
@@ -1958,8 +2294,16 @@ impl MessageStore {
     ) -> Result<Option<MessageOrigin>, CoreError> {
         let conn = lock_conn(&self.conn);
         conn.query_row(
-            "SELECT chat_id, sender_user_id FROM messages
-             WHERE msg_id = ?1 ORDER BY id ASC LIMIT 1",
+            "SELECT chat_id, sender_user_id
+             FROM (
+                 SELECT chat_id, sender_user_id, id, 0 AS source
+                 FROM messages WHERE msg_id = ?1
+                 UNION ALL
+                 SELECT chat_id, sender_user_id, id, 1 AS source
+                 FROM message_conflicts WHERE incoming_msg_id = ?1
+             )
+             ORDER BY source ASC, id ASC
+             LIMIT 1",
             params![msg_id],
             |row| {
                 Ok(MessageOrigin {
@@ -1982,12 +2326,7 @@ impl MessageStore {
         lamport: u64,
         arrival: MessageArrival,
     ) -> Result<bool, CoreError> {
-        // 0/1 = BLE direct/muled, 2 = relay, 3/4 = LAN direct/muled.
-        if arrival.transport > 4 {
-            return Err(CoreError::Malformed(
-                "invalid message arrival transport".to_string(),
-            ));
-        }
+        validate_message_arrival(&arrival)?;
         let conn = lock_conn(&self.conn);
         let changed = conn
             .execute(
@@ -3592,6 +3931,11 @@ impl MessageStore {
         tx.execute("DELETE FROM messages WHERE chat_id = ?1", params![user_id])
             .map_err(store_err)?;
         tx.execute(
+            "DELETE FROM message_conflicts WHERE chat_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
             "DELETE FROM consumed_hidden_lamports WHERE chat_id = ?1",
             params![user_id],
         )
@@ -4343,6 +4687,11 @@ impl MessageStore {
             .map_err(store_err)?;
         tx.execute(
             "DELETE FROM messages WHERE chat_id = ?1",
+            params![&group_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM message_conflicts WHERE chat_id = ?1",
             params![&group_id],
         )
         .map_err(store_err)?;
@@ -6008,6 +6357,31 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat_lamport ON messages(chat_id, lamport);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp_id ON messages(chat_id, timestamp, id);
 
+-- Conflicting authenticated branches cannot be resolved safely without a
+-- wire-level stream generation. Keep the visible branch in `messages` and
+-- retain each distinct incoming branch here for bounded recovery/diagnostics.
+CREATE TABLE IF NOT EXISTS message_conflicts (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id                  BLOB NOT NULL,
+    sender_user_id           BLOB NOT NULL,
+    lamport                  INTEGER NOT NULL,
+    existing_fingerprint     BLOB NOT NULL,
+    incoming_fingerprint     BLOB NOT NULL,
+    incoming_timestamp       INTEGER NOT NULL,
+    incoming_kind            INTEGER NOT NULL,
+    incoming_payload         BLOB NOT NULL,
+    incoming_msg_id          BLOB,
+    incoming_reply_to_msg_id BLOB,
+    arrival_transport        INTEGER,
+    hops_taken               INTEGER,
+    first_seen_at            INTEGER NOT NULL,
+    last_seen_at             INTEGER NOT NULL,
+    seen_count               INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(chat_id, sender_user_id, lamport, incoming_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_message_conflicts_recent
+    ON message_conflicts(last_seen_at DESC, id DESC);
+
 -- The highest lamport this device has ever authored into a chat, kept
 -- separately from `messages` so it SURVIVES delete_contact. Deleting a
 -- contact clears our copy of a chat, but the peer keeps theirs; if our
@@ -7497,6 +7871,239 @@ mod tests {
             697,
             "ignoring stale evidence must preserve the receipt derived from the retained branch"
         );
+    }
+
+    #[test]
+    fn arrival_aware_insert_atomically_records_first_route_and_classifies_replay() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let message = msg(b"chat", b"sender", 9, "aboard");
+        let first_arrival = MessageArrival {
+            transport: 4,
+            hops_taken: 3,
+            received_at: 1_700_000_000_123,
+        };
+        assert_eq!(
+            store
+                .insert_incoming_message_with_arrival(
+                    message.clone(),
+                    vec![0x11; MESSAGE_ID_LEN],
+                    None,
+                    first_arrival.clone(),
+                )
+                .unwrap(),
+            IncomingMessageInsertOutcome::Inserted
+        );
+        assert_eq!(
+            store
+                .message_arrival(b"chat".to_vec(), b"sender".to_vec(), 9)
+                .unwrap(),
+            Some(first_arrival.clone())
+        );
+        let csv = store.export_delivery_metrics_csv().unwrap();
+        assert_eq!(csv.lines().count(), 2);
+        assert!(csv.contains(",1700000000123,,,,4,3"));
+
+        assert_eq!(
+            store
+                .insert_incoming_message_with_arrival(
+                    message,
+                    vec![0x22; MESSAGE_ID_LEN],
+                    None,
+                    MessageArrival {
+                        transport: 0,
+                        hops_taken: 1,
+                        received_at: first_arrival.received_at + 1_000,
+                    },
+                )
+                .unwrap(),
+            IncomingMessageInsertOutcome::Duplicate
+        );
+        assert_eq!(
+            store
+                .message_arrival(b"chat".to_vec(), b"sender".to_vec(), 9)
+                .unwrap(),
+            Some(first_arrival),
+            "a replay must not replace first-arrival evidence"
+        );
+        assert_eq!(
+            store.export_delivery_metrics_csv().unwrap().lines().count(),
+            2
+        );
+    }
+
+    #[test]
+    fn stream_conflict_is_quarantined_with_redacted_source_diagnostics() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut current = msg(b"katie", b"david", 694, "current-visible");
+        current.timestamp = 10_000;
+        assert!(store.insert_message(current).unwrap());
+
+        let mut stale = msg(b"katie", b"david", 694, "stale-restored");
+        stale.timestamp = 5_000;
+        let arrival = MessageArrival {
+            transport: 1,
+            hops_taken: 2,
+            received_at: 50_000,
+        };
+        assert_eq!(
+            store
+                .insert_incoming_message_with_arrival(
+                    stale.clone(),
+                    vec![0xAB; MESSAGE_ID_LEN],
+                    None,
+                    arrival.clone(),
+                )
+                .unwrap(),
+            IncomingMessageInsertOutcome::QuarantinedConflict
+        );
+        // The same conflicting branch is one quarantine row with a replay
+        // count, not an attacker-controlled unbounded append.
+        assert_eq!(
+            store
+                .insert_incoming_message_with_arrival(
+                    stale,
+                    vec![0xCD; MESSAGE_ID_LEN],
+                    None,
+                    MessageArrival {
+                        received_at: 60_000,
+                        ..arrival
+                    },
+                )
+                .unwrap(),
+            IncomingMessageInsertOutcome::QuarantinedConflict
+        );
+
+        let conflicts = store.message_conflict_summaries(10).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        let conflict = &conflicts[0];
+        assert_eq!(conflict.lamport, 694);
+        assert_eq!(conflict.arrival_transport, Some(1));
+        assert_eq!(conflict.first_seen_at_ms, 50_000);
+        assert_eq!(conflict.last_seen_at_ms, 60_000);
+        assert_eq!(conflict.seen_count, 2);
+        assert_eq!(conflict.chat_hash.len(), METRIC_CHAT_HASH_LEN * 2);
+        assert_eq!(conflict.sender_hash.len(), METRIC_CHAT_HASH_LEN * 2);
+        assert_eq!(
+            conflict.existing_fingerprint.len(),
+            MESSAGE_CONFLICT_FINGERPRINT_LEN * 2
+        );
+
+        let conn = lock_conn(&store.conn);
+        let quarantined_payload: Vec<u8> = conn
+            .query_row(
+                "SELECT incoming_payload FROM message_conflicts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined_payload, b"stale-restored");
+        drop(conn);
+        assert_eq!(
+            store.messages_for_chat(b"katie".to_vec()).unwrap()[0].payload,
+            b"current-visible"
+        );
+
+        let csv = store.export_message_conflicts_csv().unwrap();
+        assert_eq!(csv.lines().count(), 2);
+        assert!(csv.contains(&conflict.chat_hash));
+        assert!(csv.contains(&conflict.sender_hash));
+        assert!(csv.contains(",694,"));
+        assert!(csv.contains(",1,50000,60000,2"));
+        assert!(!csv.contains("katie"));
+        assert!(!csv.contains("david"));
+        assert!(!csv.contains("current-visible"));
+        assert!(!csv.contains("stale-restored"));
+        assert!(store.has_message_conflicts().unwrap());
+        store.clear_message_conflicts().unwrap();
+        assert!(!store.has_message_conflicts().unwrap());
+        assert_eq!(
+            store
+                .export_message_conflicts_csv()
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            store.messages_for_chat(b"katie".to_vec()).unwrap()[0].payload,
+            b"current-visible",
+            "clearing diagnostics must not touch the accepted visible branch"
+        );
+    }
+
+    #[test]
+    fn stream_conflict_quarantine_is_globally_bounded() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(store
+            .insert_message(msg(b"chat", b"sender", 1, "current"))
+            .unwrap());
+        for index in 0..(MESSAGE_CONFLICT_QUARANTINE_LIMIT + 5) {
+            let mut conflict = msg(
+                b"chat",
+                b"sender",
+                1,
+                &format!("conflicting-branch-{index}"),
+            );
+            conflict.timestamp += index;
+            assert!(!store.insert_message(conflict).unwrap());
+        }
+        assert_eq!(
+            store.message_conflict_summaries(1_000).unwrap().len(),
+            MESSAGE_CONFLICT_QUARANTINE_LIMIT as usize
+        );
+    }
+
+    #[test]
+    fn hidden_conflicts_cannot_evict_envelope_backed_chat_conflicts() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(store
+            .insert_message(msg(b"chat", b"sender", 1, "current"))
+            .unwrap());
+
+        for index in 0..MESSAGE_CONFLICT_QUARANTINE_LIMIT {
+            let mut conflict = msg(
+                b"chat",
+                b"sender",
+                1,
+                &format!("chat-conflicting-branch-{index}"),
+            );
+            conflict.timestamp += index;
+            assert_eq!(
+                store
+                    .insert_incoming_message_classified(
+                        conflict,
+                        vec![index as u8; MESSAGE_ID_LEN],
+                        None,
+                    )
+                    .unwrap(),
+                IncomingMessageInsertOutcome::QuarantinedConflict
+            );
+        }
+
+        // These plain inserts model hidden/legacy paths with no durable
+        // envelope id. The quarantine remains globally capped, but none may
+        // displace the chat-path recovery evidence already retained.
+        for index in 0..5 {
+            let mut hidden = msg(
+                b"chat",
+                b"sender",
+                1,
+                &format!("hidden-conflicting-branch-{index}"),
+            );
+            hidden.timestamp += 10_000 + index;
+            assert!(!store.insert_message(hidden).unwrap());
+        }
+
+        let conn = lock_conn(&store.conn);
+        let (total, envelope_backed): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(incoming_msg_id) FROM message_conflicts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(total, MESSAGE_CONFLICT_QUARANTINE_LIMIT);
+        assert_eq!(envelope_backed, MESSAGE_CONFLICT_QUARANTINE_LIMIT);
     }
 
     #[test]
@@ -10051,7 +10658,10 @@ mod tests {
             let path = dir.join(format!("snapshot-{index}.sqlite"));
             let store = MessageStore::open(":memory:".to_string()).unwrap();
             let history = msg(b"alice-id", b"me", 8, "history");
-            store.insert_message(history).unwrap();
+            store.insert_message(history.clone()).unwrap();
+            let mut conflict = history;
+            conflict.payload = b"conflicting restored history".to_vec();
+            assert!(!store.insert_message(conflict).unwrap());
             {
                 let conn = lock_conn(&store.conn);
                 conn.execute(
@@ -10089,6 +10699,7 @@ mod tests {
                 include_history
             );
             assert_eq!(restored.carried_len().unwrap() == 1, include_courier);
+            assert_eq!(restored.has_message_conflicts().unwrap(), include_history);
             let authored_high: i64 = lock_conn(&restored.conn)
                 .query_row(
                     "SELECT high_lamport FROM authored_lamport_watermarks
