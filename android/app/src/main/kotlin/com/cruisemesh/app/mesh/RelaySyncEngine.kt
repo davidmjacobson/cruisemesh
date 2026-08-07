@@ -35,6 +35,9 @@ import uniffi.cruisemesh_core.recentPresenceHintsFor
 import uniffi.cruisemesh_core.relayCursorKey
 import uniffi.cruisemesh_core.relayFetchBatchLimit
 import uniffi.cruisemesh_core.relayFetchWalkContinues
+import uniffi.cruisemesh_core.RelayMailboxWalkAction
+import uniffi.cruisemesh_core.relayMailboxContinuationDelayMs
+import uniffi.cruisemesh_core.relayMailboxWalkAction
 import uniffi.cruisemesh_core.relayPassStartCursor
 import uniffi.cruisemesh_core.relaySweepDue
 import uniffi.cruisemesh_core.ContactRelayRejection
@@ -887,14 +890,15 @@ internal class RelaySyncEngine(
      * whose processing threw must be re-presented next pass, so nothing may
      * be persisted past it.
      *
-     * A pass is also bounded by [relayMailboxWalkAction]. This matters when a
-     * legacy/current backup restores without `relay_fetch_cursors`: starting
-     * at zero is correct, but must not synchronously drain an arbitrarily deep
-     * mailbox. Safe pages advance the durable frontier, then the walk yields
-     * and schedules a delayed continuation from that point.
+     * A pass is also bounded by [relayMailboxWalkAction], whose budget lives
+     * in the core so iOS bounds its walk with the same numbers. This matters
+     * when a legacy/current backup restores without `relay_fetch_cursors`:
+     * starting at zero is correct, but must not synchronously drain an
+     * arbitrarily deep mailbox. Safe pages advance the durable cursors, then
+     * the walk yields and schedules a delayed continuation from that point.
      *
-     * Occasionally the pass sweeps instead -- walks the whole mailbox from 0,
-     * exactly as before -- so those deliberately-unacked rows stay
+     * Occasionally the pass sweeps instead -- walks the whole mailbox rather
+     * than only what is new -- so those deliberately-unacked rows stay
      * re-discoverable for the phones that depend on this one re-offering
      * them over Bluetooth, and so a relay rebuilt with its row ids restarted
      * at 1 heals itself. [relaySweepDue] owns when, from the *persisted*
@@ -903,6 +907,18 @@ internal class RelaySyncEngine(
      * every process start -- this service is killed and restarted all day, a
      * sweep re-downloads the sealed body of every row still in the mailbox,
      * and tying that to the restart rate made the interval meaningless.
+     *
+     * A sweep also carries its own resume cursor
+     * ([RelayFetchCursor.sweepAfterId], advanced through
+     * [MessageStore.advanceRelaySweepCursor] under the frontier's rule) and
+     * resumes from it rather than restarting at 0. It has to: the budget above
+     * hands a deep mailbox back after four pages, and a sweep is only recorded
+     * complete on the empty page at the end of it. Restarting at 0 on every
+     * continuation meant any mailbox holding more than one budget's worth of
+     * hint-matching rows re-downloaded the same first pages every second or
+     * so, indefinitely, and never finished a sweep at all. The frontier cannot
+     * stand in for that cursor -- it never moves backwards, so on a
+     * long-established mailbox it says nothing about where the sweep is.
      *
      * TODO(relay-proxy-polling follow-up): [MessageStore.relayProxyHints]
      * fetches every contact's hints on every pass, so its cost scales with
@@ -920,13 +936,18 @@ internal class RelaySyncEngine(
         if (fetchHints.isEmpty()) return false
         val cursorKey = relayCursorKey(config.relayUrl, config.relayToken)
         val cursor = store.relayFetchCursor(cursorKey)
-        val sweeping = relaySweepDue(sweptThisSession.contains(cursorKey), cursor.lastSweepAtMs, now)
-        var after = relayPassStartCursor(sweeping, cursor.afterId)
-        // Once any page fails to fully process, the frontier stops moving for
+        val sweeping = relaySweepDue(
+            sweptThisSession.contains(cursorKey),
+            cursor.lastSweepAtMs,
+            cursor.sweepAfterId,
+            now,
+        )
+        var after = relayPassStartCursor(sweeping, cursor.afterId, cursor.sweepAfterId)
+        // Once any page fails to fully process, both cursors stop moving for
         // the rest of this pass -- persisting a later page's cursor would
         // skip the failed one forever. The walk itself continues, so one bad
         // envelope never blocks the mail behind it.
-        var frontierAdvancing = true
+        var cursorsAdvancing = true
         // Not a val: a page this client cannot take halves the ask and retries
         // the same cursor, and the reduced limit is kept for the rest of this
         // mailbox's walk rather than reset per page -- a mailbox that produced
@@ -946,8 +967,8 @@ internal class RelaySyncEngine(
         // this device's internet works, so it must mean "this mailbox
         // answered", not "the walk was attempted".
         var answered = false
-        var pagesFetched = 0
-        var envelopesFetched = 0
+        var pagesFetched = 0u
+        var envelopesFetched = 0u
         while (isRunning() && hasValidatedInternet()) {
             val fetched = relayRequest {
                 RelayClient.fetchEnvelopesWithinResponseCap(
@@ -975,8 +996,8 @@ internal class RelaySyncEngine(
                 if (sweeping) noteSweepCompleted(cursorKey, now)
                 return true
             }
-            pagesFetched += 1
-            envelopesFetched += page.envelopes.size
+            pagesFetched += 1u
+            envelopesFetched += page.envelopes.size.toUInt()
             var pageFullyProcessed = true
             val dispositions = ArrayList<CoreRelayEnvelopeDisposition>(page.envelopes.size)
             for (envelope in page.envelopes) {
@@ -1039,9 +1060,15 @@ internal class RelaySyncEngine(
                     Log.w(TAG, "Failed to ack relay envelope(s) on ${config.relayUrl}: ${e.message}")
                 }
             }
-            if (!pageFullyProcessed) frontierAdvancing = false
-            if (frontierAdvancing) {
+            if (!pageFullyProcessed) cursorsAdvancing = false
+            if (cursorsAdvancing) {
                 store.advanceRelayFetchCursor(cursorKey, page.nextCursor, true)
+                // Only while sweeping. An ordinary pass writing its page
+                // cursors here would leave behind sweep progress claiming
+                // coverage of rows no sweep looked at -- and a non-zero
+                // progress is also what tells the next pass a sweep is under
+                // way.
+                if (sweeping) store.advanceRelaySweepCursor(cursorKey, page.nextCursor, true)
             }
             // End the walk on an EMPTY page, never on a short one: a server
             // is free to clamp `limit=` below our ask, and reading a short
@@ -1062,7 +1089,8 @@ internal class RelaySyncEngine(
                 Log.i(
                     TAG,
                     "Relay ${config.relayUrl} mailbox walk yielding after " +
-                        "$pagesFetched page(s)/$envelopesFetched envelope(s); continuation scheduled",
+                        "$pagesFetched page(s)/$envelopesFetched envelope(s) at after=$after; " +
+                        "continuation scheduled",
                 )
                 // Start the delay only after the entire multi-mailbox pass
                 // finishes. Scheduling here could let the timer fire while a
@@ -1078,20 +1106,30 @@ internal class RelaySyncEngine(
     /**
      * Mailboxes this process has already walked in full.
      *
-     * Deliberately in-memory, and deliberately *narrow*: [relaySweepDue] now
+     * Deliberately in-memory, and deliberately *narrow*: [relaySweepDue]
      * schedules from the persisted timestamp, and consults this only for a
      * mailbox that has never recorded a completed sweep. There it stops a
      * store write that keeps failing from turning every pass into a full
      * walk. A cold start on a mailbox with a recent sweep no longer re-walks
      * anything.
+     *
+     * Its meaning is unchanged by the sweep resume cursor, and the two do not
+     * overlap. This bounds the cost of a store that cannot be written to --
+     * where nothing is persisted, so `sweepAfterId` reads 0 and cannot keep a
+     * sweep due. Persisted progress bounds the cost of a mailbox too deep to
+     * walk in one pass, which is a store working exactly as intended. One
+     * failing write still costs one walk per process; it does not cost one
+     * per pass, and it never did once this set was consulted.
      */
     private val sweptThisSession: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     /**
-     * Records that a walk from 0 reached the end of this mailbox. Only called
-     * on natural termination -- a sweep cut short by the service stopping,
-     * the network going away, or a relay error leaves the timestamp alone so
-     * the next pass tries again rather than believing a partial re-walk.
+     * Records that a walk reached the end of this mailbox: restarts the sweep
+     * interval and clears the sweep's resume cursor. Only called on natural
+     * termination -- a sweep cut short by the service stopping, the network
+     * going away, a relay error, or simply running out of its per-pass budget
+     * leaves the timestamp alone, so the next pass finishes the sweep from
+     * where this one stopped rather than believing a partial re-walk.
      */
     private fun noteSweepCompleted(cursorKey: String, now: Long) {
         sweptThisSession.add(cursorKey)
@@ -1295,7 +1333,7 @@ internal class RelaySyncEngine(
 
     private fun scheduleMailboxContinuation() {
         handler.removeCallbacks(mailboxContinuationRunnable)
-        handler.postDelayed(mailboxContinuationRunnable, RELAY_MAILBOX_CONTINUATION_DELAY_MS)
+        handler.postDelayed(mailboxContinuationRunnable, relayMailboxContinuationDelayMs())
     }
 
     /**

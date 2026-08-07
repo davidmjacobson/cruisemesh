@@ -2188,6 +2188,28 @@ public protocol MessageStoreProtocol : AnyObject {
     func advanceRelayFetchCursor(configKey: String, pageNextCursor: Int64, pageFullyProcessed: Bool) throws  -> Int64
 
     /**
+     * Persist how far the sweep now under way has walked, and return what is
+     * now remembered.
+     *
+     * The frontier's twin, and deliberately a separate column rather than a
+     * second use of `after_id`: [`crate::relay_cursor_advance`] never lets the
+     * frontier move backwards, so on a mailbox already walked to the top the
+     * frontier cannot say where a sweep has got to. Without a cursor of its
+     * own a sweep restarted at 0 on every yield and, on any mailbox holding
+     * more rows than one bounded pass can take, never reached the empty page
+     * that completes it — a permanent re-download loop.
+     *
+     * It obeys the same rule the frontier does, decided by the same function:
+     * it moves only for a page that reached a terminal disposition for every
+     * envelope *and* landed its acks, and it never moves backwards. Call it
+     * only while actually sweeping — an ordinary pass writing its page
+     * cursors here would leave behind progress claiming coverage of rows the
+     * sweep never looked at, and `sweep_after_id` is also what
+     * [`crate::relay_sweep_due`] reads as "a sweep is under way".
+     */
+    func advanceRelaySweepCursor(configKey: String, pageNextCursor: Int64, pageFullyProcessed: Bool) throws  -> Int64
+
+    /**
      * T23: apply a contact's relay-change notice to their stored endpoint.
      *
      * Three rules, all enforced here rather than in either shell, because
@@ -3336,7 +3358,17 @@ public protocol MessageStoreProtocol : AnyObject {
      * self-correcting — everything already delivered is deduped on the way
      * back in by the seen-id gossip filter.
      *
-     * It resets `after_id` and nothing else. Deleting the rows outright would
+     * It resets `sweep_after_id` alongside `after_id`, and for the same
+     * reason. A sweep part-way up the mailbox has covered the rows below its
+     * resume cursor *against the old hint set*; the rows a widened hint set
+     * makes visible are exactly the ones that were invisible on the way past.
+     * Resuming from that cursor would carry the gap forward into the
+     * completed sweep and then close the schedule behind it. Zeroing progress
+     * is safe here precisely because it does not force a sweep — 0 reads as
+     * "no sweep under way" in [`crate::relay_sweep_due`], and the frontier
+     * reset above is what actually re-walks the mailbox.
+     *
+     * It resets those two columns and nothing else. Deleting the rows outright would
      * take `last_sweep_at` with it, and that timestamp is the *only* record of
      * when each mailbox was last walked end to end. Losing it has two bad
      * consequences and no good one: every mailbox reads as never-swept and so
@@ -3374,12 +3406,16 @@ public protocol MessageStoreProtocol : AnyObject {
 
     /**
      * Record that a walk from 0 completed for this mailbox, restarting its
-     * sweep interval.
+     * sweep interval and clearing the sweep's resume cursor.
      *
      * Called only when the walk actually reached the end of the mailbox. A
      * sweep cut short — the service stopped, internet went away, the relay
-     * errored — deliberately leaves the timestamp alone, so the next pass
-     * tries again instead of believing a partial re-walk was a full one.
+     * errored, or the walk simply ran out of its per-pass budget —
+     * deliberately leaves the timestamp alone, so the next pass finishes the
+     * sweep instead of believing a partial re-walk was a full one. The
+     * resume cursor is what lets "the next pass finishes it" be true rather
+     * than aspirational, and clearing it here is the single act that turns a
+     * sweep from in-progress back into scheduled.
      */
     func noteRelaySweepCompleted(configKey: String, nowMs: Int64) throws
 
@@ -3903,6 +3939,36 @@ public static func `open`(path: String)throws  -> MessageStore {
 open func advanceRelayFetchCursor(configKey: String, pageNextCursor: Int64, pageFullyProcessed: Bool)throws  -> Int64 {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_advance_relay_fetch_cursor(self.uniffiClonePointer(),
+        FfiConverterString.lower(configKey),
+        FfiConverterInt64.lower(pageNextCursor),
+        FfiConverterBool.lower(pageFullyProcessed),$0
+    )
+})
+}
+
+    /**
+     * Persist how far the sweep now under way has walked, and return what is
+     * now remembered.
+     *
+     * The frontier's twin, and deliberately a separate column rather than a
+     * second use of `after_id`: [`crate::relay_cursor_advance`] never lets the
+     * frontier move backwards, so on a mailbox already walked to the top the
+     * frontier cannot say where a sweep has got to. Without a cursor of its
+     * own a sweep restarted at 0 on every yield and, on any mailbox holding
+     * more rows than one bounded pass can take, never reached the empty page
+     * that completes it — a permanent re-download loop.
+     *
+     * It obeys the same rule the frontier does, decided by the same function:
+     * it moves only for a page that reached a terminal disposition for every
+     * envelope *and* landed its acks, and it never moves backwards. Call it
+     * only while actually sweeping — an ordinary pass writing its page
+     * cursors here would leave behind progress claiming coverage of rows the
+     * sweep never looked at, and `sweep_after_id` is also what
+     * [`crate::relay_sweep_due`] reads as "a sweep is under way".
+     */
+open func advanceRelaySweepCursor(configKey: String, pageNextCursor: Int64, pageFullyProcessed: Bool)throws  -> Int64 {
+    return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_advance_relay_sweep_cursor(self.uniffiClonePointer(),
         FfiConverterString.lower(configKey),
         FfiConverterInt64.lower(pageNextCursor),
         FfiConverterBool.lower(pageFullyProcessed),$0
@@ -5700,7 +5766,17 @@ open func noteContactRelayUnreachable(userId: Data, endpointKey: String, nowMs: 
      * self-correcting — everything already delivered is deduped on the way
      * back in by the seen-id gossip filter.
      *
-     * It resets `after_id` and nothing else. Deleting the rows outright would
+     * It resets `sweep_after_id` alongside `after_id`, and for the same
+     * reason. A sweep part-way up the mailbox has covered the rows below its
+     * resume cursor *against the old hint set*; the rows a widened hint set
+     * makes visible are exactly the ones that were invisible on the way past.
+     * Resuming from that cursor would carry the gap forward into the
+     * completed sweep and then close the schedule behind it. Zeroing progress
+     * is safe here precisely because it does not force a sweep — 0 reads as
+     * "no sweep under way" in [`crate::relay_sweep_due`], and the frontier
+     * reset above is what actually re-walks the mailbox.
+     *
+     * It resets those two columns and nothing else. Deleting the rows outright would
      * take `last_sweep_at` with it, and that timestamp is the *only* record of
      * when each mailbox was last walked end to end. Losing it has two bad
      * consequences and no good one: every mailbox reads as never-swept and so
@@ -5744,12 +5820,16 @@ open func noteRelayHintSources(ownUserId: Data)throws  -> Bool {
 
     /**
      * Record that a walk from 0 completed for this mailbox, restarting its
-     * sweep interval.
+     * sweep interval and clearing the sweep's resume cursor.
      *
      * Called only when the walk actually reached the end of the mailbox. A
      * sweep cut short — the service stopped, internet went away, the relay
-     * errored — deliberately leaves the timestamp alone, so the next pass
-     * tries again instead of believing a partial re-walk was a full one.
+     * errored, or the walk simply ran out of its per-pass budget —
+     * deliberately leaves the timestamp alone, so the next pass finishes the
+     * sweep instead of believing a partial re-walk was a full one. The
+     * resume cursor is what lets "the next pass finishes it" be true rather
+     * than aspirational, and clearing it here is the single act that turns a
+     * sweep from in-progress back into scheduled.
      */
 open func noteRelaySweepCompleted(configKey: String, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_note_relay_sweep_completed(self.uniffiClonePointer(),
@@ -13068,14 +13148,14 @@ public func FfiConverterTypeRelayEndpoint_lower(_ value: RelayEndpoint) -> RustB
 
 
 /**
- * How far a relay mailbox has been walked, and when it was last walked in
- * full. See [`crate::relay_cursor`] for what the two numbers mean and the
- * rules that move them.
+ * How far a relay mailbox has been walked, how far the sweep now under way
+ * has got, and when it was last walked in full. See [`crate::relay_cursor`]
+ * for what the three numbers mean and the rules that move them.
  *
- * An unknown mailbox reads as `{ after_id: 0, last_sweep_at_ms: 0 }` — walk
- * everything, and a sweep is due. That is the correct answer for a first
- * run, for a rotated credential, and for a restored backup alike, so no
- * caller needs to special-case any of them.
+ * An unknown mailbox reads as all zeroes — walk everything, no sweep under
+ * way, and a sweep is due. That is the correct answer for a first run, for a
+ * rotated credential, and for a restored backup alike, so no caller needs to
+ * special-case any of them.
  */
 public struct RelayFetchCursor {
     /**
@@ -13087,6 +13167,22 @@ public struct RelayFetchCursor {
      * When a walk from 0 last completed for this mailbox, or 0 if never.
      */
     public var lastSweepAtMs: Int64
+    /**
+     * How far the sweep currently in progress has walked, or 0 when no sweep
+     * is part-way through.
+     *
+     * A sweep is bounded ([`crate::relay_mailbox_walk_action`]) and so
+     * usually spans several passes; this is the only thing that lets it
+     * resume rather than restart. It cannot be folded into `after_id`: the
+     * frontier never moves backwards, so on a mailbox already walked to the
+     * top it says nothing about where the sweep is.
+     *
+     * Non-zero also *means* a sweep is under way — [`crate::relay_sweep_due`]
+     * reads it that way — so it is cleared exactly when a sweep stops being
+     * under way: on the empty page that completes it, and on a hint-set
+     * change that invalidates the coverage it claims.
+     */
+    public var sweepAfterId: Int64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -13097,9 +13193,25 @@ public struct RelayFetchCursor {
          */afterId: Int64,
         /**
          * When a walk from 0 last completed for this mailbox, or 0 if never.
-         */lastSweepAtMs: Int64) {
+         */lastSweepAtMs: Int64,
+        /**
+         * How far the sweep currently in progress has walked, or 0 when no sweep
+         * is part-way through.
+         *
+         * A sweep is bounded ([`crate::relay_mailbox_walk_action`]) and so
+         * usually spans several passes; this is the only thing that lets it
+         * resume rather than restart. It cannot be folded into `after_id`: the
+         * frontier never moves backwards, so on a mailbox already walked to the
+         * top it says nothing about where the sweep is.
+         *
+         * Non-zero also *means* a sweep is under way — [`crate::relay_sweep_due`]
+         * reads it that way — so it is cleared exactly when a sweep stops being
+         * under way: on the empty page that completes it, and on a hint-set
+         * change that invalidates the coverage it claims.
+         */sweepAfterId: Int64) {
         self.afterId = afterId
         self.lastSweepAtMs = lastSweepAtMs
+        self.sweepAfterId = sweepAfterId
     }
 }
 
@@ -13113,12 +13225,16 @@ extension RelayFetchCursor: Equatable, Hashable {
         if lhs.lastSweepAtMs != rhs.lastSweepAtMs {
             return false
         }
+        if lhs.sweepAfterId != rhs.sweepAfterId {
+            return false
+        }
         return true
     }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(afterId)
         hasher.combine(lastSweepAtMs)
+        hasher.combine(sweepAfterId)
     }
 }
 
@@ -13131,13 +13247,15 @@ public struct FfiConverterTypeRelayFetchCursor: FfiConverterRustBuffer {
         return
             try RelayFetchCursor(
                 afterId: FfiConverterInt64.read(from: &buf),
-                lastSweepAtMs: FfiConverterInt64.read(from: &buf)
+                lastSweepAtMs: FfiConverterInt64.read(from: &buf),
+                sweepAfterId: FfiConverterInt64.read(from: &buf)
         )
     }
 
     public static func write(_ value: RelayFetchCursor, into buf: inout [UInt8]) {
         FfiConverterInt64.write(value.afterId, into: &buf)
         FfiConverterInt64.write(value.lastSweepAtMs, into: &buf)
+        FfiConverterInt64.write(value.sweepAfterId, into: &buf)
     }
 }
 
@@ -15614,6 +15732,90 @@ public func FfiConverterTypePeerConnectionTransport_lower(_ value: PeerConnectio
 
 
 extension PeerConnectionTransport: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What a walk should do once the current page is fully accounted for.
+ */
+
+public enum RelayMailboxWalkAction {
+
+    /**
+     * Under budget: fetch the next page in this same pass.
+     *
+     * Deliberately not named `Continue`: that is a keyword in one of the two
+     * languages this enum is generated into, and an escaped case name is a
+     * worse thing to read than a slightly longer one.
+     */
+    case continueWalk
+    /**
+     * Out of budget: stop this mailbox's walk, persist what has been
+     * processed, and schedule a continuation in
+     * [`RELAY_MAILBOX_CONTINUATION_DELAY_MS`].
+     *
+     * The continuation is a whole new sync pass, which is why the resume
+     * point has to be *persisted* rather than held in a local: a sweep that
+     * yields here and restarts at 0 next pass is the livelock this module's
+     * second section describes.
+     */
+    case yieldAndScheduleContinuation
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRelayMailboxWalkAction: FfiConverterRustBuffer {
+    typealias SwiftType = RelayMailboxWalkAction
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayMailboxWalkAction {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .continueWalk
+
+        case 2: return .yieldAndScheduleContinuation
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RelayMailboxWalkAction, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .continueWalk:
+            writeInt(&buf, Int32(1))
+
+
+        case .yieldAndScheduleContinuation:
+            writeInt(&buf, Int32(2))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayMailboxWalkAction_lift(_ buf: RustBuffer) throws -> RelayMailboxWalkAction {
+    return try FfiConverterTypeRelayMailboxWalkAction.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayMailboxWalkAction_lower(_ value: RelayMailboxWalkAction) -> RustBuffer {
+    return FfiConverterTypeRelayMailboxWalkAction.lower(value)
+}
+
+
+
+extension RelayMailboxWalkAction: Equatable, Hashable {}
 
 
 
@@ -19132,6 +19334,15 @@ public func relayContactSharesOwnFamily(contactRelayUrl: String?, contactRelayTo
  * the maximum means a sweep re-reads the mailbox without ever costing the
  * frontier its position, so an interrupted sweep cannot turn into a
  * re-walk-everything-next-pass loop.
+ *
+ * The same function decides the sweep's own `sweep_after_id`
+ * (`MessageStore::advance_relay_sweep_cursor`), because the rule is the same
+ * rule: a page that did not finish must be presented again, and a cursor that
+ * could slip backwards would re-walk ground the sweep had already covered.
+ * The only difference is who clears it — a sweep's progress is reset to 0 by
+ * completion (`note_relay_sweep_completed`) and by a hint-set change
+ * (`note_relay_hint_sources`), which are explicit writes rather than
+ * anything this function can express.
  */
 public func relayCursorAdvance(persistedAfterId: Int64, pageNextCursor: Int64, pageFullyProcessed: Bool) -> Int64 {
     return try!  FfiConverterInt64.lift(try! rustCall() {
@@ -19391,6 +19602,51 @@ public func relayHintSourceDigest(sourceIds: [Data]) -> String {
 })
 }
 /**
+ * [`RELAY_MAILBOX_CONTINUATION_DELAY_MS`], for shells that cannot see the
+ * constant.
+ */
+public func relayMailboxContinuationDelayMs() -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_mailbox_continuation_delay_ms($0
+    )
+})
+}
+/**
+ * [`RELAY_MAILBOX_MAX_ENVELOPES_PER_PASS`], for shells that cannot see the
+ * constant.
+ */
+public func relayMailboxMaxEnvelopesPerPass() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_mailbox_max_envelopes_per_pass($0
+    )
+})
+}
+/**
+ * [`RELAY_MAILBOX_MAX_PAGES_PER_PASS`], for shells that cannot see the
+ * constant.
+ */
+public func relayMailboxMaxPagesPerPass() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_mailbox_max_pages_per_pass($0
+    )
+})
+}
+/**
+ * Has this mailbox's walk used up its budget for this pass?
+ *
+ * Called after each page is processed and its cursors are persisted, so a
+ * yield never strands work: everything counted here has already reached a
+ * terminal disposition and been written down.
+ */
+public func relayMailboxWalkAction(pagesFetched: UInt32, envelopesFetched: UInt32) -> RelayMailboxWalkAction {
+    return try!  FfiConverterTypeRelayMailboxWalkAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_mailbox_walk_action(
+        FfiConverterUInt32.lower(pagesFetched),
+        FfiConverterUInt32.lower(envelopesFetched),$0
+    )
+})
+}
+/**
  * Maximum response body that either mobile shell may accumulate before
  * cancelling the relay request. The core repeats this check at every decoder
  * so callers outside the first-party shells cannot bypass it.
@@ -19402,16 +19658,32 @@ public func relayMaxResponseBytes() -> UInt32 {
 })
 }
 /**
- * The `after=` this pass starts its walk at: 0 for a sweep, the remembered
- * frontier otherwise. A negative persisted value (corrupt row, hand-edited
+ * The `after=` this pass starts its walk at.
+ *
+ * An ordinary pass resumes from the remembered frontier. A sweep resumes from
+ * its own remembered progress: 0 the first time, and wherever the last
+ * bounded pass left off after that.
+ *
+ * The two cursors are separate on purpose and cannot be collapsed into one.
+ * The frontier never moves backwards (see [`relay_cursor_advance`]), which is
+ * what stops a sweep from costing an ordinary pass its position; that same
+ * property makes it useless as a sweep's resume point, because on a mailbox
+ * whose frontier already sits at the top it carries no information about how
+ * far this sweep has walked. Reading the frontier as sweep progress would
+ * skip the whole mailbox; reading 0 as sweep progress restarts the walk on
+ * every yield, which is the livelock. Only a cursor belonging to the sweep
+ * answers correctly.
+ *
+ * A negative persisted value on either cursor (corrupt row, hand-edited
  * database) reads as 0 rather than being sent to a relay that would reject
  * it.
  */
-public func relayPassStartCursor(sweeping: Bool, persistedAfterId: Int64) -> Int64 {
+public func relayPassStartCursor(sweeping: Bool, persistedAfterId: Int64, sweepProgressAfterId: Int64) -> Int64 {
     return try!  FfiConverterInt64.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_relay_pass_start_cursor(
         FfiConverterBool.lower(sweeping),
-        FfiConverterInt64.lower(persistedAfterId),$0
+        FfiConverterInt64.lower(persistedAfterId),
+        FfiConverterInt64.lower(sweepProgressAfterId),$0
     )
 })
 }
@@ -19481,8 +19753,20 @@ public func relaySetupIsOfficial(relayUrl: String) -> Bool {
  * completed sweep proves the mailbox's ids have regressed would fix it
  * properly and is the obvious follow-up; nothing here forecloses it.
  *
- * Two valves stay open, because they are the states a stored timestamp
- * genuinely cannot speak for:
+ * Three valves stay open, because they are the states a stored sweep
+ * timestamp genuinely cannot speak for:
+ *
+ * - **A sweep already under way** (`sweep_progress_after_id > 0`) is due
+ * until it finishes, whatever the timestamp says. A bounded walk
+ * ([`relay_mailbox_walk_action`]) hands a deep mailbox back after a few
+ * pages, and only the empty page at the end of the mailbox writes
+ * `last_sweep_at`; so between the first yield and the last page the
+ * timestamp still describes the *previous* sweep, and reading it alone
+ * would abandon a half-finished walk — leaving `sweep_after_id` stranded
+ * in the middle of the mailbox and the coverage it exists to provide
+ * quietly incomplete. This branch is also what makes the resume cursor
+ * safe to trust: progress is only ever read by a pass that is sweeping,
+ * and a pass that finds progress is always sweeping.
  *
  * - **Never swept** (`last_sweep_at_ms <= 0`) sweeps. This is also the
  * entire "heal promptly after an install" story and the reason no extra
@@ -19501,9 +19785,10 @@ public func relaySetupIsOfficial(relayUrl: String) -> Bool {
  * reason. One completed sweep rewrites the timestamp to now, so it settles;
  * a sweep that never *finishes* does not, because both shells record
  * completion only on the empty page that ends the walk. A mailbox too large
- * to walk inside one service lifetime therefore keeps re-walking from 0.
- * That predates this change and is not made worse by it, but it is the
- * reason "one sweep and it stops" is not quite true.
+ * to walk inside one service lifetime used to keep re-walking from 0 for
+ * that reason; it no longer does, because the sweep resumes from
+ * `sweep_after_id` and so converges on the empty page across as many passes
+ * as it takes.
  *
  * One case the stored timestamp cannot speak for is deliberately handled
  * elsewhere rather than by a valve here: gaining a contact or a group widens
@@ -19516,12 +19801,19 @@ public func relaySetupIsOfficial(relayUrl: String) -> Bool {
  * has already swept passes `swept_this_session: true`, so zeroing it here
  * would answer "not due" from then until the service restarted — a membership
  * change would quietly retire the schedule for the lifetime of the process.
+ * It zeroes the sweep *progress* alongside the frontier, for the same reason
+ * it zeroes the frontier — a partial sweep's coverage was computed against a
+ * narrower hint set, so it no longer means what it claims — and zeroing
+ * progress is safe there precisely because it does not force a sweep: it
+ * lands back on the "no sweep under way" reading, and the frontier reset is
+ * what actually re-walks the mailbox.
  */
-public func relaySweepDue(sweptThisSession: Bool, lastSweepAtMs: Int64, nowMs: Int64) -> Bool {
+public func relaySweepDue(sweptThisSession: Bool, lastSweepAtMs: Int64, sweepProgressAfterId: Int64, nowMs: Int64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_relay_sweep_due(
         FfiConverterBool.lower(sweptThisSession),
         FfiConverterInt64.lower(lastSweepAtMs),
+        FfiConverterInt64.lower(sweepProgressAfterId),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -20226,7 +20518,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_contact_shares_own_family() != 37254) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_cursor_advance() != 64540) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_cursor_advance() != 22764) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_cursor_key() != 37643) {
@@ -20271,10 +20563,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_hint_source_digest() != 28986) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_mailbox_continuation_delay_ms() != 34456) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_mailbox_max_envelopes_per_pass() != 32171) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_mailbox_max_pages_per_pass() != 61445) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_mailbox_walk_action() != 9184) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_pass_start_cursor() != 19739) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_pass_start_cursor() != 15530) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_retry_after_ms() != 10198) {
@@ -20283,7 +20587,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 11572) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 25542) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 62593) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_interval_ms() != 37428) {
@@ -20488,6 +20792,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_advance_relay_fetch_cursor() != 11436) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_advance_relay_sweep_cursor() != 32345) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 21099) {
@@ -20772,10 +21079,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_contact_relay_unreachable() != 15591) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_hint_sources() != 11955) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_hint_sources() != 12844) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_sweep_completed() != 49168) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_sweep_completed() != 50076) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_shared_request_prompt() != 16956) {

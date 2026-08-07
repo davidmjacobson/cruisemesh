@@ -31,6 +31,33 @@
 //! from 0 again so the rows that are *supposed* to stay there remain
 //! re-discoverable.
 //!
+//! ## The second bug: a sweep that could never finish
+//!
+//! A walk is bounded — [`relay_mailbox_walk_action`] yields after
+//! [`RELAY_MAILBOX_MAX_PAGES_PER_PASS`] pages or
+//! [`RELAY_MAILBOX_MAX_ENVELOPES_PER_PASS`] envelopes and asks the shell to
+//! schedule a continuation, so a deep mailbox cannot hold a sync pass hostage.
+//! That bound and the sweep were incompatible for as long as a sweep had only
+//! one place to start: **0**.
+//!
+//! A sweep is recorded complete only on the empty page that ends the walk. A
+//! mailbox with more than one budget's worth of hint-matching rows never
+//! reaches that page inside one pass, so the sweep stayed due, and the next
+//! pass — a second later — started it again at 0. In the field this was a
+//! permanent loop: the same first 512 rows re-downloaded every few seconds,
+//! ~97 times in fourteen minutes, indefinitely. The frontier could not serve
+//! as the resume point either, because [`relay_cursor_advance`] deliberately
+//! never moves backwards, so on a mailbox whose frontier is already at the top
+//! it says nothing at all about how far *this sweep* has got.
+//!
+//! So a sweep now carries its own cursor, persisted beside the frontier:
+//! `sweep_after_id`. It advances under exactly the frontier's rule (only on a
+//! fully-processed page, never backwards), a sweep resumes from it instead of
+//! from 0, and completing the sweep clears it. A sweep is therefore a walk
+//! that survives yields, process death, and days of interruptions and still
+//! finishes — instead of one that had to fit inside a single pass or never end
+//! at all.
+//!
 //! Policy lives here, as plain functions, so both shells answer every
 //! question the same way and every answer is unit-testable without a relay,
 //! a socket, or a store.
@@ -84,6 +111,95 @@ pub const RELAY_SWEEP_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
 #[uniffi::export]
 pub fn relay_sweep_interval_ms() -> i64 {
     RELAY_SWEEP_INTERVAL_MS
+}
+
+/// How many pages one pass may fetch from a single mailbox before yielding.
+///
+/// A relay mailbox can hold years of deliberately unacked proxy rows, and a
+/// sweep — or a first walk after a restore, which has no frontier to resume
+/// from — starts at 0 and would otherwise run thousands of sequential HTTP
+/// round trips without ever letting go. Four pages is small enough that no
+/// single mailbox can starve the others in a multi-relay pass, and large
+/// enough that an ordinary frontier pass (which almost always ends on its
+/// first or second page) never notices the budget exists.
+pub const RELAY_MAILBOX_MAX_PAGES_PER_PASS: u32 = 4;
+
+/// How many envelopes one pass may take from a single mailbox before
+/// yielding.
+///
+/// The page budget bounds *requests*; this bounds *work*. relayd fills a page
+/// up to a byte cap rather than a row count, so four pages can be four rows or
+/// four hundred, and it is the envelope processing — unseal, dedupe, store,
+/// ack — that costs the phone. 512 is comfortably more than a quiet mailbox
+/// ever produces and well short of what a background pass can be killed for.
+pub const RELAY_MAILBOX_MAX_ENVELOPES_PER_PASS: u32 = 512;
+
+/// How long to wait before resuming a walk that hit its budget.
+///
+/// Long enough to be a genuine yield — the pass ends, its thread and its
+/// sockets are released, the rest of the mesh gets a turn — and short enough
+/// that draining a deep mailbox is measured in minutes rather than in sweep
+/// intervals.
+pub const RELAY_MAILBOX_CONTINUATION_DELAY_MS: i64 = 1_000;
+
+/// [`RELAY_MAILBOX_MAX_PAGES_PER_PASS`], for shells that cannot see the
+/// constant.
+#[uniffi::export]
+pub fn relay_mailbox_max_pages_per_pass() -> u32 {
+    RELAY_MAILBOX_MAX_PAGES_PER_PASS
+}
+
+/// [`RELAY_MAILBOX_MAX_ENVELOPES_PER_PASS`], for shells that cannot see the
+/// constant.
+#[uniffi::export]
+pub fn relay_mailbox_max_envelopes_per_pass() -> u32 {
+    RELAY_MAILBOX_MAX_ENVELOPES_PER_PASS
+}
+
+/// [`RELAY_MAILBOX_CONTINUATION_DELAY_MS`], for shells that cannot see the
+/// constant.
+#[uniffi::export]
+pub fn relay_mailbox_continuation_delay_ms() -> i64 {
+    RELAY_MAILBOX_CONTINUATION_DELAY_MS
+}
+
+/// What a walk should do once the current page is fully accounted for.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayMailboxWalkAction {
+    /// Under budget: fetch the next page in this same pass.
+    ///
+    /// Deliberately not named `Continue`: that is a keyword in one of the two
+    /// languages this enum is generated into, and an escaped case name is a
+    /// worse thing to read than a slightly longer one.
+    ContinueWalk,
+    /// Out of budget: stop this mailbox's walk, persist what has been
+    /// processed, and schedule a continuation in
+    /// [`RELAY_MAILBOX_CONTINUATION_DELAY_MS`].
+    ///
+    /// The continuation is a whole new sync pass, which is why the resume
+    /// point has to be *persisted* rather than held in a local: a sweep that
+    /// yields here and restarts at 0 next pass is the livelock this module's
+    /// second section describes.
+    YieldAndScheduleContinuation,
+}
+
+/// Has this mailbox's walk used up its budget for this pass?
+///
+/// Called after each page is processed and its cursors are persisted, so a
+/// yield never strands work: everything counted here has already reached a
+/// terminal disposition and been written down.
+#[uniffi::export]
+pub fn relay_mailbox_walk_action(
+    pages_fetched: u32,
+    envelopes_fetched: u32,
+) -> RelayMailboxWalkAction {
+    if pages_fetched >= RELAY_MAILBOX_MAX_PAGES_PER_PASS
+        || envelopes_fetched >= RELAY_MAILBOX_MAX_ENVELOPES_PER_PASS
+    {
+        RelayMailboxWalkAction::YieldAndScheduleContinuation
+    } else {
+        RelayMailboxWalkAction::ContinueWalk
+    }
 }
 
 /// A stable, credential-free name for one relay mailbox: the URL and the
@@ -206,8 +322,20 @@ pub fn relay_hint_source_digest(mut source_ids: Vec<Vec<u8>>) -> String {
 /// completed sweep proves the mailbox's ids have regressed would fix it
 /// properly and is the obvious follow-up; nothing here forecloses it.
 ///
-/// Two valves stay open, because they are the states a stored timestamp
-/// genuinely cannot speak for:
+/// Three valves stay open, because they are the states a stored sweep
+/// timestamp genuinely cannot speak for:
+///
+/// - **A sweep already under way** (`sweep_progress_after_id > 0`) is due
+///   until it finishes, whatever the timestamp says. A bounded walk
+///   ([`relay_mailbox_walk_action`]) hands a deep mailbox back after a few
+///   pages, and only the empty page at the end of the mailbox writes
+///   `last_sweep_at`; so between the first yield and the last page the
+///   timestamp still describes the *previous* sweep, and reading it alone
+///   would abandon a half-finished walk — leaving `sweep_after_id` stranded
+///   in the middle of the mailbox and the coverage it exists to provide
+///   quietly incomplete. This branch is also what makes the resume cursor
+///   safe to trust: progress is only ever read by a pass that is sweeping,
+///   and a pass that finds progress is always sweeping.
 ///
 /// - **Never swept** (`last_sweep_at_ms <= 0`) sweeps. This is also the
 ///   entire "heal promptly after an install" story and the reason no extra
@@ -226,9 +354,10 @@ pub fn relay_hint_source_digest(mut source_ids: Vec<Vec<u8>>) -> String {
 ///   reason. One completed sweep rewrites the timestamp to now, so it settles;
 ///   a sweep that never *finishes* does not, because both shells record
 ///   completion only on the empty page that ends the walk. A mailbox too large
-///   to walk inside one service lifetime therefore keeps re-walking from 0.
-///   That predates this change and is not made worse by it, but it is the
-///   reason "one sweep and it stops" is not quite true.
+///   to walk inside one service lifetime used to keep re-walking from 0 for
+///   that reason; it no longer does, because the sweep resumes from
+///   `sweep_after_id` and so converges on the empty page across as many passes
+///   as it takes.
 ///
 /// One case the stored timestamp cannot speak for is deliberately handled
 /// elsewhere rather than by a valve here: gaining a contact or a group widens
@@ -241,8 +370,22 @@ pub fn relay_hint_source_digest(mut source_ids: Vec<Vec<u8>>) -> String {
 /// has already swept passes `swept_this_session: true`, so zeroing it here
 /// would answer "not due" from then until the service restarted — a membership
 /// change would quietly retire the schedule for the lifetime of the process.
+/// It zeroes the sweep *progress* alongside the frontier, for the same reason
+/// it zeroes the frontier — a partial sweep's coverage was computed against a
+/// narrower hint set, so it no longer means what it claims — and zeroing
+/// progress is safe there precisely because it does not force a sweep: it
+/// lands back on the "no sweep under way" reading, and the frontier reset is
+/// what actually re-walks the mailbox.
 #[uniffi::export]
-pub fn relay_sweep_due(swept_this_session: bool, last_sweep_at_ms: i64, now_ms: i64) -> bool {
+pub fn relay_sweep_due(
+    swept_this_session: bool,
+    last_sweep_at_ms: i64,
+    sweep_progress_after_id: i64,
+    now_ms: i64,
+) -> bool {
+    if sweep_progress_after_id > 0 {
+        return true;
+    }
     if last_sweep_at_ms <= 0 {
         return !swept_this_session;
     }
@@ -252,17 +395,35 @@ pub fn relay_sweep_due(swept_this_session: bool, last_sweep_at_ms: i64, now_ms: 
     now_ms - last_sweep_at_ms >= RELAY_SWEEP_INTERVAL_MS
 }
 
-/// The `after=` this pass starts its walk at: 0 for a sweep, the remembered
-/// frontier otherwise. A negative persisted value (corrupt row, hand-edited
+/// The `after=` this pass starts its walk at.
+///
+/// An ordinary pass resumes from the remembered frontier. A sweep resumes from
+/// its own remembered progress: 0 the first time, and wherever the last
+/// bounded pass left off after that.
+///
+/// The two cursors are separate on purpose and cannot be collapsed into one.
+/// The frontier never moves backwards (see [`relay_cursor_advance`]), which is
+/// what stops a sweep from costing an ordinary pass its position; that same
+/// property makes it useless as a sweep's resume point, because on a mailbox
+/// whose frontier already sits at the top it carries no information about how
+/// far this sweep has walked. Reading the frontier as sweep progress would
+/// skip the whole mailbox; reading 0 as sweep progress restarts the walk on
+/// every yield, which is the livelock. Only a cursor belonging to the sweep
+/// answers correctly.
+///
+/// A negative persisted value on either cursor (corrupt row, hand-edited
 /// database) reads as 0 rather than being sent to a relay that would reject
 /// it.
 #[uniffi::export]
-pub fn relay_pass_start_cursor(sweeping: bool, persisted_after_id: i64) -> i64 {
-    if sweeping || persisted_after_id < 0 {
-        0
-    } else {
-        persisted_after_id
+pub fn relay_pass_start_cursor(
+    sweeping: bool,
+    persisted_after_id: i64,
+    sweep_progress_after_id: i64,
+) -> i64 {
+    if sweeping {
+        return sweep_progress_after_id.max(0);
     }
+    persisted_after_id.max(0)
 }
 
 /// The frontier to persist after one page, given what was already persisted.
@@ -281,6 +442,15 @@ pub fn relay_pass_start_cursor(sweeping: bool, persisted_after_id: i64) -> i64 {
 /// the maximum means a sweep re-reads the mailbox without ever costing the
 /// frontier its position, so an interrupted sweep cannot turn into a
 /// re-walk-everything-next-pass loop.
+///
+/// The same function decides the sweep's own `sweep_after_id`
+/// (`MessageStore::advance_relay_sweep_cursor`), because the rule is the same
+/// rule: a page that did not finish must be presented again, and a cursor that
+/// could slip backwards would re-walk ground the sweep had already covered.
+/// The only difference is who clears it — a sweep's progress is reset to 0 by
+/// completion (`note_relay_sweep_completed`) and by a hint-set change
+/// (`note_relay_hint_sources`), which are explicit writes rather than
+/// anything this function can express.
 #[uniffi::export]
 pub fn relay_cursor_advance(
     persisted_after_id: i64,
@@ -433,11 +603,12 @@ mod tests {
         // restart rate would set the bandwidth bill and the interval would
         // mean nothing.
         let swept_at = 1_000_000i64;
-        assert!(!relay_sweep_due(false, swept_at, swept_at));
-        assert!(!relay_sweep_due(false, swept_at, swept_at + 1));
+        assert!(!relay_sweep_due(false, swept_at, 0, swept_at));
+        assert!(!relay_sweep_due(false, swept_at, 0, swept_at + 1));
         assert!(!relay_sweep_due(
             false,
             swept_at,
+            0,
             swept_at + RELAY_SWEEP_INTERVAL_MS - 1
         ));
     }
@@ -448,11 +619,13 @@ mod tests {
         assert!(relay_sweep_due(
             false,
             swept_at,
+            0,
             swept_at + RELAY_SWEEP_INTERVAL_MS
         ));
         assert!(relay_sweep_due(
             false,
             swept_at,
+            0,
             swept_at + 10 * RELAY_SWEEP_INTERVAL_MS
         ));
     }
@@ -460,15 +633,17 @@ mod tests {
     #[test]
     fn later_passes_sweep_only_once_the_interval_has_elapsed() {
         let swept_at = 1_000_000i64;
-        assert!(!relay_sweep_due(true, swept_at, swept_at));
+        assert!(!relay_sweep_due(true, swept_at, 0, swept_at));
         assert!(!relay_sweep_due(
             true,
             swept_at,
+            0,
             swept_at + RELAY_SWEEP_INTERVAL_MS - 1
         ));
         assert!(relay_sweep_due(
             true,
             swept_at,
+            0,
             swept_at + RELAY_SWEEP_INTERVAL_MS
         ));
         assert_eq!(relay_sweep_interval_ms(), 6 * 60 * 60 * 1000);
@@ -479,30 +654,137 @@ mod tests {
         // Fresh install, a rotated token, or a moved host reads as 0 here and
         // must walk from the beginning. This is the promptness a
         // cold-start grace period would otherwise have had to provide.
-        assert!(relay_sweep_due(false, 0, 5_000));
-        assert!(relay_sweep_due(false, -1, 5_000));
+        assert!(relay_sweep_due(false, 0, 0, 5_000));
+        assert!(relay_sweep_due(false, -1, 0, 5_000));
         // ...but only once per process. A store write that keeps failing must
         // not turn every single pass into a full walk.
-        assert!(!relay_sweep_due(true, 0, 5_000));
-        assert!(!relay_sweep_due(true, -1, 5_000));
+        assert!(!relay_sweep_due(true, 0, 0, 5_000));
+        assert!(!relay_sweep_due(true, -1, 0, 5_000));
     }
 
     #[test]
     fn a_backwards_clock_sweeps_rather_than_pinning_the_mailbox() {
         // A timestamp in the future, from either side of a restart. Recording
         // the sweep rewrites it to now, so this resolves in one pass.
-        assert!(relay_sweep_due(true, 5_000_000, 1_000));
-        assert!(relay_sweep_due(false, 5_000_000, 1_000));
-        assert!(relay_sweep_due(false, i64::MAX, 1_000));
+        assert!(relay_sweep_due(true, 5_000_000, 0, 1_000));
+        assert!(relay_sweep_due(false, 5_000_000, 0, 1_000));
+        assert!(relay_sweep_due(false, i64::MAX, 0, 1_000));
+    }
+
+    /// The livelock, stated as a rule: a sweep that yielded mid-mailbox is
+    /// still due, so the next pass finishes it rather than treating the
+    /// mailbox as swept and abandoning `sweep_after_id` in the middle.
+    #[test]
+    fn a_sweep_left_half_finished_stays_due() {
+        let swept_at = 1_000_000i64;
+        // Timestamp says "swept an hour ago"; progress says "no it wasn't".
+        assert!(relay_sweep_due(true, swept_at, 512, swept_at + 3_600_000));
+        assert!(relay_sweep_due(false, swept_at, 512, swept_at + 1));
+        // ...and once the empty page clears progress, the schedule takes over
+        // again. This is the pairing that ends the loop: progress is the only
+        // thing that keeps a sweep due, and completion is the only thing that
+        // clears it.
+        assert!(!relay_sweep_due(true, swept_at, 0, swept_at + 3_600_000));
     }
 
     #[test]
-    fn a_sweep_starts_at_zero_and_a_normal_pass_resumes() {
-        assert_eq!(relay_pass_start_cursor(true, 9_000), 0);
-        assert_eq!(relay_pass_start_cursor(false, 9_000), 9_000);
-        assert_eq!(relay_pass_start_cursor(false, 0), 0);
+    fn a_sweep_resumes_from_its_progress_and_a_normal_pass_from_the_frontier() {
+        // The regression. A sweep that yielded at 512 must not start at 0
+        // again -- that re-downloads the same first pages every continuation,
+        // forever, and never reaches the empty page that completes it.
+        assert_eq!(relay_pass_start_cursor(true, 29_000, 512), 512);
+        assert_eq!(relay_pass_start_cursor(true, 29_000, 0), 0);
+        // A sweep never reads the frontier: on a mailbox already walked to the
+        // top, the frontier would skip everything the sweep exists to re-see.
+        assert_eq!(relay_pass_start_cursor(true, 29_000, 16), 16);
+        // An ordinary pass never reads sweep progress, for the mirror-image
+        // reason: it would re-fetch everything above the progress point.
+        assert_eq!(relay_pass_start_cursor(false, 9_000, 512), 9_000);
+        assert_eq!(relay_pass_start_cursor(false, 0, 512), 0);
         // Corrupt/hand-edited row: never send a negative `after`.
-        assert_eq!(relay_pass_start_cursor(false, -5), 0);
+        assert_eq!(relay_pass_start_cursor(false, -5, 0), 0);
+        assert_eq!(relay_pass_start_cursor(true, 0, -5), 0);
+    }
+
+    #[test]
+    fn a_walk_yields_once_it_runs_out_of_pages_or_envelopes() {
+        assert_eq!(
+            relay_mailbox_walk_action(0, 0),
+            RelayMailboxWalkAction::ContinueWalk
+        );
+        assert_eq!(
+            relay_mailbox_walk_action(RELAY_MAILBOX_MAX_PAGES_PER_PASS - 1, 12),
+            RelayMailboxWalkAction::ContinueWalk
+        );
+        assert_eq!(
+            relay_mailbox_walk_action(RELAY_MAILBOX_MAX_PAGES_PER_PASS, 12),
+            RelayMailboxWalkAction::YieldAndScheduleContinuation
+        );
+        // Either budget alone ends the pass: relayd fills a page to a byte cap,
+        // so two pages can be worth more work than four.
+        assert_eq!(
+            relay_mailbox_walk_action(2, RELAY_MAILBOX_MAX_ENVELOPES_PER_PASS),
+            RelayMailboxWalkAction::YieldAndScheduleContinuation
+        );
+        assert_eq!(
+            relay_mailbox_walk_action(2, RELAY_MAILBOX_MAX_ENVELOPES_PER_PASS - 1),
+            RelayMailboxWalkAction::ContinueWalk
+        );
+    }
+
+    #[test]
+    fn the_budget_constants_are_visible_to_both_shells() {
+        assert_eq!(relay_mailbox_max_pages_per_pass(), 4);
+        assert_eq!(relay_mailbox_max_envelopes_per_pass(), 512);
+        assert_eq!(relay_mailbox_continuation_delay_ms(), 1_000);
+    }
+
+    /// End to end, in the shape a shell runs it: a mailbox deeper than one
+    /// pass's budget is swept across several continuations and then completes,
+    /// instead of re-reading its first pages forever.
+    #[test]
+    fn a_bounded_sweep_converges_across_continuations() {
+        let swept_at = 1_000_000i64;
+        let now = swept_at + RELAY_SWEEP_INTERVAL_MS;
+        // Ten pages of 128 rows, then the empty page.
+        let mailbox_end = 1_280i64;
+        let mut progress = 0i64;
+        let mut frontier = 29_000i64; // already at the top; useless to a sweep
+        let mut passes = 0i64;
+        loop {
+            passes += 1;
+            assert!(passes < 20, "the walk must terminate, not livelock");
+            assert!(relay_sweep_due(true, swept_at, progress, now));
+            let mut after = relay_pass_start_cursor(true, frontier, progress);
+            let mut pages = 0u32;
+            let mut envelopes = 0u32;
+            loop {
+                if after >= mailbox_end {
+                    // The empty page: sweep complete, progress cleared.
+                    progress = 0;
+                    assert!(!relay_sweep_due(true, now, progress, now));
+                    assert_eq!(passes, 3, "4 pages a pass, 10 pages of mailbox");
+                    return;
+                }
+                let next = after + 128;
+                pages += 1;
+                envelopes += 128;
+                progress = relay_cursor_advance(progress, next, true);
+                frontier = relay_cursor_advance(frontier, next, true);
+                assert!(relay_fetch_walk_continues(128, after, next));
+                after = next;
+                if relay_mailbox_walk_action(pages, envelopes)
+                    == RelayMailboxWalkAction::YieldAndScheduleContinuation
+                {
+                    break;
+                }
+            }
+            // Every yield leaves the sweep strictly further along than the
+            // last one did. Without a resume cursor this is where it went
+            // back to 0.
+            assert_eq!(progress, passes * 512);
+            assert_eq!(frontier, 29_000, "a sweep never costs the frontier");
+        }
     }
 
     #[test]
