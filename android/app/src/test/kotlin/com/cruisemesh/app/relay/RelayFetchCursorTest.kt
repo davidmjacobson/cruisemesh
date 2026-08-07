@@ -18,6 +18,7 @@ import uniffi.cruisemesh_core.relayFetchWalkContinues
 import uniffi.cruisemesh_core.relayPassStartCursor
 import uniffi.cruisemesh_core.relaySweepDue
 import uniffi.cruisemesh_core.relaySweepIntervalMs
+import uniffi.cruisemesh_core.relaySweepRestartFromZero
 import java.util.Base64
 
 /**
@@ -31,6 +32,11 @@ import java.util.Base64
  * at 0 every pass meant paging through everything stale before reaching
  * anything new -- minutes of delivery latency on a real mailbox, and passes
  * that timed out before finishing.
+ *
+ * And the sweep's own resume cursor, which is the second half of the same
+ * story: the walk is bounded per pass, a sweep is only recorded complete on
+ * the empty page at the end of the mailbox, so a sweep that restarted at 0 on
+ * every yield could never finish on a mailbox big enough to need the bound.
  *
  * Policy lives in the core (`core/src/relay_cursor.rs`) so both shells answer
  * identically; this exercises it through the binding the shell actually calls,
@@ -126,10 +132,10 @@ class RelayFetchCursorTest {
         // restart rate -- not the interval -- set the bandwidth bill.
         val sweptAt = 1_000_000L
         val interval = relaySweepIntervalMs()
-        assertFalse(relaySweepDue(false, sweptAt, sweptAt))
-        assertFalse(relaySweepDue(false, sweptAt, sweptAt + interval - 1))
+        assertFalse(relaySweepDue(false, sweptAt, 0L, sweptAt))
+        assertFalse(relaySweepDue(false, sweptAt, 0L, sweptAt + interval - 1))
         // Stale enough, and a cold start sweeps like any other pass.
-        assertTrue(relaySweepDue(false, sweptAt, sweptAt + interval))
+        assertTrue(relaySweepDue(false, sweptAt, 0L, sweptAt + interval))
     }
 
     @Test
@@ -137,25 +143,25 @@ class RelayFetchCursorTest {
         val sweptAt = 1_000_000L
         val interval = relaySweepIntervalMs()
         assertEquals(6L * 60 * 60 * 1000, interval)
-        assertFalse(relaySweepDue(true, sweptAt, sweptAt))
-        assertFalse(relaySweepDue(true, sweptAt, sweptAt + interval - 1))
-        assertTrue(relaySweepDue(true, sweptAt, sweptAt + interval))
+        assertFalse(relaySweepDue(true, sweptAt, 0L, sweptAt))
+        assertFalse(relaySweepDue(true, sweptAt, 0L, sweptAt + interval - 1))
+        assertTrue(relaySweepDue(true, sweptAt, 0L, sweptAt + interval))
     }
 
     @Test
     fun `a mailbox never swept sweeps once, not once per pass`() {
         // Fresh install, rotated token, and moved host read as 0 and must walk
         // from the beginning. Restore preserves a recent frontier instead.
-        assertTrue(relaySweepDue(false, 0L, 5_000L))
+        assertTrue(relaySweepDue(false, 0L, 0L, 5_000L))
         // ...but a store write that keeps failing must not re-walk forever.
-        assertFalse(relaySweepDue(true, 0L, 5_000L))
+        assertFalse(relaySweepDue(true, 0L, 0L, 5_000L))
     }
 
     @Test
     fun `a backwards clock sweeps rather than pinning the mailbox`() {
-        assertTrue(relaySweepDue(true, 5_000_000L, 1_000L))
-        assertTrue(relaySweepDue(false, 5_000_000L, 1_000L))
-        assertTrue(relaySweepDue(false, Long.MAX_VALUE, 1_000L))
+        assertTrue(relaySweepDue(true, 5_000_000L, 0L, 1_000L))
+        assertTrue(relaySweepDue(false, 5_000_000L, 0L, 1_000L))
+        assertTrue(relaySweepDue(false, Long.MAX_VALUE, 0L, 1_000L))
     }
 
     @Test
@@ -166,14 +172,157 @@ class RelayFetchCursorTest {
         val cursor = store.relayFetchCursor(key())
         assertEquals(9_000L, cursor.afterId)
         assertEquals(1_000_000L, cursor.lastSweepAtMs)
-        assertFalse(relaySweepDue(true, cursor.lastSweepAtMs, 1_000_001L))
+        assertFalse(relaySweepDue(true, cursor.lastSweepAtMs, cursor.sweepAfterId, 1_000_001L))
     }
 
     @Test
     fun `a sweep starts at zero and a normal pass resumes from the frontier`() {
-        assertEquals(0L, relayPassStartCursor(true, 9_000L))
-        assertEquals(9_000L, relayPassStartCursor(false, 9_000L))
-        assertEquals(0L, relayPassStartCursor(false, -5L))
+        assertEquals(0L, relayPassStartCursor(true, 9_000L, 0L))
+        assertEquals(9_000L, relayPassStartCursor(false, 9_000L, 0L))
+        assertEquals(0L, relayPassStartCursor(false, -5L, 0L))
+    }
+
+    // -- the sweep's own resume cursor -----------------------------------
+
+    @Test
+    fun `a yielded sweep resumes from its progress instead of restarting at zero`() {
+        // The livelock. A walk is bounded (relayMailboxWalkAction), and a
+        // sweep is only recorded complete on the empty page that ends the
+        // mailbox. On any mailbox holding more than one budget's worth of
+        // hint-matching rows the sweep never reached that page, stayed due,
+        // and started again at 0 a second later -- the same first 512 rows
+        // re-downloaded every few seconds, indefinitely.
+        val store = MessageStore.open(":memory:")
+        // A long-established mailbox: frontier at the top, last swept six
+        // hours ago.
+        store.advanceRelayFetchCursor(key(), 29_000L, true)
+        store.noteRelaySweepCompleted(key(), 1_000_000L)
+        val now = 1_000_000L + relaySweepIntervalMs()
+
+        var cursor = store.relayFetchCursor(key())
+        assertTrue(relaySweepDue(true, cursor.lastSweepAtMs, cursor.sweepAfterId, now))
+        assertEquals(0L, relayPassStartCursor(true, cursor.afterId, cursor.sweepAfterId))
+
+        // Four pages, then the budget runs out and the pass yields.
+        for (pageCursor in listOf(128L, 256L, 384L, 512L)) {
+            store.advanceRelaySweepCursor(key(), pageCursor, true, now)
+        }
+
+        cursor = store.relayFetchCursor(key())
+        assertEquals(512L, cursor.sweepAfterId)
+        assertEquals(29_000L, cursor.afterId)
+        // Still due -- an unfinished sweep must be finished, whatever the
+        // timestamp says -- and it picks up where it stopped.
+        assertTrue(relaySweepDue(true, cursor.lastSweepAtMs, cursor.sweepAfterId, now))
+        assertEquals(512L, relayPassStartCursor(true, cursor.afterId, cursor.sweepAfterId))
+        // An ordinary pass in between still reads the frontier, never this.
+        assertEquals(29_000L, relayPassStartCursor(false, cursor.afterId, cursor.sweepAfterId))
+
+        // The empty page ends it: interval restarts, resume cursor cleared.
+        store.noteRelaySweepCompleted(key(), now)
+        cursor = store.relayFetchCursor(key())
+        assertEquals(0L, cursor.sweepAfterId)
+        assertEquals(29_000L, cursor.afterId)
+        assertFalse(relaySweepDue(true, cursor.lastSweepAtMs, cursor.sweepAfterId, now + 1))
+    }
+
+    @Test
+    fun `sweep progress obeys the frontier's rule and never slips backwards`() {
+        val store = MessageStore.open(":memory:")
+        assertEquals(256L, store.advanceRelaySweepCursor(key(), 256L, true, 1_000L))
+        // A page that did not reach a terminal disposition for every envelope,
+        // or failed to land its acks, must be presented again.
+        assertEquals(256L, store.advanceRelaySweepCursor(key(), 512L, false, 1_000L))
+        assertEquals(256L, store.relayFetchCursor(key()).sweepAfterId)
+        assertEquals(256L, store.advanceRelaySweepCursor(key(), 128L, true, 1_000L))
+        // An endpoint with no url or token persists nothing here either.
+        assertEquals(0L, store.advanceRelaySweepCursor("", 512L, true, 1_000L))
+        assertEquals(0L, store.relayFetchCursor("").sweepAfterId)
+    }
+
+    @Test
+    fun `a sweep that survives a restart resumes rather than starting over`() {
+        // The mesh service is killed and restarted all day. Before the resume
+        // cursor, every restart mid-sweep threw the whole walk away.
+        val store = MessageStore.open(":memory:")
+        store.advanceRelaySweepCursor(key(), 512L, true, 1_000L)
+        val cursor = store.relayFetchCursor(key())
+        // sweptThisSession is empty again after a restart, but that guard is
+        // not what keeps this sweep alive -- the persisted progress is.
+        assertTrue(relaySweepDue(false, cursor.lastSweepAtMs, cursor.sweepAfterId, 9_999L))
+        assertEquals(512L, relayPassStartCursor(true, cursor.afterId, cursor.sweepAfterId))
+    }
+
+    @Test
+    fun `a sweep stalled across days offline walks from zero again`() {
+        // The rebuilt-relay case. A phone goes offline mid-sweep for days;
+        // while it is away the relay is rebuilt from a fresh volume and its
+        // row ids restart at 1. The remembered resume cursor now points past
+        // the end of the mailbox, so resuming from it would fetch one empty
+        // page, record a sweep that covered nothing at all, and put the
+        // mailbox back to sleep for another interval while real mail sat below
+        // a frontier no ordinary pass goes under.
+        val store = MessageStore.open(":memory:")
+        store.advanceRelayFetchCursor(key(), 29_000L, true)
+        store.noteRelaySweepCompleted(key(), 1_000_000L)
+        val sweepStarted = 1_000_000L + relaySweepIntervalMs()
+        store.advanceRelaySweepCursor(key(), 20_000L, true, sweepStarted)
+
+        val backOnline = sweepStarted + 3L * 24 * 60 * 60 * 1000
+        var cursor = store.relayFetchCursor(key())
+        assertTrue(relaySweepDue(false, cursor.lastSweepAtMs, cursor.sweepAfterId, backOnline))
+        assertTrue(relaySweepRestartFromZero(cursor.sweepAfterId, cursor.sweepStartedAtMs, backOnline))
+
+        store.resetRelaySweepProgress(key(), backOnline)
+        cursor = store.relayFetchCursor(key())
+        assertEquals(0L, relayPassStartCursor(true, cursor.afterId, cursor.sweepAfterId))
+        // The frontier is not what proved wrong, so it is left alone.
+        assertEquals(29_000L, cursor.afterId)
+
+        // ...and the walk that starts here is dated, so the pass a second
+        // later resumes it rather than restarting it again. Otherwise the
+        // repair would be its own re-download loop.
+        store.advanceRelaySweepCursor(key(), 512L, true, backOnline)
+        cursor = store.relayFetchCursor(key())
+        assertFalse(
+            relaySweepRestartFromZero(cursor.sweepAfterId, cursor.sweepStartedAtMs, backOnline + 1_000L),
+        )
+        assertEquals(512L, relayPassStartCursor(true, cursor.afterId, cursor.sweepAfterId))
+    }
+
+    @Test
+    fun `a sweep that yielded moments ago resumes rather than restarting`() {
+        // The other half, and why this is a staleness question rather than an
+        // empty-page one: a walk yields on a fixed budget, so about one sweep
+        // in four yields exactly at the end of the mailbox and then resumes
+        // into a perfectly honest empty page. Re-walking that from 0 would
+        // land on the same boundary again -- the same loop, slower.
+        val store = MessageStore.open(":memory:")
+        store.advanceRelaySweepCursor(key(), 512L, true, 5_000_000L)
+        val cursor = store.relayFetchCursor(key())
+        assertEquals(5_000_000L, cursor.sweepStartedAtMs)
+        assertFalse(relaySweepRestartFromZero(cursor.sweepAfterId, cursor.sweepStartedAtMs, 5_001_000L))
+        assertEquals(512L, relayPassStartCursor(true, cursor.afterId, cursor.sweepAfterId))
+    }
+
+    @Test
+    fun `abandoning a walk hands the mailbox back to the schedule`() {
+        // A relay that answers incoherently -- rows returned, cursor standing
+        // still -- ends the walk without completing the sweep. The progress it
+        // leaves behind has to go: a mailbox that reads as "a sweep is under
+        // way" on every pass never runs an ordinary frontier pass again, so
+        // new mail at the top of it would stop arriving altogether.
+        val store = MessageStore.open(":memory:")
+        store.advanceRelayFetchCursor(key(), 29_000L, true)
+        store.advanceRelaySweepCursor(key(), 512L, true, 1_000L)
+        var cursor = store.relayFetchCursor(key())
+        assertTrue(relaySweepDue(true, cursor.lastSweepAtMs, cursor.sweepAfterId, 2_000L))
+
+        store.resetRelaySweepProgress(key(), 2_000L)
+        cursor = store.relayFetchCursor(key())
+        assertEquals(0L, cursor.sweepAfterId)
+        assertFalse(relaySweepDue(true, cursor.lastSweepAtMs, cursor.sweepAfterId, 2_000L))
+        assertEquals(29_000L, relayPassStartCursor(false, cursor.afterId, cursor.sweepAfterId))
     }
 
     @Test

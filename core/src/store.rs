@@ -380,14 +380,14 @@ pub struct ConsumedHiddenLamport {
     pub lamport: u64,
 }
 
-/// How far a relay mailbox has been walked, and when it was last walked in
-/// full. See [`crate::relay_cursor`] for what the two numbers mean and the
-/// rules that move them.
+/// How far a relay mailbox has been walked, how far the sweep now under way
+/// has got, and when it was last walked in full. See [`crate::relay_cursor`]
+/// for what the three numbers mean and the rules that move them.
 ///
-/// An unknown mailbox reads as `{ after_id: 0, last_sweep_at_ms: 0 }` — walk
-/// everything, and a sweep is due. That is the correct answer for a first
-/// run, for a rotated credential, and for a restored backup alike, so no
-/// caller needs to special-case any of them.
+/// An unknown mailbox reads as all zeroes — walk everything, no sweep under
+/// way, and a sweep is due. That is the correct answer for a first run, for a
+/// rotated credential, and for a restored backup alike, so no caller needs to
+/// special-case any of them.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct RelayFetchCursor {
     /// The highest relay row id whose page was fully processed. A normal
@@ -395,6 +395,34 @@ pub struct RelayFetchCursor {
     pub after_id: i64,
     /// When a walk from 0 last completed for this mailbox, or 0 if never.
     pub last_sweep_at_ms: i64,
+    /// How far the sweep currently in progress has walked, or 0 when no sweep
+    /// is part-way through.
+    ///
+    /// A sweep is bounded ([`crate::relay_mailbox_walk_action`]) and so
+    /// usually spans several passes; this is the only thing that lets it
+    /// resume rather than restart. It cannot be folded into `after_id`: the
+    /// frontier never moves backwards, so on a mailbox already walked to the
+    /// top it says nothing about where the sweep is.
+    ///
+    /// Non-zero also *means* a sweep is under way — [`crate::relay_sweep_due`]
+    /// reads it that way — so it is cleared exactly when a sweep stops being
+    /// under way: on the empty page that completes it, and on a hint-set
+    /// change that invalidates the coverage it claims.
+    pub sweep_after_id: i64,
+    /// When the sweep now under way first got somewhere, or 0 when no sweep
+    /// is part-way through (or when one is, but has not yet fully processed a
+    /// page).
+    ///
+    /// A resume cursor is only as good as the id space it points into. A relay
+    /// rebuilt from scratch restarts its row ids at 1, and a cursor remembered
+    /// from the old id space then points past the end of the new mailbox: the
+    /// resumed walk fetches one empty page, reads it as end-of-mailbox, and
+    /// records a sweep that covered nothing. This timestamp is how
+    /// [`crate::relay_sweep_restart_from_zero`] tells a sweep that yielded a
+    /// second ago — whose empty page is simply the end of the mailbox — from
+    /// one that has been stalled across days offline, which is the case in
+    /// which the mailbox underneath it can have been replaced.
+    pub sweep_started_at_ms: i64,
 }
 
 /// The name to show for a contact: the local nickname when the user has set a
@@ -813,6 +841,25 @@ impl MessageStore {
             "peer_connection_summary",
             "last_received_at_ms",
             "INTEGER",
+        )?;
+        // Sweep resume cursor. Stores written before this column existed have
+        // no sweep in progress to resume, and 0 is exactly that reading -- so
+        // an upgrade starts its next sweep at the beginning, once, and every
+        // sweep after that resumes properly.
+        ensure_column(
+            &conn,
+            "relay_fetch_cursors",
+            "sweep_after_id",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // When the sweep now under way first got somewhere. 0 on an older
+        // store reads as "no sweep under way that I can date", which costs
+        // nothing: the first page of the next sweep stamps it.
+        ensure_column(
+            &conn,
+            "relay_fetch_cursors",
+            "sweep_started_at",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&conn, "messages", "arrival_transport", "INTEGER")?;
         ensure_column(&conn, "receipts", "via_transport", "INTEGER")?;
@@ -3640,21 +3687,27 @@ impl MessageStore {
             return Ok(RelayFetchCursor {
                 after_id: 0,
                 last_sweep_at_ms: 0,
+                sweep_after_id: 0,
+                sweep_started_at_ms: 0,
             });
         }
         let conn = lock_conn(&self.conn);
-        let row: Option<(i64, i64)> = conn
+        let row: Option<(i64, i64, i64, i64)> = conn
             .query_row(
-                "SELECT after_id, last_sweep_at FROM relay_fetch_cursors WHERE config_key = ?1",
+                "SELECT after_id, last_sweep_at, sweep_after_id, sweep_started_at
+                 FROM relay_fetch_cursors WHERE config_key = ?1",
                 params![config_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(store_err)?;
-        let (after_id, last_sweep_at_ms) = row.unwrap_or((0, 0));
+        let (after_id, last_sweep_at_ms, sweep_after_id, sweep_started_at_ms) =
+            row.unwrap_or((0, 0, 0, 0));
         Ok(RelayFetchCursor {
             after_id,
             last_sweep_at_ms,
+            sweep_after_id,
+            sweep_started_at_ms,
         })
     }
 
@@ -3704,13 +3757,133 @@ impl MessageStore {
         Ok(advanced)
     }
 
+    /// Persist how far the sweep now under way has walked, and return what is
+    /// now remembered.
+    ///
+    /// The frontier's twin, and deliberately a separate column rather than a
+    /// second use of `after_id`: [`crate::relay_cursor_advance`] never lets the
+    /// frontier move backwards, so on a mailbox already walked to the top the
+    /// frontier cannot say where a sweep has got to. Without a cursor of its
+    /// own a sweep restarted at 0 on every yield and, on any mailbox holding
+    /// more rows than one bounded pass can take, never reached the empty page
+    /// that completes it — a permanent re-download loop.
+    ///
+    /// It obeys the same rule the frontier does, decided by the same function:
+    /// it moves only for a page that reached a terminal disposition for every
+    /// envelope *and* landed its acks, and it never moves backwards. Call it
+    /// only while actually sweeping — an ordinary pass writing its page
+    /// cursors here would leave behind progress claiming coverage of rows the
+    /// sweep never looked at, and `sweep_after_id` is also what
+    /// [`crate::relay_sweep_due`] reads as "a sweep is under way".
+    ///
+    /// The first page that actually moves a sweep off 0 also dates the sweep,
+    /// in `sweep_started_at`. Nothing else writes it, so it is the age of the
+    /// walk rather than of the last page — which is the question
+    /// [`crate::relay_sweep_restart_from_zero`] has to answer, and the reason
+    /// `now_ms` is a parameter of an otherwise timeless function.
+    pub fn advance_relay_sweep_cursor(
+        &self,
+        config_key: String,
+        page_next_cursor: i64,
+        page_fully_processed: bool,
+        now_ms: i64,
+    ) -> Result<i64, CoreError> {
+        if config_key.is_empty() {
+            return Ok(0);
+        }
+        let conn = lock_conn(&self.conn);
+        let persisted: i64 = conn
+            .query_row(
+                "SELECT sweep_after_id FROM relay_fetch_cursors WHERE config_key = ?1",
+                params![config_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?
+            .unwrap_or(0);
+        let advanced =
+            crate::relay_cursor_advance(persisted, page_next_cursor, page_fully_processed);
+        if advanced == persisted {
+            return Ok(persisted);
+        }
+        if persisted <= 0 {
+            // This sweep's first page: date it.
+            conn.execute(
+                "INSERT INTO relay_fetch_cursors
+                     (config_key, after_id, last_sweep_at, sweep_after_id, sweep_started_at)
+                 VALUES (?1, 0, 0, ?2, ?3)
+                 ON CONFLICT(config_key)
+                 DO UPDATE SET sweep_after_id = ?2, sweep_started_at = ?3",
+                params![config_key, advanced, now_ms],
+            )
+            .map_err(store_err)?;
+        } else {
+            conn.execute(
+                "INSERT INTO relay_fetch_cursors
+                     (config_key, after_id, last_sweep_at, sweep_after_id)
+                 VALUES (?1, 0, 0, ?2)
+                 ON CONFLICT(config_key) DO UPDATE SET sweep_after_id = ?2",
+                params![config_key, advanced],
+            )
+            .map_err(store_err)?;
+        }
+        Ok(advanced)
+    }
+
+    /// Forget how far the sweep now under way has walked, so the next walk of
+    /// this mailbox starts at 0 again, and date the restart.
+    ///
+    /// Two callers, both of them cases where the remembered progress has
+    /// stopped meaning what it says:
+    ///
+    /// - a sweep whose resume cursor is stale enough to be pointing into an id
+    ///   space that no longer exists ([`crate::relay_sweep_restart_from_zero`]
+    ///   decides; the shell calls this and then walks from 0 in the same
+    ///   pass);
+    /// - a walk abandoned because the relay returned rows without advancing
+    ///   its cursor. That mailbox is answering incoherently, and leaving
+    ///   non-zero progress behind would hold it in "a sweep is under way"
+    ///   ([`crate::relay_sweep_due`]) on *every* pass from then on — which
+    ///   also means never running an ordinary frontier pass against it again,
+    ///   so new mail at the top of that mailbox would stop arriving
+    ///   altogether. Clearing it hands the mailbox back to the schedule.
+    ///
+    /// Stamping `sweep_started_at` matters for the first caller and is
+    /// harmless for the second: it is what stops the walk this call is about
+    /// to start from being judged stale on the very next pass and restarted
+    /// again, which would be the same re-download loop in a new costume.
+    /// Writes nothing for a mailbox with no cursor row — there is no progress
+    /// to forget, and inventing a row would only claim a sweep that is not
+    /// happening.
+    pub fn reset_relay_sweep_progress(
+        &self,
+        config_key: String,
+        now_ms: i64,
+    ) -> Result<(), CoreError> {
+        if config_key.is_empty() {
+            return Ok(());
+        }
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "UPDATE relay_fetch_cursors SET sweep_after_id = 0, sweep_started_at = ?2
+             WHERE config_key = ?1",
+            params![config_key, now_ms],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
     /// Record that a walk from 0 completed for this mailbox, restarting its
-    /// sweep interval.
+    /// sweep interval and clearing the sweep's resume cursor.
     ///
     /// Called only when the walk actually reached the end of the mailbox. A
     /// sweep cut short — the service stopped, internet went away, the relay
-    /// errored — deliberately leaves the timestamp alone, so the next pass
-    /// tries again instead of believing a partial re-walk was a full one.
+    /// errored, or the walk simply ran out of its per-pass budget —
+    /// deliberately leaves the timestamp alone, so the next pass finishes the
+    /// sweep instead of believing a partial re-walk was a full one. The
+    /// resume cursor is what lets "the next pass finishes it" be true rather
+    /// than aspirational, and clearing it here is the single act that turns a
+    /// sweep from in-progress back into scheduled.
     pub fn note_relay_sweep_completed(
         &self,
         config_key: String,
@@ -3721,9 +3894,11 @@ impl MessageStore {
         }
         let conn = lock_conn(&self.conn);
         conn.execute(
-            "INSERT INTO relay_fetch_cursors (config_key, after_id, last_sweep_at)
-             VALUES (?1, 0, ?2)
-             ON CONFLICT(config_key) DO UPDATE SET last_sweep_at = ?2",
+            "INSERT INTO relay_fetch_cursors
+                 (config_key, after_id, last_sweep_at, sweep_after_id, sweep_started_at)
+             VALUES (?1, 0, ?2, 0, 0)
+             ON CONFLICT(config_key)
+             DO UPDATE SET last_sweep_at = ?2, sweep_after_id = 0, sweep_started_at = 0",
             params![config_key, now_ms],
         )
         .map_err(store_err)?;
@@ -3763,7 +3938,17 @@ impl MessageStore {
     /// self-correcting — everything already delivered is deduped on the way
     /// back in by the seen-id gossip filter.
     ///
-    /// It resets `after_id` and nothing else. Deleting the rows outright would
+    /// It resets `sweep_after_id` alongside `after_id`, and for the same
+    /// reason. A sweep part-way up the mailbox has covered the rows below its
+    /// resume cursor *against the old hint set*; the rows a widened hint set
+    /// makes visible are exactly the ones that were invisible on the way past.
+    /// Resuming from that cursor would carry the gap forward into the
+    /// completed sweep and then close the schedule behind it. Zeroing progress
+    /// is safe here precisely because it does not force a sweep — 0 reads as
+    /// "no sweep under way" in [`crate::relay_sweep_due`], and the frontier
+    /// reset above is what actually re-walks the mailbox.
+    ///
+    /// It resets those two columns and nothing else. Deleting the rows outright would
     /// take `last_sweep_at` with it, and that timestamp is the *only* record of
     /// when each mailbox was last walked end to end. Losing it has two bad
     /// consequences and no good one: every mailbox reads as never-swept and so
@@ -3814,8 +3999,12 @@ impl MessageStore {
         let invalidates = stored.is_some();
         let tx = conn.transaction().map_err(store_err)?;
         if invalidates {
-            tx.execute("UPDATE relay_fetch_cursors SET after_id = 0", [])
-                .map_err(store_err)?;
+            tx.execute(
+                "UPDATE relay_fetch_cursors
+                 SET after_id = 0, sweep_after_id = 0, sweep_started_at = 0",
+                [],
+            )
+            .map_err(store_err)?;
         }
         tx.execute(
             "INSERT INTO relay_hint_source_state (id, digest) VALUES (0, ?1)
@@ -6646,10 +6835,22 @@ CREATE TABLE IF NOT EXISTS peer_connection_summary (
 -- them makes restore immediately re-walk a shared mailbox and recreate the
 -- stale courier backlog restore intentionally discarded. Scheduled sweeps
 -- bound the repair delay if a restored frontier is stale.
+-- `sweep_after_id` is how far the sweep currently in progress has walked, 0
+-- when none is. A walk is bounded per pass, so a sweep of a deep mailbox spans
+-- several passes and needs somewhere to resume from; `after_id` cannot serve,
+-- because the frontier never moves backwards and so carries no information
+-- about a sweep's position. Cleared by completion and by a hint-set change.
+-- `sweep_started_at` dates that sweep, from its first fully-processed page. A
+-- resume cursor is only meaningful in the id space it was recorded in, and a
+-- relay rebuilt from scratch restarts its ids at 1; a sweep stalled across
+-- days offline therefore re-walks from 0 rather than trusting the empty page a
+-- stale cursor produces. Cleared alongside `sweep_after_id`.
 CREATE TABLE IF NOT EXISTS relay_fetch_cursors (
-    config_key    TEXT PRIMARY KEY,
-    after_id      INTEGER NOT NULL DEFAULT 0,
-    last_sweep_at INTEGER NOT NULL DEFAULT 0
+    config_key       TEXT PRIMARY KEY,
+    after_id         INTEGER NOT NULL DEFAULT 0,
+    last_sweep_at    INTEGER NOT NULL DEFAULT 0,
+    sweep_after_id   INTEGER NOT NULL DEFAULT 0,
+    sweep_started_at INTEGER NOT NULL DEFAULT 0
 );
 
 -- One row. The digest of the id set our relay fetch hints derive from (own
@@ -9701,6 +9902,65 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    /// A store written before the sweep resume cursor existed keeps its
+    /// frontier and its sweep timestamp, and reads as "no sweep under way" --
+    /// which is true, because the sweep that was interrupted by the upgrade
+    /// had nowhere to record itself. It starts its next sweep at the
+    /// beginning, once, and resumes properly from then on.
+    #[test]
+    fn open_migrates_a_relay_cursor_table_without_the_sweep_resume_column() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("cruisemesh-sweep-migration-{unique}.sqlite"));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE relay_fetch_cursors (
+                config_key    TEXT PRIMARY KEY,
+                after_id      INTEGER NOT NULL DEFAULT 0,
+                last_sweep_at INTEGER NOT NULL DEFAULT 0
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO relay_fetch_cursors (config_key, after_id, last_sweep_at)
+             VALUES (?1, 29000, 1000000)",
+            params![cursor_key()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = MessageStore::open(path_str).unwrap();
+        let cursor = store.relay_fetch_cursor(cursor_key()).unwrap();
+        assert_eq!(cursor.after_id, 29_000);
+        assert_eq!(cursor.last_sweep_at_ms, 1_000_000);
+        assert_eq!(cursor.sweep_after_id, 0);
+        assert_eq!(cursor.sweep_started_at_ms, 0);
+        // The new columns are writable, so the very next sweep resumes
+        // normally -- and dates itself, so it is never mistaken for a sweep
+        // stalled since before the relay was last rebuilt.
+        assert_eq!(
+            store
+                .advance_relay_sweep_cursor(cursor_key(), 512, true, 2_000_000)
+                .unwrap(),
+            512
+        );
+        assert_eq!(
+            store
+                .relay_fetch_cursor(cursor_key())
+                .unwrap()
+                .sweep_started_at_ms,
+            2_000_000
+        );
+
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn set_contact_nickname_round_trips_and_blank_clears() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
@@ -10070,6 +10330,7 @@ mod tests {
         assert!(crate::relay_sweep_due(
             false,
             cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
             10_000
         ));
     }
@@ -10192,17 +10453,335 @@ mod tests {
         assert!(!crate::relay_sweep_due(
             true,
             cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
             1_000_001
         ));
         assert!(crate::relay_sweep_due(
             true,
             cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
             1_000_000 + crate::RELAY_SWEEP_INTERVAL_MS
         ));
         // Recording a sweep for a mailbox with no frontier yet is fine too.
         let fresh = crate::relay_cursor_key("https://fresh.example".into(), "tok".into());
         store.note_relay_sweep_completed(fresh.clone(), 7).unwrap();
         assert_eq!(store.relay_fetch_cursor(fresh).unwrap().after_id, 0);
+    }
+
+    /// The livelock, at the store. A sweep bounded by
+    /// `relay_mailbox_walk_action` yields part-way up the mailbox; the pass a
+    /// second later must resume where it stopped. Reading 0 here is what made
+    /// a mailbox of 512-plus hint-matching rows re-download its first pages
+    /// every few seconds and never finish.
+    #[test]
+    fn a_yielded_sweep_resumes_from_its_progress_instead_of_zero() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        // Frontier already at the top of a long-lived mailbox, and a sweep now
+        // due on the six-hour schedule.
+        store
+            .advance_relay_fetch_cursor(key.clone(), 29_000, true)
+            .unwrap();
+        store
+            .note_relay_sweep_completed(key.clone(), 1_000_000)
+            .unwrap();
+        let now = 1_000_000 + crate::RELAY_SWEEP_INTERVAL_MS;
+
+        let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
+        assert!(crate::relay_sweep_due(
+            true,
+            cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
+            now
+        ));
+        assert_eq!(
+            crate::relay_pass_start_cursor(true, cursor.after_id, cursor.sweep_after_id),
+            0,
+            "a sweep with no progress yet starts at the beginning"
+        );
+        // Four pages, then the budget runs out and the pass yields.
+        for page_cursor in [128, 256, 384, 512] {
+            store
+                .advance_relay_sweep_cursor(key.clone(), page_cursor, true, now)
+                .unwrap();
+        }
+
+        let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
+        assert_eq!(cursor.sweep_after_id, 512);
+        assert_eq!(
+            cursor.after_id, 29_000,
+            "a sweep must still never cost the frontier its position"
+        );
+        assert!(
+            crate::relay_sweep_due(true, cursor.last_sweep_at_ms, cursor.sweep_after_id, now),
+            "an unfinished sweep stays due however recent the timestamp"
+        );
+        assert_eq!(
+            crate::relay_pass_start_cursor(true, cursor.after_id, cursor.sweep_after_id),
+            512,
+            "the continuation resumes; restarting at 0 is the livelock"
+        );
+        // ...and an ordinary pass in between is unaffected: it reads the
+        // frontier, never the sweep's progress.
+        assert_eq!(
+            crate::relay_pass_start_cursor(false, cursor.after_id, cursor.sweep_after_id),
+            29_000
+        );
+    }
+
+    /// The DTN-mirror rule, applied to the sweep cursor: a page that did not
+    /// reach a terminal disposition for every envelope (or failed to land its
+    /// acks) must be presented again, so nothing may be persisted past it.
+    #[test]
+    fn sweep_progress_only_moves_for_a_fully_processed_page() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        assert_eq!(
+            store
+                .advance_relay_sweep_cursor(key.clone(), 256, true, 1_000)
+                .unwrap(),
+            256
+        );
+        assert_eq!(
+            store
+                .advance_relay_sweep_cursor(key.clone(), 512, false, 1_000)
+                .unwrap(),
+            256
+        );
+        assert_eq!(
+            store
+                .relay_fetch_cursor(key.clone())
+                .unwrap()
+                .sweep_after_id,
+            256
+        );
+        // And it never moves backwards, so a re-presented page cannot undo
+        // ground the sweep has already covered.
+        assert_eq!(
+            store
+                .advance_relay_sweep_cursor(key.clone(), 128, true, 1_000)
+                .unwrap(),
+            256
+        );
+        // A config with no usable endpoint persists nothing at all.
+        assert_eq!(
+            store
+                .advance_relay_sweep_cursor(String::new(), 9, true, 1_000)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .relay_fetch_cursor(String::new())
+                .unwrap()
+                .sweep_after_id,
+            0
+        );
+    }
+
+    /// The empty page ends the walk: the timestamp restarts and the resume
+    /// cursor is cleared, which is the single act that turns the sweep from
+    /// in-progress back into scheduled.
+    #[test]
+    fn completing_a_sweep_clears_its_resume_cursor() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        store
+            .advance_relay_sweep_cursor(key.clone(), 512, true, 1_000)
+            .unwrap();
+        store
+            .note_relay_sweep_completed(key.clone(), 2_000_000)
+            .unwrap();
+        let cursor = store.relay_fetch_cursor(key).unwrap();
+        assert_eq!(cursor.sweep_after_id, 0);
+        assert_eq!(cursor.last_sweep_at_ms, 2_000_000);
+        assert!(
+            !crate::relay_sweep_due(
+                true,
+                cursor.last_sweep_at_ms,
+                cursor.sweep_after_id,
+                2_000_001
+            ),
+            "a finished sweep goes back on the schedule"
+        );
+    }
+
+    /// A sweep is dated by its first page and by nothing else, so the date is
+    /// the age of the *walk* rather than of the last page it took.
+    #[test]
+    fn sweep_progress_is_dated_by_the_page_that_starts_the_walk() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        // A page that fails to fully process moves nothing, so it dates
+        // nothing either -- there is no walk to date yet.
+        store
+            .advance_relay_sweep_cursor(key.clone(), 256, false, 4_000)
+            .unwrap();
+        assert_eq!(
+            store
+                .relay_fetch_cursor(key.clone())
+                .unwrap()
+                .sweep_started_at_ms,
+            0
+        );
+        store
+            .advance_relay_sweep_cursor(key.clone(), 256, true, 5_000)
+            .unwrap();
+        store
+            .advance_relay_sweep_cursor(key.clone(), 512, true, 9_000)
+            .unwrap();
+        let cursor = store.relay_fetch_cursor(key).unwrap();
+        assert_eq!(cursor.sweep_after_id, 512);
+        assert_eq!(
+            cursor.sweep_started_at_ms, 5_000,
+            "later pages must not make a stalled sweep look young"
+        );
+    }
+
+    /// The rebuilt-relay case, end to end at the store. A phone goes offline
+    /// mid-sweep for days; while it is away the relay is rebuilt from a fresh
+    /// volume and its row ids restart at 1. The remembered resume cursor now
+    /// points past the end of the mailbox, so resuming from it would fetch one
+    /// empty page, record a sweep that covered nothing, and put the mailbox
+    /// back to sleep for another six hours with real mail sitting below a
+    /// frontier no ordinary pass will ever go under. The walk restarts at 0
+    /// instead, and heals on the first pass back.
+    #[test]
+    fn a_sweep_stalled_across_days_offline_restarts_from_zero() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        let last_sweep = 1_000_000i64;
+        store
+            .advance_relay_fetch_cursor(key.clone(), 29_000, true)
+            .unwrap();
+        store
+            .note_relay_sweep_completed(key.clone(), last_sweep)
+            .unwrap();
+        // The next sweep starts on schedule and yields part-way up.
+        let sweep_started = last_sweep + crate::RELAY_SWEEP_INTERVAL_MS;
+        store
+            .advance_relay_sweep_cursor(key.clone(), 20_000, true, sweep_started)
+            .unwrap();
+
+        let back_online = sweep_started + 3 * 24 * 60 * 60 * 1000;
+        let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
+        assert!(crate::relay_sweep_due(
+            false,
+            cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
+            back_online
+        ));
+        assert!(crate::relay_sweep_restart_from_zero(
+            cursor.sweep_after_id,
+            cursor.sweep_started_at_ms,
+            back_online
+        ));
+        store
+            .reset_relay_sweep_progress(key.clone(), back_online)
+            .unwrap();
+
+        let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
+        assert_eq!(
+            crate::relay_pass_start_cursor(true, cursor.after_id, cursor.sweep_after_id),
+            0,
+            "the walk must start at the beginning of the mailbox that exists now"
+        );
+        assert_eq!(
+            cursor.after_id, 29_000,
+            "and the frontier is not what proved wrong, so it is left alone"
+        );
+
+        // That walk yields in its turn -- and the pass a second later resumes
+        // it rather than restarting it, or the repair would be its own loop.
+        store
+            .advance_relay_sweep_cursor(key.clone(), 512, true, back_online)
+            .unwrap();
+        let cursor = store.relay_fetch_cursor(key).unwrap();
+        assert!(!crate::relay_sweep_restart_from_zero(
+            cursor.sweep_after_id,
+            cursor.sweep_started_at_ms,
+            back_online + crate::relay_mailbox_continuation_delay_ms()
+        ));
+        assert_eq!(
+            crate::relay_pass_start_cursor(true, cursor.after_id, cursor.sweep_after_id),
+            512
+        );
+    }
+
+    /// A relay that answers incoherently -- rows returned, cursor standing
+    /// still -- ends the walk without completing the sweep. The progress it
+    /// leaves behind has to go, or a mailbox that has never completed a sweep
+    /// reads as "a sweep is under way" on every pass from then on: it would
+    /// never run an ordinary frontier pass again, and new mail at the top of
+    /// that mailbox would simply stop arriving.
+    #[test]
+    fn abandoning_a_walk_hands_the_mailbox_back_to_the_schedule() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        store
+            .advance_relay_fetch_cursor(key.clone(), 29_000, true)
+            .unwrap();
+        store
+            .advance_relay_sweep_cursor(key.clone(), 512, true, 1_000)
+            .unwrap();
+
+        let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
+        assert!(
+            crate::relay_sweep_due(true, cursor.last_sweep_at_ms, cursor.sweep_after_id, 2_000),
+            "progress alone keeps a sweep due -- which is the point, until it is abandoned"
+        );
+        store
+            .reset_relay_sweep_progress(key.clone(), 2_000)
+            .unwrap();
+
+        let cursor = store.relay_fetch_cursor(key).unwrap();
+        assert_eq!(cursor.sweep_after_id, 0);
+        assert!(
+            !crate::relay_sweep_due(true, cursor.last_sweep_at_ms, cursor.sweep_after_id, 2_000),
+            "an abandoned walk must not pin the mailbox into sweeping forever"
+        );
+        assert_eq!(
+            crate::relay_pass_start_cursor(false, cursor.after_id, cursor.sweep_after_id),
+            29_000,
+            "ordinary passes resume, so new mail keeps arriving"
+        );
+    }
+
+    /// A sweep is a walk across process lifetimes: the phone is killed and
+    /// restarted all day, and the resume cursor is the only reason that costs
+    /// nothing.
+    #[test]
+    fn a_sweep_interrupted_by_a_restart_resumes_where_it_stopped() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("cruisemesh-sweep-restart-{unique}.sqlite"));
+        let path = path.to_string_lossy().to_string();
+        let key = cursor_key();
+        {
+            let store = MessageStore::open(path.clone()).unwrap();
+            store
+                .advance_relay_sweep_cursor(key.clone(), 512, true, 1_000)
+                .unwrap();
+        }
+        let restarted = MessageStore::open(path.clone()).unwrap();
+        let cursor = restarted.relay_fetch_cursor(key).unwrap();
+        assert_eq!(cursor.sweep_after_id, 512);
+        // `swept_this_session` is false again after a restart, but that guard
+        // is not what keeps this sweep alive -- the persisted progress is.
+        assert!(crate::relay_sweep_due(
+            false,
+            cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
+            9_999
+        ));
+        assert_eq!(
+            crate::relay_pass_start_cursor(true, cursor.after_id, cursor.sweep_after_id),
+            512
+        );
+        drop(restarted);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -10240,11 +10819,16 @@ mod tests {
 
         let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
         assert!(
-            !crate::relay_sweep_due(false, cursor.last_sweep_at_ms, 1_000_000 + 60_000),
+            !crate::relay_sweep_due(
+                false,
+                cursor.last_sweep_at_ms,
+                cursor.sweep_after_id,
+                1_000_000 + 60_000
+            ),
             "a restart minutes after a sweep must not re-walk the mailbox"
         );
         assert_eq!(
-            crate::relay_pass_start_cursor(false, cursor.after_id),
+            crate::relay_pass_start_cursor(false, cursor.after_id, cursor.sweep_after_id),
             29_000,
             "and the pass must resume from the frontier, not from 0"
         );
@@ -10252,6 +10836,7 @@ mod tests {
         assert!(crate::relay_sweep_due(
             false,
             cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
             1_000_000 + crate::RELAY_SWEEP_INTERVAL_MS
         ));
     }
@@ -10276,6 +10861,10 @@ mod tests {
         store
             .note_relay_sweep_completed(cursor_key(), 1_000_000)
             .unwrap();
+        // ...and a sweep of the second mailbox is part-way up it.
+        store
+            .advance_relay_sweep_cursor(other.clone(), 6_000, true, 1_000)
+            .unwrap();
 
         // Importing a contact widens the proxy-poll hints. Mail already in the
         // mailbox under that contact's hints is *below* the frontier, so the
@@ -10286,6 +10875,26 @@ mod tests {
         assert!(store.note_relay_hint_sources(own.clone()).unwrap());
         assert_eq!(store.relay_fetch_cursor(cursor_key()).unwrap().after_id, 0);
         assert_eq!(store.relay_fetch_cursor(other.clone()).unwrap().after_id, 0);
+        // The half-finished sweep's progress goes with it. Everything below
+        // 6_000 was walked while the widened hints were still invisible, so
+        // resuming from there would carry that gap into a sweep that then
+        // reports itself complete.
+        assert_eq!(
+            store
+                .relay_fetch_cursor(other.clone())
+                .unwrap()
+                .sweep_after_id,
+            0,
+            "a widened hint set invalidates a partial sweep's coverage"
+        );
+        assert_eq!(
+            store
+                .relay_fetch_cursor(other.clone())
+                .unwrap()
+                .sweep_started_at_ms,
+            0,
+            "and the sweep it dated is no longer under way"
+        );
         // ...and *only* the frontier gives. The sweep timestamp is the only
         // record of when this mailbox was last walked end to end; dropping it
         // here would both spend a full sweep on the next cold start and, worse,
@@ -10355,7 +10964,10 @@ mod tests {
 
         let cursor = store.relay_fetch_cursor(key).unwrap();
         // The re-walk happens now, sweep flag or not.
-        assert_eq!(crate::relay_pass_start_cursor(false, cursor.after_id), 0);
+        assert_eq!(
+            crate::relay_pass_start_cursor(false, cursor.after_id, cursor.sweep_after_id),
+            0
+        );
         // And the six-hour cadence is untouched: not due a minute later, due
         // once the interval measured from the *real* last sweep has elapsed --
         // asked with swept_this_session = true, the value that made the bug
@@ -10363,12 +10975,14 @@ mod tests {
         assert!(!crate::relay_sweep_due(
             true,
             cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
             swept_at + 60_000
         ));
         assert!(
             crate::relay_sweep_due(
                 true,
                 cursor.last_sweep_at_ms,
+                cursor.sweep_after_id,
                 swept_at + crate::RELAY_SWEEP_INTERVAL_MS
             ),
             "a membership change must not disable the periodic sweep"
@@ -10395,6 +11009,7 @@ mod tests {
         assert!(crate::relay_sweep_due(
             false,
             cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
             10_000
         ));
     }
@@ -10501,6 +11116,7 @@ mod tests {
         assert!(!crate::relay_sweep_due(
             false,
             cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
             1_000_001
         ));
         // And taking the backup did not cost the live store its frontier.
@@ -10840,6 +11456,7 @@ mod tests {
         assert!(!crate::relay_sweep_due(
             false,
             cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
             1_000_001
         ));
         assert!(
