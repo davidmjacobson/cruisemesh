@@ -85,6 +85,59 @@ pub fn core_lan_network_id_for_ipv4(address: String) -> Option<String> {
     core_lan_network_id_for_components(vec![format!("ipv4:{prefix}")])
 }
 
+/// Whether `candidate_host` sits on the same local network as `local_host` --
+/// the same IPv4 /24 the network-id fingerprint is built from, or the same
+/// routable IPv6 /64.
+///
+/// This decides whether a hinted address may be *filed* under this phone's
+/// current network id, not whether it may be dialed. Dialing a hint across
+/// subnets is deliberate (a routed LAN can carry TCP where mDNS cannot), but
+/// that one bounded attempt must not leave a seven-day cache entry claiming a
+/// foreign-subnet host belongs to the network we are on: a cached entry is
+/// re-dialed on every Wi-Fi join, so one stale hint otherwise becomes an
+/// endless probe of an address that can never answer here.
+///
+/// Both hosts must be address literals of the same family. A name, a mixed
+/// pair, or any unparseable string answers `false` -- "same network" is only
+/// claimed when it can be shown. IPv6 link-local addresses answer `false` as
+/// well: every link is `fe80::/64`, so a match there is no evidence at all,
+/// which is exactly the mistake this function exists to prevent. A global or
+/// unique-local /64 is a real fingerprint and is honoured, so an IPv6-only
+/// Wi-Fi network is not silently excluded from the cache.
+///
+/// Nothing here discovers or forwards an address; it compares two the caller
+/// already holds.
+#[uniffi::export]
+pub fn lan_hosts_share_local_network(local_host: String, candidate_host: String) -> bool {
+    if let Some(local) = core_lan_network_id_for_ipv4(local_host.clone()) {
+        return core_lan_network_id_for_ipv4(candidate_host).is_some_and(|it| it == local);
+    }
+    let Some(local) = routable_ipv6_prefix_64(&local_host) else {
+        return false;
+    };
+    routable_ipv6_prefix_64(&candidate_host).is_some_and(|candidate| candidate == local)
+}
+
+/// The /64 of an IPv6 literal that can fingerprint a network, or `None` when
+/// the address cannot (link-local, loopback, unspecified, or unparseable). A
+/// zone suffix (`fe80::1%wlan0`) is stripped before parsing -- Android hands
+/// those out -- but such an address is link-local and rejected regardless.
+fn routable_ipv6_prefix_64(address: &str) -> Option<[u8; 8]> {
+    let host = address.split('%').next()?;
+    let parsed: std::net::Ipv6Addr = host.parse().ok()?;
+    if parsed.is_loopback() || parsed.is_unspecified() {
+        return None;
+    }
+    let octets = parsed.octets();
+    // fe80::/10 -- identical on every link, so it proves nothing.
+    if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+        return None;
+    }
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&octets[..8]);
+    Some(prefix)
+}
+
 #[uniffi::export]
 pub fn core_lan_network_id_for_components(components: Vec<String>) -> Option<String> {
     if components.is_empty() {
@@ -230,6 +283,97 @@ mod tests {
             "",
         ] {
             assert!(!lan_endpoint_host_is_local(host.into()), "{host}");
+        }
+    }
+
+    #[test]
+    fn same_network_check_only_says_yes_for_a_shared_ipv4_24() {
+        assert!(lan_hosts_share_local_network(
+            "192.168.86.31".into(),
+            "192.168.86.23".into()
+        ));
+        assert!(lan_hosts_share_local_network(
+            "10.80.209.1".into(),
+            "10.80.209.68".into()
+        ));
+        // The field case: a hint from a foreign subnet must never be filed
+        // under the network this phone is actually on.
+        assert!(!lan_hosts_share_local_network(
+            "192.168.86.31".into(),
+            "10.80.209.68".into()
+        ));
+        // Neighbouring /24s are different networks even inside one prefix.
+        assert!(!lan_hosts_share_local_network(
+            "192.168.86.31".into(),
+            "192.168.87.23".into()
+        ));
+        // Same host is trivially on its own network.
+        assert!(lan_hosts_share_local_network(
+            "192.168.86.31".into(),
+            "192.168.86.31".into()
+        ));
+    }
+
+    #[test]
+    fn same_network_check_honours_a_routable_ipv6_64() {
+        // An IPv6-only Wi-Fi network still has a real fingerprint, so hints
+        // on it are cacheable rather than silently dropped.
+        assert!(lan_hosts_share_local_network(
+            "2001:db8:1:2::31".into(),
+            "2001:db8:1:2::23".into()
+        ));
+        assert!(lan_hosts_share_local_network(
+            "fd12:3456:789a:1::1".into(),
+            "fd12:3456:789a:1::99".into()
+        ));
+        // A different /64 is a different network.
+        assert!(!lan_hosts_share_local_network(
+            "2001:db8:1:2::31".into(),
+            "2001:db8:1:3::23".into()
+        ));
+        // Link-local is fe80::/64 on every link in the world: a match there
+        // is no evidence, so it never authorises a cache entry -- with or
+        // without a zone suffix.
+        assert!(!lan_hosts_share_local_network(
+            "fe80::1".into(),
+            "fe80::2".into()
+        ));
+        assert!(!lan_hosts_share_local_network(
+            "fe80::1%wlan0".into(),
+            "fe80::2%wlan0".into()
+        ));
+        // Families never mix.
+        assert!(!lan_hosts_share_local_network(
+            "192.168.86.31".into(),
+            "2001:db8:1:2::23".into()
+        ));
+        assert!(!lan_hosts_share_local_network(
+            "2001:db8:1:2::31".into(),
+            "192.168.86.23".into()
+        ));
+    }
+
+    #[test]
+    fn same_network_check_rejects_anything_it_cannot_parse() {
+        for (local, candidate) in [
+            ("192.168.86.31", "phone.local"),
+            ("192.168.86.31", "fe80::1"),
+            ("192.168.86.31", "[fe80::1]"),
+            ("192.168.86.31", ""),
+            ("192.168.86.31", "192.168.86"),
+            ("192.168.86.31", "192.168.86.999"),
+            ("192.168.86.31", "192.168.86.23:45892"),
+            ("fe80::1", "fe80::1"),
+            ("::1", "::1"),
+            ("2001:db8:1:2::31", "not:an:address"),
+            ("", "192.168.86.23"),
+            ("", ""),
+            ("router", "192.168.86.23"),
+        ] {
+            assert!(
+                !lan_hosts_share_local_network(local.into(), candidate.into()),
+                "{local} vs {candidate}"
+            );
         }
     }
 

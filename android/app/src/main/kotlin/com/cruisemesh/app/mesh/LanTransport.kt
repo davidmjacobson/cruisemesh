@@ -41,6 +41,7 @@ import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.LanNoiseSession
 import uniffi.cruisemesh_core.lanDefaultTcpPort
+import uniffi.cruisemesh_core.lanHostsShareLocalNetwork
 import uniffi.cruisemesh_core.lanServiceType
 
 /**
@@ -508,7 +509,28 @@ internal class LanTransport(
             val remoteToken = hint.instanceToken.toHex()
             val hintKey = lanHintConnectKey(remoteToken)
             val endpoint = LanManualEndpoint(hint.host, hint.port.toInt())
-            onEndpointObserved(expectedUserId, endpoint, currentNetworkId)
+            // The dial below is deliberately attempted even when the hinted
+            // host sits on another subnet -- a routed LAN can carry TCP where
+            // mDNS cannot, and it is one bounded attempt Noise authenticates.
+            // Filing that address in the endpoint cache is a different matter:
+            // the cache is keyed by THIS phone's network, is re-dialed on
+            // every Wi-Fi join and lives for seven days, so a foreign-subnet
+            // host written here became a permanent background probe of an
+            // address that can never answer on this network. Only remember an
+            // address we can show is on the network we are on.
+            //
+            // When this phone has no comparable address of its own the hint
+            // is simply not filed. That is the safe direction, and it is not
+            // the last chance to learn the address: if the dial below
+            // authenticates, onLanPeerAuthenticated files the endpoint on the
+            // stronger authority of having reached it.
+            val localHost = endpointHint?.host
+            if (
+                localHost != null &&
+                lanHostsShareLocalNetwork(localHost = localHost, candidateHost = endpoint.host)
+            ) {
+                onEndpointObserved(expectedUserId, endpoint, currentNetworkId)
+            }
             if (!started) return@post
             notePeerEvidence(remoteToken)
             if (!shouldInitiateLanConnection(instanceToken, remoteToken)) {
@@ -541,7 +563,7 @@ internal class LanTransport(
             val network = wifiNetwork ?: return@post
             connectToEndpoints(
                 network = network,
-                key = "cache:${expectedUserId.toHex()}:${endpoint.display}",
+                key = lanCachedConnectKey(expectedUserId.toHex(), endpoint.display),
                 endpoints = listOf(InetSocketAddress(endpoint.host, endpoint.port)),
                 expectedUserId = expectedUserId,
             )
@@ -712,7 +734,9 @@ internal class LanTransport(
         // reconnect target means every scheduleReconnect for the key finds
         // nothing to retry. A later hint (or discovery, or the cached
         // endpoint) can try again -- the attempt just never reschedules
-        // itself.
+        // itself. Completing Noise is what promotes such an address from
+        // "claimed" to "proven": runConnection remembers it then, so a link
+        // that really worked still comes back on the reconnect timer.
         if (!isSingleShotLanConnectKey(key)) {
             rememberReconnectTarget(key, endpoints, expectedUserId)
         }
@@ -760,6 +784,11 @@ internal class LanTransport(
                     connectionBackoff.recordFailure(key, System.currentTimeMillis())
                     outboundServiceKeys.remove(key)
                     releaseSocketSlot()
+                    // A single-shot key only holds a reconnect target because
+                    // this address once authenticated. It just failed to
+                    // answer, so it is unproven again -- retire it rather than
+                    // let one good handshake license a standing probe.
+                    if (isSingleShotLanConnectKey(key)) reconnectTargets.remove(key)
                     scheduleReconnect(key)
                     // A failed direct connect is exactly when a fallback
                     // sweep becomes worth checking promptly, instead of
@@ -871,12 +900,24 @@ internal class LanTransport(
             connections[address] = connection
             authenticatedUserIds[address] = trustedUserId.toHex()
             outboundServiceKey?.let { key ->
-                // computeIfPresent keeps this a single atomic step; scan and
-                // reconnect attempts touch the same key from other executor
-                // threads and a plain read-modify-write could lose a racing
-                // update to this reconnect target's endpoint list.
-                reconnectTargets.computeIfPresent(key) { _, target ->
-                    target.copy(expectedUserId = trustedUserId.copyOf())
+                if (isSingleShotLanConnectKey(key) && advertisedEndpoint != null) {
+                    // A hinted or cached address is dialed once precisely
+                    // because nothing proved it was real. Finishing Noise is
+                    // that proof, so it earns a reconnect target now: a link
+                    // the AP or Doze kills comes back on the backoff timer
+                    // instead of waiting for the next Wi-Fi join. If the
+                    // retry then fails, connectToEndpoints retires the target
+                    // again and the address is back to single-shot.
+                    rememberReconnectTarget(key, listOf(advertisedEndpoint), trustedUserId)
+                } else {
+                    // computeIfPresent keeps this a single atomic step; scan
+                    // and reconnect attempts touch the same key from other
+                    // executor threads and a plain read-modify-write could
+                    // lose a racing update to this reconnect target's
+                    // endpoint list.
+                    reconnectTargets.computeIfPresent(key) { _, target ->
+                        target.copy(expectedUserId = trustedUserId.copyOf())
+                    }
                 }
             }
             val authenticatedEndpoint = advertisedEndpoint?.let {
@@ -1778,26 +1819,59 @@ internal fun shouldRunAutomaticLanScan(
     pendingOutboundAttempts <= 0 &&
     scanRemaining <= 0
 
+/**
+ * Whether a closed link's reconnect target survives the close.
+ *
+ * An authenticated link always keeps it: the address is proven, and the peer
+ * may simply have gone to sleep. A close without authentication keeps it only
+ * for evidence this phone gathered itself and can gather again -- a subnet
+ * sweep hit that turned out not to be a friend is dropped, and so is a hinted
+ * or cached address, which only ever holds a target because an earlier
+ * handshake proved it (see [isSingleShotLanConnectKey]). Failing now makes it
+ * unproven again.
+ */
 internal fun shouldRetainLanReconnectTarget(
     serviceKey: String,
     wasAuthenticated: Boolean,
-): Boolean = wasAuthenticated || !serviceKey.startsWith("scan:")
+): Boolean = wasAuthenticated ||
+    !(serviceKey.startsWith("scan:") || isSingleShotLanConnectKey(serviceKey))
 
 /** Prefix marking a connection key that came from a contact's LAN hint. */
 internal const val LAN_HINT_KEY_PREFIX = "hint:"
 
+/** Prefix marking a connection key replayed from the saved endpoint cache. */
+internal const val LAN_CACHED_KEY_PREFIX = "cache:"
+
 internal fun lanHintConnectKey(remoteInstanceToken: String): String =
     "$LAN_HINT_KEY_PREFIX$remoteInstanceToken"
 
+internal fun lanCachedConnectKey(userIdHex: String, endpointDisplay: String): String =
+    "$LAN_CACHED_KEY_PREFIX$userIdHex:$endpointDisplay"
+
 /**
  * Whether a connection key may only ever be attempted once per piece of
- * evidence. A hint carries an address supplied by the contact rather than one
- * this phone observed, so it is tried when it arrives and never retried on a
- * timer; a fresh hint, mDNS discovery, or the cached endpoint is what starts
- * another attempt. Keys this phone found itself keep their reconnect target.
+ * evidence. Keys this phone found itself (mDNS, a subnet scan, a manual
+ * address a human typed) keep their reconnect target and retry on a timer.
+ * Two kinds do not:
+ *
+ * - a hint carries an address supplied by the contact rather than one this
+ *   phone observed, so it is tried when it arrives and never retried;
+ * - a cached endpoint is a *remembered* hint, so it is no better evidence
+ *   than the hint was. Retrying it on a timer is what turned a single stale
+ *   address into a dial every sixty seconds for as long as the phone stayed
+ *   on the network.
+ *
+ * Retry coverage is not lost. `MeshService.onLanNetworkReady` replays every
+ * cached endpoint on each Wi-Fi join, so a cached address still gets one
+ * attempt per network join, plus another whenever a fresh hint or discovery
+ * arrives -- which is the only kind of event that can make a dead address
+ * live again. And single-shot is only the state an *unproven* address is in:
+ * once one of these completes a Noise handshake, `runConnection` gives it a
+ * reconnect target like any other proven link, so a dropped link still comes
+ * back on the timer. The target is retired the moment an attempt fails again.
  */
 internal fun isSingleShotLanConnectKey(serviceKey: String): Boolean =
-    serviceKey.startsWith(LAN_HINT_KEY_PREFIX)
+    serviceKey.startsWith(LAN_HINT_KEY_PREFIX) || serviceKey.startsWith(LAN_CACHED_KEY_PREFIX)
 
 private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 

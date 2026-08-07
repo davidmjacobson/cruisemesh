@@ -8,6 +8,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.lanDefaultTcpPort
+import uniffi.cruisemesh_core.lanHostsShareLocalNetwork
 import uniffi.cruisemesh_core.lanServiceType
 
 class LanTransportTest {
@@ -109,14 +110,103 @@ class LanTransportTest {
         val hintKey = lanHintConnectKey("a1b2c3d4e5f60718")
         assertTrue(isSingleShotLanConnectKey(hintKey))
         // Keys this phone found itself keep retrying: mDNS service names,
-        // subnet sweep hits, the cached endpoint, and manual entry.
+        // subnet sweep hits, and manual entry.
         assertTrue(!isSingleShotLanConnectKey("CruiseMesh-abc123._cruisemesh._tcp"))
         assertTrue(!isSingleShotLanConnectKey("scan:10.0.0.2"))
-        assertTrue(!isSingleShotLanConnectKey("cache:friend:10.0.0.5:45892"))
         assertTrue(!isSingleShotLanConnectKey("manual:10.0.0.4:45892"))
         // The hint key stays distinct from the bare instance token so a
         // hint can never take over a discovered peer's retry state.
         assertTrue(!isSingleShotLanConnectKey("a1b2c3d4e5f60718"))
+    }
+
+    @Test
+    fun `a cached address is a remembered hint and retries no harder than one`() {
+        // A cache entry is only ever a hint this phone wrote down, so it
+        // carries no better evidence than the hint did. Retrying it on a
+        // timer is what turned one stale address into a dial every sixty
+        // seconds forever; onLanNetworkReady replays the cache on each Wi-Fi
+        // join, so the address still gets an attempt whenever anything about
+        // the network could have changed.
+        val cachedKey = lanCachedConnectKey("a1b2c3d4e5f60718", "10.0.0.5:45892")
+        assertEquals("cache:a1b2c3d4e5f60718:10.0.0.5:45892", cachedKey)
+        assertTrue(isSingleShotLanConnectKey(cachedKey))
+        assertTrue(isSingleShotLanConnectKey("cache:friend:10.0.0.5:45892"))
+        // A key that merely mentions the word is not a cached key.
+        assertTrue(!isSingleShotLanConnectKey("scan:10.0.0.2/cache:"))
+    }
+
+    @Test
+    fun `a hinted address is filed only when it is on this phone's own subnet`() {
+        // The field failure: a phone on 192.168.86.0/24 kept a hint for
+        // 10.80.209.68 as if it belonged to the network it was on. This is
+        // the rule for a *hint*; an endpoint that authenticated is filed on
+        // its own authority (MeshService.onLanPeerAuthenticated), because an
+        // address that answered is better evidence than a claim about one.
+        assertTrue(
+            lanHostsShareLocalNetwork(
+                localHost = "192.168.86.31",
+                candidateHost = "192.168.86.23",
+            ),
+        )
+        assertTrue(
+            !lanHostsShareLocalNetwork(
+                localHost = "192.168.86.31",
+                candidateHost = "10.80.209.68",
+            ),
+        )
+        // Unprovable is treated as "no": names, IPv6 literals, and garbage.
+        assertTrue(
+            !lanHostsShareLocalNetwork(
+                localHost = "192.168.86.31",
+                candidateHost = "phone.local",
+            ),
+        )
+        assertTrue(
+            !lanHostsShareLocalNetwork(localHost = "192.168.86.31", candidateHost = "fe80::1"),
+        )
+        assertTrue(!lanHostsShareLocalNetwork(localHost = "", candidateHost = "192.168.86.23"))
+        // An IPv6-only Wi-Fi network still has a usable fingerprint, so hints
+        // on one are cacheable -- except link-local, which is fe80::/64 on
+        // every link there has ever been and therefore proves nothing.
+        assertTrue(
+            lanHostsShareLocalNetwork(
+                localHost = "2001:db8:1:2::31",
+                candidateHost = "2001:db8:1:2::23",
+            ),
+        )
+        assertTrue(
+            !lanHostsShareLocalNetwork(
+                localHost = "2001:db8:1:2::31",
+                candidateHost = "2001:db8:1:3::23",
+            ),
+        )
+        assertTrue(
+            !lanHostsShareLocalNetwork(localHost = "fe80::1", candidateHost = "fe80::2"),
+        )
+    }
+
+    @Test
+    fun `a single-shot address keeps a reconnect target only while it stays proven`() {
+        // The point of single-shot is to stop dialing an address nothing ever
+        // answered on. An address that completed a Noise handshake is not
+        // that address: dropping its reconnect target would leave a working
+        // LAN link waiting for the next Wi-Fi join after the access point
+        // idles the socket out. So an authenticated close retains the
+        // target...
+        val cachedKey = lanCachedConnectKey("a1b2c3d4e5f60718", "10.0.0.5:45892")
+        val hintKey = lanHintConnectKey("00112233445566778899aabbccddeeff")
+        assertTrue(shouldRetainLanReconnectTarget(cachedKey, wasAuthenticated = true))
+        assertTrue(shouldRetainLanReconnectTarget(hintKey, wasAuthenticated = true))
+        // ...and a close without authentication -- including the retry that
+        // proof bought -- retires it again, so one good handshake can never
+        // license a permanent background probe.
+        assertTrue(!shouldRetainLanReconnectTarget(cachedKey, wasAuthenticated = false))
+        assertTrue(!shouldRetainLanReconnectTarget(hintKey, wasAuthenticated = false))
+        // A sweep hit that was not a friend is dropped the same way, while
+        // evidence this phone can regather itself is kept.
+        assertTrue(!shouldRetainLanReconnectTarget("scan:10.0.0.5:45892", wasAuthenticated = false))
+        assertTrue(shouldRetainLanReconnectTarget("nsd:friend-phone", wasAuthenticated = false))
+        assertTrue(shouldRetainLanReconnectTarget("manual:10.0.0.5:45892", wasAuthenticated = false))
     }
 
     @Test
@@ -382,7 +472,10 @@ class LanTransportTest {
         assertTrue(shouldRetainLanReconnectTarget("scan:10.0.0.2", wasAuthenticated = true))
         assertTrue(!shouldRetainLanReconnectTarget("scan:10.0.0.3", wasAuthenticated = false))
         assertTrue(shouldRetainLanReconnectTarget("manual:10.0.0.4", wasAuthenticated = false))
-        assertTrue(shouldRetainLanReconnectTarget("cache:friend:10.0.0.5", wasAuthenticated = false))
+        // A cached address is unproven evidence in exactly the way a failed
+        // sweep hit is -- see the single-shot rule.
+        assertTrue(!shouldRetainLanReconnectTarget("cache:friend:10.0.0.5", wasAuthenticated = false))
+        assertTrue(shouldRetainLanReconnectTarget("cache:friend:10.0.0.5", wasAuthenticated = true))
     }
 
     @Test

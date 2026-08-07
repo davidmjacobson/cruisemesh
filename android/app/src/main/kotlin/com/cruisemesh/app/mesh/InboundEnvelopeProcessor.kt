@@ -975,29 +975,33 @@ internal class InboundEnvelopeProcessor(
 
         val hintedNetworkId = content.networkId.toString(Charsets.UTF_8)
         val endpoint = LanManualEndpoint(content.host, content.port.toInt())
-        lan.saveLanEndpoint(hintedNetworkId, senderUserId, endpoint)
         LanCapabilityStore.markSupported(context, senderUserId)
         lan.onLanCapabilityChanged()
         val now = System.currentTimeMillis()
-        // The network fingerprint is stored with the cached endpoint but
-        // deliberately does NOT gate this dial: requiring an exact match
-        // silently disabled fresh hints on routed multi-subnet LANs -- the
-        // case the sealed hint exists for (mDNS is link-local; TCP may still
-        // route). A cross-network false positive is one bounded TCP attempt
-        // to an endpoint the contact sealed to us, and Noise authenticates.
-        // Being on some Wi-Fi is the only requirement.
-        if (
-            content.expiresAtMs > now &&
-            lan.currentLanNetworkId() != null
-        ) {
-            lan.connectToLanHint(
-                Frame.LanEndpoint(
-                    instanceToken = content.instanceToken,
-                    host = content.host,
-                    port = content.port,
-                ),
-                senderUserId,
-            )
+        // A sealed hint is only good for its stated lifetime (fifteen minutes;
+        // see LanEndpointSender). This envelope may have sat in a relay
+        // backlog for hours or days, so an expired hint is neither saved nor
+        // dialed -- saving first would re-file a long-dead address and reset
+        // its seven-day cache clock on every replay.
+        if (content.expiresAtMs > now) {
+            lan.saveLanEndpoint(hintedNetworkId, senderUserId, endpoint)
+            // The network fingerprint is stored with the cached endpoint but
+            // deliberately does NOT gate this dial: requiring an exact match
+            // silently disabled fresh hints on routed multi-subnet LANs -- the
+            // case the sealed hint exists for (mDNS is link-local; TCP may
+            // still route). A cross-network false positive is one bounded TCP
+            // attempt to an endpoint the contact sealed to us, and Noise
+            // authenticates. Being on some Wi-Fi is the only requirement.
+            if (lan.currentLanNetworkId() != null) {
+                lan.connectToLanHint(
+                    Frame.LanEndpoint(
+                        instanceToken = content.instanceToken,
+                        host = content.host,
+                        port = content.port,
+                    ),
+                    senderUserId,
+                )
+            }
         }
         acknowledgeHiddenMessage(address, senderUserId, identity, contact)
     }

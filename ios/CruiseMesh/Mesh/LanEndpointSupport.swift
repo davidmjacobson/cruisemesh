@@ -26,17 +26,56 @@ func parseLanEndpointLink(_ fragment: String?) -> LanManualEndpoint? {
 /// Prefix marking a connection key that came from a contact's LAN hint.
 let lanHintKeyPrefix = "hint:"
 
+/// Prefix marking a connection key replayed from the saved endpoint cache.
+let lanCachedKeyPrefix = "cache:"
+
 func lanHintConnectKey(_ endpointDisplay: String) -> String {
     "\(lanHintKeyPrefix)\(endpointDisplay)"
 }
 
+func lanCachedConnectKey(_ endpointDisplay: String) -> String {
+    "\(lanCachedKeyPrefix)\(endpointDisplay)"
+}
+
 /// Whether a connection key may only ever be attempted once per piece of
-/// evidence. A hint carries an address supplied by the contact rather than one
-/// this phone observed, so it is tried when it arrives and never retried on a
-/// timer; a fresh hint, Bonjour discovery, or the cached endpoint is what
-/// starts another attempt. Keys this phone found itself keep retrying.
+/// evidence. Keys this phone found itself -- Bonjour service names, subnet
+/// sweep hits, a manual address a human typed -- keep retrying on a timer.
+/// Two kinds do not:
+///
+/// - a hint carries an address supplied by the contact rather than one this
+///   phone observed, so it is tried when it arrives and never retried;
+/// - a cached endpoint is a *remembered* hint, so it is no better evidence
+///   than the hint was. Retrying it on a timer turned a single stale address
+///   into a dial every sixty seconds for as long as the phone stayed on the
+///   network.
+///
+/// Retry coverage is not lost. `MeshController`'s `onNetworkReady` replays
+/// every cached endpoint on each Wi-Fi join, so a cached address still gets
+/// one attempt per network join, plus another whenever a fresh hint or
+/// Bonjour discovery arrives -- the only kind of event that can make a dead
+/// address live again. And single-shot is only the state an *unproven*
+/// address is in: once one of these completes a Noise handshake,
+/// `LanTransport.connectionAuthenticated` files it as a retry endpoint like
+/// any other proven link, so a dropped link still comes back on the timer.
+/// The endpoint is retired the moment an attempt fails again.
 func isSingleShotLanConnectKey(_ serviceKey: String) -> Bool {
-    serviceKey.hasPrefix(lanHintKeyPrefix)
+    serviceKey.hasPrefix(lanHintKeyPrefix) || serviceKey.hasPrefix(lanCachedKeyPrefix)
+}
+
+/// Whether a hinted host may be *filed* in this phone's endpoint cache, given
+/// the phone's own LAN address. Dialing a hint across subnets is deliberate;
+/// remembering it as if it belonged to the network we are on is the defect
+/// this closes -- the shared core is the authority for the comparison.
+///
+/// No comparable local address means no filing. Nothing is lost by that here:
+/// this phone's cache is keyed by an IPv4 network fingerprint
+/// (`lanNetworkId(ipv4Address:)`), so without an IPv4 address there is no
+/// cache to write to in the first place. And if the hint's dial
+/// authenticates, `onLanPeerAuthenticated` files the endpoint anyway, on the
+/// stronger authority of having reached it.
+func lanHintMayBeCached(localHost: String?, candidateHost: String) -> Bool {
+    guard let localHost else { return false }
+    return lanHostsShareLocalNetwork(localHost: localHost, candidateHost: candidateHost)
 }
 
 /// The active Wi-Fi IPv4 address and its advertised subnet prefix.
