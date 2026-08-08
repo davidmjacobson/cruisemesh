@@ -133,7 +133,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private var lanHealthTimer: DispatchSourceTimer?
     // D8: periodic re-digest bookkeeping.
     private var digestMaintenanceTimer: DispatchSourceTimer?
-    private var lastDigestAtByAddress: [String: Int64] = [:]
+    // The map that used to live here — `lastDigestAtByAddress` — is gone. It
+    // was written by every spray and read by only one of them (the maintenance
+    // tick), so the event-driven call sites sprayed unconditionally; see issue
+    // #280 and `core/src/spray_policy.rs`. Cadence, budgets, identical-set
+    // suppression and receipt-quiet backoff are now one core decision,
+    // consulted through `SprayPolicy`.
     private var audioRouteObserver: NSObjectProtocol?
     private var relaySyncInFlight = false
     private var relaySyncPending = false
@@ -450,7 +455,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         failoverResumeDebounce.clear()
         digestMaintenanceTimer?.cancel()
         digestMaintenanceTimer = nil
-        lastDigestAtByAddress.removeAll()
+        SprayPolicy.reset()
         currentLanEndpoint = nil
         currentLanInstanceToken = nil
         currentLanNetworkId = nil
@@ -896,11 +901,53 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             refreshNearby()
             return
         }
+        // Small frames first, and outside every brake: they are the fastest
+        // way off this radio entirely if the peer shares our Wi-Fi.
         sendLanEndpointHint(address: address)
         queueCurrentLanEndpoint(to: userId)
-        drainCarriedEnvelopesTo(address: address, peerUserId: userId)
+
+        // Cadence gate (#280). This handler claims `.firstContact` because a
+        // HELLO is what a fresh encounter looks like from here — two phones
+        // meeting and beginning to sync must never be delayed. Core does not
+        // take the claim on trust: it downgrades it to reconnect churn from
+        // its own record of this peer, which is what makes hundreds of
+        // reconnects cost hundreds of map lookups instead of hundreds of
+        // bursts.
+        let gate = SprayPolicy.maySpray(
+            peerUserId: userId,
+            address: address,
+            trigger: .firstContact
+        )
+        guard gate.allow else {
+            log.info("Holding the HELLO burst for \(address, privacy: .public): retry in \(gate.retryAfterMs)ms")
+            rearmGatedSpray(peerUserId: userId, gate: gate)
+            refreshNearby()
+            return
+        }
+        drainCarriedEnvelopesTo(
+            address: address,
+            peerUserId: userId,
+            carriedBudgetBytes: gate.carriedBudgetBytes
+        )
         sendDigest(address: address, userId: userId, identity: identity)
         refreshNearby()
+    }
+
+    /// Re-arm a burst the cadence gate held back, when core says the wait is
+    /// short enough to be worth a timer.
+    ///
+    /// Nothing is dropped either way: past that horizon the ordinary 3-5
+    /// minute maintenance tick is the cheaper way back, and it always comes.
+    /// The threshold is core's (`SprayPolicy.retryArmMaxMs`) so neither shell
+    /// owns it. Re-entry is `scheduleFailoverResume`, the same coalescing path
+    /// a dying sibling link uses, so a gate denial landing on top of a live
+    /// failover burst still produces one resume rather than two.
+    private func rearmGatedSpray(peerUserId: Data, gate: CoreSprayGate) {
+        guard gate.retryWorthArming, gate.retryAfterMs > 0 else { return }
+        meshQueue.asyncAfter(deadline: .now() + .milliseconds(Int(clamping: gate.retryAfterMs))) { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.scheduleFailoverResume(peerUserId: peerUserId)
+        }
     }
 
     /// Failover path into `resumeLogicalPeerSync`, delayed and coalesced per
@@ -949,8 +996,26 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private func resumeLogicalPeerSync(peerUserId: Data) {
         guard let identity,
               let route = MeshRouter.routeFor(userId: peerUserId) else { return }
+        // Cadence gate (#280). This is the reconnect-churn path: a link dying
+        // and being re-elected several times a minute used to buy a full burst
+        // each time. First contact is not this path — `handleHello` owns that
+        // — so a denial here only ever delays a repeat.
+        let gate = SprayPolicy.maySpray(
+            peerUserId: peerUserId,
+            address: route.1,
+            trigger: .reconnect
+        )
+        guard gate.allow else {
+            log.info("Holding the resume burst for \(route.1, privacy: .public): retry in \(gate.retryAfterMs)ms")
+            rearmGatedSpray(peerUserId: peerUserId, gate: gate)
+            return
+        }
         log.info("Logical peer selected \(route.1, privacy: .public); resuming carry and digest sync")
-        drainCarriedEnvelopesTo(address: route.1, peerUserId: peerUserId)
+        drainCarriedEnvelopesTo(
+            address: route.1,
+            peerUserId: peerUserId,
+            carriedBudgetBytes: gate.carriedBudgetBytes
+        )
         sendDigest(address: route.1, userId: peerUserId, identity: identity)
     }
 
@@ -979,7 +1044,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             return
         }
         MeshRouter.sendToAddress(address: address, frame: digest)
-        lastDigestAtByAddress[address] = Int64(Date().timeIntervalSince1970 * 1_000)
+        SprayPolicy.noteDigestSent(peerUserId: userId, address: address)
     }
 
     /// Battery, 2026-07-21: foreground-only (see `setAppForeground`). This
@@ -1023,13 +1088,20 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private func checkDigestMaintenance() {
         guard let identity else { return }
         let routes = MeshRouter.selectedIdentifiedRoutes()
-        let active = Set(routes.map { $0.address })
-        lastDigestAtByAddress = lastDigestAtByAddress.filter { active.contains($0.key) }
-        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        let now = SprayPolicy.nowMs
         for route in routes {
-            let last = lastDigestAtByAddress[route.address] ?? 0
-            let seed = UInt64(bitPattern: Int64(truncatingIfNeeded: route.address.hashValue))
-            if shouldRedigest(nowMs: now, lastDigestAtMs: last, jitterSeed: seed) {
+            // Core still owns the jittered 3-5 minute window; what is new is
+            // that a link whose sprays keep producing no receipt progress
+            // waits longer, and that this tick and the event-driven callers
+            // now read the same record instead of one writing and the other
+            // reading. No bookkeeping is retained here: core prunes its own.
+            let gate = SprayPolicy.maySpray(
+                peerUserId: route.userId,
+                address: route.address,
+                trigger: .maintenance,
+                nowMs: now
+            )
+            if gate.allow {
                 sendDigest(address: route.address, userId: route.userId, identity: identity)
             }
         }
@@ -1046,6 +1118,21 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         guard DigestSync.isExpectedChatId(digestChatId: chatId, helloUserId: peerUserId),
               let peerUserId else {
             log.warning("Dropping DIGEST from \(address, privacy: .public)")
+            return
+        }
+        // Cadence gate (#280). This is the larger outbound half of the
+        // exchange, so leaving it ungated would brake nothing. It is normally
+        // allowed: our own just-sent digest opened core's exchange window, and
+        // this digest is the answer to it. What it refuses is an unprovoked
+        // digest arriving from a peer reconnecting every few seconds.
+        let gate = SprayPolicy.maySpray(
+            peerUserId: peerUserId,
+            address: address,
+            trigger: .peerDigest
+        )
+        guard gate.allow else {
+            log.info("Holding the digest response for \(address, privacy: .public): retry in \(gate.retryAfterMs)ms")
+            rearmGatedSpray(peerUserId: peerUserId, gate: gate)
             return
         }
         if let contact = try? store.getContact(userId: peerUserId) {
@@ -1089,7 +1176,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             address: address,
             peerUserId: peerUserId,
             peerKnownIds: recentMsgIds,
-            identity: identity
+            identity: identity,
+            gate: gate
         )
     }
 
@@ -1978,6 +2066,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         guard let receipt = try? decodeReceiptContent(bytes: body.content) else { return }
         guard receipt.senderUserId == identity.userId else { return }
         guard (try? store.getContact(userId: envelopeSender)) != nil else { return }
+        // A receipt is the other half of what the receipt-quiet backoff (#280)
+        // watches for: sprays toward this peer are converging, so its cadence
+        // returns to normal.
+        SprayPolicy.noteReceiptProgress(peerUserId: envelopeSender)
         // T4-06: advancing the receipt watermark is the durable state here;
         // let a store failure propagate so a relay-fetched receipt is not
         // acked away before it is recorded. T6: the receipt returned on the
@@ -2886,7 +2978,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// dropped mid-transfer link is a harmless duplicate resend (the peer's
     /// seen-set/store dedupes it), never a lost envelope; an unconfirmed
     /// carry still dies at its normal expiry via `store.pruneExpiredCarried`.
-    private func drainCarriedEnvelopesTo(address: String, peerUserId: Data) {
+    private func drainCarriedEnvelopesTo(
+        address: String,
+        peerUserId: Data,
+        carriedBudgetBytes: UInt64
+    ) {
+        guard carriedBudgetBytes > 0 else { return }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         try? store.pruneExpiredCarried(nowMs: now)
         // G2: budgeted page + resume cursor (DTN: offer only, never remove on send).
@@ -2896,7 +2993,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         guard let page = try? store.carriedEnvelopesForHintsPage(
             hints: hints,
             nowMs: now,
-            budgetBytes: MeshDefaults.carriedSprayBudgetBytes,
+            budgetBytes: carriedBudgetBytes,
             after: lane.after
         ) else { return }
         var delivered = 0
@@ -2946,11 +3043,24 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         carriedOffersThisEpoch += 1
     }
 
+    /// Executes Rust's complete digest-time mule plan, inside the budgets
+    /// `gate` was issued with.
+    ///
+    /// `gate` is core's answer to "may this peer be sprayed, and how much"
+    /// (`SprayPolicy`); the caller has already checked `gate.allow`. Two
+    /// further core decisions happen here, both after the plan is built
+    /// because both need to know what the plan came out as: whether the
+    /// advertised set is byte-identical to the one this peer was already
+    /// offered, and what the plan costs this link's burst allowance. A
+    /// suppressed plan sends nothing and, just as importantly, advances no
+    /// cursor and records no hidden-kind offer — everything it would have
+    /// offered stays exactly as re-discoverable as it was.
     private func sprayDigestPlanTo(
         address: String,
         peerUserId: Data,
         peerKnownIds: [Data],
-        identity: Identity
+        identity: Identity,
+        gate: CoreSprayGate
     ) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): confirm delivery of
@@ -2964,6 +3074,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             nowMs: now
         ), confirmed > 0 {
             log.info("Confirmed delivery of \(confirmed) carried envelope(s) to \(UserIdHex.encode(peerUserId), privacy: .public); dropped our copy")
+            // Hard evidence that sprays to this peer are landing: it just
+            // proved it holds copies we were carrying. That is what the
+            // receipt-quiet backoff is looking for. Its absence is NOT
+            // evidence of a fault — a courier for someone who is not here
+            // legitimately confirms nothing.
+            SprayPolicy.noteReceiptProgress(peerUserId: peerUserId)
         }
         // How far this link session's walk through our carry queue has got. A
         // courier's store can be many times one round's budget, so each
@@ -2980,15 +3096,28 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             peerHints: recentHintsFor(userId: peerUserId, nowMs: now),
             peerKnownMsgIds: peerKnownIds,
             nowMs: now,
-            carriedBudgetBytes: allowCarried ? MeshDefaults.carriedSprayBudgetBytes : 0,
-            ownOutboundBudgetBytes: MeshDefaults.ownOutboundSprayBudgetBytes,
-            ownReceiptBudgetBytes: MeshDefaults.ownReceiptSprayBudgetBytes,
+            carriedBudgetBytes: allowCarried ? gate.carriedBudgetBytes : 0,
+            ownOutboundBudgetBytes: gate.ownOutboundBudgetBytes,
+            ownReceiptBudgetBytes: gate.ownReceiptBudgetBytes,
             receiptQueryLimit: MeshDefaults.relayStoreBatchLimit,
             peerAcksHiddenKinds: MeshRouter.peerAcksHiddenKinds(address: address),
             hiddenAlreadyOffered: MeshRouter.hiddenOfferedFor(address: address),
             carriedCursor: lane.after
         ) else {
             log.warning("Failed to build digest spray plan for \(address, privacy: .public)")
+            return
+        }
+        // Identical-set suppression (#280): 28 consecutive sprays of a
+        // byte-identical set is what the field recorded. Asked here rather
+        // than before the plan because the answer is the plan.
+        let admission = SprayPolicy.admitPlan(
+            peerUserId: peerUserId,
+            address: address,
+            setDigest: plan.advertisedSetDigest,
+            planBytes: plan.planBytes
+        )
+        guard admission.send else {
+            log.info("Suppressed an unchanged digest spray to \(address, privacy: .public) (\(plan.planBytes) bytes, re-offerable in \(admission.reofferInMs)ms)")
             return
         }
         // Own lanes first, foreign carry last. On a slow link every frame here
@@ -4118,6 +4247,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     }
 
     private func recordPeerDisconnected(address: String) {
+        // The link's byte allowance goes with the link. The *peer's* cadence
+        // deliberately does not: dropping it here is exactly how reconnect
+        // churn would reset the gate that exists for reconnect churn.
+        SprayPolicy.forgetLink(address: address)
         guard let userId = MeshRouter.userIdFor(address: address),
               let transport = MeshRouter.transportFor(address: address),
               (try? store.getContact(userId: userId)) != nil else { return }

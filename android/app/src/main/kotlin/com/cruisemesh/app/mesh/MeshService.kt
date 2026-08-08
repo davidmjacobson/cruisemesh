@@ -39,6 +39,8 @@ import com.cruisemesh.app.identity.TermsAcceptanceStore
 import com.cruisemesh.app.relay.RelayConfigStore
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
+import uniffi.cruisemesh_core.CoreSprayGate
+import uniffi.cruisemesh_core.CoreSprayTrigger
 import uniffi.cruisemesh_core.DigestEntry
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Identity
@@ -49,7 +51,6 @@ import uniffi.cruisemesh_core.PeerConnectionEventKind
 import uniffi.cruisemesh_core.PeerConnectionTransport
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.encodeDigest
-import uniffi.cruisemesh_core.shouldRedigest
 import uniffi.cruisemesh_core.coreIsHiddenSprayKind
 import uniffi.cruisemesh_core.coreOwnCapabilities
 import uniffi.cruisemesh_core.encodeHello
@@ -66,8 +67,8 @@ private const val STOP_SERVICE_REQUEST_CODE = 1002
 private const val ENABLE_BLUETOOTH_REQUEST_CODE = 1003
 private const val LAN_HEALTH_INTERVAL_MS = 30_000L
 // D8: how often to check whether a long-lived link is due for a re-digest. The
-// actual 3-5 min jittered gate lives in core `shouldRedigest`; this only sets
-// the polling granularity.
+// actual 3-5 min jittered gate lives in core (`spray_policy.rs`, which asks
+// `should_redigest`); this only sets the polling granularity.
 private const val DIGEST_MAINTENANCE_INTERVAL_MS = 60_000L
 
 internal fun bluetoothAudioConnectedFromProfileState(state: Int): Boolean? = when (state) {
@@ -446,8 +447,12 @@ class MeshService : Service() {
             if (running) relayMainHandler.postDelayed(this, RADIO_POWER_CHECK_INTERVAL_MS)
         }
     }
-    // D8: when this link last ran a digest exchange, keyed by peer address.
-    private val lastDigestAtByAddress = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    // The map that used to live here -- `lastDigestAtByAddress` -- is gone.
+    // It was written by every spray and read by only one of them (the
+    // maintenance tick), so the two event-driven call sites sprayed
+    // unconditionally; see issue #280 and `core/src/spray_policy.rs`. Cadence,
+    // budgets, identical-set suppression and receipt-quiet backoff are now one
+    // core decision, consulted through [SprayPolicy].
 
     /**
      * FA3: the actual [checkDigestMaintenance] pass (store.chatDigest +
@@ -736,6 +741,7 @@ class MeshService : Service() {
         // stop() above tears down connections without per-address disconnect
         // callbacks, so clear the router's mappings wholesale.
         MeshRouter.reset()
+        SprayPolicy.reset()
         MeshConnectivityStatus.clear()
         // Belt to the stopForeground brace above, and the last word in this
         // teardown: stopForeground only removes a notification while the
@@ -1080,6 +1086,10 @@ class MeshService : Service() {
     }
 
     private fun recordPeerDisconnected(address: String) {
+        // The link's byte allowance goes with the link. The *peer's* cadence
+        // deliberately does not: dropping it here is exactly how reconnect
+        // churn would reset the gate that exists for reconnect churn.
+        SprayPolicy.forgetLink(address)
         val userId = MeshRouter.userIdFor(address) ?: return
         val transport = MeshRouter.transportFor(address) ?: return
         if (store.getContact(userId) == null) return
@@ -1286,15 +1296,41 @@ class MeshService : Service() {
             scheduleDeferredSpray(peerUserId, deferralMs)
             return
         }
+        // Cadence gate (#280). This is the reconnect-churn path: a link dying
+        // and being re-elected 5 times a minute used to buy 5 full bursts.
+        // First contact is not this path -- [handleHello] owns that -- so a
+        // denial here only ever delays a repeat.
+        val gate = SprayPolicy.maySpray(peerUserId, address, CoreSprayTrigger.RECONNECT)
+        if (!gate.allow) {
+            Log.i(TAG, "Holding the resume burst for $address: ${gate.reason} (retry in ${gate.retryAfterMs}ms)")
+            rearmGatedSpray(peerUserId, gate)
+            return
+        }
         Log.i(TAG, "Logical peer selected $address; resuming carry and digest sync")
         // A digest this peer sent while its window was open is answered first:
         // its carried-copy confirmations retire envelopes the drain below would
         // otherwise re-offer, which is the spray the cooldown exists to reduce.
         takeGatedDigest(peerUserId)?.let { gated ->
-            respondToDigest(address, peerUserId, gated.entries, gated.recentMsgIds, identity)
+            respondToDigest(address, peerUserId, gated.entries, gated.recentMsgIds, identity, gate)
         }
-        envelopeProcessor?.drainCarriedEnvelopesTo(address, peerUserId)
+        envelopeProcessor?.drainCarriedEnvelopesTo(address, peerUserId, gate.carriedBudgetBytes)
         sendDigestTo(address, peerUserId, identity)
+    }
+
+    /**
+     * Re-arm a burst the cadence gate held back, when core says the wait is
+     * short enough to be worth a timer.
+     *
+     * Nothing is dropped either way: past that horizon the ordinary 3-5 minute
+     * maintenance tick is the cheaper way back, and it always comes. The
+     * threshold is core's ([SprayPolicy.retryArmMaxMs]) so neither shell owns
+     * it. Re-entry is [scheduleDeferredSpray], the same one-per-peer coalescing
+     * path the post-reject cooldown uses, so a gate denial landing on top of a
+     * live failover burst still produces one resume rather than two.
+     */
+    private fun rearmGatedSpray(peerUserId: ByteArray, gate: CoreSprayGate) {
+        if (!gate.retryWorthArming || gate.retryAfterMs <= 0L) return
+        scheduleDeferredSpray(peerUserId, gate.retryAfterMs)
     }
 
     /** A peer DIGEST held by the spray cooldown; see [gatedDigests]. */
@@ -1636,11 +1672,13 @@ class MeshService : Service() {
         // leaves the reconnect loop unbraked.
         val syncDeferralMs = peripheralSyncSprayDeferralMs(address)
 
-        // Hand off anything we're muling for this peer (DESIGN.md §5.3 carry
-        // queue) before the digest sync. This runs for *any* peer, contact or
-        // not: we carry foreign envelopes for strangers too, and a stranger to
-        // us may still be the intended recipient of something we picked up.
-        if (syncDeferralMs <= 0L) envelopeProcessor?.drainCarriedEnvelopesTo(address, userId)
+        // Cadence gate (#280). This handler claims FIRST_CONTACT because a
+        // HELLO is what a fresh encounter looks like from here -- two phones
+        // meeting and beginning to sync must never be delayed. Core does not
+        // take the claim on trust: it downgrades it to reconnect churn from
+        // its own record of this peer, which is what makes 498 connects in 88
+        // minutes cost 498 map lookups instead of 498 bursts.
+        val gate = SprayPolicy.maySpray(userId, address, CoreSprayTrigger.FIRST_CONTACT)
 
         val contact = store.getContact(userId)
         if (contact == null) {
@@ -1648,9 +1686,25 @@ class MeshService : Service() {
         } else {
             // One small frame, and the fastest way off this radio entirely if
             // the peer turns out to share our Wi-Fi -- it is not part of the
-            // burst the cooldown holds back.
+            // burst either brake holds back, so it goes out before both of
+            // them are read.
             sendLanEndpointHintTo(address)
         }
+
+        if (!gate.allow) {
+            Log.i(TAG, "Holding the HELLO burst for $address: ${gate.reason} (retry in ${gate.retryAfterMs}ms)")
+            rearmGatedSpray(userId, gate)
+            return
+        }
+
+        // Hand off anything we're muling for this peer (DESIGN.md §5.3 carry
+        // queue) before the digest sync. This runs for *any* peer, contact or
+        // not: we carry foreign envelopes for strangers too, and a stranger to
+        // us may still be the intended recipient of something we picked up.
+        if (syncDeferralMs <= 0L) {
+            envelopeProcessor?.drainCarriedEnvelopesTo(address, userId, gate.carriedBudgetBytes)
+        }
+
         if (syncDeferralMs > 0L) {
             Log.i(
                 TAG,
@@ -1720,9 +1774,16 @@ class MeshService : Service() {
 
     /**
      * Encode and send the §7.3 digest for `address` (per-sender lamports for a
-     * known contact, or a carry-suppression digest for a stranger) and record
-     * the time so [checkDigestMaintenance] can re-run it on a long-lived link
-     * (D8). Called at HELLO time and on the periodic re-digest tick.
+     * known contact, or a carry-suppression digest for a stranger) and tell
+     * [SprayPolicy] it went, so the cadence gate and the periodic re-digest
+     * (D8) both measure from the same event.
+     *
+     * Callers gate first. This function does not: it used to *write* a
+     * timestamp that only the maintenance tick read, which is precisely why
+     * two event-driven callers could spray unthrottled (#280). Recording here
+     * also opens core's exchange window, so the peer's answering DIGEST --
+     * which our own digest is what provokes -- is not then refused by the gate
+     * that just let us speak.
      */
     private fun sendDigestTo(address: String, userId: ByteArray, identity: Identity) {
         val digestEntries = store.getContact(userId)?.let { store.chatDigest(it.userId) } ?: emptyList()
@@ -1733,7 +1794,7 @@ class MeshService : Service() {
             return
         }
         MeshRouter.sendToAddress(address, digestFrame)
-        lastDigestAtByAddress[address] = System.currentTimeMillis()
+        SprayPolicy.noteDigestSent(userId, address)
     }
 
     private fun scheduleDigestMaintenance() {
@@ -1762,12 +1823,15 @@ class MeshService : Service() {
         val identity = this.identity ?: return
         if (!running) return
         val routes = MeshRouter.selectedIdentifiedRoutes()
-        // Drop bookkeeping for links that have gone away.
-        lastDigestAtByAddress.keys.retainAll(routes.map { it.address }.toSet())
-        val now = System.currentTimeMillis()
+        val now = SprayPolicy.nowMs()
         for (route in routes) {
-            val last = lastDigestAtByAddress[route.address] ?: 0L
-            if (shouldRedigest(now, last, route.address.hashCode().toLong().toULong())) {
+            // Core still owns the jittered 3-5 minute window; what is new is
+            // that a link whose sprays keep producing no receipt progress
+            // waits longer, and that this tick and the event-driven callers
+            // now read the same record instead of one writing and the other
+            // reading. No bookkeeping is retained here: core prunes its own.
+            val gate = SprayPolicy.maySpray(route.userId, route.address, CoreSprayTrigger.MAINTENANCE, now)
+            if (gate.allow) {
                 sendDigestTo(route.address, route.userId, identity)
             }
         }
@@ -1856,7 +1920,28 @@ class MeshService : Service() {
             return
         }
 
-        respondToDigest(address, resolvedPeerUserId, entries, recentMsgIds, identity)
+        // Cadence gate (#280). This is the larger outbound half of the
+        // exchange, so leaving it ungated would brake nothing. It is normally
+        // allowed: our own just-sent digest opened core's exchange window, and
+        // this digest is the answer to it. What it refuses is an unprovoked
+        // digest arriving from a peer reconnecting every few seconds.
+        //
+        // A refused digest is held, not discarded, for the same reason the
+        // post-reject cooldown holds one: this is the only path that sends the
+        // receipts we owe and the backlog the peer's watermark asks for, and
+        // #241 is what a stuck receipt watermark costs.
+        val gate = SprayPolicy.maySpray(resolvedPeerUserId, address, CoreSprayTrigger.PEER_DIGEST)
+        if (!gate.allow) {
+            Log.i(
+                TAG,
+                "Holding the digest response for $address: ${gate.reason} (retry in ${gate.retryAfterMs}ms)",
+            )
+            stashGatedDigest(resolvedPeerUserId, entries, recentMsgIds)
+            rearmGatedSpray(resolvedPeerUserId, gate)
+            return
+        }
+
+        respondToDigest(address, resolvedPeerUserId, entries, recentMsgIds, identity, gate)
     }
 
     /**
@@ -1874,6 +1959,7 @@ class MeshService : Service() {
         entries: List<DigestEntry>,
         recentMsgIds: List<ByteArray>,
         identity: Identity,
+        gate: CoreSprayGate,
     ) {
         val contact = store.getContact(resolvedPeerUserId)
         if (contact != null) {
@@ -1910,7 +1996,7 @@ class MeshService : Service() {
             // groups this peer is in; their insert is idempotent.
             resendGroupOutboundToPeer(address, resolvedPeerUserId, identity)
         }
-        envelopeProcessor?.sprayDigestPlanTo(address, resolvedPeerUserId, recentMsgIds, identity)
+        envelopeProcessor?.sprayDigestPlanTo(address, resolvedPeerUserId, recentMsgIds, identity, gate)
         if (contact == null) {
             Log.i(TAG, "DIGEST from unrecognized userId=${UserIdHex.encode(resolvedPeerUserId)}; sprayed carry queue only")
         }

@@ -1,0 +1,97 @@
+package com.cruisemesh.app.mesh
+
+import android.os.SystemClock
+import com.cruisemesh.app.chat.UserIdHex
+import uniffi.cruisemesh_core.CoreSprayAdmission
+import uniffi.cruisemesh_core.CoreSprayGate
+import uniffi.cruisemesh_core.CoreSprayPolicy
+import uniffi.cruisemesh_core.CoreSprayTrigger
+import uniffi.cruisemesh_core.coreSprayRetryArmMaxMs
+
+/**
+ * Process-wide delegate to the core digest-spray policy (same singleton shape
+ * as [MeshRouter]).
+ *
+ * There is deliberately no decision in this file. Every question this shell
+ * used to answer with a local timestamp -- may this peer be sprayed, how much
+ * may go out, is this the same offer we just made, how long should a quiet
+ * link wait -- is answered by `core/src/spray_policy.rs`, so Android and iOS
+ * cannot drift. What lives here is the address-to-key mapping, the clock
+ * choice, and nothing else.
+ *
+ * ## Keys
+ *
+ * - `peerKey` is the hex user id: the *logical* peer. Cadence is per peer
+ *   because reconnect churn moves between addresses, and keying it by address
+ *   would let a phone that reconnects on a new address bypass the gate.
+ * - `linkKey` is the transport address. The byte budget is per link because
+ *   the FIFO being filled belongs to a link, not to a peer.
+ *
+ * ## Clock
+ *
+ * [SystemClock.elapsedRealtime], never `System.currentTimeMillis`. The map
+ * this replaces used the wall clock, so an NTP correction landing mid-session
+ * could expire a spray window early -- producing exactly the burst the window
+ * exists to prevent -- or hold it open indefinitely. It is also the clock
+ * `postDelayed`, [FailoverResumeDebounce] and [PeripheralSprayCooldown] all
+ * count on, so the three gates now measure time the same way.
+ */
+object SprayPolicy {
+    private val core = CoreSprayPolicy()
+
+    /** Monotonic milliseconds; see the class KDoc. */
+    fun nowMs(): Long = SystemClock.elapsedRealtime()
+
+    /**
+     * May this peer be sprayed now, and with what per-lane byte budgets?
+     *
+     * Consulted before any store work, so a reconnect storm costs a map
+     * lookup rather than a full plan build. Records nothing: a burst the
+     * post-reject cooldown then defers must not arm a cadence it never spent.
+     */
+    fun maySpray(
+        peerUserId: ByteArray,
+        address: String,
+        trigger: CoreSprayTrigger,
+        nowMs: Long = nowMs(),
+    ): CoreSprayGate = core.maySpray(UserIdHex.encode(peerUserId), address, trigger, nowMs)
+
+    /** A DIGEST frame actually went out to this peer on this link. */
+    fun noteDigestSent(peerUserId: ByteArray, address: String, nowMs: Long = nowMs()) {
+        core.noteDigestSent(UserIdHex.encode(peerUserId), address, nowMs)
+    }
+
+    /**
+     * A plan is built; does it go on the radio?
+     *
+     * When this says no, the caller must not send, must not advance a carried
+     * cursor, and must not record hidden-kind offers -- a suppressed offer has
+     * to stay exactly as re-discoverable as it was.
+     */
+    fun admitPlan(
+        peerUserId: ByteArray,
+        address: String,
+        setDigest: ULong,
+        planBytes: ULong,
+        nowMs: Long = nowMs(),
+    ): CoreSprayAdmission =
+        core.admitPlan(UserIdHex.encode(peerUserId), address, setDigest, planBytes, nowMs)
+
+    /**
+     * Evidence that sprays toward this peer are achieving something: carried
+     * copies it confirmed holding, or a receipt consumed from it. Resets the
+     * receipt-quiet backoff.
+     */
+    fun noteReceiptProgress(peerUserId: ByteArray, nowMs: Long = nowMs()) {
+        core.noteReceiptProgress(UserIdHex.encode(peerUserId), nowMs)
+    }
+
+    /** Longest deferral worth arming a timer for, from core. */
+    fun retryArmMaxMs(): Long = coreSprayRetryArmMaxMs()
+
+    /** A link went away. Peer cadence deliberately survives it. */
+    fun forgetLink(address: String) = core.forgetLink(address)
+
+    /** Mesh stopped; none of this is durable state. */
+    fun reset() = core.clear()
+}

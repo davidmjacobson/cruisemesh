@@ -29,6 +29,7 @@ mod relay_setup;
 mod relay_status;
 mod relay_wire;
 mod semantic;
+mod spray_policy;
 mod store;
 mod transport_policy;
 
@@ -166,6 +167,15 @@ pub use semantic::{
     core_is_visible_chat_kind, core_last_visible_message, core_reaction_summaries_by_target,
     core_tick_status_for, core_unread_count, core_visible_chat_messages, core_visible_gap_indices,
     CoreReactionSummary, CoreReactionTargetSummary, CoreReplyMetadata, CoreTickStatus,
+};
+pub use spray_policy::{
+    core_spray_retry_arm_max_ms, CoreSprayAdmission, CoreSprayAdmissionReason, CoreSprayGate,
+    CoreSprayGateReason, CoreSprayPolicy, CoreSprayTrigger, CARRIED_SPRAY_BUDGET_BYTES,
+    FIRST_CONTACT_LAPSE_MS, IDENTICAL_SET_REOFFER_INTERVAL_MS, LINK_BURST_BYTES,
+    LINK_DRAIN_BYTES_PER_SEC, MAX_SPRAY_INTERVAL_MS, MIN_USEFUL_BURST_BYTES,
+    OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_QUIET_MAX_SHIFT,
+    RECONNECT_SPRAY_MIN_INTERVAL_MS, SPRAY_EXCHANGE_WINDOW_MS, SPRAY_RETRY_ARM_MAX_MS,
+    SPRAY_STATE_RETENTION_MS, TOTAL_ENCOUNTER_BUDGET_BYTES,
 };
 pub use store::{
     core_peer_transport_for_arrival, core_peer_transport_is_observed,

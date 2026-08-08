@@ -28,6 +28,7 @@ import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.CoreInboundDisposition
 import uniffi.cruisemesh_core.CoreInboundGate
+import uniffi.cruisemesh_core.CoreSprayGate
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
@@ -73,38 +74,16 @@ private const val TAG = "MeshService"
 /** DESIGN.md §5.3: the bounded budget (~5 MB) of *foreign* muled envelopes; family (known-recipient) traffic is exempt. */
 private const val FOREIGN_CARRY_BUDGET_BYTES: Long = 5L * 1024 * 1024
 
-/**
- * Muling hook B: bounded per-digest-exchange budget (sealed-byte
- * size) for spraying our own still-undelivered 1:1 outbound envelopes to a
- * non-recipient mule. Same order of magnitude as [FOREIGN_CARRY_BUDGET_BYTES]
- * is generous for storage, but this budget bounds one GATT exchange's worth
- * of traffic, not total storage, so it's much smaller.
- */
-private const val OWN_OUTBOUND_SPRAY_BUDGET_BYTES: Long = 256L * 1024
-
-/**
- * Bounded per-digest-exchange budget
- * (sealed-byte size) for spraying our own still-undelivered outgoing receipt
- * envelopes to a mule so it can carry them back toward the original message
- * senders. Receipts are tiny (a fixed cumulative watermark, no message body),
- * so this is far smaller than [OWN_OUTBOUND_SPRAY_BUDGET_BYTES] -- 64 KiB is
- * hundreds of receipts, a backstop against a pathological backlog rather than
- * a normal-case limiter.
- */
-private const val OWN_RECEIPT_SPRAY_BUDGET_BYTES: Long = 64L * 1024
-
-/**
- * Bounded per-digest-exchange budget (sealed-byte size) for spraying *foreign*
- * carried envelopes onward. Same size as [OWN_OUTBOUND_SPRAY_BUDGET_BYTES]: a
- * phone that has been muling for a busy fleet can be holding the whole
- * [FOREIGN_CARRY_BUDGET_BYTES] of third-party traffic, and offering all of it
- * on one encounter fills a BLE link's single FIFO for minutes, with live
- * replies to real contacts stuck behind it. Nothing is dropped by the cut: the
- * carry queue is untouched and the periodic re-digest re-offers the remainder,
- * oldest first, so a big backlog drains over several rounds instead of one
- * burst.
- */
-private const val CARRIED_SPRAY_BUDGET_BYTES: Long = 256L * 1024
+// The three per-encounter spray byte budgets that used to live here -- carried
+// 256 KiB, own outbound 256 KiB, receipts 64 KiB -- are gone. iOS carried the
+// same three numbers in ProtocolKinds.swift; they were equal, and nothing made
+// them stay equal. They now live in `core/src/spray_policy.rs` beside the plan
+// that spends them, and arrive at these call sites inside a `CoreSprayGate`
+// already scaled by what the link can take (#280, ledger row SPRAY-01).
+//
+// [FOREIGN_CARRY_BUDGET_BYTES] above is deliberately NOT one of them: it
+// bounds how much foreign traffic this device *stores*, not how much it offers
+// in one encounter.
 
 /** G3: rolling window in which concurrent foreign-carry offers are capped. */
 private const val CARRIED_OFFER_EPOCH_MS: Long = 5_000L
@@ -703,7 +682,11 @@ internal class InboundEnvelopeProcessor(
      * seen-set/store dedupes it), never a lost envelope; an unconfirmed
      * carry still dies at its normal expiry via [MessageStore.pruneExpiredCarried].
      */
-    fun drainCarriedEnvelopesTo(address: String, peerUserId: ByteArray) {
+    fun drainCarriedEnvelopesTo(address: String, peerUserId: ByteArray, carriedBudgetBytes: ULong) {
+        if (carriedBudgetBytes == 0uL) {
+            Log.d(TAG, "Targeted carried drain skipped for $address (no carried budget this encounter)")
+            return
+        }
         val now = System.currentTimeMillis()
         var carriedReservation: CarriedOfferEpochGate.Reservation? = null
         try {
@@ -730,7 +713,7 @@ internal class InboundEnvelopeProcessor(
             val page = store.carriedEnvelopesForHintsPage(
                 deliveryHints,
                 now,
-                CARRIED_SPRAY_BUDGET_BYTES.toULong(),
+                carriedBudgetBytes,
                 lane.after,
             )
             if (page.rows.isEmpty()) {
@@ -2017,6 +2000,10 @@ internal class InboundEnvelopeProcessor(
                 "throughLamport=${receipt.lamport} type=${receipt.receiptType}",
         )
         MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(envelopeSenderUserId), System.currentTimeMillis())
+        // A receipt is the other half of what the receipt-quiet backoff (#280)
+        // watches for: sprays toward this peer are converging, so its cadence
+        // returns to normal.
+        SprayPolicy.noteReceiptProgress(envelopeSenderUserId)
         // The receipt returned on the exact link that delivered the message;
         // record that route against the watermark (T6) so every acknowledged
         // message's Info pane can prove LAN/BLE/relay delivery -- not just the
@@ -2184,12 +2171,26 @@ internal class InboundEnvelopeProcessor(
         }
     }
 
-    /** Executes Rust's complete digest-time mule plan. */
+    /**
+     * Executes Rust's complete digest-time mule plan, inside the budgets
+     * `gate` was issued with.
+     *
+     * `gate` is core's answer to "may this peer be sprayed, and how much"
+     * ([SprayPolicy]); the caller has already checked `gate.allow`. Two
+     * further core decisions happen here, both after the plan is built because
+     * both need to know what the plan came out as: whether the advertised set
+     * is byte-identical to the one this peer was already offered, and what the
+     * plan costs this link's burst allowance. A suppressed plan sends nothing
+     * and, just as importantly, advances no cursor and records no hidden-kind
+     * offer -- everything it would have offered stays exactly as
+     * re-discoverable as it was.
+     */
     fun sprayDigestPlanTo(
         address: String,
         peerUserId: ByteArray,
         peerKnownMsgIds: List<ByteArray>,
         identity: Identity,
+        gate: CoreSprayGate,
     ) {
         val now = System.currentTimeMillis()
         var carriedReservation: CarriedOfferEpochGate.Reservation? = null
@@ -2202,6 +2203,12 @@ internal class InboundEnvelopeProcessor(
             val confirmed = store.coreConfirmCarriedDeliveries(peerUserId, peerKnownMsgIds, now)
             if (confirmed > 0uL) {
                 Log.i(TAG, "Confirmed delivery of $confirmed carried envelope(s) to ${UserIdHex.encode(peerUserId)}; dropped our copy")
+                // Hard evidence that sprays to this peer are landing: it just
+                // proved it holds copies we were carrying. That is what the
+                // receipt-quiet backoff is looking for. Its absence is NOT
+                // evidence of a fault -- a courier for someone who is not here
+                // legitimately confirms nothing.
+                SprayPolicy.noteReceiptProgress(peerUserId)
             }
             // How far this link session's walk through our carry queue has
             // got. A courier's store can be many times one round's budget, so
@@ -2226,14 +2233,33 @@ internal class InboundEnvelopeProcessor(
                 peerHints = recentHintsFor(peerUserId, now),
                 peerKnownMsgIds = peerKnownMsgIds,
                 nowMs = now,
-                carriedBudgetBytes = if (allowCarried) CARRIED_SPRAY_BUDGET_BYTES.toULong() else 0uL,
-                ownOutboundBudgetBytes = OWN_OUTBOUND_SPRAY_BUDGET_BYTES.toULong(),
-                ownReceiptBudgetBytes = OWN_RECEIPT_SPRAY_BUDGET_BYTES.toULong(),
+                carriedBudgetBytes = if (allowCarried) gate.carriedBudgetBytes else 0uL,
+                ownOutboundBudgetBytes = gate.ownOutboundBudgetBytes,
+                ownReceiptBudgetBytes = gate.ownReceiptBudgetBytes,
                 receiptQueryLimit = RELAY_STORE_BATCH_LIMIT,
                 peerAcksHiddenKinds = MeshRouter.peerAcksHiddenKinds(address),
                 hiddenAlreadyOffered = MeshRouter.hiddenOfferedFor(address),
                 carriedCursor = lane.after,
             )
+            // Identical-set suppression (#280): 28 consecutive sprays of a
+            // byte-identical set is what the field recorded. Asked here rather
+            // than before the plan because the answer is the plan.
+            val admission = SprayPolicy.admitPlan(
+                peerUserId,
+                address,
+                plan.advertisedSetDigest,
+                plan.planBytes,
+            )
+            if (!admission.send) {
+                carriedReservation?.let(carriedOfferGate::release)
+                carriedReservation = null
+                Log.i(
+                    TAG,
+                    "Suppressed an unchanged digest spray to $address " +
+                        "(${plan.planBytes} bytes, re-offerable in ${admission.reofferInMs}ms)",
+                )
+                return
+            }
             if (carriedReservation != null) {
                 if (plan.carriedFrames.isEmpty()) {
                     carriedOfferGate.release(carriedReservation)

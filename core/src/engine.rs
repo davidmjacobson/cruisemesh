@@ -168,6 +168,16 @@ pub struct CoreDigestSprayPlan {
     /// i.e. this peer has now been offered everything it is eligible for, so
     /// the lane can park until the re-walk cooldown elapses.
     pub carried_exhausted: bool,
+    /// Stable, order-independent digest of the `msg_id` set this plan
+    /// advertises, across all three lanes. Handed straight to
+    /// [`crate::CoreSprayPolicy::admit_plan`], which suppresses a set the peer
+    /// was already offered inside the re-offer interval -- the 28 consecutive
+    /// byte-identical sprays of issue #280. Computed here rather than in the
+    /// shells so both platforms compare the same thing.
+    pub advertised_set_digest: u64,
+    /// Total sealed bytes this plan would put on the wire. What the per-link
+    /// burst allowance is charged.
+    pub plan_bytes: u64,
 }
 
 /// One relay-post row of a group message's per-member fan-out
@@ -713,6 +723,27 @@ impl MessageStore {
         // a budget-evicted hidden envelope stays eligible next digest.
         let selected_ids: HashSet<&Vec<u8>> = own_outbound.iter().map(|e| &e.msg_id).collect();
         offered_hidden_msg_ids.retain(|id| selected_ids.contains(id));
+
+        // Identify the advertised set before the rows are consumed into
+        // frames. Sealed bytes (not frame bytes) are what every budget in this
+        // function is denominated in, so the charge reported to the spray
+        // policy uses the same unit as the budgets it spent.
+        let advertised_set_digest = crate::spray_policy::spray_set_digest(
+            carried
+                .rows
+                .iter()
+                .map(|row| row.msg_id.as_slice())
+                .chain(own_outbound.iter().map(|row| row.msg_id.as_slice()))
+                .chain(own_receipts.iter().map(|row| row.msg_id.as_slice())),
+        );
+        let plan_bytes: u64 = carried
+            .rows
+            .iter()
+            .map(|row| row.sealed.len() as u64)
+            .chain(own_outbound.iter().map(|row| row.sealed.len() as u64))
+            .chain(own_receipts.iter().map(|row| row.sealed.len() as u64))
+            .sum();
+
         Ok(CoreDigestSprayPlan {
             carried_frames: carried.rows.into_iter().map(frame_carried).collect(),
             own_outbound_frames: own_outbound.into_iter().map(frame_outbound).collect(),
@@ -720,6 +751,8 @@ impl MessageStore {
             offered_hidden_msg_ids,
             next_carried_cursor: carried.next,
             carried_exhausted: carried.exhausted,
+            advertised_set_digest,
+            plan_bytes,
         })
     }
 
@@ -2364,6 +2397,59 @@ mod tests {
                 "every offered frame is whole -- the budget never truncates one"
             );
         }
+    }
+
+    #[test]
+    fn the_plan_reports_the_set_it_advertises_and_what_it_costs() {
+        // The identical-set suppression in `spray_policy` is only as honest as
+        // this digest: it must change when the advertised set changes and must
+        // not change when the same set is re-planned. `plan_bytes` must be the
+        // sealed bytes actually offered, because that is what the per-link
+        // burst allowance is charged.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let now_ms = 1_700_000_000_000_i64;
+        seed_carried(&store, 3, 100, now_ms);
+
+        let plan_for = |budget: u64| {
+            store
+                .core_digest_spray_plan(
+                    vec![1_u8; 16],
+                    vec![9_u8; 16],
+                    vec![],
+                    vec![],
+                    now_ms,
+                    budget,
+                    0,
+                    0,
+                    0,
+                    true,
+                    vec![],
+                    None,
+                )
+                .unwrap()
+        };
+
+        let two = plan_for(250);
+        assert_eq!(two.carried_frames.len(), 2);
+        assert_eq!(two.plan_bytes, 200, "two 100-byte sealed payloads");
+        // Re-planning the same store gives the same answer, so a re-offer of
+        // an unchanged set is recognisable as one.
+        assert_eq!(
+            plan_for(250).advertised_set_digest,
+            two.advertised_set_digest
+        );
+
+        let three = plan_for(1_000);
+        assert_eq!(three.carried_frames.len(), 3);
+        assert_eq!(three.plan_bytes, 300);
+        assert_ne!(
+            three.advertised_set_digest, two.advertised_set_digest,
+            "a wider set must not look identical to a narrower one"
+        );
+
+        let empty = plan_for(0);
+        assert_eq!(empty.plan_bytes, 0);
+        assert!(empty.carried_frames.is_empty());
     }
 
     #[test]

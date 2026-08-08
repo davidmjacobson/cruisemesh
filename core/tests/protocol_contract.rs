@@ -42,8 +42,10 @@ use cruisemesh_core::{
     relay_cursor_advance, relay_fetch_walk_continues, relay_frontier_after_completed_sweep,
     relay_mailbox_walk_action, relay_retry_after_ms, CarriedEnvelope, Contact,
     CoreInboundDisposition, CoreRelayEnvelopeDisposition, CoreRelayFault, CoreRelayPathState,
-    Frame, MessageStore, RelayMailboxWalkAction, CAP_ACKS_HIDDEN_KINDS, KIND_LAN_ENDPOINT_HINT,
-    KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, RECEIPT_TYPE_DELIVERED,
+    CoreSprayPolicy, CoreSprayTrigger, Frame, MessageStore, RelayMailboxWalkAction,
+    CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC,
+    KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LINK_BURST_BYTES, MAX_SPRAY_INTERVAL_MS,
+    OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED,
 };
 
 // ---------------------------------------------------------------------------
@@ -168,11 +170,9 @@ const CONTRACT: &[Invariant] = &[
         id: "SPRAY-01",
         statement: "Carried-first work toward one peer is bounded per encounter in bytes as well \
                     as rows, and re-offers are cadence-gated.",
-        owner: Owner::HoistPending {
-            shell_tests: "android PeripheralSprayCooldownTest.kt + \
-                          PeripheralSprayCooldownDebounceTest.kt (cadence half; no iOS twin yet)",
-            package: "D2 (mesh_meet); the cadence gate itself is issue #280",
-        },
+        owner: Owner::Core(
+            "core/src/spray_policy.rs cadence, suppression, byte-budget and backoff tests",
+        ),
     },
     Invariant {
         id: "HELLO-01",
@@ -1063,16 +1063,15 @@ fn hello_01_the_legacy_handshake_is_frozen_and_hello2_is_the_extension_point() {
 }
 
 #[test]
-fn spray_01_the_concurrent_carried_offer_cap_exists_in_core() {
-    // Deliberately not claiming SPRAY-01 is owned here. What this pins is one
-    // narrow thing: how many peers may have a carried offer in flight at once.
-    // It is NOT a bound on how much work goes toward a single peer, so it
-    // would not catch #280's evidence at any value. The per-encounter byte
-    // budget is spent by core but its numbers come from shell constants, and
-    // the re-offer cadence gate does not exist. The registry keeps this
-    // invariant hoist-pending; this test only pins the part that would
-    // otherwise regress silently.
+fn spray_01_one_peer_is_bounded_in_bytes_and_its_re_offers_are_cadence_gated() {
+    // Thin re-assertion; the real coverage is the table-driven suite in
+    // `core/src/spray_policy.rs`, whose cases were mutation-verified before
+    // this row moved off hoist-pending. What is asserted here is the shape a
+    // reader of the id needs: both halves of the rule now exist in core, and
+    // neither half can starve a legitimate peer.
     let id = lookup("SPRAY-01").id;
+
+    // Half one, unchanged: how many peers may have a carried offer at once.
     contract_assert!(
         id,
         may_start_carried_offer(0),
@@ -1083,9 +1082,68 @@ fn spray_01_the_concurrent_carried_offer_cap_exists_in_core() {
         !may_start_carried_offer(2),
         "concurrent carried offers must be capped so one carrier cannot fan out to a whole desk"
     );
-    assert!(
-        matches!(lookup("SPRAY-01").owner, Owner::HoistPending { .. }),
-        "SPRAY-01 must stay hoist-pending until the byte cap and cadence gate land together"
+
+    // Half two, new with issue #280: bytes toward ONE peer, and cadence.
+    let policy = CoreSprayPolicy::new();
+    let peer = "7f".repeat(16);
+    let link = "AA:BB:CC:DD:EE:01".to_string();
+
+    // A fresh encounter is never gated -- two phones meeting is the product --
+    // and it arrives carrying core's budgets rather than a shell's.
+    let first = policy.may_spray(
+        peer.clone(),
+        link.clone(),
+        CoreSprayTrigger::FirstContact,
+        0,
+    );
+    contract_assert!(id, first.allow, "first contact must never be cadence-gated");
+    contract_assert!(
+        id,
+        first.carried_budget_bytes == CARRIED_SPRAY_BUDGET_BYTES
+            && first.own_outbound_budget_bytes == OWN_OUTBOUND_SPRAY_BUDGET_BYTES
+            && first.own_receipt_budget_bytes == OWN_RECEIPT_SPRAY_BUDGET_BYTES,
+        "the per-encounter byte budgets are core's numbers, not a shell constant"
+    );
+
+    // The recorded failure: 34 triggers inside one second toward one peer.
+    // Bytes, not frames, is what has to be bounded -- 34 frames sounded
+    // modest and was ~639 KB.
+    let frame_bytes = 18_795_u64;
+    let mut queued = 0_u64;
+    for round in 0..34_u64 {
+        let now = round as i64 * 30;
+        let gate = policy.may_spray(
+            peer.clone(),
+            link.clone(),
+            CoreSprayTrigger::FirstContact,
+            now,
+        );
+        if !gate.allow {
+            contract_assert!(
+                id,
+                gate.retry_after_ms > 0,
+                "every refusal names a finite expiry -- a gate here is a delay, never a drop"
+            );
+            continue;
+        }
+        let admitted = policy.admit_plan(peer.clone(), link.clone(), 0xfeed, frame_bytes, now);
+        if admitted.send {
+            queued += admitted.charged_bytes;
+        }
+    }
+    contract_assert!(
+        id,
+        queued <= LINK_BURST_BYTES,
+        "one peer's burst must stay inside the per-link byte allowance"
+    );
+
+    // And the rate limit is never a give-up: a peer that produces no receipt
+    // -- a courier holding mail for someone who is not here -- is still
+    // offered everything, at a bounded worst-case interval.
+    contract_assert!(
+        id,
+        MAX_SPRAY_INTERVAL_MS > 0 && MAX_SPRAY_INTERVAL_MS <= 60 * 60_000,
+        "receipt-quiet backoff must be bounded -- an absent recipient is not a broken peer"
     );
 }
 
@@ -1157,17 +1215,6 @@ fn endpoint_01_hint_authoring_is_still_shell_owned() {
             ReceiptRepairTests.swift; no core model or stateful test exists; hoist in package D2"]
 fn wm_01_receipt_repair_has_no_core_model() {
     unimplemented!("package D2 gives receipt repair a bounded, reachable core state machine");
-}
-
-#[test]
-#[ignore = "HOIST-PENDING: SPRAY-01 -- core_digest_spray_plan spends a per-encounter byte budget, \
-            but all three budget numbers are shell constants (InboundEnvelopeProcessor.kt and \
-            ProtocolKinds.swift) and nothing gates how often an encounter may re-offer; the cooldown \
-            half is owned by android PeripheralSprayCooldownTest.kt; see issue #280; hoist in D2"]
-fn spray_01_has_no_cadence_gate_and_its_byte_budgets_are_shell_constants() {
-    unimplemented!(
-        "issue #280: 34 copies of an 18,795-byte frame queued to one peer in one second"
-    );
 }
 
 #[test]

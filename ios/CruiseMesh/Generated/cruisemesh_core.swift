@@ -1939,6 +1939,334 @@ public func FfiConverterTypeCoreReconnectBackoffTracker_lower(_ value: CoreRecon
 
 
 
+/**
+ * Every digest-spray decision, in one place, for both shells.
+ *
+ * One instance per process. Both shells hold it in the same singleton that
+ * already owns their router state, and pass the same `peer_key` (hex user id
+ * — the *logical* peer, because reconnect churn moves between addresses) and
+ * `link_key` (the transport address — because the FIFO being filled is a
+ * link's, not a peer's).
+ */
+public protocol CoreSprayPolicyProtocol : AnyObject {
+
+    /**
+     * A plan has been built. Does it go on the radio, and what does it cost?
+     *
+     * `set_digest` is [`crate::CoreDigestSprayPlan::advertised_set_digest`] —
+     * core computed it while selecting, so the shells never hash anything.
+     * `plan_bytes` is the same plan's `plan_bytes`.
+     *
+     * A suppressed plan must leave the world untouched: the caller must not
+     * advance a carried cursor, must not record hidden-kind offers, and must
+     * not send. Nothing here removes or acks anything either way.
+     */
+    func admitPlan(peerKey: String, linkKey: String, setDigest: UInt64, planBytes: UInt64, nowMs: Int64)  -> CoreSprayAdmission
+
+    /**
+     * Mesh stopped. Everything is scheduling state; none of it survives.
+     */
+    func clear()
+
+    /**
+     * A link went away for good. Peer cadence is deliberately NOT dropped
+     * with it: forgetting the peer on disconnect is exactly how reconnect
+     * churn would reset the gate it exists to enforce.
+     */
+    func forgetLink(linkKey: String)
+
+    /**
+     * Bytes this link may currently have queued at it. Diagnostics and tests.
+     */
+    func linkAllowanceBytes(linkKey: String, nowMs: Int64)  -> UInt64
+
+    /**
+     * May this peer be sprayed now, and with what per-lane byte budgets?
+     *
+     * Consulted *before* any store work, so reconnect churn costs a map
+     * lookup rather than a full plan build. Mutates nothing: an allowed
+     * spray is recorded by [`Self::note_digest_sent`] or
+     * [`Self::admit_plan`], because a spray that the post-reject cooldown
+     * then defers must not arm the cadence for a burst that never happened.
+     */
+    func maySpray(peerKey: String, linkKey: String, trigger: CoreSprayTrigger, nowMs: Int64)  -> CoreSprayGate
+
+    /**
+     * A DIGEST frame actually went out to this peer.
+     *
+     * This is what arms the cadence for the *small* half of the exchange. It
+     * matters because our digest is what provokes the peer's full spray back
+     * at us: leaving it ungated would brake nothing, which is precisely the
+     * shape issue #280 recorded (`sendDigestTo` wrote the timestamp that only
+     * the maintenance tick read).
+     */
+    func noteDigestSent(peerKey: String, linkKey: String, nowMs: Int64)
+
+    /**
+     * Evidence that sprays toward this peer are achieving something: a
+     * receipt consumed from it, or carried copies it confirmed holding.
+     *
+     * Resets the receipt-quiet backoff. Absence of this is not evidence of a
+     * fault — a courier for an absent recipient legitimately never produces
+     * it — which is exactly why the backoff has a ceiling and no give-up
+     * state.
+     */
+    func noteReceiptProgress(peerKey: String, nowMs: Int64)
+
+    /**
+     * Consecutive admitted sprays to this peer with no progress since.
+     * Diagnostics and tests.
+     */
+    func quietRounds(peerKey: String)  -> UInt32
+
+}
+
+/**
+ * Every digest-spray decision, in one place, for both shells.
+ *
+ * One instance per process. Both shells hold it in the same singleton that
+ * already owns their router state, and pass the same `peer_key` (hex user id
+ * — the *logical* peer, because reconnect churn moves between addresses) and
+ * `link_key` (the transport address — because the FIFO being filled is a
+ * link's, not a peer's).
+ */
+open class CoreSprayPolicy:
+    CoreSprayPolicyProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_corespraypolicy(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_corespraypolicy_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_corespraypolicy(pointer, $0) }
+    }
+
+
+
+
+    /**
+     * A plan has been built. Does it go on the radio, and what does it cost?
+     *
+     * `set_digest` is [`crate::CoreDigestSprayPlan::advertised_set_digest`] —
+     * core computed it while selecting, so the shells never hash anything.
+     * `plan_bytes` is the same plan's `plan_bytes`.
+     *
+     * A suppressed plan must leave the world untouched: the caller must not
+     * advance a carried cursor, must not record hidden-kind offers, and must
+     * not send. Nothing here removes or acks anything either way.
+     */
+open func admitPlan(peerKey: String, linkKey: String, setDigest: UInt64, planBytes: UInt64, nowMs: Int64) -> CoreSprayAdmission {
+    return try!  FfiConverterTypeCoreSprayAdmission.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corespraypolicy_admit_plan(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerKey),
+        FfiConverterString.lower(linkKey),
+        FfiConverterUInt64.lower(setDigest),
+        FfiConverterUInt64.lower(planBytes),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+    /**
+     * Mesh stopped. Everything is scheduling state; none of it survives.
+     */
+open func clear() {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corespraypolicy_clear(self.uniffiClonePointer(),$0
+    )
+}
+}
+
+    /**
+     * A link went away for good. Peer cadence is deliberately NOT dropped
+     * with it: forgetting the peer on disconnect is exactly how reconnect
+     * churn would reset the gate it exists to enforce.
+     */
+open func forgetLink(linkKey: String) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corespraypolicy_forget_link(self.uniffiClonePointer(),
+        FfiConverterString.lower(linkKey),$0
+    )
+}
+}
+
+    /**
+     * Bytes this link may currently have queued at it. Diagnostics and tests.
+     */
+open func linkAllowanceBytes(linkKey: String, nowMs: Int64) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corespraypolicy_link_allowance_bytes(self.uniffiClonePointer(),
+        FfiConverterString.lower(linkKey),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+    /**
+     * May this peer be sprayed now, and with what per-lane byte budgets?
+     *
+     * Consulted *before* any store work, so reconnect churn costs a map
+     * lookup rather than a full plan build. Mutates nothing: an allowed
+     * spray is recorded by [`Self::note_digest_sent`] or
+     * [`Self::admit_plan`], because a spray that the post-reject cooldown
+     * then defers must not arm the cadence for a burst that never happened.
+     */
+open func maySpray(peerKey: String, linkKey: String, trigger: CoreSprayTrigger, nowMs: Int64) -> CoreSprayGate {
+    return try!  FfiConverterTypeCoreSprayGate.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corespraypolicy_may_spray(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerKey),
+        FfiConverterString.lower(linkKey),
+        FfiConverterTypeCoreSprayTrigger.lower(trigger),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+    /**
+     * A DIGEST frame actually went out to this peer.
+     *
+     * This is what arms the cadence for the *small* half of the exchange. It
+     * matters because our digest is what provokes the peer's full spray back
+     * at us: leaving it ungated would brake nothing, which is precisely the
+     * shape issue #280 recorded (`sendDigestTo` wrote the timestamp that only
+     * the maintenance tick read).
+     */
+open func noteDigestSent(peerKey: String, linkKey: String, nowMs: Int64) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corespraypolicy_note_digest_sent(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerKey),
+        FfiConverterString.lower(linkKey),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
+}
+
+    /**
+     * Evidence that sprays toward this peer are achieving something: a
+     * receipt consumed from it, or carried copies it confirmed holding.
+     *
+     * Resets the receipt-quiet backoff. Absence of this is not evidence of a
+     * fault — a courier for an absent recipient legitimately never produces
+     * it — which is exactly why the backoff has a ceiling and no give-up
+     * state.
+     */
+open func noteReceiptProgress(peerKey: String, nowMs: Int64) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corespraypolicy_note_receipt_progress(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerKey),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
+}
+
+    /**
+     * Consecutive admitted sprays to this peer with no progress since.
+     * Diagnostics and tests.
+     */
+open func quietRounds(peerKey: String) -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corespraypolicy_quiet_rounds(self.uniffiClonePointer(),
+        FfiConverterString.lower(peerKey),$0
+    )
+})
+}
+
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSprayPolicy: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CoreSprayPolicy
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreSprayPolicy {
+        return CoreSprayPolicy(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CoreSprayPolicy) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSprayPolicy {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CoreSprayPolicy, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayPolicy_lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreSprayPolicy {
+    return try FfiConverterTypeCoreSprayPolicy.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayPolicy_lower(_ value: CoreSprayPolicy) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCoreSprayPolicy.lower(value)
+}
+
+
+
+
 public protocol LanNoiseSessionProtocol : AnyObject {
 
     /**
@@ -9990,6 +10318,20 @@ public struct CoreDigestSprayPlan {
      * the lane can park until the re-walk cooldown elapses.
      */
     public var carriedExhausted: Bool
+    /**
+     * Stable, order-independent digest of the `msg_id` set this plan
+     * advertises, across all three lanes. Handed straight to
+     * [`crate::CoreSprayPolicy::admit_plan`], which suppresses a set the peer
+     * was already offered inside the re-offer interval -- the 28 consecutive
+     * byte-identical sprays of issue #280. Computed here rather than in the
+     * shells so both platforms compare the same thing.
+     */
+    public var advertisedSetDigest: UInt64
+    /**
+     * Total sealed bytes this plan would put on the wire. What the per-link
+     * burst allowance is charged.
+     */
+    public var planBytes: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -10011,13 +10353,27 @@ public struct CoreDigestSprayPlan {
          * Whether the carried lane reached the tail of the queue this round --
          * i.e. this peer has now been offered everything it is eligible for, so
          * the lane can park until the re-walk cooldown elapses.
-         */carriedExhausted: Bool) {
+         */carriedExhausted: Bool,
+        /**
+         * Stable, order-independent digest of the `msg_id` set this plan
+         * advertises, across all three lanes. Handed straight to
+         * [`crate::CoreSprayPolicy::admit_plan`], which suppresses a set the peer
+         * was already offered inside the re-offer interval -- the 28 consecutive
+         * byte-identical sprays of issue #280. Computed here rather than in the
+         * shells so both platforms compare the same thing.
+         */advertisedSetDigest: UInt64,
+        /**
+         * Total sealed bytes this plan would put on the wire. What the per-link
+         * burst allowance is charged.
+         */planBytes: UInt64) {
         self.carriedFrames = carriedFrames
         self.ownOutboundFrames = ownOutboundFrames
         self.ownReceiptFrames = ownReceiptFrames
         self.offeredHiddenMsgIds = offeredHiddenMsgIds
         self.nextCarriedCursor = nextCarriedCursor
         self.carriedExhausted = carriedExhausted
+        self.advertisedSetDigest = advertisedSetDigest
+        self.planBytes = planBytes
     }
 }
 
@@ -10043,6 +10399,12 @@ extension CoreDigestSprayPlan: Equatable, Hashable {
         if lhs.carriedExhausted != rhs.carriedExhausted {
             return false
         }
+        if lhs.advertisedSetDigest != rhs.advertisedSetDigest {
+            return false
+        }
+        if lhs.planBytes != rhs.planBytes {
+            return false
+        }
         return true
     }
 
@@ -10053,6 +10415,8 @@ extension CoreDigestSprayPlan: Equatable, Hashable {
         hasher.combine(offeredHiddenMsgIds)
         hasher.combine(nextCarriedCursor)
         hasher.combine(carriedExhausted)
+        hasher.combine(advertisedSetDigest)
+        hasher.combine(planBytes)
     }
 }
 
@@ -10069,7 +10433,9 @@ public struct FfiConverterTypeCoreDigestSprayPlan: FfiConverterRustBuffer {
                 ownReceiptFrames: FfiConverterSequenceData.read(from: &buf),
                 offeredHiddenMsgIds: FfiConverterSequenceData.read(from: &buf),
                 nextCarriedCursor: FfiConverterOptionTypeCoreCarriedCursor.read(from: &buf),
-                carriedExhausted: FfiConverterBool.read(from: &buf)
+                carriedExhausted: FfiConverterBool.read(from: &buf),
+                advertisedSetDigest: FfiConverterUInt64.read(from: &buf),
+                planBytes: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -10080,6 +10446,8 @@ public struct FfiConverterTypeCoreDigestSprayPlan: FfiConverterRustBuffer {
         FfiConverterSequenceData.write(value.offeredHiddenMsgIds, into: &buf)
         FfiConverterOptionTypeCoreCarriedCursor.write(value.nextCarriedCursor, into: &buf)
         FfiConverterBool.write(value.carriedExhausted, into: &buf)
+        FfiConverterUInt64.write(value.advertisedSetDigest, into: &buf)
+        FfiConverterUInt64.write(value.planBytes, into: &buf)
     }
 }
 
@@ -12215,6 +12583,246 @@ public func FfiConverterTypeCoreReplyMetadata_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeCoreReplyMetadata_lower(_ value: CoreReplyMetadata) -> RustBuffer {
     return FfiConverterTypeCoreReplyMetadata.lower(value)
+}
+
+
+/**
+ * The answer to "this is what the plan came out as; does it go on the radio?".
+ */
+public struct CoreSprayAdmission {
+    public var send: Bool
+    public var reason: CoreSprayAdmissionReason
+    /**
+     * Bytes charged against this link's burst allowance. Zero when suppressed.
+     */
+    public var chargedBytes: UInt64
+    /**
+     * When a suppressed set becomes offerable again, or 0 when it was sent.
+     */
+    public var reofferInMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(send: Bool, reason: CoreSprayAdmissionReason,
+        /**
+         * Bytes charged against this link's burst allowance. Zero when suppressed.
+         */chargedBytes: UInt64,
+        /**
+         * When a suppressed set becomes offerable again, or 0 when it was sent.
+         */reofferInMs: Int64) {
+        self.send = send
+        self.reason = reason
+        self.chargedBytes = chargedBytes
+        self.reofferInMs = reofferInMs
+    }
+}
+
+
+
+extension CoreSprayAdmission: Equatable, Hashable {
+    public static func ==(lhs: CoreSprayAdmission, rhs: CoreSprayAdmission) -> Bool {
+        if lhs.send != rhs.send {
+            return false
+        }
+        if lhs.reason != rhs.reason {
+            return false
+        }
+        if lhs.chargedBytes != rhs.chargedBytes {
+            return false
+        }
+        if lhs.reofferInMs != rhs.reofferInMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(send)
+        hasher.combine(reason)
+        hasher.combine(chargedBytes)
+        hasher.combine(reofferInMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSprayAdmission: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSprayAdmission {
+        return
+            try CoreSprayAdmission(
+                send: FfiConverterBool.read(from: &buf),
+                reason: FfiConverterTypeCoreSprayAdmissionReason.read(from: &buf),
+                chargedBytes: FfiConverterUInt64.read(from: &buf),
+                reofferInMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreSprayAdmission, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.send, into: &buf)
+        FfiConverterTypeCoreSprayAdmissionReason.write(value.reason, into: &buf)
+        FfiConverterUInt64.write(value.chargedBytes, into: &buf)
+        FfiConverterInt64.write(value.reofferInMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayAdmission_lift(_ buf: RustBuffer) throws -> CoreSprayAdmission {
+    return try FfiConverterTypeCoreSprayAdmission.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayAdmission_lower(_ value: CoreSprayAdmission) -> RustBuffer {
+    return FfiConverterTypeCoreSprayAdmission.lower(value)
+}
+
+
+/**
+ * The answer to "may I spray this peer now, and how much?".
+ */
+public struct CoreSprayGate {
+    public var allow: Bool
+    public var reason: CoreSprayGateReason
+    /**
+     * Sealed-byte budget for the foreign-carry lane this encounter.
+     */
+    public var carriedBudgetBytes: UInt64
+    /**
+     * Sealed-byte budget for this device's own outbound lane.
+     */
+    public var ownOutboundBudgetBytes: UInt64
+    /**
+     * Sealed-byte budget for this device's own receipt lane.
+     */
+    public var ownReceiptBudgetBytes: UInt64
+    /**
+     * How long until this decision could come out differently, or 0 when the
+     * spray was allowed. Always finite: no gate here is permanent.
+     */
+    public var retryAfterMs: Int64
+    /**
+     * Whether `retry_after_ms` is short enough to be worth arming a timer for
+     * rather than waiting for the maintenance tick.
+     */
+    public var retryWorthArming: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(allow: Bool, reason: CoreSprayGateReason,
+        /**
+         * Sealed-byte budget for the foreign-carry lane this encounter.
+         */carriedBudgetBytes: UInt64,
+        /**
+         * Sealed-byte budget for this device's own outbound lane.
+         */ownOutboundBudgetBytes: UInt64,
+        /**
+         * Sealed-byte budget for this device's own receipt lane.
+         */ownReceiptBudgetBytes: UInt64,
+        /**
+         * How long until this decision could come out differently, or 0 when the
+         * spray was allowed. Always finite: no gate here is permanent.
+         */retryAfterMs: Int64,
+        /**
+         * Whether `retry_after_ms` is short enough to be worth arming a timer for
+         * rather than waiting for the maintenance tick.
+         */retryWorthArming: Bool) {
+        self.allow = allow
+        self.reason = reason
+        self.carriedBudgetBytes = carriedBudgetBytes
+        self.ownOutboundBudgetBytes = ownOutboundBudgetBytes
+        self.ownReceiptBudgetBytes = ownReceiptBudgetBytes
+        self.retryAfterMs = retryAfterMs
+        self.retryWorthArming = retryWorthArming
+    }
+}
+
+
+
+extension CoreSprayGate: Equatable, Hashable {
+    public static func ==(lhs: CoreSprayGate, rhs: CoreSprayGate) -> Bool {
+        if lhs.allow != rhs.allow {
+            return false
+        }
+        if lhs.reason != rhs.reason {
+            return false
+        }
+        if lhs.carriedBudgetBytes != rhs.carriedBudgetBytes {
+            return false
+        }
+        if lhs.ownOutboundBudgetBytes != rhs.ownOutboundBudgetBytes {
+            return false
+        }
+        if lhs.ownReceiptBudgetBytes != rhs.ownReceiptBudgetBytes {
+            return false
+        }
+        if lhs.retryAfterMs != rhs.retryAfterMs {
+            return false
+        }
+        if lhs.retryWorthArming != rhs.retryWorthArming {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(allow)
+        hasher.combine(reason)
+        hasher.combine(carriedBudgetBytes)
+        hasher.combine(ownOutboundBudgetBytes)
+        hasher.combine(ownReceiptBudgetBytes)
+        hasher.combine(retryAfterMs)
+        hasher.combine(retryWorthArming)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSprayGate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSprayGate {
+        return
+            try CoreSprayGate(
+                allow: FfiConverterBool.read(from: &buf),
+                reason: FfiConverterTypeCoreSprayGateReason.read(from: &buf),
+                carriedBudgetBytes: FfiConverterUInt64.read(from: &buf),
+                ownOutboundBudgetBytes: FfiConverterUInt64.read(from: &buf),
+                ownReceiptBudgetBytes: FfiConverterUInt64.read(from: &buf),
+                retryAfterMs: FfiConverterInt64.read(from: &buf),
+                retryWorthArming: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreSprayGate, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.allow, into: &buf)
+        FfiConverterTypeCoreSprayGateReason.write(value.reason, into: &buf)
+        FfiConverterUInt64.write(value.carriedBudgetBytes, into: &buf)
+        FfiConverterUInt64.write(value.ownOutboundBudgetBytes, into: &buf)
+        FfiConverterUInt64.write(value.ownReceiptBudgetBytes, into: &buf)
+        FfiConverterInt64.write(value.retryAfterMs, into: &buf)
+        FfiConverterBool.write(value.retryWorthArming, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayGate_lift(_ buf: RustBuffer) throws -> CoreSprayGate {
+    return try FfiConverterTypeCoreSprayGate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayGate_lower(_ value: CoreSprayGate) -> RustBuffer {
+    return FfiConverterTypeCoreSprayGate.lower(value)
 }
 
 
@@ -18402,6 +19010,312 @@ extension CoreRelayPathState: Equatable, Hashable {}
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Why a built plan was or was not admitted onto the radio.
+ */
+
+public enum CoreSprayAdmissionReason {
+
+    /**
+     * The plan selected nothing; there is nothing to suppress or charge.
+     */
+    case empty
+    /**
+     * The advertised set differs from the one last sprayed to this peer.
+     */
+    case setChanged
+    /**
+     * Same set, but the re-offer interval has lapsed: DTN re-discovery.
+     */
+    case reofferLapsed
+    /**
+     * Byte-identical to the set this peer was last offered, inside the
+     * re-offer interval.
+     */
+    case identicalSuppressed
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSprayAdmissionReason: FfiConverterRustBuffer {
+    typealias SwiftType = CoreSprayAdmissionReason
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSprayAdmissionReason {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .empty
+
+        case 2: return .setChanged
+
+        case 3: return .reofferLapsed
+
+        case 4: return .identicalSuppressed
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreSprayAdmissionReason, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .empty:
+            writeInt(&buf, Int32(1))
+
+
+        case .setChanged:
+            writeInt(&buf, Int32(2))
+
+
+        case .reofferLapsed:
+            writeInt(&buf, Int32(3))
+
+
+        case .identicalSuppressed:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayAdmissionReason_lift(_ buf: RustBuffer) throws -> CoreSprayAdmissionReason {
+    return try FfiConverterTypeCoreSprayAdmissionReason.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayAdmissionReason_lower(_ value: CoreSprayAdmissionReason) -> RustBuffer {
+    return FfiConverterTypeCoreSprayAdmissionReason.lower(value)
+}
+
+
+
+extension CoreSprayAdmissionReason: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Why a spray was allowed or refused.
+ */
+
+public enum CoreSprayGateReason {
+
+    /**
+     * Genuine first contact with this peer. Never gated.
+     */
+    case firstContact
+    /**
+     * Inside the window opened by an already-allowed spray: this is the rest
+     * of one exchange, not a new one.
+     */
+    case exchangeOpen
+    /**
+     * The trigger's interval has elapsed since the last spray.
+     */
+    case intervalElapsed
+    /**
+     * Too soon after the last spray to this peer.
+     */
+    case cadenceGated
+    /**
+     * Too soon, and the interval is stretched because this link's sprays keep
+     * producing no evidence of progress.
+     */
+    case receiptQuietBackoff
+    /**
+     * The cadence allows it, but this link has no burst allowance left.
+     */
+    case linkBurstExhausted
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSprayGateReason: FfiConverterRustBuffer {
+    typealias SwiftType = CoreSprayGateReason
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSprayGateReason {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .firstContact
+
+        case 2: return .exchangeOpen
+
+        case 3: return .intervalElapsed
+
+        case 4: return .cadenceGated
+
+        case 5: return .receiptQuietBackoff
+
+        case 6: return .linkBurstExhausted
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreSprayGateReason, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .firstContact:
+            writeInt(&buf, Int32(1))
+
+
+        case .exchangeOpen:
+            writeInt(&buf, Int32(2))
+
+
+        case .intervalElapsed:
+            writeInt(&buf, Int32(3))
+
+
+        case .cadenceGated:
+            writeInt(&buf, Int32(4))
+
+
+        case .receiptQuietBackoff:
+            writeInt(&buf, Int32(5))
+
+
+        case .linkBurstExhausted:
+            writeInt(&buf, Int32(6))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayGateReason_lift(_ buf: RustBuffer) throws -> CoreSprayGateReason {
+    return try FfiConverterTypeCoreSprayGateReason.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayGateReason_lower(_ value: CoreSprayGateReason) -> RustBuffer {
+    return FfiConverterTypeCoreSprayGateReason.lower(value)
+}
+
+
+
+extension CoreSprayGateReason: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What caused a spray to be considered.
+ */
+
+public enum CoreSprayTrigger {
+
+    /**
+     * A peer appeared and identified itself (HELLO). The caller believes this
+     * is a fresh encounter. Core verifies that against its own record and
+     * downgrades the claim to [`CoreSprayTrigger::Reconnect`] if it has
+     * sprayed this peer within [`FIRST_CONTACT_LAPSE_MS`].
+     */
+    case firstContact
+    /**
+     * The same peer re-established a link, was re-elected onto another route,
+     * or a failover resumed. This is the churn case.
+     */
+    case reconnect
+    /**
+     * The peer sent us a DIGEST and we are about to answer it.
+     */
+    case peerDigest
+    /**
+     * The periodic re-digest tick on a link that has stayed up.
+     */
+    case maintenance
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSprayTrigger: FfiConverterRustBuffer {
+    typealias SwiftType = CoreSprayTrigger
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSprayTrigger {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .firstContact
+
+        case 2: return .reconnect
+
+        case 3: return .peerDigest
+
+        case 4: return .maintenance
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreSprayTrigger, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .firstContact:
+            writeInt(&buf, Int32(1))
+
+
+        case .reconnect:
+            writeInt(&buf, Int32(2))
+
+
+        case .peerDigest:
+            writeInt(&buf, Int32(3))
+
+
+        case .maintenance:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayTrigger_lift(_ buf: RustBuffer) throws -> CoreSprayTrigger {
+    return try FfiConverterTypeCoreSprayTrigger.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayTrigger_lower(_ value: CoreSprayTrigger) -> RustBuffer {
+    return FfiConverterTypeCoreSprayTrigger.lower(value)
+}
+
+
+
+extension CoreSprayTrigger: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum CoreTickStatus {
 
@@ -22499,6 +23413,15 @@ public func coreShouldAckInbound(disposition: CoreInboundDisposition) -> Bool {
     )
 })
 }
+/**
+ * See [`SPRAY_RETRY_ARM_MAX_MS`]. Exported so neither shell owns the number.
+ */
+public func coreSprayRetryArmMaxMs() -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_spray_retry_arm_max_ms($0
+    )
+})
+}
 public func coreSubnet24Hosts(address: String) -> [String] {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_subnet_24_hosts(
@@ -24844,6 +25767,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 5043) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_spray_retry_arm_max_ms() != 63580) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_subnet_24_hosts() != 3135) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -25366,6 +26292,30 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_retry_delay_ms() != 40354) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_admit_plan() != 25274) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_clear() != 37090) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_forget_link() != 53938) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_link_allowance_bytes() != 15213) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_may_spray() != 34513) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_note_digest_sent() != 10759) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_note_receipt_progress() != 3726) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_quiet_rounds() != 64566) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_decrypt_record() != 12115) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -25859,6 +26809,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_corereconnectbackofftracker_new() != 29344) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corespraypolicy_new() != 15233) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_lannoisesession_new() != 19269) {
