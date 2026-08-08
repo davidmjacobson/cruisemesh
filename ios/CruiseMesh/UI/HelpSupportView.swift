@@ -25,7 +25,7 @@ struct HelpSupportView: View {
 
                 Section("Delivery") {
                     NavigationLink {
-                        ConnectionDetailsView()
+                        ConnectionDetailsView(appModel: appModel)
                     } label: {
                         VStack(alignment: .leading, spacing: 3) {
                             Text("Understand delivery")

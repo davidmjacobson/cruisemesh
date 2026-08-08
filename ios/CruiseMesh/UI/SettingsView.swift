@@ -46,7 +46,7 @@ struct SettingsView: View {
                     )
                     LabeledContent("Status", value: runtime.pillText)
                     NavigationLink {
-                        ConnectionDetailsView()
+                        ConnectionDetailsView(appModel: appModel)
                     } label: {
                         VStack(alignment: .leading, spacing: 3) {
                             Text("Connection details")
