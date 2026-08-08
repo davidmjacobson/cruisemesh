@@ -3874,7 +3874,9 @@ impl MessageStore {
     }
 
     /// Record that a walk from 0 completed for this mailbox, restarting its
-    /// sweep interval and clearing the sweep's resume cursor.
+    /// sweep interval, clearing the sweep's resume cursor, and lowering the
+    /// frontier if the walk proved it sits above the top of the mailbox.
+    /// Reports whether the frontier was lowered.
     ///
     /// Called only when the walk actually reached the end of the mailbox. A
     /// sweep cut short — the service stopped, internet went away, the relay
@@ -3884,25 +3886,70 @@ impl MessageStore {
     /// resume cursor is what lets "the next pass finishes it" be true rather
     /// than aspirational, and clearing it here is the single act that turns a
     /// sweep from in-progress back into scheduled.
+    ///
+    /// `swept_through_id` is the `after=` the walk was holding when the empty
+    /// page arrived — the highest id of a hint-matching row the sweep proved
+    /// exists. [`crate::relay_frontier_after_completed_sweep`] decides what to
+    /// do with it, and that doc comment carries the reasoning: it is the one
+    /// place the frontier moves *down*, it only does so on a mailbox that had
+    /// rows in it, and it never moves the frontier up. Restricting the whole
+    /// question to this method is what keeps "only a completed sweep is
+    /// evidence" true by construction — nothing else in the store can reach
+    /// the lowering, and both shells call this only from the empty page.
+    ///
+    /// The read and the write share one held connection lock, so a page cursor
+    /// landing between them cannot make the repair decide against a frontier
+    /// that no longer exists.
+    ///
+    /// Reporting the lowering is not bookkeeping: relayd's live push gates on
+    /// the `after=` the client subscribed with, and that gate only ever moves
+    /// *up* for the life of the socket (`handle_ws` keeps a local `after` and
+    /// runs `after = after.max(id)` on every row it replays or pushes). So a
+    /// socket opened against the old frontier can never deliver a row at or
+    /// below it, and stays deaf to a rebuilt mailbox until it reconnects. The
+    /// shells use this to reopen it (`RelayPushClient.resubscribe`).
+    ///
+    /// A `true` here is not by itself a rebuilt relay, and the shells' logs say
+    /// so: relayd deletes a row when it is acked, so a healthy mailbox whose
+    /// newest rows were consumed by this device routinely reports a top below
+    /// the frontier. See [`crate::relay_frontier_after_completed_sweep`] for why
+    /// lowering there is correct and free. The reopen is unconditional on the
+    /// lowering because the client cannot tell the two apart, and a threshold
+    /// that guessed would suppress the reopen in exactly the rebuild whose
+    /// frontier was low to begin with; the cost is one socket reopen per
+    /// completed sweep of the one mailbox the socket watches, at most once per
+    /// `RELAY_SWEEP_INTERVAL_MS`.
     pub fn note_relay_sweep_completed(
         &self,
         config_key: String,
         now_ms: i64,
-    ) -> Result<(), CoreError> {
+        swept_through_id: i64,
+    ) -> Result<bool, CoreError> {
         if config_key.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let conn = lock_conn(&self.conn);
+        let persisted: i64 = conn
+            .query_row(
+                "SELECT after_id FROM relay_fetch_cursors WHERE config_key = ?1",
+                params![config_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?
+            .unwrap_or(0);
+        let repaired = crate::relay_frontier_after_completed_sweep(persisted, swept_through_id);
         conn.execute(
             "INSERT INTO relay_fetch_cursors
                  (config_key, after_id, last_sweep_at, sweep_after_id, sweep_started_at)
-             VALUES (?1, 0, ?2, 0, 0)
+             VALUES (?1, ?3, ?2, 0, 0)
              ON CONFLICT(config_key)
-             DO UPDATE SET last_sweep_at = ?2, sweep_after_id = 0, sweep_started_at = 0",
-            params![config_key, now_ms],
+             DO UPDATE SET last_sweep_at = ?2, after_id = ?3, sweep_after_id = 0,
+                           sweep_started_at = 0",
+            params![config_key, now_ms, repaired],
         )
         .map_err(store_err)?;
-        Ok(())
+        Ok(repaired < persisted)
     }
 
     /// Forget every remembered frontier, so the next pass re-walks each
@@ -6845,6 +6892,11 @@ CREATE TABLE IF NOT EXISTS peer_connection_summary (
 -- relay rebuilt from scratch restarts its ids at 1; a sweep stalled across
 -- days offline therefore re-walks from 0 rather than trusting the empty page a
 -- stale cursor produces. Cleared alongside `sweep_after_id`.
+-- `after_id` moves down exactly once in its life, and only through
+-- `note_relay_sweep_completed`: a sweep that walked to the natural empty page
+-- and found its highest matching row below the remembered frontier has proved
+-- that frontier belongs to an id space the relay no longer has. See
+-- `crate::relay_frontier_after_completed_sweep`.
 CREATE TABLE IF NOT EXISTS relay_fetch_cursors (
     config_key       TEXT PRIMARY KEY,
     after_id         INTEGER NOT NULL DEFAULT 0,
@@ -10430,7 +10482,7 @@ mod tests {
             0
         );
         store
-            .note_relay_sweep_completed(String::new(), 5_000)
+            .note_relay_sweep_completed(String::new(), 5_000, 0)
             .unwrap();
         let cursor = store.relay_fetch_cursor(String::new()).unwrap();
         assert_eq!(cursor.after_id, 0);
@@ -10445,7 +10497,7 @@ mod tests {
             .advance_relay_fetch_cursor(key.clone(), 9_000, true)
             .unwrap();
         store
-            .note_relay_sweep_completed(key.clone(), 1_000_000)
+            .note_relay_sweep_completed(key.clone(), 1_000_000, 9_000)
             .unwrap();
         let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
         assert_eq!(cursor.after_id, 9_000, "a sweep must not cost the frontier");
@@ -10464,7 +10516,9 @@ mod tests {
         ));
         // Recording a sweep for a mailbox with no frontier yet is fine too.
         let fresh = crate::relay_cursor_key("https://fresh.example".into(), "tok".into());
-        store.note_relay_sweep_completed(fresh.clone(), 7).unwrap();
+        store
+            .note_relay_sweep_completed(fresh.clone(), 7, 0)
+            .unwrap();
         assert_eq!(store.relay_fetch_cursor(fresh).unwrap().after_id, 0);
     }
 
@@ -10483,7 +10537,7 @@ mod tests {
             .advance_relay_fetch_cursor(key.clone(), 29_000, true)
             .unwrap();
         store
-            .note_relay_sweep_completed(key.clone(), 1_000_000)
+            .note_relay_sweep_completed(key.clone(), 1_000_000, 29_000)
             .unwrap();
         let now = 1_000_000 + crate::RELAY_SWEEP_INTERVAL_MS;
 
@@ -10590,7 +10644,7 @@ mod tests {
             .advance_relay_sweep_cursor(key.clone(), 512, true, 1_000)
             .unwrap();
         store
-            .note_relay_sweep_completed(key.clone(), 2_000_000)
+            .note_relay_sweep_completed(key.clone(), 2_000_000, 512)
             .unwrap();
         let cursor = store.relay_fetch_cursor(key).unwrap();
         assert_eq!(cursor.sweep_after_id, 0);
@@ -10655,7 +10709,7 @@ mod tests {
             .advance_relay_fetch_cursor(key.clone(), 29_000, true)
             .unwrap();
         store
-            .note_relay_sweep_completed(key.clone(), last_sweep)
+            .note_relay_sweep_completed(key.clone(), last_sweep, 29_000)
             .unwrap();
         // The next sweep starts on schedule and yields part-way up.
         let sweep_started = last_sweep + crate::RELAY_SWEEP_INTERVAL_MS;
@@ -10705,6 +10759,187 @@ mod tests {
         assert_eq!(
             crate::relay_pass_start_cursor(true, cursor.after_id, cursor.sweep_after_id),
             512
+        );
+    }
+
+    /// The other half of the rebuilt-relay story, and the one that was still
+    /// open: the *frontier*. A phone whose relay was rebuilt underneath it
+    /// remembers a frontier from an id space that no longer exists, so every
+    /// ordinary pass asks above the top of the new mailbox and sees nothing --
+    /// and relayd's live push gates on the same value, so the socket is blind
+    /// too. Only the six-hourly sweep, which starts at 0, ever reached that
+    /// mail. Here the sweep that walks the new mailbox end to end is what
+    /// hands the mailbox back to ordinary delivery.
+    #[test]
+    fn a_completed_sweep_over_a_rebuilt_mailbox_lowers_the_frontier() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        let last_sweep = 1_000_000i64;
+        store
+            .advance_relay_fetch_cursor(key.clone(), 29_000, true)
+            .unwrap();
+        store
+            .note_relay_sweep_completed(key.clone(), last_sweep, 29_000)
+            .unwrap();
+
+        // The relay is rebuilt from a fresh volume: row ids restart at 1, and
+        // the mailbox now holds two pages ending at id 40. An ordinary pass
+        // cannot see any of it.
+        let now = last_sweep + crate::RELAY_SWEEP_INTERVAL_MS;
+        let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
+        assert_eq!(
+            crate::relay_pass_start_cursor(false, cursor.after_id, cursor.sweep_after_id),
+            29_000,
+            "the blindness this repairs: asking above the top of the mailbox"
+        );
+        assert!(crate::relay_sweep_due(
+            true,
+            cursor.last_sweep_at_ms,
+            cursor.sweep_after_id,
+            now
+        ));
+
+        // The sweep walks from 0. Its pages are far below the frontier, so
+        // they cannot move it -- the never-backwards rule still holds per page.
+        for page_cursor in [16i64, 40i64] {
+            store
+                .advance_relay_sweep_cursor(key.clone(), page_cursor, true, now)
+                .unwrap();
+            store
+                .advance_relay_fetch_cursor(key.clone(), page_cursor, true)
+                .unwrap();
+        }
+        assert_eq!(
+            store.relay_fetch_cursor(key.clone()).unwrap().after_id,
+            29_000
+        );
+
+        // The empty page ends the walk at after=40, and that is the evidence.
+        assert!(store
+            .note_relay_sweep_completed(key.clone(), now, 40)
+            .unwrap());
+        let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
+        assert_eq!(
+            cursor.after_id, 40,
+            "the frontier now names the mailbox that exists"
+        );
+        assert_eq!(cursor.sweep_after_id, 0);
+        assert_eq!(cursor.last_sweep_at_ms, now);
+
+        // Ordinary delivery is restored: the next pass asks just above the new
+        // top and picks up the mail that lands there, without waiting for
+        // another sweep.
+        assert_eq!(
+            crate::relay_pass_start_cursor(false, cursor.after_id, cursor.sweep_after_id),
+            40
+        );
+        assert_eq!(
+            store
+                .advance_relay_fetch_cursor(key.clone(), 41, true)
+                .unwrap(),
+            41
+        );
+
+        // And the repair does not repeat. The next completed sweep finds the
+        // same top of the same mailbox and writes nothing back.
+        let later = now + crate::RELAY_SWEEP_INTERVAL_MS;
+        assert!(!store
+            .note_relay_sweep_completed(key.clone(), later, 41)
+            .unwrap());
+        assert_eq!(store.relay_fetch_cursor(key).unwrap().after_id, 41);
+    }
+
+    /// The hazard the rule turns on: a drained mailbox and a rebuilt one look
+    /// almost the same from the client. A completed sweep that met the empty
+    /// page immediately has no evidence either way, so it leaves the frontier
+    /// alone -- and loses nothing by doing so, because mail arriving on a
+    /// relay that was *not* rebuilt lands above that frontier where an
+    /// ordinary pass finds it.
+    #[test]
+    fn a_completed_sweep_over_a_quiet_mailbox_leaves_the_frontier_alone() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        store
+            .advance_relay_fetch_cursor(key.clone(), 29_000, true)
+            .unwrap();
+        // Everything this device ever fetched has since been acked away, so
+        // the sweep walks from 0 straight into the empty page.
+        assert!(!store
+            .note_relay_sweep_completed(key.clone(), 2_000_000, 0)
+            .unwrap());
+        let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
+        assert_eq!(cursor.after_id, 29_000);
+        assert_eq!(cursor.last_sweep_at_ms, 2_000_000);
+        // New mail on the same relay is above the frontier and arrives
+        // normally.
+        assert_eq!(
+            store.advance_relay_fetch_cursor(key, 29_001, true).unwrap(),
+            29_001
+        );
+    }
+
+    /// A sweep that yielded, was abandoned, or simply died with the process
+    /// has walked a *prefix* of the mailbox and knows nothing about the top of
+    /// it. Lowering the frontier to a prefix's last id would strand every row
+    /// above it behind a re-walk on every ordinary pass -- the exact
+    /// thousands-of-round-trips behaviour the frontier exists to remove. Only
+    /// the empty page at the end of a walk reaches the repair at all.
+    #[test]
+    fn an_interrupted_sweep_never_lowers_the_frontier() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        store
+            .advance_relay_fetch_cursor(key.clone(), 29_000, true)
+            .unwrap();
+        // Four pages, then the per-pass budget runs out. Nothing calls
+        // `note_relay_sweep_completed`, so nothing can lower anything.
+        for page_cursor in [128i64, 256, 384, 512] {
+            store
+                .advance_relay_sweep_cursor(key.clone(), page_cursor, true, 1_000)
+                .unwrap();
+        }
+        assert_eq!(
+            store.relay_fetch_cursor(key.clone()).unwrap().after_id,
+            29_000
+        );
+        // Abandoning the walk outright does not lower it either.
+        store
+            .reset_relay_sweep_progress(key.clone(), 2_000)
+            .unwrap();
+        assert_eq!(
+            store.relay_fetch_cursor(key).unwrap().after_id,
+            29_000,
+            "a walk that never reached the end of the mailbox is not evidence"
+        );
+    }
+
+    /// The frontier's own safety rule survives the exception. A page whose
+    /// envelopes could not all be processed freezes the frontier while the
+    /// walk carries on above it, so a completed sweep routinely ends *above*
+    /// the frontier; treating that as license to raise it would skip exactly
+    /// the envelope the freeze exists to re-present.
+    #[test]
+    fn a_completed_sweep_never_raises_the_frontier() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let key = cursor_key();
+        store
+            .advance_relay_fetch_cursor(key.clone(), 5_900, true)
+            .unwrap();
+        // The page at 6_000 threw, so the frontier stops there while the walk
+        // continues to the top of the mailbox at 29_000.
+        assert_eq!(
+            store
+                .advance_relay_fetch_cursor(key.clone(), 6_000, false)
+                .unwrap(),
+            5_900
+        );
+        assert!(!store
+            .note_relay_sweep_completed(key.clone(), 1_000_000, 29_000)
+            .unwrap());
+        assert_eq!(
+            store.relay_fetch_cursor(key).unwrap().after_id,
+            5_900,
+            "the unprocessed envelope must still be re-presented"
         );
     }
 
@@ -10814,7 +11049,7 @@ mod tests {
             .advance_relay_fetch_cursor(key.clone(), 29_000, true)
             .unwrap();
         store
-            .note_relay_sweep_completed(key.clone(), 1_000_000)
+            .note_relay_sweep_completed(key.clone(), 1_000_000, 29_000)
             .unwrap();
 
         let cursor = store.relay_fetch_cursor(key.clone()).unwrap();
@@ -10859,7 +11094,7 @@ mod tests {
             .advance_relay_fetch_cursor(other.clone(), 4_000, true)
             .unwrap();
         store
-            .note_relay_sweep_completed(cursor_key(), 1_000_000)
+            .note_relay_sweep_completed(cursor_key(), 1_000_000, 29_000)
             .unwrap();
         // ...and a sweep of the second mailbox is part-way up it.
         store
@@ -10954,7 +11189,7 @@ mod tests {
             .advance_relay_fetch_cursor(key.clone(), 29_000, true)
             .unwrap();
         store
-            .note_relay_sweep_completed(key.clone(), swept_at)
+            .note_relay_sweep_completed(key.clone(), swept_at, 29_000)
             .unwrap();
 
         store
@@ -11086,7 +11321,7 @@ mod tests {
             .advance_relay_fetch_cursor(cursor_key(), 9_000, true)
             .unwrap();
         store
-            .note_relay_sweep_completed(cursor_key(), 1_000_000)
+            .note_relay_sweep_completed(cursor_key(), 1_000_000, 9_000)
             .unwrap();
         store
             .enqueue_relay_carried_envelope(
@@ -11373,7 +11608,7 @@ mod tests {
             .advance_relay_fetch_cursor(cursor_key(), 9_000, true)
             .unwrap();
         store
-            .note_relay_sweep_completed(cursor_key(), 1_000_000)
+            .note_relay_sweep_completed(cursor_key(), 1_000_000, 9_000)
             .unwrap();
 
         {

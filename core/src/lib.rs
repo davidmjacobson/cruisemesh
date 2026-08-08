@@ -122,7 +122,8 @@ pub use protocol::{
 };
 pub use recipient_hints::{dedupe_hints, recent_hints_for, recent_presence_hints_for};
 pub use relay_cursor::{
-    relay_cursor_advance, relay_cursor_key, relay_fetch_walk_continues, relay_hint_source_digest,
+    relay_cursor_advance, relay_cursor_key, relay_fetch_walk_continues,
+    relay_frontier_after_completed_sweep, relay_hint_source_digest,
     relay_mailbox_continuation_delay_ms, relay_mailbox_max_envelopes_per_pass,
     relay_mailbox_max_pages_per_pass, relay_mailbox_walk_action, relay_pass_start_cursor,
     relay_sweep_due, relay_sweep_interval_ms, relay_sweep_restart_from_zero,

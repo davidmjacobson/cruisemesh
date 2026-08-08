@@ -1,59 +1,114 @@
 import Foundation
 
-private struct CachedLanEndpoint: Codable {
+/// The shape builds before provenance wrote: a JSON blob, with no record of
+/// how the address became known. Still decoded so an upgrade keeps whatever
+/// those builds learned -- as `LanEndpointProvenance.hinted`, the
+/// conservative reading, since those builds filed hints and proven addresses
+/// through the same door.
+private struct LegacyCachedLanEndpoint: Codable {
     let endpoint: LanManualEndpoint
     let savedAtMs: Int64
 }
 
-/// Whether a cached endpoint may still be dialed: fresh enough, and a host the
-/// shared core still considers a local network address.
+/// Per-network memory of where a contact was last reachable over Wi-Fi.
 ///
-/// Entries written by older builds hold whatever string arrived at the time,
-/// including a name, and nothing re-checked them on the way out -- so without
-/// this an entry could keep a host alive for seven days after a hint stopped
-/// being allowed to carry it. The core is the authority for both halves; this
-/// only combines them.
-func cachedLanEndpointIsDialable(host: String, savedAtMs: Int64, nowMs: Int64) -> Bool {
-    lanEndpointCacheIsFresh(savedAtMs: savedAtMs, nowMs: nowMs) && lanEndpointHostIsLocal(host: host)
-}
-
+/// Every entry records how the address became known -- see
+/// `LanEndpointProvenance`. The shared core owns the stored format and the
+/// rules; this type only reaches `UserDefaults`, so both apps agree byte for
+/// byte on what an entry means.
 enum LanEndpointCache {
     private static let prefix = "cruisemesh.lan.endpoint."
+    /// Serialises the read-modify-write in `save` and the read-then-delete in
+    /// `load`. `UserDefaults` is atomic per operation but not across a pair of
+    /// them, and a hint that read an entry before a handshake promoted it
+    /// would write the promotion away -- the demotion
+    /// `lanEndpointCacheEncodeUpdate` exists to prevent. Neither body calls
+    /// the other, so a plain lock is enough.
+    private static let lock = NSLock()
 
     static func save(
         networkId: String?,
         userId: Data,
         endpoint: LanManualEndpoint,
+        provenance: LanEndpointProvenance,
         nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
     ) {
-        guard let networkId,
-              lanEndpointHostIsLocal(host: endpoint.host),
-              let encoded = try? JSONEncoder().encode(CachedLanEndpoint(endpoint: endpoint, savedAtMs: nowMs)) else {
-            return
-        }
-        UserDefaults.standard.set(encoded, forKey: key(networkId: networkId, userId: userId))
+        guard let networkId, lanEndpointHostIsLocal(host: endpoint.host) else { return }
+        let storageKey = key(networkId: networkId, userId: userId)
+        let entry = LanEndpointCacheEntry(
+            host: endpoint.host,
+            port: endpoint.port,
+            savedAtMs: nowMs,
+            provenance: provenance
+        )
+        lock.lock()
+        defer { lock.unlock() }
+        UserDefaults.standard.set(
+            lanEndpointCacheEncodeUpdate(existingValue: storedValue(forKey: storageKey), entry: entry),
+            forKey: storageKey
+        )
     }
 
+    /// The cached endpoint for this contact on this network, if one may still
+    /// be dialed. `localHost` is this phone's own LAN address, which is what
+    /// lets an unproven entry be checked against the network we are actually
+    /// on; an entry the core rules out for good is deleted here rather than
+    /// left to age out over seven days.
     static func load(
         networkId: String?,
         userId: Data,
+        localHost: String?,
         nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
     ) -> LanManualEndpoint? {
         guard let networkId else { return nil }
         let storageKey = key(networkId: networkId, userId: userId)
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let cached = try? JSONDecoder().decode(CachedLanEndpoint.self, from: data) else {
-            return nil
-        }
-        guard cachedLanEndpointIsDialable(
-            host: cached.endpoint.host,
-            savedAtMs: cached.savedAtMs,
-            nowMs: nowMs
-        ) else {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let stored = storedValue(forKey: storageKey) else {
+            // Nothing readable here. If something is nonetheless stored under
+            // the key it is in neither shape and never will be, so it is
+            // deleted rather than re-read and re-rejected on every Wi-Fi join
+            // -- Android deletes the equivalent unreadable string. Removing an
+            // absent key is a no-op, which covers the ordinary empty case.
             UserDefaults.standard.removeObject(forKey: storageKey)
             return nil
         }
-        return cached.endpoint
+        guard let entry = lanEndpointCacheDecode(value: stored) else {
+            UserDefaults.standard.removeObject(forKey: storageKey)
+            return nil
+        }
+        switch lanEndpointCacheDecision(entry: entry, localHost: localHost, nowMs: nowMs) {
+        case .use:
+            return LanManualEndpoint(host: entry.host, port: entry.port)
+        case .skip:
+            return nil
+        case .evict:
+            UserDefaults.standard.removeObject(forKey: storageKey)
+            return nil
+        }
+    }
+
+    /// The stored value in the current format, rewriting a legacy JSON blob
+    /// into it on the way past so nothing downstream has to know two shapes.
+    /// A value that is neither is `nil`, and the caller deletes it.
+    private static func storedValue(forKey storageKey: String) -> String? {
+        if let value = UserDefaults.standard.string(forKey: storageKey) {
+            return value
+        }
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let legacy = try? JSONDecoder().decode(LegacyCachedLanEndpoint.self, from: data) else {
+            return nil
+        }
+        let migrated = lanEndpointCacheEncode(entry: LanEndpointCacheEntry(
+            host: legacy.endpoint.host,
+            port: legacy.endpoint.port,
+            savedAtMs: legacy.savedAtMs,
+            provenance: .hinted
+        ))
+        // The saved-at millisecond is carried across unchanged: a migration is
+        // not new evidence and must not restart the seven-day clock.
+        UserDefaults.standard.set(migrated, forKey: storageKey)
+        return migrated
     }
 
     private static func key(networkId: String, userId: Data) -> String {

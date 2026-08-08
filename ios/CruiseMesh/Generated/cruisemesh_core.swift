@@ -3412,7 +3412,9 @@ public protocol MessageStoreProtocol : AnyObject {
 
     /**
      * Record that a walk from 0 completed for this mailbox, restarting its
-     * sweep interval and clearing the sweep's resume cursor.
+     * sweep interval, clearing the sweep's resume cursor, and lowering the
+     * frontier if the walk proved it sits above the top of the mailbox.
+     * Reports whether the frontier was lowered.
      *
      * Called only when the walk actually reached the end of the mailbox. A
      * sweep cut short — the service stopped, internet went away, the relay
@@ -3422,8 +3424,41 @@ public protocol MessageStoreProtocol : AnyObject {
      * resume cursor is what lets "the next pass finishes it" be true rather
      * than aspirational, and clearing it here is the single act that turns a
      * sweep from in-progress back into scheduled.
+     *
+     * `swept_through_id` is the `after=` the walk was holding when the empty
+     * page arrived — the highest id of a hint-matching row the sweep proved
+     * exists. [`crate::relay_frontier_after_completed_sweep`] decides what to
+     * do with it, and that doc comment carries the reasoning: it is the one
+     * place the frontier moves *down*, it only does so on a mailbox that had
+     * rows in it, and it never moves the frontier up. Restricting the whole
+     * question to this method is what keeps "only a completed sweep is
+     * evidence" true by construction — nothing else in the store can reach
+     * the lowering, and both shells call this only from the empty page.
+     *
+     * The read and the write share one held connection lock, so a page cursor
+     * landing between them cannot make the repair decide against a frontier
+     * that no longer exists.
+     *
+     * Reporting the lowering is not bookkeeping: relayd's live push gates on
+     * the `after=` the client subscribed with, and that gate only ever moves
+     * *up* for the life of the socket (`handle_ws` keeps a local `after` and
+     * runs `after = after.max(id)` on every row it replays or pushes). So a
+     * socket opened against the old frontier can never deliver a row at or
+     * below it, and stays deaf to a rebuilt mailbox until it reconnects. The
+     * shells use this to reopen it (`RelayPushClient.resubscribe`).
+     *
+     * A `true` here is not by itself a rebuilt relay, and the shells' logs say
+     * so: relayd deletes a row when it is acked, so a healthy mailbox whose
+     * newest rows were consumed by this device routinely reports a top below
+     * the frontier. See [`crate::relay_frontier_after_completed_sweep`] for why
+     * lowering there is correct and free. The reopen is unconditional on the
+     * lowering because the client cannot tell the two apart, and a threshold
+     * that guessed would suppress the reopen in exactly the rebuild whose
+     * frontier was low to begin with; the cost is one socket reopen per
+     * completed sweep of the one mailbox the socket watches, at most once per
+     * `RELAY_SWEEP_INTERVAL_MS`.
      */
-    func noteRelaySweepCompleted(configKey: String, nowMs: Int64) throws
+    func noteRelaySweepCompleted(configKey: String, nowMs: Int64, sweptThroughId: Int64) throws  -> Bool
 
     /**
      * Should this requester's pending request raise a prompt right now, and
@@ -5862,7 +5897,9 @@ open func noteRelayHintSources(ownUserId: Data)throws  -> Bool {
 
     /**
      * Record that a walk from 0 completed for this mailbox, restarting its
-     * sweep interval and clearing the sweep's resume cursor.
+     * sweep interval, clearing the sweep's resume cursor, and lowering the
+     * frontier if the walk proved it sits above the top of the mailbox.
+     * Reports whether the frontier was lowered.
      *
      * Called only when the walk actually reached the end of the mailbox. A
      * sweep cut short — the service stopped, internet went away, the relay
@@ -5872,13 +5909,48 @@ open func noteRelayHintSources(ownUserId: Data)throws  -> Bool {
      * resume cursor is what lets "the next pass finishes it" be true rather
      * than aspirational, and clearing it here is the single act that turns a
      * sweep from in-progress back into scheduled.
+     *
+     * `swept_through_id` is the `after=` the walk was holding when the empty
+     * page arrived — the highest id of a hint-matching row the sweep proved
+     * exists. [`crate::relay_frontier_after_completed_sweep`] decides what to
+     * do with it, and that doc comment carries the reasoning: it is the one
+     * place the frontier moves *down*, it only does so on a mailbox that had
+     * rows in it, and it never moves the frontier up. Restricting the whole
+     * question to this method is what keeps "only a completed sweep is
+     * evidence" true by construction — nothing else in the store can reach
+     * the lowering, and both shells call this only from the empty page.
+     *
+     * The read and the write share one held connection lock, so a page cursor
+     * landing between them cannot make the repair decide against a frontier
+     * that no longer exists.
+     *
+     * Reporting the lowering is not bookkeeping: relayd's live push gates on
+     * the `after=` the client subscribed with, and that gate only ever moves
+     * *up* for the life of the socket (`handle_ws` keeps a local `after` and
+     * runs `after = after.max(id)` on every row it replays or pushes). So a
+     * socket opened against the old frontier can never deliver a row at or
+     * below it, and stays deaf to a rebuilt mailbox until it reconnects. The
+     * shells use this to reopen it (`RelayPushClient.resubscribe`).
+     *
+     * A `true` here is not by itself a rebuilt relay, and the shells' logs say
+     * so: relayd deletes a row when it is acked, so a healthy mailbox whose
+     * newest rows were consumed by this device routinely reports a top below
+     * the frontier. See [`crate::relay_frontier_after_completed_sweep`] for why
+     * lowering there is correct and free. The reopen is unconditional on the
+     * lowering because the client cannot tell the two apart, and a threshold
+     * that guessed would suppress the reopen in exactly the rebuild whose
+     * frontier was low to begin with; the cost is one socket reopen per
+     * completed sweep of the one mailbox the socket watches, at most once per
+     * `RELAY_SWEEP_INTERVAL_MS`.
      */
-open func noteRelaySweepCompleted(configKey: String, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+open func noteRelaySweepCompleted(configKey: String, nowMs: Int64, sweptThroughId: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_note_relay_sweep_completed(self.uniffiClonePointer(),
         FfiConverterString.lower(configKey),
-        FfiConverterInt64.lower(nowMs),$0
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterInt64.lower(sweptThroughId),$0
     )
-}
+})
 }
 
     /**
@@ -12436,6 +12508,91 @@ public func FfiConverterTypeIntroductionTicket_lower(_ value: IntroductionTicket
 
 
 /**
+ * One entry of the per-network LAN endpoint cache, as both apps hold it.
+ */
+public struct LanEndpointCacheEntry {
+    public var host: String
+    public var port: UInt16
+    public var savedAtMs: Int64
+    public var provenance: LanEndpointProvenance
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(host: String, port: UInt16, savedAtMs: Int64, provenance: LanEndpointProvenance) {
+        self.host = host
+        self.port = port
+        self.savedAtMs = savedAtMs
+        self.provenance = provenance
+    }
+}
+
+
+
+extension LanEndpointCacheEntry: Equatable, Hashable {
+    public static func ==(lhs: LanEndpointCacheEntry, rhs: LanEndpointCacheEntry) -> Bool {
+        if lhs.host != rhs.host {
+            return false
+        }
+        if lhs.port != rhs.port {
+            return false
+        }
+        if lhs.savedAtMs != rhs.savedAtMs {
+            return false
+        }
+        if lhs.provenance != rhs.provenance {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(host)
+        hasher.combine(port)
+        hasher.combine(savedAtMs)
+        hasher.combine(provenance)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLanEndpointCacheEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanEndpointCacheEntry {
+        return
+            try LanEndpointCacheEntry(
+                host: FfiConverterString.read(from: &buf),
+                port: FfiConverterUInt16.read(from: &buf),
+                savedAtMs: FfiConverterInt64.read(from: &buf),
+                provenance: FfiConverterTypeLanEndpointProvenance.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LanEndpointCacheEntry, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.host, into: &buf)
+        FfiConverterUInt16.write(value.port, into: &buf)
+        FfiConverterInt64.write(value.savedAtMs, into: &buf)
+        FfiConverterTypeLanEndpointProvenance.write(value.provenance, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointCacheEntry_lift(_ buf: RustBuffer) throws -> LanEndpointCacheEntry {
+    return try FfiConverterTypeLanEndpointCacheEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointCacheEntry_lower(_ value: LanEndpointCacheEntry) -> RustBuffer {
+    return FfiConverterTypeLanEndpointCacheEntry.lower(value)
+}
+
+
+/**
  * Short-lived endpoint candidate sent inside a sealed `kind = 8` message.
  * `network_id` is a hashed local-network fingerprint, never a raw SSID.
  */
@@ -17676,6 +17833,172 @@ extension IncomingMessageInsertOutcome: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What a shell should do with an entry it just read off disk.
+ */
+
+public enum LanEndpointCacheDecision {
+
+    /**
+     * Dial it.
+     */
+    case use
+    /**
+     * Do not dial it, but leave it stored -- this load could not judge it.
+     */
+    case skip
+    /**
+     * Delete it. It can never be dialed successfully from here again.
+     */
+    case evict
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLanEndpointCacheDecision: FfiConverterRustBuffer {
+    typealias SwiftType = LanEndpointCacheDecision
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanEndpointCacheDecision {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .use
+
+        case 2: return .skip
+
+        case 3: return .evict
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: LanEndpointCacheDecision, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .use:
+            writeInt(&buf, Int32(1))
+
+
+        case .skip:
+            writeInt(&buf, Int32(2))
+
+
+        case .evict:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointCacheDecision_lift(_ buf: RustBuffer) throws -> LanEndpointCacheDecision {
+    return try FfiConverterTypeLanEndpointCacheDecision.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointCacheDecision_lower(_ value: LanEndpointCacheDecision) -> RustBuffer {
+    return FfiConverterTypeLanEndpointCacheDecision.lower(value)
+}
+
+
+
+extension LanEndpointCacheDecision: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How a cached LAN endpoint came to be known.
+ *
+ * The distinction exists because the two are worth very different amounts.
+ * A hint is a claim the contact made about an address; an authenticated
+ * entry is an address this phone reached and completed a Noise handshake
+ * with. Only the second is evidence, so only the second may sit in the cache
+ * on a subnet this phone cannot see itself on -- a routed LAN carries TCP
+ * where mDNS cannot, and a peer proven there is legitimately cross-subnet.
+ */
+
+public enum LanEndpointProvenance {
+
+    /**
+     * The address arrived in a contact's endpoint hint and nothing has
+     * confirmed it. Values written before provenance was recorded decode as
+     * this: the conservative reading, since a pre-provenance build filed
+     * hints and proven addresses through the same door.
+     */
+    case hinted
+    /**
+     * The address completed a Noise handshake with this phone.
+     */
+    case authenticated
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLanEndpointProvenance: FfiConverterRustBuffer {
+    typealias SwiftType = LanEndpointProvenance
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanEndpointProvenance {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .hinted
+
+        case 2: return .authenticated
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: LanEndpointProvenance, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .hinted:
+            writeInt(&buf, Int32(1))
+
+
+        case .authenticated:
+            writeInt(&buf, Int32(2))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointProvenance_lift(_ buf: RustBuffer) throws -> LanEndpointProvenance {
+    return try FfiConverterTypeLanEndpointProvenance.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointProvenance_lower(_ value: LanEndpointProvenance) -> RustBuffer {
+    return FfiConverterTypeLanEndpointProvenance.lower(value)
+}
+
+
+
+extension LanEndpointProvenance: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * A metadata-only connection event. No addresses, network names, tokens, or
  * message content are retained.
  *
@@ -18355,6 +18678,30 @@ fileprivate struct FfiConverterOptionTypeGroup: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeGroup.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeLanEndpointCacheEntry: FfiConverterRustBuffer {
+    typealias SwiftType = LanEndpointCacheEntry?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeLanEndpointCacheEntry.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeLanEndpointCacheEntry.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -21472,6 +21819,106 @@ public func lanDefaultTcpPort() -> UInt16 {
     )
 })
 }
+/**
+ * What to do with a cache entry read back on this phone's current network.
+ *
+ * `local_host` is this phone's own LAN address, or `None` when it has none to
+ * compare with.
+ *
+ * Shipped builds filed a hinted address under this phone's network id
+ * whatever subnet the address was on, so a phone that ever received such a
+ * hint burns one connect timeout per Wi-Fi join for the seven days the entry
+ * lives. Freshness and the host rule alone could not clear those: an address
+ * that authenticated on a routed LAN is a legitimate cross-subnet entry and
+ * looks identical without provenance. With provenance recorded, the rule is
+ * finally expressible -- an unproven address must be on the network we are
+ * on, a proven one need not be.
+ *
+ * The two "cannot tell" cases are deliberately not the same answer. When
+ * *this phone* has no address that can fingerprint a network, the load itself
+ * is uninformative, so an unproven entry is skipped and left alone: not
+ * dialing is enough to stop the loop, and the next load on a readable
+ * interface can still judge it. When the *entry's* host is the unprovable one
+ * (a link-local IPv6 address, identical on every link there has ever been) no
+ * future load can judge it either -- unprovable is exactly what #271 said may
+ * not be remembered -- so that is a terminal answer and the entry goes.
+ *
+ * Nothing here discovers or forwards an address; every value examined is one
+ * this phone already holds.
+ */
+public func lanEndpointCacheDecision(entry: LanEndpointCacheEntry, localHost: String?, nowMs: Int64) -> LanEndpointCacheDecision {
+    return try!  FfiConverterTypeLanEndpointCacheDecision.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_decision(
+        FfiConverterTypeLanEndpointCacheEntry.lower(entry),
+        FfiConverterOptionString.lower(localHost),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * Parses a stored cache value, or `None` when it cannot be trusted at all.
+ *
+ * A legacy three-field value parses as [`LanEndpointProvenance::Hinted`].
+ * That is the conservative reading and the whole point of the migration: the
+ * builds that wrote those values filed cross-subnet hints, so treating them
+ * as proven would preserve exactly the entries this is meant to clear.
+ * An unrecognised provenance field is read as `Hinted` for the same reason.
+ *
+ * Fields past the fourth are ignored rather than rejected. Both shells delete
+ * a value this returns `None` for, so being strict about length would mean
+ * that appending a fifth field later silently wipes the whole cache -- proven
+ * cross-subnet entries included -- on any phone that rolls back to this build.
+ * Ignoring the tail costs nothing and makes the next append survivable.
+ */
+public func lanEndpointCacheDecode(value: String) -> LanEndpointCacheEntry? {
+    return try!  FfiConverterOptionTypeLanEndpointCacheEntry.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_decode(
+        FfiConverterString.lower(value),$0
+    )
+})
+}
+/**
+ * Serialises a cache entry to the single string both shells persist.
+ *
+ * The shape is `base64url(host)|port|savedAtMs|provenance`, extending the
+ * three-field value shipped builds wrote by appending a field rather than
+ * changing one, so the three fields those builds wrote keep their meaning and
+ * their position. The host is encoded because it can contain the separator
+ * (an IPv6 literal) and a zone suffix.
+ *
+ * That only buys forward compatibility because [`lan_endpoint_cache_decode`]
+ * ignores fields it does not know: shipped builds did **not** -- their
+ * three-field parsers rejected anything longer, and the shells delete a value
+ * they cannot parse. So a phone that rolls back past this change loses its
+ * cache; a phone that rolls back past a *later* appended field does not.
+ */
+public func lanEndpointCacheEncode(entry: LanEndpointCacheEntry) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_encode(
+        FfiConverterTypeLanEndpointCacheEntry.lower(entry),$0
+    )
+})
+}
+/**
+ * The value to store for `entry`, given whatever is already stored under the
+ * same key (`None` when nothing is).
+ *
+ * This exists so a save never silently *demotes* a proven address. A contact
+ * keeps resending its endpoint hint, and if that hint names the address this
+ * phone already authenticated, rewriting the entry as merely hinted would
+ * hand it back to the eviction rule below and drop a working cross-subnet
+ * peer on the next Wi-Fi join. A hint about an already-proven address
+ * refreshes its clock and keeps the proof; anything else -- a different
+ * address, or a fresh handshake -- writes what the caller passed.
+ */
+public func lanEndpointCacheEncodeUpdate(existingValue: String?, entry: LanEndpointCacheEntry) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_encode_update(
+        FfiConverterOptionString.lower(existingValue),
+        FfiConverterTypeLanEndpointCacheEntry.lower(entry),$0
+    )
+})
+}
 public func lanEndpointCacheIsFresh(savedAtMs: Int64, nowMs: Int64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_is_fresh(
@@ -21874,6 +22321,13 @@ public func relayContactSharesOwnFamily(contactRelayUrl: String?, contactRelayTo
  * frontier its position, so an interrupted sweep cannot turn into a
  * re-walk-everything-next-pass loop.
  *
+ * There is exactly one way the frontier moves down, and it is deliberately
+ * not expressible here: [`relay_frontier_after_completed_sweep`], applied once
+ * by a sweep that walked all the way to the empty page. Per *page* the
+ * never-backwards rule has to be absolute, because a page cursor below the
+ * frontier is the normal shape of a sweep in progress and says nothing about
+ * the top of the mailbox. Only the end of a completed walk does.
+ *
  * The same function decides the sweep's own `sweep_after_id`
  * (`MessageStore::advance_relay_sweep_cursor`), because the rule is the same
  * rule: a page that did not finish must be presented again, and a cursor that
@@ -22102,6 +22556,132 @@ public func relayFetchWalkContinues(pageEnvelopeCount: UInt32, afterId: Int64, p
 })
 }
 /**
+ * The frontier to persist when a sweep reaches the end of the mailbox,
+ * given how far that sweep actually walked.
+ *
+ * This is the one place the frontier is allowed to move *down*, and it exists
+ * for the operator event [`relay_sweep_due`]'s doc comment describes and could
+ * not repair: a relay rebuilt from a fresh volume restarts its row ids at 1
+ * underneath a frontier we still remember. [`relay_cursor_advance`] never
+ * moves backwards, so ordinary passes go on sending `after=29000` against a
+ * mailbox whose highest row is 40 and see nothing; relayd's live push gates on
+ * the same client-supplied value, so the socket is blind too. Delivery for
+ * that mailbox degrades to sweep cadence — up to [`RELAY_SWEEP_INTERVAL_MS`] —
+ * permanently.
+ *
+ * `swept_through_id` is the `after=` the walk was holding when the empty page
+ * arrived: the highest id of a row matching our hints that the sweep proved
+ * exists. It is not a new cursor the shells have to keep — it is the walk's
+ * own loop variable, which starts at the sweep's resume point and takes each
+ * page's `next_cursor` in turn, so it already covers the passes before this
+ * one (a sweep resumes from a cursor no higher than what those passes saw, and
+ * re-walks anything above it).
+ *
+ * Three rules, and each of them is load-bearing:
+ *
+ * - **Only downwards.** `swept_through_id` at or above the frontier returns
+ * the frontier untouched. A sweep whose walk outran the frontier is the
+ * ordinary case — a page that failed to process freezes the frontier while
+ * the walk carries on — and letting the sweep's cursor *raise* the frontier
+ * there would skip exactly the envelope the freeze exists to re-present.
+ * Raising is also how a broken or hostile relay would push this device past
+ * its own mail, which is reason enough on its own. It is what makes this
+ * safe alongside `MessageStore::note_relay_hint_sources`, too: a hint-set
+ * change that zeroed the frontier mid-sweep stays zeroed, because a sweep
+ * completing afterwards can only lower.
+ *
+ * - **Only on a mailbox with rows in it.** `swept_through_id` of 0 — a walk
+ * from 0 that met the empty page immediately — changes nothing. This is the
+ * distinction the whole function turns on, because a regressed id space and
+ * a drained mailbox look almost identical from here, and an empty mailbox is
+ * the one shape that carries no evidence either way. It also costs nothing
+ * to decline on a relay that was *not* rebuilt: new mail lands above the
+ * remembered frontier and an ordinary pass sees it. On one that *was*, it
+ * costs a bounded blind window, and the honest statement of it is this: a
+ * message sent just after an empty sweep lands at an id below the stale
+ * frontier, where no ordinary pass and no live push can reach it, and the
+ * sweep that would repair the frontier is up to [`RELAY_SWEEP_INTERVAL_MS`]
+ * away — because the empty sweep just stamped `last_sweep_at`. So that one
+ * message waits for the next sweep to fetch it *and* to lower the frontier;
+ * everything after it arrives normally. One sweep interval, once, at the
+ * moment a rebuilt mailbox stops being empty — against the permanent
+ * blindness this function replaces, and against the alternative below.
+ * Lowering an empty mailbox's frontier to 0 would ask relayd to re-scan from
+ * the bottom of a shared family mailbox on every poll, forever, and would
+ * fire on every ordinary drained mailbox rather than on the rare rebuild.
+ *
+ * - **To what the sweep proved, not to 0.** The repaired frontier is
+ * `swept_through_id` itself. A completed sweep sends the same hints an
+ * ordinary pass does, so "no matching row above `swept_through_id`" is
+ * exactly what it established; dropping to 0 instead would re-present every
+ * row below it on the next ordinary pass — the deliberately-unacked carry
+ * copies included — which is the thousands-of-round-trips behaviour this
+ * whole module exists to remove.
+ *
+ * What a lowering does *not* prove is that anything went wrong, and the
+ * distinction matters to whoever reads the log line a shell writes here.
+ * relayd deletes a row when it is acked, so the ordinary steady state of a
+ * healthy mailbox is a frontier sitting above every row that still exists: the
+ * last message this phone consumed took its row with it, and the top surviving
+ * hint-matching row — a `CARRIED` proxy copy left in place on purpose, a
+ * legacy group-hint row that is never acked at all — is older and lower. A
+ * completed sweep over *that* mailbox lowers the frontier too, and it is
+ * correct and free to do so: ids are never reused, so nothing above the new
+ * value can appear later at an id below it, and nothing below it is
+ * re-presented (the walk that just finished proved the new value is the top).
+ * The rebuilt relay is the case this repair exists for; the drained-top
+ * mailbox is the case that reaches it most often.
+ *
+ * The write is idempotent by construction: after one lowering the frontier
+ * *is* `swept_through_id`, so a second completed sweep proving the same top of
+ * the mailbox lands in the "at or above" branch and writes nothing.
+ *
+ * Note what this deliberately does not do: it never re-presents mail, it only
+ * stops the frontier lying about where the mailbox ends. Everything between
+ * the repaired frontier and the old one has already been walked by the sweep
+ * that just finished, and anything re-fetched later is deduped on the way in.
+ *
+ * It also cannot violate the rule the frontier exists to keep — nothing is
+ * persisted past an envelope that never reached a terminal disposition —
+ * because it only ever moves the cursor *down*. A page that failed mid-walk
+ * sits below the old frontier and below the repaired one alike, so no envelope
+ * becomes newly skipped; the sweep that re-reads that page from 0 remains the
+ * path that presents it again. That is why this exception can sit beside
+ * [`relay_cursor_advance`]'s never-backwards rule without weakening it: the
+ * rule stops a *page* cursor from undoing the frontier, and lowering is not a
+ * page cursor.
+ *
+ * One interaction with the sweep's own resume cursor is worth stating plainly,
+ * because `swept_through_id` is that cursor's final value rather than an
+ * independent observation of the mailbox. A sweep paused mid-walk when the
+ * relay is rebuilt under it resumes at a cursor from the id space that is now
+ * gone, meets the empty page immediately, and reports *that* stale id. The
+ * frontier is then lowered to a value which is itself above the new mailbox —
+ * a weaker repair, never a wrong one. Nothing that was reachable stops being
+ * reachable (the frontier was already above the new top and still is), and
+ * completing the sweep clears its progress, so the *next* sweep necessarily
+ * starts at 0, walks the new mailbox, and finishes the repair. Buying the
+ * stronger answer would mean persisting the highest row id a sweep has
+ * actually seen — a third cursor — to improve a case that already converges on
+ * its own.
+ *
+ * Only a *completed* sweep may call it. A walk that yielded on its budget, was
+ * abandoned because the relay stopped advancing its cursor, or simply ran out
+ * of network has seen a prefix of the mailbox and knows nothing about the top
+ * of it; lowering the frontier to a prefix's last id would strand every row
+ * above it behind a re-walk on every ordinary pass. Both shells call this only
+ * through `MessageStore::note_relay_sweep_completed`, which is only reached on
+ * the empty page that ends the walk.
+ */
+public func relayFrontierAfterCompletedSweep(persistedAfterId: Int64, sweptThroughId: Int64) -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_frontier_after_completed_sweep(
+        FfiConverterInt64.lower(persistedAfterId),
+        FfiConverterInt64.lower(sweptThroughId),$0
+    )
+})
+}
+/**
  * A stable name for the *set of ids* this device's relay fetch hints are
  * derived from: our own user id, every group we are a member of, and every
  * contact we proxy-poll for.
@@ -22281,20 +22861,22 @@ public func relaySetupIsOfficial(relayUrl: String) -> Bool {
  * repaired by restarting the app.
  *
  * It is worth being precise about what "repaired" ever meant here, because it
- * is less than it sounds. [`relay_cursor_advance`] never moves the frontier
- * *backwards*, and a sweep only re-reads pages — it never lowers `after_id`.
+ * was less than it sounded. [`relay_cursor_advance`] never moves the frontier
+ * *backwards*, and a sweep only re-reads pages — it never lowered `after_id`.
  * So on a mailbox whose ids restarted under a frontier of, say, 29000, that
- * frontier stays at 29000 for good. Ordinary passes send `after=29000` and see
+ * frontier stayed at 29000 for good. Ordinary passes sent `after=29000` and saw
  * nothing; relayd's live push gates on the same client-supplied value, so the
- * socket is blind too. Only a sweep, which starts from 0, sees that mail. The
- * mailbox is therefore in permanent sweep-cadence delivery either way — this
- * change moves that cadence from minutes (one forced walk per app restart, and
+ * socket was blind too. Only a sweep, which starts from 0, saw that mail. The
+ * mailbox was therefore in permanent sweep-cadence delivery either way — this
+ * change moved that cadence from minutes (one forced walk per app restart, and
  * phones restart all day) to up to [`RELAY_SWEEP_INTERVAL_MS`].
  *
- * That is a real regression for one rare operator event, accepted against a
- * constant cost paid by every phone every day. Lowering the frontier when a
- * completed sweep proves the mailbox's ids have regressed would fix it
- * properly and is the obvious follow-up; nothing here forecloses it.
+ * The sweep that cadence describes now *ends* the state rather than papering
+ * over it: [`relay_frontier_after_completed_sweep`] lowers the frontier to
+ * whatever a completed walk actually found, so the mailbox is back on ordinary
+ * frontier delivery — and back on live push, which gates on the same value —
+ * from the first completed sweep that finds anything in the rebuilt mailbox
+ * rather than never.
  *
  * The sweep's own resume cursor could have made that case *worse* — a cursor
  * remembered from the old id space points past the end of a rebuilt mailbox,
@@ -23080,6 +23662,18 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_lan_default_tcp_port() != 33372) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_decision() != 52054) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_decode() != 30229) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_encode() != 20029) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_encode_update() != 62187) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_is_fresh() != 25415) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -23158,7 +23752,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_contact_shares_own_family() != 37254) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_cursor_advance() != 22764) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_cursor_advance() != 57134) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_cursor_key() != 37643) {
@@ -23200,6 +23794,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_fetch_walk_continues() != 16691) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_frontier_after_completed_sweep() != 40678) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_hint_source_digest() != 28986) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -23227,7 +23824,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 11572) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 44099) {
+    if (uniffi_cruisemesh_core_checksum_func_relay_sweep_due() != 21646) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_interval_ms() != 37428) {
@@ -23725,7 +24322,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_hint_sources() != 12844) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_sweep_completed() != 50076) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_sweep_completed() != 29578) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_shared_request_prompt() != 16956) {
