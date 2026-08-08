@@ -35,14 +35,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cruisemesh_core::{
-    core_contact_relay_unreachable_delta, core_is_hidden_spray_kind, core_kind_persists_msg_id_row,
-    core_own_capabilities, core_relay_ack_ids, core_relay_queue_reflects_delivery,
-    core_should_ack_inbound, encode_hello, encode_hello2, may_start_carried_offer, parse_frame,
-    relay_classify_http_error, relay_cursor_advance, relay_fetch_walk_continues,
-    relay_frontier_after_completed_sweep, relay_mailbox_walk_action, relay_retry_after_ms,
-    CarriedEnvelope, CoreInboundDisposition, CoreRelayEnvelopeDisposition, CoreRelayFault,
-    CoreRelayPathState, Frame, MessageStore, RelayMailboxWalkAction, CAP_ACKS_HIDDEN_KINDS,
-    KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT,
+    authored_expiry, core_contact_relay_unreachable_delta, core_is_hidden_spray_kind,
+    core_kind_persists_msg_id_row, core_own_capabilities, core_relay_ack_ids,
+    core_relay_queue_reflects_delivery, core_should_ack_inbound, encode_hello, encode_hello2,
+    generate_identity, may_start_carried_offer, parse_frame, relay_classify_http_error,
+    relay_cursor_advance, relay_fetch_walk_continues, relay_frontier_after_completed_sweep,
+    relay_mailbox_walk_action, relay_retry_after_ms, CarriedEnvelope, Contact,
+    CoreInboundDisposition, CoreRelayEnvelopeDisposition, CoreRelayFault, CoreRelayPathState,
+    Frame, MessageStore, RelayMailboxWalkAction, CAP_ACKS_HIDDEN_KINDS, KIND_LAN_ENDPOINT_HINT,
+    KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, RECEIPT_TYPE_DELIVERED,
 };
 
 // ---------------------------------------------------------------------------
@@ -201,9 +202,9 @@ const CONTRACT: &[Invariant] = &[
         id: "QUEUE-01",
         statement: "Proof of delivery permits — and the queue eventually performs — retirement \
                     of a 1:1 outbound envelope, and short-lived payloads are superseded.",
-        owner: Owner::Unimplemented {
-            package: "the fix for issue #283 (outbound queue retirement)",
-        },
+        owner: Owner::Core(
+            "core/src/outbound_retirement.rs coverage, sweep, supersession and expiry tests",
+        ),
     },
     Invariant {
         id: "SECRET-01",
@@ -641,6 +642,151 @@ fn carry_01_uploading_a_carried_row_does_not_remove_it() {
 }
 
 #[test]
+fn queue_01_proof_of_delivery_shrinks_the_advertised_set() {
+    let id = lookup("QUEUE-01").id;
+    let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+    let now_ms = 1_700_000_000_000;
+    let me = generate_identity();
+    let peer = generate_identity();
+    let peer_contact = Contact {
+        user_id: peer.user_id.clone(),
+        name: "Robin".to_string(),
+        sign_pk: peer.sign_pk.clone(),
+        agree_pk: peer.agree_pk.clone(),
+        relay_url: None,
+        relay_token: None,
+        nickname: None,
+    };
+    store
+        .upsert_contact(peer_contact.clone())
+        .expect("accept contact");
+
+    for body in [&b"one"[..], b"two", b"three"] {
+        store
+            .author_pairwise_message(
+                me.clone(),
+                peer_contact.clone(),
+                KIND_TEXT,
+                body.to_vec(),
+                None,
+                now_ms,
+            )
+            .expect("author");
+    }
+    // Supersession: five generations of a snapshot kind, one survivor.
+    for generation in 0..5u8 {
+        store
+            .author_pairwise_message(
+                me.clone(),
+                peer_contact.clone(),
+                KIND_PROFILE_SYNC,
+                vec![generation; 8],
+                None,
+                now_ms,
+            )
+            .expect("author profile sync");
+    }
+    let queued = store
+        .outbound_envelopes_after(peer.user_id.clone(), me.user_id.clone(), 0)
+        .expect("queued");
+    contract_assert!(
+        id,
+        queued.len() == 4,
+        "only the newest generation of a snapshot kind may stay queued; {} rows left",
+        queued.len()
+    );
+
+    // Coverage: a delivered watermark retires what it covers, in the queue the
+    // relay uploader and the digest spray both read.
+    let covered_through = queued[1].lamport;
+    store
+        .record_receipt(
+            peer.user_id.clone(),
+            me.user_id.clone(),
+            RECEIPT_TYPE_DELIVERED,
+            covered_through,
+            None,
+        )
+        .expect("record receipt");
+    let after = store
+        .outbound_envelopes_after(peer.user_id.clone(), me.user_id.clone(), 0)
+        .expect("queued after receipt");
+    contract_assert!(
+        id,
+        after.iter().all(|row| row.lamport > covered_through),
+        "a delivered watermark must retire everything it covers"
+    );
+    let relay_pending = store
+        .pending_relay_outbound_envelopes(64, now_ms, vec![])
+        .expect("relay candidates");
+    contract_assert!(
+        id,
+        relay_pending.len() == after.len(),
+        "the relay uploader must see the same shrunken set as the digest path"
+    );
+
+    // The obligation survives the row: the stored message can still be
+    // re-sealed for a peer whose gap-aware digest asks for it.
+    let stored = store
+        .messages_after(peer.user_id.clone(), me.user_id.clone(), 0)
+        .expect("messages");
+    let rebuildable = stored
+        .into_iter()
+        .find(|message| message.lamport == covered_through)
+        .expect("the covered message row must survive its envelope");
+    let rebuilt = store
+        .backfill_pairwise_envelope(me.clone(), peer_contact.clone(), rebuildable.clone(), None)
+        .expect("backfill");
+    contract_assert!(
+        id,
+        rebuilt.envelope.lamport == covered_through && !rebuilt.envelope.sealed.is_empty(),
+        "retirement removed the ability to retransmit, not just the queued copy"
+    );
+
+    // ...and answering that peer must not put the row back. A peer's digest
+    // reports its gap-aware contiguous watermark, which sits below the MAX
+    // watermark retirement follows whenever its copy of the stream is holey,
+    // so this rebuild is routine rather than exotic. If it re-queued, the
+    // advertised set would regrow on every digest and the relay uploader would
+    // re-post acknowledged mail: the rule would hold for minutes at a time and
+    // never longer.
+    let rebuilt_again = store
+        .backfill_pairwise_envelope(me.clone(), peer_contact, rebuildable, None)
+        .expect("backfill twice");
+    contract_assert!(
+        id,
+        rebuilt_again.envelope.msg_id == rebuilt.envelope.msg_id,
+        "a re-sealed envelope must keep the message's own identity, or every \
+         dedupe set on both sides reads a retransmission as new traffic"
+    );
+    let after_rebuild = store
+        .outbound_envelopes_after(peer.user_id.clone(), me.user_id.clone(), 0)
+        .expect("queued after rebuild");
+    contract_assert!(
+        id,
+        after_rebuild.len() == after.len(),
+        "answering a digest must not re-admit a retired row to the queue"
+    );
+    contract_assert!(
+        id,
+        store
+            .pending_relay_outbound_envelopes(64, now_ms, vec![])
+            .expect("relay candidates after rebuild")
+            .len()
+            == after.len(),
+        "answering a digest must not hand the relay uploader acknowledged mail"
+    );
+
+    // Expiry is right-sized, not flat: a payload that states its own short
+    // validity does not get a week.
+    contract_assert!(
+        id,
+        authored_expiry(KIND_LAN_ENDPOINT_HINT, now_ms) < authored_expiry(KIND_TEXT, now_ms),
+        "a reachability hint must not outlive a person's message"
+    );
+}
+
+#[test]
 fn cursor_01_the_frontier_moves_only_over_fully_processed_ground() {
     let id = lookup("CURSOR-01").id;
 
@@ -1050,17 +1196,6 @@ fn idemp_01_external_result_replay_is_not_modelled_yet() {
             frontier commit under fault injection)"]
 fn txn_01_transaction_boundaries_are_not_enforced_by_a_test_yet() {
     unimplemented!("package C0 proves no store transaction spans external I/O");
-}
-
-#[test]
-#[ignore = "UNIMPLEMENTED: owned by the fix for issue #283 — outbound_envelopes has no \
-            receipt-coverage retirement and no supersession, only a flat 7-day expiry for every \
-            kind; see fixture zombie-outbound-queue.jsonl"]
-fn queue_01_the_outbound_queue_has_no_retirement_path_but_expiry() {
-    unimplemented!(
-        "issue #283: proof of delivery must permit retirement and short-lived payloads must be \
-         superseded, so the advertised set shrinks under coverage"
-    );
 }
 
 // ---------------------------------------------------------------------------

@@ -2289,9 +2289,65 @@ public protocol MessageStoreProtocol : AnyObject {
     func backfillOutgoingReceiptEnvelopes(identity: Identity, nowMs: Int64) throws  -> [Data]
 
     /**
-     * Seal and persist an envelope for a legacy authored message that was
-     * stored before the outbound queue existed. Repeated calls return the
-     * already-persisted envelope instead of generating a new msg id.
+     * Re-seal one locally authored message for a peer whose gap-aware digest
+     * says it is missing that lamport, when the outbound queue no longer holds
+     * the sealed copy. Both shells' digest responders reach this through
+     * `queuedByLamport[lamport] ?: backfill(...)`.
+     *
+     * A queue row can be absent for three quite different reasons, and #283
+     * made the difference matter. Before it, absence meant only "authored
+     * before the outbound queue table existed", so re-sealing *and re-queuing*
+     * was right. Now it can also mean "retired on proof of delivery" or
+     * "retired because a newer generation of this snapshot kind superseded
+     * it", and re-queuing those would undo the retirement on the next digest —
+     * with the queue regrown, the relay uploader re-posting acknowledged mail,
+     * and (before the identity fix below) a fresh random `msg_id` defeating
+     * every dedupe set on both sides.
+     *
+     * So this function separates the two obligations that used to be one:
+     *
+     * * **Re-sealing is unconditional.** The peer asked for the lamport, and
+     * its digest watermark is the gap-aware contiguous one, so it genuinely
+     * may be missing a message our own MAX-based delivered watermark
+     * covers. Refusing to answer would strand the peer's contiguity
+     * permanently. The returned envelope is for immediate transmission on
+     * the link that asked.
+     * * **Re-queuing is conditional**, on
+     * [`crate::outbound_retirement::backfill_rejoins_the_queue`]: only a row
+     * whose absence is unexplained — genuinely legacy, still undelivered,
+     * still the kind of thing the queue is for — goes back in. A repair copy
+     * never re-enters the relay-upload set or the standing spray set.
+     *
+     * The envelope's identity is the message's own persisted `msg_id`, not a
+     * new random one, so a message re-sealed on ten successive digests carries
+     * one id forever: the peer's seen-set dedupes it, and the once-per-session
+     * hidden-kind offer bound in both shells (which is keyed on `msg_id`)
+     * still bounds it. A pre-`msg_id` legacy row is given one and it is
+     * written back, so the identity is durable from then on.
+     *
+     * A stable identity does mean a peer that already recorded this `msg_id`
+     * as seen drops the retransmission. That is the point nearly everywhere —
+     * a peer that holds the message needs no second copy, and the receive path
+     * deliberately records an id only once handling reached a terminal state,
+     * so an envelope whose store failed stays re-presentable. The one case it
+     * costs anything is a peer that received the envelope and dropped it as
+     * expired: it drops the re-seal too, until its bounded FIFO seen-set
+     * evicts the id. That is the trade-off any stable identity makes, and the
+     * alternative — a fresh random id on every digest — is precisely the
+     * resend chatter the HELLO2 capability flags were introduced to stop.
+     *
+     * Its delivery expiry is [`crate::default_expiry`] from the authoring
+     * timestamp — the flat default, deliberately not the per-kind authored
+     * lifetime. The short ephemeral lifetimes are an authoring policy; applied
+     * here they would hand back an envelope that expired the moment it was
+     * built (a thirty-minute lifetime measured from a two-day-old timestamp),
+     * which the shells would frame anyway and the recipient's inbound gate
+     * would drop as expired — dead bytes on the most constrained link, and a
+     * hole in the peer's stream that could never close. A stale endpoint
+     * inside such an envelope is still refused: the payload's own validity
+     * stamp owns that check (#278) and is untouched by this.
+     *
+     * Repeated calls return the already-persisted envelope when one exists.
      */
     func backfillPairwiseEnvelope(identity: Identity, contact: Contact, message: StoredMessage, replyToMsgId: Data?) throws  -> AuthoredEnvelope
 
@@ -3085,11 +3141,20 @@ public protocol MessageStoreProtocol : AnyObject {
      * transit, not wiped) go undetected forever, since the peer would
      * believe we already have everything up to the max we've seen.
      *
-     * Moving receipts/badges to MAX is safe from a message-loss
-     * standpoint: `record_receipt` (a peer acking delivery/read of *our*
-     * stream) never prunes `outbound_envelopes` -- only expiry and
-     * chat-delete do -- so an overstated watermark here cannot cause a
-     * sender to drop an undelivered message of their own.
+     * Moving receipts/badges to MAX is safe from a message-loss standpoint,
+     * though the reason changed with #283 and is worth restating exactly.
+     * `record_receipt` now *does* retire the `outbound_envelopes` rows a
+     * delivered watermark covers, so an overstated watermark reaching the
+     * sender does remove sealed rows for messages that peer never filed. What
+     * makes that harmless is that retirement removes only the sealed
+     * retransmission artifact and only where the `messages` row that
+     * regenerates it survives (see `crate::outbound_retirement`): the sender
+     * still holds the message, the peer's *digest* still reports the gap-aware
+     * contiguous watermark, and the digest responder re-seals the envelope
+     * from the stored message. Nothing a sender still owes becomes
+     * unsendable. Carried rows -- other people's mail, which this device is
+     * the only copy of -- are untouched by all of this and still leave only
+     * on their own digest proof.
      */
     func highestLamport(chatId: Data, senderUserId: Data) throws  -> UInt64
 
@@ -3747,6 +3812,20 @@ public protocol MessageStoreProtocol : AnyObject {
      * touches it, and a receipt with an unknown route (`via_transport =
      * None`) never clears an already-known one. Pass `None` when the return
      * route isn't known.
+     *
+     * **A delivered receipt also retires what it newly covers** (#283,
+     * contract `QUEUE-01`). Proof of delivery for a 1:1 outbound envelope is
+     * the removal condition the DTN ack-safety invariant permits, and this is
+     * the natural, incremental place to act on it: the queue shrinks in the
+     * same transaction that records the proof, rather than growing until a
+     * flat seven-day expiry. Nothing here touches group rows or carried rows
+     * -- `CARRY-01` is untouched, a carried copy still leaves only on its own
+     * digest proof -- and the retirement is deliberately narrower than the
+     * watermark: it removes a sealed *retransmission artifact* only where the
+     * `messages` row that regenerates it survives, so a peer that later
+     * notices a hole still gets the envelope rebuilt by the digest responder.
+     * See `crate::outbound_retirement` for the full predicate and its
+     * reasoning.
      */
     func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws
 
@@ -4233,9 +4312,65 @@ open func backfillOutgoingReceiptEnvelopes(identity: Identity, nowMs: Int64)thro
 }
 
     /**
-     * Seal and persist an envelope for a legacy authored message that was
-     * stored before the outbound queue existed. Repeated calls return the
-     * already-persisted envelope instead of generating a new msg id.
+     * Re-seal one locally authored message for a peer whose gap-aware digest
+     * says it is missing that lamport, when the outbound queue no longer holds
+     * the sealed copy. Both shells' digest responders reach this through
+     * `queuedByLamport[lamport] ?: backfill(...)`.
+     *
+     * A queue row can be absent for three quite different reasons, and #283
+     * made the difference matter. Before it, absence meant only "authored
+     * before the outbound queue table existed", so re-sealing *and re-queuing*
+     * was right. Now it can also mean "retired on proof of delivery" or
+     * "retired because a newer generation of this snapshot kind superseded
+     * it", and re-queuing those would undo the retirement on the next digest —
+     * with the queue regrown, the relay uploader re-posting acknowledged mail,
+     * and (before the identity fix below) a fresh random `msg_id` defeating
+     * every dedupe set on both sides.
+     *
+     * So this function separates the two obligations that used to be one:
+     *
+     * * **Re-sealing is unconditional.** The peer asked for the lamport, and
+     * its digest watermark is the gap-aware contiguous one, so it genuinely
+     * may be missing a message our own MAX-based delivered watermark
+     * covers. Refusing to answer would strand the peer's contiguity
+     * permanently. The returned envelope is for immediate transmission on
+     * the link that asked.
+     * * **Re-queuing is conditional**, on
+     * [`crate::outbound_retirement::backfill_rejoins_the_queue`]: only a row
+     * whose absence is unexplained — genuinely legacy, still undelivered,
+     * still the kind of thing the queue is for — goes back in. A repair copy
+     * never re-enters the relay-upload set or the standing spray set.
+     *
+     * The envelope's identity is the message's own persisted `msg_id`, not a
+     * new random one, so a message re-sealed on ten successive digests carries
+     * one id forever: the peer's seen-set dedupes it, and the once-per-session
+     * hidden-kind offer bound in both shells (which is keyed on `msg_id`)
+     * still bounds it. A pre-`msg_id` legacy row is given one and it is
+     * written back, so the identity is durable from then on.
+     *
+     * A stable identity does mean a peer that already recorded this `msg_id`
+     * as seen drops the retransmission. That is the point nearly everywhere —
+     * a peer that holds the message needs no second copy, and the receive path
+     * deliberately records an id only once handling reached a terminal state,
+     * so an envelope whose store failed stays re-presentable. The one case it
+     * costs anything is a peer that received the envelope and dropped it as
+     * expired: it drops the re-seal too, until its bounded FIFO seen-set
+     * evicts the id. That is the trade-off any stable identity makes, and the
+     * alternative — a fresh random id on every digest — is precisely the
+     * resend chatter the HELLO2 capability flags were introduced to stop.
+     *
+     * Its delivery expiry is [`crate::default_expiry`] from the authoring
+     * timestamp — the flat default, deliberately not the per-kind authored
+     * lifetime. The short ephemeral lifetimes are an authoring policy; applied
+     * here they would hand back an envelope that expired the moment it was
+     * built (a thirty-minute lifetime measured from a two-day-old timestamp),
+     * which the shells would frame anyway and the recipient's inbound gate
+     * would drop as expired — dead bytes on the most constrained link, and a
+     * hole in the peer's stream that could never close. A stale endpoint
+     * inside such an envelope is still refused: the payload's own validity
+     * stamp owns that check (#278) and is untouched by this.
+     *
+     * Repeated calls return the already-persisted envelope when one exists.
      */
 open func backfillPairwiseEnvelope(identity: Identity, contact: Contact, message: StoredMessage, replyToMsgId: Data?)throws  -> AuthoredEnvelope {
     return try  FfiConverterTypeAuthoredEnvelope.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -5400,11 +5535,20 @@ open func highestContiguousLamport(chatId: Data, senderUserId: Data)throws  -> U
      * transit, not wiped) go undetected forever, since the peer would
      * believe we already have everything up to the max we've seen.
      *
-     * Moving receipts/badges to MAX is safe from a message-loss
-     * standpoint: `record_receipt` (a peer acking delivery/read of *our*
-     * stream) never prunes `outbound_envelopes` -- only expiry and
-     * chat-delete do -- so an overstated watermark here cannot cause a
-     * sender to drop an undelivered message of their own.
+     * Moving receipts/badges to MAX is safe from a message-loss standpoint,
+     * though the reason changed with #283 and is worth restating exactly.
+     * `record_receipt` now *does* retire the `outbound_envelopes` rows a
+     * delivered watermark covers, so an overstated watermark reaching the
+     * sender does remove sealed rows for messages that peer never filed. What
+     * makes that harmless is that retirement removes only the sealed
+     * retransmission artifact and only where the `messages` row that
+     * regenerates it survives (see `crate::outbound_retirement`): the sender
+     * still holds the message, the peer's *digest* still reports the gap-aware
+     * contiguous watermark, and the digest responder re-seals the envelope
+     * from the stored message. Nothing a sender still owes becomes
+     * unsendable. Carried rows -- other people's mail, which this device is
+     * the only copy of -- are untouched by all of this and still leave only
+     * on their own digest proof.
      */
 open func highestLamport(chatId: Data, senderUserId: Data)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -6449,6 +6593,20 @@ open func recordPeerConnectionEvent(userId: Data, transport: PeerConnectionTrans
      * touches it, and a receipt with an unknown route (`via_transport =
      * None`) never clears an already-known one. Pass `None` when the return
      * route isn't known.
+     *
+     * **A delivered receipt also retires what it newly covers** (#283,
+     * contract `QUEUE-01`). Proof of delivery for a 1:1 outbound envelope is
+     * the removal condition the DTN ack-safety invariant permits, and this is
+     * the natural, incremental place to act on it: the queue shrinks in the
+     * same transaction that records the proof, rather than growing until a
+     * flat seven-day expiry. Nothing here touches group rows or carried rows
+     * -- `CARRY-01` is untouched, a carried copy still leaves only on its own
+     * digest proof -- and the retirement is deliberately narrower than the
+     * watermark: it removes a sealed *retransmission artifact* only where the
+     * `messages` row that regenerates it survives, so a peer that later
+     * notices a hole still gets the envelope rebuilt by the digest responder.
+     * See `crate::outbound_retirement` for the full predicate and its
+     * reasoning.
      */
 open func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_record_receipt(self.uniffiClonePointer(),
@@ -25256,7 +25414,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_outgoing_receipt_envelopes() != 46042) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_envelope() != 41114) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_envelope() != 38262) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_inventory() != 55991) {
@@ -25427,7 +25585,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 43009) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 22726) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 49979) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_hint_matches_known_target() != 15933) {
@@ -25592,7 +25750,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_peer_connection_event() != 36800) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_receipt() != 38794) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_receipt() != 9025) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_sent_metric() != 27687) {

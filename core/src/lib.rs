@@ -21,6 +21,7 @@ mod lan_util;
 mod late_arrival;
 mod limits;
 mod link_detect;
+mod outbound_retirement;
 mod protocol;
 mod recipient_hints;
 mod relay_cursor;
@@ -105,6 +106,13 @@ pub use late_arrival::{
 pub use limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 pub use link_detect::{
     core_detect_links, core_link_openable_scheme, CoreDetectedLink, CoreLinkScheme,
+};
+// Plain Rust policy, deliberately not `#[uniffi::export]`: the shells never
+// decide any of this. The store executes it, and `core/tests` asserts it under
+// `QUEUE-01`.
+pub use outbound_retirement::{
+    authored_delivery_lifetime_ms, authored_expiry, covered_by_delivered_watermark,
+    supersedes_queued_generations, LAN_ENDPOINT_HINT_EXPIRY_MS,
 };
 pub use protocol::{
     compute_recipient_hint, core_is_hidden_spray_kind, core_kind_persists_msg_id_row,

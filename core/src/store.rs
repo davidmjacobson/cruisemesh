@@ -1017,6 +1017,25 @@ impl MessageStore {
             [],
         )
         .map_err(store_err)?;
+        // Receipt-coverage catch-up (#283, contract `QUEUE-01`). Every store
+        // written before receipt-coverage retirement existed carries rows the
+        // recipient acknowledged long ago -- 2,143 of 3,964 on the field store
+        // that prompted the issue -- and the incremental hook in
+        // `record_receipt` can only ever act on receipts that arrive from now
+        // on. This is the sweep that reaches the rest.
+        //
+        // It sits in `open` rather than behind a one-shot migration flag on
+        // purpose. It is driven from `receipts`, which holds one row per chat
+        // per receipt type, so its cost is set by how many people this device
+        // talks to and not at all by queue size; after the first run it finds
+        // nothing and costs a handful of index seeks. Running it every open
+        // therefore buys a standing safety net -- a watermark advanced by a
+        // path that somehow bypassed the hook, or a database restored from a
+        // backup taken before this build -- for a price that does not grow.
+        // Forward-only, and no schema change: no column and no index is added
+        // or repurposed, so an older build reading this store afterwards sees
+        // a smaller queue and nothing else.
+        crate::outbound_retirement::sweep_receipt_covered(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             #[cfg(test)]
@@ -2773,11 +2792,20 @@ impl MessageStore {
     /// transit, not wiped) go undetected forever, since the peer would
     /// believe we already have everything up to the max we've seen.
     ///
-    /// Moving receipts/badges to MAX is safe from a message-loss
-    /// standpoint: `record_receipt` (a peer acking delivery/read of *our*
-    /// stream) never prunes `outbound_envelopes` -- only expiry and
-    /// chat-delete do -- so an overstated watermark here cannot cause a
-    /// sender to drop an undelivered message of their own.
+    /// Moving receipts/badges to MAX is safe from a message-loss standpoint,
+    /// though the reason changed with #283 and is worth restating exactly.
+    /// `record_receipt` now *does* retire the `outbound_envelopes` rows a
+    /// delivered watermark covers, so an overstated watermark reaching the
+    /// sender does remove sealed rows for messages that peer never filed. What
+    /// makes that harmless is that retirement removes only the sealed
+    /// retransmission artifact and only where the `messages` row that
+    /// regenerates it survives (see `crate::outbound_retirement`): the sender
+    /// still holds the message, the peer's *digest* still reports the gap-aware
+    /// contiguous watermark, and the digest responder re-seals the envelope
+    /// from the stored message. Nothing a sender still owes becomes
+    /// unsendable. Carried rows -- other people's mail, which this device is
+    /// the only copy of -- are untouched by all of this and still leave only
+    /// on their own digest proof.
     pub fn highest_lamport(
         &self,
         chat_id: Vec<u8>,
@@ -3369,6 +3397,20 @@ impl MessageStore {
     /// touches it, and a receipt with an unknown route (`via_transport =
     /// None`) never clears an already-known one. Pass `None` when the return
     /// route isn't known.
+    ///
+    /// **A delivered receipt also retires what it newly covers** (#283,
+    /// contract `QUEUE-01`). Proof of delivery for a 1:1 outbound envelope is
+    /// the removal condition the DTN ack-safety invariant permits, and this is
+    /// the natural, incremental place to act on it: the queue shrinks in the
+    /// same transaction that records the proof, rather than growing until a
+    /// flat seven-day expiry. Nothing here touches group rows or carried rows
+    /// -- `CARRY-01` is untouched, a carried copy still leaves only on its own
+    /// digest proof -- and the retirement is deliberately narrower than the
+    /// watermark: it removes a sealed *retransmission artifact* only where the
+    /// `messages` row that regenerates it survives, so a peer that later
+    /// notices a hole still gets the envelope rebuilt by the digest responder.
+    /// See `crate::outbound_retirement` for the full predicate and its
+    /// reasoning.
     pub fn record_receipt(
         &self,
         chat_id: Vec<u8>,
@@ -3378,8 +3420,9 @@ impl MessageStore {
         via_transport: Option<u8>,
     ) -> Result<(), CoreError> {
         validate_receipt_watermark(receipt_type, through_lamport)?;
-        let conn = lock_conn(&self.conn);
-        conn.execute(
+        let mut conn = lock_conn(&self.conn);
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
             "INSERT INTO receipts (chat_id, sender_user_id, receipt_type, through_lamport, via_transport)
                 VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(chat_id, sender_user_id, receipt_type) DO UPDATE SET
@@ -3402,6 +3445,27 @@ impl MessageStore {
             ],
         )
         .map_err(store_err)?;
+        if receipt_type == RECEIPT_TYPE_DELIVERED {
+            // Against the *stored* watermark, not the one that just arrived: a
+            // replayed or out-of-order receipt may be below what is already
+            // known, and the queue must reflect the best proof held, not the
+            // last message seen.
+            let effective: i64 = tx
+                .query_row(
+                    "SELECT through_lamport FROM receipts
+                     WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
+                    params![&chat_id, &sender_user_id, receipt_type as i64],
+                    |row| row.get(0),
+                )
+                .map_err(store_err)?;
+            crate::outbound_retirement::retire_receipt_covered(
+                &tx,
+                &chat_id,
+                &sender_user_id,
+                effective.max(0) as u64,
+            )?;
+        }
+        tx.commit().map_err(store_err)?;
         Ok(())
     }
 
@@ -13429,10 +13493,18 @@ mod tests {
     /// acknowledging side holds a row for (a front gap from the lamport
     /// ratchet, or a kind -- like a group invite -- filed under another chat).
     /// The receiving side must absorb that harmlessly: monotonic as always,
-    /// and above all it must not drop anything it still owes. Only expiry and
-    /// chat-delete prune `outbound_envelopes`; a receipt never does.
+    /// and never leaving anything it still owes unsendable.
+    ///
+    /// Since #283 "harmlessly" no longer means "changes nothing". The covered
+    /// envelope is retired, because the watermark is the same proof the spray
+    /// planner already seeks past and the same proof the UI already draws two
+    /// ticks from -- keeping a row nobody will ever offer again was the defect.
+    /// What must survive is the *ability to send it again*, and that is what
+    /// this pins: the `messages` row stays, so the digest responder's backfill
+    /// can re-seal the envelope for a peer whose contiguous digest later
+    /// reports the hole.
     #[test]
-    fn record_receipt_absorbs_an_over_reported_watermark_without_dropping_outbound_work() {
+    fn an_over_reported_watermark_retires_the_envelope_but_never_the_ability_to_resend() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let alice = crate::generate_identity();
         let bob = crate::generate_identity();
@@ -13445,7 +13517,8 @@ mod tests {
             relay_token: None,
             nickname: None,
         };
-        store
+        store.upsert_contact(bob_contact.clone()).unwrap();
+        let authored = store
             .author_pairwise_message(
                 alice.clone(),
                 bob_contact.clone(),
@@ -13483,14 +13556,23 @@ mod tests {
                 .unwrap(),
             9_999
         );
-        // The queued envelope is still there to send/resend.
-        assert_eq!(
-            store
-                .outbound_envelopes_after(bob.user_id.clone(), alice.user_id.clone(), 0)
-                .unwrap()
-                .len(),
-            1
-        );
+        // The covered envelope is retired...
+        assert!(store
+            .outbound_envelopes_after(bob.user_id.clone(), alice.user_id.clone(), 0)
+            .unwrap()
+            .is_empty());
+        // ...and the message it sealed is still here, so the digest responder
+        // can rebuild the envelope on demand.
+        let stored = store
+            .messages_after(bob.user_id.clone(), alice.user_id.clone(), 0)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        let rebuilt = store
+            .backfill_pairwise_envelope(alice.clone(), bob_contact.clone(), stored[0].clone(), None)
+            .unwrap();
+        assert_eq!(rebuilt.envelope.lamport, authored.envelope.lamport);
+        assert_eq!(rebuilt.envelope.kind, crate::KIND_TEXT);
+        assert!(!rebuilt.envelope.sealed.is_empty());
 
         // And an ordinary, correctly-sized receipt arriving afterwards still
         // cannot regress the watermark.

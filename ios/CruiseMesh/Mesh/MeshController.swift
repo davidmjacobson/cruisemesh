@@ -2747,6 +2747,20 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         return existing == nil || existing!.throughLamport < authored.envelope.throughLamport
     }
 
+    /// Android `backfillOutboundAuthoredEnvelope` twin. Re-seals one locally
+    /// authored message the outbound queue no longer holds a sealed copy of,
+    /// so this peer's digest can be answered for that lamport.
+    ///
+    /// Core decides what happens to the rebuilt envelope beyond being returned
+    /// here (`outbound_retirement.rs`, #283). A row can be missing because it
+    /// predates the outbound-envelope table, because a delivered receipt
+    /// retired it, or because a newer generation of a snapshot kind superseded
+    /// it; only the first belongs back in the queue, and only core knows which
+    /// case this is. This function never assumes: it asks, sends what comes
+    /// back, and leaves the queue to the store. The returned `msgId` is the
+    /// message's own persisted id, so `GossipState.seenIds` and the
+    /// `alreadyOffered` bound in `handleDigest` both keep recognising a
+    /// retransmission as one.
     private func backfillOutbound(identity: Identity, contact: Contact, message: StoredMessage) -> OutboundEnvelope? {
         guard let authored = try? store.backfillPairwiseEnvelope(
             identity: identity,

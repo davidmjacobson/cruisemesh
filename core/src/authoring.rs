@@ -1,6 +1,7 @@
 use rusqlite::{params, OptionalExtension, Transaction};
 
 use crate::causal_order::causal_display_timestamp;
+use crate::outbound_retirement::{authored_expiry, backfill_rejoins_the_queue, retire_superseded};
 use crate::store::{
     outbound_message_dedupe_key, row_to_outbound, row_to_outgoing_receipt, store_err,
     upsert_group_tx,
@@ -78,6 +79,15 @@ impl MessageStore {
             &message,
             reply_to_msg_id.as_deref(),
             timestamp_ms,
+            generate_msg_id(),
+            // Per-kind, not flat: a payload that states its own fifteen-minute
+            // validity has no business being carried for a week. See
+            // `crate::outbound_retirement::authored_expiry` for the decision on
+            // every kind. This is an *authoring* policy — how long a freshly
+            // minted envelope deserves to chase its recipient — and the repair
+            // re-seal in `backfill_pairwise_envelope` deliberately does not
+            // share it.
+            authored_expiry(kind, timestamp_ms),
         )?;
         insert_authored_rows(
             &tx,
@@ -107,9 +117,65 @@ impl MessageStore {
         )
     }
 
-    /// Seal and persist an envelope for a legacy authored message that was
-    /// stored before the outbound queue existed. Repeated calls return the
-    /// already-persisted envelope instead of generating a new msg id.
+    /// Re-seal one locally authored message for a peer whose gap-aware digest
+    /// says it is missing that lamport, when the outbound queue no longer holds
+    /// the sealed copy. Both shells' digest responders reach this through
+    /// `queuedByLamport[lamport] ?: backfill(...)`.
+    ///
+    /// A queue row can be absent for three quite different reasons, and #283
+    /// made the difference matter. Before it, absence meant only "authored
+    /// before the outbound queue table existed", so re-sealing *and re-queuing*
+    /// was right. Now it can also mean "retired on proof of delivery" or
+    /// "retired because a newer generation of this snapshot kind superseded
+    /// it", and re-queuing those would undo the retirement on the next digest —
+    /// with the queue regrown, the relay uploader re-posting acknowledged mail,
+    /// and (before the identity fix below) a fresh random `msg_id` defeating
+    /// every dedupe set on both sides.
+    ///
+    /// So this function separates the two obligations that used to be one:
+    ///
+    /// * **Re-sealing is unconditional.** The peer asked for the lamport, and
+    ///   its digest watermark is the gap-aware contiguous one, so it genuinely
+    ///   may be missing a message our own MAX-based delivered watermark
+    ///   covers. Refusing to answer would strand the peer's contiguity
+    ///   permanently. The returned envelope is for immediate transmission on
+    ///   the link that asked.
+    /// * **Re-queuing is conditional**, on
+    ///   [`crate::outbound_retirement::backfill_rejoins_the_queue`]: only a row
+    ///   whose absence is unexplained — genuinely legacy, still undelivered,
+    ///   still the kind of thing the queue is for — goes back in. A repair copy
+    ///   never re-enters the relay-upload set or the standing spray set.
+    ///
+    /// The envelope's identity is the message's own persisted `msg_id`, not a
+    /// new random one, so a message re-sealed on ten successive digests carries
+    /// one id forever: the peer's seen-set dedupes it, and the once-per-session
+    /// hidden-kind offer bound in both shells (which is keyed on `msg_id`)
+    /// still bounds it. A pre-`msg_id` legacy row is given one and it is
+    /// written back, so the identity is durable from then on.
+    ///
+    /// A stable identity does mean a peer that already recorded this `msg_id`
+    /// as seen drops the retransmission. That is the point nearly everywhere —
+    /// a peer that holds the message needs no second copy, and the receive path
+    /// deliberately records an id only once handling reached a terminal state,
+    /// so an envelope whose store failed stays re-presentable. The one case it
+    /// costs anything is a peer that received the envelope and dropped it as
+    /// expired: it drops the re-seal too, until its bounded FIFO seen-set
+    /// evicts the id. That is the trade-off any stable identity makes, and the
+    /// alternative — a fresh random id on every digest — is precisely the
+    /// resend chatter the HELLO2 capability flags were introduced to stop.
+    ///
+    /// Its delivery expiry is [`crate::default_expiry`] from the authoring
+    /// timestamp — the flat default, deliberately not the per-kind authored
+    /// lifetime. The short ephemeral lifetimes are an authoring policy; applied
+    /// here they would hand back an envelope that expired the moment it was
+    /// built (a thirty-minute lifetime measured from a two-day-old timestamp),
+    /// which the shells would frame anyway and the recipient's inbound gate
+    /// would drop as expired — dead bytes on the most constrained link, and a
+    /// hole in the peer's stream that could never close. A stale endpoint
+    /// inside such an envelope is still refused: the payload's own validity
+    /// stamp owns that check (#278) and is untouched by this.
+    ///
+    /// Repeated calls return the already-persisted envelope when one exists.
     pub fn backfill_pairwise_envelope(
         &self,
         identity: Identity,
@@ -148,20 +214,20 @@ impl MessageStore {
         if let Some(envelope) = existing {
             return Ok(authored(message, envelope, 0));
         }
+        let msg_id = stable_backfill_msg_id(&tx, &message)?;
         let envelope = build_pairwise_envelope(
             identity,
             &contact,
             &message,
             reply_to_msg_id.as_deref(),
             message.timestamp,
+            msg_id,
+            default_expiry(message.timestamp),
         )?;
-        insert_authored_rows(
-            &tx,
-            &message,
-            &envelope,
-            reply_to_msg_id.as_deref(),
-            message.timestamp,
-        )?;
+        record_authored_watermark(&tx, &message)?;
+        if backfill_rejoins_the_queue(&tx, &envelope)? {
+            queue_outbound_row(&tx, &envelope, message.timestamp)?;
+        }
         tx.commit().map_err(store_err)?;
         Ok(authored(message, envelope, 0))
     }
@@ -321,8 +387,15 @@ impl MessageStore {
             if member.user_id == identity.user_id {
                 continue;
             }
-            let envelope =
-                build_pairwise_envelope(identity.clone(), &member, &message, None, timestamp_ms)?;
+            let envelope = build_pairwise_envelope(
+                identity.clone(),
+                &member,
+                &message,
+                None,
+                timestamp_ms,
+                generate_msg_id(),
+                authored_expiry(KIND_GROUP_INVITE, timestamp_ms),
+            )?;
             insert_authored_rows(&tx, &message, &envelope, None, timestamp_ms)?;
             authored_invites.push(authored(message.clone(), envelope, acknowledged_delivered));
         }
@@ -639,16 +712,24 @@ fn causal_timestamp_for_chat(
     Ok(causal_display_timestamp(newest, now_ms))
 }
 
+/// Seal one pairwise envelope. `msg_id` and `expiry` are supplied rather than
+/// derived here because the two callers legitimately differ on both: authoring
+/// mints a fresh id and applies the per-kind [`authored_expiry`], while the
+/// repair re-seal in `backfill_pairwise_envelope` reuses the message's own
+/// persisted id and the flat [`default_expiry`]. Making them parameters keeps
+/// that difference visible at the call site instead of hidden behind a flag.
 fn build_pairwise_envelope(
     identity: Identity,
     contact: &Contact,
     message: &StoredMessage,
     reply_to_msg_id: Option<&[u8]>,
     routing_timestamp_ms: i64,
+    msg_id: Vec<u8>,
+    expiry: i64,
 ) -> Result<OutboundEnvelope, CoreError> {
     let body = encoded_body(message, identity.user_id.clone(), reply_to_msg_id)?;
     Ok(OutboundEnvelope {
-        msg_id: generate_msg_id(),
+        msg_id,
         recipient_user_id: contact.user_id.clone(),
         chat_id: message.chat_id.clone(),
         sender_user_id: message.sender_user_id.clone(),
@@ -656,10 +737,58 @@ fn build_pairwise_envelope(
         lamport: message.lamport,
         timestamp: message.timestamp,
         hop_ttl: DEFAULT_HOP_TTL,
-        expiry: default_expiry(routing_timestamp_ms),
+        expiry,
         recipient_hint: compute_recipient_hint(contact.user_id.clone(), routing_timestamp_ms),
         sealed: seal_message(identity, contact.agree_pk.clone(), body)?,
     })
+}
+
+/// The durable wire identity of a stored message, for a re-seal.
+///
+/// `messages.msg_id` is written by [`insert_authored_rows`] at authoring time
+/// and is the id the recipient saw the first time, so reusing it makes a
+/// re-seal a *retransmission* rather than a new piece of traffic: the peer's
+/// seen-set and both shells' `msg_id`-keyed once-per-session hidden-offer
+/// bound recognise it. Minting a fresh random id on every digest — what this
+/// path did before #283 made re-seals routine — defeats all three.
+///
+/// A row authored before the column existed has no id. It gets one, written
+/// back in the same transaction so the identity is stable from then on.
+fn stable_backfill_msg_id(
+    tx: &Transaction<'_>,
+    message: &StoredMessage,
+) -> Result<Vec<u8>, CoreError> {
+    let stored: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT msg_id FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+            params![
+                message.chat_id,
+                message.sender_user_id,
+                message.lamport as i64
+            ],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()
+        .map_err(store_err)?
+        .flatten()
+        .filter(|id| !id.is_empty());
+    if let Some(msg_id) = stored {
+        return Ok(msg_id);
+    }
+    let msg_id = generate_msg_id();
+    tx.execute(
+        "UPDATE messages SET msg_id = ?4
+         WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3 AND msg_id IS NULL",
+        params![
+            message.chat_id,
+            message.sender_user_id,
+            message.lamport as i64,
+            msg_id
+        ],
+    )
+    .map_err(store_err)?;
+    Ok(msg_id)
 }
 
 fn encoded_body(
@@ -680,17 +809,14 @@ fn encoded_body(
     }
 }
 
-fn insert_authored_rows(
+/// Record how far our counter has got, in the caller's transaction, so it
+/// holds even for kinds that are never stored as chat rows. `MAX` rather than
+/// plain assignment: the watermark only ever climbs, so an out-of-order or
+/// replayed author cannot walk it backwards.
+fn record_authored_watermark(
     tx: &Transaction<'_>,
     message: &StoredMessage,
-    envelope: &OutboundEnvelope,
-    reply_to_msg_id: Option<&[u8]>,
-    queued_at_ms: i64,
 ) -> Result<(), CoreError> {
-    // Record how far our counter has got before anything else, in the same
-    // transaction, so it holds even for kinds that are never stored as chat
-    // rows. `MAX` rather than plain assignment: the watermark only ever
-    // climbs, so an out-of-order or replayed author cannot walk it backwards.
     tx.execute(
         "INSERT INTO authored_lamport_watermarks (chat_id, sender_user_id, high_lamport)
          VALUES (?1, ?2, ?3)
@@ -703,22 +829,17 @@ fn insert_authored_rows(
         ],
     )
     .map_err(store_err)?;
-    tx.execute(
-        "INSERT OR IGNORE INTO messages
-            (chat_id, sender_user_id, lamport, timestamp, kind, payload, msg_id, reply_to_msg_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            message.chat_id,
-            message.sender_user_id,
-            message.lamport as i64,
-            message.timestamp,
-            message.kind as i64,
-            message.payload,
-            envelope.msg_id,
-            reply_to_msg_id
-        ],
-    )
-    .map_err(store_err)?;
+    Ok(())
+}
+
+/// Put one sealed envelope in the outbound queue. Split out from
+/// [`insert_authored_rows`] because the repair re-seal path queues
+/// conditionally — see `MessageStore::backfill_pairwise_envelope`.
+fn queue_outbound_row(
+    tx: &Transaction<'_>,
+    envelope: &OutboundEnvelope,
+    queued_at_ms: i64,
+) -> Result<(), CoreError> {
     tx.execute(
         "INSERT OR IGNORE INTO outbound_envelopes
             (dedupe_key, msg_id, recipient_user_id, chat_id, sender_user_id, kind,
@@ -747,6 +868,51 @@ fn insert_authored_rows(
         ],
     )
     .map_err(store_err)?;
+    Ok(())
+}
+
+fn insert_authored_rows(
+    tx: &Transaction<'_>,
+    message: &StoredMessage,
+    envelope: &OutboundEnvelope,
+    reply_to_msg_id: Option<&[u8]>,
+    queued_at_ms: i64,
+) -> Result<(), CoreError> {
+    record_authored_watermark(tx, message)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO messages
+            (chat_id, sender_user_id, lamport, timestamp, kind, payload, msg_id, reply_to_msg_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            message.chat_id,
+            message.sender_user_id,
+            message.lamport as i64,
+            message.timestamp,
+            message.kind as i64,
+            message.payload,
+            envelope.msg_id,
+            reply_to_msg_id
+        ],
+    )
+    .map_err(store_err)?;
+    queue_outbound_row(tx, envelope, queued_at_ms)?;
+    // Supersession (#283, contract QUEUE-01), in the same transaction that
+    // queued the replacement so the queue never briefly holds both. For a
+    // snapshot kind only the newest generation can inform the recipient of
+    // anything: the field store had queued 120 generations of the friend
+    // directory to a single contact, each one a full copy of a snapshot the
+    // recipient's own revision guard would discard on arrival. See
+    // `crate::outbound_retirement::supersedes_queued_generations` for the
+    // per-kind justification and for why request-shaped hidden kinds are not
+    // in the set.
+    retire_superseded(
+        tx,
+        &envelope.recipient_user_id,
+        &envelope.chat_id,
+        &envelope.sender_user_id,
+        envelope.kind,
+        envelope.lamport,
+    )?;
     Ok(())
 }
 
