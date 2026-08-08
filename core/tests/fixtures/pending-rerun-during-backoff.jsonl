@@ -1,0 +1,10 @@
+{"schema":"cruisemesh.protocol-event/v1","record":"header","fixture":"pending-rerun-during-backoff","title":"A nudge that arrived while a pass was in flight must not start a new pass inside the quiet window","origin":"synthetic","pseudonyms":["mailbox-a"],"expect_invariants":["RATE-01","PROGRESS-01"]}
+{"record":"event","seq":1,"at_ms":1700000000000,"code":"pass_start","pass":"p1","actor":"mailbox-a","counts":{"carried_pending":180},"outcome":"nudged"}
+{"record":"event","seq":2,"at_ms":1700000000300,"code":"request_rejected","pass":"p1","action":1,"actor":"mailbox-a","invariants":["RATE-01"],"counts":{"status":429,"retry_after_ms":30000},"outcome":"rate_limited"}
+{"record":"event","seq":3,"at_ms":1700000000310,"code":"rate_limit_abort","pass":"p1","actor":"mailbox-a","invariants":["RATE-01"],"counts":{"further_requests":0,"quiet_until_ms":30000},"outcome":"remaining_network_stages_skipped"}
+{"record":"event","seq":4,"at_ms":1700000000320,"code":"pass_finish","pass":"p1","actor":"mailbox-a","counts":{"requests":1,"pending_nudges":1},"outcome":"aborted_rate_limited"}
+{"record":"event","seq":5,"at_ms":1700000000330,"code":"continuation_scheduled","pass":"p1","actor":"mailbox-a","invariants":["RATE-01","PROGRESS-01"],"counts":{"delay_ms":30000,"deadline_before_ms":0,"deadline_after_ms":30000},"outcome":"nudge_deferred_into_quiet_window"}
+{"record":"event","seq":6,"at_ms":1700000000340,"code":"pass_start","pass":"p2","actor":"mailbox-a","invariants":["RATE-01"],"counts":{"requests":0},"outcome":"refused_inside_quiet_window"}
+{"record":"event","seq":7,"at_ms":1700000030340,"code":"pass_start","pass":"p3","actor":"mailbox-a","invariants":["PROGRESS-01"],"counts":{"carried_pending":180},"outcome":"quiet_window_elapsed"}
+{"record":"event","seq":8,"at_ms":1700000030900,"code":"action_result_accepted","pass":"p3","action":1,"actor":"mailbox-a","counts":{"status":200},"outcome":"upload_accepted"}
+{"record":"event","seq":9,"at_ms":1700000030910,"code":"pass_finish","pass":"p3","actor":"mailbox-a","invariants":["PROGRESS-01"],"counts":{"requests":1,"carried_pending":179},"outcome":"work_cursor_advanced"}

@@ -1,0 +1,11 @@
+{"schema":"cruisemesh.protocol-event/v1","record":"header","fixture":"sweep-livelock","title":"A mailbox sweep that rescheduled forever without ever advancing its cursor","origin":"synthetic","public_reference":"#270","pseudonyms":["mailbox-a"],"expect_invariants":["PROGRESS-01","LIVE-01","CURSOR-01"]}
+{"record":"event","seq":1,"at_ms":1700000000000,"code":"pass_start","pass":"p1","actor":"mailbox-a","counts":{"configs":1},"outcome":"sweep_due"}
+{"record":"event","seq":2,"at_ms":1700000000120,"code":"action_emitted","pass":"p1","action":1,"actor":"mailbox-a","counts":{"requested_rows":256,"from_cursor":0},"outcome":"fetch_issued"}
+{"record":"event","seq":3,"at_ms":1700000000940,"code":"page_ingested","pass":"p1","action":1,"actor":"mailbox-a","counts":{"rows_returned":256,"rows_consumed":0,"rows_carried":256},"outcome":"page_full"}
+{"record":"event","seq":4,"at_ms":1700000000950,"code":"frontier_held","pass":"p1","action":1,"actor":"mailbox-a","invariants":["CURSOR-01"],"counts":{"rows_acked":0,"frontier_before":0,"frontier_after":0},"outcome":"no_ack_eligible_rows"}
+{"record":"event","seq":5,"at_ms":1700000000960,"code":"budget_yield","pass":"p1","actor":"mailbox-a","invariants":["LIVE-01"],"counts":{"pages_used":4,"pages_budget":4,"envelopes_used":512,"envelopes_budget":512},"outcome":"walk_budget_exhausted"}
+{"record":"event","seq":6,"at_ms":1700000000970,"code":"continuation_scheduled","pass":"p1","actor":"mailbox-a","invariants":["PROGRESS-01"],"counts":{"delay_ms":1000,"cursor_before":0,"cursor_after":0},"outcome":"resume_cursor_unchanged"}
+{"record":"event","seq":7,"at_ms":1700000000980,"code":"pass_finish","pass":"p1","actor":"mailbox-a","counts":{"requests":4,"envelopes":512},"outcome":"continuation_pending"}
+{"record":"event","seq":8,"at_ms":1700000001980,"code":"pass_start","pass":"p2","actor":"mailbox-a","counts":{"configs":1},"outcome":"continuation"}
+{"record":"event","seq":9,"at_ms":1700000002000,"code":"action_emitted","pass":"p2","action":1,"actor":"mailbox-a","counts":{"requested_rows":256,"from_cursor":0},"outcome":"fetch_issued"}
+{"record":"event","seq":10,"at_ms":1700000002900,"code":"invariant_violation","pass":"p2","actor":"mailbox-a","invariants":["PROGRESS-01","LIVE-01"],"counts":{"identical_continuations":2,"cursor_after":0},"outcome":"unchanged_state_reschedule"}

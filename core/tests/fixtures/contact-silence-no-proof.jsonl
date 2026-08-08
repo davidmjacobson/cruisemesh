@@ -1,0 +1,12 @@
+{"schema":"cruisemesh.protocol-event/v1","record":"header","fixture":"contact-silence-no-proof","title":"A silent contact endpoint may not be rested while this device has no proof any relay answered","origin":"synthetic","pseudonyms":["mailbox-a","contact-b"],"expect_invariants":["SILENCE-01"]}
+{"record":"event","seq":1,"at_ms":1700000000000,"code":"pass_start","pass":"p1","actor":"mailbox-a","counts":{"configs":2},"outcome":"nudged"}
+{"record":"event","seq":2,"at_ms":1700000000100,"code":"action_emitted","pass":"p1","action":1,"actor":"mailbox-a","counts":{"requested_rows":256},"outcome":"fetch_issued"}
+{"record":"event","seq":3,"at_ms":1700000030100,"code":"action_result_accepted","pass":"p1","action":1,"actor":"mailbox-a","counts":{"status":0},"outcome":"transport_error_no_answer"}
+{"record":"event","seq":4,"at_ms":1700000030200,"code":"action_emitted","pass":"p1","action":2,"actor":"contact-b","counts":{"requested_rows":256},"outcome":"fetch_issued"}
+{"record":"event","seq":5,"at_ms":1700000060200,"code":"silence_observed","pass":"p1","action":2,"actor":"contact-b","invariants":["SILENCE-01"],"counts":{"provisional":1,"committed":0},"outcome":"provisional_only"}
+{"record":"event","seq":6,"at_ms":1700000060300,"code":"pass_finish","pass":"p1","actor":"mailbox-a","invariants":["SILENCE-01"],"counts":{"own_relay_answered":0,"silence_streak_delta":0},"outcome":"silence_discarded_no_proof"}
+{"record":"event","seq":7,"at_ms":1700000120000,"code":"pass_start","pass":"p2","actor":"mailbox-a","counts":{"configs":2},"outcome":"nudged"}
+{"record":"event","seq":8,"at_ms":1700000120600,"code":"action_result_accepted","pass":"p2","action":1,"actor":"mailbox-a","counts":{"status":200},"outcome":"own_mailbox_answered"}
+{"record":"event","seq":9,"at_ms":1700000150600,"code":"silence_observed","pass":"p2","action":2,"actor":"contact-b","invariants":["SILENCE-01"],"counts":{"provisional":1},"outcome":"provisional_only"}
+{"record":"event","seq":10,"at_ms":1700000150700,"code":"endpoint_rested","pass":"p2","actor":"contact-b","invariants":["SILENCE-01"],"counts":{"own_relay_answered":1,"silence_streak_delta":1,"silence_streak":1},"outcome":"committed_with_proof"}
+{"record":"event","seq":11,"at_ms":1700000200000,"code":"endpoint_recovered","pass":"p3","actor":"contact-b","invariants":["SILENCE-01"],"counts":{"status":200,"silence_streak":0},"outcome":"success_clears_streak"}

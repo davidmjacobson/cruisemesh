@@ -68,6 +68,15 @@ a literal in code — CI rejects hardcoded literals.
   be declined regardless of quality — this is a load-bearing project rule.
 - **Match the design doc, or change it first.** If your change alters
   protocol or architecture, PR a DESIGN.md update as part of the change.
+- **Say where the decision lives.** Protocol behaviour must be exactly one
+  of: **core only**, a **native adapter** that executes a typed action and
+  returns a typed result, **shell-forever** with the reason stated (OS
+  drivers, lifecycle, presentation), or a **temporary twin** with a link to
+  the issue that deletes it. A second copy of a rule with no deletion plan is
+  how the two platforms drift apart. If your change touches a rule in
+  [`specs/protocol-contract-v1.md`](specs/protocol-contract-v1.md), name its
+  invariant ids in the PR — `core/tests/protocol_contract.rs` is the index of
+  record and says what owns each invariant today.
 - **Honest UX copy.** User-facing text must not promise coverage or
   instant delivery; this app's credibility rests on truthful expectations.
 

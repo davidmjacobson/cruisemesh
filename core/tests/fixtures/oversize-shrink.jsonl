@@ -1,0 +1,9 @@
+{"schema":"cruisemesh.protocol-event/v1","record":"header","fixture":"oversize-shrink","title":"A page over the response body cap is refused before decode and retried smaller, never skipped","origin":"synthetic","pseudonyms":["mailbox-a"],"expect_invariants":["PAGE-01","LIVE-01"]}
+{"record":"event","seq":1,"at_ms":1700000000000,"code":"pass_start","pass":"p1","actor":"mailbox-a","counts":{"configs":1},"outcome":"nudged"}
+{"record":"event","seq":2,"at_ms":1700000000100,"code":"action_emitted","pass":"p1","action":1,"actor":"mailbox-a","counts":{"requested_rows":256,"from_cursor":0,"max_response_bytes":12582912},"outcome":"fetch_issued"}
+{"record":"event","seq":3,"at_ms":1700000002400,"code":"request_rejected","pass":"p1","action":1,"actor":"mailbox-a","invariants":["PAGE-01"],"counts":{"body_bytes":13107200,"max_response_bytes":12582912},"outcome":"body_cap_exceeded_before_decode"}
+{"record":"event","seq":4,"at_ms":1700000002420,"code":"action_emitted","pass":"p1","action":2,"actor":"mailbox-a","invariants":["PAGE-01","LIVE-01"],"counts":{"requested_rows":64,"from_cursor":0},"outcome":"retry_smaller_same_cursor"}
+{"record":"event","seq":5,"at_ms":1700000003600,"code":"page_ingested","pass":"p1","action":2,"actor":"mailbox-a","invariants":["PAGE-01"],"counts":{"rows_returned":64,"rows_consumed":64},"outcome":"page_fully_processed"}
+{"record":"event","seq":6,"at_ms":1700000003700,"code":"frontier_advanced","pass":"p1","action":3,"actor":"mailbox-a","counts":{"frontier_before":0,"frontier_after":64,"rows_acked":64},"outcome":"ack_succeeded"}
+{"record":"event","seq":7,"at_ms":1700000003720,"code":"budget_yield","pass":"p1","actor":"mailbox-a","invariants":["LIVE-01"],"counts":{"requests":3,"bytes_read":11010048},"outcome":"byte_budget_respected"}
+{"record":"event","seq":8,"at_ms":1700000003730,"code":"pass_finish","pass":"p1","actor":"mailbox-a","counts":{"requests":3,"envelopes":64},"outcome":"continuation_pending"}
