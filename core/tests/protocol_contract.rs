@@ -735,12 +735,46 @@ fn queue_01_proof_of_delivery_shrinks_the_advertised_set() {
         .find(|message| message.lamport == covered_through)
         .expect("the covered message row must survive its envelope");
     let rebuilt = store
-        .backfill_pairwise_envelope(me.clone(), peer_contact, rebuildable, None)
+        .backfill_pairwise_envelope(me.clone(), peer_contact.clone(), rebuildable.clone(), None)
         .expect("backfill");
     contract_assert!(
         id,
         rebuilt.envelope.lamport == covered_through && !rebuilt.envelope.sealed.is_empty(),
         "retirement removed the ability to retransmit, not just the queued copy"
+    );
+
+    // ...and answering that peer must not put the row back. A peer's digest
+    // reports its gap-aware contiguous watermark, which sits below the MAX
+    // watermark retirement follows whenever its copy of the stream is holey,
+    // so this rebuild is routine rather than exotic. If it re-queued, the
+    // advertised set would regrow on every digest and the relay uploader would
+    // re-post acknowledged mail: the rule would hold for minutes at a time and
+    // never longer.
+    let rebuilt_again = store
+        .backfill_pairwise_envelope(me.clone(), peer_contact, rebuildable, None)
+        .expect("backfill twice");
+    contract_assert!(
+        id,
+        rebuilt_again.envelope.msg_id == rebuilt.envelope.msg_id,
+        "a re-sealed envelope must keep the message's own identity, or every \
+         dedupe set on both sides reads a retransmission as new traffic"
+    );
+    let after_rebuild = store
+        .outbound_envelopes_after(peer.user_id.clone(), me.user_id.clone(), 0)
+        .expect("queued after rebuild");
+    contract_assert!(
+        id,
+        after_rebuild.len() == after.len(),
+        "answering a digest must not re-admit a retired row to the queue"
+    );
+    contract_assert!(
+        id,
+        store
+            .pending_relay_outbound_envelopes(64, now_ms, vec![])
+            .expect("relay candidates after rebuild")
+            .len()
+            == after.len(),
+        "answering a digest must not hand the relay uploader acknowledged mail"
     );
 
     // Expiry is right-sized, not flat: a payload that states its own short

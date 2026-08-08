@@ -231,7 +231,7 @@ which roughly 93% were service kinds, including week-old reachability hints
 whose payload stops being true after about fifteen minutes. The advertised
 set must shrink under coverage.
 
-Two boundaries are part of the rule rather than details of one
+Three boundaries are part of the rule rather than details of one
 implementation of it.
 
 **Retirement removes a retransmission artifact, never the ability to
@@ -243,6 +243,20 @@ reports the hole in its gap-aware digest is served a re-sealed envelope; the
 sender's obligation survives the queue row. Carried rows — other people's
 mail, of which this device may be the only copy — are outside this rule
 entirely and keep leaving only under `CARRY-01`.
+
+**A re-seal answers the peer; it does not re-admit the row.** The two
+watermarks in the previous paragraph do not move together: a digest reports
+the *contiguous* watermark and retirement follows the *MAX*, so any hole in
+a peer's copy of our stream makes it ask to rebuild rows we have already
+retired — routinely, on a field device, not as an edge case. The rebuilt
+envelope must therefore go on the link that asked and nowhere else. If it
+rejoined the outbound queue, the advertised set would regrow within one link
+session, mail the recipient already acknowledged would be re-posted to the
+relay, and the rule would hold for minutes at a time and never longer. A
+rebuild also keeps the message's own persisted `msg_id`: a retransmission
+that arrives under a fresh identity is new traffic to every dedupe set on
+both sides, which is the resend chatter `HELLO-01`'s capability flags exist
+to bound.
 
 **Group rows are excluded, and the group rule is deliberately not stated
 here.** A group envelope is queued once against the group id and fanned out
@@ -721,7 +735,7 @@ against the tree as it stands. Labels:
 | LAN scan and socket lifecycle | `LanTransport.kt` and scan files | `LanTransport.swift` and scan files | primitives in `lan_util.rs` / `lan_session.rs` | shell-forever (drivers) | shared progress policy in D2/D3 |
 | BLE central / peripheral lifecycle | `BleCentral.kt`, `BlePeripheral.kt` | `BleTransport.swift` | framing only, in `framing.rs` | shell-forever | — |
 | Push, OS polling, background wake | `relay/RelayPushClient.kt` + service scheduling | `Relay/RelayPushClient.swift` + controller scheduling | none | shell-forever | push stays a pass nudge only |
-| Outbound queue retirement | none | none | `outbound_retirement.rs` owns coverage retirement, supersession and per-kind expiry; `store.rs` executes them at receipt time and on open (#283) | presentation-only | stays core; no shell decides any of it |
+| Outbound queue retirement | no policy — `respondToDigest` in `MeshService.kt` calls the core re-seal | no policy — `handleDigest` in `MeshController.swift` calls the same | `outbound_retirement.rs` owns coverage retirement, supersession, per-kind expiry and whether a re-seal rejoins the queue; `store.rs` executes them at receipt time and on open (#283) | presentation-only | stays core; no shell decides any of it, and the digest responders' re-seal loop is the one caller that must stay a caller |
 | Delivery / transport / health UI | Compose status surfaces | SwiftUI status surfaces | semantic facts in `connection_health.rs` / `semantic.rs` | presentation-only | core facts, native presentation; D3 |
 | Field diagnostics archive | `debug/DiagnosticsShare.kt` | `UI/DiagnosticsArchive.swift` | delivery metrics only | hoist-now | shared event JSONL + native wrappers; B1 |
 | Multi-node orchestration test | n/a | n/a | `core/tests/mesh_sim.rs` reimplements receive and meet | delete | production `mesh_receive` / `mesh_meet`; D0/D2 |

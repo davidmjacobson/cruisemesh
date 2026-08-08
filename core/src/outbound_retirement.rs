@@ -3,11 +3,12 @@
 //! Protocol contract `QUEUE-01`, issue #283. Before this module the queue had
 //! exactly one exit — a flat seven-day expiry — so a device's advertised set
 //! only ever grew inside the retention window. A pulled field store held 3,964
-//! unexpired rows: 2,143 of them already covered by the recipient's own
-//! delivered-receipt watermark, 852 of them LAN endpoint hints whose payload
-//! stops being true fifteen minutes after it is written, and 3,046 of them
-//! superseded generations of two snapshot kinds that are last-write-wins by
-//! construction. Thirty-seven rows carried information.
+//! rows, 3,757 of them unexpired: 2,143 already covered by the recipient's own
+//! delivered-receipt watermark, 852 LAN endpoint hints whose payload stops
+//! being true fifteen minutes after it is written, and 3,046 superseded
+//! generations of two snapshot kinds that are last-write-wins by construction.
+//! Fifty-two rows — 43 texts, 8 reactions, one friend request — were somebody's
+//! message.
 //!
 //! Three exits are added here, and they are deliberately *policy* — pure
 //! functions plus the exact SQL that executes them — rather than conditionals
@@ -46,6 +47,16 @@
 //!   harmless: a peer that later notices the hole asks for it by contiguous
 //!   digest and the envelope is rebuilt from the stored message.
 //!
+//! That last property is not free, and getting it wrong would undo the whole
+//! module. The re-seal path used to *re-queue* whatever it rebuilt, under a
+//! fresh random `msg_id` and with `relay_posted_at` cleared. Since a holey peer
+//! stream makes rebuilds routine rather than exotic — the digest walks from the
+//! peer's contiguous watermark, retirement follows its MAX — that would have
+//! regrown the queue on every digest, re-posted acknowledged mail to the relay,
+//! and re-minted an identity that every dedupe set on both sides is keyed on.
+//! [`backfill_rejoins_the_queue`] is where the two obligations are separated:
+//! answer the peer always, re-admit to the queue only what belongs there.
+//!
 //! ## Group rows are structurally excluded, and the group rule is not guessed
 //!
 //! Retirement here applies to pairwise 1:1 rows only. The predicate requires
@@ -79,12 +90,12 @@
 //! carries a payload that expires on a clock, and it gets a matching lifetime;
 //! the rest keep the seven-day default. See [`authored_expiry`].
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::store::store_err;
 use crate::{
-    CoreError, DEFAULT_EXPIRY_MS, KIND_FRIEND_DIRECTORY, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC,
-    KIND_RELAY_UPDATE, RECEIPT_TYPE_DELIVERED,
+    CoreError, OutboundEnvelope, DEFAULT_EXPIRY_MS, KIND_FRIEND_DIRECTORY, KIND_LAN_ENDPOINT_HINT,
+    KIND_PROFILE_SYNC, KIND_RELAY_UPDATE, RECEIPT_TYPE_DELIVERED,
 };
 
 /// How long a queued LAN endpoint hint stays deliverable.
@@ -262,16 +273,25 @@ pub(crate) const RETIRE_COVERED_SQL: &str = "DELETE FROM outbound_envelopes
 /// authored — strictly greater than every generation it replaces, since the
 /// authored lamport counter only climbs.
 ///
-/// Same index, same shape, same 1:1 restriction: a group-hinted row cannot be
-/// reached because `recipient_user_id = chat_id = ?1` is checked against the
-/// recipient the caller authored to, and none of the four supersedable kinds
-/// is ever authored into a group stream.
+/// Same index, same shape, same 1:1 restriction — and the group exclusion is
+/// spelled out here rather than left to the kind set. `recipient_user_id =
+/// chat_id` does **not** exclude a group row on its own: `author_group_message`
+/// and the metadata-update path both set `recipient_user_id = chat_id =
+/// group.id`, so a group envelope satisfies that clause exactly. What keeps
+/// group rows safe today is only that none of the four supersedable kinds is
+/// group-authorable — a fact that would quietly stop being true the day
+/// somebody adds a group membership or metadata *snapshot* to
+/// [`supersedes_queued_generations`], and the cost of being wrong is deleting
+/// queued group mail with no per-member coverage record to justify it.
+/// `NOT EXISTS (… groups …)` makes the boundary structural, exactly as
+/// [`RETIRE_COVERED_SQL`] does.
 pub(crate) const RETIRE_SUPERSEDED_SQL: &str = "DELETE FROM outbound_envelopes
      WHERE recipient_user_id = ?1
        AND chat_id = ?1
        AND sender_user_id = ?2
        AND kind = ?3
-       AND lamport < ?4";
+       AND lamport < ?4
+       AND NOT EXISTS (SELECT 1 FROM groups WHERE group_id = ?1)";
 
 /// Retire everything a delivered watermark of `through_lamport` now covers in
 /// the 1:1 chat with `chat_id`, for envelopes authored by `sender_user_id`.
@@ -330,6 +350,64 @@ pub(crate) fn retire_superseded(
     Ok(removed as u64)
 }
 
+/// Whether a re-sealed repair envelope belongs back in the outbound queue.
+///
+/// This is the other half of retirement, and without it the first half does
+/// not survive contact with a digest. Both shells' digest responders answer a
+/// peer with `queuedByLamport[lamport] ?: backfill(...)`, walking every stored
+/// message above the peer's **contiguous** watermark. Retirement is driven by
+/// the **delivered** watermark, which is a MAX over the peer's stream
+/// (`WM-01`). Any hole in the peer's copy pins its contiguous watermark far
+/// below that MAX — on the field store, three of the peer streams were holey,
+/// one of them holding 385 messages with a contiguous watermark of 342 — so
+/// the responder routinely asks to rebuild rows retirement has just removed.
+/// If every rebuild re-queued, the queue would regrow to its old size within
+/// one link session, the relay uploader would re-post acknowledged mail with a
+/// cleared `relay_posted_at`, and the measured shrink would be a mirage.
+///
+/// So a repair copy is re-sealed and sent, but rejoins the queue only when the
+/// queue's own rules say it belongs there:
+///
+/// * **A snapshot kind never rejoins.** Its queue membership is governed by
+///   supersession and a short life; a newer generation is already queued or
+///   already delivered, and re-admitting an old one would re-advertise exactly
+///   the thing this module exists to stop. The peer still receives the re-seal
+///   on the link that asked for it, which is what closes its stream gap.
+/// * **A receipt-covered lamport never rejoins.** Its absence is not a gap in
+///   the queue; it is the proof of delivery doing its job. Re-admitting it
+///   would undo the retirement and hand the relay uploader mail the recipient
+///   has already acknowledged.
+///
+/// Everything else does rejoin — genuinely undelivered visible mail whose
+/// sealed copy predates the outbound queue table. That is the case this path
+/// was built for, and it is unchanged.
+pub(crate) fn backfill_rejoins_the_queue(
+    conn: &Connection,
+    envelope: &OutboundEnvelope,
+) -> Result<bool, CoreError> {
+    if supersedes_queued_generations(envelope.kind) {
+        return Ok(false);
+    }
+    let delivered_through: i64 = conn
+        .query_row(
+            "SELECT through_lamport FROM receipts
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
+            params![
+                &envelope.chat_id,
+                &envelope.sender_user_id,
+                RECEIPT_TYPE_DELIVERED as i64
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(store_err)?
+        .unwrap_or(0);
+    Ok(!covered_by_delivered_watermark(
+        envelope.lamport,
+        delivered_through.max(0) as u64,
+    ))
+}
+
 /// One-time-per-open catch-up for rows that were covered before this build
 /// existed, plus a safety net for any watermark advance the incremental hook
 /// missed. Returns how many rows went.
@@ -381,7 +459,7 @@ mod tests {
     use super::*;
     use crate::{
         create_group, generate_identity, Contact, Group, Identity, MessageStore,
-        KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
+        KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
         KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_REACTION, KIND_RECEIPT,
         KIND_TEXT, RECEIPT_TYPE_READ,
     };
@@ -453,11 +531,52 @@ mod tests {
             .lamport
     }
 
+    /// Every `KIND_*` constant declared in `protocol.rs`, parsed out of the
+    /// source so the inventory cannot silently fall behind the wire.
+    ///
+    /// [`delivery_lifetime_is_decided_per_kind`] and
+    /// [`supersession_covers_exactly_the_four_snapshot_kinds`] both drive
+    /// hand-written decision tables, and both policy functions end in a
+    /// catch-all arm — a `u8` match cannot be exhaustive. Without this, adding
+    /// a kind compiles, silently inherits the seven-day default and
+    /// "not a snapshot", and every test stays green, which is the opposite of
+    /// what those tables promise a reader auditing the policy. With it, the new
+    /// constant appears here and the tables fail until somebody decides.
+    fn every_declared_kind() -> Vec<(u8, String)> {
+        let source = include_str!("protocol.rs");
+        let mut kinds = Vec::new();
+        for line in source.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("pub const KIND_") else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(": u8 = ") else {
+                continue;
+            };
+            let value = value.trim_end_matches(';').trim();
+            let Ok(kind) = value.parse::<u8>() else {
+                continue;
+            };
+            kinds.push((kind, format!("KIND_{name}")));
+        }
+        assert!(
+            kinds.len() >= 12,
+            "the KIND_* scan found only {} constants, so it has stopped matching the source",
+            kinds.len()
+        );
+        kinds
+    }
+
     /// Every kind this codebase can author, and the lifetime it must get.
     /// A new kind added without a decision here shows up as a failing row.
     #[test]
     fn delivery_lifetime_is_decided_per_kind() {
         let table: &[(u8, i64, &str)] = &[
+            (
+                KIND_ATTACHMENT_CHUNK,
+                DEFAULT_EXPIRY_MS,
+                "carries a slice of a manifest that keeps the default",
+            ),
             (KIND_TEXT, DEFAULT_EXPIRY_MS, "chat history"),
             (KIND_RECEIPT, DEFAULT_EXPIRY_MS, "not authored through here"),
             (
@@ -507,6 +626,14 @@ mod tests {
                 "kind {kind} ({why})"
             );
         }
+        let decided: HashSet<u8> = table.iter().map(|(kind, _, _)| *kind).collect();
+        for (kind, name) in every_declared_kind() {
+            assert!(
+                decided.contains(&kind),
+                "{name} ({kind}) has no delivery-lifetime decision; it would inherit the \
+                 seven-day default by accident"
+            );
+        }
     }
 
     /// The endpoint hint's envelope must outlive its payload, and by a margin
@@ -553,6 +680,7 @@ mod tests {
                 "retry state reads the queue",
             ),
             (KIND_ATTACHMENT_MANIFEST, false, "chat history"),
+            (KIND_ATTACHMENT_CHUNK, false, "a slice, not a snapshot"),
             (KIND_REACTION, false, "chat history"),
             (KIND_GROUP_METADATA_UPDATE, false, "convergent group stream"),
         ];
@@ -561,6 +689,14 @@ mod tests {
                 supersedes_queued_generations(*kind),
                 *expected,
                 "kind {kind} ({why})"
+            );
+        }
+        let decided: HashSet<u8> = table.iter().map(|(kind, _, _)| *kind).collect();
+        for (kind, name) in every_declared_kind() {
+            assert!(
+                decided.contains(&kind),
+                "{name} ({kind}) has no supersession decision; it would default to \
+                 'not a snapshot' by accident"
             );
         }
     }
@@ -913,6 +1049,243 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // 2b. The repair re-seal must not undo the retirement
+    // -----------------------------------------------------------------
+
+    /// Both shells' digest responder, reduced to the part that matters here:
+    /// walk every stored message above the peer's *contiguous* watermark, use
+    /// the queued envelope if there is one and re-seal from the stored message
+    /// if there is not, and send what comes back. Returns the `msg_id` of each
+    /// envelope that would go on the wire, in order.
+    fn simulate_digest_response(
+        store: &MessageStore,
+        me: &Identity,
+        contact: &Contact,
+        peer_has_through: u64,
+    ) -> Vec<Vec<u8>> {
+        let queued: std::collections::HashMap<u64, Vec<u8>> = store
+            .outbound_envelopes_after(
+                contact.user_id.clone(),
+                me.user_id.clone(),
+                peer_has_through,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|envelope| (envelope.lamport, envelope.msg_id))
+            .collect();
+        store
+            .messages_after(
+                contact.user_id.clone(),
+                me.user_id.clone(),
+                peer_has_through,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|message| match queued.get(&message.lamport) {
+                Some(msg_id) => msg_id.clone(),
+                None => {
+                    store
+                        .backfill_pairwise_envelope(me.clone(), contact.clone(), message, None)
+                        .unwrap()
+                        .envelope
+                        .msg_id
+                }
+            })
+            .collect()
+    }
+
+    /// The failure this module would otherwise cause, pinned. A peer's digest
+    /// reports its *contiguous* watermark, which a single hole pins far below
+    /// the *delivered* MAX that drives retirement, so the responder routinely
+    /// asks to rebuild rows retirement has just removed. Answering must not
+    /// re-queue them: otherwise the queue regrows to its old size within one
+    /// link session and the relay uploader re-posts mail the recipient has
+    /// already acknowledged, with `relay_posted_at` cleared.
+    #[test]
+    fn answering_a_holey_digest_does_not_regrow_the_queue_or_the_relay_set() {
+        let (store, me, peer, contact) = pairing(":memory:");
+        for body in [&b"one"[..], b"two", b"three"] {
+            author(&store, &me, &contact, KIND_TEXT, body);
+        }
+        for generation in 0..3u8 {
+            author(&store, &me, &contact, KIND_PROFILE_SYNC, &[generation; 4]);
+        }
+        assert_eq!(queued(&store, &me, &peer).len(), 4);
+
+        store
+            .record_receipt(
+                peer.user_id.clone(),
+                me.user_id.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                6,
+                None,
+            )
+            .unwrap();
+        assert!(queued(&store, &me, &peer).is_empty());
+
+        // The peer's contiguous watermark is 0 -- a hole at its very first
+        // lamport -- so it asks for the whole stream, twice over two sessions.
+        let first = simulate_digest_response(&store, &me, &contact, 0);
+        let second = simulate_digest_response(&store, &me, &contact, 0);
+        assert_eq!(first.len(), 6, "every stored message is answered");
+        assert_eq!(
+            first, second,
+            "a re-sealed envelope keeps the message's own identity, so the \
+             peer's dedupe and both shells' once-per-session offer bound still \
+             recognise it"
+        );
+        assert!(
+            queued(&store, &me, &peer).is_empty(),
+            "answering a digest must not re-admit retired rows to the queue"
+        );
+        assert!(
+            store
+                .pending_relay_outbound_envelopes(1_000, NOW, vec![])
+                .unwrap()
+                .is_empty(),
+            "answering a digest must not hand the relay uploader acknowledged mail"
+        );
+    }
+
+    /// The re-sealed envelope carries the id the message was authored with, so
+    /// a repair is a retransmission and not new traffic.
+    #[test]
+    fn a_repair_re_seal_carries_the_authored_msg_id() {
+        let (store, me, peer, contact) = pairing(":memory:");
+        let authored = store
+            .author_pairwise_message(
+                me.clone(),
+                contact.clone(),
+                KIND_TEXT,
+                b"hello".to_vec(),
+                None,
+                NOW,
+            )
+            .unwrap();
+        store
+            .record_receipt(
+                peer.user_id.clone(),
+                me.user_id.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                authored.envelope.lamport,
+                None,
+            )
+            .unwrap();
+        assert!(queued(&store, &me, &peer).is_empty());
+
+        let rebuilt = store
+            .backfill_pairwise_envelope(me.clone(), contact.clone(), authored.message.clone(), None)
+            .unwrap();
+        assert_eq!(
+            rebuilt.envelope.msg_id, authored.envelope.msg_id,
+            "a re-seal must not mint a new identity"
+        );
+        assert!(!rebuilt.envelope.sealed.is_empty());
+    }
+
+    /// A row whose absence is unexplained -- authored before the outbound queue
+    /// table existed, still undelivered, still a kind the queue is for -- is
+    /// exactly what this path was built for, and it still rejoins.
+    #[test]
+    fn a_genuinely_legacy_envelope_still_rejoins_the_queue() {
+        let (store, me, peer, contact) = pairing(":memory:");
+        let authored = store
+            .author_pairwise_message(
+                me.clone(),
+                contact.clone(),
+                KIND_TEXT,
+                b"pre-queue".to_vec(),
+                None,
+                NOW,
+            )
+            .unwrap();
+        // Simulate the pre-queue store: the message row exists, the sealed row
+        // never did. No receipt covers it.
+        {
+            let conn = store.conn.lock().expect("store mutex poisoned");
+            conn.execute("DELETE FROM outbound_envelopes", []).unwrap();
+        }
+        assert!(queued(&store, &me, &peer).is_empty());
+
+        store
+            .backfill_pairwise_envelope(me.clone(), contact.clone(), authored.message, None)
+            .unwrap();
+        assert_eq!(
+            queued(&store, &me, &peer),
+            vec![(authored.envelope.lamport, KIND_TEXT)],
+            "undelivered legacy mail belongs in the queue"
+        );
+    }
+
+    /// A snapshot kind never rejoins, whatever the receipts say. Its queue
+    /// membership is governed by supersession and a short life; re-admitting an
+    /// old generation would re-advertise the exact thing this module removes.
+    #[test]
+    fn a_repair_re_seal_of_a_snapshot_kind_never_rejoins_the_queue() {
+        let (store, me, peer, contact) = pairing(":memory:");
+        let hint = store
+            .author_pairwise_message(
+                me.clone(),
+                contact.clone(),
+                KIND_LAN_ENDPOINT_HINT,
+                b"endpoint".to_vec(),
+                None,
+                NOW,
+            )
+            .unwrap();
+        {
+            let conn = store.conn.lock().expect("store mutex poisoned");
+            conn.execute("DELETE FROM outbound_envelopes", []).unwrap();
+        }
+        let rebuilt = store
+            .backfill_pairwise_envelope(me.clone(), contact.clone(), hint.message, None)
+            .unwrap();
+        assert!(
+            !rebuilt.envelope.sealed.is_empty(),
+            "the peer is still answered"
+        );
+        assert!(
+            queued(&store, &me, &peer).is_empty(),
+            "a superseded generation must not be re-advertised"
+        );
+    }
+
+    /// A repair re-seal is transmitted the moment it is built, so it must be
+    /// deliverable. The short ephemeral lifetimes are an *authoring* policy;
+    /// applied to a re-seal of an older message they would hand back an
+    /// envelope already past its expiry, which the shells frame anyway and the
+    /// recipient's inbound gate drops -- dead bytes, and a stream hole that
+    /// could never close.
+    #[test]
+    fn a_repair_re_seal_is_never_born_expired() {
+        let (store, me, _peer, contact) = pairing(":memory:");
+        let hint = store
+            .author_pairwise_message(
+                me.clone(),
+                contact.clone(),
+                KIND_LAN_ENDPOINT_HINT,
+                b"endpoint".to_vec(),
+                None,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(hint.envelope.expiry, NOW + LAN_ENDPOINT_HINT_EXPIRY_MS);
+        {
+            let conn = store.conn.lock().expect("store mutex poisoned");
+            conn.execute("DELETE FROM outbound_envelopes", []).unwrap();
+        }
+        let rebuilt = store
+            .backfill_pairwise_envelope(me.clone(), contact.clone(), hint.message, None)
+            .unwrap();
+        let a_day_later = NOW + 24 * 60 * 60 * 1_000;
+        assert!(
+            rebuilt.envelope.expiry > a_day_later,
+            "a re-seal an hour, or a day, after authoring must still be deliverable"
+        );
+        assert_eq!(rebuilt.envelope.expiry, NOW + DEFAULT_EXPIRY_MS);
+    }
+
+    // -----------------------------------------------------------------
     // 3. Supersession
     // -----------------------------------------------------------------
 
@@ -1013,6 +1386,55 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// The supersession statement's group exclusion is structural, not a
+    /// consequence of today's kind set.
+    ///
+    /// A group envelope satisfies `recipient_user_id = chat_id` exactly --
+    /// `author_group_message` sets both to the group id -- so the pairwise
+    /// shape alone does not exclude it. Only `NOT EXISTS (… groups …)` does.
+    /// The statement is exercised directly here, with a kind the caller-level
+    /// guard would refuse, so the protection is pinned to the SQL and survives
+    /// somebody later adding a group-authorable snapshot kind to
+    /// [`supersedes_queued_generations`].
+    #[test]
+    fn the_supersession_statement_refuses_a_group_row_by_itself() {
+        let (store, me, peer, _contact) = pairing(":memory:");
+        let group = create_group(
+            "Deck party".to_string(),
+            vec![me.user_id.clone(), peer.user_id.clone()],
+        )
+        .unwrap();
+        store.upsert_group(group.clone()).unwrap();
+        for body in [&b"first"[..], b"second"] {
+            store
+                .author_group_message(
+                    me.clone(),
+                    group.clone(),
+                    KIND_TEXT,
+                    body.to_vec(),
+                    None,
+                    NOW,
+                )
+                .unwrap();
+        }
+        let conn = store.conn.lock().expect("store mutex poisoned");
+        let removed = conn
+            .execute(
+                RETIRE_SUPERSEDED_SQL,
+                params![
+                    group.id.clone(),
+                    me.user_id.clone(),
+                    KIND_TEXT as i64,
+                    9_999i64
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            removed, 0,
+            "no group row may be retired without a per-member coverage record"
         );
     }
 
