@@ -379,6 +379,16 @@ private fun PermissionsSlide(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 14.dp),
         )
+
+        // Radios are the subject of this slide, and airplane mode is the one
+        // radio setting that decides whether the trip ends with a roaming
+        // bill. Same supporting-text style as the line above it.
+        Text(
+            text = stringResource(R.string.ui_onboarding_airplane_tip),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 10.dp),
+        )
     }
 }
 

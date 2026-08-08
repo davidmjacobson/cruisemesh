@@ -329,6 +329,15 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
                         stringResource(R.string.ui_paste_your_setup_card_well_test_it),
                         modifier = Modifier.padding(top = 8.dp),
                     )
+                    // Who bills for what, before anyone commits to a pass. Kept
+                    // in the secondary style the rest of this screen uses for
+                    // supporting text: it is an answer, not a warning.
+                    Text(
+                        stringResource(R.string.ui_shore_pass_data_note),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
                 }
                 if (configured != null) {
                     Text(

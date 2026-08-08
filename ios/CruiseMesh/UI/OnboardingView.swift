@@ -270,6 +270,13 @@ private struct PermissionsSlide: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+            // Radios are the subject of this slide, and airplane mode is the
+            // one radio setting that decides whether the trip ends with a
+            // roaming bill. Same supporting style as the footnote above it.
+            Text("On board, turn on airplane mode, then turn Wi-Fi and Bluetooth back on. CruiseMesh works fully without cellular, and airplane mode prevents roaming charges.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
         }
         .padding(28)
         .onAppear(perform: refreshPermissions)
