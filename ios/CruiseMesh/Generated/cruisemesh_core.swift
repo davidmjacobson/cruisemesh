@@ -2325,6 +2325,17 @@ public protocol MessageStoreProtocol : AnyObject {
      * still bounds it. A pre-`msg_id` legacy row is given one and it is
      * written back, so the identity is durable from then on.
      *
+     * A stable identity does mean a peer that already recorded this `msg_id`
+     * as seen drops the retransmission. That is the point nearly everywhere —
+     * a peer that holds the message needs no second copy, and the receive path
+     * deliberately records an id only once handling reached a terminal state,
+     * so an envelope whose store failed stays re-presentable. The one case it
+     * costs anything is a peer that received the envelope and dropped it as
+     * expired: it drops the re-seal too, until its bounded FIFO seen-set
+     * evicts the id. That is the trade-off any stable identity makes, and the
+     * alternative — a fresh random id on every digest — is precisely the
+     * resend chatter the HELLO2 capability flags were introduced to stop.
+     *
      * Its delivery expiry is [`crate::default_expiry`] from the authoring
      * timestamp — the flat default, deliberately not the per-kind authored
      * lifetime. The short ephemeral lifetimes are an authoring policy; applied
@@ -4336,6 +4347,17 @@ open func backfillOutgoingReceiptEnvelopes(identity: Identity, nowMs: Int64)thro
      * hidden-kind offer bound in both shells (which is keyed on `msg_id`)
      * still bounds it. A pre-`msg_id` legacy row is given one and it is
      * written back, so the identity is durable from then on.
+     *
+     * A stable identity does mean a peer that already recorded this `msg_id`
+     * as seen drops the retransmission. That is the point nearly everywhere —
+     * a peer that holds the message needs no second copy, and the receive path
+     * deliberately records an id only once handling reached a terminal state,
+     * so an envelope whose store failed stays re-presentable. The one case it
+     * costs anything is a peer that received the envelope and dropped it as
+     * expired: it drops the re-seal too, until its bounded FIFO seen-set
+     * evicts the id. That is the trade-off any stable identity makes, and the
+     * alternative — a fresh random id on every digest — is precisely the
+     * resend chatter the HELLO2 capability flags were introduced to stop.
      *
      * Its delivery expiry is [`crate::default_expiry`] from the authoring
      * timestamp — the flat default, deliberately not the per-kind authored
@@ -25392,7 +25414,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_outgoing_receipt_envelopes() != 46042) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_envelope() != 32252) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_backfill_pairwise_envelope() != 38262) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_inventory() != 55991) {
