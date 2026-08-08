@@ -6,6 +6,7 @@ uniffi::setup_scaffolding!("cruisemesh_core");
 mod authoring;
 mod backup;
 mod causal_order;
+mod connection_health;
 mod contact_relay_health;
 mod content;
 mod crypto;
@@ -37,6 +38,15 @@ pub use backup::{
     BackupPassphraseStrength, CoreBackupError, CoreBackupPayload,
 };
 pub use causal_order::{causal_display_timestamp, CAUSAL_ORDER_MAX_SKEW_MS};
+pub use connection_health::{
+    core_classify_connection_health, core_connection_checking_expired, core_group_people,
+    core_person_attention_rank, core_person_is_reachable_now, core_person_reach,
+    CoreConnectionEvidence, CoreConnectionHealth, CoreConnectionHealthInput,
+    CoreConnectionHealthReport, CoreDirectLink, CoreDirectPathState, CoreHealthAction,
+    CoreHealthReason, CoreMeshRuntime, CorePeopleGroups, CorePersonAttention, CorePersonGroup,
+    CorePersonHealthInput, CorePersonPlacement, CorePersonReach, CoreRelayPathState,
+    CONNECTION_CHECKING_TIMEOUT_MS, CONNECTION_PRESENCE_ONLINE_WINDOW_MS,
+};
 pub use contact_relay_health::{
     contact_relay_fault_is_authoritative, core_contact_relay_endpoint_usable,
     core_contact_relay_is_stale, core_contact_relay_recheck_due, core_contact_relay_streak_delta,
