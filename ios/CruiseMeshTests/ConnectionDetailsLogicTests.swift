@@ -392,81 +392,234 @@ final class ConnectionDetailsLogicTests: XCTestCase {
 
     // MARK: - Delivery language
 
+    private func facts(
+        waitingCount: Int,
+        oldestWaitingMs: Int64,
+        lastProgressMs: Int64,
+        oversizedWaiting: Bool = false,
+        relayRejectStreak: Int64 = 0,
+        /// By default nothing has been handed over yet.
+        unpostedWaitingCount: Int? = nil
+    ) -> PersonDeliveryFacts {
+        PersonDeliveryFacts(
+            waitingCount: waitingCount,
+            unpostedWaitingCount: unpostedWaitingCount ?? waitingCount,
+            oldestWaitingMs: oldestWaitingMs,
+            lastProgressMs: lastProgressMs,
+            oversizedWaiting: oversizedWaiting,
+            relayRejectStreak: relayRejectStreak,
+            relayRejectedAtMs: relayRejectStreak > 0 ? Self.fixedNowMs : 0,
+            relayUnreachableStreak: 0,
+            relayUnreachableAtMs: 0
+        )
+    }
+
     private func deliveryLine(
-        queued: Int,
-        routeIsDirect: Bool = false,
+        waitingCount: Int,
+        directLink: Bool = false,
         ownRelayUsable: Bool = true,
-        contactHasRelayEndpoint: Bool = true,
-        contactRelayStale: Bool = false,
-        relay: CoreRelayPathState = .connected,
-        receiptIsNewestEvidence: Bool = false
-    ) -> DeliveryLine? {
+        hasRelayEndpoint: Bool = true,
+        ageMs: Int64 = ConnectionDetailsLogicTests.oneMinuteMs,
+        oversizedWaiting: Bool = false,
+        relayRejectStreak: Int64 = 0,
+        relay: CoreRelayPathState = .connected
+    ) -> CoreDeliveryLine? {
         DeliveryPresentation.line(
-            queued: queued,
-            routeIsDirect: routeIsDirect,
+            person: person(
+                1,
+                "Ash",
+                hasRelayEndpoint: hasRelayEndpoint,
+                delivery: facts(
+                    waitingCount: waitingCount,
+                    oldestWaitingMs: Self.fixedNowMs - ageMs,
+                    lastProgressMs: Self.fixedNowMs - ageMs,
+                    oversizedWaiting: oversizedWaiting,
+                    relayRejectStreak: relayRejectStreak
+                )
+            ),
+            directLink: directLink,
             ownRelayUsable: ownRelayUsable,
-            contactHasRelayEndpoint: contactHasRelayEndpoint,
-            contactRelayStale: contactRelayStale,
             relay: relay,
-            receiptIsNewestEvidence: receiptIsNewestEvidence
+            nowMs: Self.fixedNowMs
         )
     }
 
     func testNothingWaitingMeansNoDeliveryLineAtAll() {
-        XCTAssertNil(deliveryLine(queued: 0))
+        XCTAssertNil(deliveryLine(waitingCount: 0))
     }
 
     func testALiveLinkMeansTheWorkIsGoingOutNow() {
-        XCTAssertEqual(
-            deliveryLine(queued: 2, routeIsDirect: true, ownRelayUsable: false),
-            DeliveryLine(kind: .sending, count: 2)
-        )
+        let line = deliveryLine(waitingCount: 2, directLink: true, ownRelayUsable: false)
+        XCTAssertEqual(line?.state, CoreDeliveryState.sending)
+        XCTAssertEqual(line?.count, 2)
     }
 
     func testAWorkingPassPlusTheirEndpointIsAlsoAUsableRoute() {
-        XCTAssertEqual(deliveryLine(queued: 1), DeliveryLine(kind: .sending, count: 1))
-    }
-
-    /// Nothing will ever mark these rows uploaded, so the number is not a
-    /// backlog: it is every message written to them inside the retention
-    /// window, and it would sit under their name for a week.
-    func testAWrittenOffEndpointMeansNoLineBecauseTheCountCannotDrain() {
-        XCTAssertNil(deliveryLine(queued: 4, contactRelayStale: true))
+        XCTAssertEqual(deliveryLine(waitingCount: 1)?.state, CoreDeliveryState.sending)
     }
 
     func testNoInternetWithOnlyAPassRouteSaysSoPlainly() {
-        XCTAssertEqual(
-            deliveryLine(queued: 3, ownRelayUsable: false, relay: .waitingForInternet),
-            DeliveryLine(kind: .waitingForInternet, count: 3)
+        let line = deliveryLine(
+            waitingCount: 3,
+            ownRelayUsable: false,
+            relay: .waitingForInternet
         )
+        XCTAssertEqual(line?.state, CoreDeliveryState.waitingForInternet)
+        XCTAssertEqual(line?.count, 3)
     }
 
+    /// The movement state stays a promise underneath the fault. An expired pass
+    /// stops the internet route; it does not stop the next encounter, and the
+    /// copy must not say otherwise.
     func testAPassFaultStillPromisesTheNextEncounterRatherThanAFailure() {
+        let line = deliveryLine(waitingCount: 4, ownRelayUsable: false, relay: .passExpired)
+        XCTAssertEqual(line?.state, CoreDeliveryState.willDeliverWhenReconnected)
+        XCTAssertEqual(line?.blockedReason, CoreDeliveryBlockedReason.passExpired)
+    }
+
+    /// The DTN invariant, asserted at an age where a naive threshold would have
+    /// fired a thousand times over.
+    func testAFriendWhoIsMerelyOfflineIsNeverAnErrorAtAnyAge() {
+        let line = DeliveryPresentation.line(
+            person: person(
+                1,
+                "Ash",
+                hasRelayEndpoint: false,
+                delivery: facts(
+                    waitingCount: 6,
+                    oldestWaitingMs: Self.fixedNowMs - 10 * 24 * ConnectionDetailsLogicTests.oneHourMs,
+                    lastProgressMs: 0
+                )
+            ),
+            directLink: false,
+            ownRelayUsable: false,
+            relay: .connected,
+            nowMs: Self.fixedNowMs
+        )
+        XCTAssertEqual(line?.state, CoreDeliveryState.willDeliverWhenReconnected)
+        XCTAssertEqual(line?.delayed, false)
+        XCTAssertNil(line?.blockedReason)
+        XCTAssertNil(line?.attention)
+    }
+
+    func testAUsableRouteThatHasCarriedNothingForTheWindowReadsAsDelayed() {
+        let line = deliveryLine(waitingCount: 2, ageMs: 30 * ConnectionDetailsLogicTests.oneMinuteMs)
+        XCTAssertEqual(line?.delayed, true)
+        XCTAssertEqual(line?.attention, CorePersonAttention.delayed)
+        // Still sending underneath: the path works, it is just not moving.
+        XCTAssertEqual(line?.state, CoreDeliveryState.sending)
+    }
+
+    /// Our pass works, their endpoint is healthy, every message was accepted --
+    /// and their phone is off. A successful upload is the last progress this
+    /// device can record, so an age-only rule would park this friend in Needs
+    /// attention overnight, every night, with nothing to do about it.
+    func testAFriendWhoHasNotCollectedMailWeAlreadySentIsNeverDelayed() {
+        let threeDaysMs = 3 * 24 * ConnectionDetailsLogicTests.oneHourMs
+        let line = DeliveryPresentation.line(
+            person: person(
+                1,
+                "Ash",
+                hasRelayEndpoint: true,
+                delivery: facts(
+                    waitingCount: 2,
+                    oldestWaitingMs: Self.fixedNowMs - threeDaysMs,
+                    lastProgressMs: Self.fixedNowMs - threeDaysMs,
+                    unpostedWaitingCount: 0
+                )
+            ),
+            directLink: false,
+            ownRelayUsable: true,
+            relay: .connected,
+            nowMs: Self.fixedNowMs
+        )
+        XCTAssertEqual(line?.state, CoreDeliveryState.sending)
+        XCTAssertEqual(line?.delayed, false)
+        XCTAssertNil(line?.attention)
+    }
+
+    func testTheirRejectedCardIsTheMostSevereAttentionThereIs() {
+        let line = deliveryLine(waitingCount: 5, relayRejectStreak: 4)
+        XCTAssertEqual(line?.blockedReason, CoreDeliveryBlockedReason.contactSetupRejected)
+        XCTAssertEqual(line?.attention, CorePersonAttention.setupRejected)
+    }
+
+    func testAnOversizedMessageIsTerminalEvenWithTheFriendInTheRoom() {
+        let line = deliveryLine(waitingCount: 1, directLink: true, oversizedWaiting: true)
+        XCTAssertEqual(line?.blockedReason, CoreDeliveryBlockedReason.messageTooLarge)
+        XCTAssertEqual(line?.attention, CorePersonAttention.messageTooLarge)
+    }
+
+    /// The "red under every friend" failure, in one assertion: a friend whose
+    /// card carries no endpoint is untouched by our expired pass.
+    func testOurOwnPassFaultNeverReachesAFriendTheInternetWasNotARouteTo() {
+        let line = deliveryLine(
+            waitingCount: 3,
+            ownRelayUsable: false,
+            hasRelayEndpoint: false,
+            relay: .passExpired
+        )
+        XCTAssertNil(line?.blockedReason)
+        XCTAssertNil(line?.attention)
+    }
+
+    // MARK: - Best route
+
+    private func bestRoute(
+        directLink: CoreDirectLink? = nil,
+        ownRelayUsable: Bool = true,
+        hasRelayEndpoint: Bool = true,
+        relayRejectStreak: Int64 = 0
+    ) -> CorePersonRoute {
+        DeliveryPresentation.bestRoute(
+            person: person(
+                1,
+                "Ash",
+                hasRelayEndpoint: hasRelayEndpoint,
+                delivery: facts(
+                    waitingCount: 0,
+                    oldestWaitingMs: 0,
+                    lastProgressMs: 0,
+                    relayRejectStreak: relayRejectStreak
+                )
+            ),
+            directLink: directLink,
+            ownRelayUsable: ownRelayUsable,
+            nowMs: Self.fixedNowMs
+        )
+    }
+
+    /// A post-only friend card must not read as broken, which is why this is
+    /// the core's answer and not a second derivation on this side of the FFI.
+    func testTheBestRouteRestatesTheCoreAnswerRatherThanReDerivingIt() {
+        XCTAssertEqual(bestRoute(directLink: .bluetooth), CorePersonRoute.directBluetooth)
+        XCTAssertEqual(bestRoute(directLink: .localWifi), CorePersonRoute.directLocalWifi)
+        XCTAssertEqual(bestRoute(), CorePersonRoute.shorePass)
+        XCTAssertEqual(bestRoute(ownRelayUsable: false), CorePersonRoute.noneNow)
+        XCTAssertEqual(bestRoute(hasRelayEndpoint: false), CorePersonRoute.noneNow)
+        XCTAssertEqual(bestRoute(relayRejectStreak: 4), CorePersonRoute.noneNow)
+    }
+
+    // MARK: - Waiting age
+
+    func testAWaitingAgeIsADurationAndNeverADate() {
+        XCTAssertEqual(ConnectionTimes.waitingAge(sinceMs: 0, nowMs: now), .unknown)
+        // A stamp from the future is a clock artifact, not a negative age.
+        XCTAssertEqual(ConnectionTimes.waitingAge(sinceMs: now + minute, nowMs: now), .unknown)
+        // Under a minute renders nothing rather than "0 min".
+        XCTAssertEqual(ConnectionTimes.waitingAge(sinceMs: now - 30_000, nowMs: now), .unknown)
         XCTAssertEqual(
-            deliveryLine(queued: 4, ownRelayUsable: false, relay: .passExpired),
-            DeliveryLine(kind: .willDeliverWhenReconnected, count: 4)
+            ConnectionTimes.waitingAge(sinceMs: now - 14 * minute, nowMs: now),
+            .minutes(14)
         )
-    }
-
-    /// The contradiction this page exists to remove. The count is rows whose
-    /// upload stamp is unset, and only an upload sets it -- not a receipt, and
-    /// not handing the message over in person. On a phone with no pass saved,
-    /// or for a friend whose card carries no endpoint, the number never goes
-    /// down.
-    func testABacklogThatRelayUploadCannotDrainIsNotShownAtAll() {
-        XCTAssertNil(
-            deliveryLine(
-                queued: 12,
-                routeIsDirect: true,
-                ownRelayUsable: false,
-                relay: .notSetUp
-            )
+        XCTAssertEqual(
+            ConnectionTimes.waitingAge(sinceMs: now - 3 * hour, nowMs: now),
+            .hours(3)
         )
-        XCTAssertNil(deliveryLine(queued: 12, contactHasRelayEndpoint: false))
-    }
-
-    func testARowThatAlreadySaysTheyReceivedAMessageGetsNoLineUnderIt() {
-        XCTAssertNil(deliveryLine(queued: 12, receiptIsNewestEvidence: true))
+        XCTAssertEqual(
+            ConnectionTimes.waitingAge(sinceMs: now - 48 * hour, nowMs: now),
+            .days(2)
+        )
     }
 
     // MARK: - View-state assembly
@@ -478,8 +631,9 @@ final class ConnectionDetailsLogicTests: XCTestCase {
         _ name: String,
         blocked: Bool = false,
         hasRelayEndpoint: Bool = true,
-        queued: Int = 0,
-        latest: PersonEvidence? = nil
+        delivery: PersonDeliveryFacts = PersonDeliveryFacts.none,
+        latest: PersonEvidence? = nil,
+        lastDeliveredMs: Int64 = 0
     ) -> ConnectionPerson {
         let bytes = userId(id)
         return ConnectionPerson(
@@ -488,8 +642,21 @@ final class ConnectionDetailsLogicTests: XCTestCase {
             name: name,
             blocked: blocked,
             hasRelayEndpoint: hasRelayEndpoint,
-            queued: queued,
-            latest: latest
+            delivery: delivery,
+            latest: latest,
+            lastDeliveredMs: lastDeliveredMs
+        )
+    }
+
+    /// `count` messages that started waiting `ageMs` ago and have not moved since.
+    private func waiting(
+        _ count: Int,
+        ageMs: Int64 = ConnectionDetailsLogicTests.oneMinuteMs
+    ) -> PersonDeliveryFacts {
+        facts(
+            waitingCount: count,
+            oldestWaitingMs: Self.fixedNowMs - ageMs,
+            lastProgressMs: Self.fixedNowMs - ageMs
         )
     }
 
@@ -504,7 +671,6 @@ final class ConnectionDetailsLogicTests: XCTestCase {
         /// Zero, unless a test is about the bounded Checking state: a mark of
         /// zero is "nothing pending" and resolves the bound immediately.
         checkingSinceMs: Int64 = 0,
-        stale: Set<Data> = [],
         presence: [Data: Int64] = [:],
         activity: [ConnectionActivityRow] = []
     ) -> ConnectionDetailsState {
@@ -516,7 +682,6 @@ final class ConnectionDetailsLogicTests: XCTestCase {
             relayConfigured: relayConfigured,
             lanListening: lanListening,
             bluetoothAudioActive: false,
-            staleRelayContacts: stale,
             presenceLastSeen: presence,
             contactLastSeen: [:],
             snapshot: ConnectionStoreSnapshot(
@@ -536,6 +701,7 @@ final class ConnectionDetailsLogicTests: XCTestCase {
         XCTAssertNil(result.health.reason)
         XCTAssertNil(result.health.action)
         XCTAssertEqual(result.health.nearbyFriendCount, 0)
+        XCTAssertTrue(result.needsAttention.isEmpty)
         XCTAssertTrue(result.reachableNow.isEmpty)
         XCTAssertEqual(result.otherPeople.map { $0.name }, ["Ash"])
     }
@@ -597,7 +763,8 @@ final class ConnectionDetailsLogicTests: XCTestCase {
             people: [person(9, "Blocked", blocked: true), person(2, "Sam")],
             directPaths: [userId(9): .bluetooth]
         )
-        let allNames = (result.reachableNow + result.otherPeople).map { $0.name }
+        let allNames = (result.needsAttention + result.reachableNow + result.otherPeople)
+            .map { $0.name }
         XCTAssertEqual(allNames, ["Sam"])
     }
 
@@ -645,18 +812,22 @@ final class ConnectionDetailsLogicTests: XCTestCase {
 
     func testWaitingWorkNeverRendersAsAnErrorWhateverThePathState() {
         let result = state(
-            people: [person(1, "Ash", queued: 3)],
+            people: [person(1, "Ash", delivery: waiting(3))],
             relayHealth: .noInternet
         )
-        XCTAssertEqual(
-            result.otherPeople[0].delivery,
-            DeliveryLine(kind: .waitingForInternet, count: 3)
-        )
+        let delivery = result.otherPeople[0].delivery
+        XCTAssertEqual(delivery?.state, CoreDeliveryState.waitingForInternet)
+        XCTAssertEqual(delivery?.count, 3)
+        XCTAssertNil(delivery?.blockedReason)
+        // Not in Needs attention either: no fault, no stall, nothing to do.
+        XCTAssertTrue(result.needsAttention.isEmpty)
     }
 
-    /// The contradiction in one assertion: the row says "Received your message
-    /// 12 min ago" and the old page put "Sending 12 messages…" directly
-    /// beneath it, for as long as the retention window lasted.
+    /// The contradiction this page exists to remove. The row says "Received
+    /// your message 12 min ago"; the old page put "Sending 12 messages…"
+    /// directly beneath it for as long as the retention window lasted. Phase 2
+    /// makes that impossible upstream: the count is receipt-aware, so a
+    /// satisfied conversation arrives here as zero.
     func testAFriendWhoAlreadyReceivedAMessageGetsNoQueueLineUnderTheRow() {
         let receivedAt = Self.fixedNowMs - 12 * minute
         let result = state(
@@ -664,12 +835,12 @@ final class ConnectionDetailsLogicTests: XCTestCase {
                 person(
                     1,
                     "Ash",
-                    queued: 12,
                     latest: PersonEvidence(
                         evidence: .messageDelivered,
                         path: .shorePass,
                         atMs: receivedAt
-                    )
+                    ),
+                    lastDeliveredMs: receivedAt
                 )
             ]
         )
@@ -678,6 +849,83 @@ final class ConnectionDetailsLogicTests: XCTestCase {
             .history(evidence: .messageDelivered, atMs: receivedAt)
         )
         XCTAssertNil(result.otherPeople[0].delivery)
+        XCTAssertEqual(result.otherPeople[0].detail.lastDeliveredMs, receivedAt)
+    }
+
+    /// Grouped by the same verdict their row renders -- one classification,
+    /// used twice, so a row cannot be filed under a problem it never states.
+    func testAFriendNeedingAttentionLeadsThePageAndStatesWhyInTheirOwnRow() {
+        let waitingSince = Self.fixedNowMs - 14 * minute
+        let result = state(
+            people: [
+                person(1, "Bo"),
+                person(
+                    2,
+                    "Ash",
+                    delivery: facts(
+                        waitingCount: 2,
+                        oldestWaitingMs: waitingSince,
+                        lastProgressMs: waitingSince,
+                        relayRejectStreak: 4
+                    )
+                ),
+            ]
+        )
+        XCTAssertEqual(result.needsAttention.map { $0.name }, ["Ash"])
+        let row = result.needsAttention[0]
+        XCTAssertEqual(row.attention, CorePersonAttention.setupRejected)
+        XCTAssertEqual(
+            row.delivery?.blockedReason,
+            CoreDeliveryBlockedReason.contactSetupRejected
+        )
+        XCTAssertEqual(row.delivery?.oldestWaitingMs, waitingSince)
+        // And nowhere else on the page.
+        XCTAssertEqual(result.otherPeople.map { $0.name }, ["Bo"])
+        XCTAssertTrue(result.reachableNow.isEmpty)
+    }
+
+    func testADelayedFriendNeedsAttentionWithoutTheirRowBecomingAnError() {
+        let result = state(people: [person(1, "Ash", delivery: waiting(2, ageMs: 30 * minute))])
+        XCTAssertEqual(result.needsAttention.count, 1)
+        let row = result.needsAttention[0]
+        XCTAssertEqual(row.attention, CorePersonAttention.delayed)
+        XCTAssertEqual(row.delivery?.delayed, true)
+        XCTAssertNil(row.delivery?.blockedReason)
+    }
+
+    func testThePersonDetailCarriesTheCoreRouteAndTheTimesItCanProve() {
+        let deliveredAt = Self.fixedNowMs - 5 * minute
+        let result = state(
+            people: [person(1, "Sam", lastDeliveredMs: deliveredAt)],
+            directPaths: [userId(1): .bluetooth]
+        )
+        let detail = result.reachableNow[0].detail
+        XCTAssertEqual(detail.bestRoute, CorePersonRoute.directBluetooth)
+        XCTAssertEqual(detail.lastDeliveredMs, deliveredAt)
+    }
+
+    /// A block is a tombstone. The most eye-catching group on the page is
+    /// exactly where a leak would be most visible.
+    func testABlockedFriendWithARejectedCardIsNotPromotedIntoNeedsAttention() {
+        let result = state(
+            people: [
+                person(
+                    1,
+                    "Blocked",
+                    blocked: true,
+                    delivery: facts(
+                        waitingCount: 9,
+                        oldestWaitingMs: Self.fixedNowMs - hour,
+                        lastProgressMs: Self.fixedNowMs - hour,
+                        relayRejectStreak: 4
+                    )
+                )
+            ]
+        )
+        XCTAssertTrue(result.needsAttention.isEmpty)
+        XCTAssertTrue(result.reachableNow.isEmpty)
+        XCTAssertTrue(result.otherPeople.isEmpty)
+        XCTAssertFalse(result.hasContacts)
     }
 
     /// Not in a group, and not in the numbers above the groups either: a count

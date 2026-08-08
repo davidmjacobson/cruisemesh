@@ -23,6 +23,32 @@ enum InternetDeliveryService: Equatable {
     }
 }
 
+/// Which semantic dot color the mesh status pill shows. Mirrors Android's
+/// `MeshStatusDotColor`, value for value, because the two pills now take their
+/// severity from the same core verdict and must not draw it differently.
+enum MeshStatusDotColor: Equatable {
+    case green
+    case blue
+    case amber
+    case neutral
+}
+
+/// Everything the pill renders, decided once.
+struct MeshStatusPillStatus: Equatable {
+    let text: String
+    let dot: MeshStatusDotColor
+    /**
+     The core's verdict on this device's connection
+     (`coreClassifyConnectionHealth`).
+
+     Carried on the record rather than kept private so the pill's state is
+     inspectable in tests: the property that matters is that it is the *same*
+     value the Connection details health card renders, and a value nobody can
+     read is a property nobody can pin.
+     */
+    let health: CoreConnectionHealth
+}
+
 /// Whether the mesh status pill should say that internet delivery has stopped,
 /// and in what words.
 ///
@@ -80,6 +106,103 @@ enum MeshStatusPillLogic {
             return String(localized: "A message was too large to send")
         case .ok, .checking, .noInternet, .noConfig, .failing, .rateLimited:
             return nil
+        }
+    }
+
+    /**
+     The whole pill: its words, its dot, and the verdict behind the dot.
+
+     **The severity is not decided here.** It comes from
+     `coreClassifyConnectionHealth` -- the same call, on the same inputs, that
+     produces the Connection details health card -- so the pill and that page
+     cannot claim different things about the same phone. Before this, the iOS
+     pill had no relay-health layer at all beyond the action-required suffix:
+     its dot was the mesh runtime and nothing else, so a phone with a friend in
+     the room and a pass that had run out was green over a page reading
+     `Working, with limits` about that same phone at that same moment.
+
+     The *words* remain this file's own, and remain far quieter than Android's,
+     for the reason documented above: a pill is a one-line summary and the card
+     is a paragraph. What must agree is the verdict, not the wording.
+
+     - Parameter runtimeText: `MeshRuntimeStatus.pillText`, passed in so this
+       stays a pure function of its arguments.
+     - Parameter nearbyCount: peers with a live direct link.
+     - Parameter checkingSinceMs: when the current unresolved check began, from
+       a `CheckingClock` held across renders. Zero means nothing is pending.
+     */
+    static func build(
+        runtimeState: MeshRuntimeState,
+        runtimeText: String,
+        nearbyCount: Int,
+        bluetooth: BluetoothAvailability,
+        lanListening: Bool,
+        relayHealth: RelayHealth,
+        service: InternetDeliveryService?,
+        checkingSinceMs: Int64,
+        nowMs: Int64
+    ) -> MeshStatusPillStatus {
+        let relay = ConnectionInputs.relay(relayHealth, configured: service != nil)
+        let report = coreClassifyConnectionHealth(
+            input: CoreConnectionHealthInput(
+                runtime: ConnectionInputs.runtime(runtimeState, bluetooth: bluetooth),
+                bluetooth: ConnectionInputs.bluetooth(runtimeState, availability: bluetooth),
+                // The pill counts *peers*, not per-radio links, and the counts
+                // feed only the core's evidence record, which the pill does not
+                // render. Splitting a number the pill does not have would be
+                // inventing evidence to look thorough.
+                bluetoothLinks: 0,
+                localWifi: ConnectionInputs.localWifi(runtimeState, listening: lanListening),
+                localWifiLinks: 0,
+                relay: relay,
+                validatedInternet: ConnectionInputs.validatedInternet(relayHealth),
+                nearbyFriendCount: UInt32(clamping: nearbyCount),
+                checkingSinceMs: checkingSinceMs,
+                nowMs: nowMs
+            )
+        )
+        let suffix = faultSuffix(
+            runtimeState: runtimeState,
+            relayHealth: relayHealth,
+            service: service
+        )
+        let text = suffix.map { String(localized: "\(runtimeText) · \($0)") } ?? runtimeText
+        return MeshStatusPillStatus(
+            text: text,
+            dot: dot(report.state, nearbyCount: nearbyCount, relay: report.evidence.relay),
+            health: report.state
+        )
+    }
+
+    /**
+     The dot, from the core's verdict.
+
+     `ready` still distinguishes green from blue from neutral, because those
+     three are not severities: they say which path is carrying, and a person who
+     is used to green meaning "someone is here" would lose that reading if every
+     healthy state looked alike. Everything that *is* a severity comes from the
+     core, so a degraded phone can no longer show green just because a friend
+     happens to be in the room.
+     */
+    private static func dot(
+        _ state: CoreConnectionHealth,
+        nearbyCount: Int,
+        relay: CoreRelayPathState
+    ) -> MeshStatusDotColor {
+        switch state {
+        // No verdict yet is not a warning. The card shows a spinner here; the
+        // pill has no room for one, and a colored dot would be a claim.
+        case .checking:
+            return .neutral
+        case .limited, .needsAttention:
+            return .amber
+        case .ready:
+            if nearbyCount > 0 { return .green }
+            if relay == CoreRelayPathState.connected { return .blue }
+            // Listening, with nobody here and nothing to report. This is the
+            // ordinary state of a phone on a quiet morning and must not look
+            // like a problem.
+            return .neutral
         }
     }
 }

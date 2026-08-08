@@ -5,6 +5,7 @@ import androidx.annotation.PluralsRes
 import androidx.annotation.StringRes
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -16,9 +17,13 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
@@ -35,8 +40,10 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -60,7 +67,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -82,10 +91,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.cruisemesh_core.CoreConnectionHealth
+import uniffi.cruisemesh_core.CoreDeliveryBlockedReason
+import uniffi.cruisemesh_core.CoreDeliveryLine
 import uniffi.cruisemesh_core.CoreDeliveryState
 import uniffi.cruisemesh_core.CoreDirectPathState
 import uniffi.cruisemesh_core.CoreHealthAction
 import uniffi.cruisemesh_core.CoreHealthReason
+import uniffi.cruisemesh_core.CorePersonRoute
 import uniffi.cruisemesh_core.CoreRelayPathState
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.PeerConnectionTransport
@@ -116,6 +128,7 @@ import java.util.Date
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConnectionDetailsScreen(
+    ownUserId: ByteArray,
     onBack: () -> Unit,
     onStartMesh: () -> Unit = {},
     onManageShorePass: () -> Unit = {},
@@ -131,7 +144,6 @@ fun ConnectionDetailsScreen(
     val bluetoothAudio by MeshRuntimeStatus.bluetoothAudioConnected.collectAsState()
     val transports by MeshConnectivityStatus.nearbyTransports.collectAsState()
     val relayHealth by MeshConnectivityStatus.relay.collectAsState()
-    val staleRelayContacts by MeshConnectivityStatus.staleRelayContacts.collectAsState()
     val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
     val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
     val lanState by LanTransportDiagnostics.state.collectAsState()
@@ -181,7 +193,7 @@ fun ConnectionDetailsScreen(
             // main thread.
             load = {
                 withContext(Dispatchers.IO) {
-                    loadConnectionSnapshot(store, System.currentTimeMillis())
+                    loadConnectionSnapshot(store, ownUserId, System.currentTimeMillis())
                 }
             },
             onLoaded = { snapshot = it },
@@ -213,7 +225,6 @@ fun ConnectionDetailsScreen(
         relayHealth,
         lanListening,
         bluetoothAudio,
-        staleRelayContacts,
         presenceLastSeen,
         contactLastSeen,
         snapshot,
@@ -228,7 +239,6 @@ fun ConnectionDetailsScreen(
             relayConfigured = relayConfigured,
             lanListening = lanListening,
             bluetoothAudioActive = bluetoothAudio,
-            staleRelayContacts = staleRelayContacts,
             presenceLastSeen = presenceLastSeen,
             contactLastSeen = contactLastSeen,
             snapshot = snapshot,
@@ -240,8 +250,39 @@ fun ConnectionDetailsScreen(
 
     var showClear by remember { mutableStateOf(false) }
     var troubleshootingExpanded by remember { mutableStateOf(false) }
-    var howToFixReason by remember { mutableStateOf<CoreHealthReason?>(null) }
+    // A sheet rather than a scroll target. The spec forbids dropping a reader
+    // at the top of a long section to hunt for their answer, and a sheet is
+    // the only arrangement where "the explanation is on screen" is guaranteed
+    // rather than dependent on measured heights and where the list happened to
+    // be scrolled.
+    var howToFix by remember { mutableStateOf<HowToFixTopic?>(null) }
+    // One row open at a time, remembered by id rather than index so a reload
+    // that reorders the groups cannot swap which person is expanded under the
+    // reader.
+    var expandedPersonHex by remember { mutableStateOf<String?>(null) }
+    var expandedPersonEvents by remember {
+        mutableStateOf<List<ConnectionActivityRow>?>(null)
+    }
     val scope = rememberCoroutineScope()
+
+    // The expansion's own bounded query: one person, five events, off the main
+    // thread, and only when a reader actually opens a row. Keyed on the open
+    // row so closing one and opening another cancels the first.
+    LaunchedEffect(expandedPersonHex, snapshot) {
+        val hex = expandedPersonHex
+        if (hex == null) {
+            expandedPersonEvents = null
+            return@LaunchedEffect
+        }
+        val person = snapshot.people.firstOrNull { it.userIdHex == hex }
+        if (person == null) {
+            expandedPersonEvents = emptyList()
+            return@LaunchedEffect
+        }
+        expandedPersonEvents = withContext(Dispatchers.IO) {
+            loadPersonEvents(store, person.userId, person.name)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -274,26 +315,47 @@ fun ConnectionDetailsScreen(
                 nowMs = nowMs,
                 startOfTodayMs = rememberStartOfToday(nowMs),
                 troubleshootingExpanded = troubleshootingExpanded,
-                howToFixReason = howToFixReason,
+                expandedPersonHex = expandedPersonHex,
+                expandedPersonEvents = expandedPersonEvents,
                 onToggleTroubleshooting = { troubleshootingExpanded = !troubleshootingExpanded },
+                onTogglePerson = { hex ->
+                    // Cleared here, not after the query returns: the events
+                    // held right now belong to the row that was open, and
+                    // `PersonCardRow` hands whatever is in this list to
+                    // whichever row is expanded. Leaving them in place prints
+                    // one friend's history, by name, under another friend's
+                    // name for the whole background round trip -- which under
+                    // store-lock contention is not one frame. Reloads
+                    // deliberately do not clear it, so an open row keeps its
+                    // events while the page refreshes underneath it.
+                    expandedPersonEvents = null
+                    expandedPersonHex = if (expandedPersonHex == hex) null else hex
+                },
                 onHealthAction = { action ->
                     when (action) {
                         CoreHealthAction.START_MESH -> onStartMesh()
                         CoreHealthAction.TURN_ON_BLUETOOTH -> onTurnOnBluetooth()
                         CoreHealthAction.MANAGE_SHORE_PASS -> onManageShorePass()
-                        CoreHealthAction.HOW_TO_FIX -> {
-                            // Never drop someone at the top of a long section
-                            // to hunt for the answer: expand it *and* name the
-                            // reason inside it.
-                            howToFixReason = state.health.reason
-                            troubleshootingExpanded = true
-                        }
+                        CoreHealthAction.HOW_TO_FIX ->
+                            state.health.reason?.let { howToFix = HowToFixTopic.Device(it) }
                     }
                 },
+                onHowToFix = { howToFix = it },
                 onClearHistory = { showClear = true },
                 onStoreChanged = signal,
             )
         }
+    }
+
+    howToFix?.let { topic ->
+        HowToFixSheet(
+            topic = topic,
+            onManageShorePass = {
+                howToFix = null
+                onManageShorePass()
+            },
+            onDismiss = { howToFix = null },
+        )
     }
 
     if (showClear) {
@@ -356,16 +418,27 @@ private const val CLOCK_TICK_MS = 10_000L
  *
  * Separate from [ConnectionDetailsScreen] so the screenshot tests can feed it
  * synthetic fixtures without a store, a service, or a clock.
+ *
+ * A [LazyColumn], not a scrolling [Column]: with Other people expanded this
+ * page is the whole address book plus an activity log, and a plain Column
+ * composes and measures every row of it on the first frame whether or not any
+ * of them is on screen. Phase 1 deferred the swap because there was nothing
+ * under a person row yet; there is now.
  */
+@Suppress("LongParameterList")
 @Composable
 fun ConnectionDetailsContent(
     state: ConnectionDetailsState,
     nowMs: Long,
     startOfTodayMs: Long,
     troubleshootingExpanded: Boolean = false,
-    howToFixReason: CoreHealthReason? = null,
+    expandedPersonHex: String? = null,
+    /** Null while the expansion's bounded query is still running. */
+    expandedPersonEvents: List<ConnectionActivityRow>? = null,
     onToggleTroubleshooting: () -> Unit = {},
+    onTogglePerson: (String) -> Unit = {},
     onHealthAction: (CoreHealthAction) -> Unit = {},
+    onHowToFix: (HowToFixTopic) -> Unit = {},
     onClearHistory: () -> Unit = {},
     onStoreChanged: () -> Unit = {},
 ) {
@@ -373,52 +446,73 @@ fun ConnectionDetailsContent(
     var activityExpanded by remember { mutableStateOf(false) }
     var showAllActivity by remember { mutableStateOf(false) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 20.dp, vertical = 16.dp),
+    val otherPeopleCollapsed = state.otherPeople.size > CONNECTION_OTHER_PEOPLE_COLLAPSE_AT &&
+        !otherPeopleExpanded
+    val shownOtherPeople = if (otherPeopleCollapsed) {
+        state.otherPeople.take(CONNECTION_OTHER_PEOPLE_COLLAPSE_AT)
+    } else {
+        state.otherPeople
+    }
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp),
     ) {
-        HealthCard(state.health, state.updatedAtMs, state.refreshing, nowMs, onHealthAction)
-
-        Spacer(modifier = Modifier.height(18.dp))
-        PathsCard(state.paths, nowMs, startOfTodayMs)
-
-        if (state.reachableNow.isNotEmpty()) {
+        item(key = "health") {
+            HealthCard(state.health, state.updatedAtMs, state.refreshing, nowMs, onHealthAction)
+        }
+        item(key = "paths") {
             Spacer(modifier = Modifier.height(18.dp))
-            SectionHeading(
-                pluralStringResource(
-                    R.plurals.ui_section_reachable_now,
-                    state.reachableNow.size,
-                    state.reachableNow.size,
-                ),
-            )
-            PeopleCard(state.reachableNow, nowMs, startOfTodayMs)
+            PathsCard(state.paths, nowMs, startOfTodayMs)
         }
 
-        if (state.otherPeople.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(18.dp))
-            SectionHeading(
-                pluralStringResource(
-                    R.plurals.ui_section_other_people,
-                    state.otherPeople.size,
-                    state.otherPeople.size,
-                ),
-            )
-            val collapsed = state.otherPeople.size > CONNECTION_OTHER_PEOPLE_COLLAPSE_AT &&
-                !otherPeopleExpanded
-            PeopleCard(
-                if (collapsed) {
-                    state.otherPeople.take(CONNECTION_OTHER_PEOPLE_COLLAPSE_AT)
-                } else {
-                    state.otherPeople
-                },
-                nowMs,
-                startOfTodayMs,
-            )
-            if (state.otherPeople.size > CONNECTION_OTHER_PEOPLE_COLLAPSE_AT) {
+        // Needs attention comes first because it is the only group anyone has
+        // to do something about; the spec's order, not a layout preference.
+        peopleSection(
+            key = "attention",
+            heading = { count ->
+                pluralStringResource(R.plurals.ui_section_needs_attention, count, count)
+            },
+            rows = state.needsAttention,
+            nowMs = nowMs,
+            startOfTodayMs = startOfTodayMs,
+            expandedPersonHex = expandedPersonHex,
+            expandedPersonEvents = expandedPersonEvents,
+            onTogglePerson = onTogglePerson,
+            onHowToFix = onHowToFix,
+        )
+        peopleSection(
+            key = "reachable",
+            heading = { count ->
+                pluralStringResource(R.plurals.ui_section_reachable_now, count, count)
+            },
+            rows = state.reachableNow,
+            nowMs = nowMs,
+            startOfTodayMs = startOfTodayMs,
+            expandedPersonHex = expandedPersonHex,
+            expandedPersonEvents = expandedPersonEvents,
+            onTogglePerson = onTogglePerson,
+            onHowToFix = onHowToFix,
+        )
+        peopleSection(
+            key = "other",
+            heading = { pluralStringResource(R.plurals.ui_section_other_people, it, it) },
+            // The heading counts everyone in the group; the list renders only
+            // what is not collapsed away. `Other people (12) [Show 7 people]`
+            // is the pair the spec asks for.
+            headingCount = state.otherPeople.size,
+            rows = shownOtherPeople,
+            nowMs = nowMs,
+            startOfTodayMs = startOfTodayMs,
+            expandedPersonHex = expandedPersonHex,
+            expandedPersonEvents = expandedPersonEvents,
+            onTogglePerson = onTogglePerson,
+            onHowToFix = onHowToFix,
+        )
+        if (state.otherPeople.size > CONNECTION_OTHER_PEOPLE_COLLAPSE_AT) {
+            item(key = "other-toggle") {
                 val hidden = state.otherPeople.size - CONNECTION_OTHER_PEOPLE_COLLAPSE_AT
-                val label = if (collapsed) {
+                val label = if (otherPeopleCollapsed) {
                     pluralStringResource(R.plurals.ui_show_people, hidden, hidden)
                 } else {
                     stringResource(R.string.ui_show_less)
@@ -435,74 +529,116 @@ fun ConnectionDetailsContent(
         // before the background load has returned -- is a false one for
         // everybody who has friends.
         if (state.updatedAtMs > 0L && !state.hasContacts) {
-            Spacer(modifier = Modifier.height(18.dp))
-            Text(
-                stringResource(R.string.ui_no_friends_added_yet),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-
-        Spacer(modifier = Modifier.height(18.dp))
-        CollapsibleSection(
-            title = stringResource(R.string.ui_section_recent_activity),
-            // Collapsed, the newest event time is the only signal that
-            // anything happened at all; without it the row gives a reader no
-            // reason to open it.
-            detail = state.activity.firstOrNull()?.let {
-                eventTimeText(it.atMs, nowMs, startOfTodayMs)
-            },
-            expanded = activityExpanded,
-            onToggle = { activityExpanded = !activityExpanded },
-        ) {
-            if (state.activity.isEmpty()) {
+            item(key = "no-friends") {
+                Spacer(modifier = Modifier.height(18.dp))
                 Text(
-                    stringResource(
-                        R.string.ui_connection_activity_will_appear_here_as_cruisemesh_reaches,
-                    ),
+                    stringResource(R.string.ui_no_friends_added_yet),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-            } else {
-                val shown = if (showAllActivity) {
-                    state.activity
-                } else {
-                    state.activity.take(CONNECTION_ACTIVITY_PREVIEW_COUNT)
-                }
-                shown.forEach { ActivityLine(it, nowMs, startOfTodayMs) }
-                if (state.activity.size > CONNECTION_ACTIVITY_PREVIEW_COUNT) {
-                    val label = if (showAllActivity) {
-                        stringResource(R.string.ui_show_less)
-                    } else {
-                        stringResource(R.string.ui_show_all_activity)
-                    }
-                    TextButton(
-                        onClick = { showAllActivity = !showAllActivity },
-                        modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize(),
-                    ) { Text(label) }
-                }
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
-        CollapsibleSection(
-            title = stringResource(R.string.ui_section_troubleshooting),
-            expanded = troubleshootingExpanded,
-            onToggle = onToggleTroubleshooting,
-        ) {
-            howToFixReason?.let { reason ->
-                howToFixTextId(reason)?.let { id ->
+        item(key = "activity") {
+            Spacer(modifier = Modifier.height(18.dp))
+            CollapsibleSection(
+                title = stringResource(R.string.ui_section_recent_activity),
+                // Collapsed, the newest event time is the only signal that
+                // anything happened at all; without it the row gives a reader
+                // no reason to open it.
+                detail = state.activity.firstOrNull()?.let {
+                    eventTimeText(it.atMs, nowMs, startOfTodayMs)
+                },
+                expanded = activityExpanded,
+                onToggle = { activityExpanded = !activityExpanded },
+            ) {
+                if (state.activity.isEmpty()) {
                     Text(
-                        stringResource(id),
+                        stringResource(
+                            R.string.ui_connection_activity_will_appear_here_as_cruisemesh_reaches,
+                        ),
                         style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.padding(bottom = 12.dp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                } else {
+                    val shown = if (showAllActivity) {
+                        state.activity
+                    } else {
+                        state.activity.take(CONNECTION_ACTIVITY_PREVIEW_COUNT)
+                    }
+                    shown.forEach { ActivityLine(it, nowMs, startOfTodayMs) }
+                    if (state.activity.size > CONNECTION_ACTIVITY_PREVIEW_COUNT) {
+                        val label = if (showAllActivity) {
+                            stringResource(R.string.ui_show_less)
+                        } else {
+                            stringResource(R.string.ui_show_all_activity)
+                        }
+                        TextButton(
+                            onClick = { showAllActivity = !showAllActivity },
+                            modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize(),
+                        ) { Text(label) }
+                    }
                 }
             }
-            TroubleshootingControls(onClearHistory = onClearHistory, onStoreChanged = onStoreChanged)
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        item(key = "troubleshooting") {
+            Spacer(modifier = Modifier.height(12.dp))
+            CollapsibleSection(
+                title = stringResource(R.string.ui_section_troubleshooting),
+                expanded = troubleshootingExpanded,
+                onToggle = onToggleTroubleshooting,
+            ) {
+                TroubleshootingControls(
+                    onClearHistory = onClearHistory,
+                    onStoreChanged = onStoreChanged,
+                )
+            }
+            Spacer(modifier = Modifier.height(24.dp))
+        }
+    }
+}
+
+/**
+ * One People group: a heading, then its rows drawn as a single card.
+ *
+ * The card look is assembled per row rather than by wrapping the group in one
+ * `Card`, because a wrapper is one composable and would put every row of the
+ * group back into a single measured item -- which is the cost the LazyColumn
+ * exists to avoid. Each row paints the same surface and only the first and
+ * last round their corners, so the seam is invisible.
+ */
+@Suppress("LongParameterList")
+private fun LazyListScope.peopleSection(
+    key: String,
+    heading: @Composable (Int) -> String,
+    rows: List<ConnectionPersonRow>,
+    nowMs: Long,
+    startOfTodayMs: Long,
+    expandedPersonHex: String?,
+    expandedPersonEvents: List<ConnectionActivityRow>?,
+    onTogglePerson: (String) -> Unit,
+    onHowToFix: (HowToFixTopic) -> Unit,
+    headingCount: Int = rows.size,
+) {
+    // Empty sections are omitted entirely; the page reserves no blank cards.
+    if (rows.isEmpty()) return
+    item(key = "$key-heading") {
+        Spacer(modifier = Modifier.height(18.dp))
+        SectionHeading(heading(headingCount))
+    }
+    itemsIndexed(rows, key = { _, row -> "$key-${row.userIdHex}" }) { index, row ->
+        PersonCardRow(
+            row = row,
+            isFirst = index == 0,
+            isLast = index == rows.lastIndex,
+            expanded = row.userIdHex == expandedPersonHex,
+            events = if (row.userIdHex == expandedPersonHex) expandedPersonEvents else null,
+            nowMs = nowMs,
+            startOfTodayMs = startOfTodayMs,
+            onToggle = { onTogglePerson(row.userIdHex) },
+            onHowToFix = onHowToFix,
+        )
     }
 }
 
@@ -741,27 +877,66 @@ private fun PathRowNote(note: String?) {
 private fun isLargeTextScale(): Boolean =
     androidx.compose.ui.platform.LocalDensity.current.fontScale >= 1.5f
 
+/**
+ * One person, drawn as a slice of the group's card.
+ *
+ * [isFirst] and [isLast] round only the outer corners so consecutive rows read
+ * as one card while each stays its own lazy item.
+ */
+@Suppress("LongParameterList")
 @Composable
-private fun PeopleCard(
-    rows: List<ConnectionPersonRow>,
+private fun PersonCardRow(
+    row: ConnectionPersonRow,
+    isFirst: Boolean,
+    isLast: Boolean,
+    expanded: Boolean,
+    events: List<ConnectionActivityRow>?,
     nowMs: Long,
     startOfTodayMs: Long,
+    onToggle: () -> Unit,
+    onHowToFix: (HowToFixTopic) -> Unit,
 ) {
-    DetailCard {
-        rows.forEachIndexed { index, row ->
-            if (index > 0) HorizontalDivider()
-            PersonRow(row, nowMs, startOfTodayMs)
+    val radius = 12.dp
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.46f),
+        shape = RoundedCornerShape(
+            topStart = if (isFirst) radius else 0.dp,
+            topEnd = if (isFirst) radius else 0.dp,
+            bottomStart = if (isLast) radius else 0.dp,
+            bottomEnd = if (isLast) radius else 0.dp,
+        ),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            if (!isFirst) HorizontalDivider()
+            PersonRow(
+                row = row,
+                expanded = expanded,
+                nowMs = nowMs,
+                startOfTodayMs = startOfTodayMs,
+                onToggle = onToggle,
+                onHowToFix = onHowToFix,
+            )
+            if (expanded) {
+                PersonDetailBlock(row, events, nowMs, startOfTodayMs)
+            }
         }
     }
 }
 
 @Composable
-private fun PersonRow(row: ConnectionPersonRow, nowMs: Long, startOfTodayMs: Long) {
+private fun PersonRow(
+    row: ConnectionPersonRow,
+    expanded: Boolean,
+    nowMs: Long,
+    startOfTodayMs: Long,
+    onToggle: () -> Unit,
+    onHowToFix: (HowToFixTopic) -> Unit,
+) {
     val status = personStatusText(row.status, nowMs, startOfTodayMs)
     val badge = row.badge?.let { stringResource(pathBadgeLabelId(it)) }
-    val delivery = row.delivery?.let {
-        pluralStringResource(deliveryTextId(it.kind), it.count, it.count)
-    }
+    val delivery = row.delivery?.let { deliveryLineText(it, nowMs) }
+    val reason = row.delivery?.blockedReason?.let { stringResource(deliveryReasonId(it)) }
     // One sentence per fact, in the order they are read on screen. The
     // delivery line has to be in here: the row clears its children's semantics
     // so the whole row is announced once, and anything left out is silent.
@@ -770,17 +945,22 @@ private fun PersonRow(row: ConnectionPersonRow, nowMs: Long, startOfTodayMs: Lon
     } else {
         stringResource(R.string.ui_a11y_via_path, status, badge)
     }
-    val label = if (delivery == null) {
-        stringResource(R.string.ui_a11y_two_sentences, row.name, statusPhrase)
-    } else {
-        stringResource(R.string.ui_a11y_three_sentences, row.name, statusPhrase, delivery)
-    }
+    val expansionLabel = stringResource(
+        if (expanded) R.string.ui_a11y_person_expanded else R.string.ui_a11y_person_collapsed,
+    )
+    val label = spokenSentences(
+        listOfNotNull(row.name, statusPhrase, delivery, reason, expansionLabel),
+    )
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = 48.dp)
+            .clickable(onClick = onToggle)
             .padding(vertical = 10.dp)
-            .clearAndSetSemantics { contentDescription = label },
+            .clearAndSetSemantics {
+                contentDescription = label
+                role = Role.Button
+            },
     ) {
         val stacked = isLargeTextScale()
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -790,6 +970,12 @@ private fun PersonRow(row: ConnectionPersonRow, nowMs: Long, startOfTodayMs: Lon
                 modifier = Modifier.weight(1f),
             )
             if (!stacked) badge?.let { PathBadge(it) }
+            Icon(
+                if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 6.dp).size(20.dp),
+            )
         }
         if (stacked) {
             badge?.let {
@@ -806,12 +992,130 @@ private fun PersonRow(row: ConnectionPersonRow, nowMs: Long, startOfTodayMs: Lon
             Text(
                 it,
                 style = MaterialTheme.typography.bodyMedium,
-                // Neutral, always. Waiting is what this product does; the old
-                // page's red line under every friend is the bug being removed.
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                // Error color only when something has to change before the
+                // message can go; caution when a working path has stalled;
+                // otherwise the ordinary secondary color, because waiting is
+                // what this product does and the old page's red line under
+                // every friend is the bug being removed.
+                color = deliveryColor(row.delivery),
                 modifier = Modifier.padding(top = 2.dp),
             )
         }
+        reason?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+    }
+    // Outside the semantics-clearing column so the button keeps its own label:
+    // it is the one thing in this row a person can act on, and a merged row
+    // would swallow it.
+    row.delivery?.blockedReason?.let { blocked ->
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+            horizontalArrangement = Arrangement.End,
+        ) {
+            TextButton(
+                onClick = { onHowToFix(HowToFixTopic.Person(blocked, row.name)) },
+                modifier = Modifier.minimumInteractiveComponentSize(),
+            ) { Text(stringResource(R.string.ui_how_to_fix)) }
+        }
+    }
+}
+
+/**
+ * The informational expansion: how a message would travel, what is known about
+ * them, and the last few things that happened.
+ *
+ * No transport picker, by design and by specification -- CruiseMesh chooses the
+ * path, and offering a choice here would imply the choice matters.
+ */
+@Composable
+private fun PersonDetailBlock(
+    row: ConnectionPersonRow,
+    events: List<ConnectionActivityRow>?,
+    nowMs: Long,
+    startOfTodayMs: Long,
+) {
+    Column(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+        HorizontalDivider(modifier = Modifier.padding(bottom = 8.dp))
+        DetailFact(
+            label = stringResource(R.string.ui_person_detail_best_route),
+            value = stringResource(bestRouteTextId(row.detail.bestRoute)),
+        )
+        DetailFact(
+            label = stringResource(R.string.ui_person_detail_last_seen),
+            value = eventTimeText(row.detail.lastSeenMs, nowMs, startOfTodayMs)
+                ?: stringResource(R.string.ui_person_detail_never),
+        )
+        DetailFact(
+            label = stringResource(R.string.ui_person_detail_last_delivered),
+            value = eventTimeText(row.detail.lastDeliveredMs, nowMs, startOfTodayMs)
+                ?: stringResource(R.string.ui_person_detail_never),
+        )
+        DetailFact(
+            label = stringResource(R.string.ui_person_detail_waiting),
+            value = row.delivery?.let { deliveryLineText(it, nowMs) }
+                ?: stringResource(R.string.ui_delivery_nothing_waiting),
+        )
+        Text(
+            stringResource(R.string.ui_person_detail_recent_events),
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 10.dp, bottom = 2.dp),
+        )
+        when {
+            // Null is the query still running. Saying "no events recorded"
+            // before it returns would be a claim the page cannot support, and
+            // for anyone with history it would be wrong.
+            events == null -> CircularProgressIndicator(
+                modifier = Modifier.padding(vertical = 6.dp).size(16.dp),
+                strokeWidth = 2.dp,
+            )
+            events.isEmpty() -> Text(
+                stringResource(R.string.ui_person_detail_no_events),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            else -> events.forEach { ActivityLine(it, nowMs, startOfTodayMs) }
+        }
+    }
+}
+
+/**
+ * Several facts as one announced sentence run.
+ *
+ * A person row has a variable number of them -- the delivery line and its
+ * reason come and go -- so the fixed-arity a11y templates cannot cover it, and
+ * joining with a literal `". "` here would hard-code English punctuation into
+ * the one path a screen-reader user depends on.
+ */
+@Composable
+private fun spokenSentences(parts: List<String>): String {
+    val sentences = parts.map { stringResource(R.string.ui_a11y_sentence, it) }
+    return sentences.reduceOrNull { run, next ->
+        stringResource(R.string.ui_a11y_sentence_join, run, next)
+    }.orEmpty()
+}
+
+@Composable
+private fun DetailFact(label: String, value: String) {
+    val spoken = stringResource(R.string.ui_a11y_two_sentences, label, value)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp)
+            .semantics(mergeDescendants = true) { contentDescription = spoken },
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(value, style = MaterialTheme.typography.bodyMedium)
     }
 }
 
@@ -1054,12 +1358,140 @@ private fun healthActionLabelId(action: CoreHealthAction): Int = when (action) {
     CoreHealthAction.HOW_TO_FIX -> R.string.ui_how_to_fix
 }
 
-/** The How-to-fix explanation for the reasons this release can offer one for. */
+/** The How-to-fix explanation for the device-wide faults that can offer one. */
 @StringRes
 private fun howToFixTextId(reason: CoreHealthReason): Int? = when (reason) {
     CoreHealthReason.OWN_SETUP_REJECTED -> R.string.ui_how_to_fix_setup_rejected
     CoreHealthReason.STORAGE_FULL -> R.string.ui_how_to_fix_storage_full
+    CoreHealthReason.PASS_EXPIRED -> R.string.ui_how_to_fix_pass_expired
+    CoreHealthReason.PASS_SUSPENDED -> R.string.ui_how_to_fix_pass_suspended
     else -> null
+}
+
+/**
+ * The How-to-fix explanation for a fault stopping delivery to one friend.
+ *
+ * Every reason has one. A blocked row offers the control unconditionally, so a
+ * reason with nothing behind it would open an empty sheet -- which is worse
+ * than the silence it replaced.
+ */
+@StringRes
+private fun howToFixTextId(reason: CoreDeliveryBlockedReason): Int = when (reason) {
+    CoreDeliveryBlockedReason.CONTACT_SETUP_REJECTED ->
+        R.string.ui_how_to_fix_contact_setup_rejected
+    CoreDeliveryBlockedReason.PASS_EXPIRED -> R.string.ui_how_to_fix_pass_expired
+    CoreDeliveryBlockedReason.PASS_SUSPENDED -> R.string.ui_how_to_fix_pass_suspended
+    CoreDeliveryBlockedReason.STORAGE_FULL -> R.string.ui_how_to_fix_storage_full
+    CoreDeliveryBlockedReason.OWN_SETUP_REJECTED -> R.string.ui_how_to_fix_setup_rejected
+    CoreDeliveryBlockedReason.MESSAGE_TOO_LARGE -> R.string.ui_how_to_fix_message_too_large
+}
+
+/**
+ * Does this fault's instructions name the friend?
+ *
+ * Only two of them do, and passing a name to the others would rely on
+ * `String.format` quietly dropping an argument its format string never asked
+ * for -- which holds today and stops holding the moment a translator writes a
+ * percent sign.
+ */
+private fun namesTheFriend(reason: CoreDeliveryBlockedReason): Boolean = when (reason) {
+    CoreDeliveryBlockedReason.CONTACT_SETUP_REJECTED,
+    CoreDeliveryBlockedReason.MESSAGE_TOO_LARGE,
+    -> true
+    CoreDeliveryBlockedReason.PASS_EXPIRED,
+    CoreDeliveryBlockedReason.PASS_SUSPENDED,
+    CoreDeliveryBlockedReason.STORAGE_FULL,
+    CoreDeliveryBlockedReason.OWN_SETUP_REJECTED,
+    -> false
+}
+
+/** Does this fault have a button on it, and does that button do something? */
+private fun offersManageShorePass(reason: CoreDeliveryBlockedReason): Boolean = when (reason) {
+    CoreDeliveryBlockedReason.PASS_EXPIRED,
+    CoreDeliveryBlockedReason.PASS_SUSPENDED,
+    CoreDeliveryBlockedReason.OWN_SETUP_REJECTED,
+    -> true
+    // Nothing on the Shore Pass screen repairs a friend's card, an oversized
+    // message, or a full mailbox, and a button that leads somewhere useless
+    // costs a reader more than no button at all.
+    CoreDeliveryBlockedReason.CONTACT_SETUP_REJECTED,
+    CoreDeliveryBlockedReason.STORAGE_FULL,
+    CoreDeliveryBlockedReason.MESSAGE_TOO_LARGE,
+    -> false
+}
+
+private fun offersManageShorePass(reason: CoreHealthReason): Boolean = when (reason) {
+    CoreHealthReason.PASS_EXPIRED,
+    CoreHealthReason.PASS_SUSPENDED,
+    CoreHealthReason.OWN_SETUP_REJECTED,
+    -> true
+    else -> false
+}
+
+/**
+ * The How-to-fix content, on a sheet.
+ *
+ * A sheet rather than a scrolled-to paragraph inside Troubleshooting: the spec
+ * forbids dropping a reader at the top of a long section to find their own
+ * answer, and a sheet is the only arrangement that puts the explanation in
+ * front of them without depending on measured heights or scroll position.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun HowToFixSheet(
+    topic: HowToFixTopic,
+    onManageShorePass: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val body: String?
+    val showManage: Boolean
+    when (topic) {
+        is HowToFixTopic.Device -> {
+            body = howToFixTextId(topic.reason)?.let { stringResource(it) }
+            showManage = offersManageShorePass(topic.reason)
+        }
+        is HowToFixTopic.Person -> {
+            val id = howToFixTextId(topic.reason)
+            body = if (namesTheFriend(topic.reason)) {
+                stringResource(id, topic.name)
+            } else {
+                stringResource(id)
+            }
+            showManage = offersManageShorePass(topic.reason)
+        }
+    }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 32.dp),
+        ) {
+            Text(
+                stringResource(R.string.ui_how_to_fix_title),
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(bottom = 12.dp),
+            )
+            Text(
+                // A fault with no written remedy is not a blank sheet. The
+                // core only offers this control for faults that have one, so
+                // reaching here means a new reason arrived without its copy --
+                // say so and point at the one thing that still helps.
+                body ?: stringResource(R.string.ui_how_to_fix_unknown),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            if (showManage) {
+                Button(
+                    onClick = onManageShorePass,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 20.dp)
+                        .minimumInteractiveComponentSize(),
+                ) { Text(stringResource(R.string.ui_manage_shore_pass)) }
+            }
+        }
+    }
 }
 
 /**
@@ -1133,6 +1565,85 @@ private fun deliveryTextId(kind: CoreDeliveryState): Int = when (kind) {
     CoreDeliveryState.WILL_DELIVER_WHEN_RECONNECTED ->
         R.plurals.ui_delivery_will_deliver_when_you_reconnect
     CoreDeliveryState.WAITING_FOR_INTERNET -> R.plurals.ui_delivery_waiting_for_internet
+}
+
+/**
+ * One person's waiting work, as one sentence.
+ *
+ * The precedence is the core record's own: a blocking fault, then a stall on a
+ * working path, then where the work is going. The last of those is always true
+ * underneath the other two -- an expired pass stops the internet route, but the
+ * messages really will go the moment the friend is nearby -- which is why the
+ * fault is a *different* sentence beneath this one rather than a replacement
+ * for it.
+ *
+ * The age is appended when there is an honest one to append. `· 14 min` on a
+ * delayed row is the difference between a reader thinking something is stuck
+ * and knowing how stuck.
+ */
+@Composable
+private fun deliveryLineText(line: CoreDeliveryLine, nowMs: Long): String {
+    val count = line.count.toInt()
+    val headline = when {
+        line.blockedReason != null ->
+            pluralStringResource(R.plurals.ui_delivery_cant_be_sent, count, count)
+        line.delayed -> pluralStringResource(R.plurals.ui_delivery_delayed, count, count)
+        else -> pluralStringResource(deliveryTextId(line.state), count, count)
+    }
+    // Routine states carry no age on purpose: "3 messages will deliver when you
+    // reconnect · 2 days" turns a promise into an accusation.
+    if (line.blockedReason == null && !line.delayed) return headline
+    val age = waitingAgeText(line.oldestWaitingMs, nowMs) ?: return headline
+    return stringResource(R.string.ui_delivery_with_age, headline, age)
+}
+
+/** How long the oldest waiting message has been waiting, or null when unknown. */
+@Composable
+private fun waitingAgeText(oldestWaitingMs: Long, nowMs: Long): String? =
+    when (val age = ConnectionTimes.waitingAge(oldestWaitingMs, nowMs)) {
+        is WaitingAge.Unknown -> null
+        is WaitingAge.Minutes ->
+            pluralStringResource(R.plurals.ui_waiting_age_minutes, age.value, age.value)
+        is WaitingAge.Hours ->
+            pluralStringResource(R.plurals.ui_waiting_age_hours, age.value, age.value)
+        is WaitingAge.Days ->
+            pluralStringResource(R.plurals.ui_waiting_age_days, age.value, age.value)
+    }
+
+/**
+ * The color of a delivery line.
+ *
+ * Error only when a person has to change something, caution when a working
+ * path has stalled, and the ordinary secondary color for everything else --
+ * which is most of the time, because waiting is what this product does. Every
+ * one of these is paired with words that say the same thing, so nothing here
+ * is communicated by color alone.
+ */
+@Composable
+private fun deliveryColor(line: CoreDeliveryLine?): Color = when {
+    line?.blockedReason != null -> MaterialTheme.colorScheme.error
+    line?.delayed == true -> LocalReachabilityPalette.current.recent
+    else -> MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+@StringRes
+private fun deliveryReasonId(reason: CoreDeliveryBlockedReason): Int = when (reason) {
+    CoreDeliveryBlockedReason.CONTACT_SETUP_REJECTED ->
+        R.string.ui_delivery_reason_contact_setup_rejected
+    CoreDeliveryBlockedReason.PASS_EXPIRED -> R.string.ui_delivery_reason_pass_expired
+    CoreDeliveryBlockedReason.PASS_SUSPENDED -> R.string.ui_delivery_reason_pass_suspended
+    CoreDeliveryBlockedReason.STORAGE_FULL -> R.string.ui_delivery_reason_storage_full
+    CoreDeliveryBlockedReason.OWN_SETUP_REJECTED -> R.string.ui_delivery_reason_own_setup_rejected
+    CoreDeliveryBlockedReason.MESSAGE_TOO_LARGE -> R.string.ui_delivery_reason_message_too_large
+}
+
+/** The core's routing answer, restated. Never re-derived here; see the spec. */
+@StringRes
+private fun bestRouteTextId(route: CorePersonRoute): Int = when (route) {
+    CorePersonRoute.DIRECT_BLUETOOTH -> R.string.ui_person_detail_route_bluetooth
+    CorePersonRoute.DIRECT_LOCAL_WIFI -> R.string.ui_person_detail_route_local_wifi
+    CorePersonRoute.SHORE_PASS -> R.string.ui_person_detail_route_shore_pass
+    CorePersonRoute.NONE_NOW -> R.string.ui_person_detail_route_none
 }
 
 @Composable
@@ -1286,13 +1797,24 @@ internal fun transportLabelId(transport: PeerConnectionTransport): Int? = when (
  * a block can outlive the contact row and can sort past the people cap, and
  * either way an activity row for a blocked identity is the tombstone leaking.
  */
-internal fun loadConnectionSnapshot(store: MessageStore, nowMs: Long): ConnectionStoreSnapshot {
+internal fun loadConnectionSnapshot(
+    store: MessageStore,
+    ownUserId: ByteArray,
+    nowMs: Long,
+): ConnectionStoreSnapshot {
     val contacts = runCatching { store.listContacts() }
         .getOrDefault(emptyList())
         .take(CONNECTION_PEOPLE_LIMIT)
-    val depths = runCatching { store.pendingRelayOutboundDepthByRecipient(nowMs) }
+    // The per-recipient read model, not the relay-upload backlog. The backlog
+    // is a diagnostic that never drains on a phone with no pass; this is
+    // receipt-aware, which is why a row saying a friend received a message can
+    // no longer have a waiting line under it. Blocked identities are dropped
+    // inside the query, so the map simply has no entry for them.
+    val delivery = runCatching {
+        store.recipientDeliveryStatus(ownUserId, contacts.map { it.userId }, nowMs)
+    }
         .getOrDefault(emptyList())
-        .associate { UserIdHex.encode(it.recipientUserId) to it.queued.toInt() }
+        .associateBy { UserIdHex.encode(it.recipientUserId) }
     val summaries = runCatching { store.peerConnectionSummaries() }
         .getOrDefault(emptyList())
         .groupBy { UserIdHex.encode(it.userId) }
@@ -1303,14 +1825,34 @@ internal fun loadConnectionSnapshot(store: MessageStore, nowMs: Long): Connectio
 
     val people = contacts.map { contact ->
         val hex = UserIdHex.encode(contact.userId)
+        val rows = summaries[hex].orEmpty()
+        val status = delivery[hex]
         ConnectionPerson(
             userIdHex = hex,
             userId = contact.userId,
             name = coreContactDisplayName(contact),
             blocked = hex in blocked,
             hasRelayEndpoint = !contact.relayUrl.isNullOrBlank(),
-            queued = depths[hex] ?: 0,
-            latest = latestPeerStatus(summaries[hex].orEmpty()),
+            delivery = status?.let {
+                PersonDeliveryFacts(
+                    // Clamped rather than wrapped: the core counts up from
+                    // zero, and a shell that let an unsigned value fold into a
+                    // negative would put an absurd number under someone's name.
+                    waitingCount = it.waitingCount.toLong()
+                        .coerceIn(0L, Int.MAX_VALUE.toLong()).toInt(),
+                    unpostedWaitingCount = it.unpostedWaitingCount.toLong()
+                        .coerceIn(0L, Int.MAX_VALUE.toLong()).toInt(),
+                    oldestWaitingMs = it.oldestWaitingMs,
+                    lastProgressMs = it.lastProgressMs,
+                    oversizedWaiting = it.oversizedWaiting,
+                    relayRejectStreak = it.relayRejectStreak,
+                    relayRejectedAtMs = it.relayRejectedAtMs,
+                    relayUnreachableStreak = it.relayUnreachableStreak,
+                    relayUnreachableAtMs = it.relayUnreachableAtMs,
+                )
+            } ?: PersonDeliveryFacts.NONE,
+            latest = latestPeerStatus(rows),
+            lastDeliveredMs = rows.mapNotNull { it.lastDeliveredAtMs }.maxOrNull() ?: 0L,
         )
     }
 
@@ -1332,6 +1874,34 @@ internal fun loadConnectionSnapshot(store: MessageStore, nowMs: Long): Connectio
 
     return ConnectionStoreSnapshot(people = people, activity = activity, loadedAtMs = nowMs)
 }
+
+/**
+ * The recent events inside one person's expansion.
+ *
+ * Deliberately not part of [loadConnectionSnapshot]. Five events per friend
+ * folded into the page reload would be one query per contact every four
+ * seconds — bounded per query and unbounded in aggregate, which is the shape
+ * of cost this page is under orders to avoid. A reader opening one row is one
+ * query, once, for the row they opened.
+ *
+ * Runs on a background dispatcher only, like every other store call here.
+ */
+internal fun loadPersonEvents(
+    store: MessageStore,
+    userId: ByteArray,
+    name: String,
+): List<ConnectionActivityRow> = runCatching {
+    store.peerConnectionEvents(userId, CONNECTION_PERSON_EVENT_LIMIT.toUInt())
+}
+    .getOrDefault(emptyList())
+    .map { event ->
+        ConnectionActivityRow(
+            name = name,
+            evidence = peerEvidenceOf(event.kind),
+            transport = event.transport,
+            atMs = event.occurredAtMs,
+        )
+    }
 
 // ---------------------------------------------------------------------------
 // Clocks and visibility

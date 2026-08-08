@@ -37,6 +37,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.cruisemesh.app.chat.ChatSummaryLoader
@@ -107,6 +109,9 @@ import com.cruisemesh.app.notify.MessageNotifier
 import com.cruisemesh.app.notify.ChatMuteStore
 import com.cruisemesh.app.relay.RelayImport
 import com.cruisemesh.app.relay.RelayConfigStore
+import com.cruisemesh.app.ui.CheckingClock
+import com.cruisemesh.app.ui.ConnectionInputs
+import com.cruisemesh.app.ui.connectionCheckPending
 import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ChatListScreen
 import com.cruisemesh.app.ui.ChatSummary
@@ -292,6 +297,7 @@ fun CruiseMeshApp(
         composable("settings") { SettingsRoute(identity, navController) }
         composable("connectionDetails") {
             ConnectionDetailsScreen(
+                ownUserId = identity.userId,
                 onBack = { navController.popOrExit(context) },
                 onStartMesh = { startMesh(context) },
                 onManageShorePass = { navController.navigate("shorePass") },
@@ -532,13 +538,30 @@ private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplet
 }
 
 /**
+ * How often the status pill re-evaluates its clock-dependent state.
+ *
+ * Ten seconds, matching `CLOCK_TICK_MS` on the Connection details page, and
+ * deliberately faster than [CONNECTIVITY_TICK_MS]. The pill and that page now
+ * consume the same core verdict, and the spec's acceptance criterion is that
+ * the two can never contradict each other -- but a shared classification only
+ * buys that if both shells ask it at comparable times. The bounded `Checking`
+ * window is ten seconds: on the slower tick the page would resolve to a fault
+ * while the pill still showed a neutral "still checking" dot beside it for up
+ * to twenty seconds more.
+ */
+private const val PILL_TICK_MS = 10_000L
+
+/** The tick everything else on the home screen ages on. */
+private const val CONNECTIVITY_TICK_MS = 30_000L
+
+/**
  * Reachability levels decay purely with time
  * (a contact drifts ONLINE_RELAY -> RECENT -> OFFLINE with no event firing),
  * so the UI needs a clock tick to re-evaluate on, not just flow updates. Ticks
- * every 30 s, and only while the activity is RESUMED -- no background work.
+ * every [tickMs], and only while the activity is RESUMED -- no background work.
  */
 @Composable
-private fun rememberConnectivityNowMs(): Long {
+private fun rememberConnectivityNowMs(tickMs: Long = CONNECTIVITY_TICK_MS): Long {
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     var isResumed by remember { mutableStateOf(false) }
     DisposableEffect(lifecycleOwner) {
@@ -553,11 +576,11 @@ private fun rememberConnectivityNowMs(): Long {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(isResumed) {
+    LaunchedEffect(isResumed, tickMs) {
         if (isResumed) {
             nowMs = System.currentTimeMillis()
             while (true) {
-                kotlinx.coroutines.delay(30_000L)
+                kotlinx.coroutines.delay(tickMs)
                 nowMs = System.currentTimeMillis()
             }
         }
@@ -748,6 +771,10 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
     val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
     val connectivityNowMs = rememberConnectivityNowMs()
+    // The pill's own clock. Its verdict is the core's, shared with the
+    // Connection details page, and a page open beside the pill must never see
+    // the two disagree; see [PILL_TICK_MS].
+    val pillNowMs = rememberConnectivityNowMs(PILL_TICK_MS)
     var transientMeshStatus by remember { mutableStateOf<String?>(null) }
     var ownDisplayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     var ownAvatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
@@ -916,15 +943,52 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             )
         }
     }
-    val displayRelayHealth = remember(relayHealth, pushHealthy, connectivityNowMs) {
-        freshRelayHealthForDisplay(relayHealth, connectivityNowMs, pushHealthy)
+    // On the pill's clock, not the chat list's: this feeds the pill's core
+    // verdict, and a staleness window evaluated 20 s later than the page's
+    // would reintroduce the disagreement the shared classification removed.
+    val displayRelayHealth = remember(relayHealth, pushHealthy, pillNowMs) {
+        freshRelayHealthForDisplay(relayHealth, pillNowMs, pushHealthy)
     }
-    val pillStatus = remember(runtimeStatus, nearbyPeerIds, displayRelayHealth, internetDeliveryService) {
+    // The pill's severity is now the core's, which needs the local Wi-Fi path
+    // as well. Only whether the transport holds a listening socket is taken,
+    // mapped before it is collected: the full LAN snapshot changes on every
+    // peer and every sweep, and collecting it here would recompose the whole
+    // home screen at LAN-event rates for a boolean that flips when the mesh
+    // starts and stops. The endpoint itself never leaves this line.
+    val lanListening by remember {
+        LanTransportDiagnostics.state
+            .map { it.localEndpoint != null }
+            .distinctUntilChanged()
+    }.collectAsState(initial = false)
+    // Held across recompositions so the core's bounded-Checking window is
+    // measured from when the wait actually began; a mark restamped on every
+    // recomposition can never expire.
+    val pillCheckingClock = remember { CheckingClock() }
+    val pillStatus = remember(
+        runtimeStatus,
+        nearbyPeerIds,
+        displayRelayHealth,
+        internetDeliveryService,
+        lanListening,
+        pillNowMs,
+    ) {
+        val relayPath = ConnectionInputs.relay(displayRelayHealth, internetDeliveryService != null)
         MeshStatusTextLogic.build(
-            runtimeStatus,
-            nearbyPeerIds.size,
-            displayRelayHealth,
-            internetDeliveryService,
+            runtimeState = runtimeStatus,
+            nearbyCount = nearbyPeerIds.size,
+            relayHealth = displayRelayHealth,
+            internetDeliveryService = internetDeliveryService,
+            lanListening = lanListening,
+            checkingSinceMs = pillCheckingClock.mark(
+                connectionCheckPending(
+                    ConnectionInputs.runtime(runtimeStatus),
+                    ConnectionInputs.bluetooth(runtimeStatus),
+                    ConnectionInputs.localWifi(runtimeStatus, lanListening),
+                    relayPath,
+                ),
+                pillNowMs,
+            ),
+            nowMs = pillNowMs,
         )
     }
     val pillDotColor = pillStatus.dot.toComposeColor()
