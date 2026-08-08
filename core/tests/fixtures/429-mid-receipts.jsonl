@@ -1,0 +1,9 @@
+{"schema":"cruisemesh.protocol-event/v1","record":"header","fixture":"429-mid-receipts","title":"A family rate limit arriving part-way through receipt upload must end the pass's remaining network work","origin":"synthetic","public_reference":"#260","pseudonyms":["mailbox-a"],"expect_invariants":["RATE-01","LIVE-01"]}
+{"record":"event","seq":1,"at_ms":1700000000000,"code":"pass_start","pass":"p1","actor":"mailbox-a","counts":{"receipts_pending":9,"authored_pending":4,"carried_pending":120},"outcome":"nudged"}
+{"record":"event","seq":2,"at_ms":1700000000150,"code":"action_emitted","pass":"p1","action":1,"actor":"mailbox-a","counts":{"envelope_bytes":312},"outcome":"receipt_upload_issued"}
+{"record":"event","seq":3,"at_ms":1700000000480,"code":"action_result_accepted","pass":"p1","action":1,"actor":"mailbox-a","counts":{"status":200},"outcome":"upload_accepted"}
+{"record":"event","seq":4,"at_ms":1700000000640,"code":"action_emitted","pass":"p1","action":2,"actor":"mailbox-a","counts":{"envelope_bytes":312},"outcome":"receipt_upload_issued"}
+{"record":"event","seq":5,"at_ms":1700000000910,"code":"request_rejected","pass":"p1","action":2,"actor":"mailbox-a","invariants":["RATE-01"],"counts":{"status":429,"retry_after_ms":15000},"outcome":"rate_limited"}
+{"record":"event","seq":6,"at_ms":1700000000920,"code":"rate_limit_abort","pass":"p1","actor":"mailbox-a","invariants":["RATE-01","LIVE-01"],"counts":{"receipts_remaining":7,"authored_remaining":4,"carried_remaining":120,"further_requests":0},"outcome":"remaining_network_stages_skipped"}
+{"record":"event","seq":7,"at_ms":1700000000930,"code":"pass_finish","pass":"p1","actor":"mailbox-a","invariants":["LIVE-01"],"counts":{"requests":2,"quiet_until_ms":15000},"outcome":"aborted_rate_limited"}
+{"record":"event","seq":8,"at_ms":1700000005000,"code":"pass_start","pass":"p2","actor":"mailbox-a","invariants":["RATE-01"],"counts":{"requests":0},"outcome":"refused_inside_quiet_window"}

@@ -1,0 +1,13 @@
+{"schema":"cruisemesh.protocol-event/v1","record":"header","fixture":"ack-fail-after-consume","title":"A page consumed durably, an ack that failed, and a restart that must replay without moving the frontier","origin":"synthetic","pseudonyms":["mailbox-a"],"expect_invariants":["TXN-01","CURSOR-01","IDEMP-01"]}
+{"record":"event","seq":1,"at_ms":1700000000000,"code":"pass_start","pass":"p1","actor":"mailbox-a","counts":{"configs":1},"outcome":"nudged"}
+{"record":"event","seq":2,"at_ms":1700000000100,"code":"action_emitted","pass":"p1","action":1,"actor":"mailbox-a","counts":{"requested_rows":256,"from_cursor":400},"outcome":"fetch_issued"}
+{"record":"event","seq":3,"at_ms":1700000000800,"code":"page_ingested","pass":"p1","action":1,"actor":"mailbox-a","invariants":["TXN-01"],"counts":{"rows_returned":40,"rows_consumed":40,"transactions":1},"outcome":"consume_committed_before_ack"}
+{"record":"event","seq":4,"at_ms":1700000000820,"code":"action_emitted","pass":"p1","action":2,"actor":"mailbox-a","counts":{"ack_ids":40},"outcome":"ack_issued"}
+{"record":"event","seq":5,"at_ms":1700000001500,"code":"action_result_accepted","pass":"p1","action":2,"actor":"mailbox-a","counts":{"status":503},"outcome":"ack_failed"}
+{"record":"event","seq":6,"at_ms":1700000001510,"code":"frontier_held","pass":"p1","action":2,"actor":"mailbox-a","invariants":["CURSOR-01","TXN-01"],"counts":{"frontier_before":400,"frontier_after":400},"outcome":"required_ack_did_not_succeed"}
+{"record":"event","seq":7,"at_ms":1700000001520,"code":"pass_finish","pass":"p1","actor":"mailbox-a","counts":{"requests":2},"outcome":"finished_without_advance"}
+{"record":"event","seq":8,"at_ms":1700000009000,"code":"pass_start","pass":"p2","actor":"mailbox-a","counts":{"configs":1},"outcome":"process_restart"}
+{"record":"event","seq":9,"at_ms":1700000009200,"code":"action_emitted","pass":"p2","action":1,"actor":"mailbox-a","counts":{"requested_rows":256,"from_cursor":400},"outcome":"fetch_issued"}
+{"record":"event","seq":10,"at_ms":1700000009900,"code":"page_ingested","pass":"p2","action":1,"actor":"mailbox-a","invariants":["IDEMP-01"],"counts":{"rows_returned":40,"rows_consumed":0,"rows_seen":40},"outcome":"replay_applied_nothing"}
+{"record":"event","seq":11,"at_ms":1700000009920,"code":"action_result_stale_ignored","pass":"p2","action":1,"actor":"mailbox-a","invariants":["IDEMP-01"],"counts":{"mutations":0},"outcome":"late_result_from_finished_pass"}
+{"record":"event","seq":12,"at_ms":1700000010400,"code":"frontier_advanced","pass":"p2","action":2,"actor":"mailbox-a","invariants":["CURSOR-01"],"counts":{"frontier_before":400,"frontier_after":440,"rows_acked":40},"outcome":"ack_succeeded_on_retry"}

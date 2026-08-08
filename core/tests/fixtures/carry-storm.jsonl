@@ -1,0 +1,11 @@
+{"schema":"cruisemesh.protocol-event/v1","record":"header","fixture":"carry-storm","title":"Carried rows re-uploaded on every launch because no durable upload marker was written","origin":"synthetic","public_reference":"#222","pseudonyms":["mailbox-a"],"expect_invariants":["MARK-01","CARRY-01","LIVE-01"]}
+{"record":"event","seq":1,"at_ms":1700000000000,"code":"pass_start","pass":"p1","actor":"mailbox-a","counts":{"carried_pending":290},"outcome":"nudged"}
+{"record":"event","seq":2,"at_ms":1700000000200,"code":"action_emitted","pass":"p1","action":1,"actor":"mailbox-a","counts":{"envelope_bytes":1184},"outcome":"carried_upload_issued"}
+{"record":"event","seq":3,"at_ms":1700000000640,"code":"action_result_accepted","pass":"p1","action":1,"actor":"mailbox-a","counts":{"status":200},"outcome":"upload_accepted"}
+{"record":"event","seq":4,"at_ms":1700000000650,"code":"carried_row_marked","pass":"p1","action":1,"actor":"mailbox-a","invariants":["MARK-01"],"counts":{"marked":0,"expected_marked":1},"outcome":"marker_not_written"}
+{"record":"event","seq":5,"at_ms":1700000000660,"code":"pass_finish","pass":"p1","actor":"mailbox-a","counts":{"requests":1,"uploads":1},"outcome":"finished"}
+{"record":"event","seq":6,"at_ms":1700000060000,"code":"pass_start","pass":"p2","actor":"mailbox-a","counts":{"carried_pending":290},"outcome":"process_restart"}
+{"record":"event","seq":7,"at_ms":1700000060200,"code":"action_emitted","pass":"p2","action":1,"actor":"mailbox-a","invariants":["MARK-01"],"counts":{"envelope_bytes":1184,"prior_uploads":1},"outcome":"same_row_reoffered"}
+{"record":"event","seq":8,"at_ms":1700000060900,"code":"request_rejected","pass":"p2","action":1,"actor":"mailbox-a","counts":{"status":429},"outcome":"rate_limited"}
+{"record":"event","seq":9,"at_ms":1700000060910,"code":"invariant_violation","pass":"p2","actor":"mailbox-a","invariants":["MARK-01","LIVE-01"],"counts":{"posts_last_minute":290},"outcome":"unbounded_reupload"}
+{"record":"event","seq":10,"at_ms":1700000060920,"code":"carried_row_marked","pass":"p2","actor":"mailbox-a","invariants":["CARRY-01"],"counts":{"rows_removed":0},"outcome":"upload_never_removes_carry"}

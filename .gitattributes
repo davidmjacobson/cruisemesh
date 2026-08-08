@@ -9,6 +9,12 @@
 # box, and systemd reads a CRLF "ExecStart=...\r" as a path that ends in a
 # carriage return.
 relayd/deploy/* text eol=lf
+# Protocol replay fixtures are a wire format, not source: one JSON object per
+# LF-terminated line, byte-identical on every host, and the same file a person
+# exports from Advanced diagnostics feeds the replay command. A CRLF rewrite on
+# a Windows checkout would change the bytes a fixture is supposed to pin, so the
+# corpus is pinned to LF and its validator asserts the same thing.
+*.jsonl text eol=lf
 # Screenshot references and every other image are bytes, not text. Git's
 # autodetection already treats them as binary, but this checkout runs with
 # core.autocrlf=true, and an explicit rule is cheaper than discovering a

@@ -1,0 +1,8 @@
+{"schema":"cruisemesh.protocol-event/v1","record":"header","fixture":"watermark-lock","title":"Receipt repair gated itself forever because the peer watermark had never left zero","origin":"synthetic","public_reference":"#241","pseudonyms":["peer-a"],"expect_invariants":["WM-01","PROGRESS-01"]}
+{"record":"event","seq":1,"at_ms":1700000000000,"code":"pass_start","session":"s1","actor":"peer-a","counts":{"backlog":64},"outcome":"link_established"}
+{"record":"event","seq":2,"at_ms":1700000000300,"code":"receipt_watermark_observed","session":"s1","actor":"peer-a","invariants":["WM-01"],"counts":{"peer_watermark":0,"local_highest_lamport":64},"outcome":"watermark_zero"}
+{"record":"event","seq":3,"at_ms":1700000000310,"code":"spray_planned","session":"s1","actor":"peer-a","invariants":["WM-01"],"counts":{"planned":0,"eligible":64},"outcome":"gated_on_contiguous_watermark"}
+{"record":"event","seq":4,"at_ms":1700000000320,"code":"continuation_scheduled","session":"s1","actor":"peer-a","invariants":["PROGRESS-01"],"counts":{"delay_ms":30000,"watermark_before":0,"watermark_after":0},"outcome":"no_repair_path_taken"}
+{"record":"event","seq":5,"at_ms":1700000030320,"code":"receipt_watermark_observed","session":"s1","actor":"peer-a","invariants":["WM-01"],"counts":{"peer_watermark":0,"local_highest_lamport":64},"outcome":"watermark_zero"}
+{"record":"event","seq":6,"at_ms":1700000030330,"code":"invariant_violation","session":"s1","actor":"peer-a","invariants":["WM-01","PROGRESS-01"],"counts":{"repair_attempts":0,"backlog":64},"outcome":"repair_unreachable_from_state"}
+{"record":"event","seq":7,"at_ms":1700000030340,"code":"pass_finish","session":"s1","actor":"peer-a","counts":{"delivered":0},"outcome":"self_locked"}

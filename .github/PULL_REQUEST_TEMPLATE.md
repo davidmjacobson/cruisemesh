@@ -8,6 +8,10 @@
 - [ ] `cargo test --workspace` passes
 - [ ] If `core/` changed: bindings regenerated (`core/build-android.sh` / `core/build-ios.sh`)
 - [ ] If protocol/architecture changed: DESIGN.md updated in this PR
+- [ ] If this changes protocol behaviour, say which it is — **core only** /
+      **native adapter** / **shell-forever, with the reason** / **temporary
+      twin, with a link to its deletion issue** — and name the Contract v1
+      invariant ids it touches (`specs/protocol-contract-v1.md`)
 - [ ] No new cryptographic constructions (CONTRIBUTING.md)
 - [ ] User-facing copy stays honest about delivery expectations
 
