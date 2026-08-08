@@ -641,7 +641,8 @@ struct ConnectionDetailsView: View {
         note: String?
     ) -> some View {
         let label = ConnectionCopy.twoSentences(name, state)
-        Group {
+        // Qualified: `Group` unqualified is the core's chat-group record.
+        SwiftUI.Group {
             // Side by side there is not enough width for both halves at
             // accessibility text sizes, and a name column narrower than its
             // longest word wraps one letter per line. Stacking is the honest
@@ -961,10 +962,11 @@ struct ConnectionDetailsView: View {
     /// Delivery metrics are captured unconditionally, and MetricKit collection
     /// is not gated by the logging switch either.
     ///
-    /// Static because two of these reach the store, so it has to be callable
-    /// from a detached task without dragging a view's worth of observed
-    /// objects across with it.
-    private static func hasAnythingCaptured() -> Bool {
+    /// Static and nonisolated because two of these reach the store, so it has
+    /// to run off the main actor -- a `View` carries main-actor isolation onto
+    /// its static members, and inheriting it here would put the store reads
+    /// straight back where they were.
+    nonisolated private static func hasAnythingCaptured() -> Bool {
         if DiagnosticLogExport.hasArchive() { return true }
         if !DiagnosticLogExport.metricKitFileURLs().isEmpty { return true }
         if FieldMetricsExport.hasCapturedMetrics() { return true }
