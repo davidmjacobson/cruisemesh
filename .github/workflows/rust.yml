@@ -72,23 +72,40 @@ jobs:
       # phone.
       - name: kotlin-gen drift check
         run: git diff --exit-code android/app/src/main/kotlin-gen
+      # THE authoritative gate on the committed Swift bindings. It lives here,
+      # not in ios.yml, because this job runs on every PR with no path filter
+      # and needs no Xcode, no cross-compiles and no xcframework, so it fails
+      # in minutes instead of tens of them. ios.yml carries a comment pointing
+      # back here and no drift check of its own; do not add a second one.
+      #
       # The Swift bindings, unlike kotlin-gen, ARE committed -- and nothing
       # compiled catches them going stale: UniFFI checks its per-function
       # checksums at *runtime*, so a mismatch is a fatalError the moment the
-      # app launches, while the iOS workflow only builds. Since UniFFI 0.28.3
-      # a function's doc comment feeds its checksum, so even a comment-only
-      # edit in core/ can silently invalidate a checked-in binding. Regenerate
-      # and diff, exactly like the tripwire above.
+      # app launches, while the iOS workflow only builds, and it regenerates
+      # the bindings before it does. Since UniFFI 0.28.3 a function's doc
+      # comment feeds its checksum, so even a comment-only edit in core/ can
+      # silently invalidate a checked-in binding. Regenerate and diff, exactly
+      # like the tripwire above. Blocking, with no continue-on-error: a
+      # non-blocking drift check is an unread log line.
+      #
+      # --no-format is load-bearing for a gate that compares Linux output
+      # against bytes a contributor may have generated on a Mac: uniffi-bindgen
+      # silently pipes its Swift through swiftformat whenever that binary is on
+      # PATH (`brew install swiftformat` puts it there; this runner has none).
+      # swiftformat rewraps and reorders, so the difference is NOT whitespace
+      # and --ignore-all-space below would not absorb it -- the gate would fail
+      # a regeneration that is in fact perfectly current. core/build-ios.sh
+      # passes the same flag so every generation path emits the same bytes.
       - name: Generate Swift UniFFI bindings
         run: |
           cargo run -p cruisemesh-core --bin uniffi-bindgen --features cruisemesh-core/cli -- \
-            generate --library target/debug/libcruisemesh_core.so --language swift \
+            generate --no-format --library target/debug/libcruisemesh_core.so --language swift \
             --out-dir ios/CruiseMesh/Generated
       # --ignore-all-space on purpose: the committed copies are the generator's
       # output with trailing whitespace stripped (what every editor in the
       # project does on save). Signature and checksum drift -- the thing that
       # actually crashes the app -- is not whitespace, so it still fails here.
-      - name: Swift bindings drift check
+      - name: Swift bindings drift check (authoritative)
         run: git diff --exit-code --ignore-all-space ios/CruiseMesh/Generated
       - name: gradlew :app:testDebugUnitTest
         working-directory: android

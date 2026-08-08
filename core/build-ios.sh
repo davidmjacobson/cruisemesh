@@ -21,8 +21,15 @@ host_lib="target/debug/libcruisemesh_core.dylib"
 
 echo "==> Generating Swift bindings from $host_lib"
 mkdir -p "$gen_dir"
+# --no-format: uniffi-bindgen pipes its Swift through swiftformat whenever that
+# binary is on PATH -- which it is on a Mac carrying the Homebrew formula, and
+# is not on the Linux runner whose regeneration gates these committed files
+# (rust.yml). swiftformat rewraps and reorders, so the resulting difference is
+# not whitespace and that gate's --ignore-all-space would not absorb it: a Mac
+# regeneration would be reported as stale bindings. rust.yml passes the same
+# flag, so every generation path emits the same bytes.
 cargo run -p cruisemesh-core --bin uniffi-bindgen --features cruisemesh-core/cli -- \
-    generate --library "$host_lib" --language swift --out-dir "$gen_dir"
+    generate --no-format --library "$host_lib" --language swift --out-dir "$gen_dir"
 
 echo "==> Cross-compiling for iOS device + simulators"
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios >/dev/null 2>&1 || true
