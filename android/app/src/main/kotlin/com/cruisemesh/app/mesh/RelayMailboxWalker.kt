@@ -1,6 +1,7 @@
 package com.cruisemesh.app.mesh
 
 import android.util.Log
+import androidx.annotation.VisibleForTesting
 import com.cruisemesh.app.relay.RelayCappedFetch
 import com.cruisemesh.app.relay.RelayConfig
 import com.cruisemesh.app.relay.RelayFetchedEnvelope
@@ -442,6 +443,21 @@ internal class RelayMailboxWalker(
         }
         return RelayMailboxWalkResult(answered = answered, continuationNeeded = false)
     }
+
+    /**
+     * Whether this process has already walked this mailbox to its end -- the
+     * `swept_this_session` [relaySweepDue] reads at the top of every pass.
+     *
+     * Exposed because the schedule question the walk asks cannot be
+     * reconstructed from the store: [sweptThisSession] is exactly the part of
+     * that question the store does not hold, and what it guards against is a
+     * store that will not take the completion write, where the persisted row
+     * therefore never stops saying "never swept". Mirrors
+     * `RelaySweepSession.hasSwept` on iOS, which is separately addressable for
+     * the same reason.
+     */
+    @VisibleForTesting
+    fun hasSweptThisSession(cursorKey: String): Boolean = sweptThisSession.contains(cursorKey)
 
     /**
      * Records that a walk reached the end of this mailbox: restarts the sweep

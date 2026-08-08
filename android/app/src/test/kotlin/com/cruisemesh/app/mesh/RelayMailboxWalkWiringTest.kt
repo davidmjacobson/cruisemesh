@@ -15,6 +15,8 @@ import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.generateIdentity
 import uniffi.cruisemesh_core.relayCursorKey
+import uniffi.cruisemesh_core.relayFetchBatchLimit
+import uniffi.cruisemesh_core.relayFetchShrunkLimit
 import uniffi.cruisemesh_core.relayMailboxContinuationDelayMs
 import uniffi.cruisemesh_core.relaySweepDue
 import uniffi.cruisemesh_core.relaySweepIntervalMs
@@ -144,6 +146,37 @@ class RelayMailboxWalkWiringTest {
         assertTrue(harness.sweepDue(now + relayMailboxContinuationDelayMs()))
     }
 
+    @Test
+    fun `only a sweep that reached the end of the mailbox is recorded for this process`() {
+        // The walker's own set is the schedule's answer to a store that will
+        // not take the completion write: the persisted row then never stops
+        // saying "never swept", and this record is the only thing that keeps
+        // such a device to one full walk per process instead of one per pass.
+        // It guards that branch alone, so only a walk that actually reached the
+        // empty page at the end of the mailbox may write it.
+        val shallow = harness(rows = 30, serverPageSize = 10)
+        val now = 5_000_000L
+        assertTrue("a mailbox never swept sweeps on its first pass", shallow.sweepDue(now))
+        assertFalse(shallow.sweptThisSession())
+
+        shallow.walk(now)
+
+        assertTrue(shallow.sweptThisSession())
+        // What that record buys, in the state it exists for: a row still
+        // reading never-swept, which the persisted timestamp alone would sweep
+        // on every pass forever.
+        assertFalse(relaySweepDue(true, 0L, 0L, now))
+        assertTrue(relaySweepDue(false, 0L, 0L, now))
+
+        // A sweep that only yielded on its budget has reached no such
+        // conclusion: it has walked part of the mailbox, and the persisted
+        // progress is what has to carry the rest.
+        val deep = harness(rows = 100, serverPageSize = 10)
+        assertTrue(deep.walk(now).continuationNeeded)
+        assertFalse(deep.sweptThisSession())
+        assertTrue(deep.sweepDue(now + relayMailboxContinuationDelayMs()))
+    }
+
     // -- an ordinary frontier pass ---------------------------------------
 
     @Test
@@ -191,6 +224,41 @@ class RelayMailboxWalkWiringTest {
         assertEquals(80L, harness.cursor().afterId)
         assertEquals(listOf(0L, 10L, 20L, 30L, 40L, 50L, 60L, 70L), harness.mailbox.fetches.map { it.after })
         assertEquals(0L, harness.cursor().sweepAfterId)
+    }
+
+    // -- a page too big for this client to take ---------------------------
+
+    @Test
+    fun `an oversize page shrinks the ask for the rest of that mailbox and no further`() {
+        // A window whose body blows the response cap is answered with the same
+        // cursor at half the limit. The reduction is then kept for the rest of
+        // THIS mailbox -- a mailbox that produced one oversize window usually
+        // produces the next one too, and rediscovering that costs a wasted
+        // round trip on every page -- and no longer, because one relay's
+        // oversize page says nothing about the next relay's, and shrinking
+        // every other mailbox's pages for the rest of the pass is not a fix
+        // for anything.
+        val harness = harness(rows = 100, serverPageSize = 10)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        val full = relayFetchBatchLimit().toInt()
+        harness.mailbox.refuseLimitsAbove(full / 4)
+        val now = 1_000_000L + 1_000L
+
+        harness.walk(now)
+
+        // Paid once, on the first page, and worked down through the core's own
+        // halving rule; every later page of this mailbox asks the reduced
+        // limit straight out.
+        assertEquals(listOf(full to full / 2, full / 2 to full / 4), harness.mailbox.shrinks)
+        assertEquals(List(4) { full / 4 }, harness.mailbox.fetches.map { it.limit })
+
+        // The next mailbox of the same pass pays its own discovery, from the
+        // full limit: this walk's reduction was a local of this walk.
+        harness.walk(now, config = RelayConfig("https://other.example", "other-token"))
+        assertEquals(
+            listOf(full to full / 2, full / 2 to full / 4, full to full / 2, full / 2 to full / 4),
+            harness.mailbox.shrinks,
+        )
     }
 
     // -- a page that will not process ------------------------------------
@@ -505,17 +573,17 @@ class RelayMailboxWalkWiringTest {
 
         fun cursor() = store.relayFetchCursor(cursorKey)
 
+        /** Whether this process has walked the mailbox to its end, as the walk sees it. */
+        fun sweptThisSession() = walker.hasSweptThisSession(cursorKey)
+
         /**
-         * The schedule question the walk asks at the top of every pass.
-         *
-         * `sweptThisSession` is false because that is what it actually is here:
-         * the walker's in-memory set only ever suppresses the *never swept*
-         * branch, and every mailbox in these tests is judged from its persisted
-         * row instead -- which is the state the livelock lived in.
+         * The schedule question the walk asks at the top of every pass, asked
+         * the way the walk asks it: from the persisted row *and* the walker's
+         * own record of what this process has already walked in full.
          */
         fun sweepDue(now: Long): Boolean {
             val cursor = cursor()
-            return relaySweepDue(false, cursor.lastSweepAtMs, cursor.sweepAfterId, now)
+            return relaySweepDue(sweptThisSession(), cursor.lastSweepAtMs, cursor.sweepAfterId, now)
         }
     }
 }
@@ -539,15 +607,23 @@ internal class FakeRelayMailbox(
     private val serverPageSize: Int = Int.MAX_VALUE,
 ) {
 
-    /** One `GET /envelopes` as the relay saw it. */
+    /** One `GET /envelopes` as the relay saw it, at the limit that served it. */
     data class Fetch(val after: Long, val limit: Int, val hints: List<ByteArray>)
 
     private val rows = rows.sortedBy { it.id }.toMutableList()
     val fetches = mutableListOf<Fetch>()
     val acked = mutableListOf<Long>()
 
+    /**
+     * Every `(asked, retried with)` pair this mailbox forced, across every
+     * walk. One page too big to take costs one halving; paying that again on
+     * the next page of the same mailbox is the regression this records.
+     */
+    val shrinks = mutableListOf<Pair<Int, Int>>()
+
     private var freezeFromPage = Int.MAX_VALUE
     private var failAckOnPage = Int.MAX_VALUE
+    private var maxServableLimit = Int.MAX_VALUE
 
     /** From this page number on, answer with rows but never move the cursor. */
     fun freezeCursorFromPage(page: Int) {
@@ -561,6 +637,17 @@ internal class FakeRelayMailbox(
     /** Fail the ack issued for this page number, as a dropped connection does. */
     fun failAckOnPage(page: Int) {
         failAckOnPage = page
+    }
+
+    /**
+     * Refuse any window wider than this, as a page whose body blows the
+     * response cap does -- the client's answer is the same cursor at half the
+     * limit, and this fake makes it work its way down exactly as
+     * [com.cruisemesh.app.relay.RelayClient.fetchEnvelopesWithinResponseCap]
+     * does, through the core's own halving rule.
+     */
+    fun refuseLimitsAbove(limit: Int) {
+        maxServableLimit = limit
     }
 
     fun remainingIds(): List<Long> = rows.map { it.id }
@@ -587,7 +674,16 @@ internal class FakeRelayMailbox(
             after: Long,
             limit: Int,
             onShrink: (Int, Int) -> Unit,
-        ): RelayCappedFetch = RelayCappedFetch(page(after, limit, hints), limit)
+        ): RelayCappedFetch {
+            var attempt = limit
+            while (attempt > maxServableLimit) {
+                val smaller = relayFetchShrunkLimit(attempt.toUInt())?.toInt() ?: break
+                shrinks += attempt to smaller
+                onShrink(attempt, smaller)
+                attempt = smaller
+            }
+            return RelayCappedFetch(page(after, attempt, hints), attempt)
+        }
 
         override fun ack(config: RelayConfig, relayIds: List<Long>) = ackRows(relayIds)
 

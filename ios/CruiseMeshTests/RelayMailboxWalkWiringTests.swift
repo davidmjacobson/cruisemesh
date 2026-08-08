@@ -133,6 +133,48 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
         XCTAssertTrue(try harness.sweepDue(now + relayMailboxContinuationDelayMs()))
     }
 
+    func testOnlyASweepThatReachedTheEndOfTheMailboxIsRecordedForThisProcess() async throws {
+        // `RelaySweepSession` is the schedule's answer to a store that will not
+        // take the completion write: the persisted row then never stops saying
+        // "never swept", and this record is the only thing that keeps such a
+        // device to one full walk per process instead of one per pass. It
+        // guards that branch alone, so only a walk that actually reached the
+        // empty page at the end of the mailbox may write it.
+        let shallow = try makeHarness(rows: 30, serverPageSize: 10)
+        let now: Int64 = 5_000_000
+        XCTAssertTrue(try shallow.sweepDue(now), "a mailbox never swept sweeps on its first pass")
+        XCTAssertFalse(RelaySweepSession.shared.hasSwept(cursorKey()))
+
+        _ = try await shallow.walk(now: now)
+
+        XCTAssertTrue(RelaySweepSession.shared.hasSwept(cursorKey()))
+        // What that record buys, in the state it exists for: a row still
+        // reading never-swept, which the persisted timestamp alone would sweep
+        // on every pass forever.
+        XCTAssertFalse(relaySweepDue(
+            sweptThisSession: true,
+            lastSweepAtMs: 0,
+            sweepProgressAfterId: 0,
+            nowMs: now
+        ))
+        XCTAssertTrue(relaySweepDue(
+            sweptThisSession: false,
+            lastSweepAtMs: 0,
+            sweepProgressAfterId: 0,
+            nowMs: now
+        ))
+
+        // A sweep that only yielded on its budget has reached no such
+        // conclusion: it has walked part of the mailbox, and the persisted
+        // progress is what has to carry the rest.
+        RelaySweepSession.shared.reset()
+        let deep = try makeHarness(rows: 100, serverPageSize: 10)
+        let yielded = try await deep.walk(now: now)
+        XCTAssertTrue(yielded.continuationNeeded)
+        XCTAssertFalse(RelaySweepSession.shared.hasSwept(cursorKey()))
+        XCTAssertTrue(try deep.sweepDue(now + relayMailboxContinuationDelayMs()))
+    }
+
     // MARK: - an ordinary frontier pass
 
     func testAFrontierPassResumesFromTheFrontierAndWritesNoSweepProgress() async throws {
@@ -178,6 +220,40 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
         XCTAssertEqual(try harness.cursor().afterId, 80)
         XCTAssertEqual(harness.mailbox.fetches.map { $0.after }, [0, 10, 20, 30, 40, 50, 60, 70])
         XCTAssertEqual(try harness.cursor().sweepAfterId, 0)
+    }
+
+    // MARK: - a page too big for this client to take
+
+    func testAnOversizePageShrinksTheAskForTheRestOfThatMailboxAndNoFurther() async throws {
+        // A window whose body blows the response cap is answered with the same
+        // cursor at half the limit. The reduction is then kept for the rest of
+        // THIS mailbox -- a mailbox that produced one oversize window usually
+        // produces the next one too, and rediscovering that costs a wasted
+        // round trip on every page -- and no longer, because one relay's
+        // oversize page says nothing about the next relay's, and shrinking
+        // every other mailbox's pages for the rest of the pass is not a fix for
+        // anything.
+        let harness = try makeHarness(rows: 100, serverPageSize: 10)
+        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        let full = Int(relayFetchBatchLimit())
+        harness.mailbox.refuseLimitsAbove(full / 4)
+        let now: Int64 = 1_000_000 + 1_000
+
+        _ = try await harness.walk(now: now)
+
+        // Paid once, on the first page, and worked down through the core's own
+        // halving rule; every later page of this mailbox asks the reduced limit
+        // straight out.
+        XCTAssertEqual(harness.mailbox.shrinks.map { $0.from }, [full, full / 2])
+        XCTAssertEqual(harness.mailbox.shrinks.map { $0.to }, [full / 2, full / 4])
+        XCTAssertEqual(harness.mailbox.fetches.map { $0.limit }, Array(repeating: full / 4, count: 4))
+
+        // The next mailbox of the same pass pays its own discovery, from the
+        // full limit: this walk's reduction was a local of this walk.
+        let other = RelayConfig(relayUrl: "https://other.example", relayToken: "other-token")
+        _ = try await harness.walk(now: now, config: other)
+        XCTAssertEqual(harness.mailbox.shrinks.map { $0.from }, [full, full / 2, full, full / 2])
+        XCTAssertEqual(harness.mailbox.shrinks.map { $0.to }, [full / 2, full / 4, full / 2, full / 4])
     }
 
     // MARK: - a page that will not process
@@ -493,16 +569,17 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
             ))
         }
 
-        /// The schedule question the walk asks at the top of every pass.
-        ///
-        /// `sweptThisSession` is false because that is what it is here: the
-        /// process-wide set only ever suppresses the *never swept* branch, and
-        /// every mailbox in these tests is judged from its persisted row
-        /// instead -- which is the state the livelock lived in.
+        /// The schedule question the walk asks at the top of every pass, asked
+        /// the way the walk asks it: from the persisted row *and* the
+        /// process-wide record of the mailboxes already walked in full.
         func sweepDue(_ now: Int64) throws -> Bool {
             let row = try cursor()
+            let key = relayCursorKey(
+                relayUrl: defaultConfig.relayUrl,
+                relayToken: defaultConfig.relayToken
+            )
             return relaySweepDue(
-                sweptThisSession: false,
+                sweptThisSession: RelaySweepSession.shared.hasSwept(key),
                 lastSweepAtMs: row.lastSweepAtMs,
                 sweepProgressAfterId: row.sweepAfterId,
                 nowMs: now
@@ -520,11 +597,17 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
 /// read. Android twin: `FakeRelayMailbox` in RelayMailboxWalkWiringTest.kt.
 final class FakeRelayMailbox {
 
-    /// One `GET /envelopes` as the relay saw it.
+    /// One `GET /envelopes` as the relay saw it, at the limit that served it.
     struct Fetch {
         let after: Int64
         let limit: Int
         let hints: [Data]
+    }
+
+    /// One `(asked, retried with)` pair a page too big to take forced.
+    struct Shrink {
+        let from: Int
+        let to: Int
     }
 
     private var rows: [RelayFetchedEnvelope]
@@ -534,9 +617,14 @@ final class FakeRelayMailbox {
     private let serverPageSize: Int
     private var freezeFromPage = Int.max
     private var failAckFromPage = Int.max
+    private var maxServableLimit = Int.max
 
     private(set) var fetches: [Fetch] = []
     private(set) var acked: [Int64] = []
+    /// Every halving this mailbox forced, across every walk. One page too big
+    /// to take costs one halving; paying it again on the next page of the same
+    /// mailbox is the regression this records.
+    private(set) var shrinks: [Shrink] = []
 
     init(rows: [RelayFetchedEnvelope], serverPageSize: Int) {
         self.rows = rows.sorted { $0.id < $1.id }
@@ -556,6 +644,15 @@ final class FakeRelayMailbox {
     /// dropped connection does.
     func failAckOnPage(_ page: Int) {
         failAckFromPage = page
+    }
+
+    /// Refuse any window wider than this, as a page whose body blows the
+    /// response cap does -- the client's answer is the same cursor at half the
+    /// limit, and this fake works its way down exactly as
+    /// `RelayClient.fetchEnvelopesWithinResponseCap` does, through the core's
+    /// own halving rule.
+    func refuseLimitsAbove(_ limit: Int) {
+        maxServableLimit = limit
     }
 
     func remainingIds() -> [Int64] {
@@ -584,7 +681,18 @@ final class FakeRelayMailbox {
     func pages() -> RelayMailboxPages {
         RelayMailboxPages(
             fetch: { _, hints, after, limit in
-                RelayCappedFetch(page: self.page(after: after, limit: limit, hints: hints), limit: limit)
+                var attempt = limit
+                while attempt > self.maxServableLimit {
+                    guard let smaller = relayFetchShrunkLimit(
+                        currentLimit: UInt32(clamping: attempt)
+                    ) else { break }
+                    self.shrinks.append(Shrink(from: attempt, to: Int(smaller)))
+                    attempt = Int(smaller)
+                }
+                return RelayCappedFetch(
+                    page: self.page(after: after, limit: attempt, hints: hints),
+                    limit: attempt
+                )
             },
             ack: { _, ids in
                 try self.ackRows(ids)
