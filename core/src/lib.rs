@@ -160,11 +160,11 @@ pub use store::{
     sanitize_restored_message_store_with_options, BackupContentOptions, BackupInventory,
     BackupSanitizationReport, CarriedEnvelope, ConsumedHiddenLamport, Contact,
     ContactDiscoveryPolicy, ContactProvenance, ContactRelayRejection, ContactRelayUnreachable,
-    CoreCarriedCursor, CoreCarriedSyncPage, CoreChatPreview, CoreMessageReceivedAt, DigestEntry,
-    FriendSuggestion, IncomingMessageInsertOutcome, MessageArrival, MessageConflictSummary,
-    MessageOrigin, MessageReference, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
-    PeerConnectionEvent, PeerConnectionEventKind, PeerConnectionSummary, PeerConnectionTransport,
-    RelayFetchCursor, StoredMessage,
+    CoreCarriedCursor, CoreCarriedSyncPage, CoreChatPreview, CoreMessageReceivedAt,
+    CoreRecipientDeliveryStatus, DigestEntry, FriendSuggestion, IncomingMessageInsertOutcome,
+    MessageArrival, MessageConflictSummary, MessageOrigin, MessageReference, MessageStore,
+    OutboundEnvelope, OutgoingReceiptEnvelope, PeerConnectionEvent, PeerConnectionEventKind,
+    PeerConnectionSummary, PeerConnectionTransport, RelayFetchCursor, StoredMessage,
 };
 pub use transport_policy::{
     core_transport_send_plan, digest_is_expected_chat_id, digest_through_lamport_for_sender,

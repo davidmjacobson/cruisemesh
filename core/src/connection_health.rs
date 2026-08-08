@@ -29,6 +29,11 @@
 //!
 //! See `specs/connection-details-page.md` for the surface these feed.
 
+use crate::contact_relay_health::{
+    core_contact_relay_endpoint_usable, core_contact_relay_is_stale,
+    core_contact_relay_unreachable_endpoint_usable, core_contact_relay_unreachable_is_stale,
+};
+
 /// How long an unresolved check may hold the card in
 /// [`CoreConnectionHealth::Checking`] before it must resolve to the
 /// best-supported real state.
@@ -526,11 +531,10 @@ pub enum CoreDirectLink {
 
 /// Why a person needs the user's attention.
 ///
-/// Phase 1 shells supply only `None` or [`CorePersonAttention::SetupRejected`]
-/// -- the one per-person fault the app already tracks. The remaining variants
-/// exist so the per-recipient delivery read model can fill them in later
-/// without reshaping this API, which is also why the grouping call already
-/// takes them.
+/// Produced by [`core_classify_recipient_delivery`] from the per-recipient
+/// read model, so a person's placement in the Needs attention group and the
+/// delivery line in their row are always the same verdict rather than two
+/// judgements that can disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum CorePersonAttention {
     /// A usable route exists but nothing has progressed for the delayed
@@ -538,8 +542,8 @@ pub enum CorePersonAttention {
     Delayed,
     /// A queued message exceeds the size cap and can never post as-is.
     MessageTooLarge,
-    /// Our own pass cannot post on their behalf (expired, suspended, or the
-    /// family's storage is full).
+    /// Our own pass cannot post on their behalf: expired, suspended, our own
+    /// saved setup rejected, or the family's storage is full.
     PassBlocked,
     /// Their saved Shore Pass setup was rejected -- their friend card points
     /// at somewhere that will not serve them. The most severe, because it
@@ -787,14 +791,32 @@ fn name_order(left: &CorePersonHealthInput, right: &CorePersonHealthInput) -> st
 // Delivery language
 // ---------------------------------------------------------------------------
 
-/// The user-visible meaning of messages still waiting for one person.
+/// How long a usable route may carry no progress before the waiting work is
+/// called out as delayed.
 ///
-/// Deliberately has no error member. Phase 1 reads only signals that already
-/// exist -- receipts, waiting work, and path state -- and none of those can
-/// prove a terminal failure. Waiting for a friend who is simply elsewhere is
-/// what this product does, so it is never dressed as a fault. The blocked and
-/// delayed reasons arrive with the per-recipient read model in Phase 2, which
-/// is also what will let this take a real age.
+/// Ten minutes, and it is a single named constant here precisely so field
+/// evidence can move it without either shell being touched. The number only
+/// has meaning while a route is usable: a friend who is simply elsewhere may
+/// stay queued for days without anything being wrong, and no threshold applies
+/// to them at any age.
+///
+/// Ten is chosen against the relay's own rhythm -- a sync pass runs about once
+/// a minute -- so reaching it means roughly ten consecutive passes moved
+/// nothing. Shorter would fire during an ordinary lift ride; much longer and a
+/// genuinely stuck conversation stays silent past the point a person has
+/// already noticed and started doubting the app.
+pub const RELAY_DELIVERY_DELAYED_THRESHOLD_MS: i64 = 10 * 60 * 1000;
+
+/// The user-visible *movement* meaning of messages still waiting for one
+/// person: what happens to them next, on the evidence available.
+///
+/// Deliberately has no error member, and does not gain one in Phase 2. This
+/// answers "where is this work going", and the answer for a friend who is
+/// merely elsewhere is "it travels at the next encounter" whatever else is
+/// wrong -- store-and-forward through encounters is what the product does.
+/// Faults are carried alongside it as overlays on [`CoreDeliveryLine`], so a
+/// fault can explain why the *internet* route is stopped without ever turning
+/// the promise underneath into a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum CoreDeliveryState {
     /// A route to this person is usable now.
@@ -803,6 +825,71 @@ pub enum CoreDeliveryState {
     WillDeliverWhenReconnected,
     /// Shore Pass is the only known route and this phone has no internet.
     WaitingForInternet,
+}
+
+/// A terminal or configuration fault stopping the internet route to one
+/// person, and therefore the reason an error row can offer `How to fix`.
+///
+/// Each variant exists because it maps to different, concrete instructions
+/// (see the specification's "How to fix" section). A fault with no distinct
+/// remedy would not earn a variant -- it would just be a longer sentence
+/// describing the same button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CoreDeliveryBlockedReason {
+    /// *Their* saved Shore Pass setup will not serve us: it authoritatively
+    /// rejected our credential, or the host in their friend card has gone
+    /// unanswered long enough to be actionable rather than transient.
+    ///
+    /// Both land here because the repair is identical and order-sensitive: the
+    /// friend fixes their own pass first, *then* shares a fresh card, which is
+    /// then rescanned. A card re-shared before the pass is fixed reproduces
+    /// the problem exactly.
+    ContactSetupRejected,
+    /// Our own pass has lapsed. Repaired under Manage Shore Pass.
+    PassExpired,
+    /// Our own pass was turned off by the operator.
+    PassSuspended,
+    /// Our family's hosted storage is full. It frees itself as friends collect
+    /// their messages, which is the first thing the instructions must say.
+    StorageFull,
+    /// Our own saved setup was rejected. Same affordance as an expired pass,
+    /// separate variant because the explanation differs.
+    OwnSetupRejected,
+    /// A waiting message is larger than any transport will carry. The sealed
+    /// ceiling is enforced identically by the relay and by peer framing, so
+    /// this is terminal on every path, not merely on the internet one -- and
+    /// no amount of reconnecting will change it.
+    MessageTooLarge,
+}
+
+/// Everything the page says about one person's waiting mail: where it is
+/// going, whether it has stalled, what is stopping it, and where that puts
+/// them in the People grouping.
+///
+/// The three verdict fields are layered, not alternatives, and render in this
+/// precedence: `blocked_reason`, then `delayed`, then `state`. Keeping `state`
+/// truthful underneath a fault is the point -- an expired pass stops the
+/// internet route, but the messages really will still go the moment the friend
+/// is nearby, and a page that replaced that promise with "can't be sent" would
+/// be lying about the one behaviour this product exists for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CoreDeliveryLine {
+    /// User-visible messages the line is about. Never zero: no waiting work
+    /// means no line at all.
+    pub count: u32,
+    /// Where this work is going.
+    pub state: CoreDeliveryState,
+    /// A usable route exists and nothing has progressed for
+    /// [`RELAY_DELIVERY_DELAYED_THRESHOLD_MS`].
+    pub delayed: bool,
+    /// A terminal or configuration fault stops the internet route.
+    pub blocked_reason: Option<CoreDeliveryBlockedReason>,
+    /// Where this person belongs in the People grouping; `None` leaves them
+    /// wherever their reachability puts them.
+    pub attention: Option<CorePersonAttention>,
+    /// Authoring time of the oldest affected message, epoch ms; `0` when
+    /// unknown. Dates the delayed line and orders Needs attention.
+    pub oldest_waiting_ms: i64,
 }
 
 /// Everything the per-person delivery line consumes.
@@ -879,17 +966,265 @@ pub fn core_relay_queue_reflects_delivery(
     relay != CoreRelayPathState::NotSetUp && contact_has_relay_endpoint && !contact_relay_stale
 }
 
-/// The delivery line for one person, or `None` when there is nothing honest to
-/// say.
+/// Everything the per-recipient delivery classification consumes.
 ///
-/// Nothing here is an error and nothing here is red. The old page's red
-/// `Pending relay upload` under every friend -- including friends who had
-/// already received the message -- is what this replaces.
-#[uniffi::export]
-pub fn core_classify_delivery_line(input: CoreDeliveryLineInput) -> Option<CoreDeliveryState> {
-    if input.queued == 0 {
+/// The first block comes verbatim from
+/// [`crate::CoreRecipientDeliveryStatus`] -- the store's answer to "what is
+/// still outstanding for this person" -- and the second from this device's own
+/// path state, which the shell already holds. Nothing here is a verdict; the
+/// verdicts are all below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CoreRecipientDeliveryInput {
+    /// User-visible messages their delivery receipt does not cover.
+    pub waiting_count: u32,
+    /// Authoring time of the oldest of those, epoch ms; `0` when unknown.
+    pub oldest_waiting_ms: i64,
+    /// Newest evidence that their mail moved, epoch ms; `0` when none.
+    pub last_progress_ms: i64,
+    /// A waiting envelope exceeds what any transport will carry.
+    pub oversized_waiting: bool,
+    /// Persisted contact-endpoint health, interpreted here through
+    /// `crate::contact_relay_health` rather than re-derived.
+    pub relay_reject_streak: i64,
+    pub relay_rejected_at_ms: i64,
+    pub relay_unreachable_streak: i64,
+    pub relay_unreachable_at_ms: i64,
+    /// This phone's own Shore Pass path, normalized
+    /// ([`CoreConnectionEvidence::relay`]).
+    pub relay: CoreRelayPathState,
+    /// This phone's own Shore Pass path can deliver right now
+    /// ([`CoreConnectionEvidence::own_relay_usable`]).
+    pub own_relay_usable: bool,
+    /// Their friend card carries an internet-delivery endpoint at all.
+    /// Without one, nothing about our pass or their pass is relevant to them.
+    pub contact_has_relay_endpoint: bool,
+    /// A live direct link to this person exists right now.
+    pub direct_link: bool,
+    pub now_ms: i64,
+}
+
+/// The facts the one classifier works from, after each entry point has
+/// resolved its own inputs into them.
+///
+/// Exists so the Phase 1 entry point and the Phase 2 one cannot drift: there
+/// is a single decision procedure, and the two public functions differ only in
+/// how much evidence they are able to supply it.
+struct DeliveryFacts {
+    waiting_count: u32,
+    oldest_waiting_ms: i64,
+    last_progress_ms: i64,
+    oversized_waiting: bool,
+    /// Their endpoint is resting -- written off after rejecting us, or quiet
+    /// long enough to stop spending requests on. Not a route today.
+    contact_endpoint_resting: bool,
+    /// Their endpoint has failed long enough that a person should be told,
+    /// rather than merely long enough to stop retrying.
+    contact_setup_actionable: bool,
+    relay: CoreRelayPathState,
+    own_relay_usable: bool,
+    contact_has_relay_endpoint: bool,
+    direct_link: bool,
+    now_ms: i64,
+}
+
+/// Has a usable route carried nothing for longer than the delayed window?
+///
+/// Measured from the later of the last progress and the oldest waiting
+/// message. Both halves matter: with no progress ever recorded the wait is
+/// dated from the message itself, and a message queued a minute ago is not
+/// delayed merely because the previous upload was hours earlier. Unknown
+/// timestamps and a clock that has moved backwards both answer `false` --
+/// inventing a delay from a missing number would put a red row under a friend
+/// on nothing but arithmetic.
+fn delivery_progress_stalled(last_progress_ms: i64, oldest_waiting_ms: i64, now_ms: i64) -> bool {
+    let since = last_progress_ms.max(oldest_waiting_ms);
+    if since <= 0 || now_ms < since {
+        return false;
+    }
+    now_ms - since >= RELAY_DELIVERY_DELAYED_THRESHOLD_MS
+}
+
+/// The one place a fault becomes an error row.
+///
+/// Order is the specification's severity order, and every arm before the pass
+/// faults exists to stop a device-wide problem being re-announced under every
+/// friend:
+///
+/// * an oversized message is terminal on *every* path, so it outranks
+///   everything and applies even while the friend is standing right here;
+/// * a live direct link means the work is moving now, so nothing is blocking
+///   it whatever the internet path is doing;
+/// * a friend whose card carries no endpoint is untouched by any pass fault --
+///   the internet was never their route, and telling their reader otherwise
+///   would be the "red under every friend" failure this page replaces.
+fn delivery_blocked_reason(facts: &DeliveryFacts) -> Option<CoreDeliveryBlockedReason> {
+    if facts.oversized_waiting {
+        return Some(CoreDeliveryBlockedReason::MessageTooLarge);
+    }
+    if facts.direct_link || !facts.contact_has_relay_endpoint {
         return None;
     }
+    if facts.contact_setup_actionable {
+        return Some(CoreDeliveryBlockedReason::ContactSetupRejected);
+    }
+    match facts.relay {
+        CoreRelayPathState::PassSuspended => Some(CoreDeliveryBlockedReason::PassSuspended),
+        CoreRelayPathState::PassExpired => Some(CoreDeliveryBlockedReason::PassExpired),
+        CoreRelayPathState::StorageFull => Some(CoreDeliveryBlockedReason::StorageFull),
+        CoreRelayPathState::SetupRejected => Some(CoreDeliveryBlockedReason::OwnSetupRejected),
+        // Everything else is a service having a moment, or no pass at all.
+        // Neither is a fault, and neither stops the next encounter.
+        CoreRelayPathState::NotSetUp
+        | CoreRelayPathState::Checking
+        | CoreRelayPathState::Connected
+        | CoreRelayPathState::WaitingForInternet
+        | CoreRelayPathState::Unreachable
+        | CoreRelayPathState::SyncingSlowed => None,
+    }
+}
+
+/// Which Needs attention bucket a verdict puts the person in.
+fn delivery_attention(
+    blocked_reason: Option<CoreDeliveryBlockedReason>,
+    delayed: bool,
+) -> Option<CorePersonAttention> {
+    match blocked_reason {
+        Some(CoreDeliveryBlockedReason::ContactSetupRejected) => {
+            Some(CorePersonAttention::SetupRejected)
+        }
+        Some(CoreDeliveryBlockedReason::MessageTooLarge) => {
+            Some(CorePersonAttention::MessageTooLarge)
+        }
+        Some(CoreDeliveryBlockedReason::PassExpired)
+        | Some(CoreDeliveryBlockedReason::PassSuspended)
+        | Some(CoreDeliveryBlockedReason::StorageFull)
+        | Some(CoreDeliveryBlockedReason::OwnSetupRejected) => {
+            Some(CorePersonAttention::PassBlocked)
+        }
+        None if delayed => Some(CorePersonAttention::Delayed),
+        None => None,
+    }
+}
+
+/// The single delivery decision procedure.
+fn classify_delivery(facts: DeliveryFacts) -> Option<CoreDeliveryLine> {
+    if facts.waiting_count == 0 {
+        return None;
+    }
+    let route_usable = core_contact_route_usable(
+        facts.direct_link,
+        facts.own_relay_usable,
+        facts.contact_has_relay_endpoint,
+        facts.contact_endpoint_resting,
+    );
+    let state = if route_usable {
+        CoreDeliveryState::Sending
+    } else if facts.relay == CoreRelayPathState::WaitingForInternet
+        && facts.contact_has_relay_endpoint
+        && !facts.contact_endpoint_resting
+    {
+        // Only say "waiting for internet" when internet is genuinely what is
+        // missing. A friend whose card carries no endpoint, or one whose
+        // endpoint is resting, would not be reached by this phone coming
+        // online, and telling their reader to find Wi-Fi would waste their
+        // afternoon.
+        CoreDeliveryState::WaitingForInternet
+    } else {
+        // Deliberately a promise, not a failure: store-and-forward through
+        // encounters is the product's core behavior, and a friend who is
+        // simply ashore may stay here indefinitely without anything being
+        // wrong.
+        CoreDeliveryState::WillDeliverWhenReconnected
+    };
+    let delayed = route_usable
+        && delivery_progress_stalled(
+            facts.last_progress_ms,
+            facts.oldest_waiting_ms,
+            facts.now_ms,
+        );
+    let blocked_reason = delivery_blocked_reason(&facts);
+    Some(CoreDeliveryLine {
+        count: facts.waiting_count,
+        state,
+        delayed,
+        blocked_reason,
+        attention: delivery_attention(blocked_reason, delayed),
+        oldest_waiting_ms: facts.oldest_waiting_ms,
+    })
+}
+
+/// The whole per-recipient delivery verdict, from the read model plus this
+/// device's path state.
+///
+/// This is the specification's derived-state table, evaluated once, in one
+/// language. The two rules it exists to guarantee:
+///
+/// * **A receipt silences the line rather than contradicting it.** The count
+///   arriving here is already receipt-aware, so "they received your message"
+///   and a waiting line cannot appear together -- not because a special case
+///   suppresses the second, but because there is nothing left to count.
+/// * **Age alone is never a fault.** The delayed window is only consulted
+///   while a route is usable, and the movement state under any fault stays a
+///   promise. A friend who is offline stays neutral at ten minutes, at ten
+///   hours, and at ten days.
+#[uniffi::export]
+pub fn core_classify_recipient_delivery(
+    input: CoreRecipientDeliveryInput,
+) -> Option<CoreDeliveryLine> {
+    // Both halves of the persisted endpoint health are consulted through
+    // `contact_relay_health`, never re-derived: that module owns the streak
+    // thresholds, the rest windows, and the backwards-clock rule, and a second
+    // copy of any of them here is how the two shells drifted in the first
+    // place.
+    let rejected_resting = !core_contact_relay_endpoint_usable(
+        input.relay_reject_streak,
+        input.relay_rejected_at_ms,
+        input.now_ms,
+    );
+    let silent_resting = !core_contact_relay_unreachable_endpoint_usable(
+        input.relay_unreachable_streak,
+        input.relay_unreachable_at_ms,
+        input.now_ms,
+    );
+    classify_delivery(DeliveryFacts {
+        waiting_count: input.waiting_count,
+        oldest_waiting_ms: input.oldest_waiting_ms,
+        last_progress_ms: input.last_progress_ms,
+        oversized_waiting: input.oversized_waiting,
+        contact_endpoint_resting: rejected_resting || silent_resting,
+        // Resting and actionable are deliberately different questions. A
+        // written-off card becomes probe-eligible again every six hours, and
+        // an unanswered host every half hour, so "resting" blinks off and on
+        // for as long as the fault lasts -- fine for spending requests, and
+        // useless as a thing to tell a person. The verdict a person sees is
+        // driven by the streak having reached the stale threshold, which only
+        // a success clears.
+        contact_setup_actionable: core_contact_relay_is_stale(input.relay_reject_streak)
+            || core_contact_relay_unreachable_is_stale(input.relay_unreachable_streak),
+        relay: input.relay,
+        own_relay_usable: input.own_relay_usable,
+        contact_has_relay_endpoint: input.contact_has_relay_endpoint,
+        direct_link: input.direct_link,
+        now_ms: input.now_ms,
+    })
+}
+
+/// The delivery line for one person from Phase 1's inputs, or `None` when
+/// there is nothing honest to say.
+///
+/// A thin front end onto [`core_classify_recipient_delivery`], kept because
+/// both shells call it while their per-recipient read model is being wired up.
+/// It supplies exactly the evidence Phase 1 has -- a raw relay-upload depth, a
+/// receipt as newest-evidence flag, and path state -- and no ages or
+/// per-recipient faults, so the classifier cannot return `delayed` or a
+/// blocking reason through this door. That is a property of the missing
+/// inputs, not of a second decision procedure, which is why there is only one.
+///
+/// Nothing reachable through here is an error and nothing here is red. The old
+/// page's `Pending relay upload` under every friend -- including friends who
+/// had already received the message -- is what this replaces.
+#[uniffi::export]
+pub fn core_classify_delivery_line(input: CoreDeliveryLineInput) -> Option<CoreDeliveryState> {
     if !core_relay_queue_reflects_delivery(
         input.relay,
         input.contact_has_relay_endpoint,
@@ -899,25 +1234,25 @@ pub fn core_classify_delivery_line(input: CoreDeliveryLineInput) -> Option<CoreD
     }
     // The page has just told the reader this person received a message from
     // us. Whatever bookkeeping is left, contradicting that sentence one line
-    // below it is worse than saying nothing.
+    // below it is worse than saying nothing. The Phase 2 door needs no such
+    // rule: its count is receipt-aware to begin with.
     if input.delivery_receipt_is_newest_evidence {
         return None;
     }
-    if core_contact_route_usable(
-        input.direct_link,
-        input.own_relay_usable,
-        input.contact_has_relay_endpoint,
-        input.contact_relay_stale,
-    ) {
-        return Some(CoreDeliveryState::Sending);
-    }
-    if input.relay == CoreRelayPathState::WaitingForInternet {
-        return Some(CoreDeliveryState::WaitingForInternet);
-    }
-    // Deliberately a promise, not a failure: store-and-forward through
-    // encounters is the product's core behavior, and a friend who is simply
-    // ashore may stay here indefinitely without anything being wrong.
-    Some(CoreDeliveryState::WillDeliverWhenReconnected)
+    classify_delivery(DeliveryFacts {
+        waiting_count: input.queued,
+        oldest_waiting_ms: 0,
+        last_progress_ms: 0,
+        oversized_waiting: false,
+        contact_endpoint_resting: input.contact_relay_stale,
+        contact_setup_actionable: false,
+        relay: input.relay,
+        own_relay_usable: input.own_relay_usable,
+        contact_has_relay_endpoint: input.contact_has_relay_endpoint,
+        direct_link: input.direct_link,
+        now_ms: 0,
+    })
+    .map(|line| line.state)
 }
 
 #[cfg(test)]
@@ -1710,6 +2045,537 @@ mod tests {
         assert!(!core_contact_route_usable(false, true, true, true));
         assert!(!core_contact_route_usable(false, true, false, false));
         assert!(!core_contact_route_usable(false, false, true, false));
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-recipient delivery (Phase 2)
+    // -----------------------------------------------------------------------
+
+    use crate::contact_relay_health::{
+        CONTACT_RELAY_RECHECK_MS, CONTACT_RELAY_STALE_STREAK,
+        CONTACT_RELAY_UNREACHABLE_STALE_STREAK, CONTACT_RELAY_UNREACHABLE_STREAK,
+    };
+
+    /// A healthy recipient with `count` messages waiting, everything working,
+    /// and progress a minute ago.
+    fn waiting(count: u32) -> CoreRecipientDeliveryInput {
+        CoreRecipientDeliveryInput {
+            waiting_count: count,
+            oldest_waiting_ms: NOW - 60_000,
+            last_progress_ms: NOW - 60_000,
+            oversized_waiting: false,
+            relay_reject_streak: 0,
+            relay_rejected_at_ms: 0,
+            relay_unreachable_streak: 0,
+            relay_unreachable_at_ms: 0,
+            relay: CoreRelayPathState::Connected,
+            own_relay_usable: true,
+            contact_has_relay_endpoint: true,
+            direct_link: false,
+            now_ms: NOW,
+        }
+    }
+
+    /// Nobody reachable, nothing moving: the ordinary offline friend.
+    fn offline(count: u32) -> CoreRecipientDeliveryInput {
+        CoreRecipientDeliveryInput {
+            relay: CoreRelayPathState::WaitingForInternet,
+            own_relay_usable: false,
+            ..waiting(count)
+        }
+    }
+
+    #[test]
+    fn a_receipt_covered_recipient_gets_no_line_at_all() {
+        // Not "the line is suppressed" -- there is nothing left to count,
+        // because the store's count is receipt-aware. That is what makes
+        // "Received your message" and a waiting warning structurally unable to
+        // appear together.
+        assert_eq!(core_classify_recipient_delivery(waiting(0)), None);
+    }
+
+    #[test]
+    fn recipient_delivery_matrix() {
+        // The specification's derived-state table, one row at a time.
+        // (label, input, expected state, delayed, blocked reason)
+        let cases: Vec<(
+            &str,
+            CoreRecipientDeliveryInput,
+            CoreDeliveryState,
+            bool,
+            Option<CoreDeliveryBlockedReason>,
+        )> = vec![
+            (
+                "usable relay route",
+                waiting(2),
+                CoreDeliveryState::Sending,
+                false,
+                None,
+            ),
+            (
+                "standing next to them with no pass at all",
+                CoreRecipientDeliveryInput {
+                    relay: CoreRelayPathState::NotSetUp,
+                    own_relay_usable: false,
+                    contact_has_relay_endpoint: false,
+                    direct_link: true,
+                    ..waiting(2)
+                },
+                CoreDeliveryState::Sending,
+                false,
+                None,
+            ),
+            (
+                "no internet, and internet is what is missing",
+                offline(2),
+                CoreDeliveryState::WaitingForInternet,
+                false,
+                None,
+            ),
+            (
+                "no internet, but they have no endpoint either",
+                CoreRecipientDeliveryInput {
+                    contact_has_relay_endpoint: false,
+                    ..offline(2)
+                },
+                CoreDeliveryState::WillDeliverWhenReconnected,
+                false,
+                None,
+            ),
+            (
+                "the service is not answering",
+                CoreRecipientDeliveryInput {
+                    relay: CoreRelayPathState::Unreachable,
+                    own_relay_usable: false,
+                    ..waiting(2)
+                },
+                CoreDeliveryState::WillDeliverWhenReconnected,
+                false,
+                None,
+            ),
+            (
+                "slowed by the shared family limit: still moving",
+                CoreRecipientDeliveryInput {
+                    relay: CoreRelayPathState::SyncingSlowed,
+                    ..waiting(2)
+                },
+                CoreDeliveryState::Sending,
+                false,
+                None,
+            ),
+            (
+                "usable route, nothing has moved for the window",
+                CoreRecipientDeliveryInput {
+                    last_progress_ms: NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+                    oldest_waiting_ms: NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+                    ..waiting(2)
+                },
+                CoreDeliveryState::Sending,
+                true,
+                None,
+            ),
+            (
+                "their saved setup was rejected",
+                CoreRecipientDeliveryInput {
+                    relay_reject_streak: CONTACT_RELAY_STALE_STREAK,
+                    relay_rejected_at_ms: NOW - 1_000,
+                    ..waiting(2)
+                },
+                CoreDeliveryState::WillDeliverWhenReconnected,
+                false,
+                Some(CoreDeliveryBlockedReason::ContactSetupRejected),
+            ),
+            (
+                "their host has been silent long enough to say so",
+                CoreRecipientDeliveryInput {
+                    relay_unreachable_streak: CONTACT_RELAY_UNREACHABLE_STALE_STREAK,
+                    relay_unreachable_at_ms: NOW - 1_000,
+                    ..waiting(2)
+                },
+                CoreDeliveryState::WillDeliverWhenReconnected,
+                false,
+                Some(CoreDeliveryBlockedReason::ContactSetupRejected),
+            ),
+            (
+                "our pass expired",
+                CoreRecipientDeliveryInput {
+                    relay: CoreRelayPathState::PassExpired,
+                    own_relay_usable: false,
+                    ..waiting(2)
+                },
+                CoreDeliveryState::WillDeliverWhenReconnected,
+                false,
+                Some(CoreDeliveryBlockedReason::PassExpired),
+            ),
+            (
+                "our pass suspended",
+                CoreRecipientDeliveryInput {
+                    relay: CoreRelayPathState::PassSuspended,
+                    own_relay_usable: false,
+                    ..waiting(2)
+                },
+                CoreDeliveryState::WillDeliverWhenReconnected,
+                false,
+                Some(CoreDeliveryBlockedReason::PassSuspended),
+            ),
+            (
+                "our family storage is full",
+                CoreRecipientDeliveryInput {
+                    relay: CoreRelayPathState::StorageFull,
+                    own_relay_usable: false,
+                    ..waiting(2)
+                },
+                CoreDeliveryState::WillDeliverWhenReconnected,
+                false,
+                Some(CoreDeliveryBlockedReason::StorageFull),
+            ),
+            (
+                "our own saved setup was rejected",
+                CoreRecipientDeliveryInput {
+                    relay: CoreRelayPathState::SetupRejected,
+                    own_relay_usable: false,
+                    ..waiting(2)
+                },
+                CoreDeliveryState::WillDeliverWhenReconnected,
+                false,
+                Some(CoreDeliveryBlockedReason::OwnSetupRejected),
+            ),
+            (
+                "a message no transport will carry",
+                CoreRecipientDeliveryInput {
+                    oversized_waiting: true,
+                    ..waiting(1)
+                },
+                CoreDeliveryState::Sending,
+                false,
+                Some(CoreDeliveryBlockedReason::MessageTooLarge),
+            ),
+        ];
+
+        for (label, input, want_state, want_delayed, want_reason) in cases {
+            let line = core_classify_recipient_delivery(input)
+                .unwrap_or_else(|| panic!("{label}: expected a line"));
+            assert_eq!(line.state, want_state, "{label}");
+            assert_eq!(line.delayed, want_delayed, "{label}");
+            assert_eq!(line.blocked_reason, want_reason, "{label}");
+        }
+    }
+
+    #[test]
+    fn an_offline_friend_is_never_an_error_at_any_age() {
+        // The DTN rule, pinned. Waiting is what this product is for; nothing
+        // about how long it has been waiting may turn it into a fault.
+        let minute = 60_000i64;
+        for age in [
+            minute,
+            10 * minute,
+            60 * minute,
+            24 * 60 * minute,
+            30 * 24 * 60 * minute,
+            365 * 24 * 60 * minute,
+        ] {
+            let line = core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+                oldest_waiting_ms: NOW - age,
+                last_progress_ms: 0,
+                ..offline(3)
+            })
+            .expect("waiting work still gets a line");
+            assert_eq!(
+                line.state,
+                CoreDeliveryState::WaitingForInternet,
+                "age {age}ms"
+            );
+            assert!(!line.delayed, "age {age}ms");
+            assert_eq!(line.blocked_reason, None, "age {age}ms");
+            assert_eq!(line.attention, None, "age {age}ms");
+        }
+    }
+
+    #[test]
+    fn a_fault_never_takes_the_promise_away() {
+        // Every blocking reason still leaves a truthful movement state
+        // underneath it: the messages really do travel at the next encounter.
+        for input in [
+            CoreRecipientDeliveryInput {
+                relay: CoreRelayPathState::PassExpired,
+                own_relay_usable: false,
+                ..waiting(2)
+            },
+            CoreRecipientDeliveryInput {
+                relay_reject_streak: CONTACT_RELAY_STALE_STREAK,
+                relay_rejected_at_ms: NOW,
+                ..waiting(2)
+            },
+        ] {
+            let line = core_classify_recipient_delivery(input).unwrap();
+            assert!(line.blocked_reason.is_some());
+            assert_eq!(line.state, CoreDeliveryState::WillDeliverWhenReconnected);
+        }
+    }
+
+    #[test]
+    fn a_friend_with_no_endpoint_is_untouched_by_our_pass_faults() {
+        // The "red under every friend" failure, structurally prevented: the
+        // internet was never this person's route, so our pass expiring says
+        // nothing about them.
+        for relay in [
+            CoreRelayPathState::PassExpired,
+            CoreRelayPathState::PassSuspended,
+            CoreRelayPathState::StorageFull,
+            CoreRelayPathState::SetupRejected,
+        ] {
+            let line = core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+                relay,
+                own_relay_usable: false,
+                contact_has_relay_endpoint: false,
+                ..waiting(2)
+            })
+            .unwrap();
+            assert_eq!(line.blocked_reason, None, "{relay:?}");
+            assert_eq!(line.attention, None, "{relay:?}");
+            assert_eq!(line.state, CoreDeliveryState::WillDeliverWhenReconnected);
+        }
+    }
+
+    #[test]
+    fn a_live_link_beats_every_pass_fault_but_not_an_oversized_message() {
+        // Their phone is right here: the work is moving, whatever the internet
+        // path is doing.
+        let line = core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+            relay: CoreRelayPathState::PassExpired,
+            own_relay_usable: false,
+            direct_link: true,
+            relay_reject_streak: CONTACT_RELAY_STALE_STREAK,
+            relay_rejected_at_ms: NOW,
+            ..waiting(2)
+        })
+        .unwrap();
+        assert_eq!(line.state, CoreDeliveryState::Sending);
+        assert_eq!(line.blocked_reason, None);
+
+        // Except for a message the framing itself will not carry, which no
+        // amount of proximity fixes.
+        let line = core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+            direct_link: true,
+            oversized_waiting: true,
+            ..waiting(1)
+        })
+        .unwrap();
+        assert_eq!(
+            line.blocked_reason,
+            Some(CoreDeliveryBlockedReason::MessageTooLarge)
+        );
+    }
+
+    #[test]
+    fn delayed_needs_a_usable_route_and_a_real_age() {
+        // Exactly at the threshold, with a route: delayed.
+        let stalled = CoreRecipientDeliveryInput {
+            oldest_waiting_ms: NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+            last_progress_ms: NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+            ..waiting(2)
+        };
+        assert!(core_classify_recipient_delivery(stalled).unwrap().delayed);
+
+        // One millisecond short of it: not yet.
+        assert!(
+            !core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+                oldest_waiting_ms: NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS + 1,
+                last_progress_ms: NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS + 1,
+                ..waiting(2)
+            })
+            .unwrap()
+            .delayed
+        );
+
+        // A recent upload resets it even though the oldest message is old:
+        // something is moving, which is the whole question.
+        assert!(
+            !core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+                oldest_waiting_ms: NOW - 10 * RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+                last_progress_ms: NOW - 1_000,
+                ..waiting(2)
+            })
+            .unwrap()
+            .delayed
+        );
+
+        // Nothing has ever moved, so the wait is dated from the message.
+        assert!(
+            core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+                oldest_waiting_ms: NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+                last_progress_ms: 0,
+                ..waiting(2)
+            })
+            .unwrap()
+            .delayed
+        );
+
+        // No usable route: age means nothing.
+        assert!(
+            !core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+                oldest_waiting_ms: NOW - 100 * RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+                last_progress_ms: 0,
+                ..offline(2)
+            })
+            .unwrap()
+            .delayed
+        );
+    }
+
+    #[test]
+    fn unknown_and_backwards_timestamps_never_invent_a_delay() {
+        // Both directions resolve to "not delayed": a red row assembled from a
+        // missing number, or from a clock that moved, is worse than silence.
+        assert!(!delivery_progress_stalled(0, 0, NOW));
+        assert!(!delivery_progress_stalled(-1, -1, NOW));
+        assert!(!delivery_progress_stalled(NOW + 60_000, NOW + 60_000, NOW));
+        assert!(!delivery_progress_stalled(
+            0,
+            NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS + 1,
+            NOW
+        ));
+        assert!(delivery_progress_stalled(
+            0,
+            NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+            NOW
+        ));
+    }
+
+    #[test]
+    fn the_person_verdict_uses_stale_thresholds_not_the_probe_windows() {
+        // A written-off card becomes probe-eligible again every six hours.
+        // That must not blink the row a person is reading back to normal.
+        let rejected_at = NOW - CONTACT_RELAY_RECHECK_MS;
+        let line = core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+            relay_reject_streak: CONTACT_RELAY_STALE_STREAK,
+            relay_rejected_at_ms: rejected_at,
+            ..waiting(2)
+        })
+        .unwrap();
+        assert_eq!(
+            line.blocked_reason,
+            Some(CoreDeliveryBlockedReason::ContactSetupRejected)
+        );
+
+        // And a rest that has not yet become actionable stays quiet: two
+        // silent passes stop us hammering the host, but are not enough to tell
+        // a person their friend's setup is broken.
+        let line = core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+            relay_unreachable_streak: CONTACT_RELAY_UNREACHABLE_STREAK,
+            relay_unreachable_at_ms: NOW,
+            ..waiting(2)
+        })
+        .unwrap();
+        assert_eq!(line.blocked_reason, None);
+        assert_eq!(line.state, CoreDeliveryState::WillDeliverWhenReconnected);
+    }
+
+    #[test]
+    fn attention_follows_the_reason_and_orders_by_severity() {
+        let cases = [
+            (
+                CoreRecipientDeliveryInput {
+                    relay_reject_streak: CONTACT_RELAY_STALE_STREAK,
+                    relay_rejected_at_ms: NOW,
+                    ..waiting(2)
+                },
+                CorePersonAttention::SetupRejected,
+            ),
+            (
+                CoreRecipientDeliveryInput {
+                    relay: CoreRelayPathState::PassExpired,
+                    own_relay_usable: false,
+                    ..waiting(2)
+                },
+                CorePersonAttention::PassBlocked,
+            ),
+            (
+                CoreRecipientDeliveryInput {
+                    oversized_waiting: true,
+                    ..waiting(1)
+                },
+                CorePersonAttention::MessageTooLarge,
+            ),
+            (
+                CoreRecipientDeliveryInput {
+                    oldest_waiting_ms: NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+                    last_progress_ms: 0,
+                    ..waiting(2)
+                },
+                CorePersonAttention::Delayed,
+            ),
+        ];
+        for (input, want) in cases {
+            let line = core_classify_recipient_delivery(input).unwrap();
+            assert_eq!(line.attention, Some(want));
+        }
+
+        // And the verdict feeds the grouping directly, without a second
+        // opinion about who needs attention.
+        let line = core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+            relay_reject_streak: CONTACT_RELAY_STALE_STREAK,
+            relay_rejected_at_ms: NOW,
+            ..waiting(2)
+        })
+        .unwrap();
+        let groups = core_group_people(
+            vec![CorePersonHealthInput {
+                direct_link: Some(CoreDirectLink::Bluetooth),
+                attention: line.attention,
+                attention_since_ms: line.oldest_waiting_ms,
+                ..person("Ash", 1)
+            }],
+            true,
+            NOW,
+        );
+        assert_eq!(ids(&groups.needs_attention), vec![1]);
+    }
+
+    #[test]
+    fn the_line_carries_the_count_and_age_the_copy_needs() {
+        let line = core_classify_recipient_delivery(waiting(7)).unwrap();
+        assert_eq!(line.count, 7);
+        assert_eq!(line.oldest_waiting_ms, NOW - 60_000);
+    }
+
+    #[test]
+    fn the_phase_one_door_can_never_reach_delayed_or_blocked() {
+        // One decision procedure, two doors. The old entry point cannot
+        // produce a fault or a delay because it has no evidence for one --
+        // not because a second implementation withholds it.
+        for relay in [
+            CoreRelayPathState::Connected,
+            CoreRelayPathState::SyncingSlowed,
+            CoreRelayPathState::WaitingForInternet,
+            CoreRelayPathState::Unreachable,
+            CoreRelayPathState::PassExpired,
+            CoreRelayPathState::PassSuspended,
+            CoreRelayPathState::SetupRejected,
+            CoreRelayPathState::StorageFull,
+            CoreRelayPathState::Checking,
+            CoreRelayPathState::NotSetUp,
+        ] {
+            for own_relay_usable in [true, false] {
+                for direct_link in [true, false] {
+                    for contact_relay_stale in [true, false] {
+                        let state = core_classify_delivery_line(CoreDeliveryLineInput {
+                            relay,
+                            own_relay_usable,
+                            direct_link,
+                            contact_relay_stale,
+                            ..queued(3)
+                        });
+                        assert!(matches!(
+                            state,
+                            None | Some(CoreDeliveryState::Sending)
+                                | Some(CoreDeliveryState::WaitingForInternet)
+                                | Some(CoreDeliveryState::WillDeliverWhenReconnected)
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

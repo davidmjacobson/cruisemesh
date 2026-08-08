@@ -112,9 +112,11 @@ use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::groups::{canonicalize_members, validate_group};
+use crate::limits::MAX_ENVELOPE_SEALED_BYTES;
 use crate::{
-    verify_introduction_ticket, CoreError, FriendDirectoryContent, Group, IntroductionTicket,
-    RelayUpdateContent, SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST, MS_PER_DAY,
+    core_is_visible_chat_kind, verify_introduction_ticket, CoreError, FriendDirectoryContent,
+    Group, IntroductionTicket, RelayUpdateContent, SuggestedFriendCard,
+    KIND_INTRODUCED_FRIEND_REQUEST, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
 };
 
 /// FC6: recover from mutex poisoning instead of propagating it as a panic.
@@ -621,6 +623,83 @@ pub struct OutboundEnvelope {
 pub struct RelayQueueDepth {
     pub recipient_user_id: Vec<u8>,
     pub queued: u64,
+}
+
+/// What one friend's outgoing mail actually looks like right now, in the terms
+/// the connection details page needs to say something true about it.
+///
+/// Deliberately a separate record from [`RelayQueueDepth`] rather than more
+/// fields on it. That record answers a diagnostic question -- how many rows are
+/// still waiting for relay upload -- and the page's whole problem was that the
+/// answer looks like a delivery failure when it is not: a phone with no Shore
+/// Pass never stamps `relay_posted_at`, so its "backlog" is every message
+/// written inside the retention window, forever, underneath a row that already
+/// says the friend received one. Growing that record until it could serve both
+/// purposes would have made every field mean "it depends".
+///
+/// Everything here is a fact, never a verdict. The classification lives in
+/// `crate::connection_health`, which turns these numbers plus this device's own
+/// path state into the line a person reads.
+///
+/// Scope, and why: **the pairwise conversation with this person only.** A
+/// group message is queued once against the group id, not once per member, so
+/// there is no per-member row to count in the first place -- and even if there
+/// were, there would be nothing to clear it with: group wire receipts are
+/// deferred, so no group message's delivery is ever confirmed per member.
+/// Attributing group mail to members here would report every group message as
+/// waiting for everyone until its envelope expired a week later, which is
+/// precisely the permanent false warning this page exists to remove. What
+/// cannot be proven is left out.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct CoreRecipientDeliveryStatus {
+    pub recipient_user_id: Vec<u8>,
+    /// User-visible messages we authored to this person that their delivery
+    /// receipt does not yet cover, and whose envelopes have not expired.
+    /// Hidden control kinds (endpoint hints, profile sync, relay-change
+    /// notices, reactions) share the same lamport stream and are excluded:
+    /// they produce no chat row, so counting them would inflate the number a
+    /// person reads against messages they can actually see.
+    pub waiting_count: u64,
+    /// When the oldest of those started waiting, epoch ms; `0` when none.
+    /// Orders the Needs attention group and dates the delayed line.
+    ///
+    /// This device's queue time, deliberately, not the message's displayed
+    /// timestamp: causal ordering floors an authored timestamp above
+    /// everything already in the chat, so a peer with a fast clock can push
+    /// ours forward and make a message that has been stuck for an hour read as
+    /// newer than it is.
+    pub oldest_waiting_ms: i64,
+    /// The newest evidence that this person's mail is *moving*, epoch ms; `0`
+    /// when nothing has ever moved.
+    ///
+    /// Defined as the later of the two things this store actually records as
+    /// progress toward one recipient:
+    ///
+    /// * the newest successful relay upload for them
+    ///   (`outbound_envelopes.relay_posted_at`, stamped only by an accepted
+    ///   POST), and
+    /// * the newest delivery confirmation from them
+    ///   (`peer_connection_summary.last_delivered_at_ms`, stamped when their
+    ///   receipt comes back, on whichever transport carried it -- which is
+    ///   also the only direct-link delivery evidence that exists, since a
+    ///   message handed over Bluetooth leaves no other durable mark).
+    ///
+    /// Queueing is deliberately not progress: a person typing four more
+    /// messages into a stuck conversation must not reset the delay clock.
+    /// Nor is a receipt *watermark* on its own -- it carries no timestamp, so
+    /// the confirmation event above is what dates it.
+    pub last_progress_ms: i64,
+    /// A waiting envelope is larger than any transport will carry (the sealed
+    /// ceiling is enforced identically by the relay and by peer framing), so
+    /// retrying can never deliver it.
+    pub oversized_waiting: bool,
+    /// Persisted contact-endpoint health, straight from `contacts` (see
+    /// `crate::contact_relay_health` for what the numbers mean). Passed
+    /// through rather than interpreted here so one module owns the thresholds.
+    pub relay_reject_streak: i64,
+    pub relay_rejected_at_ms: i64,
+    pub relay_unreachable_streak: i64,
+    pub relay_unreachable_at_ms: i64,
 }
 
 /// User-visible choices for the content portion of an encrypted account
@@ -2877,6 +2956,143 @@ impl MessageStore {
             })
             .map_err(store_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Per-recipient delivery state for the connection details page: how much
+    /// of what we said to each person is still unaccounted for, how old it is,
+    /// when anything last moved, and what their endpoint's persisted health
+    /// says.
+    ///
+    /// Driven from the *recipient* side, one index seek per person, never a
+    /// walk of message history. A field store carries six figures of envelopes
+    /// and a hundred megabytes of database; a query whose cost tracked total
+    /// history would have to be run off the main thread and would still get
+    /// slower every week the phone was used. Each recipient costs:
+    ///
+    /// * one primary-key probe of `blocked_identities`;
+    /// * one primary-key read of `contacts`;
+    /// * one primary-key read of `receipts` for their delivery watermark;
+    /// * one primary-key read of `peer_connection_summary`; and
+    /// * one range seek on `idx_outbound_recipient_chat_lamport` covering
+    ///   exactly the envelopes above that watermark -- the unacknowledged
+    ///   ones, which is the set the page is about. Everything already
+    ///   confirmed is skipped by the seek rather than filtered afterwards.
+    ///
+    /// See [`recipient_waiting_sql`] for the statement itself and
+    /// `recipient_delivery_query_seeks_the_recipient_index` for the plan test
+    /// that keeps it honest.
+    ///
+    /// Blocked identities are dropped rather than reported: a block is a
+    /// tombstone and this page must not surface the person in any form. That
+    /// filter is here, in the query, so a caller cannot forget it.
+    pub fn recipient_delivery_status(
+        &self,
+        own_user_id: Vec<u8>,
+        recipient_user_ids: Vec<Vec<u8>>,
+        now_ms: i64,
+    ) -> Result<Vec<CoreRecipientDeliveryStatus>, CoreError> {
+        if own_user_id.is_empty() {
+            return Err(CoreError::Malformed("own user id must not be empty".into()));
+        }
+        let conn = lock_conn(&self.conn);
+        let waiting_sql = recipient_waiting_sql();
+        let mut blocked_stmt = conn
+            .prepare("SELECT 1 FROM blocked_identities WHERE user_id = ?1")
+            .map_err(store_err)?;
+        let mut contact_stmt = conn
+            .prepare(
+                "SELECT relay_reject_streak, relay_rejected_at,
+                        relay_unreachable_streak, relay_unreachable_at
+                 FROM contacts WHERE user_id = ?1",
+            )
+            .map_err(store_err)?;
+        let mut receipt_stmt = conn
+            .prepare(
+                "SELECT through_lamport FROM receipts
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
+            )
+            .map_err(store_err)?;
+        let mut delivered_stmt = conn
+            .prepare(
+                "SELECT COALESCE(MAX(last_delivered_at_ms), 0)
+                 FROM peer_connection_summary WHERE user_id = ?1",
+            )
+            .map_err(store_err)?;
+        let mut waiting_stmt = conn.prepare(&waiting_sql).map_err(store_err)?;
+
+        let mut out = Vec::with_capacity(recipient_user_ids.len());
+        for recipient in recipient_user_ids {
+            if recipient.is_empty() || recipient.len() > 128 {
+                return Err(CoreError::Malformed("invalid recipient user id".into()));
+            }
+            let blocked = blocked_stmt
+                .query_row(params![&recipient], |_| Ok(()))
+                .optional()
+                .map_err(store_err)?
+                .is_some();
+            if blocked {
+                continue;
+            }
+            // A receipt covers everything at or below its watermark, so the
+            // seek starts strictly above it. An over-reported watermark (the
+            // repair lane reports a peer-stream MAX that can sit above
+            // anything we hold) simply empties the range, which reads as
+            // "nothing outstanding" -- the honest answer.
+            let through_lamport: i64 = receipt_stmt
+                .query_row(
+                    params![&recipient, &own_user_id, RECEIPT_TYPE_DELIVERED as i64],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(store_err)?
+                .unwrap_or(0);
+            let (waiting_count, oldest_waiting_ms, last_upload_ms, oversized_waiting) =
+                waiting_stmt
+                    .query_row(
+                        params![
+                            &recipient,
+                            through_lamport,
+                            now_ms,
+                            MAX_ENVELOPE_SEALED_BYTES as i64
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)? != 0,
+                            ))
+                        },
+                    )
+                    .map_err(store_err)?;
+            let last_delivered_ms: i64 = delivered_stmt
+                .query_row(params![&recipient], |row| row.get(0))
+                .map_err(store_err)?;
+            let (reject_streak, rejected_at, unreachable_streak, unreachable_at) = contact_stmt
+                .query_row(params![&recipient], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .optional()
+                .map_err(store_err)?
+                .unwrap_or((0, 0, 0, 0));
+            out.push(CoreRecipientDeliveryStatus {
+                recipient_user_id: recipient,
+                waiting_count: waiting_count.max(0) as u64,
+                oldest_waiting_ms: oldest_waiting_ms.max(0),
+                last_progress_ms: last_upload_ms.max(last_delivered_ms).max(0),
+                oversized_waiting,
+                relay_reject_streak: reject_streak,
+                relay_rejected_at_ms: rejected_at,
+                relay_unreachable_streak: unreachable_streak,
+                relay_unreachable_at_ms: unreachable_at,
+            });
+        }
+        Ok(out)
     }
 
     /// Mark one outbound envelope as successfully posted to a relay. Returns
@@ -6549,6 +6765,74 @@ fn ensure_column(
     Ok(())
 }
 
+/// The chat kinds that produce a row a person can actually see, as a SQL
+/// literal list.
+///
+/// Generated from [`core_is_visible_chat_kind`] rather than written out, so
+/// the SQL cannot drift from the predicate the chat screens filter with. That
+/// matters more here than it looks: hidden control kinds -- endpoint hints,
+/// profile sync, relay-change notices, friend directories, reactions -- share
+/// the *same lamport stream* as visible messages and ride the same outbound
+/// queue. A count that included them would tell a person "6 messages waiting"
+/// for two typed sentences plus four pieces of bookkeeping, and would do it
+/// worst on exactly the busiest, most-synced conversations.
+fn visible_chat_kind_sql_list() -> String {
+    (u8::MIN..=u8::MAX)
+        .filter(|kind| core_is_visible_chat_kind(*kind))
+        .map(|kind| kind.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The per-recipient waiting-work query behind
+/// [`MessageStore::recipient_delivery_status`], built in one place so the
+/// query-plan test explains the statement the code actually runs (the lesson
+/// of the carried-upload plan test, which once passed against SQL that no
+/// longer existed).
+///
+/// Parameters: `?1` recipient user id, `?2` their delivery receipt watermark,
+/// `?3` now, `?4` the sealed-envelope ceiling.
+///
+/// The `WHERE` clause is the whole performance story. `recipient_user_id = ?1
+/// AND chat_id = ?1` is the pairwise conversation with that person (a 1:1 chat
+/// is keyed by the other party's user id), and `lamport > ?2` starts the seek
+/// immediately above what their receipt already covers. Together they name a
+/// contiguous slice of `idx_outbound_recipient_chat_lamport` containing
+/// exactly the unacknowledged envelopes -- no history walk, and no growth as
+/// the conversation gets longer, since everything confirmed falls below the
+/// seek.
+///
+/// Expiry and kind are applied as residual filters inside the aggregate rather
+/// than as index columns: a leading range column would cost the seek, and the
+/// rows they filter are already only the unacknowledged ones.
+///
+/// `MAX(relay_posted_at)` deliberately spans the whole slice including hidden
+/// kinds -- posting any envelope for this person is progress on their queue,
+/// whether or not it shows up in the chat.
+///
+/// The age comes from `queued_at`, not from the message's own `timestamp`.
+/// They differ: an authored message's display timestamp is floored above
+/// everything already in the chat, so a peer whose clock runs fast drags our
+/// next few timestamps forward with it, and a message could read as newer than
+/// the moment it was written. `queued_at` is this device's own record of when
+/// the wait began, which is the number "waiting 14 min" is actually claiming.
+fn recipient_waiting_sql() -> String {
+    let visible = visible_chat_kind_sql_list();
+    format!(
+        "SELECT
+             COALESCE(SUM(CASE WHEN expiry > ?3 AND kind IN ({visible})
+                               THEN 1 ELSE 0 END), 0),
+             COALESCE(MIN(CASE WHEN expiry > ?3 AND kind IN ({visible})
+                               THEN queued_at END), 0),
+             COALESCE(MAX(relay_posted_at), 0),
+             COALESCE(MAX(CASE WHEN expiry > ?3 AND kind IN ({visible})
+                                    AND LENGTH(sealed) > ?4
+                               THEN 1 ELSE 0 END), 0)
+         FROM outbound_envelopes
+         WHERE recipient_user_id = ?1 AND chat_id = ?1 AND lamport > ?2"
+    )
+}
+
 /// The relay-upload query for [`MessageStore::family_carried_envelopes`],
 /// built in one place so the query-plan test can explain the query the code
 /// actually runs. It used to keep its own copy of this SQL, which meant it
@@ -6824,6 +7108,16 @@ CREATE INDEX IF NOT EXISTS idx_outbound_chat_sender_lamport
 CREATE INDEX IF NOT EXISTS idx_outbound_relay_posted_queued
     ON outbound_envelopes(relay_posted_at, queued_at);
 CREATE INDEX IF NOT EXISTS idx_outbound_expiry ON outbound_envelopes(expiry);
+-- Supports `recipient_waiting_sql`: the connection details page asks, per
+-- friend, what is still outstanding for them, and must answer from a seek
+-- rather than a scan. The two equality columns lead so the pairwise
+-- conversation with one person is a single index range; `lamport` follows so
+-- the range can start immediately above their delivery receipt watermark and
+-- skip everything already confirmed. Every column has been in the table since
+-- its first version, so this belongs in SCHEMA (replayed on every open) rather
+-- than beside the later migrations in `open`.
+CREATE INDEX IF NOT EXISTS idx_outbound_recipient_chat_lamport
+    ON outbound_envelopes(recipient_user_id, chat_id, lamport);
 
 CREATE TABLE IF NOT EXISTS carried_envelopes (
     msg_id         BLOB PRIMARY KEY,
@@ -9055,6 +9349,385 @@ mod tests {
                     queued: 2,
                 },
             ],
+        );
+    }
+
+    // --- per-recipient delivery read model ---------------------------------
+
+    const ALICE: &[u8] = b"alice";
+    const BOB: &[u8] = b"bob";
+    const CAROL: &[u8] = b"carol";
+    const DELIVERY_NOW: i64 = 2_000_000;
+
+    /// Queue one outbound envelope in the pairwise conversation with
+    /// `recipient` (1:1 chats are keyed by the other party's user id).
+    fn queue_pairwise(
+        store: &MessageStore,
+        recipient: &[u8],
+        lamport: u64,
+        kind: u8,
+        timestamp: i64,
+        expiry: i64,
+        sealed_len: usize,
+    ) -> Vec<u8> {
+        let message = StoredMessage {
+            chat_id: recipient.to_vec(),
+            sender_user_id: ALICE.to_vec(),
+            lamport,
+            timestamp,
+            kind,
+            payload: b"body".to_vec(),
+        };
+        let msg_id = format!("out-{}-{lamport}", String::from_utf8_lossy(recipient)).into_bytes();
+        let mut envelope = outbound_for(&message, recipient, &msg_id);
+        envelope.expiry = expiry;
+        envelope.sealed = vec![7u8; sealed_len];
+        store
+            .insert_outgoing_message(message, envelope, timestamp)
+            .unwrap();
+        msg_id
+    }
+
+    #[test]
+    fn the_waiting_age_is_when_we_queued_it_not_when_it_claims_to_be_from() {
+        // Causal ordering floors an authored timestamp above everything
+        // already in the chat, so a peer with a fast clock drags ours forward
+        // with it. Dating the wait from the displayed timestamp would let a
+        // message stuck for an hour read as newer than the moment it was
+        // written -- and, at a display timestamp beyond `now`, would suppress
+        // the delayed line entirely.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let message = StoredMessage {
+            chat_id: BOB.to_vec(),
+            sender_user_id: ALICE.to_vec(),
+            lamport: 1,
+            timestamp: DELIVERY_NOW + 3_600_000,
+            kind: crate::KIND_TEXT,
+            payload: b"body".to_vec(),
+        };
+        let mut envelope = outbound_for(&message, BOB, b"out-bob-skewed");
+        envelope.expiry = DELIVERY_NOW + 60_000;
+        store
+            .insert_outgoing_message(message, envelope, 1_000_000)
+            .unwrap();
+
+        let bob = delivery_status(&store, BOB);
+        assert_eq!(bob.waiting_count, 1);
+        assert_eq!(bob.oldest_waiting_ms, 1_000_000);
+    }
+
+    fn delivery_status(store: &MessageStore, recipient: &[u8]) -> CoreRecipientDeliveryStatus {
+        store
+            .recipient_delivery_status(ALICE.to_vec(), vec![recipient.to_vec()], DELIVERY_NOW)
+            .unwrap()
+            .pop()
+            .expect("a status row per unblocked recipient")
+    }
+
+    #[test]
+    fn recipient_delivery_counts_only_unacknowledged_visible_pairwise_messages() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let live = DELIVERY_NOW + 60_000;
+        queue_pairwise(&store, BOB, 1, crate::KIND_TEXT, 1_000_000, live, 32);
+        // A hidden control kind sharing the same lamport stream. Counting it
+        // would tell a person two sentences were four messages.
+        queue_pairwise(
+            &store,
+            BOB,
+            2,
+            crate::KIND_PROFILE_SYNC,
+            1_050_000,
+            live,
+            32,
+        );
+        queue_pairwise(&store, BOB, 3, crate::KIND_TEXT, 1_100_000, live, 32);
+        // Past its expiry: no path will carry it again, so it is not waiting
+        // work any more.
+        queue_pairwise(
+            &store,
+            BOB,
+            4,
+            crate::KIND_TEXT,
+            1_150_000,
+            DELIVERY_NOW - 1,
+            32,
+        );
+        // Another conversation entirely.
+        queue_pairwise(&store, CAROL, 1, crate::KIND_TEXT, 1_200_000, live, 32);
+
+        let bob = delivery_status(&store, BOB);
+        assert_eq!(bob.waiting_count, 2);
+        assert_eq!(bob.oldest_waiting_ms, 1_000_000);
+        assert_eq!(delivery_status(&store, CAROL).waiting_count, 1);
+
+        // Their receipt covers the first message: it stops being counted, and
+        // the age moves to what is genuinely still outstanding.
+        store
+            .record_receipt(
+                BOB.to_vec(),
+                ALICE.to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                1,
+                None,
+            )
+            .unwrap();
+        let bob = delivery_status(&store, BOB);
+        assert_eq!(bob.waiting_count, 1);
+        assert_eq!(bob.oldest_waiting_ms, 1_100_000);
+
+        // An over-reported watermark (the receipt-repair lane reports a peer
+        // stream MAX) empties the range rather than going negative.
+        store
+            .record_receipt(
+                BOB.to_vec(),
+                ALICE.to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                9_999,
+                None,
+            )
+            .unwrap();
+        let bob = delivery_status(&store, BOB);
+        assert_eq!(bob.waiting_count, 0);
+        assert_eq!(bob.oldest_waiting_ms, 0);
+    }
+
+    #[test]
+    fn hidden_kinds_alone_are_never_waiting_messages() {
+        // Endpoint hints and relay-change notices fly between two phones that
+        // have said nothing to each other in weeks. That must read as an empty
+        // conversation, not as a backlog.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let live = DELIVERY_NOW + 60_000;
+        for (i, kind) in [
+            crate::KIND_LAN_ENDPOINT_HINT,
+            crate::KIND_PROFILE_SYNC,
+            crate::KIND_RELAY_UPDATE,
+            crate::KIND_REACTION,
+            crate::KIND_FRIEND_DIRECTORY,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            queue_pairwise(&store, BOB, i as u64 + 1, kind, 1_000_000, live, 32);
+        }
+        let bob = delivery_status(&store, BOB);
+        assert_eq!(bob.waiting_count, 0);
+        assert_eq!(bob.oldest_waiting_ms, 0);
+    }
+
+    #[test]
+    fn group_mail_is_never_attributed_to_a_member() {
+        // A group envelope is queued once against the group id, and no group
+        // receipt exists to clear it. Counting it under each member would put
+        // a permanent waiting line beneath everyone in the chat.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let group = b"group-vacation";
+        let message = StoredMessage {
+            chat_id: group.to_vec(),
+            sender_user_id: ALICE.to_vec(),
+            lamport: 1,
+            timestamp: 1_000_000,
+            kind: crate::KIND_TEXT,
+            payload: b"body".to_vec(),
+        };
+        let mut envelope = outbound_for(&message, group, b"out-group-1");
+        envelope.expiry = DELIVERY_NOW + 60_000;
+        store
+            .insert_outgoing_message(message, envelope, 1_000_000)
+            .unwrap();
+
+        assert_eq!(delivery_status(&store, BOB).waiting_count, 0);
+    }
+
+    #[test]
+    fn blocked_identities_get_no_delivery_row_at_all() {
+        // A block is a tombstone, and the filter lives in the query so no
+        // caller can forget it.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        queue_pairwise(
+            &store,
+            BOB,
+            1,
+            crate::KIND_TEXT,
+            1_000_000,
+            DELIVERY_NOW + 60_000,
+            32,
+        );
+        store.block_user(BOB.to_vec(), 1_500_000).unwrap();
+
+        let rows = store
+            .recipient_delivery_status(
+                ALICE.to_vec(),
+                vec![BOB.to_vec(), CAROL.to_vec()],
+                DELIVERY_NOW,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].recipient_user_id, CAROL.to_vec());
+    }
+
+    #[test]
+    fn last_progress_takes_the_newer_of_an_upload_and_a_confirmation() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let live = DELIVERY_NOW + 60_000;
+        let first = queue_pairwise(&store, BOB, 1, crate::KIND_TEXT, 1_000_000, live, 32);
+        queue_pairwise(&store, BOB, 2, crate::KIND_TEXT, 1_100_000, live, 32);
+
+        // Nothing has moved yet.
+        assert_eq!(delivery_status(&store, BOB).last_progress_ms, 0);
+
+        // An accepted upload is progress.
+        store
+            .mark_outbound_envelope_relay_posted(first, 1_400_000)
+            .unwrap();
+        assert_eq!(delivery_status(&store, BOB).last_progress_ms, 1_400_000);
+
+        // So is a confirmation coming back, on whichever transport carried it
+        // -- which is the only durable mark a Bluetooth hand-off leaves.
+        store
+            .record_peer_connection_event(
+                BOB.to_vec(),
+                PeerConnectionTransport::Bluetooth,
+                PeerConnectionEventKind::MessageDelivered,
+                1_700_000,
+            )
+            .unwrap();
+        assert_eq!(delivery_status(&store, BOB).last_progress_ms, 1_700_000);
+
+        // An older confirmation on another path never drags it backwards.
+        store
+            .record_peer_connection_event(
+                BOB.to_vec(),
+                PeerConnectionTransport::ShorePass,
+                PeerConnectionEventKind::MessageDelivered,
+                1_200_000,
+            )
+            .unwrap();
+        assert_eq!(delivery_status(&store, BOB).last_progress_ms, 1_700_000);
+
+        // And merely queueing more work is not progress: a person typing into
+        // a stuck conversation must not reset the delay clock.
+        queue_pairwise(&store, BOB, 3, crate::KIND_TEXT, 1_900_000, live, 32);
+        assert_eq!(delivery_status(&store, BOB).last_progress_ms, 1_700_000);
+    }
+
+    #[test]
+    fn an_envelope_no_transport_will_carry_is_reported_as_oversized() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let live = DELIVERY_NOW + 60_000;
+        queue_pairwise(
+            &store,
+            BOB,
+            1,
+            crate::KIND_TEXT,
+            1_000_000,
+            live,
+            MAX_ENVELOPE_SEALED_BYTES,
+        );
+        assert!(!delivery_status(&store, BOB).oversized_waiting);
+
+        queue_pairwise(
+            &store,
+            BOB,
+            2,
+            crate::KIND_TEXT,
+            1_100_000,
+            live,
+            MAX_ENVELOPE_SEALED_BYTES + 1,
+        );
+        assert!(delivery_status(&store, BOB).oversized_waiting);
+
+        // Once their receipt covers it, it is no longer waiting work and no
+        // longer a reason to warn anyone.
+        store
+            .record_receipt(
+                BOB.to_vec(),
+                ALICE.to_vec(),
+                crate::RECEIPT_TYPE_DELIVERED,
+                2,
+                None,
+            )
+            .unwrap();
+        assert!(!delivery_status(&store, BOB).oversized_waiting);
+    }
+
+    #[test]
+    fn persisted_contact_endpoint_health_rides_along_uninterpreted() {
+        // The thresholds belong to `contact_relay_health`; this query only
+        // carries the numbers so the classifier can apply them once.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(BOB, "Bo")).unwrap();
+        store
+            .note_contact_relay_rejected(BOB.to_vec(), 1_234_000)
+            .unwrap();
+        store
+            .note_contact_relay_unreachable(BOB.to_vec(), "endpoint".to_string(), 1_235_000)
+            .unwrap();
+
+        let bob = delivery_status(&store, BOB);
+        assert_eq!(bob.relay_reject_streak, 1);
+        assert_eq!(bob.relay_rejected_at_ms, 1_234_000);
+        assert_eq!(bob.relay_unreachable_streak, 1);
+        assert_eq!(bob.relay_unreachable_at_ms, 1_235_000);
+
+        // A recipient with no contact row at all reads as healthy rather than
+        // erroring: an unknown endpoint has never failed.
+        let carol = delivery_status(&store, CAROL);
+        assert_eq!(carol.relay_reject_streak, 0);
+        assert_eq!(carol.relay_unreachable_streak, 0);
+    }
+
+    #[test]
+    fn visible_chat_kind_sql_list_is_generated_from_the_predicate() {
+        // Written out, this list would drift from the chat screens' filter the
+        // first time a kind was added. Generated, it cannot.
+        let list = visible_chat_kind_sql_list();
+        let kinds: Vec<u8> = list
+            .split(", ")
+            .map(|kind| kind.parse::<u8>().unwrap())
+            .collect();
+        assert!(!kinds.is_empty());
+        for kind in u8::MIN..=u8::MAX {
+            assert_eq!(
+                kinds.contains(&kind),
+                core_is_visible_chat_kind(kind),
+                "kind {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn recipient_delivery_query_seeks_the_recipient_index() {
+        // A field store carries six figures of envelopes. This query must
+        // reach one person's outstanding mail by seeking a contiguous index
+        // range, never by walking the queue -- and the plan is explained
+        // against the shared builder, not a second copy of the SQL that could
+        // go on passing after the real statement changed.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let conn = lock_conn(&store.conn);
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", recipient_waiting_sql()))
+            .unwrap()
+            .query_map(
+                params![
+                    BOB.to_vec(),
+                    0i64,
+                    DELIVERY_NOW,
+                    MAX_ENVELOPE_SEALED_BYTES as i64
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let plan_text = plan.join("\n");
+        assert!(
+            plan_text.contains("idx_outbound_recipient_chat_lamport"),
+            "plan did not use the recipient index:\n{plan_text}"
+        );
+        assert!(
+            !plan_text.contains("SCAN outbound_envelopes"),
+            "plan fell back to a scan:\n{plan_text}"
         );
     }
 

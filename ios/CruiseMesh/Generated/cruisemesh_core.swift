@@ -3650,6 +3650,37 @@ public protocol MessageStoreProtocol : AnyObject {
     func recentConsumedMsgIds(limit: UInt64) throws  -> [Data]
 
     /**
+     * Per-recipient delivery state for the connection details page: how much
+     * of what we said to each person is still unaccounted for, how old it is,
+     * when anything last moved, and what their endpoint's persisted health
+     * says.
+     *
+     * Driven from the *recipient* side, one index seek per person, never a
+     * walk of message history. A field store carries six figures of envelopes
+     * and a hundred megabytes of database; a query whose cost tracked total
+     * history would have to be run off the main thread and would still get
+     * slower every week the phone was used. Each recipient costs:
+     *
+     * * one primary-key probe of `blocked_identities`;
+     * * one primary-key read of `contacts`;
+     * * one primary-key read of `receipts` for their delivery watermark;
+     * * one primary-key read of `peer_connection_summary`; and
+     * * one range seek on `idx_outbound_recipient_chat_lamport` covering
+     * exactly the envelopes above that watermark -- the unacknowledged
+     * ones, which is the set the page is about. Everything already
+     * confirmed is skipped by the seek rather than filtered afterwards.
+     *
+     * See [`recipient_waiting_sql`] for the statement itself and
+     * `recipient_delivery_query_seeks_the_recipient_index` for the plan test
+     * that keeps it honest.
+     *
+     * Blocked identities are dropped rather than reported: a block is a
+     * tombstone and this page must not surface the person in any form. That
+     * filter is here, in the query, so a caller cannot forget it.
+     */
+    func recipientDeliveryStatus(ownUserId: Data, recipientUserIds: [Data], nowMs: Int64) throws  -> [CoreRecipientDeliveryStatus]
+
+    /**
      * Record an exact lamport this device consumed from a pairwise stream
      * even though that envelope leaves no durable `msg_id`-bearing message
      * row in this chat.
@@ -6266,6 +6297,45 @@ open func recentConsumedMsgIds(limit: UInt64)throws  -> [Data] {
     return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_recent_consumed_msg_ids(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(limit),$0
+    )
+})
+}
+
+    /**
+     * Per-recipient delivery state for the connection details page: how much
+     * of what we said to each person is still unaccounted for, how old it is,
+     * when anything last moved, and what their endpoint's persisted health
+     * says.
+     *
+     * Driven from the *recipient* side, one index seek per person, never a
+     * walk of message history. A field store carries six figures of envelopes
+     * and a hundred megabytes of database; a query whose cost tracked total
+     * history would have to be run off the main thread and would still get
+     * slower every week the phone was used. Each recipient costs:
+     *
+     * * one primary-key probe of `blocked_identities`;
+     * * one primary-key read of `contacts`;
+     * * one primary-key read of `receipts` for their delivery watermark;
+     * * one primary-key read of `peer_connection_summary`; and
+     * * one range seek on `idx_outbound_recipient_chat_lamport` covering
+     * exactly the envelopes above that watermark -- the unacknowledged
+     * ones, which is the set the page is about. Everything already
+     * confirmed is skipped by the seek rather than filtered afterwards.
+     *
+     * See [`recipient_waiting_sql`] for the statement itself and
+     * `recipient_delivery_query_seeks_the_recipient_index` for the plan test
+     * that keeps it honest.
+     *
+     * Blocked identities are dropped rather than reported: a block is a
+     * tombstone and this page must not surface the person in any form. That
+     * filter is here, in the query, so a caller cannot forget it.
+     */
+open func recipientDeliveryStatus(ownUserId: Data, recipientUserIds: [Data], nowMs: Int64)throws  -> [CoreRecipientDeliveryStatus] {
+    return try  FfiConverterSequenceTypeCoreRecipientDeliveryStatus.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_recipient_delivery_status(self.uniffiClonePointer(),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterSequenceData.lower(recipientUserIds),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -9272,6 +9342,160 @@ public func FfiConverterTypeCoreConnectionHealthReport_lower(_ value: CoreConnec
 
 
 /**
+ * Everything the page says about one person's waiting mail: where it is
+ * going, whether it has stalled, what is stopping it, and where that puts
+ * them in the People grouping.
+ *
+ * The three verdict fields are layered, not alternatives, and render in this
+ * precedence: `blocked_reason`, then `delayed`, then `state`. Keeping `state`
+ * truthful underneath a fault is the point -- an expired pass stops the
+ * internet route, but the messages really will still go the moment the friend
+ * is nearby, and a page that replaced that promise with "can't be sent" would
+ * be lying about the one behaviour this product exists for.
+ */
+public struct CoreDeliveryLine {
+    /**
+     * User-visible messages the line is about. Never zero: no waiting work
+     * means no line at all.
+     */
+    public var count: UInt32
+    /**
+     * Where this work is going.
+     */
+    public var state: CoreDeliveryState
+    /**
+     * A usable route exists and nothing has progressed for
+     * [`RELAY_DELIVERY_DELAYED_THRESHOLD_MS`].
+     */
+    public var delayed: Bool
+    /**
+     * A terminal or configuration fault stops the internet route.
+     */
+    public var blockedReason: CoreDeliveryBlockedReason?
+    /**
+     * Where this person belongs in the People grouping; `None` leaves them
+     * wherever their reachability puts them.
+     */
+    public var attention: CorePersonAttention?
+    /**
+     * Authoring time of the oldest affected message, epoch ms; `0` when
+     * unknown. Dates the delayed line and orders Needs attention.
+     */
+    public var oldestWaitingMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * User-visible messages the line is about. Never zero: no waiting work
+         * means no line at all.
+         */count: UInt32,
+        /**
+         * Where this work is going.
+         */state: CoreDeliveryState,
+        /**
+         * A usable route exists and nothing has progressed for
+         * [`RELAY_DELIVERY_DELAYED_THRESHOLD_MS`].
+         */delayed: Bool,
+        /**
+         * A terminal or configuration fault stops the internet route.
+         */blockedReason: CoreDeliveryBlockedReason?,
+        /**
+         * Where this person belongs in the People grouping; `None` leaves them
+         * wherever their reachability puts them.
+         */attention: CorePersonAttention?,
+        /**
+         * Authoring time of the oldest affected message, epoch ms; `0` when
+         * unknown. Dates the delayed line and orders Needs attention.
+         */oldestWaitingMs: Int64) {
+        self.count = count
+        self.state = state
+        self.delayed = delayed
+        self.blockedReason = blockedReason
+        self.attention = attention
+        self.oldestWaitingMs = oldestWaitingMs
+    }
+}
+
+
+
+extension CoreDeliveryLine: Equatable, Hashable {
+    public static func ==(lhs: CoreDeliveryLine, rhs: CoreDeliveryLine) -> Bool {
+        if lhs.count != rhs.count {
+            return false
+        }
+        if lhs.state != rhs.state {
+            return false
+        }
+        if lhs.delayed != rhs.delayed {
+            return false
+        }
+        if lhs.blockedReason != rhs.blockedReason {
+            return false
+        }
+        if lhs.attention != rhs.attention {
+            return false
+        }
+        if lhs.oldestWaitingMs != rhs.oldestWaitingMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(count)
+        hasher.combine(state)
+        hasher.combine(delayed)
+        hasher.combine(blockedReason)
+        hasher.combine(attention)
+        hasher.combine(oldestWaitingMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDeliveryLine: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDeliveryLine {
+        return
+            try CoreDeliveryLine(
+                count: FfiConverterUInt32.read(from: &buf),
+                state: FfiConverterTypeCoreDeliveryState.read(from: &buf),
+                delayed: FfiConverterBool.read(from: &buf),
+                blockedReason: FfiConverterOptionTypeCoreDeliveryBlockedReason.read(from: &buf),
+                attention: FfiConverterOptionTypeCorePersonAttention.read(from: &buf),
+                oldestWaitingMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreDeliveryLine, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.count, into: &buf)
+        FfiConverterTypeCoreDeliveryState.write(value.state, into: &buf)
+        FfiConverterBool.write(value.delayed, into: &buf)
+        FfiConverterOptionTypeCoreDeliveryBlockedReason.write(value.blockedReason, into: &buf)
+        FfiConverterOptionTypeCorePersonAttention.write(value.attention, into: &buf)
+        FfiConverterInt64.write(value.oldestWaitingMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryLine_lift(_ buf: RustBuffer) throws -> CoreDeliveryLine {
+    return try FfiConverterTypeCoreDeliveryLine.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryLine_lower(_ value: CoreDeliveryLine) -> RustBuffer {
+    return FfiConverterTypeCoreDeliveryLine.lower(value)
+}
+
+
+/**
  * Everything the per-person delivery line consumes.
  */
 public struct CoreDeliveryLineInput {
@@ -10761,6 +10985,478 @@ public func FfiConverterTypeCoreReactionTargetSummary_lift(_ buf: RustBuffer) th
 #endif
 public func FfiConverterTypeCoreReactionTargetSummary_lower(_ value: CoreReactionTargetSummary) -> RustBuffer {
     return FfiConverterTypeCoreReactionTargetSummary.lower(value)
+}
+
+
+/**
+ * Everything the per-recipient delivery classification consumes.
+ *
+ * The first block comes verbatim from
+ * [`crate::CoreRecipientDeliveryStatus`] -- the store's answer to "what is
+ * still outstanding for this person" -- and the second from this device's own
+ * path state, which the shell already holds. Nothing here is a verdict; the
+ * verdicts are all below.
+ */
+public struct CoreRecipientDeliveryInput {
+    /**
+     * User-visible messages their delivery receipt does not cover.
+     */
+    public var waitingCount: UInt32
+    /**
+     * Authoring time of the oldest of those, epoch ms; `0` when unknown.
+     */
+    public var oldestWaitingMs: Int64
+    /**
+     * Newest evidence that their mail moved, epoch ms; `0` when none.
+     */
+    public var lastProgressMs: Int64
+    /**
+     * A waiting envelope exceeds what any transport will carry.
+     */
+    public var oversizedWaiting: Bool
+    /**
+     * Persisted contact-endpoint health, interpreted here through
+     * `crate::contact_relay_health` rather than re-derived.
+     */
+    public var relayRejectStreak: Int64
+    public var relayRejectedAtMs: Int64
+    public var relayUnreachableStreak: Int64
+    public var relayUnreachableAtMs: Int64
+    /**
+     * This phone's own Shore Pass path, normalized
+     * ([`CoreConnectionEvidence::relay`]).
+     */
+    public var relay: CoreRelayPathState
+    /**
+     * This phone's own Shore Pass path can deliver right now
+     * ([`CoreConnectionEvidence::own_relay_usable`]).
+     */
+    public var ownRelayUsable: Bool
+    /**
+     * Their friend card carries an internet-delivery endpoint at all.
+     * Without one, nothing about our pass or their pass is relevant to them.
+     */
+    public var contactHasRelayEndpoint: Bool
+    /**
+     * A live direct link to this person exists right now.
+     */
+    public var directLink: Bool
+    public var nowMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * User-visible messages their delivery receipt does not cover.
+         */waitingCount: UInt32,
+        /**
+         * Authoring time of the oldest of those, epoch ms; `0` when unknown.
+         */oldestWaitingMs: Int64,
+        /**
+         * Newest evidence that their mail moved, epoch ms; `0` when none.
+         */lastProgressMs: Int64,
+        /**
+         * A waiting envelope exceeds what any transport will carry.
+         */oversizedWaiting: Bool,
+        /**
+         * Persisted contact-endpoint health, interpreted here through
+         * `crate::contact_relay_health` rather than re-derived.
+         */relayRejectStreak: Int64, relayRejectedAtMs: Int64, relayUnreachableStreak: Int64, relayUnreachableAtMs: Int64,
+        /**
+         * This phone's own Shore Pass path, normalized
+         * ([`CoreConnectionEvidence::relay`]).
+         */relay: CoreRelayPathState,
+        /**
+         * This phone's own Shore Pass path can deliver right now
+         * ([`CoreConnectionEvidence::own_relay_usable`]).
+         */ownRelayUsable: Bool,
+        /**
+         * Their friend card carries an internet-delivery endpoint at all.
+         * Without one, nothing about our pass or their pass is relevant to them.
+         */contactHasRelayEndpoint: Bool,
+        /**
+         * A live direct link to this person exists right now.
+         */directLink: Bool, nowMs: Int64) {
+        self.waitingCount = waitingCount
+        self.oldestWaitingMs = oldestWaitingMs
+        self.lastProgressMs = lastProgressMs
+        self.oversizedWaiting = oversizedWaiting
+        self.relayRejectStreak = relayRejectStreak
+        self.relayRejectedAtMs = relayRejectedAtMs
+        self.relayUnreachableStreak = relayUnreachableStreak
+        self.relayUnreachableAtMs = relayUnreachableAtMs
+        self.relay = relay
+        self.ownRelayUsable = ownRelayUsable
+        self.contactHasRelayEndpoint = contactHasRelayEndpoint
+        self.directLink = directLink
+        self.nowMs = nowMs
+    }
+}
+
+
+
+extension CoreRecipientDeliveryInput: Equatable, Hashable {
+    public static func ==(lhs: CoreRecipientDeliveryInput, rhs: CoreRecipientDeliveryInput) -> Bool {
+        if lhs.waitingCount != rhs.waitingCount {
+            return false
+        }
+        if lhs.oldestWaitingMs != rhs.oldestWaitingMs {
+            return false
+        }
+        if lhs.lastProgressMs != rhs.lastProgressMs {
+            return false
+        }
+        if lhs.oversizedWaiting != rhs.oversizedWaiting {
+            return false
+        }
+        if lhs.relayRejectStreak != rhs.relayRejectStreak {
+            return false
+        }
+        if lhs.relayRejectedAtMs != rhs.relayRejectedAtMs {
+            return false
+        }
+        if lhs.relayUnreachableStreak != rhs.relayUnreachableStreak {
+            return false
+        }
+        if lhs.relayUnreachableAtMs != rhs.relayUnreachableAtMs {
+            return false
+        }
+        if lhs.relay != rhs.relay {
+            return false
+        }
+        if lhs.ownRelayUsable != rhs.ownRelayUsable {
+            return false
+        }
+        if lhs.contactHasRelayEndpoint != rhs.contactHasRelayEndpoint {
+            return false
+        }
+        if lhs.directLink != rhs.directLink {
+            return false
+        }
+        if lhs.nowMs != rhs.nowMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(waitingCount)
+        hasher.combine(oldestWaitingMs)
+        hasher.combine(lastProgressMs)
+        hasher.combine(oversizedWaiting)
+        hasher.combine(relayRejectStreak)
+        hasher.combine(relayRejectedAtMs)
+        hasher.combine(relayUnreachableStreak)
+        hasher.combine(relayUnreachableAtMs)
+        hasher.combine(relay)
+        hasher.combine(ownRelayUsable)
+        hasher.combine(contactHasRelayEndpoint)
+        hasher.combine(directLink)
+        hasher.combine(nowMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRecipientDeliveryInput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRecipientDeliveryInput {
+        return
+            try CoreRecipientDeliveryInput(
+                waitingCount: FfiConverterUInt32.read(from: &buf),
+                oldestWaitingMs: FfiConverterInt64.read(from: &buf),
+                lastProgressMs: FfiConverterInt64.read(from: &buf),
+                oversizedWaiting: FfiConverterBool.read(from: &buf),
+                relayRejectStreak: FfiConverterInt64.read(from: &buf),
+                relayRejectedAtMs: FfiConverterInt64.read(from: &buf),
+                relayUnreachableStreak: FfiConverterInt64.read(from: &buf),
+                relayUnreachableAtMs: FfiConverterInt64.read(from: &buf),
+                relay: FfiConverterTypeCoreRelayPathState.read(from: &buf),
+                ownRelayUsable: FfiConverterBool.read(from: &buf),
+                contactHasRelayEndpoint: FfiConverterBool.read(from: &buf),
+                directLink: FfiConverterBool.read(from: &buf),
+                nowMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRecipientDeliveryInput, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.waitingCount, into: &buf)
+        FfiConverterInt64.write(value.oldestWaitingMs, into: &buf)
+        FfiConverterInt64.write(value.lastProgressMs, into: &buf)
+        FfiConverterBool.write(value.oversizedWaiting, into: &buf)
+        FfiConverterInt64.write(value.relayRejectStreak, into: &buf)
+        FfiConverterInt64.write(value.relayRejectedAtMs, into: &buf)
+        FfiConverterInt64.write(value.relayUnreachableStreak, into: &buf)
+        FfiConverterInt64.write(value.relayUnreachableAtMs, into: &buf)
+        FfiConverterTypeCoreRelayPathState.write(value.relay, into: &buf)
+        FfiConverterBool.write(value.ownRelayUsable, into: &buf)
+        FfiConverterBool.write(value.contactHasRelayEndpoint, into: &buf)
+        FfiConverterBool.write(value.directLink, into: &buf)
+        FfiConverterInt64.write(value.nowMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRecipientDeliveryInput_lift(_ buf: RustBuffer) throws -> CoreRecipientDeliveryInput {
+    return try FfiConverterTypeCoreRecipientDeliveryInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRecipientDeliveryInput_lower(_ value: CoreRecipientDeliveryInput) -> RustBuffer {
+    return FfiConverterTypeCoreRecipientDeliveryInput.lower(value)
+}
+
+
+/**
+ * What one friend's outgoing mail actually looks like right now, in the terms
+ * the connection details page needs to say something true about it.
+ *
+ * Deliberately a separate record from [`RelayQueueDepth`] rather than more
+ * fields on it. That record answers a diagnostic question -- how many rows are
+ * still waiting for relay upload -- and the page's whole problem was that the
+ * answer looks like a delivery failure when it is not: a phone with no Shore
+ * Pass never stamps `relay_posted_at`, so its "backlog" is every message
+ * written inside the retention window, forever, underneath a row that already
+ * says the friend received one. Growing that record until it could serve both
+ * purposes would have made every field mean "it depends".
+ *
+ * Everything here is a fact, never a verdict. The classification lives in
+ * `crate::connection_health`, which turns these numbers plus this device's own
+ * path state into the line a person reads.
+ *
+ * Scope, and why: **the pairwise conversation with this person only.** A
+ * group message is queued once against the group id, not once per member, so
+ * there is no per-member row to count in the first place -- and even if there
+ * were, there would be nothing to clear it with: group wire receipts are
+ * deferred, so no group message's delivery is ever confirmed per member.
+ * Attributing group mail to members here would report every group message as
+ * waiting for everyone until its envelope expired a week later, which is
+ * precisely the permanent false warning this page exists to remove. What
+ * cannot be proven is left out.
+ */
+public struct CoreRecipientDeliveryStatus {
+    public var recipientUserId: Data
+    /**
+     * User-visible messages we authored to this person that their delivery
+     * receipt does not yet cover, and whose envelopes have not expired.
+     * Hidden control kinds (endpoint hints, profile sync, relay-change
+     * notices, reactions) share the same lamport stream and are excluded:
+     * they produce no chat row, so counting them would inflate the number a
+     * person reads against messages they can actually see.
+     */
+    public var waitingCount: UInt64
+    /**
+     * When the oldest of those started waiting, epoch ms; `0` when none.
+     * Orders the Needs attention group and dates the delayed line.
+     *
+     * This device's queue time, deliberately, not the message's displayed
+     * timestamp: causal ordering floors an authored timestamp above
+     * everything already in the chat, so a peer with a fast clock can push
+     * ours forward and make a message that has been stuck for an hour read as
+     * newer than it is.
+     */
+    public var oldestWaitingMs: Int64
+    /**
+     * The newest evidence that this person's mail is *moving*, epoch ms; `0`
+     * when nothing has ever moved.
+     *
+     * Defined as the later of the two things this store actually records as
+     * progress toward one recipient:
+     *
+     * * the newest successful relay upload for them
+     * (`outbound_envelopes.relay_posted_at`, stamped only by an accepted
+     * POST), and
+     * * the newest delivery confirmation from them
+     * (`peer_connection_summary.last_delivered_at_ms`, stamped when their
+     * receipt comes back, on whichever transport carried it -- which is
+     * also the only direct-link delivery evidence that exists, since a
+     * message handed over Bluetooth leaves no other durable mark).
+     *
+     * Queueing is deliberately not progress: a person typing four more
+     * messages into a stuck conversation must not reset the delay clock.
+     * Nor is a receipt *watermark* on its own -- it carries no timestamp, so
+     * the confirmation event above is what dates it.
+     */
+    public var lastProgressMs: Int64
+    /**
+     * A waiting envelope is larger than any transport will carry (the sealed
+     * ceiling is enforced identically by the relay and by peer framing), so
+     * retrying can never deliver it.
+     */
+    public var oversizedWaiting: Bool
+    /**
+     * Persisted contact-endpoint health, straight from `contacts` (see
+     * `crate::contact_relay_health` for what the numbers mean). Passed
+     * through rather than interpreted here so one module owns the thresholds.
+     */
+    public var relayRejectStreak: Int64
+    public var relayRejectedAtMs: Int64
+    public var relayUnreachableStreak: Int64
+    public var relayUnreachableAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(recipientUserId: Data,
+        /**
+         * User-visible messages we authored to this person that their delivery
+         * receipt does not yet cover, and whose envelopes have not expired.
+         * Hidden control kinds (endpoint hints, profile sync, relay-change
+         * notices, reactions) share the same lamport stream and are excluded:
+         * they produce no chat row, so counting them would inflate the number a
+         * person reads against messages they can actually see.
+         */waitingCount: UInt64,
+        /**
+         * When the oldest of those started waiting, epoch ms; `0` when none.
+         * Orders the Needs attention group and dates the delayed line.
+         *
+         * This device's queue time, deliberately, not the message's displayed
+         * timestamp: causal ordering floors an authored timestamp above
+         * everything already in the chat, so a peer with a fast clock can push
+         * ours forward and make a message that has been stuck for an hour read as
+         * newer than it is.
+         */oldestWaitingMs: Int64,
+        /**
+         * The newest evidence that this person's mail is *moving*, epoch ms; `0`
+         * when nothing has ever moved.
+         *
+         * Defined as the later of the two things this store actually records as
+         * progress toward one recipient:
+         *
+         * * the newest successful relay upload for them
+         * (`outbound_envelopes.relay_posted_at`, stamped only by an accepted
+         * POST), and
+         * * the newest delivery confirmation from them
+         * (`peer_connection_summary.last_delivered_at_ms`, stamped when their
+         * receipt comes back, on whichever transport carried it -- which is
+         * also the only direct-link delivery evidence that exists, since a
+         * message handed over Bluetooth leaves no other durable mark).
+         *
+         * Queueing is deliberately not progress: a person typing four more
+         * messages into a stuck conversation must not reset the delay clock.
+         * Nor is a receipt *watermark* on its own -- it carries no timestamp, so
+         * the confirmation event above is what dates it.
+         */lastProgressMs: Int64,
+        /**
+         * A waiting envelope is larger than any transport will carry (the sealed
+         * ceiling is enforced identically by the relay and by peer framing), so
+         * retrying can never deliver it.
+         */oversizedWaiting: Bool,
+        /**
+         * Persisted contact-endpoint health, straight from `contacts` (see
+         * `crate::contact_relay_health` for what the numbers mean). Passed
+         * through rather than interpreted here so one module owns the thresholds.
+         */relayRejectStreak: Int64, relayRejectedAtMs: Int64, relayUnreachableStreak: Int64, relayUnreachableAtMs: Int64) {
+        self.recipientUserId = recipientUserId
+        self.waitingCount = waitingCount
+        self.oldestWaitingMs = oldestWaitingMs
+        self.lastProgressMs = lastProgressMs
+        self.oversizedWaiting = oversizedWaiting
+        self.relayRejectStreak = relayRejectStreak
+        self.relayRejectedAtMs = relayRejectedAtMs
+        self.relayUnreachableStreak = relayUnreachableStreak
+        self.relayUnreachableAtMs = relayUnreachableAtMs
+    }
+}
+
+
+
+extension CoreRecipientDeliveryStatus: Equatable, Hashable {
+    public static func ==(lhs: CoreRecipientDeliveryStatus, rhs: CoreRecipientDeliveryStatus) -> Bool {
+        if lhs.recipientUserId != rhs.recipientUserId {
+            return false
+        }
+        if lhs.waitingCount != rhs.waitingCount {
+            return false
+        }
+        if lhs.oldestWaitingMs != rhs.oldestWaitingMs {
+            return false
+        }
+        if lhs.lastProgressMs != rhs.lastProgressMs {
+            return false
+        }
+        if lhs.oversizedWaiting != rhs.oversizedWaiting {
+            return false
+        }
+        if lhs.relayRejectStreak != rhs.relayRejectStreak {
+            return false
+        }
+        if lhs.relayRejectedAtMs != rhs.relayRejectedAtMs {
+            return false
+        }
+        if lhs.relayUnreachableStreak != rhs.relayUnreachableStreak {
+            return false
+        }
+        if lhs.relayUnreachableAtMs != rhs.relayUnreachableAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(recipientUserId)
+        hasher.combine(waitingCount)
+        hasher.combine(oldestWaitingMs)
+        hasher.combine(lastProgressMs)
+        hasher.combine(oversizedWaiting)
+        hasher.combine(relayRejectStreak)
+        hasher.combine(relayRejectedAtMs)
+        hasher.combine(relayUnreachableStreak)
+        hasher.combine(relayUnreachableAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRecipientDeliveryStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRecipientDeliveryStatus {
+        return
+            try CoreRecipientDeliveryStatus(
+                recipientUserId: FfiConverterData.read(from: &buf),
+                waitingCount: FfiConverterUInt64.read(from: &buf),
+                oldestWaitingMs: FfiConverterInt64.read(from: &buf),
+                lastProgressMs: FfiConverterInt64.read(from: &buf),
+                oversizedWaiting: FfiConverterBool.read(from: &buf),
+                relayRejectStreak: FfiConverterInt64.read(from: &buf),
+                relayRejectedAtMs: FfiConverterInt64.read(from: &buf),
+                relayUnreachableStreak: FfiConverterInt64.read(from: &buf),
+                relayUnreachableAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRecipientDeliveryStatus, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.recipientUserId, into: &buf)
+        FfiConverterUInt64.write(value.waitingCount, into: &buf)
+        FfiConverterInt64.write(value.oldestWaitingMs, into: &buf)
+        FfiConverterInt64.write(value.lastProgressMs, into: &buf)
+        FfiConverterBool.write(value.oversizedWaiting, into: &buf)
+        FfiConverterInt64.write(value.relayRejectStreak, into: &buf)
+        FfiConverterInt64.write(value.relayRejectedAtMs, into: &buf)
+        FfiConverterInt64.write(value.relayUnreachableStreak, into: &buf)
+        FfiConverterInt64.write(value.relayUnreachableAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRecipientDeliveryStatus_lift(_ buf: RustBuffer) throws -> CoreRecipientDeliveryStatus {
+    return try FfiConverterTypeCoreRecipientDeliveryStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRecipientDeliveryStatus_lower(_ value: CoreRecipientDeliveryStatus) -> RustBuffer {
+    return FfiConverterTypeCoreRecipientDeliveryStatus.lower(value)
 }
 
 
@@ -15630,14 +16326,147 @@ extension CoreConnectionHealth: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * The user-visible meaning of messages still waiting for one person.
+ * A terminal or configuration fault stopping the internet route to one
+ * person, and therefore the reason an error row can offer `How to fix`.
  *
- * Deliberately has no error member. Phase 1 reads only signals that already
- * exist -- receipts, waiting work, and path state -- and none of those can
- * prove a terminal failure. Waiting for a friend who is simply elsewhere is
- * what this product does, so it is never dressed as a fault. The blocked and
- * delayed reasons arrive with the per-recipient read model in Phase 2, which
- * is also what will let this take a real age.
+ * Each variant exists because it maps to different, concrete instructions
+ * (see the specification's "How to fix" section). A fault with no distinct
+ * remedy would not earn a variant -- it would just be a longer sentence
+ * describing the same button.
+ */
+
+public enum CoreDeliveryBlockedReason {
+
+    /**
+     * *Their* saved Shore Pass setup will not serve us: it authoritatively
+     * rejected our credential, or the host in their friend card has gone
+     * unanswered long enough to be actionable rather than transient.
+     *
+     * Both land here because the repair is identical and order-sensitive: the
+     * friend fixes their own pass first, *then* shares a fresh card, which is
+     * then rescanned. A card re-shared before the pass is fixed reproduces
+     * the problem exactly.
+     */
+    case contactSetupRejected
+    /**
+     * Our own pass has lapsed. Repaired under Manage Shore Pass.
+     */
+    case passExpired
+    /**
+     * Our own pass was turned off by the operator.
+     */
+    case passSuspended
+    /**
+     * Our family's hosted storage is full. It frees itself as friends collect
+     * their messages, which is the first thing the instructions must say.
+     */
+    case storageFull
+    /**
+     * Our own saved setup was rejected. Same affordance as an expired pass,
+     * separate variant because the explanation differs.
+     */
+    case ownSetupRejected
+    /**
+     * A waiting message is larger than any transport will carry. The sealed
+     * ceiling is enforced identically by the relay and by peer framing, so
+     * this is terminal on every path, not merely on the internet one -- and
+     * no amount of reconnecting will change it.
+     */
+    case messageTooLarge
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDeliveryBlockedReason: FfiConverterRustBuffer {
+    typealias SwiftType = CoreDeliveryBlockedReason
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDeliveryBlockedReason {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .contactSetupRejected
+
+        case 2: return .passExpired
+
+        case 3: return .passSuspended
+
+        case 4: return .storageFull
+
+        case 5: return .ownSetupRejected
+
+        case 6: return .messageTooLarge
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreDeliveryBlockedReason, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .contactSetupRejected:
+            writeInt(&buf, Int32(1))
+
+
+        case .passExpired:
+            writeInt(&buf, Int32(2))
+
+
+        case .passSuspended:
+            writeInt(&buf, Int32(3))
+
+
+        case .storageFull:
+            writeInt(&buf, Int32(4))
+
+
+        case .ownSetupRejected:
+            writeInt(&buf, Int32(5))
+
+
+        case .messageTooLarge:
+            writeInt(&buf, Int32(6))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryBlockedReason_lift(_ buf: RustBuffer) throws -> CoreDeliveryBlockedReason {
+    return try FfiConverterTypeCoreDeliveryBlockedReason.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryBlockedReason_lower(_ value: CoreDeliveryBlockedReason) -> RustBuffer {
+    return FfiConverterTypeCoreDeliveryBlockedReason.lower(value)
+}
+
+
+
+extension CoreDeliveryBlockedReason: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The user-visible *movement* meaning of messages still waiting for one
+ * person: what happens to them next, on the evidence available.
+ *
+ * Deliberately has no error member, and does not gain one in Phase 2. This
+ * answers "where is this work going", and the answer for a friend who is
+ * merely elsewhere is "it travels at the next encounter" whatever else is
+ * wrong -- store-and-forward through encounters is what the product does.
+ * Faults are carried alongside it as overlays on [`CoreDeliveryLine`], so a
+ * fault can explain why the *internet* route is stopped without ever turning
+ * the promise underneath into a failure.
  */
 
 public enum CoreDeliveryState {
@@ -16649,11 +17478,10 @@ extension CoreMeshRuntime: Equatable, Hashable {}
 /**
  * Why a person needs the user's attention.
  *
- * Phase 1 shells supply only `None` or [`CorePersonAttention::SetupRejected`]
- * -- the one per-person fault the app already tracks. The remaining variants
- * exist so the per-recipient delivery read model can fill them in later
- * without reshaping this API, which is also why the grouping call already
- * takes them.
+ * Produced by [`core_classify_recipient_delivery`] from the per-recipient
+ * read model, so a person's placement in the Needs attention group and the
+ * delivery line in their row are always the same verdict rather than two
+ * judgements that can disagree.
  */
 
 public enum CorePersonAttention {
@@ -16668,8 +17496,8 @@ public enum CorePersonAttention {
      */
     case messageTooLarge
     /**
-     * Our own pass cannot post on their behalf (expired, suspended, or the
-     * family's storage is full).
+     * Our own pass cannot post on their behalf: expired, suspended, our own
+     * saved setup rejected, or the family's storage is full.
      */
     case passBlocked
     /**
@@ -18566,6 +19394,30 @@ fileprivate struct FfiConverterOptionTypeCoreCarriedCursor: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreDeliveryLine: FfiConverterRustBuffer {
+    typealias SwiftType = CoreDeliveryLine?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreDeliveryLine.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreDeliveryLine.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreFailoverResumeArm: FfiConverterRustBuffer {
     typealias SwiftType = CoreFailoverResumeArm?
 
@@ -18918,6 +19770,30 @@ fileprivate struct FfiConverterOptionTypeStoredMessage: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeStoredMessage.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCoreDeliveryBlockedReason: FfiConverterRustBuffer {
+    typealias SwiftType = CoreDeliveryBlockedReason?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreDeliveryBlockedReason.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreDeliveryBlockedReason.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -19617,6 +20493,31 @@ fileprivate struct FfiConverterSequenceTypeCoreReactionTargetSummary: FfiConvert
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCoreRecipientDeliveryStatus: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRecipientDeliveryStatus]
+
+    public static func write(_ value: [CoreRecipientDeliveryStatus], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRecipientDeliveryStatus.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRecipientDeliveryStatus] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRecipientDeliveryStatus]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRecipientDeliveryStatus.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCoreRelayEnvelopeDisposition: FfiConverterRustBuffer {
     typealias SwiftType = [CoreRelayEnvelopeDisposition]
 
@@ -20281,17 +21182,48 @@ public func coreClassifyConnectionHealth(input: CoreConnectionHealthInput) -> Co
 })
 }
 /**
- * The delivery line for one person, or `None` when there is nothing honest to
- * say.
+ * The delivery line for one person from Phase 1's inputs, or `None` when
+ * there is nothing honest to say.
  *
- * Nothing here is an error and nothing here is red. The old page's red
- * `Pending relay upload` under every friend -- including friends who had
- * already received the message -- is what this replaces.
+ * A thin front end onto [`core_classify_recipient_delivery`], kept because
+ * both shells call it while their per-recipient read model is being wired up.
+ * It supplies exactly the evidence Phase 1 has -- a raw relay-upload depth, a
+ * receipt as newest-evidence flag, and path state -- and no ages or
+ * per-recipient faults, so the classifier cannot return `delayed` or a
+ * blocking reason through this door. That is a property of the missing
+ * inputs, not of a second decision procedure, which is why there is only one.
+ *
+ * Nothing reachable through here is an error and nothing here is red. The old
+ * page's `Pending relay upload` under every friend -- including friends who
+ * had already received the message -- is what this replaces.
  */
 public func coreClassifyDeliveryLine(input: CoreDeliveryLineInput) -> CoreDeliveryState? {
     return try!  FfiConverterOptionTypeCoreDeliveryState.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_classify_delivery_line(
         FfiConverterTypeCoreDeliveryLineInput.lower(input),$0
+    )
+})
+}
+/**
+ * The whole per-recipient delivery verdict, from the read model plus this
+ * device's path state.
+ *
+ * This is the specification's derived-state table, evaluated once, in one
+ * language. The two rules it exists to guarantee:
+ *
+ * * **A receipt silences the line rather than contradicting it.** The count
+ * arriving here is already receipt-aware, so "they received your message"
+ * and a waiting line cannot appear together -- not because a special case
+ * suppresses the second, but because there is nothing left to count.
+ * * **Age alone is never a fault.** The delayed window is only consulted
+ * while a route is usable, and the movement state under any fault stays a
+ * promise. A friend who is offline stays neutral at ten minutes, at ten
+ * hours, and at ten days.
+ */
+public func coreClassifyRecipientDelivery(input: CoreRecipientDeliveryInput) -> CoreDeliveryLine? {
+    return try!  FfiConverterOptionTypeCoreDeliveryLine.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_classify_recipient_delivery(
+        FfiConverterTypeCoreRecipientDeliveryInput.lower(input),$0
     )
 })
 }
@@ -23353,7 +24285,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_classify_connection_health() != 10468) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_classify_delivery_line() != 45405) {
+    if (uniffi_cruisemesh_core_checksum_func_core_classify_delivery_line() != 33523) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_classify_recipient_delivery() != 44154) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_connection_check_pending() != 38815) {
@@ -24377,6 +25312,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_recent_consumed_msg_ids() != 58947) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_recipient_delivery_status() != 59074) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_consumed_hidden_lamport() != 35967) {
