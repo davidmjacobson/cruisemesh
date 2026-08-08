@@ -3085,11 +3085,20 @@ public protocol MessageStoreProtocol : AnyObject {
      * transit, not wiped) go undetected forever, since the peer would
      * believe we already have everything up to the max we've seen.
      *
-     * Moving receipts/badges to MAX is safe from a message-loss
-     * standpoint: `record_receipt` (a peer acking delivery/read of *our*
-     * stream) never prunes `outbound_envelopes` -- only expiry and
-     * chat-delete do -- so an overstated watermark here cannot cause a
-     * sender to drop an undelivered message of their own.
+     * Moving receipts/badges to MAX is safe from a message-loss standpoint,
+     * though the reason changed with #283 and is worth restating exactly.
+     * `record_receipt` now *does* retire the `outbound_envelopes` rows a
+     * delivered watermark covers, so an overstated watermark reaching the
+     * sender does remove sealed rows for messages that peer never filed. What
+     * makes that harmless is that retirement removes only the sealed
+     * retransmission artifact and only where the `messages` row that
+     * regenerates it survives (see `crate::outbound_retirement`): the sender
+     * still holds the message, the peer's *digest* still reports the gap-aware
+     * contiguous watermark, and the digest responder re-seals the envelope
+     * from the stored message. Nothing a sender still owes becomes
+     * unsendable. Carried rows -- other people's mail, which this device is
+     * the only copy of -- are untouched by all of this and still leave only
+     * on their own digest proof.
      */
     func highestLamport(chatId: Data, senderUserId: Data) throws  -> UInt64
 
@@ -3747,6 +3756,20 @@ public protocol MessageStoreProtocol : AnyObject {
      * touches it, and a receipt with an unknown route (`via_transport =
      * None`) never clears an already-known one. Pass `None` when the return
      * route isn't known.
+     *
+     * **A delivered receipt also retires what it newly covers** (#283,
+     * contract `QUEUE-01`). Proof of delivery for a 1:1 outbound envelope is
+     * the removal condition the DTN ack-safety invariant permits, and this is
+     * the natural, incremental place to act on it: the queue shrinks in the
+     * same transaction that records the proof, rather than growing until a
+     * flat seven-day expiry. Nothing here touches group rows or carried rows
+     * -- `CARRY-01` is untouched, a carried copy still leaves only on its own
+     * digest proof -- and the retirement is deliberately narrower than the
+     * watermark: it removes a sealed *retransmission artifact* only where the
+     * `messages` row that regenerates it survives, so a peer that later
+     * notices a hole still gets the envelope rebuilt by the digest responder.
+     * See `crate::outbound_retirement` for the full predicate and its
+     * reasoning.
      */
     func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws
 
@@ -5400,11 +5423,20 @@ open func highestContiguousLamport(chatId: Data, senderUserId: Data)throws  -> U
      * transit, not wiped) go undetected forever, since the peer would
      * believe we already have everything up to the max we've seen.
      *
-     * Moving receipts/badges to MAX is safe from a message-loss
-     * standpoint: `record_receipt` (a peer acking delivery/read of *our*
-     * stream) never prunes `outbound_envelopes` -- only expiry and
-     * chat-delete do -- so an overstated watermark here cannot cause a
-     * sender to drop an undelivered message of their own.
+     * Moving receipts/badges to MAX is safe from a message-loss standpoint,
+     * though the reason changed with #283 and is worth restating exactly.
+     * `record_receipt` now *does* retire the `outbound_envelopes` rows a
+     * delivered watermark covers, so an overstated watermark reaching the
+     * sender does remove sealed rows for messages that peer never filed. What
+     * makes that harmless is that retirement removes only the sealed
+     * retransmission artifact and only where the `messages` row that
+     * regenerates it survives (see `crate::outbound_retirement`): the sender
+     * still holds the message, the peer's *digest* still reports the gap-aware
+     * contiguous watermark, and the digest responder re-seals the envelope
+     * from the stored message. Nothing a sender still owes becomes
+     * unsendable. Carried rows -- other people's mail, which this device is
+     * the only copy of -- are untouched by all of this and still leave only
+     * on their own digest proof.
      */
 open func highestLamport(chatId: Data, senderUserId: Data)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -6449,6 +6481,20 @@ open func recordPeerConnectionEvent(userId: Data, transport: PeerConnectionTrans
      * touches it, and a receipt with an unknown route (`via_transport =
      * None`) never clears an already-known one. Pass `None` when the return
      * route isn't known.
+     *
+     * **A delivered receipt also retires what it newly covers** (#283,
+     * contract `QUEUE-01`). Proof of delivery for a 1:1 outbound envelope is
+     * the removal condition the DTN ack-safety invariant permits, and this is
+     * the natural, incremental place to act on it: the queue shrinks in the
+     * same transaction that records the proof, rather than growing until a
+     * flat seven-day expiry. Nothing here touches group rows or carried rows
+     * -- `CARRY-01` is untouched, a carried copy still leaves only on its own
+     * digest proof -- and the retirement is deliberately narrower than the
+     * watermark: it removes a sealed *retransmission artifact* only where the
+     * `messages` row that regenerates it survives, so a peer that later
+     * notices a hole still gets the envelope rebuilt by the digest responder.
+     * See `crate::outbound_retirement` for the full predicate and its
+     * reasoning.
      */
 open func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_record_receipt(self.uniffiClonePointer(),
@@ -25427,7 +25473,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 43009) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 22726) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 49979) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_hint_matches_known_target() != 15933) {
@@ -25592,7 +25638,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_peer_connection_event() != 36800) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_receipt() != 38794) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_receipt() != 9025) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_sent_metric() != 27687) {

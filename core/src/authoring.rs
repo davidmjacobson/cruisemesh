@@ -1,6 +1,7 @@
 use rusqlite::{params, OptionalExtension, Transaction};
 
 use crate::causal_order::causal_display_timestamp;
+use crate::outbound_retirement::{authored_expiry, retire_superseded};
 use crate::store::{
     outbound_message_dedupe_key, row_to_outbound, row_to_outgoing_receipt, store_err,
     upsert_group_tx,
@@ -656,7 +657,11 @@ fn build_pairwise_envelope(
         lamport: message.lamport,
         timestamp: message.timestamp,
         hop_ttl: DEFAULT_HOP_TTL,
-        expiry: default_expiry(routing_timestamp_ms),
+        // Per-kind, not flat: a payload that states its own fifteen-minute
+        // validity has no business being carried for a week. See
+        // `crate::outbound_retirement::authored_expiry` for the decision on
+        // every kind. Group envelopes keep `default_expiry` directly.
+        expiry: authored_expiry(message.kind, routing_timestamp_ms),
         recipient_hint: compute_recipient_hint(contact.user_id.clone(), routing_timestamp_ms),
         sealed: seal_message(identity, contact.agree_pk.clone(), body)?,
     })
@@ -747,6 +752,23 @@ fn insert_authored_rows(
         ],
     )
     .map_err(store_err)?;
+    // Supersession (#283, contract QUEUE-01), in the same transaction that
+    // queued the replacement so the queue never briefly holds both. For a
+    // snapshot kind only the newest generation can inform the recipient of
+    // anything: the field store had queued 120 generations of the friend
+    // directory to a single contact, each one a full copy of a snapshot the
+    // recipient's own revision guard would discard on arrival. See
+    // `crate::outbound_retirement::supersedes_queued_generations` for the
+    // per-kind justification and for why request-shaped hidden kinds are not
+    // in the set.
+    retire_superseded(
+        tx,
+        &envelope.recipient_user_id,
+        &envelope.chat_id,
+        &envelope.sender_user_id,
+        envelope.kind,
+        envelope.lamport,
+    )?;
     Ok(())
 }
 

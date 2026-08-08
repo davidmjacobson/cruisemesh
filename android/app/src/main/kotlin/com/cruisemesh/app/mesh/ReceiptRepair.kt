@@ -42,11 +42,15 @@ object ReceiptRepair {
      * to 0 permanently too, which is exactly the self-lock above.
      *
      * Uncapped is safe. The receiving side's `record_receipt` is validated and
-     * strictly monotonic (`MAX(stored, incoming)`), and it never prunes
-     * `outbound_envelopes` -- only expiry and chat-delete do -- so an
-     * over-reported watermark cannot make a sender drop a message it still
-     * owes. It can at worst tick a message as delivered slightly early. A
-     * capped one is fatal: it stalls the watermark forever.
+     * strictly monotonic (`MAX(stored, incoming)`). Since #283 it does retire
+     * the `outbound_envelopes` rows a delivered watermark covers, so an
+     * over-reported watermark removes sealed rows early -- but it removes only
+     * the sealed retransmission artifact, and only where the `messages` row
+     * that regenerates it survives, so the sender still holds the message and
+     * [respondToDigest]'s backfill re-seals it if that peer later reports the
+     * gap in its own gap-aware digest. An over-report therefore costs at worst
+     * a slightly early delivered tick, never a message the sender still owes.
+     * A capped watermark is fatal: it stalls forever.
      */
     fun owedTo(store: MessageStore, peerUserId: ByteArray): List<OwedReceipt> =
         listOf(RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ)

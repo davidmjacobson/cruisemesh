@@ -61,7 +61,7 @@ of it: the gap is now countable.
 | `HELLO-01` | Legacy HELLO never gains trailing fields; new capabilities use HELLO2 frame `0x06`. | core | `core/src/protocol.rs` HELLO/HELLO2 codec tests; index re-asserts both shapes |
 | `IDEMP-01` | Duplicate, late, or replayed external results cannot double-apply a mutation, regress a cursor, or consume a carried row. | unimplemented | package C0 |
 | `TXN-01` | No store transaction spans external I/O. Page consume and frontier advancement retain their documented two-transaction crash safety. | unimplemented | package C0 |
-| `QUEUE-01` | Proof of delivery for a 1:1 outbound envelope permits — and the queue eventually performs — its retirement, and a payload whose usefulness is shorter than its expiry is superseded rather than re-advertised. The advertised outbound set shrinks under coverage; flat expiry is a backstop, never the only retirement path. | unimplemented | the fix for issue #283 |
+| `QUEUE-01` | Proof of delivery for a 1:1 outbound envelope permits — and the queue eventually performs — its retirement, and a payload whose usefulness is shorter than its expiry is superseded rather than re-advertised. The advertised outbound set shrinks under coverage; flat expiry is a backstop, never the only retirement path. | core | `core/src/outbound_retirement.rs` coverage, sweep, supersession and expiry tests (#283); index re-asserts that a delivered watermark shrinks both readers of the queue |
 | `SECRET-01` | Events, fixtures, summaries, and exported diagnostics contain no relay tokens, raw friend cards, plaintext, private keys, or full endpoint-bearing bodies. | core | `core/tests/protocol_contract.rs` fixture canary scan |
 
 ### 1.1 What each rule means, for someone reading it cold
@@ -230,6 +230,27 @@ retirement path. Issue #283 records the failure mode: a real device holding
 which roughly 93% were service kinds, including week-old reachability hints
 whose payload stops being true after about fifteen minutes. The advertised
 set must shrink under coverage.
+
+Two boundaries are part of the rule rather than details of one
+implementation of it.
+
+**Retirement removes a retransmission artifact, never the ability to
+retransmit.** A covered envelope may leave only while the stored message
+that regenerates it stays, because the receipt watermark this rule consults
+is a MAX over a peer's stream (`WM-01`) and can legitimately sit above a
+lamport that peer never filed. With the message kept, a peer that later
+reports the hole in its gap-aware digest is served a re-sealed envelope; the
+sender's obligation survives the queue row. Carried rows — other people's
+mail, of which this device may be the only copy — are outside this rule
+entirely and keep leaving only under `CARRY-01`.
+
+**Group rows are excluded, and the group rule is deliberately not stated
+here.** A group envelope is queued once against the group id and fanned out
+per member, and group wire receipts are deferred, so no single watermark can
+mean "every member received it". Retiring one on a group watermark would
+drop mail for the members who did not get it. Group retirement needs a
+per-member coverage record that does not exist yet; until it does, this rule
+governs pairwise 1:1 rows only.
 
 #### `SECRET-01` — diagnostics must be safe to send
 
@@ -700,7 +721,7 @@ against the tree as it stands. Labels:
 | LAN scan and socket lifecycle | `LanTransport.kt` and scan files | `LanTransport.swift` and scan files | primitives in `lan_util.rs` / `lan_session.rs` | shell-forever (drivers) | shared progress policy in D2/D3 |
 | BLE central / peripheral lifecycle | `BleCentral.kt`, `BlePeripheral.kt` | `BleTransport.swift` | framing only, in `framing.rs` | shell-forever | — |
 | Push, OS polling, background wake | `relay/RelayPushClient.kt` + service scheduling | `Relay/RelayPushClient.swift` + controller scheduling | none | shell-forever | push stays a pass nudge only |
-| Outbound queue retirement | none — expiry only | none — expiry only | `store.rs` expiry prune only | hoist-later | `QUEUE-01`; the #283 fix |
+| Outbound queue retirement | none | none | `outbound_retirement.rs` owns coverage retirement, supersession and per-kind expiry; `store.rs` executes them at receipt time and on open (#283) | presentation-only | stays core; no shell decides any of it |
 | Delivery / transport / health UI | Compose status surfaces | SwiftUI status surfaces | semantic facts in `connection_health.rs` / `semantic.rs` | presentation-only | core facts, native presentation; D3 |
 | Field diagnostics archive | `debug/DiagnosticsShare.kt` | `UI/DiagnosticsArchive.swift` | delivery metrics only | hoist-now | shared event JSONL + native wrappers; B1 |
 | Multi-node orchestration test | n/a | n/a | `core/tests/mesh_sim.rs` reimplements receive and meet | delete | production `mesh_receive` / `mesh_meet`; D0/D2 |
@@ -740,3 +761,7 @@ Recorded so a reader does not have to diff two documents:
 - Stage 7 is not one order. Android walks the mailbox and then syncs
   presence; iOS syncs presence and then walks. Section 5.2 carries this and
   the presence-failure difference beside it.
+- Outbound queue retirement is **core** (#283) and never was split: neither
+  shell held a copy of it, so `outbound_retirement.rs` had nothing to hoist,
+  only a gap to fill. Both shells got the smaller queue with no code change,
+  because both read it through store calls that already existed.
